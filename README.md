@@ -1,6 +1,6 @@
 # 知识体系
 
-> 个人后端技术知识库，内容来自日常学习与有道云笔记导出整理，涵盖云原生、系统设计、DDD、设计模式、Java 基础、中间件源码与算法。
+> 个人后端技术知识库，内容来自日常学习与有道云笔记导出整理，涵盖云原生、系统设计、DDD、设计模式、Java 基础、中间件源码、算法与 AI 大模型。
 
 ## 目录导航
 
@@ -11,6 +11,7 @@
 - [基础知识](基础知识/)
 - [源码系列](源码系列/)
 - [算法](算法/)
+- [AI 大模型](https://github.com/bojieli/ai-agent-book)
 
 ---
 
@@ -98,6 +99,13 @@ Java 后端工程师核心基础：JVM、MySQL、Redis、Elasticsearch、消息�
 - [矩形](算法/矩形.md)
 
 👉 [进入文件夹 →](算法/)
+
+### 🤖 AI 大模型
+AI Agent 与大模型应用学习：开源书籍《AI Agent 实战》（bojieli/ai-agent-book），系统讲解 Agent 构建、工具调用、编排与工程落地实践。
+
+- [AI Agent 实战（开源书籍 · bojieli/ai-agent-book）](https://github.com/bojieli/ai-agent-book)
+
+👉 [查看项目 →](https://github.com/bojieli/ai-agent-book)
 
 ---
 
