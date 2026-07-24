@@ -119,19 +119,18 @@ type 列 重要
 system、const、eq_ref、ref、full_text、ref_or_null、unique_subquery、
 index_subquery、range、index_merge、index、all
 
-| system | 表中只有一行数据或者是空表。 | 
+| system | 表中只有一行数据或者是空表。 |
 | -- | -- |
-| const | 使用唯一索引或者主键，返回记录一定是一条的等值where条件时，通常type是const | 
-| eq_ref | 连接字段为主键或者唯一索引，此类型通常出现于多表的join查询，表示对于前表的每一个结果，都对应后表的唯一一条结果。并且查询的比较是=操作，查询效率比较高。 | 
-| ref | 1. | 
-| fulltext | 全文检索索引 | 
-| ref_or | 和ref类似，增加了null值判断 | 
-| unique_subquery、 index_subquery | 都是子查询，前者返回唯一值，后者返回可能有重复 | 
-| range | 索引范围扫描，常用于 ><,is null,between,in,like等 | 
-| index_merge | 表示查询使用了两个或者以上的索引数量，常见于and或者or查询匹配上了多个不同索引的字段 | 
-| index | 减少回表次数,因为要查询的索引都在一颗索引树上 | 
-| all | 全表扫描 | 
-
+| const | 使用唯一索引或者主键，返回记录一定是一条的等值where条件时，通常type是const |
+| eq_ref | 连接字段为主键或者唯一索引，此类型通常出现于多表的join查询，表示对于前表的每一个结果，都对应后表的唯一一条结果。并且查询的比较是=操作，查询效率比较高。 |
+| ref | 1. |
+| fulltext | 全文检索索引 |
+| ref_or | 和ref类似，增加了null值判断 |
+| unique_subquery、 index_subquery | 都是子查询，前者返回唯一值，后者返回可能有重复 |
+| range | 索引范围扫描，常用于 ><,is null,between,in,like等 |
+| index_merge | 表示查询使用了两个或者以上的索引数量，常见于and或者or查询匹配上了多个不同索引的字段 |
+| index | 减少回表次数,因为要查询的索引都在一颗索引树上 |
+| all | 全表扫描 |
 
 key 列
 
@@ -161,15 +160,14 @@ extra
 
 这个列包含很多不适合在其它列显示的重要信息，有很多种，常用的有：
 
-| ● | ● | 
+| ● | ● |
 | -- | -- |
-| ● | ● | 
-| using index  | ● | 
-| ● | 表示存储引擎返回的记录并不都是符合条件的，需要在server层进行筛选过滤，性能很低 | 
-| ● | ● | 
-| ● | ● | 
-| ● | ● | 
-
+| ● | ● |
+| using index  | ● |
+| ● | 表示存储引擎返回的记录并不都是符合条件的，需要在server层进行筛选过滤，性能很低 |
+| ● | ● |
+| ● | ● |
+| ● | ● |
 
 filtered 列
 
@@ -186,7 +184,6 @@ filtered 列
 4.存储层：第四层为数据存储层，主要是将数据存储在运行于该设备的文件系统之上，并完成与存储引擎的交互。
 
 **一个请求的交互：**
-
 
     
 
@@ -217,13 +214,9 @@ order by time desc
 
 **缺点**：实现复杂。因为代理服务器需要实现mysql服务端的通信协议，因此实现难度较大
 
-
     
 
 ![](images/WEBRESOURCEf20a3c2e7a6849ce772798abf572c175截图.png)
-
-
-
 
 **客户端代理：**
 
@@ -235,16 +228,11 @@ order by time desc
 
 **缺点**：1.仅支持某一种语言。例如tddl、zebra、sharding-jdbc都是使用java语言开发，因此对于使用其他语言的用户，就无法使用这些中间件2.版本升级困难。因为应用使用数据源代理就是引入一个jar包的依赖，在有多个应用都对某个版本的jar包产生依赖时，一旦这个版本有bug，所有的应用都需要升级
 
-
     
 
 ![](images/WEBRESOURCE0845f5a4ecc78fb25009bf7d508b3d21截图.png)
 
-
-
-
 ## **zebra**
-
 
     
 
@@ -270,7 +258,7 @@ creator_trx_id:  创建当前read view的事务版本号
 
 阶段总结：
 
-①当一个事务尝试改动某条数据时，会将原本表中的旧数据放入Undo-log日志中。
+①当一个事务尝试改动某条数据时，会将原本表中的旧数据放入Undo-log日志中。
 
 ②当一个事务尝试查询某条数据时，MVCC会生成一个ReadView快照。
 
@@ -340,11 +328,9 @@ creator_trx_id:  创建当前read view的事务版本号
 
 常见的分库分表方案
 
-| Range 分库分表 | 顾名思义，该方案根据数据范围划分数据的存放位置。 | 
+| Range 分库分表 | 顾名思义，该方案根据数据范围划分数据的存放位置。 |
 | -- | -- |
-| Hash 分库分表 | 常见错误案例一：非互质关系导致的数据偏斜问题 | 
-
-
+| Hash 分库分表 | 常见错误案例一：非互质关系导致的数据偏斜问题 |
 
 **mysql定位死锁**
 
@@ -608,13 +594,9 @@ FIC。
 
 传统模式具体是咋工作的？
 
-
     
 
 ![](images/WEBRESOURCE86aaa307f73bc76bb6b6341548c0d4d0截图.png)
-
-
-
 
 我们知道，当我们向包含了 AUTO_INCREMENT 列的表中插入数据时，都会持有这么一个特殊的表锁——自增锁（AUTO-INC），并且当语句执行完之后就会释放。这样一来可以保证单个语句内生成的自增值是连续的。
 
@@ -636,13 +618,9 @@ FIC。
 
 交叉模式（Interleaved）下，所有的 INSERT 语句，包含 INSERT 和 INSERT INTO ... SELECT ，都不会使用 AUTO-INC 自增锁，而是使用较为轻量的 mutex 锁。这样一来，多条 INSERT 语句可以并发的执行，这也是三种锁模式中扩展性最好的一种。
 
-
     
 
 ![](images/WEBRESOURCE67771e376be6451ac6d530bc59833279截图.png)
-
-
-
 
 并发执行所带来的副作用就是单个 INSERT 的自增值并不连续，因为 AUTO_INCREMENT 的值分配会在多个 INSERT 语句中来回交叉的执行。
 
@@ -746,7 +724,7 @@ Cost  = Server Cost + Engine Cost
 
 简单嵌套循环连接实际上就是简单粗暴的嵌套循环，如果table1有1万条数据，table2有1万条数据，那么数据比较的次数=1万 * 1万 =1亿次，这种查询效率会非常慢。
 
-所以Mysql继续优化，然后衍生出Index Nested-LoopJoin、Block Nested-Loop Join两种NLJ算法。在执行join查询时mysql会根据情况选择两种之一进行join查询。
+所以Mysql继续优化，然后衍生出Index Nested-LoopJoin、Block Nested-Loop Join两种NLJ算法。在执行join查询时mysql会根据情况选择两种之一进行join查询。
 
 **Index Nested-LoopJoin（减少内层表数据的匹配次数）**
 
@@ -773,7 +751,7 @@ Cost  = Server Cost + Engine Cost
 
 （3）join_buffer_size的默认值是256K，join_buffer_size的最大值在MySQL 5.1.22版本前是4G-1，而之后的版本才能在64位操作系统下申请大于4G的Join Buffer空间。
 
-（4）使用Block Nested-Loop Join算法需要开启优化器管理配置的optimizer_switch的设置block_nested_loop为on，默认为开启。
+（4）使用Block Nested-Loop Join算法需要开启优化器管理配置的optimizer_switch的设置block_nested_loop为on，默认为开启。
 
  **Batched Key Access Join（BKA）**算法的工作步骤如下：
 
@@ -781,7 +759,7 @@ Cost  = Server Cost + Engine Cost
 
 2) 批量的将Key（索引键值）发送到Multi-Range Read（MRR）接口
 
-3) Multi-Range Read（MRR）通过收到的Key，根据其对应的ROWID进行排序，然后再进行数据的读取操作。
+3) Multi-Range Read（MRR）通过收到的Key，根据其对应的ROWID进行排序，然后再进行数据的读取操作。
 
 4) 返回结果集给客户端
 
@@ -799,7 +777,7 @@ Cost  = Server Cost + Engine Cost
 
 （1）当用到BNLJ时，字段越少，join buffer 所缓存的数据就越多，外层表的循环次数就越少；
 
-（2）当用到INLJ时，如果可以不回表查询，即利用到覆盖索引，则可能可以提示速度。（未经验证，只是一个推论）
+（2）当用到INLJ时，如果可以不回表查询，即利用到覆盖索引，则可能可以提示速度。（未经验证，只是一个推论）
 
 ## **mysql中 in 和 exist**
 
@@ -872,7 +850,7 @@ SELECT * FROM `information_schema`.`OPTIMIZER_TRACE`
 
 [https://juejin.cn/post/7215736946253430844/](https://juejin.cn/post/7215736946253430844/)
 
-## 
+##
 mysql的group by及内存分配
 
 [https://juejin.cn/post/6957696820621344775](https://juejin.cn/post/6957696820621344775)
@@ -1068,9 +1046,7 @@ LBCC是Lock-Based Concurrent Control的简称，意思是基于锁的并发控�
 
 - 以锁粒度的维度划分：
 
-
 	- ①表锁：
-
 
 		- 全局锁：加上全局锁之后，整个数据库只能允许读，不允许做任何写操作。 **FLUSH TABLES WITH READ LOCK (FTWRL)** FLUSH TABLES WITH READ LOCK 是一个全局读锁，执行后会阻塞所有对表的写操作（如INSERT、UPDATE、DELETE等），同时允许其他会话进行只读查询。该命令通常用于全库逻辑备份，确保在备份过程中数据的一致性，防止备份过程中有其他写操作修改数据。一旦执行了 FTWRL，除非显式执行 UNLOCK TABLES 命令或关闭连接，否则全局读锁会一直保持。这意味着在此期间，任何需要对表进行写操作的事务都无法执行，可能会导致其他会话长时间阻塞。
 
@@ -1084,7 +1060,6 @@ LBCC是Lock-Based Concurrent Control的简称，意思是基于锁的并发控�
 
 	- ③行锁：
 
-
 		- 记录锁 / Record锁：也就是行锁，一条记录和一行数据是同一个意思。
 
 		- 间隙锁 / Gap锁：InnoDB中解决幻读问题的一种锁机制。
@@ -1092,7 +1067,6 @@ LBCC是Lock-Based Concurrent Control的简称，意思是基于锁的并发控�
 		- 临建锁 / Next-Key锁：间隙锁的升级版，同时具备记录锁+间隙锁的功能。
 
 - 以互斥性的维度划分：
-
 
 	- 共享锁 / S锁：不同事务之间不会相互排斥、可以同时获取的锁。
 
@@ -1102,20 +1076,17 @@ LBCC是Lock-Based Concurrent Control的简称，意思是基于锁的并发控�
 
 - 以操作类型的维度划分：
 
-
 	- 读锁：查询数据时使用的锁。
 
 	- 写锁：执行插入、删除、修改、DDL语句时使用的锁。
 
 - 以加锁方式的维度划分：
 
-
 	- 显示锁：编写SQL语句时，手动指定加锁的粒度。
 
 	- 隐式锁：执行SQL语句时，根据隔离级别自动为SQL操作加锁。
 
 - 以思想的维度划分：
-
 
 	- 乐观锁：每次执行前认为自己会成功，因此先尝试执行，失败时再获取锁。
 
@@ -1135,13 +1106,11 @@ MGR (MySQL Group Replication) 是 MySQL 官方提供的多主复制解决方案�
 
 **Shared Everthting:**一般是针对单个主机，完全透明共享CPU/MEMORY/IO，并行处理能力是最差的，典型的代表SQLServer
 
-> 
-
+>
 
 **Shared Disk：**各个处理单元使用自己的私有 CPU和Memory，共享磁盘系统。典型的代表 Oracle Rac， 它是数据共享，可通过增加节点来提高并行处理的能力，扩展能力较好。其类似于SMP（对称多处理）模式，但是当存储器接口达到饱和的时候，增加节点并不能获得更高的性能 。
 
-> 
-
+>
 
 **Shared Nothing：**各个处理单元都有自己私有的CPU/内存/硬盘等，不存在共享资源，类似于MPP（大规模并行处理）模式，各处理单元之间通过协议通信，并行处理和扩展能力更好。典型代表DB2 DPF和 Hadoop ，各节点相互独立，各自处理自己的数据，处理后的结果可能向上层汇总或在节点间流转。
 
@@ -1865,7 +1834,7 @@ LOGICAL_CLOCK：表示基于组提交的方式来完成并行复制。
 
 - **sort-union**：与union类似，不同的是sort-union会对结果集进行排序，随后再返回给用户；
 
-- 
+-
 
 ## mysql的hint
 

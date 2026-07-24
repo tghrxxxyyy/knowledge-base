@@ -8,13 +8,9 @@ AR、LSR、OSR
 
 与leader副本同步滞后过多的副本（不包括leader副本）组成OSR（Out-of-Sync Replicas）
 
-
     
 
 ![](images/WEBRESOURCE56b1ab114f86b76b3d9bb9fae9087c24截图.png)
-
-
-
 
 初始化分配固定的内存，即32MB。然后把 32MB 划分为 N 多个内存块，一个内存块默认是16KB，这样缓冲池里就会有很多的内存块。然后如果需要创建一个新的 Batch，就从缓冲池里取一个 16KB 的内存块就可以了。
 
@@ -91,13 +87,9 @@ RocketMQ根目录/
     └── logback.xml  # 日志配置
 ```
 
-
     
 
 ![](images/WEBRESOURCE78b13b2cd0a6498bf225650812269e62截图.png)
-
-
-
 
 IndexFile 文件基于物理磁盘文件实现 Hash 索引。其文件由 40 字节的文件头、500万 个 Hash 槽，每个 Hash 槽 4 个字节，最后由 2000万 个 Index 条目，每个条目由 20个 字节构成，分别为 4 字节索引 key 的 hashcode、8 字节消息物理偏移量、4 字节时间戳、4 字节的前一个 Index 条目（Hash 冲突的链表结构）。
 
@@ -113,17 +105,13 @@ IndexFile 文件基于物理磁盘文件实现 Hash 索引。其文件由 40
 
 - 数据文件：以 *.log* 后缀结尾，存储当前索引文件名对应的数据文件。
 
-- 
+-
 
 ![](images/WEBRESOURCEe7da4ccab3c2d5070558f9ab7871c685image.png)
-
 
     
 
 ![](images/WEBRESOURCE0c5ad69677c31895b0441b315f060cc6截图.png)
-
-
-
 
 Segment 文件的命名规则是： 某个 Partition 全局的第一个 Segment 从 0 开始，后续每个 Segment 文件名以当前 Partition 的最大 offset(消息偏移量)为基准,文件名长度为 64 位 long 类型，19 位数字字符长度，不足部分用 0 填充。
 
@@ -134,7 +122,6 @@ Segment 文件的命名规则是： 某个 Partition 全局的第一个 Seg
 拿到 当前查到的范围索引对应的行号之后再去对应的 log 文件中从 当前 Position 位置开始查找 offset 对应的消息，直到找到该 offset 为止。
 
 ## Kafka的重平衡
-
 
 Kafka提供了三种再平衡策略：Round Robin（轮询），Range（范围）和Sticky（粘性）。
 
@@ -234,7 +221,7 @@ log.cleanup.policy=delete 启用删除策略
 
 直接删除，删除后的消息不可恢复。可配置以下两个策略：
 
-#清理超过指定时间清理：  
+#清理超过指定时间清理：
 
 log.retention.hours=16
 

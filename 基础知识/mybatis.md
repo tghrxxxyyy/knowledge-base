@@ -1,28 +1,17 @@
 
-
 1.延迟加载的原理是什么
 
 2.说一下 mybatis 的一级缓存和二级缓存
 
 3.mybatis解析执行xml的语句的流程
 
-
-
-
-
 ![](images/WEBRESOURCEba15ebd23646b278ee3f70879e89b805截图.png)
-
-
 
 ![](images/WEBRESOURCEcbf21ebb9a380f4c070ee4c500a07f12截图.png)
 
 ## 1.延迟加载的原理是什么
 
 它的原理是，使用 CGLIB 或 Javassist( 默认 ) 创建目标对象的代理对象。当调用代理对象的延迟加载属性的 getting 方法时，进入拦截器方法。比如调用 a.getB().getName() 方法，进入拦截器的 invoke(...) 方法，发现 a.getB() 需要延迟加载时，那么就会单独发送事先保存好的查询关联 B 对象的 SQL ，把 B 查询上来，然后调用 a.setB(b) 方法，于是 a 对象 b 属性就有值了，接着完成 a.getB().getName() 方法的调用。这就是延迟加载的基本原理
-
-
-
-
 
 ## 2.说一下 mybatis 的一级缓存和二级缓存
 
@@ -34,15 +23,11 @@ BaseExecutor
 
 BaseExecutor 是一个抽象类，实现了 Executor 接口，并提供了大部分方法的实现，只有 4 个基本方法：doUpdate, doQuery, doQueryCursor, doFlushStatement 没有实现，还是一个抽象方法，由子类实现，这 4 个方法相当于模板方法中变化的那部分
 
-
-
 二级缓存
 
 当配置打开，Mybatis 的二级缓存是用 CachingExecutor 来实现的，它是 Executor 的一个装饰器类。为 Executor 对象添加了MapperFactoryBean缓存的功能。
 
 在介绍 CachingExecutor 之前，先来看看 CachingExecutor 依赖的两个类，TransactionalCacheManager 和 TransactionalCache。
-
-
 
 ## 3.mybatis解析执行xml的语句的流程
 

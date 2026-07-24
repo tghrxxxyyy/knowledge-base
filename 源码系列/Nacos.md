@@ -1,5 +1,4 @@
 
-
 服务的注册流程
 
 客户端发现
@@ -12,8 +11,6 @@ nacos的配置中心功能实现
 
 从springboot的自动装配说起
 
-
-
 ```javascript
 <dependency>
     <groupId>com.alibaba.cloud</groupId>
@@ -22,8 +19,6 @@ nacos的配置中心功能实现
 ```
 
 这个依赖下的spring.factories中，自动装配了类
-
-
 
 ```javascript
 org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
@@ -56,8 +51,6 @@ NacosAutoServiceRegistration
 ```javascript
 AbstractAutoServiceRegistration
 ```
-
-
 
 ```javascript
 public abstract class AbstractAutoServiceRegistration<R extends Registration>
@@ -103,8 +96,6 @@ NacosDiscoveryClientConfiguration，这个类中加载了com.alibaba.cloud.nacos
 
 这个类核心继承了 org.springframework.context.SmartLifecycle  extend  org.springframework.context.Lifecycle
 
-
-
 ```javascript
 public interface Lifecycle {
     void start();
@@ -114,8 +105,6 @@ public interface Lifecycle {
     boolean isRunning();
 }
 ```
-
-
 
 ```javascript
 @Override
@@ -129,8 +118,6 @@ private long watchDelay = 30000;
 ```
 
 ## 如何支持高并发注册（异步任务与内存队列设计原理及源码剖析）
-
-
 
 ## nacos的配置中心功能实现
 
@@ -206,10 +193,6 @@ public void checkConfigInfo() {
     }
 }
 ```
-
-
-
-
 
 ![对于服务端 而言 /v1/cs/configs/listener](images/WEBRESOURCE76d81e36f2d5a87a95ce80b335aa0f05stickPicture.png)
 
@@ -332,4 +315,3 @@ public void run() {
     }
 }
 ```
-

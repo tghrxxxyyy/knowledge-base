@@ -156,11 +156,7 @@ java.util.ServiceLoader 
 
 ## **异常处理**
 
-
 ![](images/73A56CD9149048D2A875E8A3BAD38E25v2-b340b341d921def7ca17d82e989fcccb_1440w.jpg)
-
-
-
 
 - from：可能发生异常的起始点指令索引下标(包含)
 
@@ -224,12 +220,11 @@ await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候�
 
 等待其它线程显式地唤醒，否则不会被分配 CPU 时间片。
 
-| 进入方法 | 退出方法 | 
+| 进入方法 | 退出方法 |
 | -- | -- |
-| 没有设置 Timeout 参数的 Object.wait() 方法 | Object.notify() / Object.notifyAll() | 
-| 没有设置 Timeout 参数的 Thread.join() 方法 | 被调用的线程执行完毕 | 
-| LockSupport.park() 方法 | - | 
-
+| 没有设置 Timeout 参数的 Object.wait() 方法 | Object.notify() / Object.notifyAll() |
+| 没有设置 Timeout 参数的 Thread.join() 方法 | 被调用的线程执行完毕 |
+| LockSupport.park() 方法 | - |
 
 [](#限期等待-timed-waiting)限期等待(Timed Waiting)
 
@@ -243,14 +238,13 @@ await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候�
 
 阻塞和等待的区别在于，阻塞是被动的，它是在等待获取一个排它锁。而等待是主动的，通过调用 Thread.sleep() 和 Object.wait() 等方法进入。
 
-| 进入方法 | 退出方法 | 
+| 进入方法 | 退出方法 |
 | -- | -- |
-| Thread.sleep() 方法 | 时间结束 | 
-| 设置了 Timeout 参数的 Object.wait() 方法 | 时间结束 / Object.notify() / Object.notifyAll() | 
-| 设置了 Timeout 参数的 Thread.join() 方法 | 时间结束 / 被调用的线程执行完毕 | 
-| LockSupport.parkNanos() 方法 | - | 
-| LockSupport.parkUntil() 方法 | - | 
-
+| Thread.sleep() 方法 | 时间结束 |
+| 设置了 Timeout 参数的 Object.wait() 方法 | 时间结束 / Object.notify() / Object.notifyAll() |
+| 设置了 Timeout 参数的 Thread.join() 方法 | 时间结束 / 被调用的线程执行完毕 |
+| LockSupport.parkNanos() 方法 | - |
+| LockSupport.parkUntil() 方法 | - |
 
 [](#死亡-terminated)死亡(Terminated)
 
@@ -271,7 +265,6 @@ ctl 是一个涵盖了两个概念的原子整数类，它将工作线程数和
 - TIDYING：所有任务都终止，并且工作线程也为0，处于关闭之前的状态
 
 - TERMINATED：已关闭。
-
 
     
 
@@ -338,7 +331,7 @@ MethodAccessor有两个实现，一个是基于本地方法实现，相当于直
 
 1. 获得的method对象是copy的，建议复用，避免占用堆内存
 
-1. 字节码生成的是object数组作为可变参数，涉及装箱和拆箱 
+1. 字节码生成的是object数组作为可变参数，涉及装箱和拆箱
 
 1. 方法的获取采用的是遍历匹配
 
@@ -540,11 +533,9 @@ JVMTI（Java Virtual Machine Tool Interface）即指 Java 虚拟机工具接口�
 
 [https://zhuanlan.zhihu.com/p/139756708](https://zhuanlan.zhihu.com/p/139756708)
 
-												
+Instrument 的底层实现依赖于 JVMTI(JVM Tool Interface)，它是 JVM 暴露出来的一些供用户扩展的接口集合，JVMTI 是基于事件驱动的，JVM 每执行到一定的逻辑就会调用一些事件的回调接口(如果存在)，这些接口可以供开发者去扩展自己的逻辑。
 
-Instrument 的底层实现依赖于 JVMTI(JVM Tool Interface)，它是 JVM 暴露出来的一些供用户扩展的接口集合，JVMTI 是基于事件驱动的，JVM 每执行到一定的逻辑就会调用一些事件的回调接口(如果存在)，这些接口可以供开发者去扩展自己的逻辑。					
-
-JVMTIAgent 是一个利用 JVMTI 暴露出来的接口提供了代理启动时加载(AgentOn Load)、代理通过 Attach 形式加载(Agent On Attach)和代理卸载(AgentOn Unload)功能的动态库。而 Instrument Agent 可以理解为一类 JVMTIAgent动 态 库， 别 名 是 JPLISAgent(Java Programming Language InstrumentationServices Agent)，也就是专门为 Java 语言编写的插桩服务提供支持的代理									
+JVMTIAgent 是一个利用 JVMTI 暴露出来的接口提供了代理启动时加载(AgentOn Load)、代理通过 Attach 形式加载(Agent On Attach)和代理卸载(AgentOn Unload)功能的动态库。而 Instrument Agent 可以理解为一类 JVMTIAgent动 态 库， 别 名 是 JPLISAgent(Java Programming Language InstrumentationServices Agent)，也就是专门为 Java 语言编写的插桩服务提供支持的代理
 
 ## java的管程模型
 
@@ -571,9 +562,6 @@ MESA模型中，T2唤醒T1之后，T2还是会接着执行，T1并不立即执�
 [https://zhuanlan.zhihu.com/p/302654066](https://zhuanlan.zhihu.com/p/302654066)
 
 [深入分析synchronized原理(阿里面试题) - 知乎.webarchive](attachments/WEBRESOURCE2e761aecff1bf52981d81eb2dabee63c深入分析Synchronized原理(阿里面试题) - 知乎.webarchive)
-
-
-
 
 ## LockSupport.park()详解
 
@@ -749,13 +737,11 @@ Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，�
 
 > Single Thread rule
 
-
 在一个线程内，在程序前面的操作先行发生于后面的操作。
 
 [](#_2-管程锁定规则)2. 管程锁定规则
 
 > Monitor Lock Rule
-
 
 一个 unlock 操作先行发生于后面对同一个锁的 lock 操作。
 
@@ -763,13 +749,11 @@ Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，�
 
 > Volatile Variable Rule
 
-
 对一个 volatile 变量的写操作先行发生于后面对这个变量的读操作。
 
 [](#_4-线程启动规则)4. 线程启动规则
 
 > Thread Start Rule
-
 
 Thread 对象的 start() 方法调用先行发生于此线程的每一个动作。
 
@@ -777,13 +761,11 @@ Thread 对象的 start() 方法调用先行发生于此线程的每一个动作�
 
 > Thread Join Rule
 
-
 Thread 对象的结束先行发生于 join() 方法返回。
 
 [](#_6-线程中断规则)6. 线程中断规则
 
 > Thread Interruption Rule
-
 
 对线程 interrupt() 方法的调用先行发生于被中断线程的代码检测到中断事件的发生，可以通过 interrupted() 方法检测到是否有中断发生。
 
@@ -791,13 +773,11 @@ Thread 对象的结束先行发生于 join() 方法返回。
 
 > Finalizer Rule
 
-
 一个对象的初始化完成(构造函数执行结束)先行发生于它的 finalize() 方法的开始。
 
 [](#_8-传递性) 8. 传递性
 
 > Transitivity
-
 
 如果操作 A 先行发生于操作 B，操作 B 先行发生于操作 C，那么操作 A 先行发生于操作 C。
 

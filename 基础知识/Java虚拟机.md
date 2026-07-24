@@ -94,13 +94,9 @@ jvm保存所有方法的以下信息，同域信息一样的包括声明顺序
 
 [https://blog.csdn.net/zhengzhaoyang122/article/details/115742908](https://blog.csdn.net/zhengzhaoyang122/article/details/115742908)
 
-
     
 
 ![](images/WEBRESOURCEd951f79cce6ce5caa5941b7f3ebaa11c截图.png)
-
-
-
 
 ClassFile {
 
@@ -484,13 +480,9 @@ CMS垃圾收集器发现大部分时间都浪费在GC上就会抛出OutOfMemoryE
 
 ## **G1的执行流程**
 
-
     [https://juejin.cn/post/6844903960550047757#heading-9](https://juejin.cn/post/6844903960550047757#heading-9)
 
 ![](images/WEBRESOURCEf5b326f03ae9dce647bd289013878459截图.png)
-
-
-
 
 **G1收集器与常见收集器的不同**
 
@@ -554,20 +546,15 @@ Mixed GC它一定会回收年轻代，并会采集部分老年代的Region进�
 
 ## **JMM**
 
-
     
 
 ![](images/WEBRESOURCEca25a1e4a5ce22256a3a1ea2cb89cf1e截图.png)
-
-
-
 
 Java内存模型规定了：线程对变量的所有操作都必须在「本地内存」进行，「不能直接读写主内存」的变量
 
 Java内存模型定义了8种操作来完成「变量如何从主内存到本地内存，以及变量如何从本地内存到主内存」
 
 分别是read/load/use/assign/store/write/lock/unlock操作
-
 
     
 
@@ -778,14 +765,13 @@ https://zhuanlan.zhihu.com/p/69764885
 > 6、记录字符串常量引用的StringTable
 > 7、存在跨代引用的对象8、和GC Root处于同一CardTable的对象
 
-
 ## **Shenandoah收集器 **
 
 ·初始标记(Initial M arking):与G1一样，首先标记与GC Roots直接关联的对象，这个阶段仍
 
 是“Stop The World”的，但停顿时间与堆大小无关，只与GC Roots的数量相关。
 
- ·并发标记(Concurrent Marking):与G1一样，遍历对象图，标记出全部可达的对象，这个阶段是 与 用户 线程 一起 并发 的 ，时间长短取决于堆中存活对象的数量及对象图的结构复杂程度 
+ ·并发标记(Concurrent Marking):与G1一样，遍历对象图，标记出全部可达的对象，这个阶段是 与 用户 线程 一起 并发 的 ，时间长短取决于堆中存活对象的数量及对象图的结构复杂程度
 
 ·最终标记(Final M arking):与G1一样，处理剩余的SATB扫描，并在这个阶段统计出回收价值 最高的Region，将这些Region构成一组回收集(Collection Set)。最终标记阶段也会有一小段短暂的停 顿。
 

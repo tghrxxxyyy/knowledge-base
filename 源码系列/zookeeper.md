@@ -1,8 +1,8 @@
 ## 文章 ：
 
-[https://mp.weixin.qq.com/s/ir0uurwo95hB3g__vTceJQ](https://mp.weixin.qq.com/s/ir0uurwo95hB3g__vTceJQ)      常见 zk的 面试题 
+[https://mp.weixin.qq.com/s/ir0uurwo95hB3g__vTceJQ](https://mp.weixin.qq.com/s/ir0uurwo95hB3g__vTceJQ)      常见 zk的 面试题
 
-ZNode的数据结构 
+ZNode的数据结构
 
 ```java
  public class DataNode implements Record {
@@ -29,6 +29,6 @@ ZNode的数据结构
 
  包含Znode节点的状态信息，比如**「事务id、版本号、时间戳」**等等。
 
-## zk是如何保证消息顺序性的 
+## zk是如何保证消息顺序性的
 
 ![](images/WEBRESOURCE571efa2f214a1880e3a696aac8cc818f截图.png)

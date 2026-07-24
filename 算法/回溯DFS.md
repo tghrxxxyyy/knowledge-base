@@ -28,7 +28,7 @@ for 选择 in 选择列表:
 
 典型例题：
 
-1.  leetcode  39  组合 总数 
+1.  leetcode  39  组合 总数
 
 ![](images/WEBRESOURCE018da28658393f132c2a771dc319ff1c截图.png)
 
@@ -78,7 +78,7 @@ class Solution {
 }
 ```
 
-2.  leetcode  46题   全排列 
+2.  leetcode  46题   全排列
 
 ![](images/WEBRESOURCE75068912455a4a2fa483b9ce9be1df69截图.png)
 
