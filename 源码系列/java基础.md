@@ -1,12 +1,12 @@
-## 1.**Timer、ScheduledThreadPool、DelayQueue**
+# Java 基础
 
-可以看出Timer实际就是根据任务的执行时间维护了一个优先队列，并且起了一个线程不断地拉取任务执行，根据代码可以看到有三个问题：
+## Timer、ScheduledThreadPool、DelayQueue
 
-优先队列的插入和删除的时间复杂度是O(logn)，当任务量大的时候，频繁的入堆出堆性能有待考虑
+可以看出 Timer 实际就是根据任务的执行时间维护了一个优先队列，并且起了一个线程不断地拉取任务执行，根据代码可以看到有三个问题：
 
-单线程执行，如果一个任务执行的时间过久则会影响下一个任务的执行时间(当然你任务的run要是异步执行也行)
-
-从代码中可以看到对异常没有做什么处理，那么一个任务出错的时候会导致之后的任务都无法执行
+1. 优先队列的插入和删除的时间复杂度是 O(logn)，当任务量大的时候，频繁的入堆出堆性能有待考虑。
+2. 单线程执行，如果一个任务执行的时间过久则会影响下一个任务的执行时间（当然你任务的 run 要是异步执行也行）。
+3. 从代码中可以看到对异常没有做什么处理，那么一个任务出错的时候会导致之后的任务都无法执行。
 
 ```java
 class TaskQueue {
@@ -15,8 +15,8 @@ class TaskQueue {
         // Grow backing store if necessary
         if (size + 1 == queue.length)
             queue = Arrays.copyOf(queue, 2*queue.length); //扩容
- 
- 
+
+
         queue[++size] = task; //先将任务添加到数组最后面
         fixUp(size); //调整堆
     }
@@ -38,11 +38,9 @@ class TaskQueue {
     }
      //.......
 }
- 
- 
 ```
 
-```
+```java
 public void run() {
         try {
             mainLoop();//无异常捕获
@@ -54,8 +52,8 @@ public void run() {
             }
         }
     }
- 
- 
+
+
     /**
      * The main timer loop.  (See class comment.)
      */
@@ -70,8 +68,8 @@ public void run() {
                         queue.wait();
                     if (queue.isEmpty())
                         break; // Queue is empty and will forever remain; die
- 
- 
+
+
                     // Queue nonempty; look at first evt and do the right thing
                     long currentTime, executionTime;
                     task = queue.getMin(); //获取任务
@@ -104,34 +102,34 @@ public void run() {
     }
 ```
 
-现在我们来看下ScheduledThreadPoolExecutor提交一个任务后，整体的执行过程：
+现在我们来看下 ScheduledThreadPoolExecutor 提交一个任务后，整体的执行过程：
 
-提交一个任务后，为了满足ScheduledThreadPoolExecutor能够延时执行任务和能周期执行任务的特性，会先将实现Runnable接口的类转换成ScheduledFutureTask。
+提交一个任务后，为了满足 ScheduledThreadPoolExecutor 能够延时执行任务和能周期执行任务的特性，会先将实现 `Runnable` 接口的类转换成 `ScheduledFutureTask`。
 
-然后会调用delayedExecute方法进行执行任务:先将任务放入到队列中，然后调用ensurePrestart方法，新建Worker类（此逻辑为线程池ThreadPoolExecutor实现）
+然后会调用 `delayedExecute` 方法进行执行任务：先将任务放入到队列中，然后调用 `ensurePrestart` 方法，新建 `Worker` 类（此逻辑为线程池 `ThreadPoolExecutor` 实现）。
 
-当执行任务时，就会调用被Worker所重写的run方法，进而会继续执行runWorker方法。在runWorker方法中会调用getTask方法从阻塞队列中不断的去获取任务进行执行，直到从阻塞队列中获取的任务为null的话，线程结束终止。(此处逻辑都是线程池ThreadPoolExecutor的实现)
+当执行任务时，就会调用被 `Worker` 所重写的 `run` 方法，进而会继续执行 `runWorker` 方法。在 `runWorker` 方法中会调用 `getTask` 方法从阻塞队列中不断地去获取任务进行执行，直到从阻塞队列中获取的任务为 null 的话，线程结束终止。（此处逻辑都是线程池 `ThreadPoolExecutor` 的实现）
 
-getTask方法会调用队列的poll和take方法，此处就调用到DelayedWorkQueue重写的poll和take逻辑，实现了延迟任务的阻塞
+`getTask` 方法会调用队列的 `poll` 和 `take` 方法，此处就调用到 `DelayedWorkQueue` 重写的 `poll` 和 `take` 逻辑，实现了延迟任务的阻塞。
 
-执行任务时，将调用ScheduledFutureTask重载的run方法，实现周期性任务的场景
+执行任务时，将调用 `ScheduledFutureTask` 重载的 `run` 方法，实现周期性任务的场景。
 
-小结：
+> **小结：**
+>
+> 1. ScheduledThreadPoolExecutor 继承了 ThreadPoolExecutor，通过重写任务、阻塞队列实现了延迟任务调度的实现。
+> 2. ScheduledThreadPoolExecutor 大致的流程和 Timer 差不多，都是通过一个阻塞队列维护任务，能实现单次任务、周期性任务的执行，主要差别在于能多线程运行任务，不会单线程阻塞，并且 Java 线程池底层的 runWorker 实现了异常的捕获，不会因为一个任务的出错而影响之后的任务。
+> 3. 在任务队列的维护上，与 Timer 一样，也是优先队列，插入和删除的时间复杂度是 O(logn)。
 
-ScheduledThreadPoolExecutor继承了ThreadPoolExecutor，通过重写任务、阻塞队列实现了延迟任务调度的实现
+DelayQueue 的元素必须实现 `Delayed` 接口，它本身也实现了 `BlockingQueue`：
 
-ScheduledThreadPoolExecutor大致的流程和Timer差不多，都是通过一个阻塞队列维护任务，能实现单次任务、周期性任务的执行，主要差别在于能多线程运行任务，不会单线程阻塞，并且Java线程池的底层runworker实现了异常的捕获，不会因为一个任务的出错而影响之后的任
-
-在任务队列的维护上，与Timer一样，也是优先队列，插入和删除的时间复杂度是O(logn)
-
-```
-//元素必须实现Delayed接口，也实现了阻塞队列public class DelayQueue<E extends Delayed> extends AbstractQueue<E>
+```java
+//元素必须实现Delayed接口，也实现了阻塞队列
+public class DelayQueue<E extends Delayed> extends AbstractQueue<E>
     implements BlockingQueue<E> {
- 
- 
+
     private final transient ReentrantLock lock = new ReentrantLock();
     private final PriorityQueue<E> q = new PriorityQueue<E>();//优先队列，
-    
+
    public E take() throws InterruptedException {
         final ReentrantLock lock = this.lock;
         lock.lockInterruptibly();
@@ -169,9 +167,10 @@ ScheduledThreadPoolExecutor大致的流程和Timer差不多，都是通过一个
 }
 //继承了Comparable
 public interface Delayed extends Comparable<Delayed> {
- 
- 
+
+
     long getDelay(TimeUnit unit);
 
 
+}
 ```

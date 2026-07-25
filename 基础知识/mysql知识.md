@@ -1,14 +1,16 @@
-## **mysql的存储引擎**
+# MySQL 知识
+
+## mysql的存储引擎
 
 show engines; // 查看mysql所支持的存储引擎，以及从中得到mysql默认的存储引擎。
 
-**MyISAM存储引擎：**
+### MyISAM存储引擎
 
 优缺点：MyISAM的优势在于占用空间小，处理速度快。缺点是不支持事务的完整性和并发性。
 
-**MEMORY存储引擎**
+### MEMORY存储引擎
 
-使用存储在内从中的数据来创建表，而且所有的数据也都存储在内存中。
+使用存储在内存中的数据来创建表，而且所有的数据也都存储在内存中。
 
 每个基于memory存储引擎的表实际对应一个磁盘文件，该文件的文件名和表名是相同的，类型为.frm。该文件只存储表的结构，而其数据文件，都是存储在内存中，这样有利于对数据的快速处理，提高整个表的处理能力。
 
@@ -16,17 +18,17 @@ memory存储引擎默认使用哈希（HASH）索引，其速度比使用B-+Tree
 
 memory存储引擎文件数据都存储在内存中，如果mysqld进程发生异常，重启或关闭机器这些数据都会消失。所以memory存储引擎中的表的生命周期很短，一般只使用一次。
 
-**ARCHIVE存储引擎**
+### ARCHIVE存储引擎
 
 该存储引擎非常适合存储大量独立的、作为历史记录的数据。区别于InnoDB和MyISAM这两种引擎，ARCHIVE提供了压缩功能，拥有高效的插入速度，但是这种引擎不支持索引，所以查询性能较差一些。
 
-**总结：**
+### 总结
 
 InnoDB：支持事务处理，支持外键，支持崩溃修复能力和并发控制。如果需要对事务的完整性要求比较高（比如银行），要求实现并发控制（比如售票），那选择InnoDB有很大的优势。如果需要频繁的更新、删除操作的数据库，也可以选择InnoDB，因为支持事务的提交（commit）和回滚（rollback）。
 
 MyISAM：插入数据快，空间和内存使用比较低。如果表主要是用于插入新记录和读出记录，那么选择MyISAM能实现处理高效率。如果应用的完整性、并发性要求比 较低，也可以使用。如果数据表主要用来插入和查询记录，则MyISAM引擎能提供较高的处理效率
 
-MEMORY：所有的数据都在内存中，数据的处理速度快，但是安全性不高。如果需要很快的读写速度，对数据的安全性要求较低，可以选择MEMOEY。它对表的大小有要求，不能建立太大的表。所以，这类数据库只使用在相对较小的数据库表。如果只是临时存放数据，数据量不大，并且不需要较高的数据安全性，可以选择将数据保存在内存中的Memory引擎，MySQL中使用该引擎作为临时表，存放查询的中间结果
+MEMORY：所有的数据都在内存中，数据的处理速度快，但是安全性不高。如果需要很快的读写速度，对数据的安全性要求较低，可以选择MEMORY。它对表的大小有要求，不能建立太大的表。所以，这类数据库只使用在相对较小的数据库表。如果只是临时存放数据，数据量不大，并且不需要较高的数据安全性，可以选择将数据保存在内存中的Memory引擎，MySQL中使用该引擎作为临时表，存放查询的中间结果
 
 如果只有INSERT和SELECT操作，可以选择Archive，Archive支持高并发的插入操作，但是本身不是事务安全的。Archive非常适合存储归档数据，如记录日志信息可以使用Archiv
 
@@ -35,36 +37,28 @@ MEMORY：所有的数据都在内存中，数据的处理速度快，但是安�
 [https://zhuanlan.zhihu.com/p/50564425](https://zhuanlan.zhihu.com/p/50564425)
 
 ## mysql如何实现ACID
-
-***原子性（Atomicity）:***
-
+### 原子性（Atomicity）
 依靠Undo Log（回滚日志）来确保事务的原子性。如果事务需要回滚，Undo Log中记录的信息会被用来撤销事务中已经完成的操作，确保事务要么全部完成，要么完全不发生。
-
-***一致性（Consistency）:***
-
+### 一致性（Consistency）
 一致性由多种机制共同维护，包括事务的原子性、隔离性和持久性。除此之外，InnoDB使用MVCC（多版本并发控制）来支持读取已提交（RC）和可重复读（RR）隔离级别下的数据一致性。
-
-***隔离性（Isolation）:***
-
+### 隔离性（Isolation）
 主要通过MVCC（多版本并发控制）和锁机制（行级锁和表级锁）实现。MVCC允许非阻塞读取，而锁则防止事务间的脏读、不可重复读和幻读，确保不同事务之间的数据隔离。
-
-***持久性（Durability）:***
-
+### 持久性（Durability）
 依赖于Redo Log（重做日志）来保证持久性。在事务提交后，Redo Log会记录下所有修改的数据页信息。即使在系统崩溃的情况下，通过Redo Log中的信息，MySQL可以在重启后恢复未写入磁盘的数据，确保事务的更改永久保存。
 
-## **MYSQL死锁检测**
+## MYSQL死锁检测
 
 show variables like 'innodb_lock_wait_timeout';
 
-在InnoDB中，参数innodb_lock_wait_timeout用来控制等待的时间，innodb_rollback_on_timeout用来设定是否在等待超时后回滚。前者是动态的，后者是静态的。 
+在InnoDB中，参数innodb_lock_wait_timeout用来控制等待的时间，innodb_rollback_on_timeout用来设定是否在等待超时后回滚。前者是动态的，后者是静态的。 
 
 解决死锁做简单的方法就是超时，即当两个事务互相等待时，当一个等待时间超过了某一阈值，其中一个事务进行回滚，另一个等待的事务就能继续进行。
 
-但是如果超时的事务所占权重比较大，如事务更新了很多行，占用了较多的undo log，回滚这个事务的时间相对于另一个事务所占用的时间可能会更多，就显得不合适了。
+但是如果超时的事务所占权重比较大，如事务更新了很多行，占用了较多的undo log，回滚这个事务的时间相对于另一个事务所占用的时间可能会更多，就显得不合适了。
 
-因此，除了超时机制，当前数据库都普遍采用**等待图**（wait-for graph）的方式来进行死锁检测。
+因此，除了超时机制，当前数据库都普遍采用**等待图**（wait-for graph）的方式来进行死锁检测。
 
-wait-for graph要求数据库保存以下两种信息:
+wait-for graph要求数据库保存以下两种信息:
 
 - 锁的信息链表：目前持有每个锁的事务是谁
 
@@ -78,9 +72,8 @@ wait-for graph要求数据库保存以下两种信息:
 
 死锁检测机制在MySQL后续的高版本中是默认开启的，但实际上死锁检测的开销不小，上面三个并发事务阻塞时，会对「事务等待链表、锁的信息链表」共计检索六次，那当阻塞的并发事务越来越多时，检测的效率也会呈线性增长。
 
-## **mysql 的 explain有哪些字段**
-
-   ** id 列**
+## mysql 的 explain有哪些字段
+### id 列
 
 - 每个select语句都会自动分配的一个唯一标识符
 
@@ -94,11 +87,11 @@ wait-for graph要求数据库保存以下两种信息:
 
 - id列为null表示为结果集，不需要使用这个语句来查询
 
-select_type 列（很重要）
+### select_type 列（很重要）
 
-查询类型，主要用于区别 普通查询、联合查询（union、union all）、子查询等复杂查询。
+查询类型，主要用于区别 普通查询、联合查询（union、union all）、子查询等复杂查询。
 
-table 列
+### table 列
 
 - 显示的查询表名，如果查询使用了别名，那么这里显示的就是别名
 
@@ -108,43 +101,43 @@ table 列
 
 - 如果显示为尖括号括起来的也表示一个临时表，表示来自union查询id为n、m的结果集
 
-partitions 列
+### partitions 列
 
 分区信息
 
-type 列 重要
+### type 列（重要）
 
 - 依次从好到差：
 
-system、const、eq_ref、ref、full_text、ref_or_null、unique_subquery、
+system、const、eq_ref、ref、fulltext、ref_or_null、unique_subquery、
 index_subquery、range、index_merge、index、all
 
 | system | 表中只有一行数据或者是空表。 |
 | -- | -- |
 | const | 使用唯一索引或者主键，返回记录一定是一条的等值where条件时，通常type是const |
 | eq_ref | 连接字段为主键或者唯一索引，此类型通常出现于多表的join查询，表示对于前表的每一个结果，都对应后表的唯一一条结果。并且查询的比较是=操作，查询效率比较高。 |
-| ref | 1. |
+| ref | 使用非唯一索引或唯一索引前缀进行等值匹配，返回匹配某个单独值的所有行 |
 | fulltext | 全文检索索引 |
-| ref_or | 和ref类似，增加了null值判断 |
-| unique_subquery、 index_subquery | 都是子查询，前者返回唯一值，后者返回可能有重复 |
-| range | 索引范围扫描，常用于 ><,is null,between,in,like等 |
+| ref_or_null | 和 ref 类似，增加了对 NULL 值的判断 |
+| unique_subquery、 index_subquery | 都是子查询，前者返回唯一值，后者返回可能有重复 |
+| range | 索引范围扫描，常用于 ><,is null,between,in,like等 |
 | index_merge | 表示查询使用了两个或者以上的索引数量，常见于and或者or查询匹配上了多个不同索引的字段 |
 | index | 减少回表次数,因为要查询的索引都在一颗索引树上 |
 | all | 全表扫描 |
 
-key 列
+### key 列
 
 查询实际使用的索引，select_type为index_merge时，key列可能有多个索引，其它时候这里只会有一个
 
-key_len 列
+### key_len 列
 
 - 用于处理查询的索引长度，如果是单列索引，那么整个索引长度都会计算进去，如果是多列索引，那么查询不一定能使用到所有的列，具体使用了多少个列的索引，这里就会计算进去，没有使用到的索引，这里不会计算进去。
 
 - 留意一下这个长度，计算一下就知道这个索引使用了多少列
 
-- 另外，key_len 只计算 where 条件使用到索引长度，而排序和分组就算用到了索引也不会计算key_len
+- 另外，key_len 只计算 where 条件使用到索引长度，而排序和分组就算用到了索引也不会计算key_len
 
-ref
+### ref 列
 
 - 如果是使用的常数等值查询，这里会显示const
 
@@ -152,59 +145,56 @@ ref
 
 - 如果是条件使用了表达式或者函数，或者条件列发生了内部隐式转换，这里可能会显示func
 
-rows
+### rows 列
 
 执行计划估算的扫描行数，不是精确值（innodb不是精确值，myisam是精确值，主要是因为innodb使用了mvcc）。
 
-extra
+### extra 列
 
 这个列包含很多不适合在其它列显示的重要信息，有很多种，常用的有：
 
-| ● | ● |
-| -- | -- |
-| ● | ● |
-| using index  | ● |
-| ● | 表示存储引擎返回的记录并不都是符合条件的，需要在server层进行筛选过滤，性能很低 |
-| ● | ● |
-| ● | ● |
-| ● | ● |
+> ⚠️ 待确认：原导出中 extra 列的说明表格被占位符（●）腐蚀，仅能确认下列两条片段，其余原内容已丢失。
 
-filtered 列
+- `Using index`：覆盖索引，查询所需列均在索引中，无需回表（常见含义，原文档描述缺失）。
+- （值待补全）：表示存储引擎返回的记录并不都符合查询条件，需要在 server 层再次过滤，性能较低。
 
-5.7之后的版本默认就有这个字段，不需要使用explain extended了。这个字段表示存储引擎返回的数据在server层过滤后，剩下多少满足查询的记录数量的比例，注意是百分比，不是具体记录数。
+### filtered 列
 
-## **mysql的整体架构**
+5.7之后的版本默认就有这个字段，不需要使用explain extended了。这个字段表示存储引擎返回的数据在server层过滤后，剩下多少满足查询的记录数量的比例，注意是百分比，不是具体记录数。
+
+## mysql的整体架构
 
 1.连接层：最上层是一些客户端和连接服务。主要完成一些类似于连接处理、授权认证、及相关的安全方案。在该层上引入了线程池的概念，为通过认证安全接入的客户端提供线程。同样在该层上可以实现基于SSL的安全链接。服务器也会为安全接入的每个客户端验证它所具有的操作权限。
 
-2.服务层：第二层服务层，主要完成大部分的核心服务功能， 包括查询解析、分析、优化、缓存、以及所有的内置函数，所有跨存储引擎的功能也都在这一层实现，包括触发器、存储过程、视图等。
+2.服务层：第二层服务层，主要完成大部分的核心服务功能， 包括查询解析、分析、优化、缓存、以及所有的内置函数，所有跨存储引擎的功能也都在这一层实现，包括触发器、存储过程、视图等。
 
 3.引擎层：第三层存储引擎层，存储引擎真正的负责了MySQL中数据的存储和提取，服务器通过API与存储引擎进行通信。不同的存储引擎具有的功能不同，这样我们可以根据自己的实际需要进行选取
 
 4.存储层：第四层为数据存储层，主要是将数据存储在运行于该设备的文件系统之上，并完成与存储引擎的交互。
 
-**一个请求的交互：**
+### 一个请求的交互
 
-    
+    
 
 ![](images/WEBRESOURCEa4ea9fc5cd2c4e7071a0c40740fc5346截图.png)
+> 图：一个请求的交互 相关截图
 
-## **关系型数据库的2PL**
+## 关系型数据库的2PL
 
-传统RDBMS加锁的一个原则，就是2PL (二阶段锁)：Two-Phase Locking。相对而言，2PL比较容易理解，说的是锁操作分为两个阶段：加锁阶段与解锁阶段，并且保证加锁阶段与解锁阶段不相交
+传统RDBMS加锁的一个原则，就是2PL (二阶段锁)：Two-Phase Locking。相对而言，2PL比较容易理解，说的是锁操作分为两个阶段：加锁阶段与解锁阶段，并且保证加锁阶段与解锁阶段不相交
 
-## **mysql的cpu飙高**
+## mysql的cpu飙高
 
-SELECT * FROM information_schema.PROCESSLIST WHERE command != 'Sleep' ORDER BY time DESC
+SELECT * FROM information_schema.PROCESSLIST WHERE command != 'Sleep' ORDER BY time DESC
 
-select concat('kill ', id, ';') from information_schema.processlist 
-where command != 'Sleep'
-and time > 100
-order by time desc
+select concat('kill ', id, ';') from information_schema.processlist 
+where command != 'Sleep'
+and time > 100
+order by time desc
 
-## **数据库中间件的设计**
+## 数据库中间件的设计
 
-**服务端代理：**
+### 服务端代理
 
 独立部署一个代理服务，这个代理服务背后管理多个数据库实例。而在应用中，我们通过一个普通的数据源(c3p0、druid、dbcp等)与代理服务器建立连接，所有的sql操作语句都是发送给这个代理，由这个代理去操作底层数据库，得到结果并返回给应用
 
@@ -214,11 +204,12 @@ order by time desc
 
 **缺点**：实现复杂。因为代理服务器需要实现mysql服务端的通信协议，因此实现难度较大
 
-    
+    
 
 ![](images/WEBRESOURCEf20a3c2e7a6849ce772798abf572c175截图.png)
+> 图：服务端代理 相关截图
 
-**客户端代理：**
+### 客户端代理
 
 应用程序需要使用一个特定的数据源，其作用是代理，内部管理了多个普通的数据源(c3p0、druid、dbcp等)，每个普通数据源各自与不同的库建立连接。应用程序产生的sql交给数据源代理进行处理，数据源内部对sql进行必要的操作，如sql改写等，然后交给各个普通的数据源去执行，将得到的结果进行合并，返回给应用。数据源代理通常也实现了JDBC规范定义的API，因此能够直接与orm框架整合。用户的代码需要修改，使用这个代理的数据源，而不是直接使用c3p0、druid、dbcp这样的连接池
 
@@ -228,33 +219,36 @@ order by time desc
 
 **缺点**：1.仅支持某一种语言。例如tddl、zebra、sharding-jdbc都是使用java语言开发，因此对于使用其他语言的用户，就无法使用这些中间件2.版本升级困难。因为应用使用数据源代理就是引入一个jar包的依赖，在有多个应用都对某个版本的jar包产生依赖时，一旦这个版本有bug，所有的应用都需要升级
 
-    
+    
 
 ![](images/WEBRESOURCE0845f5a4ecc78fb25009bf7d508b3d21截图.png)
+> 图：客户端代理 相关截图
 
-## **zebra**
+## zebra
 
-    
+    
 
 ![](images/WEBRESOURCE4aea291cc44b45d137a8c77cb08335ce截图.png)
+> 图：zebra 相关截图
 
-## **MVCC**
+## MVCC
 
 当一个事务启动后，首次执行select操作时，MVCC就会生成一个数据库当前的ReadView。
 
 隐藏字段见下面的隐藏字段说明
 
-**Read view 的几个重要属性**
+### Read view 的几个重要属性
 
-trx_ids:  当前系统活跃(未提交)事务版本号集合。
+trx_ids:  当前系统活跃(未提交)事务版本号集合。
 
-low_limit_id:  创建当前read view 时“当前系统最大事务版本号+1”。表示在生成当前ReadView时，系统中要给下一个事务分配的ID值。
+low_limit_id:  创建当前read view 时“当前系统最大事务版本号+1”。表示在生成当前ReadView时，系统中要给下一个事务分配的ID值。
 
-up_limit_id:  创建当前read view 时“系统正处于活跃事务最小版本号”
+up_limit_id:  创建当前read view 时“系统正处于活跃事务最小版本号”
 
-creator_trx_id:  创建当前read view的事务版本号
+creator_trx_id:  创建当前read view的事务版本号
 
 ![](images/WEBRESOURCEbac778b39e467e72744c4b95989bae47image.png)
+> 图：Read view 的几个重要属性 相关截图
 
 阶段总结：
 
@@ -262,33 +256,33 @@ creator_trx_id:  创建当前read view的事务版本号
 
 ②当一个事务尝试查询某条数据时，MVCC会生成一个ReadView快照。
 
-**Read view 匹配条件**
+### Read view 匹配条件
 
-（1）数据事务ID 
+（1）数据事务ID 
 
-如果数据事务ID小于read view中的最小活跃事务ID，则可以肯定该数据是在当前事务启之前就已经存在了的,所以可以显示。
+如果数据事务ID小于read view中的最小活跃事务ID，则可以肯定该数据是在当前事务启之前就已经存在了的,所以可以显示。
 
-（2）数据事务ID>=low_limit_id 则不显示
+（2）数据事务ID>=low_limit_id 则不显示
 
-如果数据事务ID大于read view 中的当前系统的最大事务ID，则说明该数据是在当前read view 创建之后才产生的，所以数据不予显示。
+如果数据事务ID大于read view 中的当前系统的最大事务ID，则说明该数据是在当前read view 创建之后才产生的，所以数据不予显示。
 
-（3） up_limit_id <=数据事务ID
+（3） up_limit_id <=数据事务ID
 
 如果数据的事务ID大于最小的活跃事务ID,同时又小于等于系统最大的事务ID，这种情况就说明这个数据有可能是在当前事务开始的时候还没有提交的。
 
-所以这时候我们需要把数据的事务ID与当前read view 中的活跃事务集合trx_ids 匹配:
+所以这时候我们需要把数据的事务ID与当前read view 中的活跃事务集合trx_ids 匹配:
 
-情况1:  如果事务ID不存在于trx_ids 集合（则说明read view产生的时候事务已经commit了），这种情况数据则可以显示。
+情况1:  如果事务ID不存在于trx_ids 集合（则说明read view产生的时候事务已经commit了），这种情况数据则可以显示。
 
-情况2： 如果事务ID存在trx_ids则说明read view产生的时候数据还没有提交，但是如果数据的事务ID等于creator_trx_id ，那么说明这个数据就是当前事务自己生成的，自己生成的数据自己当然能看见，所以这种情况下此数据也是可以显示的。
+情况2： 如果事务ID存在trx_ids则说明read view产生的时候数据还没有提交，但是如果数据的事务ID等于creator_trx_id ，那么说明这个数据就是当前事务自己生成的，自己生成的数据自己当然能看见，所以这种情况下此数据也是可以显示的。
 
-情况3： 如果事务ID既存在trx_ids而且又不等于creator_trx_id那就说明read view产生的时候数据还没有提交，又不是自己生成的，所以这种情况下此数据不能显示。
+情况3： 如果事务ID既存在trx_ids而且又不等于creator_trx_id那就说明read view产生的时候数据还没有提交，又不是自己生成的，所以这种情况下此数据不能显示。
 
-（4）不满足read view条件时候，从undo log里面获取数据
+（4）不满足read view条件时候，从undo log里面获取数据
 
-当数据的事务ID不满足read view条件时候，从undo log里面获取数据的历史版本，然后数据历史版本事务号回头再来和read view 条件匹配 ，直到找到一条满足条件的历史数据，或者找不到则返回空结果；
+当数据的事务ID不满足read view条件时候，从undo log里面获取数据的历史版本，然后数据历史版本事务号回头再来和read view 条件匹配 ，直到找到一条满足条件的历史数据，或者找不到则返回空结果；
 
-**下面是另外一种理解方法：**
+### 另外一种理解方法
 
 ①当事务中出现select语句时，会先根据MySQL的当前情况生成一个ReadView。
 
@@ -318,21 +312,21 @@ creator_trx_id:  创建当前read view的事务版本号
 
 就是首先会去获取表中行数据的隐藏列，然后经过上述一系列判断后，可以得知：目前查询数据的事务到底能不能访问最新版的数据。如果能，就直接拿到表中的数据并返回，反之，不能则去Undo-log日志中获取旧版本的数据返回
 
-## **分库分表**
+## 分库分表
 
 数据偏斜问题
 
 这边我们定义分库分表最大数据偏斜率为：(数据量最大样本-数据量最小样本)/数据量最小样本。
 
-一般来说，如果我们的最大数据偏斜率在 5% 以内是可以接受的。
+一般来说，如果我们的最大数据偏斜率在 5% 以内是可以接受的。
 
 常见的分库分表方案
 
-| Range 分库分表 | 顾名思义，该方案根据数据范围划分数据的存放位置。 |
+| Range 分库分表 | 顾名思义，该方案根据数据范围划分数据的存放位置。 |
 | -- | -- |
-| Hash 分库分表 | 常见错误案例一：非互质关系导致的数据偏斜问题 |
+| Hash 分库分表 | 常见错误案例一：非互质关系导致的数据偏斜问题 |
 
-**mysql定位死锁**
+### mysql定位死锁
 
 - MySQL 5.7 及以下
 
@@ -365,98 +359,100 @@ INNODB_LOCKS/data_locks：查看锁类型（LOCK_TYPE）、锁模式（LOCK_MODE
 
 INNODB_LOCK_WAITS/data_lock_waits：通过 BLOCKING_ENGINE_TRANSACTION_ID 和 REQUESTING_ENGINE_TRANSACTION_ID 找到阻塞关系。
 
-58.mysql的碎片查询
+## mysql的碎片查询
 
-show table status like '%table_name%';
-mysql> show table status like 'salaries'\G; 
-*************************** 1. row ***************************
-           Name: salaries
-         Engine: InnoDB
-        Version: 10
-     Row_format: Dynamic
-           Rows: 2838918
- Avg_row_length: 31
-    Data_length: 90832896
-Max_data_length: 0
-   Index_length: 0
-      Data_free: 4194304
- Auto_increment: NULL
-    Create_time: 2021-01-14 14:33:47
-    Update_time: 2021-01-14 14:34:42
-     Check_time: NULL
-      Collation: utf8_bin
-       Checksum: NULL
- Create_options: 
-        Comment: 
+```sql
+show table status like '%table_name%';
+mysql> show table status like 'salaries'\G; 
+### ********************* 1. row *********************
+           Name: salaries
+         Engine: InnoDB
+        Version: 10
+     Row_format: Dynamic
+           Rows: 2838918
+ Avg_row_length: 31
+    Data_length: 90832896
+Max_data_length: 0
+   Index_length: 0
+      Data_free: 4194304
+ Auto_increment: NULL
+    Create_time: 2021-01-14 14:33:47
+    Update_time: 2021-01-14 14:34:42
+     Check_time: NULL
+      Collation: utf8_bin
+       Checksum: NULL
+ Create_options: 
+        Comment: 
 
-mysql> select 
+mysql> select 
 t.table_schema,
 t.table_name,
 t.table_rows,
 t.data_length,
 t.index_length,
-concat(round(t.data_free/1024/1024,2),'m') as data_free
-from information_schema.tables t
-where t.table_schema = 'employees';
+concat(round(t.data_free/1024/1024,2),'m') as data_free
+from information_schema.tables t
+where t.table_schema = 'employees';
 
 +--------------+----------------------+------------+-------------+--------------+-----------+
-| TABLE_SCHEMA | TABLE_NAME           | TABLE_ROWS | DATA_LENGTH | INDEX_LENGTH | DATA_FREE |
+| TABLE_SCHEMA | TABLE_NAME           | TABLE_ROWS | DATA_LENGTH | INDEX_LENGTH | DATA_FREE |
 +--------------+----------------------+------------+-------------+--------------+-----------+
-| employees    | current_dept_emp     |       NULL |        NULL |         NULL | NULL      |
-| employees    | departments          |          9 |       16384 |        16384 | 0.00M     |
-| employees    | dept_emp             |     331143 |    12075008 |      5783552 | 4.00M     |
-| employees    | dept_emp_latest_date |       NULL |        NULL |         NULL | NULL      |
-| employees    | dept_manager         |         24 |       16384 |        16384 | 0.00M     |
-| employees    | employees            |     299069 |    15220736 |            0 | 4.00M     |
-| employees    | salaries             |    2838426 |   100270080 |            0 | 4.00M     |
-| employees    | titles               |     442902 |    20512768 |            0 | 4.00M     |
-+--------------+------------------
+| employees    | current_dept_emp     |       NULL |        NULL |         NULL | NULL      |
+| employees    | departments          |          9 |       16384 |        16384 | 0.00M     |
+| employees    | dept_emp             |     331143 |    12075008 |      5783552 | 4.00M     |
+| employees    | dept_emp_latest_date |       NULL |        NULL |         NULL | NULL      |
+| employees    | dept_manager         |         24 |       16384 |        16384 | 0.00M     |
+| employees    | employees            |     299069 |    15220736 |            0 | 4.00M     |
+| employees    | salaries             |    2838426 |   100270080 |            0 | 4.00M     |
+| employees    | titles               |     442902 |    20512768 |            0 | 4.00M     |
++--------------+----------------------+------------+-------------+--------------+-----------+
+```
 
-## **mysql加锁细节**
+## mysql加锁细节
 
-MySQL 的隔离等级对加锁有影响，所以在分析具体加锁场景时，首先要确定当前的隔离等级。
+MySQL 的隔离等级对加锁有影响，所以在分析具体加锁场景时，首先要确定当前的隔离等级。
 
-- 读未提交（Read Uncommitted 后续简称 RU）：可以读到未提交的读。 **即写操作加排他锁，读操作不加锁！**
+- 读未提交（Read Uncommitted 后续简称 RU）：可以读到未提交的读。 **即写操作加排他锁，读操作不加锁！**
 
-- 读已提交（Read Committed 后续简称 RC）：存在幻读问题，对当前读获取的数据加记录锁。因此对于RC级别的底层实现，对于写操作会加排他锁，而读操作会使用MVCC机制。
+- 读已提交（Read Committed 后续简称 RC）：存在幻读问题，对当前读获取的数据加记录锁。因此对于RC级别的底层实现，对于写操作会加排他锁，而读操作会使用MVCC机制。
 
-- 可重复读（Repeatable Read 后续简称 RR）：不存在幻读问题，对当前读获取的数据加记录锁，同时对涉及的范围加间隙锁，防止新的数据插入，导致幻读。
+- 可重复读（Repeatable Read 后续简称 RR）：不存在幻读问题，对当前读获取的数据加记录锁，同时对涉及的范围加间隙锁，防止新的数据插入，导致幻读。
 
-- 序列化（Serializable）：从 MVCC 并发控制退化到基于锁的并发控制，不存在快照读，都是当前读，并发效率急剧下降，不建议使用。 所有写操作加临键锁（具备互斥特性），所有读操作加共享锁
+- 序列化（Serializable）：从 MVCC 并发控制退化到基于锁的并发控制，不存在快照读，都是当前读，并发效率急剧下降，不建议使用。 所有写操作加临键锁（具备互斥特性），所有读操作加共享锁
 
-这里说明一下，RC 总是读取记录的最新版本，而 RR 是读取该记录事务开始时的那个版本，虽然这两种读取的版本不同，但是都是快照数据，并不会被写操作阻塞，所以这种读操作称为 快照读（Snapshot Read）
+这里说明一下，RC 总是读取记录的最新版本，而 RR 是读取该记录事务开始时的那个版本，虽然这两种读取的版本不同，但是都是快照数据，并不会被写操作阻塞，所以这种读操作称为 快照读（Snapshot Read）
 
-MySQL 还提供了另一种读取方式叫当前读（Current Read），它读的不再是数据的快照版本，而是数据的最新版本，并会对数据加锁，根据语句和加锁的不同，又分成三种情况：
+MySQL 还提供了另一种读取方式叫当前读（Current Read），它读的不再是数据的快照版本，而是数据的最新版本，并会对数据加锁，根据语句和加锁的不同，又分成三种情况：
 
-- SELECT ... LOCK IN SHARE MODE：加共享(S)锁
+- SELECT ... LOCK IN SHARE MODE：加共享(S)锁
 
-- SELECT ... FOR UPDATE：加排他(X)锁
+- SELECT ... FOR UPDATE：加排他(X)锁
 
-- INSERT / UPDATE / DELETE：加排他(X)锁
+- INSERT / UPDATE / DELETE：加排他(X)锁
 
-当前读在 RR 和 RC 两种隔离级别下的实现也是不一样的：RC 只加记录锁，RR 除了加记录锁，还会加间隙锁，用于解决幻读问题。
+当前读在 RR 和 RC 两种隔离级别下的实现也是不一样的：RC 只加记录锁，RR 除了加记录锁，还会加间隙锁，用于解决幻读问题。
 
-**不同 SQL 语句对加锁的影响**
+### 不同 SQL 语句对加锁的影响
 
-不同的 SQL 语句当然会加不同的锁，总结起来主要分为五种情况：
+不同的 SQL 语句当然会加不同的锁，总结起来主要分为五种情况：
 
-- SELECT ... 语句正常情况下为快照读，不加锁；
+- SELECT ... 语句正常情况下为快照读，不加锁；
 
-- SELECT ... LOCK IN SHARE MODE 语句为当前读，加 S 锁； *-- MySQL8.0之后也优化了写法，如下  ***SELECT** ... **FOR** SHARE;
+- SELECT ... LOCK IN SHARE MODE 语句为当前读，加 S 锁； *-- MySQL8.0之后也优化了写法，如下  ***SELECT** ... **FOR** SHARE;
 
-- SELECT ... FOR UPDATE 语句为当前读，加 X 锁；
+- SELECT ... FOR UPDATE 语句为当前读，加 X 锁；
 
-- 常见的 DML 语句（如 INSERT、DELETE、UPDATE）为当前读，加 X 锁；
+- 常见的 DML 语句（如 INSERT、DELETE、UPDATE）为当前读，加 X 锁；
 
-- 常见的 DDL 语句（如 ALTER、CREATE 等）加表级锁，这里涉及MDL锁且这些语句为隐式提交，不能回滚。
+- 常见的 DDL 语句（如 ALTER、CREATE 等）加表级锁，这里涉及MDL锁且这些语句为隐式提交，不能回滚。
 
-## **mysql的online-ddl**
+## mysql的online-ddl
 
 虽然FIC可以让InnoDB存储引擎避免创建临时表，从而提高索引创建的效率。但正如前面面试题中所说的，索引
 
 创建时会阻塞表上的DML操作（除读操作）。OSC（一个FaceBook的PHP脚本）虽然解决了上述的部分问题，但
 
-是还是有很大的局限性。MySQL 5.6版本开始支持Online DDL（在线数据定义）操作，其允许辅助索引创建的
+是还是有很大的局限性。MySQL 5.6版本开始支持Online DDL（在线数据定义）操作，其允许辅助索引创建的
 
 同时，还允许其他诸如INSERT、UPDATE、DELETE这类DML操作，这极大地提高了MySQL数据库在生产环境中
 
@@ -474,7 +470,7 @@ MySQL 还提供了另一种读取方式叫当前读（Current Read），它读
 
 使用语法：
 
-ALTER TABLE tbl_name
+ALTER TABLE tbl_name
 
 |ADD{INDEX|KEY}[index_name]
 
@@ -484,7 +480,7 @@ ALGORITHM[=]{DEFAULT|INPLACE|COPY}
 
 LOCK[=]{DEFAULT|NONE|SHARED|EXCLUSIVE}
 
-ALGORITHM指定了创建或删除索引的算法，COPY表示按照MySQL 5.1版本之前的工作模式，即创建临时表的方式。
+ALGORITHM指定了创建或删除索引的算法，COPY表示按照MySQL 5.1版本之前的工作模式，即创建临时表的方式。
 
 INPLACE表示索引创建或删除操作不需要创建临时表。DEFAULT表示根据参数old_alter_table来判断是通过INPLACE
 
@@ -524,23 +520,23 @@ DEFAULT模式首先会判断当前操作是否可以使用NONE模式，若不能
 
 是否可以使用EXCLUSIVE模式。也就是说DEFAULT会通过判断事务的最大并发性来判断执行DDL的模式。
 
-InnoDB存储引擎实现Online DDL的原理是在执行创建或者删除操作的同时，将INSERT、UPDATE、DELETE这类
+InnoDB存储引擎实现Online DDL的原理是在执行创建或者删除操作的同时，将INSERT、UPDATE、DELETE这类
 
 DML操作日志写入到一个缓存中。待完成索引创建后再将重做应用到表上，以此达到数据的一致性。这个缓存的大
 
 小由参数innodb_online_alter_log_max_size控制，默认的大小为128MB。
 
-需要特别注意的是，由于Online DDL在创建索引完成后再通过重做日志达到数据库的最终一致性，这意味着在索引
+需要特别注意的是，由于Online DDL在创建索引完成后再通过重做日志达到数据库的最终一致性，这意味着在索引
 
 创建过程中，SQL优化器不会选择正在创建中的索引
 
-## **mysql的FIC**
+## mysql的FIC
 
-MySQL 5.5版本之前（不包括5.5）存在的一个普遍被人诟病的问题是：MySQL数据库对于索引的添加或者删除的这类
+MySQL 5.5版本之前（不包括5.5）存在的一个普遍被人诟病的问题是：MySQL数据库对于索引的添加或者删除的这类
 
 DDL操作，MySQL数据库的操作过程为：
 
-❑首先创建一张新的临时表，表结构为通过命令ALTER TABLE新定义的结构。
+❑首先创建一张新的临时表，表结构为通过命令ALTER TABLE新定义的结构。
 
 ❑然后把原表中数据导入到临时表。
 
@@ -552,7 +548,7 @@ DDL操作，MySQL数据库的操作过程为：
 
 需要访问正在被修改的表，这意味着数据库服务不可用。MySQL数据库的索引维护始终让使用者感觉非常痛苦。
 
-InnoDB存储引擎从InnoDB 1.0.x版本开始支持一种称为Fast Index Creation（快速索引创建）的索引创建方式——简称
+InnoDB存储引擎从InnoDB 1.0.x版本开始支持一种称为Fast Index Creation（快速索引创建）的索引创建方式——简称
 
 FIC。
 
@@ -570,11 +566,10 @@ FIC。
 
 需要重建一张表
 
-## **mysql的自增锁（****AUTO-INC Locks****）**
+## mysql的自增锁（AUTO-INC Locks）
+### 锁模式
 
-**锁模式**
-
-其实在 InnoDB 中，把锁的行为叫做**锁模式**可能更加准确，那具体有哪些锁模式呢，如下：
+其实在 InnoDB 中，把锁的行为叫做**锁模式**可能更加准确，那具体有哪些锁模式呢，如下：
 
 - 传统模式（Traditional）
 
@@ -582,63 +577,65 @@ FIC。
 
 - 交叉模式（Interleaved）
 
-分别对应配置项 innodb_autoinc_lock_mode 的值0、1、2.
+分别对应配置项 innodb_autoinc_lock_mode 的值0、1、2.
 
-看到这就已经知道为啥上面说不准确了，因为三种模式下，InnoDB 对并发的处理是不一样的，而且具体选择哪种锁模式跟你当前使用的 MySQL 版本还有关系。
+看到这就已经知道为啥上面说不准确了，因为三种模式下，InnoDB 对并发的处理是不一样的，而且具体选择哪种锁模式跟你当前使用的 MySQL 版本还有关系。
 
-在 MySQL 8.0 之前，InnoDB 锁模式默认为**连续模式**，值为1，而在 MySQL 8.0 之后，默认模式变成了**交叉模式**。至于为啥会改变默认模式，后面会讲。
+在 MySQL 8.0 之前，InnoDB 锁模式默认为**连续模式**，值为1，而在 MySQL 8.0 之后，默认模式变成了**交叉模式**。至于为啥会改变默认模式，后面会讲。
 
-**传统模式**
+### 传统模式
 
-传统模式（Traditional），说白了就是还没有**锁模式**这个概念时，InnoDB 的自增锁运行的模式。只是后面版本更新，InnoDB 引入了**锁模式**的概念，然后 InnoDB 给了这种以前默认的模式一个名字，叫——传统模式。
+传统模式（Traditional），说白了就是还没有**锁模式**这个概念时，InnoDB 的自增锁运行的模式。只是后面版本更新，InnoDB 引入了**锁模式**的概念，然后 InnoDB 给了这种以前默认的模式一个名字，叫——传统模式。
 
 传统模式具体是咋工作的？
 
-    
+    
 
 ![](images/WEBRESOURCE86aaa307f73bc76bb6b6341548c0d4d0截图.png)
+> 图：传统模式 相关截图
 
-我们知道，当我们向包含了 AUTO_INCREMENT 列的表中插入数据时，都会持有这么一个特殊的表锁——自增锁（AUTO-INC），并且当语句执行完之后就会释放。这样一来可以保证单个语句内生成的自增值是连续的。
+我们知道，当我们向包含了 AUTO_INCREMENT 列的表中插入数据时，都会持有这么一个特殊的表锁——自增锁（AUTO-INC），并且当语句执行完之后就会释放。这样一来可以保证单个语句内生成的自增值是连续的。
 
-这样一来，传统模式的弊端就自然暴露出来了，如果有多个事务并发的执行 INSERT 操作，AUTO-INC的存在会使得 MySQL 的性能略有下降，因为同时只能执行一条 INSERT 语句。
+这样一来，传统模式的弊端就自然暴露出来了，如果有多个事务并发的执行 INSERT 操作，AUTO-INC的存在会使得 MySQL 的性能略有下降，因为同时只能执行一条 INSERT 语句。
 
-**连续模式**
+### 连续模式
 
-连续模式（Consecutive）是 MySQL 8.0 之前默认的模式，之所以提出这种模式，是因为传统模式存在影响性能的弊端，所以才有了连续模式。
+连续模式（Consecutive）是 MySQL 8.0 之前默认的模式，之所以提出这种模式，是因为传统模式存在影响性能的弊端，所以才有了连续模式。
 
-在锁模式处于连续模式下时，如果 INSERT 语句能够提前确定插入的数据量，则可以不用获取自增锁，举个例子，像 INSERT INTO 这种简单的、能提前确认数量的新增语句，就不会使用自增锁，这个很好理解，在自增值上，我可以直接把这个 INSERT 语句所需要的空间流出来，就可以继续执行下一个语句了。
+在锁模式处于连续模式下时，如果 INSERT 语句能够提前确定插入的数据量，则可以不用获取自增锁，举个例子，像 INSERT INTO 这种简单的、能提前确认数量的新增语句，就不会使用自增锁，这个很好理解，在自增值上，我可以直接把这个 INSERT 语句所需要的空间流出来，就可以继续执行下一个语句了。
 
-当然，这里其实并非什么锁也不用。在实际分配 ID 的过程中，InnoDB 会使用较为轻量级的 mutex 锁，来防止 ID 重复分配，ID 一旦分配好了，mutex 锁就会被释放。
+当然，这里其实并非什么锁也不用。在实际分配 ID 的过程中，InnoDB 会使用较为轻量级的 mutex 锁，来防止 ID 重复分配，ID 一旦分配好了，mutex 锁就会被释放。
 
-但是如果 INSERT 语句不能提前确认数据量，则还是会去获取自增锁。例如像 INSERT INTO ... SELECT ... 这种语句，INSERT 的值来源于另一个 SELECT 语句。
+但是如果 INSERT 语句不能提前确认数据量，则还是会去获取自增锁。例如像 INSERT INTO ... SELECT ... 这种语句，INSERT 的值来源于另一个 SELECT 语句。
 
 连续模式的图和交叉模式差不多
 
-**交叉模式**
+### 交叉模式
 
-交叉模式（Interleaved）下，所有的 INSERT 语句，包含 INSERT 和 INSERT INTO ... SELECT ，都不会使用 AUTO-INC 自增锁，而是使用较为轻量的 mutex 锁。这样一来，多条 INSERT 语句可以并发的执行，这也是三种锁模式中扩展性最好的一种。
+交叉模式（Interleaved）下，所有的 INSERT 语句，包含 INSERT 和 INSERT INTO ... SELECT ，都不会使用 AUTO-INC 自增锁，而是使用较为轻量的 mutex 锁。这样一来，多条 INSERT 语句可以并发的执行，这也是三种锁模式中扩展性最好的一种。
 
-    
+    
 
 ![](images/WEBRESOURCE67771e376be6451ac6d530bc59833279截图.png)
+> 图：交叉模式 相关截图
 
-并发执行所带来的副作用就是单个 INSERT 的自增值并不连续，因为 AUTO_INCREMENT 的值分配会在多个 INSERT 语句中来回交叉的执行。
+并发执行所带来的副作用就是单个 INSERT 的自增值并不连续，因为 AUTO_INCREMENT 的值分配会在多个 INSERT 语句中来回交叉的执行。
 
 优点很明确，缺点是在并发的情况下无法保证数据一致性，这个下面会讨论。
 
-**交叉模式缺陷**
+### 交叉模式缺陷
 
-要了解缺陷是什么，还得先了解一下 MySQL 的 Binlog。Binlog 一般用于 MySQL 的**数据复制**，通俗一点就是用于主从同步。在 MySQL 中 Binlog 的格式有 3 种，分别是：
+要了解缺陷是什么，还得先了解一下 MySQL 的 Binlog。Binlog 一般用于 MySQL 的**数据复制**，通俗一点就是用于主从同步。在 MySQL 中 Binlog 的格式有 3 种，分别是：
 
 - Statement
 
--  
+-  
 
 - 基于语句，只记录对数据做了修改的SQL语句，能够有效的减少binlog的数据量，提高读取、基于binlog重放的性能
 
 - Row
 
--  
+-  
 
 - 只记录被修改的行，所以Row记录的binlog日志量一般来说会比Statement格式要多。基于Row的binlog日志非常完整、清晰，记录了所有数据的变动，但是缺点是可能会非常多，例如一条
 
@@ -646,17 +643,17 @@ FIC。
 
 - 语句，有可能是所有的数据都有修改；再例如
 
-- alter table
+- alter table
 
 - 之类的，修改了某个字段，同样的每条记录都有改动。
 
 - Mixed
 
--  
+-  
 
 - Statement和Row的结合，怎么个结合法呢。例如像
 
-- alter table
+- alter table
 
 - 之类的对表结构的修改，采用Statement格式。其余的对数据的修改例如
 
@@ -668,31 +665,31 @@ FIC。
 
 - 采用Row格式进行记录。
 
-如果 MySQL 采用的格式为 Statement ，那么 MySQL 的主从同步实际上同步的就是一条一条的 SQL 语句。如果此时我们采用了交叉模式，那么并发情况下 INSERT 语句的执行顺序就无法得到保障。
+如果 MySQL 采用的格式为 Statement ，那么 MySQL 的主从同步实际上同步的就是一条一条的 SQL 语句。如果此时我们采用了交叉模式，那么并发情况下 INSERT 语句的执行顺序就无法得到保障。
 
-可能你还没看出问题在哪儿，INSERT 同时交叉执行，并且 AUTO_INCREMENT 交叉分配将会直接导致主从之间同行的数据**主键 ID 不同**。而这对主从同步来说是灾难性的。
+可能你还没看出问题在哪儿，INSERT 同时交叉执行，并且 AUTO_INCREMENT 交叉分配将会直接导致主从之间同行的数据**主键 ID 不同**。而这对主从同步来说是灾难性的。
 
-## **mysql的CBO**
+## mysql的CBO
 
-MySQL 执行过程
+MySQL 执行过程
 
-如上图所示，MySQL 数据库由 Server 层和 Engine 层组成：
+如上图所示，MySQL 数据库由 Server 层和 Engine 层组成：
 
-- Server 层有 SQL 分析器、SQL优化器、SQL 执行器，用于负责 SQL 语句的具体执行过程；
+- Server 层有 SQL 分析器、SQL优化器、SQL 执行器，用于负责 SQL 语句的具体执行过程；
 
-- Engine 层负责存储具体的数据，如最常使用的 InnoDB 存储引擎，还有用于在内存中存储临时结果集的 TempTable 引擎。
+- Engine 层负责存储具体的数据，如最常使用的 InnoDB 存储引擎，还有用于在内存中存储临时结果集的 TempTable 引擎。
 
-SQL 优化器会分析所有可能的执行计划，选择成本最低的执行，这种优化器称之为：CBO（Cost-based Optimizer，基于成本的优化器）。
+SQL 优化器会分析所有可能的执行计划，选择成本最低的执行，这种优化器称之为：CBO（Cost-based Optimizer，基于成本的优化器）。
 
-而在 MySQL中，**一条 SQL 的计算成本计算如下所示：**
+而在 MySQL中，**一条 SQL 的计算成本计算如下所示：**
 
-Cost  = Server Cost + Engine Cost
+Cost  = Server Cost + Engine Cost
 
-      = CPU Cost + IO Cost
+      = CPU Cost + IO Cost
 
-数据库 mysql 下的表 server_cost、engine_cost 则记录了对于各种成本的计算，如：
+数据库 mysql 下的表 server_cost、engine_cost 则记录了对于各种成本的计算，如：
 
-表 server_cost 记录了 Server 层优化器各种操作的成本，这里面包括了所有 CPU Cost，其具体含义如下。
+表 server_cost 记录了 Server 层优化器各种操作的成本，这里面包括了所有 CPU Cost，其具体含义如下。
 
 - disk_temptable_create_cost：创建磁盘临时表的成本，默认为20。
 
@@ -706,27 +703,27 @@ Cost  = Server Cost + Engine Cost
 
 - row_evaluate_cost：记录间的比较成本，默认为0.1。
 
-**可以看到，** MySQL 优化器认为如果一条 SQL 需要创建基于磁盘的临时表，则这时的成本是最大的，其成本是基于内存临时表的 20 倍。而索引键值的比较、记录之间的比较，其实开销是非常低的，但如果要比较的记录数非常多，则成本会变得非常大。
+**可以看到，** MySQL 优化器认为如果一条 SQL 需要创建基于磁盘的临时表，则这时的成本是最大的，其成本是基于内存临时表的 20 倍。而索引键值的比较、记录之间的比较，其实开销是非常低的，但如果要比较的记录数非常多，则成本会变得非常大。
 
-而表 engine_cost 记录了存储引擎层各种操作的成本，这里包含了所有的 IO Cost，具体含义如下。
+而表 engine_cost 记录了存储引擎层各种操作的成本，这里包含了所有的 IO Cost，具体含义如下。
 
 - io_block_read_cost：从磁盘读取一个页的成本，默认值为1。
 
 - memory_block_read_cost：从内存读取一个页的成本，默认值为0.25。
 
-**也就是说，** MySQL 优化器认为从磁盘读取的开销是内存开销的 4 倍。
+**也就是说，** MySQL 优化器认为从磁盘读取的开销是内存开销的 4 倍。
 
-## **mysql的join的实现**
+## mysql的join的实现
 
 在Mysql中，使用Nested-Loop Join的算法思想去优化join，Nested-Loop Join翻译成中文则是“[嵌套](https://so.csdn.net/so/search?q=%E5%B5%8C%E5%A5%97&spm=1001.2101.3001.7020)循环连接”。
 
-**Simple Nested-Loop**
+### Simple Nested-Loop
 
 简单嵌套循环连接实际上就是简单粗暴的嵌套循环，如果table1有1万条数据，table2有1万条数据，那么数据比较的次数=1万 * 1万 =1亿次，这种查询效率会非常慢。
 
 所以Mysql继续优化，然后衍生出Index Nested-LoopJoin、Block Nested-Loop Join两种NLJ算法。在执行join查询时mysql会根据情况选择两种之一进行join查询。
 
-**Index Nested-LoopJoin（减少内层表数据的匹配次数）**
+### Index Nested-Loop Join（减少内层表数据的匹配次数）
 
 索引嵌套循环连接是基于索引进行连接的算法，索引是基于内层表的，通过外层表匹配条件直接与内层表索引进行匹配，避免和内层表的每条记录进行比较， 从而利用索引的查询减少了对内层表的匹配次数，优势极大的提升了 join的性能：
 
@@ -736,8 +733,8 @@ Cost  = Server Cost + Engine Cost
 
 1. 使用场景：只有内层表join的列有索引时，才能用到Index Nested-LoopJoin进行连接。
 
-1. 由于用到索引，如果索引是辅助索引而且返回的数据还包括内层表的其他数据，则会回内层表查询数据，多了一些IO操作。
-**Block Nested-Loop Join（减少内层表数据的循环次数）**
+2. 由于用到索引，如果索引是辅助索引而且返回的数据还包括内层表的其他数据，则会回内层表查询数据，多了一些IO操作。
+### Block Nested-Loop Join（减少内层表数据的循环次数）
 
 缓存块嵌套循环连接通过一次性缓存多条数据，把参与查询的列缓存到Join Buffer 里，然后拿join buffer里的数据批量与内层表的数据进行匹配，从而减少了内层循环的次数（遍历一次内层表就可以批量匹配一次Join Buffer里面的外层表数据）。
 
@@ -753,7 +750,7 @@ Cost  = Server Cost + Engine Cost
 
 （4）使用Block Nested-Loop Join算法需要开启优化器管理配置的optimizer_switch的设置block_nested_loop为on，默认为开启。
 
- **Batched Key Access Join（BKA）**算法的工作步骤如下：
+### Batched Key Access Join（BKA）算法的工作步骤如下：
 
 1) 将外部表中相关的列放入Join Buffer中。
 
@@ -763,7 +760,7 @@ Cost  = Server Cost + Engine Cost
 
 4) 返回结果集给客户端
 
-**如何优化Join速度**
+### 如何优化Join速度
 
 用小结果集驱动大结果集，减少外层循环的数据量：
 
@@ -779,33 +776,34 @@ Cost  = Server Cost + Engine Cost
 
 （2）当用到INLJ时，如果可以不回表查询，即利用到覆盖索引，则可能可以提示速度。（未经验证，只是一个推论）
 
-## **mysql中 in 和 exist**
+## mysql中 in 和 exist
 
-**exists的执行原理：**
+#### exists的执行原理
 
 对外表做loop循环，每次loop循环再对内表（子查询）进行查询，那么因为对内表的查询使用的索引（内表效率高，故可用大表），而外表有多大都需要遍历，不可避免（尽量用小表），故内表大的使用exists，可加快效率；
 
-**in的执行原理：**
+#### in的执行原理
 
 是把外表和内表做连接，先查询内表，再把内表结果与外表匹配，对外表使用索引（外表效率高，可用大表），而内表多大都需要查询，不可避免，故外表大的使用in，可加快效率。
 
-## **mysql的主从复制**
+## mysql的主从复制
 
-首先看一张图片： 需要三个线程来完成的，在从端有两个线程，sql线程与 I/O线程。 主端有 一个 I/O线程。在实现主从复制的时候 ，首先会开启 Master端的 **binLog**记录功能 因为整个的复制流程就是 Slave从Master端获取到 binlog日志，然后再Slave上以相同的顺序执行获取到的binlog日志中的记录中的各种的SQL操作。 
+首先看一张图片： 需要三个线程来完成的，在从端有两个线程，sql线程与 I/O线程。 主端有 一个 I/O线程。在实现主从复制的时候 ，首先会开启 Master端的 **binLog**记录功能 因为整个的复制流程就是 Slave从Master端获取到 binlog日志，然后再Slave上以相同的顺序执行获取到的binlog日志中的记录中的各种的SQL操作。 
 
 ![](images/WEBRESOURCE9c309dee75eda24b84772d83a7faa0destickPicture.png)
+> 图：mysql的主从复制 相关截图
 
 1. 在从端打开主从复制的开关，开始进行复制操作。
 
-1. 此时 对于 从的 I/O线程会通过 master上已经授权的赋值用户权限请求建立连接master服务。并请求从执行binlog日志的指定位置之后开始发送binlog日志的内从（注意这里的日志文件名和位置就是在配置主从服务质量执行 change master命令指定的）
+2. 此时 对于 从的 I/O线程会通过 master上已经授权的授权用户权限请求建立连接master服务。并请求从执行binlog日志的指定位置之后开始发送binlog日志的内存（注意这里的日志文件名和位置就是在配置主从服务质量执行 change master命令指定的）
 
-1. Mater 服务器接收到来自 Salve服务器的IO请求以后，其上负责复制的IO线程会根据Slave服务器的IO线程请求的信息分批读取指定binlog日志文件指定位置之后的binlog日志信息，然后 返回给Slave端的IO线程，返回的除了基础的binlog日志内容以外，还有Master服务端记录的IO线程。返回的信息还有binlog中下一个指定更新的位置。
+3. Master 服务器接收到来自 Slave服务器的IO请求以后，其上负责复制的IO线程会根据Slave服务器的IO线程请求的信息分批读取指定binlog日志文件指定位置之后的binlog日志信息，然后 返回给Slave端的IO线程，返回的除了基础的binlog日志内容以外，还有Master服务端记录的IO线程。返回的信息还有binlog中下一个指定更新的位置。
 
-1. 当slave 服务器的IO线程读取到 Master服务器上 IO线程发送过来的日志内容，日志文件，及位置以后，会将binlog日志内容依次写到Slave端自身的Relay Log （即中继日志）文件（Mysq-relay-bin.xxx的最末端。并将新的binlog文件名和位置记录到 master-info文件中，以便能够在下一次读取master端新binlog日志时能告诉Master服务器从新binlog日志的指定文件及位置开始读取新的binlog日志内容。
+4. 当slave 服务器的IO线程读取到 Master服务器上 IO线程发送过来的日志内容，日志文件，及位置以后，会将binlog日志内容依次写到Slave端自身的Relay Log （即中继日志）文件（mysql-relay-bin.xxx的最末端。并将新的binlog文件名和位置记录到 master-info文件中，以便能够在下一次读取master端新binlog日志时能告诉Master服务器从新binlog日志的指定文件及位置开始读取新的binlog日志内容。
 
-1. Slave服务器端的SQL线程会实时检测本地Relay Log 中IO线程新增的日志内容，然后及时把Relay LOG 文件中的内容解析成sql语句，并在自身Slave服务器上按解析SQL语句的位置顺序执行应用这样sql语句，并在relay-log.info中记录当前应用中继日志的文件名和位置点
+5. Slave服务器端的SQL线程会实时检测本地Relay Log 中IO线程新增的日志内容，然后及时把Relay LOG 文件中的内容解析成sql语句，并在自身Slave服务器上按解析SQL语句的位置顺序执行应用这样sql语句，并在relay-log.info中记录当前应用中继日志的文件名和位置点
 
-## **mysql的order  by实现 **
+## mysql的order by实现
 
 1. 内存排序
 
@@ -850,8 +848,7 @@ SELECT * FROM `information_schema`.`OPTIMIZER_TRACE`
 
 [https://juejin.cn/post/7215736946253430844/](https://juejin.cn/post/7215736946253430844/)
 
-##
-mysql的group by及内存分配
+## mysql的group by及内存分配
 
 [https://juejin.cn/post/6957696820621344775](https://juejin.cn/post/6957696820621344775)
 
@@ -860,6 +857,7 @@ mysql的group by及内存分配
 排序规则（Collation）是比较和排序字符串的一种规则，每个字符集都会有默认的排序规则，你可以用命令 SHOW CHARSET 来查看：
 
 ![](images/WEBRESOURCE123784a36669eeaf22e9a7ed4fbdf3de截图.png)
+> 图：mysql中字符串的排序规则 相关截图
 
 排序规则以 _ci 结尾，表示不区分大小写（Case Insentive），_cs 表示大小写敏感，_bin 表示通过存储字符的二进制进行比较
 
@@ -908,11 +906,12 @@ WHERE object_schema != 'performance_schema';
 
 只存储部分数据，其他以链表形式存储
 
-## **mysql索引跳跃扫描**
+## mysql索引跳跃扫描
 
 MySQL8.0版本开始增加了**索引跳跃扫描**的功能，当第一列索引的唯一值较少时，即使where条件没有第一列索引，查询的时候也可以用到联合索引。
 
 ![](images/WEBRESOURCE1f01dedc0153b0051a5915b215878fbc截图.png)
+> 图：mysql索引跳跃扫描 相关截图
 
 具体优化方式，就是匹配的时候遇到第一列索引就跳过，直接匹配第二列索引的值，这样就可以用到联合索引了。
 
@@ -924,9 +923,10 @@ MySQL8.0版本开始增加了**索引跳跃扫描**的功能，当第一列索�
 
 行格式分别是compact（紧凑的）、redundant(冗余)、dynamic（动态的）和compressed（压缩的）行格式
 
-**compact格式：**
+### compact格式
 
 ![](images/WEBRESOURCE97941ea2fe061135b1ebfef86dee3f96stickPicture.png)
+> 图：compact格式 相关截图
 
 逆序存放可变长列和null值列，利用cup cache line
 
@@ -950,7 +950,7 @@ redundant 格式
 
 与compact 格式相比, 没有了 变长字段列表以及 NULL值列表, 取而代之的是 记录了所有真实数据的偏移地址表 ，偏移地址表 是倒序排放的, 但是计算偏移量却还是正序开始的从row_id作为第一个, 第一个从0开始累加字段对应的字节数。在记录头信息中, 大部分字段和compact 中的相同，但是对比compact多了
 
-**dynamic 格式**
+### dynamic格式
 
 在现在 mysql 5.7 的版本中,使用的格式就是 dynamic。
 
@@ -958,7 +958,7 @@ dynamic 和 compact 基本是相同的，只有在溢出页的处理上面,有�
 
 在compact行格式中，对于占用存储空间非常大的列，在记录的真实数据处只会存储该列的前768个字节的数据，把剩余的数据分散存储在几个其他的页中，然后记录的真实数据处用20个字节存储指向这些页的地址，从而可以找到剩余数据所在的页。
 
-**compressed 格式**
+### compressed格式
 
 compressed 格式将会在Dynamic 的基础上面进行压缩处理特别是对溢出页的压缩处理，存储在其中的行数据会以zlib的算法进行压缩，因此对于blob、text这类大长度类型的数据能够进行非常有效的存储。但compressed格式其实也是以时间换空间，性能并不友好，并不推荐在常见的业务中使用。
 
@@ -971,6 +971,7 @@ MySQL优化器会自动对联合索引中的第一个字段的值去重，然后
 ## mysql锁的内存结构
 
 ![](images/WEBRESOURCEec4b2cba0b8e6a869af3fc6d36917b7cstickPicture.png)
+> 图：mysql锁的内存结构 相关截图
 
 锁的事务信息：其中记录着当前的锁结构是由哪个事务生成的，记录的是指针，指向一个具体的事务。
 
@@ -989,6 +990,7 @@ MySQL优化器会自动对联合索引中的第一个字段的值去重，然后
 锁类型信息：对于锁结构的类型，在内部实现了复用，采用一个32bit的type_mode来表示，这个32bit的值可以拆为lock_mode、lock_type、rec_lock_type三部分，如下：
 
 ![](images/WEBRESOURCEaa4767a276ace53f394b59d5be08d1a5stickPicture.png)
+> 图：mysql锁的内存结构 相关截图
 
 - lock_mode：表示锁的模式，使用低四位。
 
@@ -1048,7 +1050,7 @@ LBCC是Lock-Based Concurrent Control的简称，意思是基于锁的并发控�
 
 	- ①表锁：
 
-		- 全局锁：加上全局锁之后，整个数据库只能允许读，不允许做任何写操作。 **FLUSH TABLES WITH READ LOCK (FTWRL)** FLUSH TABLES WITH READ LOCK 是一个全局读锁，执行后会阻塞所有对表的写操作（如INSERT、UPDATE、DELETE等），同时允许其他会话进行只读查询。该命令通常用于全库逻辑备份，确保在备份过程中数据的一致性，防止备份过程中有其他写操作修改数据。一旦执行了 FTWRL，除非显式执行 UNLOCK TABLES 命令或关闭连接，否则全局读锁会一直保持。这意味着在此期间，任何需要对表进行写操作的事务都无法执行，可能会导致其他会话长时间阻塞。
+		- 全局锁：加上全局锁之后，整个数据库只能允许读，不允许做任何写操作。 **FLUSH TABLES WITH READ LOCK (FTWRL)** FLUSH TABLES WITH READ LOCK 是一个全局读锁，执行后会阻塞所有对表的写操作（如INSERT、UPDATE、DELETE等），同时允许其他会话进行只读查询。该命令通常用于全库逻辑备份，确保在备份过程中数据的一致性，防止备份过程中有其他写操作修改数据。一旦执行了 FTWRL，除非显式执行 UNLOCK TABLES 命令或关闭连接，否则全局读锁会一直保持。这意味着在此期间，任何需要对表进行写操作的事务都无法执行，可能会导致其他会话长时间阻塞。
 
 		- 元数据锁 / MDL锁：基于表的元数据加锁，加锁后整张表不允许其他事务操作。
 
@@ -1104,7 +1106,7 @@ MGR (MySQL Group Replication) 是 MySQL 官方提供的多主复制解决方案�
 
 ## 几个数据库的设计架构
 
-**Shared Everthting:**一般是针对单个主机，完全透明共享CPU/MEMORY/IO，并行处理能力是最差的，典型的代表SQLServer
+**Shared Everything:**一般是针对单个主机，完全透明共享CPU/MEMORY/IO，并行处理能力是最差的，典型的代表SQLServer
 
 >
 
@@ -1121,8 +1123,10 @@ MGR (MySQL Group Replication) 是 MySQL 官方提供的多主复制解决方案�
 页：
 
 ![](images/WEBRESOURCE5382066f98b9c43135801d737a832ae8截图.png)
+> 图：mysql的存储结构 相关截图
 
 ![](images/WEBRESOURCEcbbbaa9c067c73c18a2d191be009ad48截图.png)
+> 图：mysql的存储结构 相关截图
 
 [https://mp.weixin.qq.com/s/r-RPEoqvgERfYOjYeFPoIg](https://mp.weixin.qq.com/s/r-RPEoqvgERfYOjYeFPoIg)
 
@@ -1131,6 +1135,7 @@ MGR (MySQL Group Replication) 是 MySQL 官方提供的多主复制解决方案�
 这是mysql内部实现的一套内存分配机制。
 
 ![](images/WEBRESOURCE1aa5f94afc9aded0aa17a7ee38818e99截图.png)
+> 图：MEM_ROOT 相关截图
 
 free：一个单向链表，链表中每一个单元叫block，block中存放的是空闲的内存区，每个block包含3个元素：
 
@@ -1140,15 +1145,15 @@ free：一个单向链表，链表中每一个单元叫block，block中存放的
 
 - next：指向下一个block的指针
 
-如上图，free所在的行就是一个free链表，链表中每个箭头相连的部分就是block，block中有left和 size，每个block之间的箭头就是next指针
+如上图，free所在的行就是一个free链表，链表中每个箭头相连的部分就是block，block中有left和 size，每个block之间的箭头就是next指针
 
 used：一个单向链表，链表中每一个单元叫block，block中存放已使用的内存区，同样，每个block包含上面3 个元素
 
-min_malloc：控制一个 block 剩余空间还有多少的时候从free链表移除，加入到used链表中
+min_malloc：控制一个 block 剩余空间还有多少的时候从free链表移除，加入到used链表中
 
 block_size：block对应内存的大小
 
-block_num：MEM_ROOT 管理的block数量
+block_num：MEM_ROOT 管理的block数量
 
 first_block_usage：free链表中第一个block不满足申请空间大小的次数
 
@@ -1159,10 +1164,11 @@ pre_alloc：当释放整个MEM_ROOT的时候可以通过参数控制，选择保
 ## mysql使用profiles功能优化和查询信息
 
 ![](images/WEBRESOURCE7b5aad388468a2e96af2c4fb0ea3bf42截图.png)
+> 图：mysql使用profiles功能优化和查询信息 相关截图
 
 ## Innodb四大特性
 
-**1.插入缓冲（insert buffer)**
+### 1. 插入缓冲（insert buffer）
 
 插入缓冲（Insert Buffer/Change Buffer）：提升插入性能，change buffering是insert buffer的加强，insert buffer只针对insert有效，change buffering对insert、delete、update(delete+insert)、purge都有效
 
@@ -1176,7 +1182,7 @@ pre_alloc：当释放整个MEM_ROOT的时候可以通过参数控制，选择保
 
 反过来，假设一个业务的更新模式是写入之后马上会做查询，那么即使满足了条件，将更新先记录在 change buffer，但之后由于马上要访问这个数据页，会立即触发 merge 过程。这样随机访问 IO 的次数不会减少，反而增加了 change buffer 的维护代价。所以，对于这种业务模式来说，change buffer 反而起到了副作用。
 
-**2.二次写(double write)**
+### 2. 二次写（double write）
 
 Doublewrite缓存是位于系统表空间的存储区域，用来缓存InnoDB的数据页从innodb buffer pool中flush之后并写入到数据文件之前，所以当操作系统或者数据库进程在数据页写磁盘的过程中崩溃，Innodb可以在doublewrite缓存中找到数据页的备份而用来执行crash恢复。数据页写入到doublewrite缓存的动作所需要的IO消耗要小于写入到数据文件的消耗，因为此写入操作会以一次大的连续块的方式写入
 
@@ -1190,7 +1196,7 @@ doublewrite组成：
 
 对缓冲池的脏页进行刷新时，不是直接写磁盘，而是会通过memcpy()函数将脏页先复制到内存中的doublewrite buffer，之后通过doublewrite 再分两次，每次1M顺序地写入共享表空间的物理磁盘上，在这个过程中，因为doublewrite页是连续的，因此这个过程是顺序写的，开销并不是很大。在完成doublewrite页的写入后，再将doublewrite buffer 中的页写入各个 表空间文件中，此时的写入则是离散的。如果操作系统在将页写入磁盘的过程中发生了崩溃，在恢复过程中，innodb可以从共享表空间中的doublewrite中找到该页的一个副本，将其复制到表空间文件，再应用重做日志。
 
-**3.自适应哈希索引(ahi)**
+### 3. 自适应哈希索引（AHI）
 
 Adaptive Hash index属性使得InnoDB更像是内存数据库。该属性通过innodb_adapitve_hash_index开启，也可以通过—skip-innodb_adaptive_hash_index参数关闭。
 
@@ -1226,7 +1232,7 @@ where a = xxx and b = xxx
 
 　　3、极端情况下，自适应hash索引才有比较大的意义，可以降低逻辑读。
 
-**4.预读(read ahead)**
+### 4. 预读（read ahead）
 
 InnoDB使用两种预读算法来提高I/O性能：线性预读（linear read-ahead）和随机预读（randomread-ahead）
 
@@ -1299,6 +1305,7 @@ sort buff 里面放的是排序字段和这个字段对应的 ID。排序字段�
 比如我们的表结构中 rating 字段的类型是 varchar(255):
 
 ![](images/WEBRESOURCE02685c60aed77913943f81cefd2ef3edstickPicture.png)
+> 图：sort_mode三种模式 相关截图
 
 如果我只是在里面存储一个 why，那么它的实际长度应该是 “why” 这 3 个字符的内存空间，加 2 个字节的字段长度，而不是真正的 255 这么长。
 
@@ -1326,7 +1333,7 @@ sort buffer 就这么点大，肯定不能太浪费了
 
 - 悲观写入：会改变B+Tree的结构，也就是会造成节点分裂，比如无序插入、修改索引键的字段值。
 
-**MySQL5.7中读操作的执行流程**
+### MySQL5.7中读操作的执行流程
 
 - ①读取数据之前首先会对B+Tree加一个共享锁。
 
@@ -1336,7 +1343,7 @@ sort buffer 就这么点大，肯定不能太浪费了
 
 - ④读取最终的目标叶子节点中的数据，读取完成后释放对应叶子节点上的共享锁。
 
-**MySQL5.7中乐观写入的执行流程**
+### MySQL5.7中乐观写入的执行流程
 
 - ①乐观写入之前首先会对B+Tree加一个共享锁。
 
@@ -1346,7 +1353,7 @@ sort buffer 就这么点大，肯定不能太浪费了
 
 - ④修改目标叶子节点中的数据后，释放对应叶子节点上的排他锁。
 
-**MySQL5.7中悲观写入的执行流程**
+### MySQL5.7中悲观写入的执行流程
 
 - ①悲观更新之前首先会对B+Tree加一个共享排他锁。
 
@@ -1358,7 +1365,7 @@ sort buffer 就这么点大，肯定不能太浪费了
 
    如果需要修改多个数据时，会在遍历查找的过程中，记录下所有要修改的目标节点。
 
-**MySQL5.7中并发事务冲突分析**
+### MySQL5.7中并发事务冲突分析
 
 观察上述讲到的三种执行情况，对于读操作、乐观写入操作而言，并不会加SX锁，共享排他锁仅针对于悲观写入操作会加，由于读操作、乐观写入执行前对整颗树加的是S锁，因此悲观写入时加的SX锁并不会阻塞乐观写入和读操作，但当另一个事务尝试执行SMO操作变更树结构时，也需要先对树加上一个SX锁，这时两个悲观写入的并发事务就会出现冲突，新来的事务会被阻塞。
 
@@ -1397,12 +1404,14 @@ ROLL_PTR全称为rollback_pointer，也就是回滚指针的意思，这个也�
 ## mysql的内存结构
 
 ![](images/WEBRESOURCE2460480228ef4e0d8a58026dc41d8f58image.png)
+> 图：mysql的内存结构 相关截图
 
 实际上MySQL内存模型和JVM类似，JVM内存主要会划分为线程共享区和线程私有区，而上图中的MySQL内存区域，左边则是线程私有区域，每条工作线程中都会分配的区域，各线程之间互不影响，而右边的三大板块，则属于线程共享区域，即所有线程都可访问的内存
 
-**mysql架构图**
+### mysql架构图
 
 ![](images/WEBRESOURCE4c402303a63aee20959c915b81a48c2dimage.png)
+> 图：mysql架构图 相关截图
 
 1. 本地内存
 
@@ -1462,11 +1471,13 @@ ROLL_PTR全称为rollback_pointer，也就是回滚指针的意思，这个也�
 
 - Flush List：脏页内存列表，这里主要记录未落盘的数据。
 
-**show** **global** variables **like** "%innodb_buffer_pool_size%";
+```sql
+show global variables like "%innodb_buffer_pool_size%";
+```
 
 在MySQL5.6版本以下，默认大小为42MB，而MySQL5.6以后的版本中，默认大小为128MB，这块内存是MySQL启动时向OS申请的一块连续空间。当然，我们也可以手动调整innodb_buffer_pool_size参数来控制，一般建议设置为机器内存的60~80%
 
-**InnoDB****也有自己的预读机制**
+### InnoDB也有自己的预读机制
 
 每个数据页都被划分在一个个的extent里，一个extent容量为64，当select操作发生时，一个extent里被读取的数据页达到一定阈值后，会触发InnoDB的预读机制，将剩余的数据页、或下一个extent提前载入到内存中
 
@@ -1476,13 +1487,15 @@ InnoDB在存储数据时，会以64个数据页作为一个extent，同时，Inn
 
 - ②随机预读：当前extent中的数据页，大部分被载入到内存时，会触发预读将extent剩下的数据页全部载入内存；
 
-**show** variables **like** 'innodb_read_ahead_threshold';
+```sql
+show variables like 'innodb_read_ahead_threshold';
+```
 
 young、old两个区域在LRU链表中的占比，默认为63:37，你也可以通过innodb_old_blocks_pc这个参数，来手动调整old区在整个LRU链表中的占比。
 
 也就是说，在划分为两个区域后，young区域是用来存储真正的热点数据页，而old区则是用来存放有可能成为热点数据页的“候选人”，当需要淘汰缓冲页时，会优先淘汰old区中的数据页，毕竟young区中留下的都是久经考验的精英！
 
-nnoDB内存管理这块的内容，InnoDB采用三个链表结构来管理所有的缓冲页：
+InnoDB内存管理这块的内容，InnoDB采用三个链表结构来管理所有的缓冲页：
 
 - Free链表：统一管理、分配所有未使用的缓冲页。
 
@@ -1508,11 +1521,11 @@ nnoDB内存管理这块的内容，InnoDB采用三个链表结构来管理所有
 
 Java程序做集群、数据库做分库分表、搜索中间件做集群.....，慢慢的，你的系统会越来越庞大复杂，需要处理的问题也更为棘手，但带来的效果也显而易见，随着系统的结构不断变化，承载百万级、千万级、亿级、乃至更大级别的流量也并非难事。
 
-   聊到MySQL的性能优化，其实也可以从多个维度出发，共计优化项如下：
+   聊到MySQL的性能优化，其实也可以从多个维度出发，共计优化项如下：
 
 - ①客户端与连接层的优化：调整客户端DB连接池的参数和DB连接层的参数。
 
-**最大连接数 = (CPU核心数 * 2) + 有效磁盘数**
+### 最大连接数 = (CPU核心数 * 2) + 有效磁盘数
 
 **在一些场景下可以分连接池，有些sql一定执行的慢的，在这个连接池中处理，其他的在快连接池中处理**
 
@@ -1530,7 +1543,7 @@ Java程序做集群、数据库做分库分表、搜索中间件做集群.....�
 
 1. 移除查询缓存
 
-1. 支持非阻塞式获取锁机制，可以在获取锁的写法上加上NOWAIT、SKIP LOCKED关键字，这样在未获取到锁时不会阻塞等待，使用SKIP LOCKED未获取到锁时会直接返回空，使用NOWAIT会直接返回并向客户端返回异常
+2. 支持非阻塞式获取锁机制，可以在获取锁的写法上加上NOWAIT、SKIP LOCKED关键字，这样在未获取到锁时不会阻塞等待，使用SKIP LOCKED未获取到锁时会直接返回空，使用NOWAIT会直接返回并向客户端返回异常
 
 ```sql
 select ... for update nowait;
@@ -1559,7 +1572,7 @@ select * from performance_schema.persisted_variables;
 
 4.   在之前的MySQL版本中，仅支持交叉连接、内连接、左外连接、右外连接四种连接类型，这四种连接都会采用默认的连接算法，而在8.0版本中提供了哈希连接、反连接两种连接优化的支持。
 
-1. 哈希连接
+#### 哈希连接
 
 在哈希连接算法中会分为两个阶段：
 
@@ -1616,7 +1629,7 @@ MySQL什么情况下会选用哈希连接？
 
 也就是说，当连表时存在等值连接条件，并且未命中索引的情况下，MySQL默认会采用哈希连接算法来完成连表查询，不过还有一种情况也会使用，就是笛卡尔积情况，即不指定连接条件的情况下也会使用哈希连接，此时MySQL会直接对整条数据生成哈希表。
 
-**2. 反连接**
+#### 反连接
 
 反连接是MySQL8.0对于一些反范围查询操作的优化，主要针对于下述几种情况会做优化：
 
@@ -1679,7 +1692,7 @@ with CTE名称
 as (查询语句/子查询语句)
 select 语句;
 
-# 举例
+## 举例
 -- MySQL8.0版本之前的子查询语句
 select * from t1 where xx in (select xx from t2 where yy = "zzz");
 
@@ -1737,6 +1750,7 @@ from
 ## 分库后程序如何访问数据库
 
 ![](images/WEBRESOURCEfc6cb814088dafaf3ef22fc836f2c195image.png)
+> 图：分库后程序如何访问数据库 相关截图
 
 一般编码层或框架层都无法单独实现数据源的切换，两者必须配合起来完成，用MyBatis.Interceptor接口拦截SQL语句，然后根据SQL中的路由键做运算，最终再通过Spring.AbstractRoutingDataSource类去动态切换数据源。但这种方案的工程量很大，实现过程也较为繁杂，所以下面直接来看一些成熟的方案，如下：
 
@@ -1776,17 +1790,18 @@ from
 
 异步复制、同步复制、半同步复制、增强式半同步复制/无损复制、延迟复制、并行复制
 
- 增强式半同步复制也被称为无损复制，这是MySQL5.7版本中引入的一种新技术，在MySQL5.7版本中就不存在普通的半同步模式了，当将复制模式配置成半同步时，默认就会选用无损复制模式，和之前传统的半同步复制区别在于：从after-commit变成了after-sync
+ 增强式半同步复制也被称为无损复制，这是MySQL5.7版本中引入的一种新技术，在MySQL5.7版本中就不存在普通的半同步模式了，当将复制模式配置成半同步时，默认就会选用无损复制模式，和之前传统的半同步复制区别在于：从after-commit变成了after-sync
 
 那延迟复制的好处在于什么呢？可以防止误删操作，如若在主库上不小心误删了大量数据、表、库或其他数据库对象，因为从库并不是立即执行同步过去的记录，因此可以及时通过从节点上的数据回滚数据。除此之外，也能对一些线上Bug进行实时观测，比如一个无法复现的故障问题发生时，如果发现时还在配置的延迟复制时间内，则可以去到从库上观察。
 
-**重点并行复制**
+### 重点并行复制
 
 GTID(Global Transaction ID)也就是全局事务标识符的意思，它由节点UUID+事务ID两部分组成，MySQL在第一次启动时都会利用UUID随机生成一个server_id，还记得在之前的[《MVCC机制》](https://juejin.cn/post/7155359629050904584#heading-13)中聊过的事务ID嘛？MySQL会对每一个写事务都分配一个顺序递增的值作为事务ID，而GTID则是由这两玩意儿组成的，格式为server_uuid:trx_id
 
 当主库的事务有了这个全局事务标识后，再发生主从切换时就无需手动寻点了，仅需要执行change master to master_auto_position = 1这条命令即可，它会自动去新主库上寻找数据的同步点，也就是MySQL自身就具备断点复制的功能。
 
 ![](images/WEBRESOURCE3e7cd5cd8876a3abe58df3076b9f6e1c截图.png)
+> 图：重点并行复制 相关截图
 
 当一个事务提交时都会调用ordered_commit函数，首先会将事务加入等待事务组，接着会经过三个核心步骤：FLUSH、SYNC、COMMIT，对应的也会有三个队列，它们三者的工作原理都大致相同：
 
@@ -1812,17 +1827,17 @@ LOGICAL_CLOCK：表示基于组提交的方式来完成并行复制。
 
 1. 先找到（FROM）你要查询的表。
 
-1. 如果数据来自多个表，那么你需要把这些表（JOIN）连接起来。
+2. 如果数据来自多个表，那么你需要把这些表（JOIN）连接起来。
 
-1. 之后，你需要筛选出（WHERE）你感兴趣的记录。
+3. 之后，你需要筛选出（WHERE）你感兴趣的记录。
 
-1. 对这些记录进行分类统计（GROUP BY），并根据某些条件再次筛选（HAVING）。
+4. 对这些记录进行分类统计（GROUP BY），并根据某些条件再次筛选（HAVING）。
 
-1. 选择你需要展示的字段（SELECT）。
+5. 选择你需要展示的字段（SELECT）。
 
-1. 最后，对结果进行排序（ORDER BY），并可能还需要限制（LIMIT）结果的数量。
+6. 最后，对结果进行排序（ORDER BY），并可能还需要限制（LIMIT）结果的数量。
 
-## **索引合并(Index Merge)**
+## 索引合并(Index Merge)
 
 索引合并是通过对一个表同时使用多个索引进行条件扫描，并将满足条件的多个主键集合取交集或并集后再进行回表，可以提升查询效率。
 
@@ -1834,8 +1849,6 @@ LOGICAL_CLOCK：表示基于组提交的方式来完成并行复制。
 
 - **sort-union**：与union类似，不同的是sort-union会对结果集进行排序，随后再返回给用户；
 
--
-
 ## mysql的hint
 
 ## mysql加锁规则
@@ -1844,10 +1857,10 @@ LOGICAL_CLOCK：表示基于组提交的方式来完成并行复制。
 
 1. 原则 1：加锁的基本单位是 next-key lock。希望你还记得，next-key lock 是前开后闭区间。
 
-1. 原则 2：查找过程中访问到的对象才会加锁。
+2. 原则 2：查找过程中访问到的对象才会加锁。
 
-1. 优化 1：索引上的等值查询，给唯一索引加锁的时候，next-key lock 退化为行锁。
+3. 优化 1：索引上的等值查询，给唯一索引加锁的时候，next-key lock 退化为行锁。
 
-1. 优化 2：索引上的等值查询，向右遍历时且最后一个值不满足等值条件的时候，next-key lock 退化为间隙锁。
+4. 优化 2：索引上的等值查询，向右遍历时且最后一个值不满足等值条件的时候，next-key lock 退化为间隙锁。
 
-1. 一个 bug：唯一索引上的范围查询会访问到不满足条件的第一个值为止。
+5. 一个 bug：唯一索引上的范围查询会访问到不满足条件的第一个值为止。

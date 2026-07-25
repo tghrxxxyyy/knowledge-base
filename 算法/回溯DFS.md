@@ -1,21 +1,29 @@
-## 模板 ：
+# 回溯（DFS）
+
+回溯算法本质是**深度优先搜索 + 状态撤销**：在递归尝试每一种选择后，撤销本次选择造成的影响，以便尝试下一种选择。
+
+## 模板
+
+### Java 模板
 
 ```java
-void backtracking(参数) {
-    if (终止条件) {
-        存放结果;
-        return;
-    }
+void backtracking(参数) {
+    if (终止条件) {
+        存放结果;
+        return;
+    }
 
-    for (选择：本层集合中元素（树中节点孩子的数量就是集合的大小）) {
-        处理节点;
-        backtracking(路径，选择列表); // 递归
-        回溯，撤销处理结果
-    }
+    for (选择：本层集合中元素（树中节点孩子的数量就是集合的大小）) {
+        处理节点;
+        backtracking(路径，选择列表); // 递归
+        回溯，撤销处理结果
+    }
 }
 ```
 
-```
+### Python 模板（伪代码）
+
+```python
 for 选择 in 选择列表:
     # 做选择
     将该选择从选择列表移除
@@ -26,13 +34,13 @@ for 选择 in 选择列表:
     将该选择再加入选择列表
 ```
 
-典型例题：
+## 典型例题
 
-1.  leetcode  39  组合 总数
+### 1. LeetCode 39 组合总和
 
 ![](images/WEBRESOURCE018da28658393f132c2a771dc319ff1c截图.png)
 
-```
+```java
 class Solution {
     public List<List<Integer>> combinationSum(int[] candidates, int target) {
         int len = candidates.length;
@@ -78,7 +86,7 @@ class Solution {
 }
 ```
 
-2.  leetcode  46题   全排列
+### 2. LeetCode 46 全排列
 
 ![](images/WEBRESOURCE75068912455a4a2fa483b9ce9be1df69截图.png)
 

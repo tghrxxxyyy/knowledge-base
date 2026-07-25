@@ -1,26 +1,19 @@
-
-服务的注册流程
-
-客户端发现
-
-如何支持高并发注册（异步任务与内存队列设计原理及源码剖析）
-
-nacos的配置中心功能实现
+# Nacos 源码解析
 
 ## 服务的注册流程
 
-从springboot的自动装配说起
+从 Spring Boot 的自动装配说起：
 
-```javascript
+```xml
 <dependency>
     <groupId>com.alibaba.cloud</groupId>
     <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
 </dependency>
 ```
 
-这个依赖下的spring.factories中，自动装配了类
+这个依赖下的 `spring.factories` 中，自动装配了类：
 
-```javascript
+```properties
 org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
   com.alibaba.cloud.nacos.discovery.NacosDiscoveryAutoConfiguration,\
   com.alibaba.cloud.nacos.ribbon.RibbonNacosAutoConfiguration,\
@@ -31,44 +24,21 @@ org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
   com.alibaba.cloud.nacos.discovery.configclient.NacosConfigServerAutoConfiguration
 org.springframework.cloud.bootstrap.BootstrapConfiguration=\
   com.alibaba.cloud.nacos.discovery.configclient.NacosDiscoveryClientConfigServiceBootstrapConfiguration
-
 ```
 
-其中，注册核心为
+其中，注册核心为 `NacosServiceRegistryAutoConfiguration`，它注入了 `NacosAutoServiceRegistration`。
 
-```javascript
-NacosServiceRegistryAutoConfiguration
-```
+这个类继承了 `AbstractAutoServiceRegistration`：
 
-注入了
-
-```javascript
-NacosAutoServiceRegistration
-```
-
-这个类继承了
-
-```javascript
-AbstractAutoServiceRegistration
-```
-
-```javascript
+```java
 public abstract class AbstractAutoServiceRegistration<R extends Registration>
       implements AutoServiceRegistration, ApplicationContextAware,
       ApplicationListener<WebServerInitializedEvent>
 ```
 
-当完成spring的容器加载后调用
+当完成 Spring 的容器加载后调用 `onApplicationEvent`，进入 `org.springframework.cloud.client.serviceregistry.ServiceRegistry#register`，进而调用 `com.alibaba.nacos.client.naming.NacosNamingService#registerInstance(java.lang.String, java.lang.String, com.alibaba.nacos.api.naming.pojo.Instance)`：
 
-```javascript
-onApplicationEvent
-```
-
-进入org.springframework.cloud.client.serviceregistry.ServiceRegistry#register
-
-com.alibaba.nacos.client.naming.NacosNamingService#registerInstance(java.lang.String, java.lang.String, com.alibaba.nacos.api.naming.pojo.Instance)
-
-```javascript
+```java
 public void registerInstance(String serviceName, String groupName, Instance instance) throws NacosException {
     //心跳默认是5s一次执行，rest接口发送
     if (instance.isEphemeral()) {
@@ -90,13 +60,11 @@ public void registerInstance(String serviceName, String groupName, Instance inst
 
 ## 客户端发现
 
-一样依靠了springboot的自动装配了这个类
+一样依靠了 Spring Boot 的自动装配了这个类 `NacosDiscoveryClientConfiguration`，这个类中加载了 `com.alibaba.cloud.nacos.discovery.NacosWatch`。
 
-NacosDiscoveryClientConfiguration，这个类中加载了com.alibaba.cloud.nacos.discovery.NacosWatch
+这个类核心继承了 `org.springframework.context.SmartLifecycle`（extends `org.springframework.context.Lifecycle`）：
 
-这个类核心继承了 org.springframework.context.SmartLifecycle  extend  org.springframework.context.Lifecycle
-
-```javascript
+```java
 public interface Lifecycle {
     void start();
 
@@ -106,7 +74,7 @@ public interface Lifecycle {
 }
 ```
 
-```javascript
+```java
 @Override
 public void start() {
    if (this.running.compareAndSet(false, true)) {
@@ -119,26 +87,23 @@ private long watchDelay = 30000;
 
 ## 如何支持高并发注册（异步任务与内存队列设计原理及源码剖析）
 
-## nacos的配置中心功能实现
+> ⚠️ 本小节内容待补充。
+
+## nacos 的配置中心功能实现
 
 整体工作流程如下：
 
-- 客户端发起长轮训请求
+- 客户端发起长轮询请求
+- 服务端收到请求以后，先比较服务端缓存中的数据是否相同，如果不同，则直接返回
+- 如果相同，则通过 schedule 延迟 29.5s 之后再执行比较
+- 为了保证当服务端在 29.5s 之内发生数据变化能够及时通知给客户端，服务端采用事件订阅的方式来监听服务端本地数据变化的事件，一旦收到事件，则触发 DataChangeTask 的通知，并且遍历 allSubs 队列中的 ClientLongPolling，把结果写回到客户端，就完成了一次数据的推送
+- 如果 DataChangeTask 任务完成了数据的“推送”之后，ClientLongPolling 中的调度任务又开始执行了怎么办呢？很简单，只要在进行“推送”操作之前，先将原来等待执行的调度任务取消掉就可以了，这样就防止了推送操作写完响应数据之后，调度任务又去写响应数据，这时肯定会报错的。所以，在 ClientLongPolling 方法中，最开始的一个步骤就是删除订阅事件
 
-- 服务端收到请求以后，先比较服务端缓存中的数据是否相同，如果不通，则直接返回
+通过 Spring Boot 的自动装配原理，在 `spring-cloud-starter-alibaba-nacos-config` 的 `spring.factories` 中自动装配了 `com.alibaba.cloud.nacos.NacosConfigBootstrapConfiguration`：
 
-- 如果相同，则通过schedule延迟29.5s之后再执行比较
-
-- 为了保证当服务端在29.5s之内发生数据变化能够及时通知给客户端，服务端采用事件订阅的方式来监听服务端本地数据变化的事件，一旦收到事件，则触发DataChangeTask的通知，并且遍历allStubs队列中的ClientLongPolling,把结果写回到客户端，就完成了一次数据的推送
-
-- 如果 DataChangeTask 任务完成了数据的 “推送” 之后，ClientLongPolling 中的调度任务又开始执行了怎么办呢？ 很简单，只要在进行 “推送” 操作之前，先将原来等待执行的调度任务取消掉就可以了，这样就防止了推送操作写完响应数据之后，调度任务又去写响应数据，这时肯定会报错的。所以，在ClientLongPolling方法中，最开始的一个步骤就是删除订阅事
-
-通过springboot的自动装配原理，在spring-cloud-starter-alibaba-nacos-config的spring.factories中自动装配了
-
-```javascript
-com.alibaba.cloud.nacos.NacosConfigBootstrapConfiguration
-//这个类里核心注入了com.alibaba.cloud.nacos.NacosConfigManager  在这个类的 构造方法中执行了 createConfigService方法通过NacosFactory
-//生成了核心的ConfigService，调用getConfig进入到NacosConfigService类中new了一个ClientWorker
+```java
+//这个类里核心注入了 com.alibaba.cloud.nacos.NacosConfigManager，在它的构造方法中执行了 createConfigService 方法，通过 NacosFactory
+//生成了核心的 ConfigService，调用 getConfig 进入到 NacosConfigService 类中 new 了一个 ClientWorker
 public ClientWorker(final HttpAgent agent, final ConfigFilterChainManager configFilterChainManager, final Properties properties) {
     this.agent = agent;
     this.configFilterChainManager = configFilterChainManager;
@@ -156,7 +121,7 @@ public ClientWorker(final HttpAgent agent, final ConfigFilterChainManager config
             return t;
         }
     });
-    //长轮训 
+    //长轮询
     executorService = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -166,7 +131,7 @@ public ClientWorker(final HttpAgent agent, final ConfigFilterChainManager config
             return t;
         }
     });
-    //每10ms执行 一次 
+    //每10ms执行 一次
     executor.scheduleWithFixedDelay(new Runnable() {
         @Override
         public void run() {
@@ -194,26 +159,27 @@ public void checkConfigInfo() {
 }
 ```
 
-![对于服务端 而言 /v1/cs/configs/listener](images/WEBRESOURCE76d81e36f2d5a87a95ce80b335aa0f05stickPicture.png)
+![服务端 /v1/cs/configs/listener 接口](images/WEBRESOURCE76d81e36f2d5a87a95ce80b335aa0f05stickPicture.png)
+
+> 上图为服务端 `/v1/cs/configs/listener` 接口的处理示意（原为有道云笔记截图，此处保留引用）。
 
 ## doPollingConfig
 
-这个方法主要是用来做长轮训和短轮询的判断
+这个方法主要是用来做长轮询和短轮询的判断：
 
-1. 如果是长轮训，直接走addLongPollingClient方法
+1. 如果是长轮询，直接走 addLongPollingClient 方法
+2. 如果是短轮询，直接比较服务端的数据，如果存在 md5 不一致，直接把数据返回
 
-1. 如果是短轮询，直接比较服务端的数据，如果存在md5不一致，直接把数据返回。
-
-```javascript
+```java
 public void addLongPollingClient(HttpServletRequest req, HttpServletResponse rsp, Map<String, String> clientMd5Map,
         int probeRequestSize) {
-    
+
     String str = req.getHeader(LongPollingService.LONG_POLLING_HEADER);
     String noHangUpFlag = req.getHeader(LongPollingService.LONG_POLLING_NO_HANG_UP_HEADER);
     String appName = req.getHeader(RequestUtil.CLIENT_APPNAME_HEADER);
     String tag = req.getHeader("Vipserver-Tag");
     int delayTime = SwitchService.getSwitchInteger(SwitchService.FIXED_DELAY_TIME, 500);
-    
+
     // Add delay time for LoadBalance, and one response is returned 500 ms in advance to avoid client timeout.
     long timeout = Math.max(10000, Long.parseLong(str) - delayTime);
     if (isFixedPolling()) {
@@ -236,23 +202,23 @@ public void addLongPollingClient(HttpServletRequest req, HttpServletResponse rsp
         }
     }
     String ip = RequestUtil.getRemoteIp(req);
-    
+
     // Must be called by http thread, or send response.
     final AsyncContext asyncContext = req.startAsync();
-    
+
     // AsyncContext.setTimeout() is incorrect, Control by oneself
     asyncContext.setTimeout(0L);
-    
+
     ConfigExecutor.executeLongPolling(
             new ClientLongPolling(asyncContext, clientMd5Map, ip, probeRequestSize, timeout, appName, tag));
 }
 public void run() {
     try {
         getRetainIps().put(ClientLongPolling.this.ip, System.currentTimeMillis());
-        
+
         // Delete subsciber's relations.
         boolean removeFlag = allSubs.remove(ClientLongPolling.this);
-        
+
         if (removeFlag) {
             if (isFixedPolling()) {
                 LogUtil.CLIENT_LOG
@@ -280,7 +246,7 @@ public void run() {
     } catch (Throwable t) {
         LogUtil.DEFAULT_LOG.error("long polling error:" + t.getMessage(), t.getCause());
     }
-    
+
 }
 //LongPollingService监听了数据变更的事件，触发事件的话会有定时任务DataChangeTask
 @Override
@@ -294,12 +260,12 @@ public void run() {
                 if (isBeta && !CollectionUtils.contains(betaIps, clientSub.ip)) {
                     continue;
                 }
-                
+
                 // If published tag is not in the tag list, then it skipped.
                 if (StringUtils.isNotBlank(tag) && !tag.equals(clientSub.tag)) {
                     continue;
                 }
-                
+
                 getRetainIps().put(clientSub.ip, System.currentTimeMillis());
                 iter.remove(); // Delete subscribers' relationships.
                 LogUtil.CLIENT_LOG

@@ -1,15 +1,12 @@
+# RocketMQ 源码解析
+
 ## FileWatchService
 
 FileWatchService 用于监听文件的变更，实现逻辑比较简单。
 
-- 在创建 FileWatchService 时，就遍历要监听的文件，计算文件的hash值，存放到内存列表中
-
-- run() 方法中就是监听的核心逻辑，while 循环通过
-
- isStopped() 判断是否中断执行
-
-- 默认每隔 500 秒检测一次文件 hash 值，然后与内存中的 hash 值做对比
-
+- 在创建 FileWatchService 时，就遍历要监听的文件，计算文件的 hash 值，存放到内存列表中
+- `run()` 方法中就是监听的核心逻辑，while 循环通过 `isStopped()` 判断是否中断执行
+- 默认每隔 500 毫秒检测一次文件 hash 值，然后与内存中的 hash 值做对比
 - 如果文件 hash 值变更，则触发监听事件的执行
 
 ```java
@@ -84,12 +81,11 @@ public class FileWatchService extends ServiceThread {
         void onChanged(String path);
     }
 }
-复制代码
 ```
 
 FileWatchService 的初始化代码大致如下：
 
-```typescript
+```java
 if (TlsSystemConfig.tlsMode != TlsMode.DISABLED) {
     fileWatchService = new FileWatchService(
         // 监听证书文件的变更
@@ -112,8 +108,10 @@ if (TlsSystemConfig.tlsMode != TlsMode.DISABLED) {
 
 ## 事件
 
-![](images/WEBRESOURCE8e53b4ac940fa21363f516c95c5d72c1截图.png)
+![RocketMQ 事件相关示意图](images/WEBRESOURCE8e53b4ac940fa21363f516c95c5d72c1截图.png)
 
-## rocket mq的底层的消息存储
+> 上图展示了相关事件（原为有道云笔记截图，此处保留引用）。
 
-不直接使用sendFile而是write然后flush主要是有小块数据写入的需要，对比sendfile更使用与大文件
+## RocketMQ 底层的消息存储
+
+不直接使用 sendfile，而是采用 write 再 flush 的方式，主要是因为存在小块数据写入的需求；相对而言，sendfile 更适用于大文件传输场景。

@@ -1,1 +1,4 @@
 .DS_Store
+
+# WorkBuddy 项目记忆目录（含本地上下文，勿推送到公开仓库）
+.workbuddy/

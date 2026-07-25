@@ -1,5 +1,5 @@
-## **对面向对象的理解**
-
+# Java 体系
+## 对面向对象的理解
 向对象的目的：解决软件系统的可扩展性，可维护性和可重用性；
 
 面向对象的三大特性：封装、多态和继承：
@@ -12,39 +12,37 @@
 
 面向对象编程（OOP）其实就是一种设计思想，在程序设计过程中把每一部分都尽量当成一个对象来考虑，以实现软件系统的可扩展性，可维护性和可重用性。
 
-## **CPU 的大致组成和所谓的超线程技术**
-
+## CPU 的大致组成和所谓的超线程技术
 CPU的基本组成
 
-PC -> Program Counter 程序计数器 （记录当前指令地址）
+PC -> Program Counter 程序计数器 （记录当前指令地址）
 
-Registers -> 暂时存储CPU计算需要用到的数据
+Registers -> 暂时存储CPU计算需要用到的数据
 
-ALU -> Arithmetic & Logic Unit 运算单元
+ALU -> Arithmetic & Logic Unit 运算单元
 
-CU -> Control Unit 控制单元
+CU -> Control Unit 控制单元
 
-MMU -> Memory Management Unit 内存管理单元
+MMU -> Memory Management Unit 内存管理单元
 
-Cache -> 缓存
+Cache -> 缓存
 
 ![](images/WEBRESOURCE77c04af5e12c22142979ddff571ca2ad截图.png)
+> 图：CPU 的大致组成和所谓的超线程技术 相关截图
 
-## **new 一个对象**
-
+## new 一个对象
 字节码指令分为3个
 
-new 分配内存空间
+new 分配内存空间
 
-invokespecial 执行初始化
+invokespecial 执行初始化
 
-astore_1 指向
+astore_1 指向
 
-## **分布式系统的NPC**
-
+## 分布式系统的NPC
 N（Network网络）、P（Process进程）、C（Clock时钟）
 
-  进程会出现的问题？
+  进程会出现的问题？
 
 失败模型
 
@@ -60,9 +58,8 @@ N（Network网络）、P（Process进程）、C（Clock时钟）
 
 时钟漂移
 
-## **c1 c2 编译器**
-
-【java之JIT(Just in time) - 抒抒说 - 博客园】[https://www.cnblogs.com/msymm/p/9395234.html](https://www.cnblogs.com/msymm/p/9395234.html)
+## c1 c2 编译器
+【java之JIT(Just in time) - 抒抒说 - 博客园】[https://www.cnblogs.com/msymm/p/9395234.html](https://www.cnblogs.com/msymm/p/9395234.html)
 
 在运行过程中被即时编译器编译的“热点代码”有两类，即：
 
@@ -70,15 +67,15 @@ N（Network网络）、P（Process进程）、C（Clock时钟）
 
 被多次执行的循环体
 
-对第一种情况，由于是方法调用触发的编译，因此编译器会以整个方法作为编译对象，即标准的JIT编译方式。后一种，虽然是循环体触发的编译动作，但编译器依然按照整个方法（而不是单独的循环体）作为编译对象。这种编译方式称为栈上替换（On Stack Replacement，简称为OSR编译）。
+对第一种情况，由于是方法调用触发的编译，因此编译器会以整个方法作为编译对象，即标准的JIT编译方式。后一种，虽然是循环体触发的编译动作，但编译器依然按照整个方法（而不是单独的循环体）作为编译对象。这种编译方式称为栈上替换（On Stack Replacement，简称为OSR编译）。
 
-判断一段代码是不是热点代码，是不是需要触发即时编译，这样的行为称为热点探测（Hot Spot Detection），目前有两种方法：
+判断一段代码是不是热点代码，是不是需要触发即时编译，这样的行为称为热点探测（Hot Spot Detection），目前有两种方法：
 
 基于采样的热点探测：采用这样的方法的虚拟机会周期性的检查各个线程的栈顶，如果发现某个（或某些）方法经常出现在栈顶，那这个方法就是“热点方法”。其好处就是实现简单、高效，还可以很容易的获取方法调用关系（将调用栈展开即可），缺点是很难精确的确认一个方法的热度，容易因为受到线程阻塞或别的外界因素的影响。
 
 基于计数器的热点探测：为每一个方法（甚至是代码块）建立计数器，统计方法的执行次数，超过一定的阈值就认为是“热点方法”。缺点是实现起来更麻烦，需要为每个方法建立并维护计数器，并且不能直接获取到方法的调用关系，优点是它的统计结果相对来说更加精确和严谨。
 
-HotSpot虚拟机使用第二种，它为每个方法准备了两类计数器：方法调用计数器（Invocation Counter）和回边计数器（Back Edge Counter，用于统计一个方法中循环体代码执行的次数）
+HotSpot虚拟机使用第二种，它为每个方法准备了两类计数器：方法调用计数器（Invocation Counter）和回边计数器（Back Edge Counter，用于统计一个方法中循环体代码执行的次数）
 
 分层编译将 Java 虚拟机的执行状态分为了五个层次。为了方便阐述，我用“C1 代码”来指代由 C1 生成的机器码，“C2 代码”来指代由 C2 生成的机器码。五个层级分别是：
 
@@ -122,41 +119,40 @@ HotSpot虚拟机使用第二种，它为每个方法准备了两类计数器：�
 
 这是因为基于 profile 的优化失败的时候，往往代表这程序的执行状态发生改变，因此需要更正已收集的 profile，以更好地反映新的程序执行状态
 
-## **java对象构成**
-
+## java对象构成
 ![](images/WEBRESOURCEa426b556e372fce00b0e2cdc8089afb6截图.png)
+> 图：java对象构成 相关截图
 
 ![](images/WEBRESOURCE1507521e7387a53802074948787febee截图.png)
+> 图：java对象构成 相关截图
 
-## **FastClass调用机制**
+## FastClass调用机制
+    JDK动态代理在调用目标类时，只能采用反射。而CGLIB采用FastClass机制，对代理类和目标类的方法建立签名hash映射，这样就可以直接调用，避免了反射调用目标类，其实是switch
 
-    JDK动态代理在调用目标类时，只能采用反射。而CGLIB采用FastClass机制，对代理类和目标类的方法建立签名hash映射，这样就可以直接调用，避免了反射调用目标类，其实是switch
+    cglib源码流程：
 
-    cglib源码流程：
+    创建 Enhancer.*create**(*cls,this*)*;
 
-    创建 Enhancer.*create**(*cls,this*)*;
+    net.sf.cglib.core.AbstractClassGenerator#create  从缓存取  
 
-    net.sf.cglib.core.AbstractClassGenerator#create  从缓存取  
+    net.sf.cglib.core.internal.LoadingCache#get
 
-    net.sf.cglib.core.internal.LoadingCache#get
+    net.sf.cglib.core.internal.LoadingCache#createEntry  封装futureTask执行
 
-    net.sf.cglib.core.internal.LoadingCache#createEntry  封装futureTask执行
+### Jdk动态代理源码
 
-**Jdk动态代理源码**
+        从java.lang.reflect.Method#invoke
 
-        从java.lang.reflect.Method#invoke
+        java.lang.reflect.Method#acquireMethodAccessor
 
-        java.lang.reflect.Method#acquireMethodAccessor
+        15次后会转为java的invoke
 
-        15次后会转为java的invoke
+## SPI机制核心
+java.util.ServiceLoader 
 
-## **SPI机制核心**
-
-java.util.ServiceLoader 
-
-## **异常处理**
-
+## 异常处理
 ![](images/73A56CD9149048D2A875E8A3BAD38E25v2-b340b341d921def7ca17d82e989fcccb_1440w.jpg)
+> 图：异常处理 相关截图
 
 - from：可能发生异常的起始点指令索引下标(包含)
 
@@ -166,43 +162,43 @@ java.util.ServiceLoader 
 
 - type：当前范围可以处理的异常类信息
 
-## **JUC下一些类的特点说明**
+## JUC下一些类的特点说明
+### CountDownLatch
 
-**CountDownLatch**
+ 通过内部类Sync继承AQS
 
- 通过内部类Sync继承AQS
+countDown()   实际上就是去释放一个共享资源  基于AQS的doReleaseShared()
 
-countDown()   实际上就是去释放一个共享资源  基于AQS的doReleaseShared()
+await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候，放入AQS的等待队列
 
-await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候，放入AQS的等待队列
+当 countDown到0的时候，唤醒
 
-当 countDown到0的时候，唤醒
+### CyclicBarrier
 
-**CyclicBarrier**
+    内部基于
 
-    内部基于
+      private final ReentrantLock lock = new ReentrantLock();
 
-      private final ReentrantLock lock = new ReentrantLock();
+     private final Condition trip = lock.newCondition();
 
-     private final Condition trip = lock.newCondition();
+    当调用await()的时候，实际上是判断size是否减到0了，如果没有，会调用trip.wait()
 
-    当调用await()的时候，实际上是判断size是否减到0了，如果没有，会调用trip.wait()
+       当为0了，会调用trip.notifyAll()
 
-       当为0了，会调用trip.notifyAll()
+### Semphore
 
-**Semphore**
+    默认非公平
 
-    默认非公平
+    获取一个共享的states，如果没有获取到，就阻塞排队
 
-    获取一个共享的states，如果没有获取到，就阻塞排队
-
-    每次release()一个，都会唤醒等待的下一个节点
+    每次release()一个，都会唤醒等待的下一个节点
 
 ## 线程状态
 
 ![](images/WEBRESOURCE80d4f625be1a7cf458342959dac3ba25截图.png)
+> 图：线程状态 相关截图
 
-**新建(New)**
+### 新建(New)
 
 创建后尚未启动。
 
@@ -250,9 +246,8 @@ await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候�
 
 可以是线程结束任务之后自己结束，或者产生了异常而结束。
 
-## **线程池**
-
-ctl 是一个涵盖了两个概念的原子整数类，它将工作线程数和线程池状态结合在一起维护，低 29 位存放 workerCount，高 3 位存放 runState。
+## 线程池
+ctl 是一个涵盖了两个概念的原子整数类，它将工作线程数和线程池状态结合在一起维护，低 29 位存放 workerCount，高 3 位存放 runState。
 
 线程池的状态
 
@@ -266,12 +261,12 @@ ctl 是一个涵盖了两个概念的原子整数类，它将工作线程数和
 
 - TERMINATED：已关闭。
 
-    
+    
 
 ![](images/5B5DCE99342C428084E5426AB54A08C3640.png)
+> 图：线程池 相关截图
 
-## **死锁产生条件**
-
+## 死锁产生条件
 - 互斥条件
 
 临界资源是独占资源，进程应互斥且排他的使用这些资源。
@@ -288,21 +283,20 @@ ctl 是一个涵盖了两个概念的原子整数类，它将工作线程数和
 
 又称环路条件，存在循环等待链，其中，每个进程都在等待链中等待下一个进程所持有的资源，造成这组进程处于永远等待状态。
 
-## **泛型的extend和super**
-
-1）上界<? extends T>不能往里存，只能往外取
+## 泛型的extend和super
+1）上界<? extends T>不能往里存，只能往外取
 
 原因是编译器只知道容器内是Fruit或者它的派生类，但具体是什么类型不知道。可能是Fruit？可能是Apple？也可能是Banana，RedApple，GreenApple？编译器在看到后面用Plate赋值以后，盘子里没有被标上有“苹果”。而是标上一个占位符：CAP#1，来表示捕获一个Fruit或Fruit的子类，具体是什么类不知道，代号CAP#1。然后无论是想往里插入Apple或者Meat或者Fruit编译器都不知道能不能和这个CAP#1匹配，所以就都不允许。
 
-（2）下界<? super T>不影响往里存，但往外取只能放在Object对象里
+（2）下界<? super T>不影响往里存，但往外取只能放在Object对象里
 
-使用下界<? super Fruit>会使从盘子里取东西的get( )方法部分失效，只能存放到Object对象里。set( )方法正常。
+使用下界<? super Fruit>会使从盘子里取东西的get( )方法部分失效，只能存放到Object对象里。set( )方法正常。
 
 因为下界规定了元素的最小粒度的下限，实际上是放松了容器元素的类型控制。既然元素是Fruit的基类，那往里存粒度比Fruit小的都可以。但往外读取元素就费劲了，只有所有类的基类Object对象才能装下。但这样的话，元素的类型信息就全部丢失。
 
-**总结:**
+### 总结:
 
-PECS原则:最后看一下什么是PECS（Producer Extends Consumer Super）原则，已经很好理解了：
+PECS原则:最后看一下什么是PECS（Producer Extends Consumer Super）原则，已经很好理解了：
 
 （1）频繁往外读取内容的，适合用上界Extends。
 
@@ -311,17 +305,17 @@ PECS原则:最后看一下什么是PECS（Producer Extends Consumer Super）�
 获得泛型类型
 
 ```java
-static <T> T newTclass (Class < T > clazz) throws InstantiationException, IllegalAccessException { T obj =clazz.newInstance(); return obj; }
+static <T> T newTclass (Class < T > clazz) throws InstantiationException, IllegalAccessException { T obj =clazz.newInstance(); return obj; }
 
 ```
 
-**为什么overload不能通过返回值去确认**
+### 为什么overload不能通过返回值去确认
 
-注意不能根据方法返回值来确定是否重载，因为假如用方法返回值作为方法重载的标记，当直接调用方法 overload() 没有指明是否需要返回值，这时候系统就会产生疑问，有不确定的因素，因此不能根据返回值来区分方法是否重载。
+注意不能根据方法返回值来确定是否重载，因为假如用方法返回值作为方法重载的标记，当直接调用方法 overload() 没有指明是否需要返回值，这时候系统就会产生疑问，有不确定的因素，因此不能根据返回值来区分方法是否重载。
 
-## **java反射**
-
+## java反射
 ![](images/5F432F5B608340B695A1E39F5E44150Cab64fe82df314d418850558808c04430.png)
+> 图：java反射 相关截图
 
 [https://blog.csdn.net/wy_05689/article/details/123101320](https://blog.csdn.net/wy_05689/article/details/123101320)
 
@@ -339,27 +333,26 @@ MethodAccessor有两个实现，一个是基于本地方法实现，相当于直
 
 1. class.forname调用的native方法占用性能
 
-**Future实现阻塞等待的原理**
+### Future实现阻塞等待的原理
 
-get()方法的底层实际上是判断当前任务执行状态，如果不是COMPLETING，会调LockSupport.park(this) 阻断
+get()方法的底层实际上是判断当前任务执行状态，如果不是COMPLETING，会调LockSupport.park(this) 阻断
 
 如果执行完成，会调用内部的set()方法，唤醒阻塞的线程，并获取值
 
-## **谈谈java的面向对象  **
-
+## 谈谈java的面向对象  
 ![](images/WEBRESOURCE01113482b636d7a789466ac0030c9cbfstickPicture.png)
+> 图：谈谈java的面向对象 相关截图
 
-## **java的线程模型**
-
+## java的线程模型
 多对一模型、一对一模型和多对多模型
 
 **多对一线程模型**，又叫作用户级线程模型，即多个用户线程对应到同一个内核线程上，线程的创建、调度、同步的所有细节全部由进程的用户空间线程库来处理。
 
-**优点：**
+### 优点
 
 - 用户线程的很多操作对内核来说都是透明的，不需要用户态和内核态的频繁切换，使线程的创建、调度、同步等非常快；
 
-**缺点：**
+### 缺点
 
 - 由于多个用户线程对应到同一个内核线程，如果其中一个用户线程阻塞，那么该其他用户线程也无法执行；
 
@@ -369,11 +362,11 @@ get()方法的底层实际上是判断当前任务执行状态，如果不是COM
 
 **一对一模型**，又叫作内核级线程模型，即一个用户线程对应一个内核线程，内核负责每个线程的调度，可以调度到其他处理器上面。
 
-**优点：**
+### 优点
 
 - 用户的应用进程中的线程也是通过一对一的使用系统内核提供的轻量级进程LWP（Light weight process）接口来使用系统内核线程，这种模型的好处是LWP在调用过程中即使阻塞了也不会影响整个进程的执行；
 
-**缺点：**
+### 缺点
 
 - 对用户线程的大部分操作都会映射到内核线程上，引起用户态和内核态的频繁切换；
 
@@ -391,7 +384,7 @@ Java使用的就是一对一线程模型，所以在Java中启一个线程要谨
 
 所以，多对多模型既不是多对一模型那种完全靠自己调度的也不是一对一模型完全靠操作系统调度的，而是中间态（自身调度与系统调度协同工作），因为这种模型的高度复杂性，操作系统内核开发者一般不会使用，所以更多时候是作为第三方库的形式出现。
 
-**优点：**
+### 优点
 
 - 兼具多对一模型的轻量；
 
@@ -399,7 +392,7 @@ Java使用的就是一对一线程模型，所以在Java中启一个线程要谨
 
 - 由于对应了多个内核线程，则可以实现较完整的调度、优先级等；
 
-**缺点：**
+### 缺点
 
 - 实现复杂
 
@@ -407,11 +400,10 @@ Go语言中的goroutine调度器就是采用的这种实现方案，在Go语言�
 
 后面讲到Java中的ForkJoinPool的时候，我们会拿Go语言的PMG线程模型来对比讲解
 
-## **指令重排序**
-
+## 指令重排序
 在计算机执行程序时候，为了能够提高性能，编译器和处理器常常会对指令做重新排序处理，就是指令的重排序。
 
-**指令重排的条件**
+### 指令重排的条件
 
 - 在单线程环境下不能改变程序的运行结果；
 
@@ -419,7 +411,7 @@ Go语言中的goroutine调度器就是采用的这种实现方案，在Go语言�
 
 - 无法通过Happens-before原则推到出来的，才能进行指令的重排序
 
-**指令重排的三种情况：**
+### 指令重排的三种情况
 
 - 编译器优化重排：编译器再不改变单线程程序语义的前体下，可以重新安排语句的执行顺序。
 
@@ -431,7 +423,7 @@ Go语言中的goroutine调度器就是采用的这种实现方案，在Go语言�
 
 **指令重排可以保证串行语义一致,但是没有义务保证多线程间的语义也一致**。所以在多线程下,指令重排序可能会导致一些问题。
 
-**什么是Happens-before**
+### 什么是Happens-before
 
 一方面，我们需要**JMM**给我们提供一个强大的内存模型来编写代码，同时另外一方面对于编译器和处理器来说希望**JMM**对他们的约束越少越好，这样就可以进行跟多的优化处理，也就是希望是一个弱的内存模型。
 
@@ -441,13 +433,13 @@ Go语言中的goroutine调度器就是采用的这种实现方案，在Go语言�
 
 就是说对于这个规则来说，我们只要是遵循了 就能够保证其在**JMM**中具有强的内存可见性。
 
-**定义**
+### 定义
 
 1. 如果一个操作 happens-before另一个操作,那么第一个操作的执行结果将对第二个操作可见,而且第一个操作的执行顺序排在第二个操作之前
 
 1. 两个操作之间存在 happens-before关系,并不意味着Java平台的具体实现必须要按照 happens-before关系指定的顺序来执行。如果重排序之后的执行结果,与按 happens- before关系来执行的结果一致,那么JMM也允许这样的重排序
 
-**天然的happens-before有哪些v**
+### 天然的happens-before有哪些v
 
 在Java中,有以下天然的 happens-before关系：
 
@@ -463,27 +455,24 @@ Go语言中的goroutine调度器就是采用的这种实现方案，在Go语言�
 
 - join规则:如果线程A执行操作 Thread join()并成功返回,那么线程B中的任意操作 happens-before于线程A从 Thread join0操作成功返回。
 
-## **java为什么 要避免使用split**
-
+## java为什么 要避免使用split
 Java 正则表达式使用的引擎实现是 NFA（Non deterministic Finite Automaton，不确定型有穷自动机）自动机，这种正则表达式引擎在进行字符匹配时会发生回溯（backtracking），而一旦发生回溯，那其消耗的时间就会变得很长，有可能是几分钟，也有可能是几个小时，时间长短取决于回溯的次数和复杂度。
 
 https://zhuanlan.zhihu.com/p/476891220  NFA 与 DFA
 
-## **java的switch**
-
+## java的switch
 对于 switch 来说，他最终生成的字节码有两种形态，一种是 tableswitch，另一种是 lookupswitch，决定最终生成的代码使用那种形态取决于 switch 的判断添加是否紧凑，例如到 case 是 1...2...3...4 这种依次递增的判断条件时，使用的是 tableswitch，而像 case 是 1...33...55...22 这种非紧凑型的判断条件时则会使用 lookupswitch
 
 当执行一次 tableswitch 时，堆栈顶部的 int 值直接用作表中的索引，以便抓取跳转目标并立即执行跳转。也就是说 tableswitch 的存储结构类似于数组，是直接用索引获取元素的，所以整个查询的时间复杂度是 O(1)，这也意味着它的搜索速度非常快。
 
 而执行 lookupswitch 时，会逐个进行分支比较或者使用二分法进行查询，因此查询时间复杂度是 O(log n)，**所以使用 lookupswitch 会比 tableswitch 慢**。
 
-## **java处理散列的方式**
-
-**开放定址法**
+## java处理散列的方式
+### 开放定址法
 
 ①核心思想：如果出现散列冲突，就重新探测一个空闲位置，将其插入。
 
-②线性探测法（Linear Probing)                                                                        ** **
+②线性探测法（Linear Probing)                                                                        ** **
 
 **插入数据**：当我们往散列表中插入数据时，如果某个数据经过散列函数之后，存储的位置已经被占用了，我们就从当前位置开始，依次往后查找，看是否有空闲位置，直到找到为止。
 
@@ -491,7 +480,7 @@ https://zhuanlan.zhihu.com/p/476891220  NFA 与 DFA
 
 **删除数据**：为了不让查找算法失效，可以将删除的元素特殊标记为deleted，当线性探测查找的时候，遇到标记为deleted的空间，并不是停下来，而是继续往下探测。
 
-**结论：最坏时间复杂度为O(n)**
+### 结论：最坏时间复杂度为O(n)
 
 ③二次探测（Quadratic probing）：线性探测每次探测的步长为1，即在数组中一个一个探测，而二次探测的步长变为原来的平方。(原: hash+1，hash+2; 现在 hash+1^2,hash+2^2…)
 
@@ -499,14 +488,13 @@ https://zhuanlan.zhihu.com/p/476891220  NFA 与 DFA
 
 ⑤线性探测法的性能描述：用“装载因子”来表示空位多少，散列表装载因子=填入表中的个数/散列表的长度。装载因子越大，说明空闲位置越少，冲突越多，散列表的性能会下降。**注: ThreadLocalMap即使用了开放寻址法解决hash冲突。**
 
-**链地址法(常用）**
+### 链地址法(常用）
 
 **插入数据：**当插入的时候，我们需要通过散列函数计算出对应的散列槽位，将其插入到对应的链表中即可，所以插入的时间复杂度为O(1)。
 
-**查找或删除数据：**当查找、删除一个元素时，通过散列函数计算对应的槽，然后遍历链表查找或删除。对于散列比较均匀的散列函数，链表的节点个数k=n/m，其中n表示散列表中数据的个数，m表示散列表中槽的个数，所以是时间复杂度为O(k)。                                                                                  **注: ****HashMap****即使用了开放寻址法解决hash冲突。**
+**查找或删除数据：**当查找、删除一个元素时，通过散列函数计算对应的槽，然后遍历链表查找或删除。对于散列比较均匀的散列函数，链表的节点个数k=n/m，其中n表示散列表中数据的个数，m表示散列表中槽的个数，所以是时间复杂度为O(k)。                                                                                  **注: ****HashMap****即使用了开放寻址法解决hash冲突。**
 
-## **JAVA agent**
-
+## JAVA agent
 说到JVMTI，必须说一下JPDA，因为JVMTI是JPDA中的一环JPDA叫做Java 平台调试架构（Java Platform Debugger Architecture）JVMTI（JVM tool interface）位于jpda最底层
 
 JVMTI（Java Virtual Machine Tool Interface）即指 Java 虚拟机工具接口，它是一套由虚拟机直接提供的 native 接口，它处于整个 JPDA 体系的最底层，所有调试功能本质上都需要通过 JVMTI 来提供。通过这些接口，开发人员不仅调试在该虚拟机上运行的 Java 程序，还能查看它们运行的状态，设置回调函数，控制某些环境变量，从而优化程序性能。JVMTI 本质上是在 JVM 内部的许多事件进行了埋点。通过这些埋点可以给外部提供当前上下文的一些信息。甚至可以接受外部的命令来改变下一步的动作。外部程序一般利用C/C++实现一个JVMTIAgent，在Agent里面注册一些JVM事件的回调。当事件发生时JVMTI调用这些回调方法。Agent可以在回调方法里面实现自己的逻辑。JVMTIAgent是以动态链接库的形式被虚拟机加载的。
@@ -530,6 +518,7 @@ JVMTI（Java Virtual Machine Tool Interface）即指 Java 虚拟机工具接口�
 	- 设置某些native方法的前缀，主要在查找native方法的时候做规则匹配
 
 ![](images/WEBRESOURCE54e3f71c4aef87a061d01f0d9c8b02be截图.png)
+> 图：JAVA agent 相关截图
 
 [https://zhuanlan.zhihu.com/p/139756708](https://zhuanlan.zhihu.com/p/139756708)
 
@@ -616,10 +605,12 @@ private:
 [https://zhuanlan.zhihu.com/p/163073352](https://zhuanlan.zhihu.com/p/163073352)
 
 ![](images/WEBRESOURCEcab48093c326ac2b7e399b73605ceec9截图.png)
+> 图：探秘java stream api的底层实现 相关截图
 
 ![](images/WEBRESOURCEb54a9400d7d1540eb93967970cb756be截图.png)
+> 图：探秘java stream api的底层实现 相关截图
 
-**操作如何叠加**
+### 操作如何叠加
 
 以上只是解决了操作记录的问题，要想让流水线起到应有的作用我们需要一种将所有操作叠加到一起的方案。你可能会觉得这很简单，只需要从流水线的head开始依次执行每一步的操作（包括回调函数）就行了。
 
@@ -655,7 +646,7 @@ private:
 
 ## 并发的几种模式
 
-**一，****Immutability模式**
+### 一，Immutability模式
 
 如果对象一旦被创建，状态就不会再发生任何变化，并且只允许存在只读方法，这个对象就是不可变对象。利用不可变对象解决并发问题的模式，就是不可变模式。快速实现具备不可变性的类时，将类设置成final，类内的所有属性设置成final，只暴露只读方法即可。
 
@@ -663,13 +654,13 @@ private:
 
 但是在使用不可变模式时，一定要搞清楚特定不可变对象的边界在哪里。比如，一个final类C的final成员变量a，当a的内部存在非final的其他对象时，并且C中存在着get_a的public接口，那么C就不是线程安全的。
 
-**二，****Copy-on-Write模式**
+### 二，Copy-on-Write模式
 
 Copy-on-Write模式适用于对数据的实时性不敏感，读多写少且对读性能要求极为苛刻的小数据场景。
 
 具体的实现也很简单，当数据需要修改时，先复制一份出来，在复制的数据上进行修改，并发读还是在旧的数据上，当数据修改完成后，再将老数据替换为修改后的新数据即可。但需要注意的是，当发生并发写时，可以使用CAS的策略来完成。
 
-**三，****线程本地存储**
+### 三，线程本地存储
 
 Java语言提供ThreadLocal实现避免共享，即每个线程拥有自己的一份数据，线程之间没有竞争关系。
 
@@ -679,7 +670,7 @@ Java语言提供ThreadLocal实现避免共享，即每个线程拥有自己的�
 
 但需要注意的是，在线程池的场景中，因为线程池中的线程通常与进程是同生共死的，即使线程本地变量的生命周期已经结束了，但因为该线程池尚未被释放，数据也是无法被回收的。因此，在这种场景下，ThreadLocal方案要小心使用。
 
-**四，****Guarded Suspension模式**
+### 四，Guarded Suspension模式
 
 Guarded Suspension模式常用在异步转同步的场景中，是一个经典的管程实现。通过使用一个中间的GuardedObject对象，管理受保护的对象，并为对象的消费者提供get方法，为对象的生产者提供onChange方法。
 
@@ -687,13 +678,13 @@ Guarded Suspension模式常用在异步转同步的场景中，是一个经典�
 
 一个方案是，在GuardedObject内维护1个K-V的static Map对象和2个static方法（create和fireEvent）,消费者使用create创建和key绑定的Object对象并get等待，生产者线程在fireEvent中，通过消息中传递的key获得对应的Object对象并onChanged通知。
 
-**五，****Balking模式**
+### 五，Balking模式
 
 在Guarded Suspension模式中，如果消息未获得返回，消费者会始终阻塞在等待条件上，但需要快速放弃也是一个常见的需求。比如，自动存盘需求中，如果文件没有改变，就无需磁盘操作。又一个更常见的需求是，单次初始化操作时，使用init变量来控制。
 
 通常会使用一个状态变量status来控制是否存在改变，如果对原子性有要求，可以使用互斥锁，如果对原子性无特殊要求，直接使用volatile即可。
 
-**六，****Thread-Per-Message**
+### 六，Thread-Per-Message
 
 现实世界中，很多事情需要委托他人办理，同样的场景，在并发编程领域，就是Thread-Per_message模式，简而言之，就是由一个线程接收任务，并发的为每一个收到的任务分配一个独立线程，这是最简单的分工方法，实现起来也非常简单。
 
@@ -701,7 +692,7 @@ Guarded Suspension模式常用在异步转同步的场景中，是一个经典�
 
 在Go语言中，存在一种轻量级线程，即协程的方案。在协程的架构下，Thread-Per-Message模式就完全没有问题了。
 
-**七，****Worker Thread模式**
+### 七，Worker Thread模式
 
 Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，如果可以使用阻塞队列做任务池，再创建固定数量的线程消费队列中的任务，这种方式也是SDK并发工具包里提供的线程池方案。
 
@@ -711,7 +702,7 @@ Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，�
 
 除此之外，使用线程池，还需要注意ThreadLocal内存泄漏问题和任务的异常处理等，尤其是，在业务中，异常处理一旦发生，后果非常严重。
 
-**八，****两阶段终止模式**
+### 八，两阶段终止模式
 
 前面所有的内容都是论述，如何启动多线程去执行一个异步任务。那么，如何优雅的终止线程呢？业界也有一套成熟的方案，叫做“两阶段终止”模式。即，将终止过程分成两个阶段，第一阶段由线程T1向线程T2发送终止指令，第二阶段是由线程T2响应终止指令。
 
@@ -719,7 +710,7 @@ Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，�
 
 实现上，可以使用一个状态标志位status，在线程T1里设置T2.status后，调用T2.interrupt，将T2从可能的休眠状态中唤醒，T2检查status是否符合终止条件，如果符合，则尝试完成正确的收尾，并优雅退出。
 
-**九，****生产者-消费者模式**
+### 九，生产者-消费者模式
 
 两个线程池通过一个阻塞队列连接起来，一个生产者线程池向队列添加任务，另一个消费者线程池从队列中消费任务，两个线程池并不知道对方的存在，符合架构设计上的“解耦”，支持异步，并可以通过控制两个线程池的线程数目，平衡生产者和消费者的速度差异。
 
@@ -727,11 +718,11 @@ Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，�
 
 ## 多线程导致的问题
 
-- CPU 增加了缓存，以均衡与内存的速度差异；// 导致 可见性问题
+- CPU 增加了缓存，以均衡与内存的速度差异；// 导致 可见性问题
 
-- 操作系统增加了进程、线程，以分时复用 CPU，进而均衡 CPU 与 I/O 设备的速度差异；// 导致 原子性问题
+- 操作系统增加了进程、线程，以分时复用 CPU，进而均衡 CPU 与 I/O 设备的速度差异；// 导致 原子性问题
 
-- 编译程序优化指令执行次序，使得缓存能够得到更加合理地利用。// 导致 有序性问题
+- 编译程序优化指令执行次序，使得缓存能够得到更加合理地利用。// 导致 有序性问题
 
 1. 单一线程原则
 
@@ -775,7 +766,7 @@ Thread 对象的结束先行发生于 join() 方法返回。
 
 一个对象的初始化完成(构造函数执行结束)先行发生于它的 finalize() 方法的开始。
 
-[](#_8-传递性) 8. 传递性
+[](#_8-传递性) 8. 传递性
 
 > Transitivity
 
@@ -787,7 +778,7 @@ Thread 对象的结束先行发生于 join() 方法返回。
 
 线程安全不是一个非真即假的命题，可以将共享数据按照安全程度的强弱顺序分成以下五类: 不可变、绝对线程安全、相对线程安全、线程兼容和线程对立。
 
-[](#_1-不可变) 1. 不可变
+[](#_1-不可变) 1. 不可变
 
 不可变(Immutable)的对象一定是线程安全的，不需要再采取任何的线程安全保障措施。只要一个不可变的对象被正确地构建出来，永远也不会看到它在多个线程之中处于不一致的状态。
 
@@ -842,18 +833,23 @@ CPU缓存导致的可见性问题
 编译优化导致的有序性问题
 
 ![](images/WEBRESOURCE16a1a743c983f3811346e1b46d5bd9ef截图.png)
+> 图：并发问题的本质 相关截图
 
 关于主内存与工作内存之间具体的交互协议，即一个变量如何从主内存拷贝到工作内存、如何从工作内存同步回主内存这一类的实现细节，**Java内存模型中定义了8种操作来完成。Java虚拟机实现时必须保证下面提及的每个操作都是原子性的、不可再分的**（但对于 double 和 long 类型来说允许有例外，这个不是今天的重点，所以不在本文中详细阐述）
 
 **JMM定义了这8种操作，并对他们进行了规范，而这些规范是解决上文种提到的三特性问题的根本。**
 
 ![](images/WEBRESOURCEd50b085f76eabc1066ce0b6aa0c47b7f截图.png)
+> 图：并发问题的本质 相关截图
 
 ![](images/WEBRESOURCE800fccfce3959d86a774eb488cda0f4a截图.png)
+> 图：并发问题的本质 相关截图
 
 ![](images/WEBRESOURCE8b1956ac1e01db9c129f266243851b35截图.png)
+> 图：并发问题的本质 相关截图
 
 ![](images/WEBRESOURCE074ccb45361586e51ba73a8db6e6f9ec截图.png)
+> 图：并发问题的本质 相关截图
 
 ## 新建对象的安全发布（Safe Publication）
 
@@ -914,6 +910,7 @@ PECS原则是Java泛型中的一个重要原则，它代表了“Producer Extend
 ## Thread Local的内存泄露问题
 
 ![](images/WEBRESOURCEe76fea66a49f3d4c17df07a2b520ad33image.png)
+> 图：Thread Local的内存泄露问题 相关截图
 
 那存在长期性内存泄露需要满足条件：ThreadLocal被回收&&线程被复用&&线程复用后不再调用ThreadLocal的set/get/remove方法
 
