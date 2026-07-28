@@ -68,9 +68,10 @@ Kubernetes 架构与核心概念笔记，已扩写为包含集群架构、核心
 👉 [进入文件夹 →](设计模式/)
 
 ### 📚 基础知识
-Java 后端工程师核心基础：JVM、MySQL、Redis、Elasticsearch、消息队列、Spring、网络、数据结构与并发编程感悟；以及**大数据**全链路专题（采集/存储/计算/数仓/治理/湖仓一体）。
+Java 后端工程师核心基础：JVM、MySQL、Redis、Elasticsearch、消息队列、Spring、网络、数据结构与并发编程感悟；以及**大数据**全链路专题（采集/存储/计算/数仓/治理/湖仓一体）与 **CI/CD** 持续集成/持续交付专题（Jenkins / GitLab CI / GitHub Actions / GitOps / 部署策略 / DevSecOps）。
 
 - 📁 [大数据（新增 · 全链路体系）](基础知识/大数据/README.md)
+- 📁 [CI/CD（新增 · 持续集成与持续交付）](基础知识/CI-CD/README.md)
 - 📝 [Java 虚拟机](基础知识/Java虚拟机.md)
 - 📝 [MySQL 知识](基础知识/mysql知识.md)
 - 📝 [Redis 知识](基础知识/redis知识.md)
@@ -111,6 +112,22 @@ Java 后端工程师核心基础：JVM、MySQL、Redis、Elasticsearch、消息�
 - 📝 [TDengine](基础知识/时序库/TDengine.md)
 - 📝 [VictoriaMetrics](基础知识/时序库/VictoriaMetrics.md)
 - 📝 [Prometheus（TSDB 视角）](基础知识/时序库/Prometheus.md)
+
+**📁 CI/CD**（新增 · 持续集成与持续交付专题）
+- 📝 [板块索引与学习路径](基础知识/CI-CD/README.md)
+- 📝 [01 概述与核心概念](基础知识/CI-CD/01-概述与核心概念.md)
+- 📝 [02 版本控制与分支策略](基础知识/CI-CD/02-版本控制与分支策略.md)
+- 📝 [03 构建与制品管理](基础知识/CI-CD/03-构建与制品管理.md)
+- 📝 [04 Jenkins 架构与核心机制](基础知识/CI-CD/04-Jenkins架构与核心机制.md)
+- 📝 [05 Jenkins Pipeline as Code](基础知识/CI-CD/05-Jenkins Pipeline as Code.md)
+- 📝 [06 GitLab CI](基础知识/CI-CD/06-GitLab CI.md)
+- 📝 [07 GitHub Actions](基础知识/CI-CD/07-GitHub Actions.md)
+- 📝 [08 云原生 CI/CD 与 GitOps 工具](基础知识/CI-CD/08-云原生CI-CD与GitOps工具.md)
+- 📝 [09 流水线设计模式与最佳实践](基础知识/CI-CD/09-流水线设计模式与最佳实践.md)
+- 📝 [10 部署策略](基础知识/CI-CD/10-部署策略.md)
+- 📝 [11 容器化与 Kubernetes 集成](基础知识/CI-CD/11-容器化与Kubernetes集成.md)
+- 📝 [12 环境配置与密钥管理](基础知识/CI-CD/12-环境配置与密钥管理.md)
+- 📝 [13 可观测性、DORA 度量与 DevSecOps](基础知识/CI-CD/13-可观测性DORA度量与DevSecOps.md)
 
 👉 [进入文件夹 →](基础知识/)
 
