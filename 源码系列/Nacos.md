@@ -280,4 +280,110 @@ public void run() {
         LogUtil.DEFAULT_LOG.error("data change error: {}", ExceptionUtil.getStackTrace(t));
     }
 }
+
+---
+
+## 注册中心的心跳与健康检查
+
+### 客户端心跳（BeatReactor）
+
+在 `registerInstance` 中已看到：临时实例（ephemeral）会向 `BeatReactor` 注册一个 `BeatInfo`（默认 5s 一次）。`BeatReactor` 内部维护一个 `ScheduledExecutorService`，对每个实例提交 `BeatTask`：
+
+```java
+// BeatReactor 核心
+public void addBeatInfo(String serviceName, BeatInfo beatInfo) {
+    executorService.schedule(new BeatTask(beatInfo), beatInfo.getPeriod(), TimeUnit.MILLISECONDS);
+}
+class BeatTask implements Runnable {
+    public void run() {
+        // 发送 HTTP /instance/beat 心跳包
+        serverProxy.sendBeat(beatInfo);
+        // 按 period 续约下一次心跳（若未被停止）
+        executorService.schedule(this, beatInfo.getPeriod(), TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+- **临时实例（ephemeral=true）**：依靠客户端心跳保活；服务端超过 `getIPDeleteTimeout()`（默认 30s，约 6 次心跳）未收到心跳则剔除实例。
+- **持久实例（ephemeral=false）**：由服务端主动发起**健康检查**（TCP / HTTP / MySQL 探活），不依赖客户端心跳。
+
+### 服务端健康检查
+
+服务端 `HealthCheckTask` 周期性扫描实例最后心跳时间，超时则置为不健康并从可用列表移除（对临时实例直接剔除）。持久实例通过 `HealthCheckProcessor` 异步探测并回写健康状态。
+
+### 一致性协议：Distro（AP）与 Raft（CP）
+
+| 维度 | Distro（AP，默认） | Raft（CP，元数据/配置/持久实例） |
+|------|-------------------|----------------------------------|
+| 适用数据 | 临时服务实例 | 配置、命名空间、持久实例 |
+| 一致性 | 最终一致 | 强一致 |
+| 选主 | 无（每个节点平等） | 有 Leader |
+
+## 配置中心长轮询（客户端视角）
+
+服务端 `addLongPollingClient` / `DataChangeTask` 已在上方分析。客户端侧由 `ClientWorker` 的 `LongPollingRunnable` 驱动：
+
+```java
+class LongPollingRunnable implements Runnable {
+    public void run() {
+        try {
+            // 1. 检查本地缓存 md5，是否有变更
+            checkLocalConfigInfo();
+            // 2. 向服务端 /v1/cs/configs/listener 发起长轮询，带上本地 md5Map
+            List<String> changedGroups = checkUpdateDataIds(cacheDataMap, inInitializingCacheList);
+            // 3. 服务端返回变更 groupKey，客户端拉取最新配置
+            for (String groupKey : changedGroups) {
+                getServerConfig(dataId, group, tenant);
+                localConfigInfoProcessor.save(dataId, group, tenant, content);
+            }
+        } finally {
+            // 4. 无论是否变更，立即再发起下一次长轮询（循环监听）
+            executorService.schedule(this, 0, TimeUnit.MILLISECONDS);
+        }
+    }
+}
+```
+
+要点：客户端把本地配置 md5 摘要随长轮询请求上报，服务端比对缓存 md5；有变更立即返回，无变更则 hold 最长 ~30s（29.5s + 500ms 提前量）后超时返回，客户端重新发起——实现**准实时推送 + 低开销**。
+
+## Nacos 的 Raft 选主（CP 模式）
+
+Nacos 的 CP 数据（配置、持久实例）基于 Raft 实现（新版使用 SOFA-JRaft）。核心类 `RaftCore` 维护节点状态机：
+
+- **角色**：`LEADER` / `CANDIDATE` / `FOLLOWER`，由 `RaftPeer.state` 表示。
+- **Term（任期）**：单调递增，每次选举自增；所有 RPC 都携 `term`，发现对方 term 更大则退为 FOLLOWER。
+- **选举流程**：
+
+```mermaid
+sequenceDiagram
+    participant F as Follower
+    participant C as Candidate
+    participant O as 其他节点
+    F->>F: election timeout（随机 150-300ms）触发
+    F->>C: 转为 Candidate，term++，投自己一票
+    C->>O: RequestVote(term, lastLogIndex)
+    O-->>C: 投票（任期更大且日志更新则同意）
+    C->>C: 获得多数票 → 成为 Leader
+    C->>O: 周期性 AppendEntries(心跳) 维持权威
+    Note over O,C: Leader 宕机 → 剩余节点超时重新选举
+```
+
+- **日志复制**：客户端写请求经 Leader，`RaftCore` 先将操作追加到本地 `Log`（文件 + 内存），再广播 `AppendEntries` 给 Follower，收到多数 ACK 后 `commit` 并应用到状态机（`Datum` 内存表 + 落盘）。
+- **成员变更 / 数据恢复**：`RaftPeerSet` 管理集群节点，`RaftStore` 负责 Raft 日志与快照的持久化（故障重启后 replay 恢复）。
+
+> 理解 Nacos 一致性要分清「注册中心（AP/Distro，可用优先）」与「配置中心（CP/Raft，一致优先）」两套协议并存的设计，这正是 Nacos 相对 Eureka/Apollo 的差异化点。
+
+## Nacos 与 Eureka / Apollo 对比
+
+| 维度 | Nacos | Eureka | Apollo |
+|------|-------|--------|--------|
+| 定位 | 注册中心 + 配置中心 一体 | 仅注册中心 | 仅配置中心 |
+| 一致性 | 注册 AP（Distro）/ 配置 CP（Raft） | AP（Peer 复制，弱一致） | CP（数据库 + 配置发布） |
+| 配置推送 | 长轮询（准实时） | 无 | 长轮询 + 客户端定时拉取 |
+| 健康检测 | 心跳（临时）/ 服务端探测（持久） | 客户端心跳 + 自我保护 | — |
+| 动态刷新 | 支持 `@RefreshScope` | 不支持 | 支持 |
+| 管理界面 | 自带 | 无（需第三方） | 自带，功能丰富 |
+| 生态 | Spring Cloud Alibaba | Spring Cloud Netflix | 独立，多语言客户端 |
+
+> 小结：Nacos 用「一套底座同时支撑注册与配置」，并允许按场景在 AP/CP 间取舍（注册走 AP 保证可用，配置走 CP 保证一致），这是其相对 Eureka（纯 AP）、Apollo（纯配置）的核心优势。
 ```

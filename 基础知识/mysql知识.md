@@ -1864,3 +1864,58 @@ LOGICAL_CLOCK：表示基于组提交的方式来完成并行复制。
 4. 优化 2：索引上的等值查询，向右遍历时且最后一个值不满足等值条件的时候，next-key lock 退化为间隙锁。
 
 5. 一个 bug：唯一索引上的范围查询会访问到不满足条件的第一个值为止。
+
+## 执行计划（EXPLAIN）深度解读与生产案例
+
+`EXPLAIN` 只是入门，`FORMAT=JSON`（MySQL 8.0 可用 `EXPLAIN ANALYZE`）才能看到真实执行成本与行数预估偏差：
+
+```sql
+EXPLAIN FORMAT=JSON SELECT * FROM orders WHERE user_id = 1 AND status = 'PAID' ORDER BY create_time DESC LIMIT 10;
+EXPLAIN ANALYZE SELECT ...;  -- 实际执行并返回真实耗时/行数（8.0+）
+```
+
+重点关注：
+- **type 优化路径**：`system > const > eq_ref > ref > range > index > ALL`。生产红线：**杜绝 ALL（全表扫描）与 index（全索引扫描）**，至少到 `range`。
+- **rows 与 filtered**：`rows` 是预估扫描行数，`filtered` 是过滤后百分比，二者乘积近似返回行数；若 `rows` 远大于实际，说明统计信息过期，需 `ANALYZE TABLE`。
+- **Extra 关键词**：
+  - `Using index`：覆盖索引，无需回表（优）；
+  - `Using where; Using index`：索引过滤+覆盖；
+  - `Using filesort`：无法利用索引排序，需额外排序（排序缓冲/sort_mode）；
+  - `Using temporary`：用临时表（如 GROUP BY 无索引），性能杀手；
+  - `Select tables optimized away`：优化器直接聚合（优）。
+
+**案例**：`WHERE a=? ORDER BY b LIMIT 10` 出现 `Using filesort`。建联合索引 `(a, b)` 即可把排序下推到索引，消除 filesort。
+
+## 锁机制全景（InnoDB）
+
+InnoDB 锁层次：
+
+| 锁类型 | 范围 | 说明 |
+| --- | --- | --- |
+| 行锁 Record Lock | 单行 | 锁定索引记录 |
+| 间隙锁 Gap Lock | 区间 | 锁定记录间空隙，防插入（解决幻读） |
+| Next-Key Lock | 行+间隙 | 左开右闭，默认 RR 级别加锁单位 |
+| 意向锁 IS/IX | 表级 | 快速判断表是否被行锁占用 |
+| 插入意向锁 | 间隙 | 插入前的特殊 gap 锁，提升并发插入 |
+
+**死锁排查**：`SHOW ENGINE INNODB STATUS` 看 `LATEST DETECTED DEADLOCK`；业务侧固定加锁顺序、缩短事务、降低隔离级别（RC 下 gap 锁退化）可减少死锁。
+
+**幻读**：InnoDB 在 RR 下靠 **Next-Key Lock + MVCC** 解决快照读幻读；当前读（`SELECT ... FOR UPDATE`）靠 Next-Key Lock 防插入幻行。
+
+## 分库分表实战
+
+- **拆分维度**：按**业务（垂直分库）**与按**数据量（水平分表）**。单表建议控制在 500w~2000w 行。
+- **分片键选择**：高基量、无跨片查询、避免热点。用户侧用 `user_id`，订单侧用 `user_id` 或 `order_id`（含分片位）。
+- **路由算法**：`hash(shard_key) % N`（均匀但扩容需迁移）vs **一致性哈希**（扩容只迁移 1/N）；或 **基因法**（分片键内嵌入用户分片位，避免订单按 order_id 查时扫全库）。
+- **扩容**：提前规划 2 的倍数；使用 `sharding-sphere` 的扩容迁移工具做在线搬迁。
+- **分布式 ID**：雪花算法（注意时钟回拨）、号段模式（Leaf-segment）、UUID（无序，索引碎裂，慎用）。
+
+**坑**：跨分片 `JOIN`、`COUNT(*)`、`ORDER BY LIMIT` 需中间件归并；分布式事务优先最终一致（本地消息表/TCC），强一致用 XA 代价高。
+
+## 生产实践与面试高频
+
+1. **为什么 B+ 树不用哈希/二叉平衡树**：磁盘 IO 按页，B+ 树矮胖（3 层存千万级）、叶子链表支持范围扫描；哈希不支持范围、二叉树高导致多次 IO。
+2. **Buffer Pool 是性能核心**：读走缓冲池，写走 change buffer（非唯一二级索引）；`innodb_buffer_pool_size` 建议物理内存 60%~80%。
+3. **刷脏与 Checkpoint**：避免一次性刷盘卡顿，double write 防页断裂。
+4. **慢 SQL 定位**：慢查询日志 `slow_query_log` + `pt-query-digest` 聚合；线上用 `SHOW PROCESSLIST` 看长事务/`Sending data`。
+5. **RR 与 RC 的选择**：RC 减少锁冲突、主从用 RC 更友好，但丢失 RR 的防幻读语义；互联网业务多选用 RC + 业务层防重。

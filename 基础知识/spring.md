@@ -131,3 +131,53 @@ Resilience4j 在“容错”方面提供了各种模式：断路器（Circuit Br
 核心是 AbstractRoutingDataSource 这个类，这个是 spring-jdbc 自带的。
 
 ## Spring Modulith（模块化单体）
+
+## AOP 原理深度
+
+AOP（面向切面编程）基于**动态代理**与**责任链**实现：
+
+- **JDK 动态代理**：目标类实现接口时，生成接口代理，拦截 `invoke`；
+- **CGLIB**：无接口时继承目标类生成子类，`MethodInterceptor` 拦截；Spring Boot 2.x 起默认 CGLIB。
+- **织入（Weaving）**：Spring 在 Bean 初始化后（`postProcessAfterInitialization`）用 `AbstractAutoProxyCreator` 决定是否创建代理。
+- **责任链执行**：一个方法上的多个 Advisor 组成拦截器链（`ReflectiveMethodInvocation`），依次 `proceed()` 嵌套执行，形成前置→目标→后置的环绕。
+
+```mermaid
+sequenceDiagram
+    participant P as Proxy
+    participant C as Chain
+    participant T as Target
+    P->>C: 调用
+    C->>C: @Before 通知
+    C->>T: 执行目标方法
+    T-->>C: 返回
+    C->>C: @After/@AfterReturning
+    C-->>P: 结果
+```
+
+切点表达式：`execution(* com.x..*Service.*(..))`、`@annotation(Log)`、`within`、`this/ target`。
+
+## Spring 事务传播行为（7 种）
+
+| 传播行为 | 行为 |
+| --- | --- |
+| `REQUIRED`（默认） | 有事务加入，无则新建 |
+| `REQUIRES_NEW` | 挂起当前事务，新建独立事务（内外互不回滚） |
+| `SUPPORTS` | 有则加入，无则以非事务运行 |
+| `NOT_SUPPORTED` | 挂起事务，非事务执行 |
+| `MANDATORY` | 必须有事务，否则抛异常 |
+| `NEVER` | 必须无事务，否则抛异常 |
+| `NESTED` | 当前事务内嵌保存点子事务，回滚只到保存点 |
+
+关键点：**自调用失效**——同类方法互调不经过代理，事务/`@Async`/`@Cacheable` 不生效；需注入自身代理或拆类。
+
+## Bean 生命周期（完整链路）
+
+`BeanDefinition` 加载 → `BeanFactoryPostProcessor`(改 BD) → 实例化 → `BeanPostProcessor.postProcessBeforeInitialization` → `@PostConstruct` / `InitializingBean.afterPropertiesSet` → 自定义 init-method → `postProcessAfterInitialization`(AOP 在此) → 就绪 → 销毁 `@PreDestroy` / `DisposableBean.destroy`。
+
+## 常见坑与面试高频
+
+1. **循环依赖**：Spring 用**三级缓存**（`singletonObjects`/`earlySingletonObjects`/`singletonFactories`）解决单例 setter/字段注入；**构造器注入无法解决**（抛 `BeanCurrentlyInCreationException`）。
+2. **事务失效场景**：自调用、非 public 方法、异常被 catch 吞掉、数据库引擎不支持（MyISAM）、数据源未交由 Spring 事务管理。
+3. **`@Transactional` 只读**：查询方法设 `readOnly=true` 可提示数据库优化（如 MySQL 只读连接）。
+4. **Bean 作用域**：`singleton`（默认，容器内单例）/ `prototype`（每次新）/ `request`、`session`、`application`（Web）。
+5. **`ApplicationContext` vs `BeanFactory`**：前者是后者的超集，预初始化单例、支持事件/国际化/AOP 等。

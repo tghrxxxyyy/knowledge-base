@@ -165,7 +165,7 @@ public class DelayQueue<E extends Delayed> extends AbstractQueue<E>
     }
     //...
 }
-//继承了Comparable
+    //继承了Comparable
 public interface Delayed extends Comparable<Delayed> {
 
 
@@ -173,4 +173,112 @@ public interface Delayed extends Comparable<Delayed> {
 
 
 }
+
+---
+
+## 集合框架核心源码要点
+
+### HashMap（JDK 8+）
+
+- **结构**：数组 `Node<K,V>[] table` + 链表 + 红黑树。默认容量 16，负载因子 0.75，阈值 = 容量 × 负载因子。
+- **hash 扰动**：`(h = key.hashCode()) ^ (h >>> 16)`，高位参与运算减少碰撞。
+- **定位桶**：`(n - 1) & hash`，容量恒为 2 的幂才有此优化。
+- **树化**：链表长度 ≥ 8 且 table 容量 ≥ 64 时转红黑树；树节点 ≤ 6 时退化为链表。
+- **扩容**：`resize()` 双倍扩容，利用 `e.hash & oldCap` 判断元素留在原桶还是迁移到「原位置 + oldCap」，无需重算 hash。
+- **并发问题**：`put` 时多线程同时扩容可能形成**环形链表**导致 `get` 死循环（JDK 7 经典 bug，JDK 8 改为尾插但仍非线程安全，正式并发请用 `ConcurrentHashMap`）。
+
+### ConcurrentHashMap（JDK 8+）
+
+- **放弃分段锁**，改为 `Node[]` + `synchronized`（锁桶头节点）+ `CAS`。
+- 写：`hash` 定位桶，桶空用 `CAS` 放头节点；非空则 `synchronized` 锁住头节点，链表/树插入。
+- 读：几乎无锁（`volatile` 修饰 `value` 与 `next`，保证可见性）。
+- `size()` 用 `baseCount` + `CounterCell[]` 分片累加（类似 LongAdder），避免热点。
+
+```java
+// 典型写流程（putVal 简化）
+if (tab == null || (f = tabAt(tab, i = (n - 1) & h)) == null) {
+    if (casTabAt(tab, i, null, new Node<K,V>(h, k, v))) break; // CAS 无锁插入
+} else {
+    synchronized (f) { /* 锁头节点，链表/树插入 */ }
+}
+```
+
+## 并发基石：AQS 与锁
+
+### AbstractQueuedSynchronizer（AQS）
+
+AQS 是 `ReentrantLock` / `Semaphore` / `CountDownLatch` / `ReentrantReadWriteLock` 的底层同步框架。
+
+- **state**：`volatile int state`，同步状态（锁重入次数 / 许可数）。
+- **CLH 队列**：竞争失败的线程包装成 `Node` 入队（FIFO 双向队列），`Node` 的 `waitStatus`（SIGNAL/CANCELLED 等）控制唤醒。
+- **两种模式**：`exclusive`（独占，如锁）、`shared`（共享，如信号量）。
+- 模板方法：`tryAcquire` / `tryRelease` / `tryAcquireShared` / `tryReleaseShared` 由子类实现，AQS 负责入队、阻塞（`LockSupport.park`）、唤醒。
+
+```mermaid
+flowchart LR
+    T1[线程 acquire] -->|tryAcquire 成功| OK[获得锁]
+    T1 -->|失败| Q[入 CLH 队列 park]
+    L[持有锁线程 release] -->|tryRelease state=0| W[unpark 队首]
+    W --> Q
+```
+
+### ReentrantLock vs synchronized
+
+| 维度 | synchronized | ReentrantLock |
+|------|--------------|---------------|
+| 实现 | JVM 内置（监视器锁） | AQS（Java 代码） |
+| 可中断 | 否 | `lockInterruptibly()` 可 |
+| 公平/非公平 | 非公平 | 可选 `fair=true` |
+| 条件变量 | 单一 `wait/notify` | 多 `Condition` |
+| 尝试获取 | 否 | `tryLock(timeout)` |
+
+- `synchronized` 在 JDK 6 后有多级锁升级：**偏向锁 → 轻量级锁（CAS 自旋）→ 重量级锁（操作系统互斥，线程 park）**，降低无竞争时的开销。
+- `ReentrantLock` 非公平模式下，新线程可能抢到刚释放的锁（插队），吞吐更高；公平模式严格按队列顺序。
+
+### CAS 与原子类
+
+`Unsafe.compareAndSwapInt` 是乐观锁基础：`期望值==内存值`才更新，失败重试（自旋）。问题：
+
+- **ABA**：值被改回原值，CAS 误判成功 → 用 `AtomicStampedReference`（版本号）解决。
+- **自旋开销**：高竞争下 CPU 空转。
+
+`LongAdder` 用**分段 Cell + base** 把热点分散，高并发累加性能远胜 `AtomicLong`（Sentinel/Netty 统计均用此思想）。
+
+```java
+// AtomicInteger 核心
+public final int incrementAndGet() {
+    return U.getAndAddInt(this, VALUE, 1) + 1; // Unsafe CAS 自旋
+}
+```
+
+## 线程池（ThreadPoolExecutor）源码要点
+
+除上方 `ScheduledThreadPoolExecutor` 外，普通 `ThreadPoolExecutor` 关键点：
+
+- **七大参数**：`corePoolSize` / `maximumPoolSize` / `keepAliveTime` / `workQueue` / `threadFactory` / `handler` / `allowCoreThreadTimeOut`。
+- **execute 流程**：核心线程未满 → 新建 `Worker` 跑任务；核心满 → 任务进 `workQueue`；队列满 → 创建非核心线程至 `maximumPoolSize`；再满 → 触发 `RejectedExecutionHandler`（Abort/Discard/DiscardOldest/CallerRuns）。
+- **Worker**：本身继承 `AQS` 且实现 `Runnable`，`run()` → `runWorker()` 循环 `getTask()` 从队列取任务；空闲超 `keepAliveTime` 且线程数 > core 则回收。
+
+```java
+// execute 核心分支（简化）
+if (workerCount < corePoolSize) addWorker(command, true);
+else if (workQueue.offer(command)) { /* 入队 */ }
+else if (!addWorker(command, false)) reject(command); // 拒绝策略
+```
+
+```mermaid
+flowchart TD
+    A[提交任务] --> B{核心线程<core?}
+    B -->|是| C[新建核心 Worker 执行]
+    B -->|否| D{队列未满?}
+    D -->|是| E[入 workQueue]
+    D -->|否| F{线程数<max?}
+    F -->|是| G[新建非核心 Worker]
+    F -->|否| H[拒绝策略]
+    E --> I[Worker 取任务执行]
+    G --> I
+    C --> I
+```
+
+> **读源码建议**：线程池抓 `execute` → `addWorker` → `runWorker` → `getTask`；并发锁抓 AQS 的 `acquire`/`release` 与 `Node` 入队；原子类抓 `Unsafe` + `LongAdder` 分段。HashMap 重点看 `resize` 的低位/高位拆分。
 ```

@@ -834,3 +834,56 @@ ZGC还有一个常在技术资料上被提及的优点是支持“NUM A-Aware”
 
 ## Epsilon
 在实际生产环境中，不能进行垃圾收集的Epsilon也仍有用武之地。很长一段时间以来，Java技术 体系的发展重心都在面向长时间、大规模的企业级应用和服务端应用，尽管也有移动平台(指JavaME而不是Android)和桌面平台的支持，但使用热度上与前者相比要逊色不少。可是近年来大型系统 从传统单体应用向微服务化、无服务化方向发展的趋势已越发明显，Java在这方面比起Golang等后起 之秀来确实有一些先天不足，使用率正渐渐下降。传统Java有着内存占用较大，在容器中启动时间 长，即时编译需要缓慢优化等特点，这对大型应用来说并不是什么太大的问题，但对短时间、小规模 的服务形式就有诸多不适。为了应对新的技术潮流，最近几个版本的JDK逐渐加入了提前编译、面向 应用的类数据共享等支持。Epsilon也是有着类似的目标，如果读者的应用只要运行数分钟甚至数秒， 只要Java虚拟机能正确分配内存，在堆耗尽之前就会退出，那显然运行负载极小、没有任何回收行为 的Epsilon便是很恰当的选择
+
+## GC 日志实战与解读
+
+开启 GC 日志是排查内存问题的第一步。JDK 9+ 统一使用 `-Xlog`：
+
+```bash
+# JDK 9+ 推荐配置
+-Xlog:gc*,gc+heap=debug,gc+age=trace:file=/path/gc-%t.log:time,uptime,pid:filecount=10,filesize=100M
+# JDK 8 及以前
+-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:/path/gc.log -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=10 -XX:GCLogFileSize=100M
+```
+
+关键指标解读：
+- **吞吐量与停顿**：关注 `Pause Young`/`Pause Full GC` 的耗时与频次；CMS/G1/ZGC 的“并发周期”不导致 Stop-The-World。
+- **晋升失败 / Promotion Failed**：老年代空间不足导致 Young GC 时对象无法晋升，触发 Full GC，需调大老年代或调整 `-XX:MaxTenuringThreshold`。
+- **Allocation Failure**：Eden 满触发 Young GC，正常；但频率过高说明 Eden 偏小或分配速率高。
+- **Metadata GC Threshold**：元空间不足，调 `-XX:MetaspaceSize`。
+
+使用 **GCViewer / GCEasy（在线）/ 阿里 Arthas** 可视化分析。Arthas 还可 `dashboard`、`heapdump`、`jvm` 实时观测：
+
+```bash
+# Arthas 常用命令
+dashboard          # 实时面板（线程/内存/GC）
+heapdump /tmp/d.hprof   # 堆转储
+jvm               # JVM 概要
+sc -d com.xxx.Class   # 类详情
+```
+
+## GC 调优参数速查（生产常用）
+
+| 目标 | 参数 | 说明 |
+| --- | --- | --- |
+| 选择收集器 | `-XX:+UseG1GC` / `-XX:+UseZGC` / `-XX:+UseShenandoahGC` | JDK 9+ 优先 G1/ZGC |
+| 堆大小 | `-Xms` `-Xmx` | 二者设相等避免动态扩容抖动 |
+| 新生代 | `-Xmn` 或 `-XX:NewRatio` | 影响 Young GC 频率 |
+| 停顿目标 | `-XX:MaxGCPauseMillis` | G1/ZGC 的软目标 |
+| 元空间 | `-XX:MetaspaceSize` `-XX:MaxMetaspaceSize` | 防止元空间无限膨胀 |
+| OOM 时动作 | `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/path` | 必开，便于事后排查 |
+
+## 常见 OOM 与定位
+
+- `java.lang.OutOfMemoryError: Java heap space`：堆对象过多/内存泄漏，`jmap -histo:live pid` 看占用 Top 类，MAT 分析支配树。
+- `Metaspace`：类加载泄漏（如自定义 ClassLoader 未释放、大量动态代理/字节码增强）。
+- `Unable to create new native thread`：线程数超限（`ulimit -u`、容器线程上限），排查线程池不收敛。
+- `Direct buffer memory`：Netty/ByteBuffer 堆外内存泄漏，关注 `-XX:MaxDirectMemorySize`。
+
+## 面试高频与易错点
+
+1. **GC Roots 包含**：虚拟机栈引用、本地方法栈引用、方法区静态属性/常量、被同步锁持有的对象、JVM 内部引用。
+2. **CMS 已被废弃**（JDK 9 标记废弃，14 移除），生产用 G1；超低延迟用 ZGC/Shenandoah。
+3. **三色标记与漏标**：增量更新（Incremental Update，CMS 用）与原始快照 SATB（G1/ZGC 用）两种解决方案。
+4. **ZGC 染色指针**把 GC 标记信息放在指针上（借助 64 位地址多余位），实现并发整理且停顿 < 10ms；但堆上限受地址位限制（JDK 15+ 已支持 TB 级）。
+5. **安全点（Safepoint）**：只有到达安全点才能 STW；JIT 在方法返回、循环回边等位置插入安全点轮询。 的Epsilon便是很恰当的选择

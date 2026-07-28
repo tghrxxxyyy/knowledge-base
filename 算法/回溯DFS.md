@@ -117,4 +117,120 @@ class Solution {
         }
     }
 }
+
+## 三、剪枝策略
+
+| 剪枝类型 | 做法 |
+| --- | --- |
+| 可行性 | 当前路径已不可能成解 → return |
+| 重复性 | 同层相同元素跳过（先排序 + used 标记） |
+| 最优性 | 当前代价已超已知最优解 → return |
+| 顺序 | 规定枚举顺序避免对称重复 |
+
+## 四、排列 / 组合 / 子集
+
+### 4.1 子集（78）
+
+```java
+public List<List<Integer>> subsets(int[] nums) {
+    List<List<Integer>> res = new ArrayList<>();
+    backtrack(nums, 0, new ArrayList<>(), res);
+    return res;
+}
+void backtrack(int[] nums, int start, List<Integer> path, List<List<Integer>> res) {
+    res.add(new ArrayList<>(path));
+    for (int i = start; i < nums.length; i++) {
+        path.add(nums[i]);
+        backtrack(nums, i+1, path, res);
+        path.remove(path.size()-1);
+    }
+}
+```
+
+### 4.2 组合（77，带剪枝）
+
+```java
+public List<List<Integer>> combine(int n, int k) {
+    List<List<Integer>> res = new ArrayList<>();
+    backtrack(n, k, 1, new ArrayList<>(), res);
+    return res;
+}
+void backtrack(int n, int k, int start, List<Integer> path, List<List<Integer>> res) {
+    if (path.size() == k) { res.add(new ArrayList<>(path)); return; }
+    for (int i = start; i <= n - (k - path.size()) + 1; i++) { // 剪枝
+        path.add(i);
+        backtrack(n, k, i+1, path, res);
+        path.remove(path.size()-1);
+    }
+}
+```
+
+### 4.3 全排列去重（47）
+
+```java
+public List<List<Integer>> permuteUnique(int[] nums) {
+    Arrays.sort(nums);
+    List<List<Integer>> res = new ArrayList<>();
+    backtrack(nums, new boolean[nums.length], new ArrayList<>(), res);
+    return res;
+}
+void backtrack(int[] nums, boolean[] used, List<Integer> path, List<List<Integer>> res) {
+    if (path.size() == nums.length) { res.add(new ArrayList<>(path)); return; }
+    for (int i = 0; i < nums.length; i++) {
+        if (used[i]) continue;
+        if (i > 0 && nums[i] == nums[i-1] && !used[i-1]) continue; // 同层去重
+        used[i] = true; path.add(nums[i]);
+        backtrack(nums, used, path, res);
+        used[i] = false; path.remove(path.size()-1);
+    }
+}
+```
+
+## 五、棋盘与 N 皇后（51）
+
+```java
+public List<List<String>> solveNQueens(int n) {
+    List<List<String>> res = new ArrayList<>();
+    int[] queens = new int[n]; Arrays.fill(queens, -1);
+    boolean[] cols = new boolean[n], dg = new boolean[2*n], udg = new boolean[2*n];
+    backtrack(0, n, queens, cols, dg, udg, res);
+    return res;
+}
+void backtrack(int row, int n, int[] q, boolean[] cols, boolean[] dg, boolean[] udg, List<List<String>> res) {
+    if (row == n) { res.add(build(q, n)); return; }
+    for (int col = 0; col < n; col++) {
+        if (cols[col] || dg[row-col+n] || udg[row+col]) continue;
+        q[row] = col; cols[col]=dg[row-col+n]=udg[row+col]=true;
+        backtrack(row+1, n, q, cols, dg, udg, res);
+        q[row] = -1; cols[col]=dg[row-col+n]=udg[row+col]=false; // 撤销
+    }
+}
+```
+- 用列、主对角线 `row-col`、副对角线 `row+col` 三个布尔数组做 O(1) 冲突检测。
+
+## 六、记忆化搜索（自顶向下 DP）
+
+回溯 + 备忘录等价于 DP，写法更直观：
+
+```java
+Map<String, Integer> memo = new HashMap<>();
+int dfs(int i, int j) {
+    if (i == 0 || j == 0) return 0;
+    String key = i + "," + j;
+    if (memo.containsKey(key)) return memo.get(key);
+    int res = Math.max(dfs(i-1, j), dfs(i, j-1)) + 1; // 示例
+    memo.put(key, res);
+    return res;
+}
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> 选1
+    选1 --> 选2
+    选1 --> 不选2
+    不选2 --> 选3
+    选2 --> [*]
+    选3 --> [*]
+```
 ```

@@ -832,3 +832,39 @@ transparent-huge-pages yes
 ## redis的monitor命令
 
 可以监控redis中执行的命令，用来观察框架执行的redis语句或分析，开启会影响性能
+
+## 通信协议 RESP
+
+Redis 客户端与服务端使用 **RESP（REdis Serialization Protocol）**，文本、易解析、人类可读：
+
+- 简单字符串：`+OK\r\n`
+- 错误：`-ERR ...\r\n`
+- 整数：`:10\r\n`
+- 批量字符串：`$长度\r\n内容\r\n`（如 `$4\r\nPING\r\n`）
+- 数组：`*元素个数\r\n...`（命令本身就是数组，如 `*2\r\n$4\r\nGET\r\n$3\r\nkey\r\n`）
+
+RESP3（Redis 6+）支持更多类型（map、set、push 等），并在 RESP2 基础上降低客户端解析开销。RESP 的简洁正是 Redis 单线程下吞吐高的原因之一。
+
+## 集群运维（Cluster）
+
+- **数据分片**：16384 个 slot，`hash_slot = CRC16(key) & 16383`；slot 均匀分布到各主节点。
+- **扩缩容**：`redis-cli --cluster add-node` 加入新节点后 `reshard` 迁移 slot；迁移期间源节点对正在迁移的 key 返回 `ASK` 重定向，客户端需临时转向目标节点（vs `MOVED` 为永久重定向）。
+- **Gossip 与故障转移**：节点间 Gossip 互通；主故障经 N 个节点确认后从 slave 中选举新主；`cluster-require-full-coverage no` 可避免单 slot 不可用导致整个集群不可写。
+- **脑裂防护**：`min-replicas-to-write` + `min-replicas-max-lag` 限制主在失联副本过多时拒绝写入，降低数据丢失。
+
+## 缓存经典问题
+
+| 问题 | 现象 | 方案 |
+| --- | --- | --- |
+| 缓存穿透 | 查不存在的 key，直击 DB | 空值缓存（短 TTL）+ 布隆过滤器 |
+| 缓存击穿 | 热点 key 过期瞬间高并发打 DB | 互斥锁重建 / 逻辑过期（不设物理 TTL，异步刷新） |
+| 缓存雪崩 | 大量 key 同时过期 / Redis 宕机 | 过期时间加随机抖动 / 多级缓存 / 高可用集群 |
+
+## 生产实践与面试高频
+
+1. **过期删除策略**：惰性删除 + 定期删除（`activeExpireCycle` 每 100ms 抽样 20 个 key）；内存淘汰在 `maxmemory` 触发，策略见 `maxmemory-policy`（volatile-lru / allkeys-lru / lfu 等）。
+2. **大 key 危害**：删除/序列化阻塞，用 `UNLINK` 异步删除、`SCAN` 渐进遍历；大 value 拆分（hash field 分片）。
+3. **热 key**：本地缓存 + 多副本；Redis 7 的 `client-eviction`、代理层（Codis/Twemproxy）分摊。
+4. **持久化选型**：RDB（快照，恢复快，丢数据多）+ AOF（append-only，可每秒 fsync，数据更安全；Redis 7 的 AOF 自动重写更高效）；混合持久化 `aof-use-rdb-preamble` 兼顾二者。
+5. **Pipeline 与 批量**：`PIPELINE` 将多条命令一次网络往返，提升吞吐；`MSET`/`MGET` 减少 RTT。
+6. **事务与 Lua**：`MULTI/EXEC` 非原子回滚（单条失败不影响其他）；复杂原子操作放 Lua 脚本（注意脚本不能过长，否则阻塞）。

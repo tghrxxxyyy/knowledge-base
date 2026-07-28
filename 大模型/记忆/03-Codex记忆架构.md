@@ -94,3 +94,34 @@ project_doc_fallback_filenames = ["TEAM_GUIDE.md", "CONTRIBUTING.md"]
 > 一句话差异：**Codex 的 `AGENTS.md` 是静态的、agent 不能自主改写；Memories 正是用来补「对话中涌现的事实」这块 `AGENTS.md` 覆盖不到的缺口**。Claude 侧则是用 Auto Memory 直接补同一缺口，但静态/生成两层都不允许 agent 改写静态层。
 
 下一篇：[04-跨系统对比与落地建议.md](./04-跨系统对比与落地建议.md)
+
+## 四、记忆检索与遗忘策略（Codex 侧）
+
+**检索**
+
+- 下一个会话启动时读取 `~/.codex/memories/` 作为上下文。
+- 用 `/memories` 控制**单任务**是否使用 / 贡献记忆（per-task 开关）。
+
+**遗忘 / 淘汰**
+
+- 一个会话需**空闲约 6 小时**才变成 eligible（可合并进 memories），有延迟、非即时。
+- 没有自动 TTL；旧记忆长期堆积会拉低信噪比，建议定期用 `/memories` 审视。
+- 同样机器本地、不云同步，换机即丢。
+
+```text
+检索：启动读 memories/ ；/memories 控制 per-task
+遗忘：无自动 TTL；需空闲 6h 才 eligible；人工审视
+```
+
+## 五、扩展：从 Markdown 记忆到向量记忆
+
+当 memories 累积到「靠文件名 / 索引已难命中」时，可加一层向量检索，把「生成笔记层」从纯文件演进为「文件 + 向量」混合：
+
+```python
+# 伪代码：把记忆片段向量化，按需语义召回
+mem_vecs = embed_all(load_memories("~/.codex/memories/"))
+hits = vector_search(mem_vecs, embed(current_task), top_k=5)
+inject(hits)   # 只把最相关的几条注入上下文
+```
+
+> 这样 Codex 的自动记忆既能靠文件名定位，也能靠语义召回长尾经验，缓解「记了但想不起来」的问题。注意向量库同样要本地化或受控，避免把敏感会话外泄。

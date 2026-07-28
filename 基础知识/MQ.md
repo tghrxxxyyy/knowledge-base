@@ -259,3 +259,52 @@ MQClientInstance 客户端实例，会开启多个异步并行服务：
 - 负载均衡服务 rebalanceService：再平衡服务，专门进行 queue 分区的再平衡、再分配。
 - 消息拉取服务 pullMessageService：专门拉取消息，通过内部实现类 DefaultMQPushConsumerImpl 拉取。
 - 消息消费线程：ConsumeMessageOrderlyService 有序消息消费。
+
+## 事务消息（半消息机制）
+
+分布式事务中，本地事务与消息发送需一致。RocketMQ 的**事务消息**流程：
+
+1. 发送 **Half Message（半消息）** 到 Broker，对消费者不可见；
+2. 执行本地事务，返回 `COMMIT` / `ROLLBACK`；
+3. Broker 收到 `COMMIT` 才将消息转为正向可消费；`ROLLBACK` 则丢弃；
+4. 若 Producer 超时未回查，Broker 发起**回查（checkLocalTransaction）**确认状态。
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    participant C as Consumer
+    P->>B: 1. 发送 Half Message
+    P->>P: 2. 执行本地事务
+    P->>B: 3. Commit/Rollback
+    B->>C: 4. Commit 后投递消息
+    Note over B,P: 超时则 Broker 回查本地事务状态
+```
+
+Kafka 通过 **事务 API + 幂等 Producer**（`enable.idempotence=true`、`transactional.id`）实现 EOS（精确一次语义），配合 `read_committed` 隔离级别消费。
+
+## 消息队列横向对比
+
+| 维度 | Kafka | RocketMQ | RabbitMQ | Pulsar |
+| --- | --- | --- | --- | --- |
+| 定位 | 大数据/日志流 | 业务级可靠消息 | 低延迟、复杂路由 | 云原生、存算分离 |
+| 协议 | 私有(仿AMQP) | 私有 | AMQP | 自研+Kafka协议 |
+| 顺序性 | 分区内有序 | 队列有序 | 队列有序 | 分区有序 |
+| 事务消息 | 事务API | 半消息 | 不支持 | 支持 |
+| 堆积能力 | 极强(磁盘) | 强 | 一般(内存为主) | 极强(分层存储) |
+| 延迟消息 | 不支持(靠外部) | 支持(18级/精度) | 支持 | 支持 |
+
+## 消费幂等（补充）
+
+MQ 不保证"只投递一次"（多为至少一次），消费端必须幂等：
+- **业务唯一键 + 去重表**：如订单号，消费前查/插去重表；
+- **Redis `SETNX`** 标记 messageId，设置 TTL 防重复；
+- **乐观锁/状态机**：避免重复扣款、重复发货。
+
+## 生产实践与面试高频
+
+1. **消息丢失**：Producer 侧 acks/事务、Broker 侧多副本(ISR)+刷盘策略、Consumer 侧**先处理后提交 offset**。
+2. **重复消费**：由 at-least-once 必然带来，靠幂等兜底；Kafka 可上 exactly-once。
+3. **消息积压**：扩容消费者、提升并行度（RocketMQ 加 queue、Kafka 加 partition）、临时转存+批量处理。
+4. **RocketMQ 零拷贝**：消费时 Broker 用 `mmap` + `sendfile` 提升吞吐；Kafka 同样重度使用 `sendfile`。
+5. **延迟消息**：RocketMQ 默认 18 个延迟级别（`1s/5s/10s...`）；精确任意时间需时间轮或外部调度。

@@ -919,3 +919,36 @@ PECS原则是Java泛型中的一个重要原则，它代表了“Producer Extend
 ReflectionUtils：[https://juejin.cn/post/7401358349877674018](https://juejin.cn/post/7401358349877674018)
 
 LambdaMetafactory：[https://juejin.cn/post/7490777239878418473](https://juejin.cn/post/7490777239878418473)
+
+## Java 8→21 新版本特性速览
+
+| 版本 | 关键特性 |
+| --- | --- |
+| Java 8 | Lambda、Stream、Optional、Date/Time API、CompletableFuture、默认方法 |
+| Java 9 | 模块化（JPMS）、JShell、List/Set/Map.of()、响应式 Flow |
+| Java 11 | 字符串增强（`isBlank`/`strip`/`lines`）、`var` 局部变量（10）、HttpClient、ZGC（实验） |
+| Java 14 | `switch` 表达式（预览→标准）、Records（16 标准）、文本块（15 标准） |
+| Java 16 | `Stream.toList()`、ZGC 支持并发线程栈处理 |
+| Java 17 | **LTS**、密封类（sealed）、强封装、AppCDS 增强 |
+| Java 21 | **LTS**、虚拟线程（Virtual Threads，Project Loom）、分代 ZGC、结构化并发（预览）、序列集合（SequencedCollection） |
+
+**虚拟线程**是重大变革：由 JDK 调度在少量平台线程（carrier）上，万级/百万级并发无需线程池调参，`Thread.perTaskExecutor` 场景下几乎零成本；但 **synchronized 块内 pin 载体线程**、`ThreadLocal` 滥用需规避。
+
+## 并发容器对比
+
+| 容器 | 实现 | 适用场景 | 注意 |
+| --- | --- | --- | --- |
+| `ConcurrentHashMap` | 分段锁→CAS+ synchronized（1.8） | 高并发 KV | 复合操作（putIfAbsent 后再算）需原子方法或加锁 |
+| `CopyOnWriteArrayList` | 写时复制数组 | 读多写极少 | 写开销大、数据有短暂不一致 |
+| `ConcurrentLinkedQueue` | CAS 无锁链表 | 高并发队列 | 无界，注意内存 |
+| `BlockingQueue` 系 | 锁/条件变量 | 生产者-消费者 | `ArrayBlockingQueue` 有界、`Linked` 无界、`Synchronous` 直接传递 |
+| `ConcurrentSkipListMap` | 跳表 | 需要有序+并发 | 范围查询、接近 O(log n) |
+
+## 面试高频与易错点
+
+1. **volatile 不保证原子性**：`i++` 仍非线程安全，需用 `AtomicInteger` 或锁。
+2. **synchronized 锁升级**：无锁 → 偏向锁 → 轻量级锁（CAS 自旋）→ 重量级锁（操作系统互斥），JDK 6 后大幅优化。
+3. **线程池参数**：核心/最大线程数、队列、拒绝策略；**不建议用 `Executors.newFixedThreadPool` 等无界队列**，易 OOM；用 `ThreadPoolExecutor` 显式构造。
+4. **`final` 的可见性语义**：JMM 保证 final 字段在构造器完成后对其他线程可见，防止部分构造对象逸出。
+5. **伪共享（False Sharing）**：多核修改同一缓存行的不同变量互相失效；用 `@Contended`（需 `-XX:-RestrictContended`）或填充对齐。
+6. **String 不可变**：`+` 在循环里产生大量临时对象，用 `StringBuilder`；`intern()` 入池需谨慎。

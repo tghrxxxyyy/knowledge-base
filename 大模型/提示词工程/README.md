@@ -23,3 +23,25 @@
 - **Microsoft prompt-engineering**：https://github.com/microsoft/prompt-engineering （及 Learn 上的 4S 原则）
 
 > ⚠️ 本模块为「整理 + 个人化注解」，非原创理论。文中标注的准确率/性能提升数据均来自上述厂商公开案例，具体效果因模型版本与任务而异，请以你自己的评测为准。
+
+## 本子模块学习路径
+
+1. `01-概述.md`：提示词组成、零 / 少样本范式、核心心法、常见反例。
+2. `02-核心原则与最佳实践.md`：OpenAI 八条、Anthropic 实践、Microsoft 4S、角色与约束、Few-shot 设计。
+3. `03-提示技巧与模式.md`：Zero/Few-shot、CoT/ToT、XML、角色、结构化输出、对抗幻觉。
+4. `04-场景化实战与模板.md`：代码 / RAG / Agent 模板与避坑清单。
+
+## 核心要点速览
+
+- 核心共识：清晰、具体、给上下文、用示例、迭代。
+- 黄金校验法：把提示给零背景同事看，他懵则模型也懵。
+- 没有跨模型通用最优提示，务必针对实际模型验证（Claude 用 XML、OpenAI 用 `###`/`"""`）。
+- 先最小可用，再用评测小样本迭代；反例与模板是最好的学习材料。
+
+## 推荐延伸阅读
+
+- dair-ai/Prompt-Engineering-Guide（最全面开源指南）
+- Anthropic Prompt Library
+- OpenAI 最佳实践 / GPT-5 提示指南
+- Microsoft prompt-engineering（4S 原则）
+- 本知识库「上下文工程」「RAG」「记忆」模块（提示词是上下文工程的输入之一）
