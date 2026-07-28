@@ -79,6 +79,16 @@ Java 后端工程师核心基础：JVM、MySQL、Redis、Elasticsearch、消息�
 - 📝 [经验感悟](基础知识/经验感悟.md)
 - 📝 [随笔](基础知识/随笔.md)
 
+**📁 时序库**（新增 · 时序数据库 TSDB 专题）
+
+- 📝 [板块概述](基础知识/时序库/README.md)
+- 📝 [InfluxDB](基础知识/时序库/InfluxDB.md)
+- 📝 [Lindorm（阿里云时序引擎）](基础知识/时序库/Lindorm.md)
+- 📝 [TimescaleDB](基础知识/时序库/TimescaleDB.md)
+- 📝 [TDengine](基础知识/时序库/TDengine.md)
+- 📝 [VictoriaMetrics](基础知识/时序库/VictoriaMetrics.md)
+- 📝 [Prometheus（TSDB 视角）](基础知识/时序库/Prometheus.md)
+
 👉 [进入文件夹 →](基础知识/)
 
 ### 🔍 源码系列
