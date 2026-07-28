@@ -55,3 +55,78 @@
 - OpenAI Practical Guide to Building Agents（PDF，官方 cookbook 附带）
 - LangGraph / CrewAI / OpenAI Agents SDK 官方文档与示例
 - OWASP LLM Top 10、OpenTelemetry GenAI Semconv（安全与可观测标准）
+
+## 九、核心概念地图（Mermaid 概念全景）
+
+```mermaid
+flowchart TD
+    AG[Agent: 自主循环] --> LOOP[Agent Loop: 感知-思考-行动-观察]
+    LOOP --> COG[认知架构: ReAct/Plan/Reflexion/ToT]
+    AG --> TOOL[工具调用 + MCP]
+    AG --> MULTI[多智能体: Workflow/编排/通信]
+    AG --> FWM[框架: LangGraph/OpenAI/CrewAI/Claude/ADK]
+    AG --> PROD[生产: 评估/护栏/可观测/部署]
+    AG --> BASIS[底座: 提示词/上下文/RAG/记忆]
+```
+
+> 上图把智能体置于五个子模块的交点：它由「提示词工程+上下文工程+RAG+记忆」共同支撑，通过工具/MCP 行动，经多智能体协作，最后落到生产化的评估与护栏。
+
+## 十、速查表（Cheat Sheet）
+
+| 决策点 | 默认 | 何时调整 |
+| --- | --- | --- |
+| 是否上 Agent | 先单条增强调用 | 需自主多步/跨系统才上 |
+| 认知架构 | ReAct | 可预分解→Plan；需试错→Reflexion |
+| 工具调用 | function calling | 工具多→代码调用省 token |
+| 协议 | MCP 接工具 | 跨厂商 agent→A2A |
+| 多智能体 | 先穷尽单 agent | 并行/隔离/专业化才拆 |
+| 框架 | 按场景非 star | 有状态→LangGraph；委托→OpenAI |
+| 生产 | eval+护栏+可观测 | 第一天就埋 |
+| 安全 | 最小权限+HITL | 破 Lethal Trifecta |
+
+## 十一、常见误区清单（汇总）
+
+1. **智能体=必须多智能体**：单 agent+好工具常够，多 agent 是手段不是目标。
+2. **框架越重越专业**：简单可组合模式常胜复杂框架。
+3. **自主=全自动**：生产几乎都要 HITL 兜底高危操作。
+4. **工具设计随意**：ACI 要像 HCI 一样认真，命名/参数/错误友好。
+5. **忽视 Lethal Trifecta**：私有数据+不可信输入+外发=注入外泄漏洞。
+6. **无 eval 就上线**：真实任务失败率可达 60–90%，必须评估先行。
+7. **不上持久化状态**：长任务进程重启即失忆，需 checkpoint/session。
+8. **并发打爆下游**：共享状态要外部化、限并发、幂等键。
+9. **按 star 选框架**：AutoGen star 多却已停更，按场景选。
+10. **把记忆当数据库**：记忆是启动注入的上下文，非可靠存储。
+
+## 十二、与其它子模块关系
+
+- **与提示词工程**：ReAct/Reflexion 等提示范式是 Agent 循环引擎；提示定人设与边界。
+- **与上下文工程**：上下文腐烂是 Agent 头号敌人，compaction/clearing/memory 杠杆直接服务 Agent。
+- **与 RAG**：RAG 是 Agent 的「知识检索工具」，由 Agent 决定是否调用。
+- **与记忆**：记忆给 Agent 跨会话状态保持，是连续性基础。
+
+## 十三、面试高频问题（速记）
+
+- Agent 定义？Workflow 与 Agent 的架构区别？
+- Agent Loop 是什么？与 ReAct 关系？
+- 增强型 LLM 三要素？何时不该用 Agent？
+- 四种认知架构（ReAct/Plan/Reflexion/ToT）适用场景？
+- ACI 是什么？为什么工具设计重要？
+- MCP 架构/原语/传输？为什么成了事实标准？
+- Lethal Trifecta 是什么？怎么破？
+- 多智能体五大 workflow？编排拓扑有哪些？
+- Handoff vs Agents-as-Tools？MCP vs A2A？
+- 主流框架怎么选（LangGraph/OpenAI/CrewAI/Claude/ADK/AG2）？
+- 生产化三件套？评估指标与红队怎么做？
+
+## 十四、整合学习路径（五模块串起来）
+
+```mermaid
+flowchart LR
+    PE[提示词工程] --> AG[Agent 循环/认知架构]
+    CTX[上下文工程] --> AG
+    RAG[RAG] --> AG
+    MEM[记忆] --> AG
+    AG --> PROD[评估/护栏/可观测/部署]
+```
+
+> 以上为智能体子模块全局速查与导航。建议路径：01 概念 → 02 架构/认知架构 → 03 工具/MCP → 04 多智能体 → 05 框架 → 06 生产落地。底座（提示词/上下文/RAG/记忆）不稳，编排再花哨也救不回。

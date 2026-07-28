@@ -460,3 +460,120 @@ docker run -d --name influxdb \
 - 官方文档：<https://docs.influxdata.com/>
 - FB Gorilla 论文（XOR 压缩）：*Gorilla: A Fast, Scalable, In-Memory Time Series Database*
 - 板块概述：[时序库 README](./README.md)
+
+---
+
+## 11. 运维实战与性能调优
+
+### 11.1 集群运维（IOx 云原生）
+
+IOx 引擎下 InfluxDB 走向「计算存储分离」：Router/Ingester 接收写入并写对象存储（S3/OSS），Catalog 记录元数据，Querier 基于 DataFusion 查询 Parquet。
+
+```bash
+# docker 启动 IOx（单机伪集群，便于验证）
+docker run -d --name influxdb-iox \
+  -p 8086:8086 -p 8082:8082 \
+  -e INFLUXDB_IOX_OBJECT_STORE=file \
+  -e INFLUXDB_IOX_DB_DIR=/var/lib/influxdb-iox \
+  influxdb:3.0-iox
+```
+
+运维要点：
+- **对象存储是持久层**，其可用性与延迟直接决定写入吞吐，建议用高可靠 OSS/S3 并监控 4xx/5xx。
+- **Catalog 后端**（Postgres/SQLite）是关键元数据，需备份与高可用。
+- 水平扩展 = 加 Ingester/Querier 实例 + 共享同一对象存储与 Catalog。
+
+### 11.2 Shard 规划
+
+shard group duration 决定单个 shard 的时间跨度，影响过期粒度与文件数：
+
+```sql
+-- 写入密集场景：保留 90 天，shard 7 天，减少 shard 数量
+CREATE RETENTION POLICY "rp_90d" ON "metrics"
+DURATION 90d REPLICATION 1 SHARD DURATION 7d DEFAULT;
+```
+
+| 保留时长 | shard duration | 说明 |
+|----------|----------------|------|
+| < 2d | 1h/1d | 避免 shard 过多 |
+| 2d~6M | 1d | 默认均衡 |
+| > 6M | 7d | 降低文件与 compaction 压力 |
+
+> 反例：保留 1 年却用 1h shard → 产生 8760 个 shard，元数据与查询规划开销剧增。
+
+### 11.3 Cardinality 治理
+
+```bash
+# 查看各 measurement 的 series 数（诊断基数）
+influx -database metrics -execute 'SHOW SERIES CARDINALITY'
+influx -database metrics -execute 'SHOW MEASUREMENT CARDINALITY'
+
+# 查看具体高基数 tag 组合
+influx -database metrics -execute 'SHOW TAG VALUES CARDINALITY FROM "cpu" WITH KEY = "host"'
+```
+
+治理手段：
+- 把 `request_id`、`user_id` 等高基数列从 tag 移到 field。
+- 用连续查询/Task 做降采样，聚合后只保留低频维度。
+- 设置 `max-series-per-database` 上限做硬性熔断（需评估业务）。
+- 定期 `DROP SERIES WHERE ...` 清理已退场设备序列，回收索引。
+
+### 11.4 备份与恢复
+
+```bash
+# 离线备份整个 InfluxDB 数据目录（停机或低峰）
+influxd backup /tmp/influxdb-backup
+
+# 备份指定数据库
+influxd backup -database metrics /tmp/metrics-backup
+
+# 恢复
+influxd restore -database metrics -metadir /var/lib/influxdb/meta \
+  -datadir /var/lib/influxdb/data /tmp/metrics-backup
+```
+
+> 生产建议：结合对象存储做定期 `influxd backup` + 二进制目录快照；IOx 下直接备份对象存储 bucket 与 Catalog 库即可。
+
+### 11.5 与 Grafana / Telegraf 全链路
+
+```toml
+# telegraf.conf：采集并写 InfluxDB + 同时暴露 Prometheus 端点
+[[outputs.influxdb]]
+  urls = ["http://influxdb:8086"]
+  database = "metrics"
+
+[[outputs.prometheus_client]]
+  listen = ":9273"
+```
+
+```json
+// Grafana 数据源配置（influxdb 数据源）
+{
+  "name": "InfluxDB",
+  "type": "influxdb",
+  "url": "http://influxdb:8086",
+  "database": "metrics",
+  "access": "proxy"
+}
+```
+
+全链路健康 checklist：
+- [ ] Telegraf `flush` 间隔与 batch 大小匹配写入峰值。
+- [ ] Grafana 查询带时间下界，避免全量扫。
+- [ ] 监控 Telegraf `write.errors`、InfluxDB `writeReq` 延迟。
+
+### 11.6 常见故障排查
+
+| 症状 | 可能根因 | 排查/处置 |
+|------|----------|-----------|
+| 写入延迟飙升 | cardinality 爆炸 / WAL 堆积 | `SHOW SERIES CARDINALITY`；扩容或降基数 |
+| 内存 OOM | 高基数 tag / cache 过大 | 降基数；调小 `cache-max-memory-size` |
+| 查询超时 | 全量扫 / shard 过多 | 加 `time >=` 下界；调整 shard duration |
+| 数据消失 | RP 误设过短 | 检查 RP；重配多 RP + CQ |
+| compaction 卡住 | 磁盘 IO 瓶颈 | 监控 `compactions.active`；换 SSD |
+
+### 11.7 迁移与升级
+
+- **v1 → v2**：用 `influx_inspect export` 导出 line protocol，再 v2 CLI 导入；注意 database→bucket 映射。
+- **v1 → IOx(v3)**：通过远程读/双写过渡；IOx 支持 SQL，旧 Flux 脚本需评估迁移成本。
+- 大版本升级前必须备份 meta + data 目录，并在隔离环境验证查询兼容性。

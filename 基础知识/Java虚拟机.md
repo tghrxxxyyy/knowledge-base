@@ -887,3 +887,79 @@ sc -d com.xxx.Class   # 类详情
 3. **三色标记与漏标**：增量更新（Incremental Update，CMS 用）与原始快照 SATB（G1/ZGC 用）两种解决方案。
 4. **ZGC 染色指针**把 GC 标记信息放在指针上（借助 64 位地址多余位），实现并发整理且停顿 < 10ms；但堆上限受地址位限制（JDK 15+ 已支持 TB 级）。
 5. **安全点（Safepoint）**：只有到达安全点才能 STW；JIT 在方法返回、循环回边等位置插入安全点轮询。 的Epsilon便是很恰当的选择
+
+---
+
+# 第二轮深度优化：低延迟 GC / GC 日志与火焰图 / NMT / OOM 排查 / JFR
+
+## 一、ZGC 与 Shenandoah：低延迟 GC
+
+- **ZGC**（JDK 11 引入、JDK 15 生产可用、JDK 21 分代 ZGC）：**染色指针（colored pointers）** + 多重映射，几乎全并发（标记/重定位/重映射都并发），停顿**不随堆大小增长**，目标 < 10ms（实测常 < 1ms）。Region 动态分小/中/大。适合超大堆（TB 级）、低延迟金融/交易系统。注意堆上限受染色位地址约束（新版本已放宽到 TB 级）。
+- **Shenandoah**（Red Hat）：并发压缩，用 **Brooks 指针/转发指针** 而非染色指针，同样亚毫秒级停顿；对 CPU 略敏感（读屏障开销）。
+- **选型**：延迟敏感选 ZGC；G1 仍是默认均衡选择；吞吐优先且可忍受百毫秒停顿用 Parallel GC。启用：`-XX:+UseZGC -XX:+ZGenerational`（分代，JDK 21+）。
+- ZGC 下 `max-pause-time`（默认 0.001s 软目标）与 `soft max heap` 共同约束；调优更多是给足堆、减少分配速率（分配速率高会让并发回收跟不上）。
+
+## 二、GC 日志与火焰图实战
+
+- **统一 GC 日志**（JDK 9+）：`-Xlog:gc*:file=/path/gc.log:time,uptime,level,tags:filecount=5,filesize=100M`。关注：GC 频次、停顿时长、老年代增长趋势、晋升失败（`promotion failed`）、Full GC 触发原因（System.gc / 元空间 / 老年代满）。
+- **应急命令**：`jcmd <pid> GC.heap_dump /path/d.hprof` 堆转储；`jcmd <pid> VM.native_memory` 看 native；`jcmd <pid> Thread.print` 线程栈；`jmap -histo:live <pid>` 看对象 Top。
+- **async-profiler**：低开销采样 CPU/alloc/wall，生成火焰图（flame graph）。`profiler.sh -e cpu -d 30 -f flame.html <pid>`；`alloc` 模式直接看对象分配热点 Call Site，比传统 profiler 轻量、适合生产。火焰图横轴是采样栈、宽度是占比，找最宽顶帧即热点。
+- **`jstack`** 抓死锁/线程堆积；**`jstat -gcutil <pid> 1s`** 实时看各代占用与 GC 次数。
+
+## 三、Native Memory Tracking（NMT）
+
+- 开启：`-XX:NativeMemoryTracking=detail`，`jcmd <pid> VM.native_memory summary/detail` 看 Java 堆外组成：metaspace、线程栈、Code Cache、Direct Buffer、GC 自身、符号等。
+- **经典问题"进程 RSS 远大于 -Xmx"**：堆外泄漏。常见元凶：Netty `DirectByteBuffer`（上限 `-XX:MaxDirectMemorySize`）、`mmap` 文件未关、JNI 分配、线程暴增（每线程默认 1MB 栈）、glibc arena（`MALLOC_ARENA_MAX` 可限制，64MB × arena 数会撑大 RSS）、压缩/解压缓冲。
+- 排查顺序：先 NMT 看哪类 native 涨；Direct 涨查 ByteBuf 释放；线程涨查线程池不收敛；arena 涨查 `MALLOC_ARENA_MAX`。
+
+## 四、OOM 排查手册（速查）
+
+- **通用**：`-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/path` 必开；OOM 后拿 hprof 用 MAT 看 Dominator Tree 与 Leak Suspects（泄漏可疑点）。
+- `Java heap space`：对象残留/缓存无上限/大集合；沿 GC Roots 强引用链找谁持有。
+- `Metaspace`：类加载泄漏（热部署、Groovy/JS 动态编译、CGLIB 无限代理）；看 `jcmd VM.classloaders`、`classes` 数是否只增不减。
+- `Direct buffer memory`：堆外 Buffer 未释放；`jcmd VM.native_memory` 看 Internal 项。
+- `unable to create new native thread`：线程数超 `ulimit -u` / 容器 pids limit；查线程池不收敛、异步任务堆积。
+- `GC overhead limit exceeded`：98% 时间 GC 却只回收 2% 内存，几乎全存活 → 典型内存泄漏信号。
+- `Requested array size exceeds VM limit`：试图分配超大数组（如一次性把大文件读进 `byte[]`）。
+
+## 五、JFR 飞行记录（Java Flight Recorder）
+
+- 低开销（约 1%~2%）持续记录运行时事件：GC、锁竞争、线程、IO、方法采样、对象分配、异常抛出。
+- 开启：`-XX:+FlightRecorder -XX:StartFlightRecording=duration=60s,filename=my.jfr,settings=profile`；或运行时 `jcmd <pid> JFR.start name=rec`。
+- 用 **JMC（Java Mission Control）** 分析：看 Hot Methods、Allocation by Call Site、Lock Instances、GC 暂停。比 async-profiler 更全景，可长期开启。
+- 实战：偶发卡顿用 JFR 抓 60s，一眼定位是 GC 停顿、锁竞争还是某方法慢——是生产排障的"黑匣子"。
+
+## 六、ZGC / Shenandoah 调优与细节
+
+- **ZGC 调优**：给足堆（避免并发回收跟不上分配导致 "Allocation Stall" 停顿）、`-XX:SoftMaxHeapSize` 软上限、`-XX:ZCollectionInterval`、`-XX:ZAllocationSpikeTolerance`；看 ZGC 日志的 `Pause Mark Start` / `Pause Relocate Start`（都 < 1ms）、`Heap Usage`。
+- **Shenandoah 调优**：`-XX:ShenandoahGCHeuristics` 启发式（adaptive/compact/traversal）；关注读屏障开销（`gc +1.0%` 级）。
+- **元空间调优**：`-XX:MetaspaceSize`（初始高水位触发 GC 阈值）与 `-XX:MaxMetaspaceSize` 同设，防无限膨胀；类加载泄漏用 `jcmd VM.classloaders` 查。
+- **压缩指针**：`-XX:+UseCompressedOops`（堆 < 32GB 默认开）省内存；超过 32GB 自动关闭，堆需更大才等效。
+- **大页（HugePage / THP）**：`-XX:+UseLargePages` 减少 TLB miss；但透明大页（THP）在部分场景反而致延迟抖动，需按场景评估。
+- **权衡小结**：吞吐 Parallel > G1 ≈ ZGC；延迟 ZGC/Shenandoah ≪ G1；内存 overhead ZGC 约 15%~20%（染色指针/多重映射）。调优前先定目标，再靠 GC 日志 + JFR 验证，别盲换。
+
+## 七、对象头与压缩指针
+
+- 对象头：Mark Word（哈希/GC 年龄/锁状态）+ Klass Pointer（类元数据指针）；开启压缩指针下 Mark Word 8B + Klass 4B，关闭则 8+8。
+- 对象按 8 字节对齐填充；小对象也占 16B 起，海量小对象要考虑（值对象/基本类型数组更省内存）。
+
+## 八、GC 日志关键字段解读
+
+- G1 日志：`Pause Young (Normal)` 年轻代、`Pause Remark`/`Pause Cleanup` 混合；关注各区间大小与 `user/sys/real`（real 即停顿时长）。
+- `Metaspace` 使用、`Eden`→`Survivors`→`Old` 流向；频繁 Young GC + 老年代持续涨 → 内存泄漏或堆过小。
+
+## 九、堆外泄漏排查清单
+
+1. `jcmd VM.native_memory` 看哪类 native 涨；2. DirectBuffer：`-XX:MaxDirectMemorySize` + `jcmd` Internal；3. 线程数 vs `ulimit -u`；4. glibc arena：`MALLOC_ARENA_MAX`；5. mmap 文件未关；6. JNI 分配（native 工具 jemalloc/jeprof）。
+
+## 十、诊断命令速查
+
+- `jps` 列进程；`jinfo` 看/改 JVM 参数；`jstat -gcutil` 实时 GC；`jmap -histo` 对象统计、`jmap -dump` 堆转储；`jstack` 线程栈；`jcmd` 万能（GC/thread/native_memory/JFR）；`async-profiler` 火焰图。
+
+## 十一、常见 JVM 参数速查补充
+
+- **内存**：`-Xms`/`-Xmx`（堆，建议相等）、`-Xmn`（新生代，或 `-XX:NewRatio`）、`-XX:MaxDirectMemorySize`（堆外）、`-XX:MaxMetaspaceSize`。
+- **GC**：`-XX:+UseG1GC`/`+UseZGC`/`+UseShenandoahGC`；`-XX:MaxGCPauseMillis`（G1/ZGC 软目标）；`-Xlog:gc*:file=...`（JDK 9+ 统一日志）。
+- **OOM**：`-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/path`；`-XX:ErrorFile=/path/hs_err.log`。
+- **诊断**：`-XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly`（看 JIT 汇编）；`-agentpath:async-profiler.so`（采样）。
+- **容器感知**：JDK 8u191+ 默认识别 cgroup 限制（`-XX:+UseContainerSupport`），避免容器内读到宿主机内存导致堆过大被 kill。

@@ -217,3 +217,122 @@ flowchart LR
 - **读写分离**：消费者可配置 `readFromSlave=true` 从 Slave 拉取（减轻 Master 压力），写入永远只走 Master。
 
 > **读源码建议**：存储主线抓 `DefaultMessageStore` 的 `putMessage`（写 CommitLog）→ `ReputMessageService`（分发 ConsumeQueue）；事务抓 `TransactionalMessageServiceImpl`；主从抓 `HAService` 与 `HAConnection`。
+
+---
+
+## 六、消息重试与死信队列
+
+RocketMQ 的「至少一次」投递依赖重试机制：
+
+- **并发消费失败**：业务抛异常（非 `MessageHook` 控制），`ConsumeMessageConcurrentlyService` 把消息发回 Broker 的 `%RETRY%{consumerGroup}` 主题，按**退避延迟等级**重新投递（等级 3s、10s、30s、1m…2h）。
+- **顺序消费失败**：默认**挂起队列**（不提交 offset，暂停后续消息）直到成功，避免乱序——所以顺序消费一定要控制异常。
+- **最大重试次数**（默认 16 次）耗尽仍失败，消息进入 **`%DLQ%{consumerGroup}` 死信队列**，需人工介入（运维控制台可重投）。
+
+```java
+// 并发消费：返回 RECONSUME_LATER 触发重试
+consumer.registerMessageListener((MessageListenerConcurrently) (msgs, context) -> {
+    try { handle(msgs); return ConsumeConcurrentlyStatus.CONSUME_SUCCESS; }
+    catch (Exception e) { return ConsumeConcurrentlyStatus.RECONSUME_LATER; }
+});
+```
+
+> 注意：重试消息带 `RETRY_TOPIC` 属性，Broker 用 `ScheduleMessageService` 按延迟级别定时（基于「延时消息 + 内部 18 个延迟队列 `SCHEDULE_TOPIC_XXXX`」）重新投递。
+
+## 七、消费负载均衡（Rebalance）
+
+集群模式下，Topic 的多个 Queue 要在同 Group 的多个 Consumer 实例间分配，由 **`RebalanceService`** 周期性（默认 20s）或「实例上下线 / 订阅变更」时触发：
+
+```mermaid
+flowchart LR
+    G[Consumer Group] -->|分配 Queue| C1[Consumer-1]
+    G -->|分配 Queue| C2[Consumer-2]
+    G -->|分配 Queue| C3[Consumer-3]
+    T[Topic-A: 6 Queue] --> Q1[Q0,Q1→C1]
+    T --> Q2[Q2,Q3→C2]
+    T --> Q3[Q4,Q5→C3]
+```
+
+- **分配策略（`AllocateMessageQueueStrategy`）**：`AllocateMessageQueueAveragely`（平均，默认）、`AveragelyByCircle`（轮询）、`ConsistentHash`（一致性哈希，扩缩容影响最小）、`ByConfig`（人工指定）。
+- **触发时机**：实例启动、实例宕机（其余实例通过心跳感知）、Topic 队列数变更。
+- **坑**：Rebalance 期间会「释放旧队列、接手新队列」，短时重复消费（因为 offset 提交有延迟）——**消费逻辑必须幂等**。另外 `consumer` 实例数不应多于 Queue 数，否则多出的实例分不到 Queue 空转。
+
+## 八、顺序消息实现
+
+RocketMQ 顺序消费 = **发送有序 + 存储有序 + 消费有序**：
+
+1. **发送**：`MessageQueueSelector` 按业务 key（如订单 id）哈希，把同一 key 的消息路由到**同一个 Queue**：
+
+```java
+producer.send(msg, (mqs, m, arg) -> {
+    int idx = Math.abs(arg.hashCode()) % mqs.size(); // 同 key 永远落同队列
+    return mqs.get(idx);
+}, orderId);
+```
+
+2. **存储**：Queue 内消息天然 FIFO（CommitLog 顺序写 + ConsumeQueue 顺序索引）。
+3. **消费**：`MessageListenerOrderly` + `ConsumeMessageOrderlyService`，对**单个 Queue 加锁（`ProcessQueue` 的 `locked`）**串行消费，且拉取时只拉「已获得锁」的队列，保证全局有序。
+
+> 代价：顺序消费吞吐受限于单 Queue，且消费失败会阻塞该 Queue（挂起重试），不适合高并发热点 key。
+
+## 九、事务消息状态回查（深入）
+
+前文讲了 Half 消息与 Commit/Rollback，这里补 Broker 侧**回查服务**的实现：
+
+- `TransactionalMessageCheckService`（继承 `ServiceThread`）每隔 `transactionCheckInterval`（默认 60s）扫描 `RMQ_SYS_TRANS_HALF_TOPIC` 中「超时未决断」的 Half 消息（`timeout = transactionTimeOut`，默认 6s）。
+- 对每个待回查消息，Broker 构造回查请求，通过 `Broker2Client` 向**原 Producer 组**发起 `CHECK_TRANSACTION_STATE`，回调 `TransactionListener.checkLocalTransaction(msg)`。
+- 回查有上限（`transactionCheckMax`，默认 15 次），超限仍无结论则**强制 Rollback**（丢弃），避免 Half 消息永久堆积。
+- 回查结果写 op 消息：`TRANSACTION_COMMIT` 则把 Half 消息重新派发到目标 ConsumeQueue 使其可见；`ROLLBACK` 则标记作废。
+
+```java
+// Producer 侧需实现
+public class OrderTxListener implements TransactionListener {
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        return LocalTransactionState.UNKNOW; // 先返回 UNKNOW，等回查
+    }
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        return isCommitted(msg) ? COMMIT_MESSAGE : ROLLBACK_MESSAGE;
+    }
+}
+```
+
+## 十、ACL 与消息轨迹
+
+- **ACL（访问控制）**：`PlainPermissionManager` 基于 `plain_acl.yml` 配置用户/资源/动作的白名单（`accessKey`/`secretKey` 签名校验）。生产开启 `aclEnable=true` 后，Producer/Consumer 需配置 `RPCHook` 在请求头带签名，Broker 侧 `AclClientRPCHook` 校验，防止未授权发布/订阅。
+- **消息轨迹（Trace）**：开启 `enableMsgTrace=true` 并指定 `accessKey`/`topic`（默认 `RMQ_SYS_TRACE_TOPIC`），客户端异步把「生产/存储/消费」各阶段耗时与状态写入轨迹 Topic，便于全链路排查。轨迹写入是**异步 + 采样**的，不影响主链路性能。
+
+## 十一、RocketMQ 与 Kafka 对比
+
+| 维度 | RocketMQ | Kafka |
+|------|----------|-------|
+| 存储模型 | CommitLog 集中 + ConsumeQueue 索引 | Partition 分区独立日志 |
+| 消费模式 | 拉 + 推（长轮询），集群/广播 | Pull，主要集群 |
+| 顺序消息 | 单 Queue 严格有序（原生支持） | Partition 内有序 |
+| 事务消息 | 半消息 + 回查（原生） | 0.11+ 事务 API（幂等+事务协调） |
+| 延迟/重试 | 内置 18 级延时、重试、死信 | 需外部实现（如外层调度） |
+| 吞吐量 | 极高（单机十万级 TPS） | 极高（批量+零拷贝，常更高） |
+| 适用场景 | 业务消息、金融事务、顺序/延时 | 日志流、大数据管道、超高吞吐 |
+
+> 选型：强业务语义（事务、顺序、延时、重试、死信）选 RocketMQ；海量日志 / 流计算 / 与 Flink 等大数据生态联动选 Kafka。RocketMQ 5.x 引入「Proxy + 计算存储分离」进一步云原生化。
+
+---
+
+## 十二、消息过滤与消费模型
+
+### 消息过滤
+
+RocketMQ 支持两种过滤，避免「全量拉取再客户端过滤」浪费带宽：
+
+- **Tag 过滤**：生产者 `msg.setTags("order")`，消费者 `subscribe(topic, "order || pay")`——Broker 在 `PullMessageProcessor` 按 ConsumeQueue 里存的 `tagsCode` 直接过滤，零额外开销。
+- **SQL92 过滤**：`subscribe(topic, MessageSelector.bySql("age > 18 AND type='vip'"))`，基于消息属性（user property）做表达式过滤，需 Broker 开启 `enablePropertyFilter=true`。
+
+```java
+consumer.subscribe("TopicTest", MessageSelector.bySql("region = 'cn' AND vip = true"));
+```
+
+### 消费模型：Push / Pull / Pop
+
+- **Push（默认）**：并非真推，而是 `PullMessageService` 拉取 + 拉完立即再拉（长轮询），封装成「看起来像推送」；`MessageListenerConcurrently`/`Orderly` 处理。
+- **Pull（旧 API `MQPullConsumer`）**：业务自己控制拉取位点与节奏，灵活但要手写 offset 管理，已基本不推荐。
+- **Pop（5.x）**：新「无状态消费」模型 `PopConsumer`，Broker 端维护消费进度（类 Kafka），消费者无状态、可随时扩缩容，天然解决「Rebalance 重复消费」与「消费实例绑定 Queue」的耦合，是 RocketMQ 5.x 云原生的核心。
+
+> 选型：存量集群用 Push（兼容好）；新建 5.x 集群 / Serverless 场景可上 Pop，省去客户端维护 offset 与 Rebalance 心智负担。

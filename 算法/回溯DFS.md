@@ -233,4 +233,134 @@ stateDiagram-v2
     选2 --> [*]
     选3 --> [*]
 ```
+
+## 七、更多棋盘 / 矩阵回溯
+
+### 7.1 解数独（37）
+
+```java
+public void solveSudoku(char[][] b){
+    backtrack(b);
+}
+boolean backtrack(char[][] b){
+    for (int i=0;i<9;i++) for (int j=0;j<9;j++){
+        if (b[i][j]=='.'){
+            for (char c='1';c<='9';c++){
+                if (valid(b,i,j,c)){
+                    b[i][j]=c;
+                    if (backtrack(b)) return true;
+                    b[i][j]='.'; // 重置
+                }
+            }
+            return false; // 九个数字都填不了，回溯
+        }
+    }
+    return true; // 无空格，完成
+}
+boolean valid(char[][] b,int r,int c,char v){
+    for (int k=0;k<9;k++)
+        if (b[r][k]==v||b[k][c]==v||b[(r/3)*3+k/3][(c/3)*3+k%3]==v) return false;
+    return true;
+}
+```
+- 找到空格逐个试 1~9，冲突回溯；返回 boolean 让第一个解立即结束。剪枝后远快于 9^81。
+
+### 7.2 单词搜索（79）
+
+```java
+public boolean exist(char[][] b, String w){
+    for (int i=0;i<b.length;i++) for (int j=0;j<b[0].length;j++)
+        if (dfs(b,w,i,j,0)) return true;
+    return false;
+}
+boolean dfs(char[][] b,String w,int i,int j,int k){
+    if (k==w.length()) return true;
+    if (i<0||j<0||i>=b.length||j>=b[0].length||b[i][j]!=w.charAt(k)) return false;
+    char t=b[i][j]; b[i][j]='#';
+    boolean ok=dfs(b,w,i+1,j,k+1)||dfs(b,w,i-1,j,k+1)||dfs(b,w,i,j+1,k+1)||dfs(b,w,i,j-1,k+1);
+    b[i][j]=t; // 状态重置
+    return ok;
+}
+```
+- 关键：临时标记 `#` 防走回头，递归后还原原字符。
+
+### 7.3 分割回文串（131）
+
+```java
+public List<List<String>> partition(String s){
+    List<List<String>> res=new ArrayList<>();
+    dfs(s,0,new ArrayList<>(),res);
+    return res;
+}
+void dfs(String s,int start,List<String> path,List<List<String>> res){
+    if (start==s.length()){ res.add(new ArrayList<>(path)); return; }
+    for (int end=start+1;end<=s.length();end++){
+        if (isPal(s,start,end-1)){
+            path.add(s.substring(start,end));
+            dfs(s,end,path,res);
+            path.remove(path.size()-1);
+        }
+    }
+}
+boolean isPal(String s,int l,int r){
+    while(l<r) if(s.charAt(l++)!=s.charAt(r--)) return false;
+    return true;
+}
+```
+- 枚举分割点，非回文段剪枝。可预处理 `pal[i][j]` 加速。
+
+## 八、DFS + 状态重置陷阱
+
+| 陷阱 | 现象 | 对策 |
+| --- | --- | --- |
+| 忘了还原全局变量 | 上一层残留脏数据 | 数独/单词搜索必须还原标记 |
+| 改错对象 | res 全变 | 存入前 `new ArrayList<>(path)` 拷贝 |
+| used 与 path 不同步 | 排列去重出错 | used 与 add 严格对称撤销 |
+| 共享可变对象 | 结果集全是同一引用 | 拷贝引用，勿存原对象 |
+
+记忆：每次「做选择 → 递归 → 撤销选择」三步走，撤销必须与选择严格对称。
+
+## 九、位运算枚举（子集 / 组合压缩）
+
+当 n ≤ 20，可用 `0..(1<<n)` 枚举所有子集，替代回溯：
+
+```java
+// 枚举所有子集
+for (int mask=0; mask<(1<<n); mask++){
+    for (int i=0;i<n;i++) if ((mask>>i&1)==1) use(i);
+}
+// 枚举 mask 的所有非空子集（总次数 = 2^popcount(mask)）
+for (int sub=mask; sub>0; sub=(sub-1)&mask) { /* 处理 sub */ }
+```
+- 优点：无递归、易去重；缺点：只适合 n 很小（如集合划分、小规模 NP 枚举）。
+
+## 十、记忆化搜索与 DP 转换进阶
+
+回溯（自顶向下）加备忘录 = 记忆化搜索；若要提速/降栈，可改写成「自底向上 DP 表」。
+
+转换四步：
+1. 递归参数 → DP 状态维度；
+2. 递归 base case → DP 初始化；
+3. 递归返回值 → DP 转移方程；
+4. 递归调用 → 填表顺序（拓扑序）。
+
+```java
+// 记忆化（自顶向下）
+Map<Integer,Integer> memo=new HashMap<>();
+int fib(int n){ if(n<2) return n; if(memo.containsKey(n)) return memo.get(n);
+    int r=fib(n-1)+fib(n-2); memo.put(n,r); return r; }
+// 自底向上 DP
+int fibDP(int n){ int[] dp=new int[n+1]; dp[0]=0;dp[1]=1;
+    for(int i=2;i<=n;i++) dp[i]=dp[i-1]+dp[i-2]; return dp[n]; }
+```
+- 记忆化写法直观、天然处理稀疏状态；DP 写法省递归开销与栈深，竞赛大状态优先 DP。
+
+```mermaid
+flowchart TD
+    A[问题可递归] --> B[加备忘录=记忆化]
+    B --> C{状态密集?}
+    C -->|是| D[转自底向上 DP 表]
+    C -->|否| E[保留记忆化]
+    D --> F[滚动数组降空间]
+```
 ```

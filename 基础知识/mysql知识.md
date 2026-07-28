@@ -1919,3 +1919,87 @@ InnoDB 锁层次：
 3. **刷脏与 Checkpoint**：避免一次性刷盘卡顿，double write 防页断裂。
 4. **慢 SQL 定位**：慢查询日志 `slow_query_log` + `pt-query-digest` 聚合；线上用 `SHOW PROCESSLIST` 看长事务/`Sending data`。
 5. **RR 与 RC 的选择**：RC 减少锁冲突、主从用 RC 更友好，但丢失 RR 的防幻读语义；互联网业务多选用 RC + 业务层防重。
+
+---
+
+# 第二轮深度优化：执行计划解读 / 锁全景 / Online DDL / ShardingSphere / 主从延迟 / MGR·PXC
+
+## 一、执行计划深度解读（EXPLAIN）
+
+`EXPLAIN FORMAT=JSON`（或 `FORMAT=TREE`）看更全信息，重点关注三列：
+
+- **type（访问类型，从好到坏）**：`system` > `const`（主键/唯一索引单值）> `eq_ref`（join 主键）> `ref`（普通索引）> `range`（索引范围）> `index`（全索引扫描）> `ALL`（全表扫描）。**出现 ALL 且数据量大必须优化**；`ref`/`range` 一般可接受。
+- **key_len（索引命中字节数）**：用于判断**复合索引用到了前几列**。如 `idx(a,b,c)` 为 `varchar(20) utf8mb4`（每字符 4 字节 + 长度 2 + NULL 1），命中 a 约 `20*4+2=82`，命中 a,b 约 `82+82=164`。key_len 偏小说明**索引没用全**，可能断在范围查询（`>`/`like 'x%'` 后失效）。
+- **Extra（额外信息）**：
+  - `Using index`：覆盖索引，无需回表（最好）；
+  - `Using where`：server 层过滤（索引未覆盖全部条件）；
+  - `Using filesort`：额外排序（ORDER BY 未走索引），大数据量危险；
+  - `Using temporary`：用临时表（GROUP BY/ DISTINCT 未走索引），危险；
+  - `Select tables optimized away`：MIN/MAX 被索引直接满足。
+- **rows**：估算扫描行数，越大越慢；与真实差异大说明统计信息过时，需 `ANALYZE TABLE`。
+
+```mermaid
+flowchart LR
+    A[EXPLAIN] --> B{type=ALL?}
+    B -- 是 --> C[加/调整索引]
+    B -- 否 --> D{Extra 有 filesort/temporary?}
+    D -- 是 --> E[优化 ORDER BY/GROUP BY 索引]
+    D -- 否 --> F{key_len 用全复合索引?}
+    F -- 否 --> G[调整复合索引列序/避免范围断链]
+```
+
+## 二、锁全景（全局 / 表 / 行 / 间隙 / Next-Key）
+
+- **全局锁**：`FLUSH TABLES WITH READ LOCK`（FTWRL）锁全库，用于全量备份；风险大，一般用 `--single-transaction`（RR 下 MVCC 一致性快照）替代。
+- **表级锁**：`LOCK TABLES`；InnoDB 一般不用（行锁为主），但 DDL 会拿 **MDL（metadata lock）**——这就是"改表卡住所有查询"的根源（长事务持有 MDL 读锁，DDL 拿写锁被阻塞，后续查询又卡在 MDL 读锁）。
+- **行级锁**：Record Lock（锁索引记录）、Gap Lock（锁间隙防插入）、Next-Key Lock（Record + Gap，左开右闭，**RR 默认加锁单位**，防幻读）、Insert Intention Lock（插入意向锁，提升并发插入）。
+- **加锁规则（MVCC + Next-Key）**：`UPDATE/DELETE/SELECT ... FOR UPDATE` 在 RR 下，等值查询退化为 Record Lock（唯一索引命中时），范围查询用 Next-Key Lock。
+- **死锁排查**：`SHOW ENGINE INNODB STATUS` 看 `LATEST DETECTED DEADLOCK`；业务侧固定加锁顺序、缩短事务、RC 下 gap 锁退化可减少死锁。
+
+## 三、Online DDL
+
+- **算法**：`ALGORITHM=INPLACE`（原地，不阻塞 DML，仅元数据变更瞬间锁）、`COPY`（建新表拷数据，全程锁，慢）、`INSTANT`（JDK 8.0+，仅改元数据，秒级，支持加列）。`LOCK=NONE/SHARED/EXCLUSIVE` 控制并发 DML。
+- **推荐**：`ALTER TABLE t ADD COLUMN c INT, ALGORITHM=INSTANT;`（8.0 加列秒级）。大表改类型/索引用 `ALGORITHM=INPLACE, LOCK=NONE` 或 **gh-ost / pt-osc**（基于 binlog 的影子表方案，对业务更友好、可限速、可回滚）。
+- **坑**：DDL 前的长事务会阻塞其拿 MDL 写锁，进而阻塞后续所有查询——改大表前先杀长事务。
+
+## 四、分库分表实战（ShardingSphere）
+
+- **ShardingSphere-JDBC**：轻量、无中心节点，解析 SQL → 路由 → 改写 → 执行 → 归并。关键概念：
+  - **分片算法**：`inline`（`ds${user_id % 2}`）、`standard`（`PreciseShardingAlgorithm`/`RangeShardingAlgorithm`）、`complex`（多分片键）、`hint`（强制路由）。
+  - **广播表**（每个库都全量，如字典表）、**绑定表**（order 与 order_item 同分片键，join 不跨库）、**单表**。
+  - **分布式事务**：XA（强一致、锁资源）、Seata AT（最终一致、无侵入）、本地消息表（最终一致）。
+  - **分页归并**：`LIMIT 100000,10` 会各分片查 100010 再归并 → 深分页慢，用 `sharding + 业务游标`（如 `id > ? ORDER BY id LIMIT 10`）。
+- **坑**：跨分片 JOIN/COUNT/ORDER BY 需中间件归并；分布式 ID 用雪花（注意时钟回拨）/号段（Leaf-segment）。
+
+## 五、主从延迟根因
+
+- **表现**：`SHOW SLAVE STATUS` 的 `Seconds_Behind_Master`（注意它只估 SQL 线程落后，网络半同步下不准）。
+- **根因**：
+  1. 大事务（一次删 100w 行）→ 从库单线程重放极慢；
+  2. DDL 在从库串行执行；
+  3. 从库配置低 / 单 SQL 线程回放（5.6+ 有并行复制 `slave_parallel_workers`，按库/逻辑时钟并行）；
+  4. 网络抖动、binlog 格式（`ROW` 更安全但体积大）；
+  5. 从库读压力过大拖慢回放。
+- **治理**：拆大事务、开并行复制、提升从库配置、读从库做降级（容忍延迟）、用半同步减少数据丢失。
+
+## 六、MGR 与 PXC（高可用集群）
+
+- **MGR（MySQL Group Replication）**：基于 **Paxos** 的分布式复制，多数节点确认即提交；支持单主/多主；自动选主、故障自动剔除。强一致（需 `group_replication_consistency`）但写性能有 Paxos 开销。
+- **PXC（Percona XtraDB Cluster）**：基于 Galera，同步多主，写任何节点都同步到全集群；写入冲突在提交时检测。优点多主易写，缺点是写放大、对网络延迟敏感、大事务易卡。
+- **对比**：MGR 官方出品、逐步成熟；PXC 多主同步体验好但运维门槛高；二者都比"异步主从"一致性更强，代价是写延迟与复杂度上升。
+
+## 七、索引高级（ICP / MRR / 覆盖索引 / 选择性）
+
+- **覆盖索引**：查询列全在索引中，`Extra: Using index`，免回表，最快（如 `SELECT id FROM t WHERE a=1 AND b=2`，有 `idx(a,b)` 含 id）。
+- **索引下推 ICP**：存储引擎层用索引里的列提前过滤，减少回表次数（`Using index condition`）。
+- **MRR（Multi-Range Read）**：把随机回表转成顺序读，减少随机 IO（尤其范围查询）。
+- **索引选择性**：区分度 = 不同值数 / 总行数；低选择性（如性别、状态位）不适合单独建索引；复合索引把**高选择性列放前面**。
+- **隐式转换坑**：`varchar` 列传数字、`datetime` 与 `int` 比较、字符集不同，都会触发隐式转换，**索引失效走全表**——这是慢 SQL 高发区。
+- **前缀索引**：`index(name(10))` 省空间，但无法用于覆盖索引与精确范围查询，需权衡。
+
+## 八、JOIN 算法与优化
+
+- **NLJ（Nested Loop Join）**：驱动表取一行，被驱动表走索引；**驱动表要小、被驱动表 join 列有索引**。
+- **BNL（Block Nested Loop）**：无索引时把驱动表分批进 join buffer 内存比对；应尽量避免（加索引转 NLJ）。
+- **BKA（Batched Key Access）**：NLJ + MRR 批量回表，减少随机 IO。
+- **优化要点**：小表驱动大表、`JOIN` 列类型/字符集一致、被驱动表索引、避免 `SELECT *`、用 `STRAIGHT_JOIN` 强制驱动顺序（优化器选错时）。

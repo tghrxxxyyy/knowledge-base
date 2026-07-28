@@ -229,3 +229,101 @@ groups:
 ## 8. 小结
 
 Prometheus 的本地 TSDB 是一个**嵌入式、面向监控优化**的时序存储：WAL 保可靠、内存 Head 保实时、2 小时 block + compaction 保压缩与查询效率。它最适合作为云原生监控的「短期热存储 + 查询引擎」，而通过 remote_write 把长期数据卸载到 VictoriaMetrics / Thanos / TDengine 等专业时序库，才能既保住 PromQL 生态又撑起规模化与持久化需求。
+
+---
+
+## 9. 运维实战与性能调优
+
+### 9.1 长期存储外置方案对比
+
+| 方案 | 机制 | 优点 | 缺点 |
+|------|------|------|------|
+| VictoriaMetrics | remote_write + 本地盘 | 简单、低延迟、高压缩 | 需自管磁盘 |
+| Thanos Sidecar | 本地 block 上传对象存储 | 多集群统一、全局视图 | 对象存储延迟、组件多 |
+| Cortex / Mimir | remote_write + 对象存储 | 多租户、水平扩展 | 部署复杂 |
+| 双 Prom + 远端 | remote_write 到另一 Prom | 快速验证 | 非真正长期方案 |
+
+### 9.2 Federation 分层
+
+联邦让上层 Prometheus 从下层 Prom 拉取**已聚合**的结果，避免全量数据上卷。
+
+```yaml
+# 上层 Prometheus 的 federation 配置
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job="node"}'          # 只拉聚合后的时间序列
+        - 'sum:node_cpu:rate5m'
+    static_configs:
+      - targets: ['prom-low-1:9090', 'prom-low-2:9090']
+```
+
+原则：联邦只传递聚合指标（如 `sum:xxx`），不传递原始高基数序列。
+
+### 9.3 Record Rules 预计算
+
+把高频重查询物化为新时间序列，查询时直接读结果：
+
+```yaml
+groups:
+  - name: cpu_rules
+    interval: 30s
+    rules:
+      - record: sum:node_cpu:rate5m
+        expr: sum by (instance) (rate(node_cpu_seconds_total[5m]))
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+```
+
+> record rule 极大降低 Grafana 面板与告警的重复计算；注意 rule 自身也会产生 series，避免 rule 输出高基数。
+
+### 9.4 高可用（双写 / Thanos Sidecar）
+
+**双写 HA**：两份 Prometheus 抓取同一目标，remote_write 到同一后端，查询层去重。
+
+```yaml
+# 两个 Prom 实例都配同样的 remote_write，VM 侧开启 dedup
+remote_write:
+  - url: http://vminsert:8480/insert/0/prometheus/api/v1/write
+```
+
+**Thanos Sidecar**：每个 Prom 旁挂 sidecar，上传 block 到对象存储，Query 组件做全局查询。
+
+```yaml
+# thanos sidecar 与 prometheus 同 pod
+args:
+  - sidecar
+  - --prometheus.url=http://localhost:9090
+  - --objstore.config-file=/etc/thanos/s3.yml
+```
+
+### 9.5 大规模下的分片
+
+单 Prometheus 实例建议活跃 series 控制在 **200 万~500 万** 以内；超出则分片：
+
+- **按功能分片**：node / k8s / blackbox 各一个 Prom。
+- **按租户/业务分片**：每业务线独立 Prom，上层联邦或 Thanos 聚合。
+- **Hashmod 分片**：用 `hashmod` relabel 把目标均分到 N 个 Prom 实例。
+
+```yaml
+# 按目标 hash 分 3 片中的第 0 片
+relabel_configs:
+  - source_labels: [__address__]
+    modulus: 3
+    target_label: __tmp_shard
+    action: hashmod
+  - source_labels: [__tmp_shard]
+    regex: 0
+    action: keep
+```
+
+### 9.6 故障排查 checklist
+
+- [ ] 内存涨/OOM → 查 label 基数（target 数 × metrics × labels）。
+- [ ] TSDB 加载慢/重启久 → 查 block 数量、head series 数、WAL 重放。
+- [ ] 查询超时 → 是否全量扫、是否缺 record rule、区间是否过大。
+- [ ] 数据缺口 → 查 scrape 失败、remote_write 队列堆积、去重配置。
+- [ ] 磁盘满 → 查 retention、compaction 是否卡住、cardinality 是否失控。

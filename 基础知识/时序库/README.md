@@ -222,3 +222,189 @@ flowchart LR
 ## 7. 本板块导航
 
 - [InfluxDB 详解](./InfluxDB.md) —— 数据模型、写入、查询（InfluxQL/Flux）、TSM 存储引擎、保留策略、集群、与 Prometheus 对接、踩坑与实战。
+
+---
+
+## 8. 运维与容量规划通用方法
+
+无论选用哪款 TSDB，运维与容量规划都可抽象为同一套方法论。核心指标只有三个：**写入吞吐（points/s）**、**序列基数（series cardinality）**、**数据保留时长（retention）**；三者共同决定 CPU、内存、磁盘与网络。
+
+### 8.1 容量估算公式（经验模型）
+
+```text
+# 1) 写入吞吐
+写入 points/s ≈ 采集目标数 × 每目标指标数 × 每指标样本维度数 / 抓取间隔(s)
+
+# 2) 序列基数（最重要的容量因子）
+series 总数 ≈ Σ (每个 measurement 的 tag 取值笛卡尔积)
+注意：基数 ≈ 数据点数的「阶」，比点数本身更决定内存/索引开销
+
+# 3) 磁盘占用（日增量，压缩后经验值）
+日磁盘(GB) ≈ 活跃 series 数 × 每 series 每日点 × 每点字节(0.5~3B) / 1024³
+
+# 4) 内存占用（索引 + 缓存）
+内存(GB) ≈ 活跃 series 数 × (2~8 KB)
+```
+
+> 经验阈值：**单实例活跃 series 超过 500 万~1000 万** 时，绝大多数 OSS 单机引擎会出现明显抖动，应考虑分片/集群或降采样。
+
+### 8.2 容量规划 checklist
+
+- [ ] 上线前用真实 tag 组合估算 series 基数，而非只看「设备数」。
+- [ ] 按冷热分层设定多档 retention（raw 7~30d，聚合 90d~1y，归档更久）。
+- [ ] 预留 30%~50% 磁盘与内存余量应对突发写入/查询。
+- [ ] WAL / 热数据选 SSD；冷数据与归档可用大容量盘或对象存储。
+- [ ] 设定 compaction / merge 的 CPU 配额，避免与写入争抢。
+- [ ] 提前规划扩容路径（加节点 / 加分片 / 双写迁移）。
+
+### 8.3 通用监控指标
+
+| 类别 | 关键指标 | 告警建议 |
+|------|----------|----------|
+| 写入 | 写入 QPS、写入延迟 P99、WAL 堆积 | P99 > 1s 或 WAL 持续增长即告警 |
+| 基数 | series cardinality、新 series 增速 | 日增 > 20% 触发基数审查 |
+| 存储 | 磁盘使用率、compaction 耗时、压缩比 | 磁盘 > 80%、压缩比骤降告警 |
+| 查询 | 查询延迟、慢查询数、内存占用 | 大范围扫描占比异常升高 |
+| 集群 | 节点存活、分片均衡、副本延迟 | 节点掉线 / 分片倾斜 > 30% |
+
+---
+
+## 9. 数据建模最佳实践（避免 cardinality 爆炸）
+
+cardinality 爆炸是 TSDB 生产事故第一大来源。根本原则：**tag/label 只放「低基数、有限枚举、需要过滤/分组」的维度**；高基数字符串一律放 field 或作为行键/子表名。
+
+### 9.1 四大反模式
+
+| 反模式 | 例子 | 后果 | 正确做法 |
+|--------|------|------|----------|
+| 高基数字符串做 tag | `user_id=123456` 做 label | 每用户一条新序列，内存爆炸 | 放 field 或干脆不存 |
+| 把 request/trace id 当维度 | `trace_id=abc` | 序列数随请求线性增长 | 仅存日志/追踪系统 |
+| 用浮点/时间戳做 tag | `latency=0.83` 做 tag | 取值近乎无限 | latency 必须放 field |
+| tag 值含随机后缀 | `host=web-01-<pod-hash>` | 实例重建即新序列 | 用稳定标识（deployment 名） |
+
+### 9.2 降基数常用手段
+
+- **预聚合**：在采集端（Telegraf processor / Prometheus recording rule）先 group，减少高精度序列数。
+- **分桶（bucketize）**：对必放的高基数列做哈希分桶，如 `user_bucket = hash(user_id) % 100`，用 100 个桶近似。
+- **降采样 + 丢弃**：原始高精度只保留短时，长期只留聚合。
+- **把维度移出 TSDB**：用户画像、订单明细本就不是时序库的活，交给关系库/数仓。
+
+### 9.3 基数诊断（通用思路）
+
+```bash
+# Prometheus / VM：查看 Top N 高基数 metric
+curl -s 'http://localhost:9090/api/v1/status/tsdb' | jq '.data.seriesCountByMetricName[0:10]'
+
+# InfluxDB：查看 measurement 级别 series 数
+influx -database metrics -execute 'SHOW SERIES CARDINALITY'
+
+# TDengine：查看子表（设备）数量级
+taos> SELECT COUNT(*) FROM information_schema.ins_tables;
+```
+
+---
+
+## 10. 迁移与双写方案
+
+从旧系统（InfluxDB v1、OpenTSDB、关系库）迁移到新 TSDB，推荐「双写 + 回放 + 灰度切读 + 校验」四步走，避免数据断层。
+
+```mermaid
+flowchart LR
+    A[采集端/应用] -->|1. 双写| B[旧库]
+    A -->|1. 双写| C[新库]
+    D[历史数据回放\n按时间区间] --> C
+    E[一致性校验\n采样比对/全量 diff] -->|差异修复| C
+    F[灰度切读\n先 5% 流量读新库] --> C
+    F -->|稳定后 100%| G[下线旧库]
+    B -.->|观察期保留| G
+```
+
+### 10.1 迁移 checklist
+
+- [ ] 明确迁移窗口与回滚方案（保留旧库一个观察期）。
+- [ ] 对齐数据模型：tag/field、精度、时区、单位。
+- [ ] 历史数据回放脚本按时间分片，错峰执行避免冲击。
+- [ ] 双写阶段监控两库写入一致性与延迟差。
+- [ ] 用采样 diff 校验数值误差（界定浮点/压缩允许的微小误差阈值）。
+- [ ] 灰度切读，先只读新库看板，确认无缺数再全量切换。
+- [ ] 旧库进入只读并最终下线，释放资源。
+
+---
+
+## 11. 与数仓/湖仓联动做 OLAP
+
+TSDB 擅长「高吞吐写入 + 时间区间聚合 + 近期热数据」，但**多维即席分析、大宽表 JOIN、复杂 OLAP** 并非其强项。业界通行做法：「**TSDB 做热/短期存储，ClickHouse / Doris 做冷/分析存储**」的分层架构。
+
+```mermaid
+flowchart LR
+    subgraph 采集
+        S[采集端 Telegraf/Prometheus/Flink]
+    end
+    subgraph 热层
+        T[(TSDB\n近期热数据 高写入)]
+    end
+    subgraph 同步
+        K[Kafka / CDC / 定时 ETL]
+    end
+    subgraph 冷分析层
+        C[(ClickHouse / Doris\n列式 OLAP 大宽表)]
+    end
+    subgraph 应用
+        G[Grafana 实时大屏]
+        BI[BI 报表 / 即席查询]
+    end
+    S --> T
+    T -->|同步| K --> C
+    T --> G
+    C --> BI
+```
+
+### 11.1 同步链路选型
+
+| 链路 | 适用 | 说明 |
+|------|------|------|
+| Kafka Connect / 客户端双写 | 实时性要求高 | TSDB 与数仓同时消费同一数据流 |
+| 定时 ETL（如 Airflow） | T+1 报表 | 夜间把降采样结果搬运到数仓 |
+| CDC / WAL 订阅 | 变更敏感 | TDengine 订阅、InfluxDB 订阅 |
+| Flink / Spark 流处理 | 需清洗/富化 | 同步中做维度补全、窗口聚合 |
+
+> 要点：不要把「需要 JOIN 业务表、做复杂 GROUP BY、跨月即席查询」的负载压给 TSDB；这类交给 ClickHouse/Doris，TSDB 专注监控与实时指标。
+
+---
+
+## 12. 选型决策树（Mermaid）
+
+```mermaid
+flowchart TD
+    Q0{需要时序存储?} -->|否| R[关系型/NoSQL]
+    Q0 -->|是| Q1{是否已在 K8s / 云原生监控?}
+    Q1 -->|是| Q2{需要长期存储/大规模?}
+    Q2 -->|否 短保留| P[Prometheus 本地 TSDB]
+    Q2 -->|是| VM[VictoriaMetrics / Thanos / Mimir]
+    Q1 -->|否| Q3{是否必须 SQL + JOIN / 事务?}
+    Q3 -->|是| TS[TimescaleDB]
+    Q3 -->|否| Q4{设备数千万级 + 国产化?}
+    Q4 -->|是| TD[TDengine]
+    Q4 -->|否| Q5{是否阿里云全托管?}
+    Q5 -->|是| LIN[Lindorm TSDB]
+    Q5 -->|否| INF[InfluxDB]
+```
+
+---
+
+## 13. 各库性能基准参考（公开 benchmark 结论）
+
+> 以下为社区/厂商公开 benchmark 的**结论性参考**，非绝对数值；实际请以自己的硬件与负载压测为准。
+
+| 维度 | InfluxDB | TimescaleDB | TDengine | VictoriaMetrics | Prometheus(本地) |
+|------|----------|-------------|----------|-----------------|------------------|
+| 写入吞吐 | 高（单机百万点/s） | 中（受 PG 约束） | 极高（官方称数千万点/s） | 极高（省资源） | 中（单实体内） |
+| 压缩比 | 高（数倍于 Prom） | 中高（4~10:1） | 极高（~10:1） | 极高（省 3~7x） | 中（1~2B/点） |
+| 查询延迟 | 中 | 中（SQL 灵活） | 低（单设备快） | 低 | 低（热数据） |
+| 水平扩展 | IOx/企业版 | multinode（版本相关） | 原生集群 | cluster 天然 | 需外部存储 |
+| 资源效率 | 中 | 中（PG 内存占用） | 高 | 最高 | 中 |
+
+- **TDengine 官方 benchmark**：同等硬件下写入吞吐与压缩比常优于 InfluxDB，强调「一设备一子表」建模红利。
+- **VictoriaMetrics 官方对比**：相较 Prometheus 本地 TSDB，磁盘占用通常降至 1/3~1/7，查询更快、内存更省。
+- **TimescaleDB**：胜在 SQL 完整性与关系分析，而非极限吞吐；benchmark 体现「时序+关系混合」独特价值。
+- **InfluxDB IOx**：转 Parquet + 对象存储后，分析型查询与云原生弹性显著改善，单机 TSM 仍是监控成熟稳定之选。

@@ -952,3 +952,82 @@ LambdaMetafactory：[https://juejin.cn/post/7490777239878418473](https://juejin.
 4. **`final` 的可见性语义**：JMM 保证 final 字段在构造器完成后对其他线程可见，防止部分构造对象逸出。
 5. **伪共享（False Sharing）**：多核修改同一缓存行的不同变量互相失效；用 `@Contended`（需 `-XX:-RestrictContended`）或填充对齐。
 6. **String 不可变**：`+` 在循环里产生大量临时对象，用 `StringBuilder`；`intern()` 入池需谨慎。
+
+---
+
+# 第二轮深度优化：虚拟线程 / 结构化并发 / Record·Sealed / FFM / JMH / GC 指南
+
+## 一、虚拟线程 Virtual Threads（Project Loom）
+
+- JDK 21 正式：`Thread.ofVirtual().start(() -> ...)` 或 `Executors.newVirtualThreadPerTaskExecutor()`。由 JVM 调度在少量 carrier（平台）线程上，万/百万级并发近乎零成本。
+- **原理**：虚拟线程在 `Blocking` 操作（网络/锁/IO）时自动 **unmount**，让出 carrier 给别的虚拟线程；阻塞不占 OS 线程——这是高吞吐关键。
+- **陷阱**：
+  1. `synchronized` 块内阻塞会 **pin（钉住）** carrier 线程（改用 `ReentrantLock` 关键区）；
+  2. `ThreadLocal` 滥用：百万虚拟线程 × 大对象 → 内存爆炸，改用 `ScopedValue`（JDK 21+）；
+  3. **不要池化**虚拟线程（本就廉价，池化反而限流）；
+  4. 检查第三方库是否 pin。
+- **适用**：IO 密集型、大量并发请求（Web 服务）；CPU 密集型无收益。
+
+## 二、结构化并发（Structured Concurrency）
+
+- `StructuredTaskScope`：把一组并发子任务"作用域化"——父作用域结束前子任务必须完成；任一失败可取消其余（`ShutdownOnFailure`）。
+- **价值**：避免线程泄漏、异常传导清晰、可观测（父子关系树）。替代裸 `Future` + 线程池的"孤儿线程"。示例：
+  ```java
+  try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+      var user = scope.fork(() -> fetchUser(id));
+      var order = scope.fork(() -> fetchOrder(id));
+      scope.join().throwIfFailed();      // 任一失败整体失败
+      return new Result(user.get(), order.get());
+  }
+  ```
+
+## 三、Record 与 Sealed（JDK 16/17）
+
+- `record`：不可变数据载体，自动生成构造器/`accessor`/`equals`/`hashCode`/`toString`；适合 DTO、返回值、模式匹配解构。**别把 record 当 Entity**（可变业务对象用 class）。
+- `sealed`：限定子类（`permits`），配合 `switch` 模式匹配做**穷尽检查**，领域模型更严谨：
+  ```java
+  sealed interface Shape permits Circle, Square {}
+  // switch (shape) { case Circle c -> ...; case Square s -> ...; } 编译期保证全覆盖
+  ```
+
+## 四、Foreign Function & Memory API（Project Panama）
+
+- 取代 JNI：在 Java 直接调用本地库（C 函数）、安全访问堆外内存（`MemorySegment`），零拷贝、无 JNI 胶水代码。JDK 22 正式。
+- 适合：调用高性能原生算法、硬件/系统库；比 JNI 开发成本低、安全性高（边界检查由 API 保证）。
+
+## 五、JMH 微基准
+
+- `@Benchmark` + `@BenchmarkMode` + `@State` + `fork`；务必 `mvn clean package` 后独立进程跑，避免 JIT/Warmup/死码消除误导。
+- **注意**：微基准难反映真实（GC、竞争、IO），仅用于对比算法/实现差异，别用它给生产性能下结论；生产结论靠端到端压测。
+
+## 六、GC 选择指南
+
+| 目标 | 收集器 | 参数 |
+| --- | --- | --- |
+| 吞吐优先（批处理） | Parallel GC | `-XX:+UseParallelGC` |
+| 均衡（默认服务端） | G1 | `-XX:+UseG1GC`（JDK 9+ 默认） |
+| 超低延迟（<10ms，大堆） | ZGC | `-XX:+UseZGC`（建议 JDK 17+，21 用分代） |
+| 亚毫秒（Red Hat 系） | Shenandoah | `-XX:+UseShenandoahGC` |
+| 堆极小/无 GC 开销（短命 CLI） | Epsilon（no-op） | `-XX:+UseEpsilonGC` |
+
+- **调优先定目标**（吞吐/延迟/内存），再看 GC 日志与 JFR，别盲目换收集器；ZGC/Shenandoah 不是银弹，CPU 开销与分配速率压力需评估。
+
+## 七、Java 新语法深入（JDK 17/21 常用）
+
+- **模式匹配 switch**（JDK 21 正式）：`case Integer i -> ...; case String s when s.length()>3 -> ...;` 类型 + 守卫，替代冗长 `instanceof` 链，编译期可穷尽检查（配 sealed）。
+- **文本块（Text Blocks）**：`"""..."""` 写 SQL/JSON/HTML 多行字面量，免转义；`.formatted()` 当模板用。
+- **var**（JDK 10）：局部变量类型推断，提升可读性，但别滥用到看不出类型。
+- **密封接口 + 记录模式**：`record Point(int x,int y)` 配合 `case Point(int x, int y)` 直接解构。
+- **String 增强**：`isEmpty`/`isBlank`/`strip`/`lines`/`repeat`/`indent`。
+- **集合工厂**：`List.of/Set.of/Map.of` 返回不可变集合（**不能 null、不能 add**，否则抛异常）。
+- **Stream 增强**：`toList()`（JDK 16）、`takeWhile`/`dropWhile`、`mapMulti`。
+- **HttpClient**（JDK 11，替代老旧 `HttpURLConnection`）：支持 HTTP/2、异步、`BodyHandlers`。
+- **Vector API（孵化）**：SIMD 加速数值计算；**值对象（Value Objects，预览）**：无对象头的扁平数据，省内存、降 GC 压力，适合海量小对象（如货币/坐标）。
+
+## 八、JDK 升级注意事项
+
+- **移除/废弃**：JDK 9 删去 `rt.jar`、CORBA、JAXB 移出 JDK（需引依赖）；JDK 11 删 `Java EE`/`CORBA`；JDK 17 强封装内部 API（`--illegal-access` 默认 deny）。
+- **字节码版本**：运行高版本字节码需对应 JDK；Spring Boot 3 要求 JDK 17+。
+- **GC 默认**：JDK 9+ 默认 G1；JDK 21 实验分代 ZGC 转正。
+- **升级策略**：先在测试/灰度用新 JDK 跑全量测试；用 `jdeps` 查内部 API 依赖；关注 `-XX:+PrintClassHistogram`/JFR 对比升级前后 GC 与吞吐。
+- **LTS 选择**：8 → 11 → 17 → 21 是长期支持线，生产优先选 LTS，避免非 LTS 短期支持风险。

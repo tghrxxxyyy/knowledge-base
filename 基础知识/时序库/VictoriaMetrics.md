@@ -247,3 +247,101 @@ services:
 ## 8. 小结
 
 VictoriaMetrics 以「**Prometheus 完全兼容 + 极高压缩 + 极简运维**」成为大规模监控长期存储的性价比之王。其 `vmstorage/vminsert/vmselect` 分离架构带来天然弹性，MetricsQL 在 PromQL 之上补齐工程化能力。落地关键在于：**控制 label 基数、正确配置去重、按写入/查询独立扩缩 insert/select、给 vmstorage 留足磁盘与内存**。
+
+---
+
+## 9. 运维实战与性能调优
+
+### 9.1 容量规划公式
+
+```text
+# 活跃 series 数（决定内存/索引）
+活跃 series ≈ 抓取目标 × 每目标指标 × 每目标 label 组合数
+
+# 日磁盘增量（压缩后经验值）
+日磁盘(GB) ≈ 每秒样本 × 86400 × 每样本字节(VM 约 0.5~1.5B) / 1024³
+# 经验：1000 samples/s ≈ 每天 ~1~3 GB；远少于 Prometheus 本地
+
+# 内存
+vmstorage 内存(GB) ≈ 活跃 series × (1~4 KB) + 块缓存
+```
+
+| 资源 | 建议 |
+|------|------|
+| vmstorage 磁盘 | 按 retention × 日增量 × 1.3 余量；优先 SSD |
+| vmstorage 内存 | 给足索引与 mmap 缓存，避免 swap |
+| vminsert/select | 无状态，前面挂 LB，按需水平扩 |
+
+### 9.2 去重策略
+
+多副本 Prometheus 双写同一 VM 会产生重复样本：
+
+```yaml
+# vmselect 全局去重（按最小抓取间隔）
+./vmselect -dedup.minScrapeInterval=30s
+
+# 或查询层用 MetricsQL dedup()
+sum(dedup(node_cpu_seconds_total)) by (instance)
+```
+
+> 去重基于 `(TSID, timestamp)` 取最新值；务必对齐时间戳，否则会出现锯齿/翻倍。
+
+### 9.3 retention 与降本
+
+```bash
+# single 模式：保留 12 个月
+./victoria-metrics -retentionPeriod=12
+
+# cluster：在 vmstorage 设置
+./vmstorage -retentionPeriod=12 -storageDataPath=/vm-data
+```
+
+降本手段：
+- 合理 retention：热 1~3 月，长期可下沉对象存储归档。
+- 控制 label 基数：砍掉高基数列是最有效的降本手段。
+- 降采样（vmagent 的 rollup 或 recording rule）：长期只留聚合，省空间。
+- 限制大查询（如 `maxConcurrentRequests`），避免为偶发大查询盲目扩容。
+
+### 9.4 与 Thanos / Mimir 取舍
+
+| 维度 | VictoriaMetrics | Thanos | Mimir |
+|------|-----------------|--------|-------|
+| 存储后端 | 本地磁盘 | 对象存储(S3) | 对象存储 |
+| 部署复杂度 | 低（无对象存储依赖） | 中 | 高 |
+| 查询延迟 | 低（本地盘） | 较高（对象拉取） | 中 |
+| 压缩比 | 极高 | 中 | 中 |
+| 适用 | 简单、低延迟 | 多集群统一、已用 S3 | 多租户、云原生 |
+
+选型：追求简单与低延迟 → VM；已有成熟对象存储且要多集群全局视图 → Thanos/Mimir。
+
+### 9.5 vmagent / vmalert 用法
+
+```bash
+# vmagent：替代 Prometheus 抓取，支持 relabel、降采样、多远端写
+./vmagent -promscrape.config=/etc/vmagent.yml \
+  -remoteWrite.url=http://vminsert:8480/insert/0/prometheus/api/v1/write \
+  -remoteWrite.tmpDataPath=/tmp/vmagent
+
+# vmalert：基于规则做告警/记录，可独立于 Prometheus
+./vmalert -rule=/etc/rules.yml \
+  -datasource.url=http://vmselect:8481/select/0/prometheus \
+  -notifier.url=http://alertmanager:9093
+```
+
+```yaml
+# vmagent.yml 抓取片段
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+```
+
+> vmagent 比 Prometheus 更省资源，且原生支持「一份采集、多份 remote_write」与采样降维，适合做采集网关。
+
+### 9.6 故障排查 checklist
+
+- [ ] 内存涨 → 查 cardinality（/api/v1/status/tsdb），砍高基 label。
+- [ ] 磁盘满 → 查 retention、是否未配置自动清理、基数是否失控。
+- [ ] 图表锯齿/翻倍 → 查去重是否开启、时间戳是否对齐。
+- [ ] 查询慢 → vmselect 是否 CPU 瓶颈、是否大范围跨月查询。
+- [ ] 扩缩 vmstorage → 低峰期操作，一致性哈希环重平衡需预留容量。

@@ -275,3 +275,125 @@ public class EchoServer {
 ```
 
 > **读源码建议**：从 `ServerBootstrap.bind()` → `AbstractBootstrap.doBind()` → `initAndRegister()` 入手，再顺 `NioEventLoop.run()` 看事件循环，最后看 `ChannelPipeline` 如何驱动 Handler。这三段是理解 Netty 的骨架。
+
+---
+
+## 十、内存池 PooledByteBufAllocator 与引用计数
+
+Netty 默认用 `PooledByteBufAllocator`（4.x 起默认开启），基于 **jemalloc 思想** 减少堆外内存的频繁申请/释放。
+
+```java
+// 默认分配器
+ByteBuf buf = ByteBufAllocator.DEFAULT.buffer(1024); // 等价于 PooledByteBufAllocator
+```
+
+- **池结构**：`PoolArena`（按线程分 `HeapArena` / `DirectArena`，减少竞争）→ `PoolChunk`（管理 16MB 连续内存，内部用**伙伴算法** `PoolSubpage` 切小内存）→ `PoolSubpage`（管理 ≤28KB 的小块，位图标记占用）。
+- **线程缓存**：每个线程有 `PoolThreadCache`，分配/释放先走本地缓存，命中即免锁，极大提升吞吐。
+- **引用计数（ReferenceCounted）**：`ByteBuf` 显式引用计数，`retain()` +1、`release()` -1，归零时真正回收（直接内存需手动释放，否则**内存泄漏**）。
+
+```java
+ByteBuf buf = ctx.alloc().directBuffer(8);
+buf.writeInt(1);
+buf.retain();            // 传递给其他引用
+// ... 使用 ...
+buf.release(); buf.release(); // 引用归零 → 归还池 / 释放
+```
+
+- **泄漏检测**：`ResourceLeakDetector` 在 `-Dio.netty.leakDetection.level=PARANOID` 下对未 release 的 ByteBuf 追踪并告警（生产建议 `SIMPLE`）。
+- **易错点**：Pipeline 中 `msg` 被多次 `write`（如广播）需 `retain()`；`SimpleChannelInboundHandler` 默认在 `channelRead0` 后自动 `release`，自定义 Handler 若往下 `fireChannelRead` 则不要重复 release。
+
+```mermaid
+flowchart LR
+    T[线程] --> C[PoolThreadCache 本地缓存]
+    C -->|未命中| A[PoolArena]
+    A --> CH[PoolChunk 伙伴分配]
+    A --> SP[PoolSubpage 小对象]
+    C -->|归还| A
+```
+
+## 十一、JCTools 无锁队列
+
+Netty 的 `MpscQueue`（多生产者单消费者）来自 **JCTools** 库（`io.netty.util.internal.shaded.org.jctools`），是 EventLoop 任务队列与 Pipeline 传递的高性能底座：
+
+- `MpscArrayQueue`：多生产者（`offer` 用 `CAS`）单消费者（`poll` 无锁），比 `LinkedBlockingQueue` 在高并发下延迟与吞吐都更优。
+- 用途：`NioEventLoop` 的 `taskQueue` 用 Mpsc；`ChannelOutboundBuffer` 写任务也借助类似无锁结构。
+- 设计要点：通过**填充（padding）避免伪共享**（头尾指针分属不同缓存行），并用 `volatile` + `CAS` 保证可见性与原子性，避免 `synchronized`/`ReentrantLock` 的内核态开销。
+
+## 十二、Native Transport（epoll / io_uring）
+
+Netty 在 Linux 提供 **native 传输**（需 `netty-transport-native-epoll`），底层用 JNI 调用 `epoll` / `eventfd`：
+
+```java
+// 使用 native 传输替代 NIO
+EventLoopGroup boss = new EpollEventLoopGroup(1);
+EventLoopGroup worker = new EpollEventLoopGroup();
+ServerBootstrap b = new ServerBootstrap();
+b.group(boss, worker).channel(EpollServerSocketChannel.class);
+```
+
+- **优势**：`epoll` 边缘触发（ET）相比 NIO 的 `select`/`poll` 减少空转；支持 `SO_REUSEPORT`（多进程/多线程绑定同端口，内核级负载均衡）。
+- **io_uring**：Netty 新版本实验性支持 `io_uring`（Linux 5.1+ 的异步 IO 框架），进一步降低系统调用开销，适合超高吞吐场景。
+- 注意：native 传输是**平台相关**的，非 Linux 会 fallback 到 NIO；部署需引入对应架构的 native 依赖。
+
+## 十三、WriteBuffer 水位与背压
+
+当对端消费慢、写出的数据堆积在 `ChannelOutboundBuffer` 时，若不限制会撑爆内存。Netty 用**写水位（writeBufferWaterMark）**实现背压：
+
+```java
+bootstrap.option(ChannelOption.WRITE_BUFFER_WATER_MARK,
+    new WriteBufferWaterMark(32 * 1024, 64 * 1024)); // 低 32K / 高 64K
+```
+
+- 当待写字节数 > 高水位，`channel.isWritable()` 变 `false`；低于低水位才恢复 `true`。
+- 业务应在 `channelWritabilityChanged` 事件中感知：不可写时暂停生产（如暂停从 MQ 拉取），可写时恢复——这正是**应用层背压**的经典实现。
+- `writeBuffer` 内存占用 = `ChannelOutboundBuffer` 中未 flush 的 `ByteBuf` 之和（含 `DirectBuffer`），水位设置过小会频繁暂停影响吞吐，过大则有 OOM 风险。
+
+## 十四、自定义协议编解码实战
+
+以「消息头(4字节长度 + 1字节类型) + body」为例，定义 `Message` 与编解码器：
+
+```java
+// 协议: [int length][byte type][byte[] body]
+public class Message {
+    byte type; byte[] body;
+}
+
+// 解码：继承 LengthFieldBasedFrameDecoder 切出整包后转 Message
+public class MessageDecoder extends LengthFieldBasedFrameDecoder {
+    public MessageDecoder() { super(1024 * 1024, 0, 4, 0, 4); } // 跳过4字节长度字段
+    @Override
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+        ByteBuf frame = (ByteBuf) super.decode(ctx, in);
+        if (frame == null) return null;
+        byte type = frame.readByte();
+        byte[] body = new byte[frame.readableBytes()];
+        frame.readBytes(body);
+        frame.release();
+        return new Message(type, body);
+    }
+}
+
+// 编码：Message -> ByteBuf
+public class MessageEncoder extends MessageToByteEncoder<Message> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, Message msg, ByteBuf out) {
+        out.writeInt(msg.body.length);   // 长度
+        out.writeByte(msg.type);         // 类型
+        out.writeBytes(msg.body);        // 内容
+    }
+}
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Pipeline
+    participant S as Server
+    C->>P: write(Message)
+    P->>P: MessageEncoder 编码
+    P->>S: TCP 字节流
+    S->>P: LengthFieldBasedFrameDecoder 拆包
+    S->>S: MessageDecoder 解码为 Message
+```
+
+要点：编解码放在 Pipeline 首尾，业务 Handler 只处理 `Message` 对象；`LengthFieldBasedFrameDecoder` 已处理拆包粘包，自定义 `decode` 只需在「拿到完整帧」后反序列化，避免重复造轮子。

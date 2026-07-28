@@ -386,4 +386,111 @@ sequenceDiagram
 | 生态 | Spring Cloud Alibaba | Spring Cloud Netflix | 独立，多语言客户端 |
 
 > 小结：Nacos 用「一套底座同时支撑注册与配置」，并允许按场景在 AP/CP 间取舍（注册走 AP 保证可用，配置走 CP 保证一致），这是其相对 Eureka（纯 AP）、Apollo（纯配置）的核心优势。
+
+---
+
+## 一、配置变更服务端发布链路（发布侧）
+
+前文详细看了客户端 `ClientWorker` 长轮询与服务端 `addLongPollingClient`/`DataChangeTask` 的「hold 住再通知」机制，这里补上**服务端内部是如何把一次配置发布事件驱动到 LongPollingService 的**：
+
+1. 控制台/OpenAPI 调 `ConfigController.publishConfig` → `ConfigOperationService.publishConfig`。
+2. 写持久化存储（外置 DB，如 `config_info` 表），并调用 `ConfigChangePublisher` 发布 `ConfigDataChangeEvent`。
+3. `NotifyCenter` 是 Nacos 的事件总线（基于 `LinkedBlockingQueue` + 独立线程 `NotifySingleService`），把事件分发给订阅者 `DumpService`：
+
+```java
+// NotifyCenter 发布
+NotifyCenter.publishEvent(new ConfigDataChangeEvent(dataId, group, tenant, time));
+// DumpService 监听：把最新配置 dump 到磁盘缓存并触发长轮询通知
+class DumpConfigChangeEventListener implements Subscriber<ConfigDataChangeEvent> {
+    public void onEvent(ConfigDataChangeEvent event) {
+        dumpService.dump(event.dataId, event.group, event.tenant, ...); // 落本地磁盘
+        // dump 完成后其内部会调 LongPollingService 的 DataChangeTask（前文已述）
+    }
+}
+```
+
+4. `LongPollingService` 收到变更 → 遍历 `allSubs` 中匹配 `groupKey` 的 `ClientLongPolling` → `sendResponse` 立即返回（即前文「in-advance」提前返回）。
+
+> 关键设计：`NotifyCenter` 解耦了「配置写入」与「配置推送」，发布侧只需发事件，推送侧（长轮询）异步消费，避免同步推送阻塞写请求。生产若推送延迟，优先查 `NotifyCenter` 消费线程是否堆积。
+
+## 二、临时实例 vs 持久实例（源码视角）
+
+Nacos 注册中心对实例做了 AP/CP 双模型：
+
+| 维度 | 临时实例（ephemeral=true，默认） | 持久实例（ephemeral=false） |
+|------|--------------------------------|---------------------------|
+| 注册存储 | `Distro` 内存 + 异步拷贝各节点 | Raft（JRaft）+ 落盘 |
+| 健康方式 | 客户端心跳保活 | 服务端主动健康检查 |
+| 宕机处理 | 超时剔除（默认 30s） | 标记不健康，不自动删 |
+| 适用 | 普通微服务（容忍最终一致） | 需强一致 / 不可丢的元数据 |
+
+- **服务端实例管理**：`ClientManager`（如 `EphemeralClientManager`）按 `connectionId` 维护客户端连接与注册的实例；临时实例随连接断开（心跳超时）被 `ExpiredClientCleaner` 清理。
+- **持久实例注册**：走 `PersistentService` / Raft 状态机，注册信息写 `instance` 表并 raft replicate，服务端通过 `HealthCheckTask` 用 TCP/HTTP/MySQL 探活。
+- **一致性切换**：`consistencyService` 根据 `ephemeral` 选择 `DistroConsistencyServiceImpl` 或 `RaftConsistencyServiceImpl`（CP 模式需以「集群模式 + 配置持久化开关」开启）。
+
+```mermaid
+flowchart LR
+    R[实例注册] -->|ephemeral=true| D[Distro 内存 AP]
+    R -->|ephemeral=false| RF[Raft CP 落盘]
+    D --> HB[客户端心跳保活]
+    RF --> HC[服务端健康检查]
+```
+
+## 三、CMDB 模块与就近路由
+
+Nacos 内置 **CMDB（Configuration Management Database）** 模块，用于「按机房/地域就近调用」：
+
+- `CmdbManager` 加载 IP → 机房（`idc`）、城市、运营商等标签；标签可来自本地 `nacos-cmdb` 插件或外部 CMDB 系统。
+- 服务发现时 `ServiceInfo` 携带实例的 `cluster`/`idc` 信息；`Selector` 可通过 `HealthOrWeight` / 自定义 `Selector` 实现「同机房优先」。
+- 控制台可配置 `CMDB` 标签与「就近路由规则」，Nacos 客户端订阅时在 `HostReactor` 中按标签做过滤/排序。
+
+> 生产价值：多机房部署下避免跨机房调用延迟；配合权重实现「本机房优先、跨机房兜底」。
+
+## 四、Nacos 与 Consul 对比（补 Eureka 之外）
+
+除前文 Eureka/Apollo 外，常拿来对标的是 HashiCorp **Consul**：
+
+| 维度 | Nacos | Consul |
+|------|-------|--------|
+| 注册/配置 | 一体 | 一体（KV 做配置） |
+| 一致性 | 注册 AP / 配置 CP 可切换 | 基于 Raft 的 CP |
+| 健康检查 | 心跳 / 服务端探测 | 多种（HTTP/TCP/gRPC/script）+ 服务端主动 |
+| 服务发现协议 | 私有 HTTP + Distro | 支持 DNS / HTTP / gRPC |
+| 多语言 | Java 为主（有 sidecar 思路） | 多语言原生友好（Go 写，DNS 接入） |
+| 配置推送 | 长轮询（准实时） | 阻塞查询（blocking query）+ watch |
+| 生态 | Spring Cloud Alibaba 深度整合 | K8s / 云原生（Consul Connect 服务网格） |
+
+> 选型：国内 Spring Cloud Alibaba 栈首选 Nacos；若已是 Go / 多语言 / 云原生体系，Consul 的 DNS 服务发现与多语言友好性更合适。
+
+## 五、生产踩坑与调优
+
+1. **长轮询超时与客户端线程池**：客户端 `ClientWorker` 的 `executorService` 线程数 = CPU 核数，监听的配置项（listener）很多时会成批（`PerTaskConfigSize` 默认 3000）起长轮询任务；配置项超万级需关注线程打满。
+2. **临时实例心跳丢失导致大面积剔除**：网络抖动若让多数实例心跳超时，Nacos 会批量剔除实例造成「雪崩式不可用」。可开启**服务端自我保护**（类似 Eureka）或调大 `ipDeleteTimeout`。
+3. **配置中心强一致下的写性能**：CP 模式（Raft）每次配置发布需多数派确认，高频发布会成为瓶颈；配置发布应「批量 + 低频」，勿用配置中心当高频动态参数通道。
+4. **Distro 数据不一致**：节点扩缩容 / 网络分区后，Distro 异步拷贝可能短暂不一致，`/nacos/v1/ns/operator/distroStatus` 可查各节点数据差异，必要时手动重新校验。
+5. **namespace / group / dataId 命名规范**：混乱的命名会导致权限与灰度失控；建议 `namespace=环境（dev/test/prod)`，`group=应用组`，`dataId=应用名.properties`。
+6. **集群部署必须奇数节点**：Raft 选主依赖多数派，3/5 节点为底线，且需独立部署避免与业务同机争资源。
+
+---
+
+## 六、Nacos 2.x 的 gRPC 长连接（对比 1.x）
+
+Nacos 1.x 注册/配置均走 HTTP 短轮询/长轮询，2.x 引入**gRPC 长连接**（默认端口 9848 = 主端口+1000），核心变化：
+
+- 注册/心跳/配置监听改用**双向流式 gRPC**（`Request/Response` 流式通道），服务端可主动 Push（如配置变更、实例上下线），不再依赖客户端长轮询 hold 住线程——服务端资源占用大幅下降。
+- 客户端 `RpcClient` 维护一条长连接，内部自动重连、健康检查（`HealthCheckRequest`）；断连后客户端本地缓存兜底，重连后增量同步。
+- 配置监听：`ConfigChangeNotifyRequest` 由服务端直接推到长连接，客户端 `ClientWorker` 收到后即时刷新，延迟从「秒级（长轮询 ~30s 上限）」降到「毫秒级」。
+- 兼容：2.x 仍保留 8848 HTTP 端口以兼容 1.x 客户端与 OpenAPI，但新客户端优先走 gRPC。
+
+> 升级建议在服务端开启 `nacos.core.protocol.grpc` 并确认防火墙放行 9848/9849；长连接模式下「网络抖动导致连接闪断」比 1.x 更敏感，需关注 `RpcClient` 重连频率。
+
+---
+
+## 七、配置灰度（Beta 发布）与监听隔离
+
+Nacos 控制台支持 **Beta 发布**：配置可先指定「灰度 IP / Tag」生效，仅这些客户端拉到新值，验证无误再全量发布，出问题可一键停止 Beta，避免「一发全挂」。
+
+- 服务端用 `ConfigCacheService` 区分 `beta` 配置与正式配置；`ConfigLongPollingService.DataChangeTask` 在推送时会校验 `betaIps` / `tag`，仅匹配客户端收到 Beta 值（前文 `DataChangeTask` 代码已体现 `isBeta` 判断）。
+- **监听隔离**：不同 `namespace` 的配置物理隔离，互不可见；同一 `namespace` 下 `group` 用于按应用聚合，`dataId` 精确标识。客户端只监听自己 `tenant+group` 下的 `dataId`，天然避免跨应用误配。
+- 运维建议：核心配置走 Beta + 灰度分批；非核心可直发。配合「配置变更审计（who/when）」与「一键回滚（历史版本）」形成闭环。
 ```

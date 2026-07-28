@@ -125,3 +125,25 @@ inject(hits)   # 只把最相关的几条注入上下文
 ```
 
 > 这样 Codex 的自动记忆既能靠文件名定位，也能靠语义召回长尾经验，缓解「记了但想不起来」的问题。注意向量库同样要本地化或受控，避免把敏感会话外泄。
+
+## 六、记忆与上下文工程 / 智能体的联动
+
+Codex 的 `AGENTS.md` + `Memories` 不是孤立的，它们正是上下文工程「Memory 杠杆」与智能体「状态保持」的落地形态：
+
+```mermaid
+flowchart LR
+    AG[AGENTS.md: 静态指令] --> WIN[上下文窗口]
+    MEM[Memories: 生成笔记] --> WIN
+    WIN --> SA[子代理: 隔离窗口]
+    WIN --> TI[Tool-result clearing]
+    MEM -.异步沉淀.-> MEM
+```
+
+| 联动点 | 说明 |
+| --- | --- |
+| 与上下文工程 | `Memories` 是「窗口外持久化」的具体实现，呼应 compaction/clearing 把高信号落外部 |
+| 与智能体 | 多轮工具调用间靠 `Memories` 保持状态，避免每轮重交代 |
+| 与 RAG | `AGENTS.md` 可写「检索范围/偏好」，再由 RAG 取细节 |
+| 与提示词 | `AGENTS.md` 本身是强结构化提示，决定 agent 人设与边界 |
+
+> 💡 Codex 的极简两层（静态 `AGENTS.md` + 生成 `Memories`）已覆盖大多数 coding agent 场景；要上海量语义记忆，再叠加 05 的向量检索即可。

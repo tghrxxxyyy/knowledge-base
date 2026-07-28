@@ -294,3 +294,118 @@ WHERE m.time >= NOW() - INTERVAL '1 hour';
 - 活跃 chunk 的膨胀用 `VACUUM` / `pg_repack` 治理。
 - 监控：关注 `hypertable_size`、压缩比、连续聚合刷新延迟、chunk 数量。
 - 备份用 PG 原生 `pg_basebackup` / WAL 归档；云版用托管快照。
+
+---
+
+## 10. 运维实战与性能调优
+
+### 10.1 Chunk 大小调优
+
+chunk 是超表物理分区，大小直接决定压缩/删除粒度与规划开销。
+
+```sql
+-- 调整时间分片区间（高频写入用 1~7 天）
+SELECT set_chunk_time_interval('sensor_readings', INTERVAL '1 day');
+
+-- 查看各 chunk 大小，判断是否需要调整
+SELECT chunk_name,
+       pg_size_pretty(hypertable_chunk_size) AS size
+FROM chunk_relation_sizes('sensor_readings')
+ORDER BY hypertable_chunk_size DESC;
+```
+
+经验准则：
+- 单 chunk 压缩前 25MB~数 GB、压缩后数 MB~数百 MB 为宜。
+- 高频写入（秒级）→ 1~3 天；中低频（分钟级）→ 7~30 天。
+- 过小 → chunk 数量爆炸，规划与元数据开销大；过大 → 删除/压缩粒度粗。
+
+### 10.2 连续聚合刷新策略
+
+```sql
+-- 分层聚合：明细 -> 1m -> 1h -> 1d 逐级物化
+SELECT add_continuous_aggregate_policy('readings_1h',
+       start_offset => INTERVAL '3 days',
+       end_offset   => INTERVAL '1 hour',
+       schedule_interval => INTERVAL '1 hour');
+
+-- 手动刷新指定窗口（回补/修复用）
+CALL refresh_continuous_aggregate('readings_1h',
+       NOW() - INTERVAL '7 days', NOW() - INTERVAL '1 hour');
+```
+
+要点：
+- `end_offset` 留 1h 余量，避免最新数据未物化导致看板缺口。
+- `start_offset` 不宜过大，否则每次刷新扫过旧数据浪费资源。
+- 层级叠加时，上层（1h）从下层（1m）读，而非从明细读，减少重算。
+
+### 10.3 压缩策略（按年龄）
+
+```sql
+-- 超过 7 天的 chunk 自动压缩
+SELECT add_compression_policy('sensor_readings', INTERVAL '7 days');
+
+-- 压缩策略 + 保留策略组合：先压缩再过期
+SELECT add_retention_policy('sensor_readings', INTERVAL '180 days');
+
+-- 查看压缩率
+SELECT hypertable_name,
+       pg_size_pretty(hypertable_size) AS total
+FROM hypertables
+WHERE hypertable_name = 'sensor_readings';
+```
+
+> 已压缩 chunk 视为不可变：对其 UPDATE/DELETE 会触发自动解压+重压缩，写放大明显。历史修正应先 `decompress_chunk` 再改，或设计 append-only。
+
+### 10.4 Multinode 运维
+
+```sql
+-- 检查数据节点状态
+SELECT * FROM timescaledb_information.data_nodes;
+
+-- 查看分布式超表的分片分布
+SELECT * FROM timescaledb_information.chunks
+WHERE hypertable_name = 'sensor_readings';
+
+-- 节点故障：重新加回或替换
+SELECT delete_data_node('dn2');
+SELECT add_data_node('dn2', host => '10.0.1.12');
+```
+
+运维要点：
+- access node 是 SQL 入口与计划分发点，需重点保障可用性与备份。
+- data node 故障时，依赖 replication_factor 提供副本；副本不足会丢写入。
+- 较新社区版以单实例 + 压缩为主，multinode 能力以云版更完整，生产前核对版本支持。
+
+### 10.5 与 PG 生态联动（PostgREST / FDW）
+
+TimescaleDB 即 PostgreSQL，可直接复用整个 PG 生态：
+
+```sql
+-- 1) 用 postgres_fdw 关联外部业务库（订单库）做跨库分析
+CREATE EXTENSION postgres_fdw;
+CREATE SERVER orders_srv FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (host '10.0.2.5', dbname 'orders');
+CREATE USER MAPPING FOR CURRENT_USER SERVER orders_srv
+  OPTIONS (user 'ro', password 'xxx');
+IMPORT FOREIGN SCHEMA public LIMIT TO (orders)
+  FROM SERVER orders_srv INTO public;
+
+-- 时序 + 业务 JOIN
+SELECT m.device_id, SUM(m.temperature), o.region
+FROM sensor_readings m
+JOIN orders o ON o.device_id = m.device_id
+WHERE m.time >= NOW() - INTERVAL '1 day'
+GROUP BY m.device_id, o.region;
+```
+
+- **PostgREST**：把超表直接暴露为 REST API，前端/BI 无需写 SQL 即可查询聚合结果（适合只读看板）。
+- **FDW / dblink**：关联 MySQL/Oracle/数仓做混合分析。
+- **PostGIS**：地理时序（轨迹/位置）直接用 GIS 函数处理。
+
+### 10.6 故障排查 checklist
+
+- [ ] 写入慢 → 检查活跃 chunk 是否膨胀（VACUUM/pg_repack）、索引是否过多。
+- [ ] 压缩比低 → 查 `segmentby`/`orderby` 设置，是否高基数列未选对。
+- [ ] 连续聚合缺口 → 查刷新策略 `end_offset`、刷新任务是否失败。
+- [ ] 查询慢 → 是否命中聚合表，是否带时间下界。
+- [ ] 磁盘涨 → 保留策略/压缩策略是否生效，旧 chunk 是否被删。

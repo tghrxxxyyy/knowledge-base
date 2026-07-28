@@ -308,3 +308,105 @@ curl -i -XPOST "http://localhost:6041/influxdb/v1/write?db=test" \
 ## 9. 小结
 
 TDengine 凭借**超级表模型 + 列式时序存储 + 单写者追加 + 原生集群**，在海量设备指标场景下做到了极高的写入吞吐与压缩比，且提供 SQL 接口降低门槛，是国产时序库的代表。其建模精髓在于「**一设备一子表、tag 做维度、时间做主键**」，把握这一点即可避开绝大多数性能坑。
+
+---
+
+## 10. 运维实战与性能调优
+
+### 10.1 vnode 规划
+
+vnode 是 TDengine 复制、均衡、恢复的基本单位，规划直接影响并行度与恢复时间。
+
+```bash
+# 建库时指定 vnode 数与副本数（按节点规模）
+taos> CREATE DATABASE iot KEEP 365 DAYS 10 BLOCKS 6 VGROUPS 32 REPLICA 3;
+
+# 查看 vnode 分布，确认均衡
+taos> SHOW VGROUPS;
+taos> SELECT * FROM information_schema.ins_vnodes;
+```
+
+经验：
+- 单 dnode 上 vnode 数 ≈ CPU 核数 1~2 倍，但不宜过多（元数据开销）。
+- 单 vnode 数据量几十 GB 量级较健康；过小迁移/恢复频繁，过大恢复慢。
+- 总 vnode 数控制在数百级；扩 dnode 后由 mnode 自动 rebalance。
+
+### 10.2 超级表设计反模式
+
+| 反模式 | 后果 | 正确做法 |
+|--------|------|----------|
+| 所有设备塞一张超级表 | 列稀疏、tag 过多 | 按设备类型分多张 STABLE |
+| `TAGS(device_id)` 且千万取值 | 标签索引灾难 | device_id 作子表名 tbname |
+| 高频变化量放 tag | tag 不压缩、写放大 | 只把静态/慢变元数据放 tag |
+| tag 数 > 16 | 索引体积大 | 单 STABLE tag < 10~16 个 |
+
+```sql
+-- 正确：按设备类型建超级表，device_id 作为子表名
+CREATE STABLE IF NOT EXISTS meters (ts TIMESTAMP, current FLOAT, voltage INT)
+  TAGS (location BINARY(64), group_id INT);
+CREATE TABLE d1001 USING meters TAGS ('北京', 1);
+```
+
+### 10.3 乱序与补数
+
+TDengine 假设单设备时间递增。迟到数据（补数）处理：
+
+```sql
+-- 补数：直接 INSERT 历史时间戳数据（会触发回写已封闭 block）
+INSERT INTO d1001 VALUES ('2026-07-20 10:00:00', 9.8, 218, 0.30);
+
+-- 大批量补数建议：独立归档子表 + 离线导入，避免冲击在线写入
+```
+
+应对策略：
+- 采集端做时间排序/缓冲，尽量顺序写。
+- 评估乱序容忍窗口；超窗口的迟到数据走独立补数流程。
+- 频繁补数会降压缩率，必要时对补数表单独配置更宽松的落盘策略。
+
+### 10.4 企业版特性
+
+| 能力 | 社区版 | 企业版 |
+|------|--------|--------|
+| 集群扩缩容 | 基础 | 平滑、可视化平台 |
+| 数据订阅（Topic） | 有限 | 完整，可做 CDC |
+| 流式计算 | 基础 | 增强窗口/聚合 |
+| 安全审计/加密/TDE | 无 | 支持 |
+| 可视化运维（Explorer） | 无 | 提供 |
+
+企业版数据订阅可与 Kafka / Flink 打通，做实时下游分发。
+
+### 10.5 与 Kafka / Flink 集成实战
+
+```bash
+# Kafka → TDengine：用 taosAdapter 的 InfluxDB 兼容接口承接（迁移成本低）
+curl -i -XPOST "http://tdengine:6041/influxdb/v1/write?db=iot" \
+  --data-binary 'meters,location=北京,group_id=1 current=10.2,voltage=220 1467106610000000000'
+```
+
+```sql
+-- Flink SQL sink 到 TDengine（通过 JDBC）
+CREATE TABLE td_sink (
+  tbname STRING,
+  ts TIMESTAMP(3),
+  current DOUBLE,
+  voltage INT
+) WITH (
+  'connector' = 'jdbc',
+  'url' = 'jdbc:TAOS-RS://tdengine:6041/iot',
+  'table-name' = 'meters',
+  'sink.parallelism' = '4'
+);
+```
+
+集成要点：
+- 用 taosAdapter 的 InfluxDB 兼容接口承接 Kafka Connect，迁移成本低。
+- Flink 聚合结果写超级表聚合子表，明细写设备子表，分层清晰。
+- 企业版 Topic 订阅可做「写入即分发」的实时管道，替代部分 ETL。
+
+### 10.6 故障排查 checklist
+
+- [ ] 写入慢 → 查 WAL 堆积、vnode 分布是否倾斜、磁盘 IO。
+- [ ] 压缩比低 → 查乱序程度、是否高基数列误放 tag。
+- [ ] 查询慢 → 是否全表扫子表（缺 tag 过滤）、是否跨大时间范围。
+- [ ] 副本不同步 → 查 dnode 存活、网络分区、mnode 选主。
+- [ ] 磁盘涨 → 查 `KEEP` 保留策略、过期数据是否清理。

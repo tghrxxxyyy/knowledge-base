@@ -149,4 +149,113 @@ flowchart LR
 ```text
 检索：MEMORY.md(≤200行/25KB) → 按需读主题文件
 遗忘：人工 /memory 清理，无自动 TTL
+
+## 六、记忆检索与遗忘策略（代码实现）
+
+把 05 的文本策略落成可运行逻辑。核心三类操作：检索合并、TTL 过期、LRU/重要性淘汰。
+
+```python
+import time, json
+from pathlib import Path
+
+class MemoryStore:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    # 检索：合并「精确 KV 命中 + 索引文件 + 按需主题」
+    def retrieve(self, key=None, limit=5):
+        if key and (self.root / f"{key}.json").exists():
+            return json.loads((self.root / f"{key}.json").read_text())  # KV 精确取
+        hits = [p for p in self.root.glob("*.md")][:limit]             # 否则召回索引
+        return [p.read_text() for p in hits]
+
+    # 写入：KV 精确写 + 更新访问时间（用于 LRU）
+    def write(self, key, value):
+        (self.root / f"{key}.json").write_text(json.dumps(
+            {"value": value, "ts": time.time(), "access": time.time()}))
+
+    # 遗忘：TTL 过期 + LRU 淘汰（按最近访问时间）
+    def forget(self, ttl=7*24*3600, max_items=100):
+        items, now = [], time.time()
+        for p in self.root.glob("*.json"):
+            d = json.loads(p.read_text()); items.append((p, d["access"]))
+        for p, access in items:
+            if now - access > ttl:
+                p.unlink()                      # TTL 过期
+        items.sort(key=lambda x: x[1])
+        while len(items) > max_items:           # LRU 淘汰
+            p, _ = items.pop(0); p.unlink()
+```
+
+> 💡 生产记忆必须有「遗忘」机制：无 TTL 的记忆会无限膨胀、噪声稀释高信号。KV 用 TTL/LRU，向量库用时间窗口+去重清理。
+
+## 七、向量 + KV 混合存储设计（深化）
+
+精确偏好走 KV、语义经验走向量，二者在「检索时合并注入」：
+
+```mermaid
+flowchart LR
+    T[任务/查询] --> KV[(KV: 用户偏好/开关)]
+    T --> VEC[(向量库: 语义经验)]
+    KV --> MERGE[合并进上下文]
+    VEC --> MERGE
+    MERGE --> LLM[LLM]
+```
+
+| 字段层 | 存储 | 示例 key/schema | 检索 |
+| --- | --- | --- | --- |
+| 偏好 | KV（Redis/SQLite） | `user:123:lang=zh` | 按 user_id 精确取 |
+| 经验 | 向量（pgvector/Milvus） | `embedding + text + tags` | 相似度 top-k |
+| 索引 | Markdown/JSON | `MEMORY.md` 人读总览 | 启动加载 |
+
+```python
+def recall(user_id, task, mem_kv, mem_vec):
+    prefs = mem_kv.get(f"user:{user_id}:prefs")     # KV 精确
+    exps  = mem_vec.search(embed(task), top_k=5)      # 向量语义
+    return build_context(prefs, exps)                # 合并注入
+```
+
+> 💡 混合设计的关键：KV 保证「确定性偏好零延迟命中」，向量补「记了但想不起来的长尾经验」。静态指令层（CLAUDE.md/AGENTS.md）可视为系统级 KV。
+
+## 八、多会话与多用户隔离
+
+记忆若不分租户，会出现「用户 A 看到用户 B 的偏好」或「会话互相污染」。隔离维度：
+
+| 维度 | 隔离键 | 做法 |
+| --- | --- | --- |
+| 多用户 | `user_id` | 记忆路径/命名空间按用户分 |
+| 多会话 | `session_id` | 工作记忆按会话隔离，长期记忆按用户 |
+| 多项目 | `project_id` | 同 Codex/Claude 的仓库级分层 |
+| 多团队 | `tenant_id` | 向量库建独立 collection/namespace |
+
+```python
+def user_memory_path(user_id, project_id):
+    # 用户 + 项目双重隔离，避免跨项目串味
+    return f"~/.mem/{user_id}/{project_id}/MEMORY.md"
+```
+
+> ⚠️ 多用户场景**必须做隔离 + 鉴权**：记忆可能含 PII，越权读取即合规事故。向量库用 namespace/collection 隔离，KV 用 user_id 前缀，检索前校验权限。
+
+## 九、在 Agent 中落地的示例代码
+
+把记忆接入一个最简 Agent 循环：启动加载长期记忆、任务中写工作记忆、结束沉淀长期记忆。
+
+```python
+class Agent:
+    def __init__(self, user_id):
+        self.mem = MemoryStore(f"~/.mem/{user_id}")
+        self.long_term = self.mem.retrieve()        # 启动注入长期记忆
+
+    def run(self, task):
+        ctx = self.long_term + "\n" + self.working   # 长期 + 工作记忆
+        plan = llm.plan(task, ctx)
+        for step in plan:
+            res = tool(step)
+            self.working += f"\n- {step}: {res}"      # 工作记忆滚动
+        self.mem.write("recent", summarize(self.working))  # 结束沉淀
+        return final_answer
+```
+
+> 💡 闭环：**启动读长期 → 任务用工作记忆 → 结束沉淀长期**。配合 05 的遗忘策略（TTL/LRU）防止膨胀，配合异步总结即可接近 Claude/Codex 的自动记忆体验。
 ```

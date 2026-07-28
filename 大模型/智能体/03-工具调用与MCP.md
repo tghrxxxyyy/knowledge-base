@@ -169,3 +169,57 @@ agent = Agent(name="triager", output_type=Ticket)  # 产出必为 Ticket 结构
 - Anthropic — Code execution with MCP（98.7% token 削减）：https://www.anthropic.com/engineering/code-execution-with-mcp
 - OpenAI Agents SDK（Function Tools / Structured Outputs）：https://openai.github.io/openai-agents-python/
 - OWASP LLM Top 10（2025）：https://owasp.org/www-project-top-10-for-large-language-model-applications/
+
+## 七、工具调用的错误恢复与重试
+
+工具执行会失败（超时、限流、脏参数、下游 5xx）。Agent 必须有「错误恢复」而非一失败就崩。
+
+```python
+import time, random
+def call_with_retry(tool, args, max_retries=3):
+    for i in range(max_retries):
+        try:
+            return run_tool(tool, args)
+        except TransientError as e:                 # 限流/超时等可重试
+            if i == max_retries - 1:
+                raise
+            wait = (2 ** i) + random.random()        # 指数退避 + 抖动
+            time.sleep(wait)
+    return None
+
+# 把错误回灌给 LLM，让它换参数/换工具重试
+def safe_call(llm, tool, args):
+    try:
+        return run_tool(tool, args)
+    except Exception as e:
+        return f"工具执行失败: {e}。请换参数或换工具重试。"
+```
+
+| 策略 | 做法 | 适用 |
+| --- | --- | --- |
+| 指数退避 + 抖动 | `2^i + rand` 重试 | 限流/瞬时故障 |
+| 熔断（Circuit Breaker） | 错误率超阈值则暂停调用 | 下游不稳定 |
+| 错误回灌 LLM | 把异常文本喂回模型 | 让模型自纠参数 |
+| 降级 fallback | 失败返回可读兜底 | 非关键路径 |
+
+> ⚠️ 重试要限次，否则 agent 会陷入「调工具→失败→重试」死循环；配合 06 篇的递归思维检测与预算上限。
+
+## 八、MCP 协议细节深化
+
+03 篇讲了架构与原语，这里补「握手/协商/双向能力」的工程细节。
+
+**初始化握手（initialize）**：客户端发 `initialize` 请求，协商协议版本与能力（是否支持 sampling/roots/elicitation），服务器回 `InitializeResult` 后客户端发 `initialized` 通知完成握手。
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize",
+ "params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{}},"clientInfo":{"name":"my-host"}}}
+```
+
+**双向能力**
+- **Sampling（服务端反采 LLM）**：server 在处理中可反向请求 host 的 LLM 补全（如让模型总结资源），host 可拒绝——防止 server 滥用模型。
+- **Elicitation（向用户补问）**：server 缺参数时经 host 向用户提问补全（2025-06 引入），用于交互式工具。
+- **Roots（路径边界）**：客户端声明可访问的本地根目录，server 只能在边界内读资源。
+
+**传输与鉴权**：stdio 走本机子进程；Streamable HTTP 需 `Mcp-Session-Id`，OAuth 2.1 授权；`Last-Event-ID` 支持 SSE 断点续传。
+
+> 💡 MCP 的「能力协商 + 有状态会话」意味着每个连接都要维护 session；服务端要做高并发，需用 `Tasks`（2025-11）把长操作异步化，避免阻塞 JSON-RPC 通道。

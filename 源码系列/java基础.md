@@ -281,4 +281,147 @@ flowchart TD
 ```
 
 > **读源码建议**：线程池抓 `execute` → `addWorker` → `runWorker` → `getTask`；并发锁抓 AQS 的 `acquire`/`release` 与 `Node` 入队；原子类抓 `Unsafe` + `LongAdder` 分段。HashMap 重点看 `resize` 的低位/高位拆分。
+
+---
+
+## AQS 深入：Condition / 读写锁 / StampedLock
+
+### Condition 实现（等待/通知）
+
+`ReentrantLock.newCondition()` 返回 `AbstractQueuedSynchronizer.ConditionObject`，内部维护一条**条件等待队列**：
+
+```java
+// await：释放锁 → 入条件队列 park → 被 signal 后重新抢锁
+public final void await() throws InterruptedException {
+    Node node = addConditionWaiter();      // 加入条件队列
+    int savedState = fullyRelease(node);  // 释放锁(state=0)
+    while (!isOnSyncQueue(node))           // 还没被移到 AQS 同步队列
+        LockSupport.park(this);            // 阻塞
+    acquireQueued(node, savedState);       // 重新抢锁
+}
+// signal：把条件队列头节点转移到 AQS 同步队列
+public final void signal() {
+    Node first = firstWaiter;
+    if (first != null) doSignal(first);
+}
+```
+
+要点：`await`/`signal` 必须持锁调用；一个 `ReentrantLock` 可 `newCondition()` 多个，实现**多条件精确唤醒**（如生产者/消费者两个队列），优于 `synchronized` 单一 `wait/notify`。
+
+### 读写锁 ReentrantReadWriteLock
+
+`state` 被**按位拆分**：高 16 位 = 读锁持有计数，低 16 位 = 写锁重入计数。
+
+```java
+// 写锁 tryAcquire：低16位
+int c = getState();
+int w = exclusiveCount(c);     // c & 0xFFFF
+if (c != 0 && (w == 0 || owner != thread)) return false; // 有读锁则写锁拿不到
+// 读锁 tryAcquireShared：高16位累加，CAS 提升 readerCount
+```
+
+- 写锁独占、读锁共享；**写锁可降级为读锁**（先拿写再拿读再放写），读不能升级为写（避免死锁）。
+- 局限：读多写少时「写饥饿」（读锁一直占着，写锁等不到）——`StampedLock` 解决了这点。
+
+### StampedLock（JDK 8+）
+
+乐观读锁：读时不加锁，仅拿一个 `stamp`，读完 `validate(stamp)` 校验期间是否有人写：
+
+```java
+double distance(Point p) {
+    long stamp = lock.tryOptimisticRead();   // 乐观读，无锁
+    double x = p.x, y = p.y;
+    if (!lock.validate(stamp)) {             // 期间有写 → 升级为悲观读
+        stamp = lock.readLock();
+        try { x = p.x; y = p.y; } finally { lock.unlockRead(stamp); }
+    }
+    return Math.sqrt(x*x + y*y);
+}
+```
+
+> 注意：`StampedLock` **不可重入**，且中断敏感（调用 `readLockInterruptibly`），适合「读多写少、读操作极短」的场景。
+
+## 线程池拒绝策略与调优
+
+`RejectedExecutionHandler` 四种内置策略：
+
+| 策略 | 行为 | 适用 |
+|------|------|------|
+| `AbortPolicy`（默认） | 抛 `RejectedExecutionException` | 需感知失败 |
+| `CallerRunsPolicy` | 由提交线程自己执行 | 平滑降级、背压 |
+| `DiscardPolicy` | 静默丢弃 | 可丢的非关键任务 |
+| `DiscardOldestPolicy` | 丢弃队首最老任务，重试提交 | 只关心最新 |
+
+**调优要点**：
+
+- 核心/最大线程数：CPU 密集 → `Ncpu + 1`；IO 密集 → 适当调大（经验 `2*Ncpu` 起，结合 RT 与并发度测算）。
+- 队列：用 `LinkedBlockingQueue`（有界！）而非无界，避免任务堆积打爆内存；队列容量结合「最大容忍延迟」设定。
+- 自定义线程工厂：命名线程（便于排查）、设 `daemon`、统一 `UncaughtExceptionHandler`。
+- 监控：暴露 `threadPoolExecutor.getActiveCount()` / `getQueue().size()` / 拒绝次数，配合告警。
+
+```java
+ThreadPoolExecutor exec = new ThreadPoolExecutor(
+    8, 32, 60L, TimeUnit.SECONDS,
+    new LinkedBlockingQueue<>(1000),
+    new NamedThreadFactory("biz-pool"),
+    new ThreadPoolExecutor.CallerRunsPolicy()); // 满了由调用方线程兜底执行
+```
+
+## CompletableFuture 源码要点
+
+`CompletableFuture` 是 JDK 8 的「异步编排核心」，内部是一个**无锁的完成栈（stack of Completion）**：
+
+- `supplyAsync` / `runAsync` 提交到 `ForkJoinPool.commonPool()`（或自定义 executor）。
+- 每个 `thenApply`/`thenAccept`/`thenCompose` 都是一个 `Completion` 节点，结果就绪时被 `postComplete()` 唤醒执行。
+- `join()`/`get()` 阻塞等待；`whenComplete` 做副作用（不转换值）。
+- 底层用 `CAS` + `Treiber 栈`（无锁）管理依赖链，比旧 `Future` + 轮询高效得多。
+
+```java
+CompletableFuture.supplyAsync(() -> orderQuery(id))      // 异步查订单
+    .thenApplyAsync(order -> enrich(order))             // 链式编排
+    .thenCombine(
+        CompletableFuture.supplyAsync(() -> queryStock(id)),  // 并行
+        (order, stock) -> merge(order, stock))
+    .whenComplete((r, e) -> { if (e != null) log.error(e); });
+```
+
+> 异常处理：`exceptionally` / `handle` 捕获链路异常；注意**不显式处理异常且未 get/join 会吞掉异常**，务必在末端 `whenComplete` 或 `exceptionally` 兜底。
+
+## 原子类与 VarHandle（JDK 9+）
+
+`java.util.concurrent.atomic` 底层靠 `Unsafe` 的 CAS。JDK 9 引入 **`VarHandle`** 作为 `Unsafe` 的安全替代：
+
+```java
+class Counter {
+    volatile int value;
+    static final VarHandle VH;
+    static { try { VH = MethodHandles.lookup().findVarHandle(Counter.class, "value", int.class); }
+             catch (ReflectiveOperationException e) { throw new Error(e); } }
+    void inc() { VH.getAndAdd(this, 1); }          // CAS 风格的原子累加
+    boolean cas(int e, int n) { return VH.compareAndSet(this, e, n); }
+}
+```
+
+- `VarHandle` 提供 `getAndAdd` / `compareAndSet` / `getAcquire` / `setRelease` 等精细内存语义，且是标准 API（不像 `Unsafe` 受限）。
+- `AtomicInteger`/`AtomicLong` 内部仍走 `Unsafe`（或 JDK 9+ 的 `VarHandle`），`LongAdder` 用分片 `Cell[]` 把热点分散，高争用下远胜 `AtomicLong`。
+- `AtomicStampedReference` 用「值 + 版本号」一对解决 **ABA**；`AtomicMarkableReference` 用「值 + 布尔标记」。
+
+## HashMap / ConcurrentHashMap 红黑树化深入
+
+前文提到链表 ≥8 树化、≤6 退化，这里看 `TreeNode` 的实现差异：
+
+- `HashMap.TreeNode` **同时是红黑树节点又是双向链表节点**（继承 `LinkedHashMap.Entry`，额外有 `prev/left/right/parent/red`）。树化时先用 `treeifyBin` 把链表重排成双向链表，再构造成红黑树——所以结构里保留 `next/prev` 以便退化回链表。
+- 树化条件双保险：`(n = tab.length) < MIN_TREEIFY_CAPACITY(64)` 时不树化，而是 `resize()` 扩容（因为小表下扩容性价比更高，扩容后链表自然变短）。
+- `ConcurrentHashMap.TreeNode` 同样继承 `Node`，但多了一个 `TreeBin` 包装类：`TreeBin` 持红黑树根并作为桶的头节点，用 `volatile int lockState`（`WAITER`/`WRITER` 标记）在树操作中做细粒度同步，读操作几乎无锁（利用 volatile + CAS），写操作才锁 `TreeBin`。
+
+```java
+// HashMap 树化入口（putVal 中）
+if (binCount >= TREEIFY_THRESHOLD - 1) // 8-1=7，第8个节点时
+    treeifyBin(tab, hash);
+// treeifyBin 内部
+if (tab == null || (n = tab.length) < MIN_TREEIFY_CAPACITY)
+    resize();          // 表太小先扩容
+else if ((b = tabAt(...)) != null)
+    treeify(table);    // 真正成树
+```
 ```

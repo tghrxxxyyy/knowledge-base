@@ -172,3 +172,168 @@ flowchart LR
 ```
 
 > **读源码建议**：入口 `Env` 静态块加载 `SlotChainBuilder`；核心链路 `SphU.entry()` → `CtSph.entryWithPriority()` → `ProcessorSlotChain.entry()`。从 `StatisticSlot`（统计）和 `FlowSlot`/`DegradeSlot`（规则）两个方向深入，再回看 `@SentinelResource` 的 Aspect 如何织入。
+
+---
+
+## 八、进阶 Slot 详解：Authority / System / Statistic 退出
+
+### AuthoritySlot 源码
+
+`AuthoritySlot` 在 FlowSlot 之前执行，做黑白名单鉴权。核心在 `AuthorityRuleChecker.checkBlackWhite`：
+
+```java
+// AuthoritySlot.checkBlackWhite
+if (authorityRule != null) {
+    AuthorityRuleChecker.checkBlackWhite(authorityRule, context.getOrigin());
+}
+// AuthorityRuleChecker
+static void checkBlackWhite(AuthorityRule rule, String origin) {
+    if (origin == null) origin = "";
+    switch (rule.getStrategy()) {
+        case AuthorityRuleConstant.BLACK:  // 黑名单：命中即拒绝
+            if (matcher.match(origin, rule.getLimitApp())) throw new AuthorityException(...);
+            break;
+        case AuthorityRuleConstant.WHITE:  // 白名单：不在名单拒绝
+            if (!matcher.match(origin, rule.getLimitApp())) throw new AuthorityException(...);
+            break;
+    }
+}
+```
+
+`limitApp` 是逗号分隔的 origin 列表，`context.getOrigin()` 通常来自 `ContextUtil.enter(resource, origin)` 或 `@SentinelResource` 的 `origin` 解析器。`limitApp = default` 表示对所有 origin 生效。
+
+### SystemSlot 源码
+
+`SystemSlot` 在链路末端，做系统自适应保护（全局维度，不看单个资源）：
+
+```java
+// SystemSlot.checkSystem
+if (resourceName != null && resourceName.startsWith("$")
+    && !(SystemRuleManager.avgRt > 0 || SystemRuleManager.maxThread > 0 ...)) {
+    return; // 入口 Sentinel 内部资源跳过
+}
+SystemRuleManager.checkSystem(resourceWrapper, count, grade);
+```
+
+`SystemRuleManager` 周期性（每 1s）通过 `SystemStatusListener` 采集 `load1`、`cpuUsage`、`thread` 数、`qps`、`rt` 等，阈值在 `SystemRule` 中配置（`highestSystemLoad` / `highestCpuUsage` / `maxThread` / `qps` / `rt`）。任一越界抛 `SystemBlockException`。其自适应算法基于 BBR 思想：当并发线程数 > `maxThread` 或 `load1` 超过阈值且线程数较大时触发。
+
+### StatisticSlot 的 exit 统计
+
+前文讲了 entry 时的 `addPassRequest`，但**异常 / 阻塞 / RT 是在 exit 时落账**的，这是容易忽略的点：
+
+```java
+// StatisticSlot.exit
+public void exit(Context context, ...) {
+    Node node = context.getCurNode();
+    long rt = TimeUtil.currentTimeMillis() - entry.getCreateTime();
+    node.addRtAndSuccess(rt, 1);          // RT 与成功数
+    node.taskDone();
+    // 若 entry 过程中抛了业务异常，通过 Tracer.trace(e) 已记入 node.addException()
+}
+```
+
+`Tracer.trace(ex)` 在 `CtSph` 捕获业务异常时调用，把异常数写入当前 `DefaultNode` 与 `ClusterNode`，供熔断（异常比例）统计使用。也就是说：**流控/熔断的「异常比例」依赖 exit 链路正确调用 `trace`**，异步场景若线程切换丢掉了 `Context`，统计就会失真——这是异步资源必须使用 `AsyncEntry` 的原因。
+
+## 九、热点参数限流（ParamFlowSlot）源码深度
+
+热点限流对「方法参数的某个具体值」单独限流。核心在 `ParamFlowChecker`：
+
+```java
+// ParamFlowChecker.passCheck（简化）
+if (rule.getGrade() == RuleConstant.FLOW_GRADE_QPS) {
+    ParameterMetric metric = getParameterMetric(resourceName);
+    if (metric != null) {
+        // 1. 取热点参数索引 getParamIdx(rule)
+        // 2. 查 paramHot 缓存是否命中热点值
+        // 3. 热点值走 paramMetric 特权桶；普通值走 clusterNode 维度限流
+        if (!paramMetric.checkPass(...)) throw new ParamFlowException(rule);
+    }
+}
+```
+
+- 热点参数用 `ParamMaping`（参数索引 → 参数值类型）建立映射，每个热点值维护独立的 `CacheMap`（基于 `ConcurrentLinkedHashMap` 的 LRU，避免热点值无限膨胀）。
+- **参数例外项（paramItem）**：为某个具体值（如 VIP 用户）配置更大的阈值，命中例外项走独立限额。
+- 底层统计同样基于 `LeapArray` 滑动窗口，但按「参数值」维度分桶，因此能做到「某 userId 单独限流，其余共享总额度」。
+
+## 十、集群流控（Cluster Flow）
+
+单机阈值在集群多实例下会「各自为战」，集群流控引入 **Token Server / Token Client**：
+
+```mermaid
+flowchart LR
+    A[实例A FlowSlot] -->|requestToken| TS[TokenServer]
+    B[实例B FlowSlot] -->|requestToken| TS
+    TS -->|按全局阈值发放/拒绝| A
+    TS -->|按全局阈值发放/拒绝| B
+```
+
+- `FlowRule` 设 `clusterMode=true` + `ClusterFlowConfig`（`flowId`、`thresholdType`、`fallbackToLocalWhenFail`）。
+- 请求走到 `FlowSlot` 时，若规则为集群模式，转交 `ClusterFlowChecker` 向 `TokenServer` 申请 token；`TokenServer` 用 `ClusterRateLimiter` 按全局阈值匀速发放，不足则返回 `OVER_THRESHOLD`。
+- TokenServer 自身高可用：可嵌入某个 Sentinel 客户端（`SENTINEL_CLUSTER_SERVER`）或独立部署；Client 通过 `ClusterStateManager` 感知 server 列表（通常由 Dashboard / 配置中心推送）。
+- 失败兜底：`fallbackToLocalWhenFail=true` 时 TokenServer 不可达则退化为本地限流，保证可用性。
+
+## 十一、Dashboard、心跳与规则持久化
+
+### 心跳
+
+Sentinel 客户端内置 `HeartbeatSender`（默认 `HttpHeartbeatSender`），每 10s 向 Dashboard 上报自身 `appName / ip / port / version`。Dashboard 的 `MachineRegistry` 维护在线机器列表，心跳超时（默认 60s）即剔除。
+
+### 规则推送与持久化
+
+Dashboard 通过 `SentinelApiClient` 调客户端 HTTP 接口（`/setFlowRule` 等）下发规则。但**默认规则只存内存**（`FlowRuleManager` 的 `flowRules` 是普通 List），重启即丢。生产必须接 `DynamicRuleDataSource`：
+
+```java
+// 以 Nacos 为例
+ReadableDataSource<String, List<FlowRule>> ds =
+    new NacosDataSource<>(properties, groupId, dataId,
+        source -> JSON.parseObject(source, new TypeReference<List<FlowRule>>() {}));
+FlowRuleManager.register2Property(ds.getProperty());
+```
+
+写方向同理用 `WritableDataSource` 把控制台改动回写配置中心，形成「控制台 ↔ 配置中心 ↔ 客户端」的闭环。
+
+## 十二、与 Spring Cloud 整合
+
+`spring-cloud-alibaba-sentinel` 自动装配：
+
+- `SentinelAutoConfiguration`：注入 `SentinelResourceAspect`（处理 `@SentinelResource`）、`SentinelBeanPostProcessor`。
+- `SentinelWebAutoConfiguration`：注册 `SentinelWebInterceptor`（对所有 `@RequestMapping` 自动埋点，资源名默认 `GET:/path`）。
+- `SentinelFeignAutoConfiguration`：Feign 调用埋点。
+- `BlockException` 统一处理：`SentinelWebMvcConfig` 配置 `BlockExceptionHandler`，默认返回 `429` + `Blocked by Sentinel`，可自定义为 JSON。
+
+```yaml
+spring:
+  cloud:
+    sentinel:
+      transport:
+        dashboard: localhost:8080   # 控制台地址
+        port: 8719                  # 客户端与控制台通信端口
+```
+
+## 十三、实战：自定义 Slot
+
+继承 `ProcessorSlot`，并通过 SPI 注册到 Slot 链：
+
+```java
+public class AuditSlot extends AbstractLinkedProcessorSlot<DefaultNode> {
+    @Override
+    public void entry(Context context, ResourceWrapper resource, DefaultNode node,
+                      int count, boolean prioritized, Object... args) throws Throwable {
+        // 在统计之前做审计/染色
+        System.out.println("access " + resource.getName() + " from " + context.getOrigin());
+        fireEntry(context, resource, node, count, prioritized, args); // 向后传递
+    }
+    @Override
+    public void exit(Context context, ResourceWrapper resource, int count, Object... args) {
+        fireExit(context, resource, count, args);
+    }
+}
+```
+
+注册方式：在 `META-INF/services/com.alibaba.csp.sentinel.slotchain.ProcessorSlot` 写入全限定类名（Sentinel 用 `SpiLoader` 加载，按 `@SpiOrder` 排序插入链中）。注意自定义 Slot 的位置会影响统计准确性——审计类建议放在 `NodeSelectorSlot` 之后、`StatisticSlot` 之前或之后视需求而定。
+
+```mermaid
+flowchart LR
+    N[NodeSelectorSlot] --> C[ClusterBuilderSlot]
+    C --> AUD[AuditSlot 自定义] --> S[StatisticSlot] --> F[FlowSlot] --> ...
+```

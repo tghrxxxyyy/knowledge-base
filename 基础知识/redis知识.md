@@ -868,3 +868,86 @@ RESP3（Redis 6+）支持更多类型（map、set、push 等），并在 RESP2 �
 4. **持久化选型**：RDB（快照，恢复快，丢数据多）+ AOF（append-only，可每秒 fsync，数据更安全；Redis 7 的 AOF 自动重写更高效）；混合持久化 `aof-use-rdb-preamble` 兼顾二者。
 5. **Pipeline 与 批量**：`PIPELINE` 将多条命令一次网络往返，提升吞吐；`MSET`/`MGET` 减少 RTT。
 6. **事务与 Lua**：`MULTI/EXEC` 非原子回滚（单条失败不影响其他）；复杂原子操作放 Lua 脚本（注意脚本不能过长，否则阻塞）。
+
+---
+
+# 第二轮深度优化：RESP3 / 多线程 IO / 客户端缓存 / 集群扩缩容 / bigkey·hotkey / RedisSearch
+
+## 一、通信协议 RESP3（Redis 6+）
+
+- RESP（Redis Serialization Protocol）是文本协议，简单、可读、易实现，是 Redis 单线程高吞吐的原因之一。
+- **RESP2**：类型靠首字节推断（`+` 简单字符串、`-` 错误、`:` 整数、`$`  bulk、`*` 数组）。
+- **RESP3**：新增 `map`（`%`）、`set`（`~`）、`push`（`>` 服务端主动推送，如客户端缓存失效消息）、`double`（`,`）、`bool`（`#`）等，服务端→客户端可携带更丰富类型且**更省解析开销**；兼容 RESP2 握手降级。RESP3 是客户端缓存、推模式的基础。
+
+## 二、多线程 IO（Redis 6.0+）
+
+- Redis **核心命令执行仍是单线程**（保证无锁、原子），但 **网络 IO 读写 + 协议解析** 从 6.0 起可多线程（`io-threads` 配置），缓解大流量下主线程被网络读写占满的问题。
+- 仅处理 **读/写网络字节** 与协议编解码，命令执行、键值操作仍在主线程；`io-threads-do-reads yes` 开启读多线程（默认只多线程写）。用 `redis-cli --stat` / `INFO stats` 看 `io_threaded_reads` 是否生效。
+
+## 三、客户端缓存（Client-Side Caching）
+
+- **问题**：应用本地缓存与 Redis 数据不一致；每次查 Redis 仍有网络 RTT。
+- **方案**：Redis 6 的 **Tracking** 机制——客户端订阅某 key 的失效通知，key 被修改时服务端主动 `invalidate` 推送（RESP3 的 `push`）。两种模式：
+  - `OPTIN`/`OPTOUT` 默认追踪（广播 BCAST 模式按前缀批量失效，适合多客户端）；
+  - 客户端收到失效后清本地缓存，下次回源 Redis。
+- 收益：把热点 key 缓存在应用进程内、零 RTT 读，同时保证一致性（失效即清）；典型场景：配置、元数据。
+
+## 四、集群扩缩容与槽迁移细节
+
+- **槽迁移流程**：`redis-cli --cluster reshard` 把源节点若干 slot 迁到目标节点。迁移期间：源节点对正在迁移的 key 返回 `ASK` 重定向（**临时**，客户端本次转向目标）；迁移完成后该 slot 归属变更，返回 `MOVED`（**永久**重定向，客户端应更新本地 slot 映射）。
+- **要点**：`ASK` 与 `MOVED` 区别——ASK 仅单次有效（不改本地映射），MOVED 需更新映射；客户端必须正确处理二者，否则会"重定向风暴"。
+- **Gossip 与故障转移**：节点间 Gossip 互通；主故障经多数派确认后从 slave 选举新主；`cluster-require-full-coverage no` 避免单 slot 不可用导致整集群不可写。
+
+## 五、bigkey / hotkey 治理（深入）
+
+- **检测**：`redis-cli --bigkeys` 抽样扫描大 key；Redis 4.0+ `memory usage key`；`--hotkeys`（需 `maxmemory-policy` 开启 LFU）找热 key。
+- **bigkey 危害**：`DEL` 阻塞主线程（用 `UNLINK` 异步删）、序列化/网络传输阻塞、集群迁移慢；拆分（hash field 分片、list 分桶）、避免一个 string 存几 MB JSON。
+- **hotkey 危害**：单节点 CPU 被打满；治理：本地缓存 + 多副本读、key 加随机后缀打散（读时按规则回源）、代理层（Codis/Twemproxy）分摊、Redis 7 `client-eviction`。
+
+## 六、RedisSearch / RedisJSON 模块
+
+- **RedisSearch（RediSearch）**：在 Redis 上建倒排索引做全文检索，支持中文分词（需 `ft.create` + 自定义/插件分词）、聚合、向量检索（KNN，做 ANN 近似最近邻，适配 AI embedding 检索）。适合"既要缓存又要检索"的场景，省去引入 ES。
+- **RedisJSON**：原生 JSON 类型，支持 `JSON.SET/GET` 与 JSONPath 查询，避免把 JSON 当大 string 整体读写（更新需整体替换、浪费带宽）。
+- **取舍**：这些模块让 Redis 从 KV 走向多模，但复杂检索/聚合能力仍不及 ES；简单检索/小数据量用 Redis 模块更轻，海量检索仍上 ES。
+
+## 七、持久化深入（RDB / AOF / 混合）
+
+- **RDB**：`fork` 子进程写快照（**COW 写时复制**，父子共享页，改时复制），恢复快、丢数据多；`save`（阻塞）/`bgsave`（后台）；适合备份与主从全量同步。
+- **AOF**：追加每个写命令；`appendfsync` `everysec`（默认，折中）/ `always`（最强）/ `no`（依赖 OS）；重写 `bgrewriteaof` 压缩（合并同 key 历史命令），Redis 7 起 AOF 多文件更稳。
+- **混合持久化** `aof-use-rdb-preamble yes`：重写时先写 RDB 快照再追加增量 AOF，兼顾恢复速度与数据安全。
+- **fork 阻塞**：大数据集 `fork` 时拷贝页表慢（"紫禁城"问题），监控 `latest_fork_usec`，避免大实例低峰期外做 RDB。
+
+## 八、内存淘汰与过期实现
+
+- **过期**：惰性删除（访问时检查）+ 定期删除（每秒 10 次抽样 `activeExpireCycle`，默认抽 20 个）；大量 key 同时过期会周期性卡顿——**集中过期**要避免（过期时间加随机抖动）。
+- **淘汰**：`maxmemory` 触发，策略 `noeviction`/`allkeys-lru`/`volatile-lru`/`allkeys-lfu`/`volatile-lfu`/`allkeys-random`/`volatile-random`；**LFU**（Redis 4.0+）比 LRU 更准（统计访问频率而非仅最近）。
+- **渐进式 rehash**：扩容时新旧 hash 表并存，增删改查双表并重定向、定时搬迁，避免一次性卡顿（与 HashMap 一次性 resize 不同）。
+
+## 九、缓存一致性（双写）
+
+- **Cache-Aside（旁路）**：先更新 DB，再删缓存；读时回源并回填。删缓存失败可用重试/消息补偿。
+- "先删缓存再更新 DB" 有并发窗口（删后、更新前另一线程读旧值回填），用**延迟双删**缓解。
+- 强一致不现实，用"短暂不一致 + 补偿"；用 **binlog（Canal）→ 删缓存** 是更稳的清除方式（与业务解耦）。
+
+## 十、特殊数据结构实战
+
+- **Bitmap**：日活/签到（`SETBIT`/`BITCOUNT`），极省内存；**HyperLogLog**：UV 近似去重（误差 ~0.81%）；**Geo**：`GEOADD`/`GEOSEARCH` 附近的人（基于 zset + geohash）；**Stream**：消息流（消费组、Pending 列表、可重复消费），可做轻量 MQ。
+
+## 十一、客户端缓存 invalidation 实战
+
+- 开启 tracking：`CLIENT TRACKING ON REDIRECT <client-id>`，key 被修改时服务端向监听客户端推 `invalidate` 消息，客户端清本地缓存。
+- BCAST 模式按前缀广播，适合多客户端共享；注意失效风暴（热点 key 频繁改会大量推），配合本地 TTL 兜底。
+
+## 十二、Redlock 争议
+
+- Redlock 用 N 个独立 Redis 加锁，多数成功即持锁；但质疑点：依赖时钟（GC/网络延迟致锁重叠）、缺乏 fencing token，Martin Kleppmann 认为不如"带单调令牌的存储锁"安全。
+- 建议：可靠性优先用 ZooKeeper/etcd（有 fencing）；Redis 锁用于"性能优先、可容忍偶发重复"，务必设过期 + 唯一 value + Lua 释放。
+
+## 十三、Bitmap 日活实战
+
+- `SETBIT sign:20240101 uid 1` + `BITCOUNT` 算日活；`BITOP AND/OR` 算连续/累计活跃。1 亿用户约 12MB/天，极省。
+- 局限：id 大且稀疏浪费空间，可用 `Roaring Bitmap` 压缩。
+
+## 十四、Pipeline 与事务替代
+
+- Pipeline 只减 RTT，不保证原子；需要原子用 `MULTI/EXEC`（或 Lua）。超大批量用 Pipeline 分批，防单次包过大阻塞。
