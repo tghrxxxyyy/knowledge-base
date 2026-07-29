@@ -2,7 +2,7 @@
 
 > 口诀：Jenkins 不是"一个 CI 工具"，而是一套"插件驱动的自动化操作系统"——Controller 管调度与状态，Agent 管干活，二者靠 Remoting 协议对话，所有能力都来自插件。
 
-本篇讲 Jenkins 的演进定位、Controller/Agent 分布式架构、Master-Agent 通信原理、插件生态、权限与安全、高可用与运维（含 JCasC），以及与 GitLab CI / GitHub Actions / Tekton 的对比。Pipeline 语法见 [05-Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md)；CI/CD 全局视野见 [01-概述与核心概念](01-概述与核心概念.md)；构建与制品见 [03-构建与制品管理](03-构建与制品管理.md)。
+本篇讲 Jenkins 的演进定位、Controller/Agent 分布式架构、Master-Agent 通信原理、插件生态、权限与安全、高可用与运维（含 JCasC），以及与 GitLab CI / GitHub Actions / Tekton 的对比。Pipeline 语法见 [05-Jenkins Pipeline as Code](05-Jenkins-Pipeline-as-Code.md)；CI/CD 全局视野见 [01-概述与核心概念](01-概述与核心概念.md)；构建与制品见 [03-构建与制品管理](03-构建与制品管理.md)。
 
 ## 一、Jenkins 定位与历史
 
@@ -55,7 +55,7 @@ flowchart TB
 |------------|----------|----------|--------|
 | 固定节点（SSH） | Controller 通过 SSH 主动连 Agent 启动 agent.jar | 长期存在的物理机/VM | 简单稳定；闲置浪费资源 |
 | Docker 容器 Agent | Controller 连 Docker daemon 起容器 | 需要隔离构建环境 | 环境干净；需守护进程权限 |
-| **Kubernetes 动态 Pod** | Kubernetes Cloud 按需起 Pod，构建完删除 | 弹性伸缩、多租户 | 极致弹性、按量付费；复杂度高（见 [05-Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md) 的 kubernetes agent） |
+| **Kubernetes 动态 Pod** | Kubernetes Cloud 按需起 Pod，构建完删除 | 弹性伸缩、多租户 | 极致弹性、按量付费；复杂度高（见 [05-Jenkins Pipeline as Code](05-Jenkins-Pipeline-as-Code.md) 的 kubernetes agent） |
 
 ## 三、分布式构建原理：任务如何分发
 
@@ -287,13 +287,13 @@ role-strategy:latest
 - [ ] 定期打安全补丁，精简插件，订阅 `jenkins.io/security`。
 - [ ] `JENKINS_HOME` 加密异地备份 + Build Discarder 治理磁盘。
 - [ ] 配置全用 JCasC `jenkins.yaml` + `plugins.txt`，杜绝手动漂移。
-- [ ] 大规模场景上 Kubernetes 动态 Agent（见 [05-Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md)）。
+- [ ] 大规模场景上 Kubernetes 动态 Agent（见 [05-Jenkins Pipeline as Code](05-Jenkins-Pipeline-as-Code.md)）。
 
 ## 与其他模块的关联
 
 - [01-概述与核心概念](01-概述与核心概念.md)：CI/CD 总览、流水线 stages 定义，本文架构是其运行时底座。
 - [03-构建与制品管理](03-构建与制品管理.md)：Jenkins 构建出的制品应归档到制品库，而非堆在 `JENKINS_HOME`。
-- [05-Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md)：本文讲的 Agent/标签/Remoting 正是 Pipeline `agent{}` 与 K8s 动态 Pod 的底层机制。
+- [05-Jenkins Pipeline as Code](05-Jenkins-Pipeline-as-Code.md)：本文讲的 Agent/标签/Remoting 正是 Pipeline `agent{}` 与 K8s 动态 Pod 的底层机制。
 - [../大数据/10-资源调度：YARN与Kubernetes](../大数据/10-资源调度：YARN与Kubernetes.md)：Kubernetes 动态 Agent 依赖 K8s 调度，原理互通。
 - [../../云原生/K8S.md](../../云原生/K8S.md)：Jenkins 在 K8s 上以 Pod 形式起 Agent，需理解 Pod/ServiceAccount/RBAC。
 
@@ -324,7 +324,7 @@ flowchart TB
 
 - **Controller 轻量化**：只管调度与 UI，不跑重构建；磁盘定期 `Build Discarder` 清理。
 - **Agent 反亲和**：构建型（maven）/ 镜像型（docker）/ GPU 型按 label 分组，避免互相争抢。
-- **K8s 动态 Agent**：高峰自动扩 Pod，闲时缩为 0，详见 [05-Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md) 第六节。
+- **K8s 动态 Agent**：高峰自动扩 Pod，闲时缩为 0，详见 [05-Jenkins Pipeline as Code](05-Jenkins-Pipeline-as-Code.md) 第六节。
 - **JCasC 备份**：`JENKINS_HOME` 加密异地备份 + 配置进 Git，故障分钟级重建。
 
 ```bash

@@ -489,7 +489,7 @@ jobs:
 - 部署策略（蓝绿/金丝雀/滚动）与 environment 审批深入见 [10-部署策略](10-部署策略.md)。
 - 密钥与 OIDC 免密钥、最小权限、供应链签名深入见 [13-安全与供应链安全](13-可观测性DORA度量与DevSecOps.md)。
 - 容器与 K8s 底座，见 [../../云原生/K8S.md](../../云原生/K8S.md)。
-- GitLab CI 的同概念对照，见 [06-GitLab CI](06-GitLab CI.md)。
+- GitLab CI 的同概念对照，见 [06-GitLab CI](06-GitLab-CI.md)。
 - 大数据 ETL 调度思想与 CI 流水线类比，见 [../大数据/09-数据仓库与OLAP引擎.md](../大数据/09-数据仓库与OLAP引擎.md)。
 
 ## 十四、小结 Checklist

@@ -23,9 +23,9 @@
 | 02 | [版本控制与分支策略](02-版本控制与分支策略.md) | GitFlow / GitHub Flow / GitLab Flow / Trunk-Based、Conventional Commits、PR/MR 门禁 |
 | 03 | [构建与制品管理](03-构建与制品管理.md) | Maven/Gradle/npm、增量与可重现构建、Nexus/Artifactory、Docker 多阶段构建、SBOM |
 | 04 | [Jenkins 架构与核心机制](04-Jenkins架构与核心机制.md) | Controller/Agent、插件生态与安全、权限与凭据、JCasC、高可用 |
-| 05 | [Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md) | Declarative/Scripted、Jenkinsfile、共享库、K8s 动态 agent、3 个完整示例 |
-| 06 | [GitLab CI](06-GitLab CI.md) | .gitlab-ci.yml、Runner/executor、cache vs artifacts、needs DAG、安全扫描模板、OIDC |
-| 07 | [GitHub Actions](07-GitHub Actions.md) | workflow/job/step/action、matrix、secrets/OIDC、reusable workflow、self-hosted |
+| 05 | [Jenkins Pipeline as Code](05-Jenkins-Pipeline-as-Code.md) | Declarative/Scripted、Jenkinsfile、共享库、K8s 动态 agent、3 个完整示例 |
+| 06 | [GitLab CI](06-GitLab-CI.md) | .gitlab-ci.yml、Runner/executor、cache vs artifacts、needs DAG、安全扫描模板、OIDC |
+| 07 | [GitHub Actions](07-GitHub-Actions.md) | workflow/job/step/action、matrix、secrets/OIDC、reusable workflow、self-hosted |
 | 08 | [云原生 CI/CD 与 GitOps 工具](08-云原生CI-CD与GitOps工具.md) | Tekton/Argo CD/Flux/Spinnaker/Drone/CircleCI 等横向对比、GitOps 拉式 reconcile |
 | 09 | [流水线设计模式与最佳实践](09-流水线设计模式与最佳实践.md) | 标准阶段、并行扇出扇入、缓存层次、质量门禁、测试金字塔、反模式对照 |
 | 10 | [部署策略](10-部署策略.md) | 蓝绿/金丝雀/滚动/灰度/影子、特性开关、回滚、expand-contract 数据库迁移 |
