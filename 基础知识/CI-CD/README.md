@@ -101,3 +101,48 @@
 - Argo CD：https://argo-cd.readthedocs.io/ ｜ Tekton：https://tekton.dev/ ｜ Flux：https://fluxcd.io/
 - OpenGitOps：https://opengitops.dev/ ｜ SLSA：https://slsa.dev/ ｜ Sigstore：https://www.sigstore.dev/
 - CNCF 持续交付：https://www.cncf.io/
+
+## 七、CI/CD 成熟度模型（5 级）
+
+参考 DORA 与业界实践，团队可按五级自测定位、制定演进路线（**不要跳级**）：
+
+| 级别 | 名称 | 关键特征 | 典型瓶颈 |
+|------|------|----------|----------|
+| L0 | 手工/脚本化 | 本地构建、手工打包部署、无统一流水线 | 人为错误多、不可重现 |
+| L1 | 基础 CI | 提交触发自动构建+单测、集中制品库 | 测试慢、缺质量门 |
+| L2 | 持续交付 | 一键/自动部署到类生产、环境标准化 | 发布靠窗口、回滚慢 |
+| L3 | 持续部署+门禁 | 自动化晋级门禁、金丝雀/蓝绿、可观测闭环 | 跨团队协同弱、安全左移不足 |
+| L4 | 平台化/DevSecOps | IDP、GitOps、供应链签名、DORA 常态化度量 | 规模化治理与单位成本 |
+
+> 演进建议：先稳住 L1 的"快速失败"，再补 L2 的环境一致性，最后上 L3/L4 的门禁与平台化。每升一级都需配套 DORA 度量验证收益，避免"为升级而升级"。
+
+## 八、工具选型决策表
+
+| 维度 | Jenkins | GitLab CI | GitHub Actions | Argo CD | Flux | Drone |
+|------|---------|-----------|----------------|---------|------|-------|
+| 定位 | 通用引擎 | 一体化平台 | 托管生态 | GitOps 交付 | GitOps 交付 | 轻量 CI |
+| 学习曲线 | 陡 | 中 | 低 | 中 | 中高 | 低 |
+| 自托管 | 强 | Runner | self-hosted | 必需 | 必需 | 强 |
+| 云原生 | K8s Agent | 原生 | 一般 | 原生 | 原生 | 容器原生 |
+| 生态 | 插件最多 | 内置安全/包 | Marketplace | Helm/Kustomize | Kustomize/OCI | 少 |
+| 适用 | 复杂老系统 | 全流程一体 | 开源/GH 项目 | K8s 渐进交付 | K8s 多租 | 小型/边缘 |
+
+> 口诀：**要灵活老牌选 Jenkins；要一体选 GitLab；要生态选 GitHub Actions；要 K8s 声明式交付选 Argo CD/Flux。**
+
+## 九、常见反模式
+
+1. **巨石 Jenkinsfile / YAML**：几百行逻辑塞进单文件 → 抽共享库 / `include` 拆分。
+2. **`latest` 标签与可变制品**：同一 tag 内容会变 → 钉 `git sha`/digest，制品不可变。
+3. **CI 里存静态密钥**：用 OIDC 换临时凭证，密钥入 Vault / ESO。
+4. **无质量门禁的"快"**：构建快但漏测漏扫 → 左移 SAST / SCA / 单测覆盖率。
+5. **跳过回滚演练**：只测发布不测回滚 → 把回滚当一等公民写进流水线。
+6. **人工卡点变摆设**：`when: manual` 未配 `allow_failure: false` → 假卡点。
+7. **一个 repo 管所有环境不隔离**：用 GitOps `overlays/` 或 Helm per-env values 表达晋级。
+
+## 十、进阶学习路径（补充）
+
+- **打地基**：本模块 01→02→03→09，建立流水线 + 制品心智。
+- **选引擎**：Jenkins(04/05)、GitLab(06)、GitHub(07) 三选一深挖，其余横向对比。
+- **上云原生**：08(GitOps)+11(K8s)+10(部署策略)，把交付搬到 K8s。
+- **补安全与度量**：12(密钥)+13(DevSecOps/DORA)，形成"度量—改进"闭环。
+- **平台化**：在 L3/L4 之上建设 IDP，把流水线、环境、密钥、门禁产品化给研发自助。

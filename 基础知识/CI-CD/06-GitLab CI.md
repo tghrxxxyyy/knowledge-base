@@ -675,3 +675,111 @@ deploy_aws:
 > - 安全扫描模板：https://docs.gitlab.com/ee/user/application_security/
 > - Environments 与 Review Apps：https://docs.gitlab.com/ee/ci/environments/
 > - 关键字速查（GitLab 18.0，DevOps School）：https://www.devopsschool.com/blog/gitlab-ci-cd-pipeline-configuration-keywords
+
+## 十、复杂多项目管道：child / parent pipeline 进阶
+
+父流水线按变更路径触发子流水线，实现大仓拆分与动态生成（`trigger` + `include` + `rules: changes`）：
+
+```yaml
+# 父 .gitlab-ci.yml
+stages: [trigger]
+micro_a:
+  stage: trigger
+  trigger:
+    include: services/a/.gitlab-ci.yml
+    strategy: depend                 # 父等子完成再继续
+  rules:
+    - changes: [ "services/a/**/*" ]
+micro_b:
+  stage: trigger
+  trigger:
+    include:
+      - local: services/b/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - changes: [ "services/b/**/*" ]
+```
+
+**多项目流水线**（跨仓库协同发布）：
+
+```yaml
+upstream_release:
+  stage: deploy
+  trigger:
+    project: mygroup/service-b
+    branch: main
+    strategy: depend
+```
+
+## 十一、rules vs only/except：该用哪个
+
+`only/except` 已落后，**统一用 `rules`**（更可读、可组合、支持 `changes`/`exists`/`variables`）：
+
+| 场景 | only/except（旧） | rules（新，推荐） |
+|------|-------------------|-------------------|
+| 仅默认分支 | `only: [main]` | `rules: - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` |
+| MR 事件 | `only: [merge_requests]` | `rules: - if: $CI_PIPELINE_SOURCE == "merge_request_event"` |
+| 排除标签 | `except: [tags]` | `rules: - if: $CI_COMMIT_TAG == null` |
+| 变更触发 | 不支持 | `rules: - changes: [ "src/**" ]` |
+
+```yaml
+build:
+  script: mvn package
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never                        # 其他情况不跑
+```
+
+## 十二、cache 策略进阶
+
+```yaml
+cache:
+  key:
+    files:                              # 依赖文件变才失效
+      - pom.xml
+      - package-lock.json
+  paths:
+    - .m2/repository/
+    - node_modules/
+  policy: pull-push                    # push 上传 / pull 下载 / pull-push 默认
+```
+
+- **按分支隔离**：`key: $CI_COMMIT_REF_SLUG` 防跨分支污染。
+- **按文件哈希失效**：`key: { files: [package-lock.json] }`，依赖升级才重建缓存。
+- **缓存与 artifact 区别**：cache 跨流水线加速、可丢；artifact 跨 job 传递、需可靠。
+
+## 十三、self-hosted Runner 调优
+
+```toml
+# config.toml（GitLab Runner）
+[[runners]]
+  name = "k8s-runner"
+  executor = "kubernetes"
+  [runners.kubernetes]
+    namespace = "gitlab-runner"
+  [runners.cache]
+    Type = "s3"
+    Path = "gitlab-cache"
+    Shared = true                       # 多 runner 共享缓存
+  concurrent = 10                       # 单 runner 并发 job 数
+  [runners.docker]
+    shm_size = 512000000                # 防 Chrome/e2e 共享内存不足
+```
+
+调优要点：
+
+| 项 | 建议 |
+|----|------|
+| `concurrent` | 按节点核数设，避免排队或过载 |
+| 缓存后端 | 用 S3/MinIO 共享，跨 runner 命中 |
+| 镜像预热 | 节点预拉基础镜像，减拉取耗时 |
+| 标签治理 | job `tags` 与 runner 标签精确匹配 |
+| 安全 | 受信任仓库才跑 `shell` executor；不可信用 `docker`/`kubernetes` 隔离 |
+
+## 本篇补充 Checklist
+
+- [ ] 大仓/多服务用 parent-child `trigger`+`include`+`changes` 拆分。
+- [ ] 统一 `rules`，弃用 `only/except`。
+- [ ] 缓存按文件哈希失效 + 按分支隔离；cache 与 artifact 分工清晰。
+- [ ] 自托管 Runner 配 `concurrent`/共享缓存/资源限制/S3，受信任才用 shell。

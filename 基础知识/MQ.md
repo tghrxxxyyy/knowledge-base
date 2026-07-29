@@ -391,3 +391,58 @@ MQ 不保证"只投递一次"（多为至少一次），消费端必须幂等：
 
 - 幂等键应选**业务唯一且稳定**的标识（如订单号、交易流水号），而非每次请求随机生成的 ID（重试时 ID 变则去重失效）。
 - 去重表用唯一索引兜底；Redis `SET` 带业务 TTL（覆盖重试窗口）；下游状态机拒绝逆向/重复流转，三者可组合。
+
+## 十一、消息积压治理与高阶实战（第三轮深度补充）
+
+### 11.1 消息积压百万级治理 SOP
+
+1. **先止血**：确认消费侧是否宕机/慢（DB 慢查询、下游超时、线程池满）；看 `lag`（`kafka-consumer-groups --describe` / RocketMQ `mqadmin brokerStatus`）。
+2. **提吞吐**：
+   - 临时扩容消费者实例（Kafka 受分区数限制，分区不够先扩分区）；
+   - 提升消费并发（线程池 / 批量消费 `max.poll.records` 调大）；
+   - 消费逻辑降级（先落库/标记，重计算异步补）；
+   - 单条慢 SQL/外部调用改成批量/缓存。
+3. **旁路追平（积压极大）**：新建「临时topic + 更多分区」，写脚本/作业把旧 topic 积压消息搬运到新 topic 多实例并发消费，追平后切回；或跳过非关键历史消息（打标跳过）。
+4. **防复发**：消费幂等（见前文十）+ 监控 `lag` 告警 + 消费耗时 SLO；大促前压测消费能力留 2x 余量。
+
+### 11.2 Exactly-Once 在 Kafka / RocketMQ / Pulsar 的实现差异
+
+| MQ | Exactly-Once 机制 | 能力边界 |
+| --- | --- | --- |
+| Kafka | **EOS**：幂等 Producer（`enable.idempotence`，PID+序列号去重）+ 事务（`transactional.id`，消费位移与输出同事务）+ 消费者 `isolation.level=read_committed` | 仅保证"消费→处理→产出"原子，端到端需下游也配合（如幂等写 DB） |
+| RocketMQ | 事务消息（半消息 + 本地事务 + 回查）+ 消费幂等 | 保证"发端"事务一致，消费端靠业务幂等兜底 |
+| Pulsar | **Pulsar IO + 幂等 Sink** + 单分区有序 + 去重（`BrokerDeduplicationEnabled`）；流处理用 Pulsar Functions 精确一次 | 单消息去重 + Functions 端到端 EOS，跨系统仍靠幂等 |
+
+- **本质提醒**：纯消息中间件几乎无法做到跨系统的绝对 Exactly-Once，都是"幂等 + 原子提交 + 去重"的组合近似；工程上优先把下游做成幂等，比追求中间件 EOS 更可靠。
+
+### 11.3 消息轨迹与全链路追踪
+
+- **消息轨迹（Message Trace）**：RocketMQ 原生 `msgId` 追踪「生产→存储→消费」各时间戳/状态（RocketMQ Console 可见）；Kafka 用 `producerId/sequence` + 消费位点近似；Pulsar 有 `messageId`。
+- **接入全链路**：在消息 `header`/`properties` 注入 `traceId`（OpenTelemetry），消费者用同一 `traceId` 起新 span，串起「生产应用 → MQ → 消费应用」；用 Jaeger/SkyWalking 看跨进程调用链，定位"消息卡在哪一跳"。
+- **价值**：排查"消息发了但下游没动"= 生产成功/消费未拉/消费失败重试中，轨迹一眼分清。
+
+### 11.4 顺序消息与分区再均衡冲突
+
+- **顺序保证**：Kafka 单 partition 内有序，同 key 落同分区即同 key 有序；RocketMQ 用 `MessageListenerOrderly` + 队列锁保证单队列顺序消费。
+- **冲突点**：发生 **rebalance（再均衡）** 时分区在消费者间重分配，若旧消费者还没 commit 偏移、新消费者已接管，可能重复消费（破坏"恰好一次顺序"）；或消费慢导致再均衡反复触发（"再均衡风暴"）。
+- **治理**：
+  - 消费处理要快、不在消费中做长事务；`max.poll.interval.ms` 调大避免被踢出；
+  - 用**静态成员资格（Static Membership）**减少再均衡（`group.instance.id`），实例重启不触发全量重平衡；
+  - 顺序消费必须幂等，rebalance 导致的少量重复用幂等键吸收。
+
+### 11.5 死信队列与人工兜底
+
+- **死信（DLQ）**：消费失败超过重试次数（Kafka 用重试 topic + 最终进 DLQ；RocketMQ `retry` topic 耗尽进 `%DLQ%`；RabbitMQ 用 DLX + TTL），消息进死信队列隔离，避免阻塞主队列、不丢消息。
+- **兜底流程**：监控 DLQ 堆积告警 → 排查根因（数据错误/下游永久不可用）→ 修复后**重放（replay）**死信（消费/重发）；对资金类必须有人工审核入口，禁止自动无限重试。
+- **注意**：死信消息保留原始 payload + 失败原因 + 次数，便于复盘；重放前确保下游已幂等，防二次副作用。
+
+### 11.6 与 CDC（Debezium）结合的实战
+
+- **CDC 链路**：Debezium 监听 MySQL/PG 的 binlog/WAL → 发到 Kafka（topic 按表分）→ 下游消费做：缓存失效、异构同步、构建 ES 索引、触发领域事件。
+- **价值**：与应用解耦，数据变更"天然有序、不侵入业务代码"，比"业务代码双写"一致性强。
+- **坑与要点**：
+  - **顺序**：同一主键变更必须落同一分区（按主键路由），否则乱序致状态回退。
+  - **快照与流式衔接**：首次全量快照 + 切到 binlog 位点需无缝，Debezium 用 `snapshot.mode` 处理。
+  - **Schema 演进**：表结构变更（DDL）需用 Schema Registry 管理兼容（backward/forward compatible），否则消费者解析失败。
+  - **幂等消费**：下游写 ES/缓存按主键 upsert，天然幂等；避免"同一条变更被重放两次"致脏数据。
+  - **Kafka Connect 运维**：Debezium 跑在 Kafka Connect 集群，需管 offset/topic 留存与 Connect 容错。

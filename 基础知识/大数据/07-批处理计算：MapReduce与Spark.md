@@ -101,6 +101,80 @@ CLUSTERED BY (user_id) INTO 64 BUCKETS;
 - [ ] 减少 shuffle：combine 前置、广播小表、控制倾斜。
 - [ ] 复用 RDD/中间表（`persist` + 物化宽表）。
 - [ ] Hive Metastore 统一元数据，表格式优先 Iceberg 以获得 ACID。
-- [ ] 监控：stage 耗时、shuffle 读写、数据倾斜、Executor GC。
+  - [ ] 监控：stage 耗时、shuffle 读写、数据倾斜、Executor GC。
 
 > 参考：Google MapReduce 论文、Apache Spark 官方（RDD/ tuning）、Apache Hive 文档、Parquet/ORC 格式说明。
+
+## 六、RDD / DataFrame / Dataset 区别
+
+| 维度 | RDD | DataFrame | Dataset |
+|------|-----|-----------|---------|
+| 类型 | 非结构化 JVM 对象 | 命名列（Row） | 强类型 JVM 对象 |
+| 优化 | 无（算子级） | **Catalyst 全优化** | Catalyst + 类型安全 |
+| 语言 | Java/Scala/Py | 全语言 | Scala/Java |
+| 序列化 | Java/ Kryo | **Tungsten 二进制** | Tungsten 二进制 |
+| 适用 | 底层控制/非结构化 | 大部分 SQL/ETL | 需类型安全的 Scala |
+
+- 优先用 DataFrame/Dataset：Catalyst + Tungsten 让执行快且省内存；RDD 仅用于 Catalyst 不支持的场景。
+
+## 七、Spark SQL Catalyst 优化器
+
+Catalyst 流程：`SQL/DF → 逻辑计划 → 分析（绑定 Catalog）→ 逻辑优化（谓词下推/列裁剪/常量折叠）→ 物理计划（CBO 选 Join 策略）→ 代码生成（Whole-Stage Codegen）`。
+
+```mermaid
+flowchart LR
+    A[Unresolved Logical Plan] --> B[Analyzed Logical Plan]
+    B --> C[Optimized Logical Plan: 下推/裁剪]
+    C --> D[Physical Plans]
+    D --> E[Selected Plan + Codegen]
+```
+
+- 常见优化：谓词下推到数据源、列裁剪、广播 Join、空值传播、子表达式消除。
+
+## 八、Shuffle 调优
+
+- **Shuffle 是性能天花板**：数据按 key 重分区、跨网络，磁盘+网络 IO 密集。
+- 关键参数：
+  - `spark.sql.shuffle.partitions`（默认 200，按数据量调大到 2000+）
+  - `spark.shuffle.file.buffer`、`spark.reducer.maxSizeInFlight`
+  - 用 **Sort Shuffle**（默认）而非 Hash；开启 `spark.shuffle.io.preferDirectBufs`。
+- 数据倾斜治理：
+  - 热点 key 加盐打散再聚合；
+  - 小表广播 `broadcast hint` 避免 shuffle join；
+  - `skew hint`（Spark 3 `ADAPTIVE` 自动处理）。
+
+## 九、Spark Streaming vs Structured Streaming
+
+| 维度 | Spark Streaming（DStream） | Structured Streaming |
+|------|---------------------------|---------------------|
+| 模型 | 微批（离散化流） | 微批/连续（DataFrame 流） |
+| API | RDD | DataFrame/SQL，批流统一 |
+| 语义 | 至少一次/精确一次（WAL） | **端到端精确一次** |
+| 水位/事件时间 | 弱 | **强（Event Time + Watermark）** |
+
+- 新项目一律用 **Structured Streaming**：同一 DataFrame API 既跑批又跑流。
+
+## 十、AQE 自适应查询（Spark 3+）
+
+- 运行时根据 shuffle 统计量**动态调整**：① 合并小分区；② 倾斜 Join 自动加盐；③ 选更佳 Join 策略（sort-merge→broadcast）。
+- 开启：`spark.sql.adaptive.enabled=true`（默认开），大幅降低调参负担。
+
+## 十一、OOM 排查与调优
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| Executor OOM | 数据倾斜/分区过大 | 增分区数、加盐、调 `spark.executor.memory` |
+| GC 长停顿 | 堆大/对象多 | 用 Kryo、堆外、降 `executor.memory` 增 `overhead` |
+| 超限被 KILL | `memoryOverhead` 不足 | 调 `spark.kubernetes.memoryOverhead` |
+| 驱动 OOM | `collect` 大结果 | 避免 collect，用 `write` 落盘 |
+
+- 口诀：**分区数 ≥ 2×核数、避免 collect 大表、倾斜必治理、AQE 必开**。
+
+## 十二、性能 Checklist
+
+- [ ] 用 DataFrame/Dataset + Catalyst，避免裸 RDD。
+- [ ] 开 AQE，调 `shuffle.partitions`。
+- [ ] 广播小表、治理倾斜 key。
+- [ ] 复用 `cache/persist`，但防内存爆。
+- [ ] OOM 看倾斜/分区/overhead；勿 collect 大结果。
+- [ ] Structured Streaming 做流，配 Watermark + 精确一次 Sink。

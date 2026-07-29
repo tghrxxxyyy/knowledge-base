@@ -408,3 +408,104 @@ flowchart TD
 - **VictoriaMetrics 官方对比**：相较 Prometheus 本地 TSDB，磁盘占用通常降至 1/3~1/7，查询更快、内存更省。
 - **TimescaleDB**：胜在 SQL 完整性与关系分析，而非极限吞吐；benchmark 体现「时序+关系混合」独特价值。
 - **InfluxDB IOx**：转 Parquet + 对象存储后，分析型查询与云原生弹性显著改善，单机 TSM 仍是监控成熟稳定之选。
+
+---
+
+## 14. 第三轮深度补充：Benchmark 实测数字、增强选型、联邦查询、基数工程规范、成本估算
+
+> 本节为第三轮深度优化新增，聚焦可落地的基准数字、选型框架、与数仓联邦、基数工程规范与成本模型。请勿与第 11~13 节基础结论混淆：本节给出**带来源标注的公开实测区间**与**可直接套用的公式/Checklist**。
+
+### 14.1 业界公开 Benchmark 对比（TSBS 实测数字）
+
+TSBS（Time Series Benchmark Suite，Timescale 开源）是社区最常被引用的时序库压测工具，常用场景为 `cpu-only`（每主机 100 指标）与 `devops`（多指标混合）。以下为**厂商/社区公开结论的汇总区间**，真实数值随硬件/版本/参数浮动，生产前务必以自身负载复测：
+
+| 维度 | InfluxDB (TSM, 单机) | TimescaleDB (压缩+连续聚合) | TDengine (社区版) | VictoriaMetrics (cluster) | Prometheus (本地) |
+|------|----------------------|------------------------------|-------------------|---------------------------|-------------------|
+| 写入吞吐(公开区间) | ~20~50 万 metrics/s | ~10~30 万 metrics/s | 官方宣称数百万~千万 metrics/s | 官方宣称单节点 ~150~200 万 metrics/s | ~10~30 万 samples/s |
+| 压缩比 | 4~10:1 | 4~10:1（列压） | 10:1 量级 | 比 Prom 省 3~7× | 1~2 B/点（≈ 1~3:1） |
+| 查询延迟（点查/短区间） | 低~中 | 中（SQL 灵活） | 低（单设备） | 低 | 低（热数据） |
+| 查询延迟（跨月大范围） | 中 | 中（依赖聚合表） | 中 | 低（本地盘） | 高（block 多） |
+
+来源标注：
+- TSBS 原始仓库：<https://github.com/timescale/tsbs>，其 README 给出 InfluxDB/TimescaleDB 多轮对比。
+- VictoriaMetrics 官方 benchmarking 博客（对比 Prom/Thanos/Influx）：<https://victoriametrics.com/blog/>。
+- TDengine 官方 benchmark 白皮书（对比 InfluxDB/OpenTSDB）。
+- 注意：厂商数字常用于宣传，建议用 TSBS 在**自身机型**上跑 `cpu-only` 与 `devops` 两组，记录 `inserts/s`、`rows/s`、磁盘占用、查询 P99。
+
+### 14.2 增强选型决策框架（Mermaid，成本/规模视角）
+
+```mermaid
+flowchart TD
+    S0{数据规模?} -->|千万级设备/超高频| S1{是否国产/自主可控?}
+    S1 -->|是| TD[TDengine]
+    S1 -->|否| VM2[VictoriaMetrics / Lindorm]
+    S0 -->|云原生 K8s 监控| S2{保留周期?}
+    S2 -->|短 15~30d| P[Prometheus 本地]
+    S2 -->|长周期/全局| S3{多集群统一?}
+    S3 -->|否| VMOSS[VictoriaMetrics single/cluster]
+    S3 -->|是 多集群| TH[Thanos / Mimir]
+    S0 -->|需 SQL+JOIN+事务| TS[TimescaleDB]
+    S0 -->|阿里云全托管| LIN[Lindorm TSDB]
+    S0 -->|纯监控开箱即用| INF[InfluxDB]
+```
+
+成本排序（由低到高大致）：VictoriaMetrics（省资源）≈ TDengine（省硬件）< InfluxDB < TimescaleDB（PG 内存）< 托管云产品（按量计费、含运维溢价）。
+
+### 14.3 TSDB 与 OLAP 数仓分工与联邦查询
+
+原则：**热/实时在 TSDB，冷/分析在 ClickHouse/Doris**。联邦查询常见两种落地：
+
+1. **查询联邦（Query Federation）**：Grafana 同时挂 TSDB 与 ClickHouse 数据源，近期大屏走 TSDB，历史 BI 走数仓；或用 `clickhouse` 的 `mysql()`/`postgresql()` 外表直接 JOIN TSDB 导出的聚合结果。
+2. **存储联邦（Pipeline Federation）**：TSDB → Kafka → Flink 清洗 → ClickHouse 物化视图，做跨月即席分析。
+
+```sql
+-- ClickHouse 通过 Kafka 表引擎消费 TSDB 同步出的指标流（示意）
+CREATE TABLE tsdb_metrics_kafka (
+  ts DateTime,
+  metric String,
+  host String,
+  val Float64
+) ENGINE = Kafka('kafka:9092', 'tsdb_metrics', 'cg_olap', 'JSONEachRow');
+
+CREATE TABLE metrics_olap
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (metric, host, ts)
+AS SELECT ts, metric, host, val FROM tsdb_metrics_kafka;
+
+-- 联邦：把 TSDB 的聚合结果（通过 PG FDW 暴露）与 ClickHouse 明细 JOIN
+-- 在 PostgreSQL/TimescaleDB 侧：
+-- SELECT m.metric, ck.avg_val FROM metrics_agg m
+-- JOIN clickhouse_remote('SELECT host, avg(val) FROM metrics_olap GROUP BY host') ck USING (host);
+```
+
+### 14.4 避免 tag cardinality 爆炸的工程规范（SOP）
+
+把基数治理前移到**研发流程**，而非上线后救火：
+
+- [ ] **Schema 评审卡点**：新增 metric/label 需经 DBA/SRE 评审，禁止 `user_id`/`request_id`/`trace_id`/浮点/时间戳作 label。
+- [ ] **命名与基数预算**：每个 metric 标注「预期基数上限」（如 `host` ≤ 5000），纳入监控告警。
+- [ ] **CI 静态检查**：在 Prometheus 规则/linter（`promtool` + 自定义）中拦截高基数 label 模式。
+- [ ] **采集端约束**：Telegraf `tagpass/tagdrop`、Prometheus `metric_relabel_configs` 丢弃无用高基 label。
+- [ ] **运行时熔断**：设置 `max-series-per-database`（InfluxDB）/ `cardinality_limit`（VM 企业）硬性上限。
+- [ ] **定期巡检**：周级跑 `seriesCountByMetricName` TopN，环比 > 20% 自动建工单。
+
+### 14.5 容量规划公式与成本估算
+
+```text
+# 核心公式（与第 8 节一致，这里给出可直接填数的模板）
+写入 points/s = 采集目标数 × 每目标指标数 × 标签组合数 / 抓取间隔(s)
+活跃 series   = Σ(每 measurement 的 tag 笛卡尔积)
+日磁盘(GB)    = 活跃 series × 每 series 每日点 × 每点字节(VM 0.5~1.5B / Prom 1~3B) / 1024³
+内存(GB)      ≈ 活跃 series × (1~8 KB)   # VM/TDengine 偏低，Prom/Influx 偏高
+```
+
+成本估算示例（单机 Prometheus → 迁 VM，1000 samples/s，保留 12 月）：
+
+| 项 | Prometheus 本地 | VictoriaMetrics |
+|----|-----------------|-----------------|
+| 日增量 | ~3 GB | ~1.5 GB |
+| 12 月磁盘 | ~1.1 TB | ~0.55 TB（省 ~50%） |
+| 内存（500 万 series） | ~30 GB | ~12 GB |
+
+> 结论：同等规模下，VM 类高压缩引擎通常可把磁盘与内存砍到 Prom 的 1/3~1/2；若再叠加降采样（长期只留 1m/1h 聚合）与对象存储归档，年成本可再降 40%~70%。

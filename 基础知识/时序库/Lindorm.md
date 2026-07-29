@@ -406,3 +406,141 @@ GROUP BY device_id, TUMBLE(ts, INTERVAL '1' MINUTE);
 - [ ] 冷查询慢 → 确认是否对 OSS 区间做高频明细查询（应改聚合）。
 - [ ] 多 AZ 写入延迟高 → 评估跨 AZ 带宽与一致性级别。
 - [ ] 大查询挤占写入 → 用资源组/限流隔离。
+
+---
+
+## 10. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
+
+### 10.1 性能基准（推导 / 公开数字）
+
+公开资料与阿里云文档给出的量级（需以自身负载复测）：
+- 写入吞吐：千万级 points/s（集群横向扩展）。
+- 压缩比：10:1 ~ 20:1（delta-of-delta + XOR + 列存）。
+- 冷数据成本：沉降 OSS 后约为块存储 1/10。
+
+推导：
+```text
+写入 points/s ≈ 设备数 × 每设备指标数 / 上报间隔(s)
+例：100 万设备、每设备 5 指标、5s 上报 → 1e6×5/5 = 1e6 点/s
+→ 需多 dnode + 连接池，单客户端 batch 1000~2000
+```
+
+### 10.2 迁移实战：InfluxDB / OpenTSDB → Lindorm 双写切换 SOP
+
+```mermaid
+flowchart LR
+    A[采集端] -->|1. 双写| B[InfluxDB/OpenTSDB]
+    A -->|1. 双写| C[Lindorm TSDB]
+    D[历史回放\ntelnet/http 重放] --> C
+    E[校验\nsample diff] --> C
+    F[灰度切读\nGrafana 切 Lindorm] --> C
+    F -->|稳定| G[旧库下线]
+```
+
+SOP：
+1. **双写**：采集端同时写旧库与 Lindorm（Lindorm 兼容 InfluxDB 行协议 / OpenTSDB）。
+2. **回放**：用旧库导出按时间区间重放到 Lindorm（注意 tag 模型对齐：高基数列改 field 或宽表 RowKey）。
+3. **校验**：抽样比对 `(metric, tags, ts)` 值，误差 < 1e-6。
+4. **切读**：Grafana 数据源切 Lindorm，观察 48h。
+5. **下线**：旧库只读 7 天确认后停写。
+
+```bash
+# 双写：InfluxDB 行协议兼容端口写 Lindorm
+curl -i -XPOST 'http://ld-bp1xxxx.lindorm.rds.aliyuncs.com:8242/write?db=iot_db' \
+  --data-binary 'device_metric,host=web01,region=cn-hangzhou cpu=0.81 1753687200000000000'
+```
+
+### 10.3 与监控 / Grafana 全链路告警规则示例
+
+Lindorm TSDB 接入 Grafana 后，用 Grafana Unified Alerting 对 SQL 查询结果告警：
+
+```yaml
+apiVersion: 1
+groups:
+  - name: lindorm_cpu_alert
+    rules:
+      - alert: HighDeviceCpu
+        sql: |
+          SELECT tag_host, AVG(field_cpu) AS v
+          FROM device_metric
+          WHERE ts >= NOW() - INTERVAL '5' MINUTE AND tag_region='cn-hangzhou'
+          GROUP BY tag_host HAVING AVG(field_cpu) > 0.85
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "设备 {{ $labels.tag_host }} 5 分钟平均 CPU > 85%"
+```
+
+全链路 Checklist：
+- [ ] 写入 `batch_size=1000`、并发 8、gzip 开启。
+- [ ] 监控 RegionServer CPU/内存、WAL 堆积、压缩比。
+- [ ] Grafana 查询带 `ts >=` 下界，冷区间改聚合查询。
+
+### 10.4 与 Flink / Spark 实时计算联动代码
+
+Flink SQL 实时聚合写 Lindorm（含 watermark 与乱序容忍）：
+
+```sql
+CREATE TABLE device_src (
+  device_id STRING, cpu DOUBLE, ts TIMESTAMP(3),
+  WATERMARK FOR ts AS ts - INTERVAL '10' SECOND
+) WITH ('connector'='kafka','topic'='device-metrics', ...);
+
+CREATE TABLE lindorm_agg (
+  device_id STRING, avg_cpu DOUBLE, w_end TIMESTAMP(3)
+) WITH (
+  'connector'='lindorm','endpoint'='ld-bp1xxxx.lindorm.rds.aliyuncs.com:8242',
+  'database'='iot_db','table'='device_metric_agg'
+);
+
+INSERT INTO lindorm_agg
+SELECT device_id, AVG(cpu), TUMBLE_END(ts, INTERVAL '1' MINUTE)
+FROM device_src GROUP BY device_id, TUMBLE(ts, INTERVAL '1' MINUTE);
+```
+
+Spark 读 Lindorm（JDBC）：
+
+```scala
+val df = spark.read.format("jdbc")
+  .option("url", "jdbc:lindorm:8242/iot_db")
+  .option("query", "SELECT tag_host, field_cpu, ts FROM device_metric WHERE ts >= NOW() - INTERVAL 1 HOUR")
+  .load()
+df.groupBy("tag_host").avg("field_cpu").show()
+```
+
+联动要点：Flink 做富化后再落 Lindorm，减少查询期 JOIN；聚合与明细分表。
+
+### 10.5 成本优化（冷热分层 / 降采样 / 保留策略）
+
+```bash
+# 开启冷热分层 + 查询冷存信息
+aliyun lindorm UpdateMultiZoneClusterNode --InstanceId ld-bp1xxxx --ColdStorageEnable true
+aliyun lindorm DescribeHotColdStorageInfo --InstanceId ld-bp1xxxx
+```
+
+```sql
+-- 热 TTL 90d，超期自动沉降 OSS；归档保留 3 年
+ALTER TABLE device_metric SET OPTIONS (coldDataTtl='90d', archiveTtl='1095d');
+```
+
+成本模型（示意）：热 ESSD 约 ¥0.8/GB·月，冷 OSS 约 ¥0.08/GB·月（1/10）。若 80% 数据为冷，整体存储成本可降 ~70%。
+
+降本清单：
+- [ ] 热 TTL 贴合真实访问窗口，避免热盘被冷数据占满。
+- [ ] 冷区间只做聚合查询，禁高频明细回扫。
+- [ ] 保持高压缩比（基数可控）；闲时降配计算规格。
+- [ ] 大查询与写入用资源组隔离，避免盲目扩容。
+
+### 10.6 生产排障 SOP
+
+**Cardinality 治理**
+- [ ] 单 metric tag 组合数控在万级；`device_id` 等高基数列放 field / 宽表 RowKey。
+- [ ] 监控压缩比，骤降即查高基数列是否混入 tag。
+
+**写入拒绝 / 延迟高 SOP**
+- [ ] 查 RegionServer 负载、WAL 堆积、是否热盘满。
+- [ ] 调大 `batch_size`/并发、开压缩；多 AZ 评估跨 AZ 带宽。
+
+**查询超时 SOP**
+- [ ] 确认带 `ts >=` 下界；冷区间改聚合。
+- [ ] 大查询用资源组限流，避免挤占写入。

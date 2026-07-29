@@ -577,3 +577,170 @@ influxd restore -database metrics -metadir /var/lib/influxdb/meta \
 - **v1 → v2**：用 `influx_inspect export` 导出 line protocol，再 v2 CLI 导入；注意 database→bucket 映射。
 - **v1 → IOx(v3)**：通过远程读/双写过渡；IOx 支持 SQL，旧 Flux 脚本需评估迁移成本。
 - 大版本升级前必须备份 meta + data 目录，并在隔离环境验证查询兼容性。
+
+---
+
+## 12. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
+
+### 12.1 性能基准（TSBS 实测数字 / 推导）
+
+TSBS `cpu-only` 场景（每主机 100 指标，单机 NVMe）公开结论区间：
+
+| 指标 | InfluxDB TSM 2.x | 说明 |
+|------|------------------|------|
+| 写入吞吐 | ~20~50 万 metrics/s | 批量+并发，纳秒精度下略降 |
+| 单点查询 P99 | < 10 ms | 带时间下界、命中 TSI |
+| 大范围聚合 | 中 | shard 多则慢，需降采样 |
+| 压缩比 | 4~10:1 | Delta/XOR + Snappy |
+
+推导公式（用于自测预估）：
+
+```text
+目标吞吐(点/s) = 主机数 × 100(指标) / scrape_interval(s)
+例：1000 主机、10s 抓 → 1000×100/10 = 1,000,000 点/s
+→ 需分布式 IOx 或双写分流，单机 TSM 易到天花板
+```
+
+建议：上线前用 TSBS 在自身机型跑 `cpu-only`+`devops`，记录 `inserts/s`、磁盘、查询 P99，作为容量基线。
+
+### 12.2 迁移实战：InfluxDB → VictoriaMetrics 双写切换 SOP
+
+适用：用 InfluxDB 做 Prom 远程存储，想换 VM 省成本。
+
+```mermaid
+flowchart LR
+    A[Prometheus] -->|1. 双写| B[InfluxDB]
+    A -->|1. 双写| C[VictoriaMetrics]
+    D[历史回放\ninfluxd backup→VM import] --> C
+    E[校验\nsample diff] --> C
+    F[灰度切读\nGrafana 数据源切 VM] --> C
+    F -->|稳定| G[InfluxDB 只读下线]
+```
+
+SOP 步骤：
+1. **双写**：Prometheus `remote_write` 同时指向 InfluxDB 与 VM；VM 开启 `-dedup.minScrapeInterval` 防重复。
+2. **回放**：用 `influxd backup` 导出历史，经 line protocol 写入 VM（VM 兼容 Influx 行协议 `/write`）。
+3. **校验**：用脚本抽样比对两库同一 `(metric, labels, ts)` 的值，允许浮点误差 < 1e-6。
+4. **切读**：Grafana 数据源先 5% 看板切 VM，观察 48h 无缺数/抖动。
+5. **下线**：InfluxDB 置只读，观察 7 天，确认后停写释放资源。
+
+```yaml
+# prometheus.yml 双写片段
+remote_write:
+  - url: http://influxdb:8086/api/v1/prom/write?db=metrics
+  - url: http://vminsert:8480/insert/0/prometheus/api/v1/write
+    queue_config: { max_samples_per_send: 10000, capacity: 100000 }
+```
+
+### 12.3 与监控 / Grafana 全链路告警规则示例
+
+Grafana 统一告警（InfluxDB 数据源 + Flux 阈值检查）：
+
+```yaml
+# grafana 告警规则（unified alerting，HTTP 配置示意）
+apiVersion: 1
+groups:
+  - name: influxdb_cpu_alert
+    rules:
+      - alert: HighCPU
+        expr: |
+          from(bucket:"metrics") |> range(start:-5m)
+          |> filter(fn:(r)=> r._measurement=="cpu" and r._field=="usage")
+          |> mean() |> filter(fn:(r)=> r._value > 85)
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "主机 {{ $labels.host }} CPU 持续 >85%"
+```
+
+Kapacitor 阈值（TICK 脚本片段）：
+
+```js
+stream
+  |from().measurement('cpu').where(lambda: "host" == 'web-01')
+  |alert()
+    .warn(lambda: "usage" > 80)
+    .crit(lambda: "usage" > 90)
+    .slack()
+```
+
+全链路健康 Checklist：
+- [ ] Telegraf `flush` 间隔匹配峰值；`write.errors` = 0。
+- [ ] InfluxDB `writeReq` 延迟 P99 < 1s；WAL 不持续增长。
+- [ ] Grafana 查询均带 `time >=` 下界，避免全量扫。
+
+### 12.4 与 Flink / Spark 实时计算联动代码
+
+Spark 读 InfluxDB 2.x（Scala，使用 influxdb-spark 或 JDBC）：
+
+```scala
+// 通过 DataFrame 读取 InfluxDB（2.x Flux 结果）
+val df = spark.read
+  .format("influxdb")
+  .option("url", "http://influxdb:8086")
+  .option("token", sys.env("INFLUX_TOKEN"))
+  .option("org", "my-org")
+  .option("query", """from(bucket:"metrics")|>range(start:-1h)|>filter(r=>r._measurement=="cpu")""")
+  .load()
+df.groupBy("host").avg("_value").show()
+```
+
+Flink SQL 将聚合结果写回 InfluxDB（行协议 sink）：
+
+```sql
+CREATE TABLE influx_sink (
+  host STRING,
+  avg_cpu DOUBLE,
+  window_end TIMESTAMP(3)
+) WITH (
+  'connector' = 'influxdb',
+  'url' = 'http://influxdb:8086',
+  'database' = 'metrics',
+  'measurement' = 'cpu_agg'
+);
+INSERT INTO influx_sink
+SELECT host, AVG(usage), TUMBLE_END(ts, INTERVAL '1' MINUTE)
+FROM cpu_stream GROUP BY host, TUMBLE(ts, INTERVAL '1' MINUTE);
+```
+
+联动要点：Flink 侧做窗口聚合/富化后再落 InfluxDB，减少查询期 JOIN；明细与聚合分 measurement 存储。
+
+### 12.5 成本优化（冷热分层 / 降采样 / 保留策略）
+
+```sql
+-- 多档 RP：原始 30d 热，1m 聚合 90d，1h 聚合 1y
+CREATE RETENTION POLICY "rp_hot"  ON metrics DURATION 30d  REPLICATION 1 SHARD DURATION 1d DEFAULT;
+CREATE RETENTION POLICY "rp_90d"  ON metrics DURATION 90d  REPLICATION 1 SHARD DURATION 7d;
+CREATE RETENTION POLICY "rp_1y"   ON metrics DURATION 365d REPLICATION 1 SHARD DURATION 7d;
+
+CREATE CONTINUOUS QUERY "cq_1m" ON metrics
+BEGIN
+  SELECT mean("usage") INTO "metrics"."rp_90d"."cpu_1m"
+  FROM "metrics"."rp_hot"."cpu" GROUP BY time(1m), *
+END;
+
+CREATE CONTINUOUS QUERY "cq_1h" ON metrics
+BEGIN
+  SELECT mean("usage") INTO "metrics"."rp_1y"."cpu_1h"
+  FROM "metrics"."rp_90d"."cpu_1m" GROUP BY time(1h), *
+END;
+```
+
+IOx 下直接把 Parquet 落对象存储（S3/OSS），热数据用 SSD、冷数据用对象存储，成本降至块存储 1/10 量级。
+
+### 12.6 生产排障 SOP
+
+**Cardinality 治理 SOP**
+- [ ] `SHOW SERIES CARDINALITY` 定位高基数 measurement。
+- [ ] 把 `request_id`/`user_id` 等从 tag 移至 field；如必须保留，用 `hash(user_id)%100` 分桶。
+- [ ] 设 `max-series-per-database` 硬上限做熔断；`DROP SERIES` 清理退场设备。
+
+**写入拒绝（write rejected / 429）SOP**
+- [ ] 查 `SHOW STATS` 的 `writeErrors`、WAL 大小、磁盘剩余。
+- [ ] 升 `cache-max-memory-size` 或加节点；临时降抓取频率缓解。
+- [ ] IOx 查对象存储 4xx/5xx，必要时提 IO/限流。
+
+**查询超时 SOP**
+- [ ] 确认查询带 `time >=` 下界；缩小时间窗与 tag 过滤。
+- [ ] 调整 shard duration（避免 1 年数据用 1h shard）。
+- [ ] 大查询走聚合 RP，避免对 `rp_hot` 做跨月明细扫。

@@ -554,3 +554,109 @@ spec:
 > - Pipeline Graph View 插件（Blue Ocean 替代）：https://plugins.jenkins.io/pipeline-graph-view/
 > - Jenkins 安全公告 2025：https://www.jenkins.io/security/advisories/
 > - 实战：Dynamic Jenkins Agents with Kubernetes（2026）：https://oneuptime.com/blog/post/2026-01-27-jenkins-kubernetes-agents/view
+
+## 十、声明式 vs 脚本式：如何取舍
+
+| 维度 | 声明式 Declarative | 脚本式 Scripted |
+|------|--------------------|-----------------|
+| 语法 | 结构化、受限、易校验 | 纯 Groovy、灵活 |
+| 学习成本 | 低，Snippet Generator 可生成 | 高，需懂 Groovy |
+| 错误拦截 | 编译期校验、结构错直接 fail | 运行期才暴露 |
+| 适用 | 绝大多数新项目 | 极复杂动态逻辑兜底 |
+
+> 取舍原则：**新项目一律 Declarative**；只有"按需动态生成 stage 数量 / 反射式调用"等声明式表达不了的，才用 `script{}` 局部兜底，禁止整篇脚本式。
+
+```groovy
+// 声明式内嵌脚本式兜底（局部，不污染整体结构）
+stage('Dynamic') {
+    steps {
+        script {
+            def services = readYaml(file: 'svc.yaml').list
+            services.each { s -> build job: "deploy-${s}" }
+        }
+    }
+}
+```
+
+## 十一、stage 并行与"失败时继续"
+
+`parallel` 块内多 stage 并发；`failFast: false` 让其中一个失败也不立即杀掉其他分支（便于收集全部测试结果）。
+
+```groovy
+stage('Test Matrix') {
+    parallel(
+        unit:   { stage('Unit')   { sh 'npm test:unit' } },
+        e2e:    { stage('E2E')    { sh 'npm test:e2e'  } },
+        lint:   { stage('Lint')   { sh 'npm run lint'  } }
+    )
+}
+// 失败时继续收集所有报告
+stage('Report') {
+    steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            sh 'npm run report'
+        }
+    }
+}
+```
+
+## 十二、post 块：统一清理与通知
+
+`post` 按结果（`always`/`success`/`failure`/`changed`/`unstable`）执行，是"清理+通知"的单一落点：
+
+```groovy
+post {
+    always   { cleanWs() }                                  // 必清工作区
+    success  { slackSend channel:'#ci', message:'✅' }
+    failure  { slackSend channel:'#ci', message:'❌' ; archiveArtifacts 'target/**' }
+    unstable { junit 'target/surefire-reports/*.xml' }
+    changed  { emailext to:'team@corp.com', subject:'状态变化' }
+}
+```
+
+## 十三、withCredentials：凭据安全注入
+
+凭据**绝不硬编码**，用 `withCredentials` 临时注入为环境变量（Jenkins 自动 masking 日志）：
+
+```groovy
+stage('Deploy') {
+    steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'docker-hub',
+            usernameVariable: 'U', passwordVariable: 'P')]) {
+            sh 'echo $P | docker login -u $U --password-stdin'
+        }
+        // 离开块后 $P/$U 失效，不会残留
+    }
+}
+// ❌ 反模式：sh "echo $TOKEN" 会明文进日志
+```
+
+## 十四、Jenkinsfile 反模式（含 Groovy 踩坑）
+
+```groovy
+// ❌ 反模式1：groovy 里做耗时 IO（在 Controller 上执行，拖垮主节点）
+node { def files = new File('/big').listFiles() }   // 应在 agent 内、用 steps
+
+// ❌ 反模式2：硬编码凭证
+environment { TOKEN = 'ak-123' }                     // 应走 credentials()
+
+// ❌ 反模式3：不清理工作区，磁盘爆炸
+// 解决：post { always { cleanWs() } }
+
+// ❌ 反模式4：agent any 乱跑，docker 构建失败
+agent any                                            // 应 label 'docker'
+
+// ❌ 反模式5：超长 Jenkinsfile，逻辑全堆一起
+// 解决：抽到 @Library('corp-lib@vX') 的 vars/
+
+// ❌ 反模式6：script{} 里关掉 Script Security
+// 解决：保留 Script Approval，别为省事放开
+```
+
+## 本篇补充 Checklist
+
+- [ ] 新项目 Declarative，`script{}` 只做局部动态兜底。
+- [ ] 重 stage 用 `parallel` + `failFast:false`；报告收集用 `catchError`。
+- [ ] `post` 统一 `cleanWs()` + 通知；凭据只走 `withCredentials`。
+- [ ] 警惕 6 类反模式：Controller 上 IO、硬编码、不清理、agent any、巨石文件、关 Script Security。

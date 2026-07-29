@@ -1031,3 +1031,68 @@ LambdaMetafactory：[https://juejin.cn/post/7490777239878418473](https://juejin.
 - **GC 默认**：JDK 9+ 默认 G1；JDK 21 实验分代 ZGC 转正。
 - **升级策略**：先在测试/灰度用新 JDK 跑全量测试；用 `jdeps` 查内部 API 依赖；关注 `-XX:+PrintClassHistogram`/JFR 对比升级前后 GC 与吞吐。
 - **LTS 选择**：8 → 11 → 17 → 21 是长期支持线，生产优先选 LTS，避免非 LTS 短期支持风险。
+
+## 九、虚拟线程与高阶实战（第三轮深度补充）
+
+### 9.1 Java 21/22 虚拟线程生产踩坑
+
+- **本质**：`VirtualThread` 是 JVM 托管、挂载在 carrier（平台）线程上的轻量线程，百万级并发只需少量 OS 线程；`Thread.startVirtualThread(() -> {...})` 或 `Executors.newVirtualThreadPerTaskExecutor()`。
+- **Pinning（钉死）坑**：虚拟线程在 `synchronized` 块内、或执行 native 方法时被"钉"在 carrier 线程上，期间无法卸载（unmount），高并发下 carrier 池（默认并行度 = CPU 核数）被占满 → 吞吐骤降。
+  - **治理**：把 `synchronized` 换成 `ReentrantLock`（不钉死）；减少同步块粒度；用 `-Djdk.virtualThreadScheduler.parallelism` 调大并发因子应急。
+  - **观测**：`-Djdk.tracePinnedThreads=full` 打印钉死栈；JFR 事件 `jdk.VirtualThreadPinned` 统计。
+- **ThreadLocal 迁移**：虚拟线程数量巨大，传统 `ThreadLocal` 会变成"每请求一个大对象"，内存放大；改用**作用域值 `ScopedValue`**（21 预览）：`ScopedValue.where(KEY, val).run(() -> ...)`，无内存泄漏、不可变、自动随作用域销毁。
+- **不要池化虚拟线程**：`newVirtualThreadPerTaskExecutor` 本就廉价，套线程池反而抵消优势；`Thread.sleep` 在虚拟线程里是让出而非阻塞 carrier，放心用。
+
+### 9.2 结构化并发（Structured Concurrency）实战
+
+- 目标：把"多个并发子任务"视为一个**任务单元**——任一个失败/超时，其余被自动取消，避免线程泄漏与"孤儿任务"。
+- API（21 预览 `java.util.concurrent`）：
+
+```java
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    var user = scope.fork(() -> loadUser(id));
+    var order = scope.fork(() -> loadOrder(id));
+    scope.join();            // 等所有子任务
+    scope.throwIfFailed();   // 任一失败则抛
+    return new Result(user.get(), order.get());
+}   // 作用域退出，未完成的子任务被取消
+```
+
+- `ShutdownOnFailure`（失败即停）vs `ShutdownOnSuccess`（任一成功即停，取最快结果）。相比手写 `Future` + 手动 `cancel`，结构化并发取消更彻底、可观测性更好。
+- 注意：子任务里抛异常若不 `fork().get()` 读取，会被吞；务必 `join` 后 `get`/`throwIfFailed`。
+
+### 9.3 ZGC 在不同业务场景的取舍
+
+- **选型矩阵**：
+
+| 场景 | 推荐 GC | 理由 |
+| --- | --- | --- |
+| 批处理 / 离线计算 | Parallel GC | 吞吐最高，停顿不敏感 |
+| 常规 Web 服务（堆 < 16G） | G1 | 均衡、调优简单 |
+| 交易 / 实时风控（延迟 < 10ms） | ZGC（分代，JDK 21+） | 停顿 < 1ms，但 CPU 开销约 +10%~15% |
+| 超大堆（> 100G）低延迟 | ZGC 分代 | 分代后年轻代回收更频繁、老年代并发，吞吐优于单代 |
+| 极端延迟（亚毫秒，Red Hat 系） | Shenandoah | 读屏障，停顿更低但吞吐略逊 |
+
+- **ZGC 代价**：染色指针 + 多重映射，堆外元数据开销约 15%~20%；分配速率过高会触发 Allocation Stall（短暂停顿等待并发回收），给足堆 + 控分配速率是关键。
+- **实测经验**：交易核心从 G1 切 ZGC，P99 从 40ms 降到 2ms，但 CPU 利用率涨 12%；不适合 CPU 已经吃满的实例。
+
+### 9.4 JMH 微基准测试实战与误区
+
+- **正确姿势**：`@BenchmarkMode(Mode.Throughput/Mode.AverageTime)`、`@State(Scope)` 管理共享状态、`@Fork(1)` 独立 JVM 排除 JIT 污染、`@Warmup` + `@Measurement` 充分预热、`Blackhole.consume()` 消费结果防死码消除。
+- **五大误区**：
+  1. **死码消除**：没消费返回值，`javac`/JIT 直接删掉计算 → 必须用 `Blackhole`。
+  2. **未预热**：JIT 没编译就测，结果毫无意义。
+  3. **同一 JVM 反复跑**：GC / 编译态不一致，必须 `@Fork` 每次新进程。
+  4. **拿微基准给生产下结论**：微基准只反映算法/实现差异，真实吞吐受 GC、锁竞争、IO 主导。
+  5. **bench 方法太长**：混合了多个操作，无法定位瓶颈。
+- **解读**：看 Score ± 误差（置信区间），误差大说明被调度/GC 干扰，单次数值别盲信。
+
+### 9.5 GraalVM 原生镜像（Spring Native / Quarkus）适配清单
+
+- **收益**：AOT 编译成原生可执行，启动毫秒级、内存降数倍，Serverless / FaaS 利器。
+- **代价与适配坑**：
+  1. **反射 / 动态代理 / 序列化**需显式注册（`reflect-config.json` / `@RegisterReflectionForBinding`），否则运行期 `ClassNotFoundException`；Spring Boot 3 的 `spring-aot` 能自动推导大部分。
+  2. **运行时类加载、JNI、`sun.misc.Unsafe`、动态字节码（CGLIB）受限**，很多框架默认路径不可用。
+  3. **构建慢**（分钟级）、需 `native-image` 工具链与足够内存。
+  4. **不全平台一致**：需目标 OS/架构对应的 builder 镜像（多阶段构建）。
+- **选型**：Quarkus 对原生镜像支持最顺（响应式优先）；Spring Boot 3 + `spring-boot-starter-aot` 可用但需逐一验证第三方库兼容性；不适合依赖大量反射的老项目硬上。

@@ -48,3 +48,76 @@
 - 方法/产品：阿里 OneData、DAMA-DMBOK、Databricks/Snowflake 实践、Dataphin/WeData/DataArts/Dataleap 治理平台（2025）、Onehouse 表格式三方对比（2025）、DuckLake 公告。
 
 > 本板块与「基础知识」下的 MQ、ES体系、redis知识、mysql知识 等互为补充：MQ 讲消息队列、ES体系讲搜索、redis知识讲缓存、mysql知识讲关系库；大数据板块聚焦"海量数据的分布式采集/存储/计算/治理"全链路。
+
+## 五、大数据学习路径路线图
+
+```mermaid
+flowchart TD
+    L0[阶段0 基础] -->|Linux/SQL/Java/Scala/Python + 数据结构| L1[阶段1 存储]
+    L1 -->|HDFS/对象存储 + Parquet/Iceberg| L2[阶段2 计算]
+    L2 -->|Spark 批 + Flink 流| L3[阶段3 管道]
+    L3 -->|Kafka + CDC + DataX| L4[阶段4 数仓]
+    L4 -->|分层建模 + OLAP| L5[阶段5 湖仓]
+    L5 -->|实时数仓 + 流批一体| L6[阶段6 治理]
+    L6 -->|元数据/质量/安全/指标| L7[阶段7 趋势]
+```
+
+- **阶段 0-2（打地基）**：先把"存储+计算"跑通——用 Spark 写 WordCount、用 Flink 算窗口聚合。
+- **阶段 3-4（建管道）**：打通"采集→数仓"，能交付一张 ADS 报表。
+- **阶段 5-7（上体系）**：做湖仓一体与治理，能独立设计一条生产级实时链路。
+
+## 六、Lambda vs Kappa 深度对比
+
+| 维度 | Lambda | Kappa |
+|------|--------|-------|
+| 链路数 | 2（批层+速度层） | 1（纯流） |
+| 计算引擎 | 批(Spark)+流(Flink) | 仅流(Flink) |
+| 存储 | HDFS+OLAP 双份 | Kafka 日志 + 一套 OLAP |
+| 历史重算 | 批层直接重跑 | 重放 Kafka 长日志 |
+| 代码维护 | 双份、易不一致 | 单份 |
+| 准确性 | 高（全量校准） | 依赖流引擎精确一次 |
+| 适用 | 离线准确+实时增量并存 | 实时为主、可重放 |
+
+> 演进结论：新项目直接用**流批一体 / 湖仓一体**替代 Lambda 双链路，仅在"历史准确性要求极高且流引擎难实现"时保留 Lambda。
+
+## 七、批流一体演进路线
+
+```mermaid
+flowchart LR
+    A[Lambda 双链路] --> B[Kappa 单链路]
+    B --> C[流批一体: 同API承流承批]
+    C --> D[湖仓一体: 一体存储+流批引擎]
+```
+
+- 关键转折：Flink 提出"**有界流即批**"，Spark Structured Streaming 用微批统一 API；存储侧用 Iceberg/Paimon 同时承接流写与批读，使"一套代码+一份存储"成为可能。
+
+## 八、主流技术栈速查表
+
+| 能力 | 首选 | 备选 |
+|------|------|------|
+| 批计算 | Spark | Hive on Tez、Flink Batch |
+| 流计算 | Flink | Kafka Streams |
+| 消息 | Kafka | Pulsar |
+| 湖表格式 | Iceberg | Paimon（流式）、Delta、Hudi |
+| OLAP | StarRocks | ClickHouse、Doris |
+| 调度 | DolphinScheduler | Airflow |
+| 资源 | Kubernetes | YARN（存量） |
+| 治理 | Atlas+Griffin+Ranger | DataHub、OpenMetadata |
+
+## 九、与 AI / LLM 数据基建的关系
+
+```mermaid
+flowchart LR
+    BIG[大数据平台] --> FEAT[特征存储 Feature Store]
+    BIG --> VEC[(向量库/向量化)]
+    BIG --> RAG[RAG 知识库]
+    BIG --> TRAIN[训练样本/清洗语料]
+    FEAT --> LLM[LLM 训练/推理]
+    VEC --> LLM
+    RAG --> LLM
+    TRAIN --> LLM
+```
+
+- 大数据平台是 LLM 的**燃料厂**：清洗语料、构建特征、生成向量化数据、搭建 RAG 知识库。
+- **NL2SQL / 数据问答**：用 LLM 把自然语言转 SQL，降低业务用数门槛（如 StarRocks/Chat2DB）。
+- **Data Agent**：自主盘点资产、给优化建议，是治理与 AI 的结合点。

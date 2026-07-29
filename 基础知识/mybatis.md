@@ -243,3 +243,170 @@ MyBatis 通过**责任链 + 动态代理**拦截四大核心对象：`Executor`�
 - 逻辑删除（`@TableLogic`）会在查询自动加 `deleted=0`，但**手动 SQL / XML 不受控**，易漏；更新时逻辑删除是 `update deleted=1` 而非物理删。
 - `updateById` 只更新非 null 字段（null 不更新），想更新为 null 需 `set` 或 `UpdateWrapper`。
 - 乐观锁 `@Version` 靠 `UPDATE ... SET ..., version=version+1 WHERE id=? AND version=?`，并发冲突抛 `OptimisticLockException`，需业务重试。
+
+---
+
+# 第三轮深度优化：插件链源码 / 缓存与事务坑 / 复杂动态 SQL / 注入防护 / TypeHandler / MP 对比与生成
+
+## 一、插件链源码级（Interceptor 四大拦截点 + 责任链）
+
+MyBatis 在创建四大对象（Executor / ParameterHandler / ResultSetHandler / StatementHandler）时，会遍历所有 `Interceptor`，用 `Plugin.wrap(target, interceptor)` 生成**嵌套代理**。以 `Executor` 为例：
+
+```java
+// Plugin.wrap 核心：对被 @Signature 标注的接口方法生成 JDK 动态代理
+public static Object wrap(Object target, Interceptor i) {
+    Map<Class<?>, Set<Method>> signatureMap = getSignatureMap(i);
+    Class<?> type = target.getClass();
+    Class<?>[] interfaces = getAllInterfaces(type, signatureMap);
+    return interfaces.length > 0
+        ? Proxy.newProxyInstance(type.getClassLoader(), interfaces, new Plugin(target, i, signatureMap))
+        : target;
+}
+// Plugin.invoke：命中签名方法才走 intercept，否则直调
+public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    if (signatureMap.get(method.getDeclaringClass()).contains(method))
+        return interceptor.intercept(new Invocation(target, method, args));
+    return method.invoke(target, args);
+}
+```
+
+- **四大拦截点的典型用途**：
+  - `Executor.update/query`：分页改写、数据权限加过滤、SQL 审计、防全表更新。
+  - `ParameterHandler.setParameters`：参数加密、租户 ID 注入、脱敏。
+  - `ResultSetHandler.handleResultSets`：结果解密、字段脱敏、类型转换。
+  - `StatementHandler.prepare/parameterize`：SQL 改写（分表路由）、读写分离选库。
+- **调用顺序**：多个插件按 `mybatis-config.xml` 中 `<plugins>` 配置顺序**从外到内**嵌套，最外层 `intercept` 前置先执行，`invocation.proceed()` 进入下一层，最终到真实对象。调试看调用栈即知顺序。
+
+## 二、自定义数据权限插件（实战代码）
+
+需求：所有查询按当前用户部门自动加 `AND dept_id IN (...)`，业务 SQL 无感知。
+
+```java
+@Intercepts({@Signature(type = Executor.class, method = "query",
+        args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})})
+public class DataPermissionInterceptor implements Interceptor {
+    public Object intercept(Invocation inv) throws Throwable {
+        MappedStatement ms = inv.getArgs()[0];
+        Object param = inv.getArgs()[1];
+        // 跳过非白名单、或标记跳过权限的 statement
+        if (needSkip(ms.getId())) return inv.proceed();
+        // 用 JSqlParser/Custom 解析 BoundSql，注入 dept 过滤条件
+        BoundSql boundSql = ms.getBoundSql(param);
+        String newSql = appendDeptFilter(boundSql.getSql(), currentUserDeptIds());
+        // 重写 MappedStatement 的 SQL（构造新 MS 不可变，需重建）
+        MappedStatement newMs = rewriteMs(ms, newSql, boundSql);
+        inv.getArgs()[0] = newMs;
+        return inv.proceed();
+    }
+    public Object plugin(Object t){ return Plugin.wrap(t, this); }
+}
+```
+
+要点：`MappedStatement`/`BoundSql` 不可变，改写 SQL 必须**重建 MappedStatement**（复制 builder 并替换 sqlSource）；解析 SQL 推荐 `JSqlParser` 而非字符串拼接（避免破坏子查询/别名）；租户/数据权限是插件最典型场景。
+
+## 三、分表插件（按分片键路由表名）
+
+```java
+@Intercepts({@Signature(type = StatementHandler.class, method = "prepare",
+        args = {Connection.class, Integer.class})})
+public class ShardingInterceptor implements Interceptor {
+    public Object intercept(Invocation inv) throws Throwable {
+        StatementHandler sh = (StatementHandler) inv.getTarget();
+        BoundSql bs = sh.getBoundSql();
+        Object param = bs.getParameterObject();
+        // 从参数取分片键（如 userId），算表后缀
+        String suffix = tableSuffix(getShardKey(param));
+        String sql = bs.getSql().replaceAll("(?i)\\{tableName\\}", "order_" + suffix);
+        // 反射改写 StatementHandler 的 delegate.boundSql.sql
+        setField(sh, "boundSql.sql", sql);
+        return inv.proceed();
+    }
+}
+```
+
+SQL 中写逻辑表名 `INSERT INTO {tableName} (...) VALUES (...)`，插件按分片键把 `{tableName}` 替换为物理表；更大规模直接用 ShardingSphere，避免自研边界坑（事务、跨片查询）。
+
+## 四、一级/二级缓存与 Spring 事务的坑
+
+- **一级缓存（SqlSession 级）与事务的关系**：纯 MyBatis 下同一 SqlSession 内事务未提交，查询命中 localCache 返回同一对象；但 Spring 整合时 `SqlSessionTemplate` 在方法结束（或事务提交）后会归还/关闭 SqlSession，**跨方法一级缓存基本不共享**。坑：在 Spring 事务中循环 `getById` 同一 id 多次，若每次都从 `SqlSessionHolder` 取同一 SqlSession（同一事务），会命中一级缓存；一旦事务边界不同，缓存不共享、多查库。
+- **二级缓存与事务提交**：`CachingExecutor` 用 `TransactionalCacheManager` 暂存待写缓存，**只有事务提交后**才刷入 `delegate`；若事务回滚，缓存不写入，避免脏读。坑：在 `@Transactional` 内更新后立刻查（同事务）能拿到新值，但这是 DB 回滚一致性保证，不是缓存——跨 SqlSession 的读仍读旧缓存直到提交。
+- **Spring 事务 + 缓存的双重失效**：`@Transactional` 方法内 `clearCache`/更新，二级缓存事务提交才生效；若方法抛异常回滚，缓存不更新但 DB 也回滚，一致；但若混用 Redis 二级缓存（外部），需 `TransactionalEventListener(AFTER_COMMIT)` 同步清 Redis，否则提交前清了 Redis 却 DB 回滚，造成脏数据。
+- **口诀**：缓存一致性难在"跨 SqlSession/跨进程"；多表 join 的二级缓存几乎必不一致，生产优先 Redis + TTL，而非 MyBatis 内置二级。
+
+## 五、动态 SQL 复杂场景（嵌套 choose / foreach 批量 upsert）
+
+- **嵌套 choose**：按条件组合不同过滤分支，注意 `when` 顺序（命中即停）：
+  ```xml
+  <where>
+    <choose>
+      <when test="type == 'A'">
+        AND status = 1 AND region = #{region}
+      </when>
+      <when test="type == 'B'">
+        AND status IN <foreach collection="statusList" item="s" open="(" close=")" separator=",">#{s}</foreach>
+      </when>
+      <otherwise>
+        AND create_time >= #{start}
+      </otherwise>
+    </choose>
+    <if test="keyword != null">
+      AND name LIKE CONCAT('%', #{keyword}, '%')
+    </if>
+  </where>
+  ```
+- **foreach 批量 upsert（MySQL `INSERT ... ON DUPLICATE KEY UPDATE`）**：
+  ```xml
+  <insert id="batchUpsert">
+    INSERT INTO t (id, name, cnt) VALUES
+    <foreach collection="list" item="e" separator=",">
+      (#{e.id}, #{e.name}, #{e.cnt})
+    </foreach>
+    ON DUPLICATE KEY UPDATE name = VALUES(name), cnt = VALUES(cnt)
+  </insert>
+  ```
+  注意：必须有唯一键（PK 或 UK）才能 upsert；批过大超 `max_allowed_packet`，需分批（每批 500~1000）；`VALUES(col)` 引用插入行的值，避免常量覆盖。
+- **foreach 批量 update（case when）**：`UPDATE t SET cnt = CASE id WHEN #{i.id} THEN #{i.cnt} ... END WHERE id IN (...)`，单条 SQL 完成多行更新，减少网络往返；但 SQL 长，批大时拆批。
+
+## 六、`#{}` 与 `${}` 注入风险与防护（进阶）
+
+- **`#{}` 永远优先**：任何值参数（列值、IN 列表元素、LIKE 内容）一律 `#{}`，PreparedStatement 预编译 + 转义，`'` 被处理，注入无效。
+- **`${}` 仅三种合法场景，且必须服务端白名单**：
+  1. 动态表名 `FROM ${table}`：表名来自固定枚举/配置，校验 `table.matches("[a-zA-Z0-9_]+")` 并查白名单集合，禁止用户任意输入。
+  2. 动态排序列 `ORDER BY ${col}`：映射 `{ "ctime": "create_time DESC" }`，前端只传 key，后端取值。**绝不把用户字符串直接拼进 ORDER BY**——`col; DROP TABLE t;--` 即删表。
+  3. 动态 direction：`ASC/DESC` 枚举校验，禁止其他值。
+- **真实防护模式**：建 `SqlInjectionFilter` 工具，对 `${}` 入参做正则白名单 + 关键字（select/update/delete/drop/;/--）拦截；MyBatis-Plus 的 `QueryWrapper` 用 `orderBy(..., "create_time")` 也只接受列名字符串，外部排序键走映射表。
+- **LIKE 注入**：`LIKE CONCAT('%', #{kw}, '%')` 安全；若用 `${'%'+kw+'%'}` 则 `$` 拼接有注入，且特殊字符（%、_、\）需 `ESCAPE` 转义。
+
+## 七、类型处理器 TypeHandler 自定义（实战）
+
+实现 `org.apache.ibatis.type.TypeHandler<T>`（或继承 `BaseTypeHandler<T>`），`setNonNullParameter` 写、`getNullableResult` 读：
+
+```java
+public class JsonTypeHandler extends BaseTypeHandler<Object> {
+    private final ObjectMapper mapper = new ObjectMapper();
+    public void setNonNullParameter(PreparedStatement ps, int i, Object p, JdbcType t) throws SQLException {
+        ps.setString(i, mapper.writeValueAsString(p));   // 对象 -> JSON 串
+    }
+    public Object getNullableResult(ResultSet rs, String col) throws SQLException {
+        String s = rs.getString(col);
+        return s == null ? null : mapper.readValue(s, Map.class); // JSON 串 -> 对象
+    }
+    // getNullableResult(ResultSet,int) / (CallableStatement,int) 同逻辑
+}
+```
+
+注册：`mybatis-config.xml` `<typeHandlers><typeHandler handler="..JsonTypeHandler" javaType="..."/></typeHandlers>`，或在 `@Result`/`resultMap` 上 `typeHandler=`。场景：JSON 字段、枚举存 code、敏感字段加解密（在 set/get 做 AES-GCM，密钥走 KMS；注意加密字段无法走索引/范围查询）。Map 统一注册 Gson/Jackson，省去每个字段声明。
+
+## 八、MyBatis-Plus 对比及代码生成
+
+| 维度 | MyBatis（原生） | MyBatis-Plus |
+| --- | --- | --- |
+| CRUD | 手写 XML/注解 | `BaseMapper` 通用 CRUD，零 XML |
+| 条件构造 | 手写动态 SQL | `QueryWrapper`/`LambdaUpdateWrapper` 链式 |
+| 分页 | 自写/PageHelper | 内置分页插件（`PaginationInnerInterceptor`） |
+| 逻辑删除/填充 | 手写 | `@TableLogic` / `MetaObjectHandler` 自动 |
+| 复杂 SQL | 灵活，手写最优 | 仍要手写 XML（Wrapper 拼不出时） |
+| 学习/掌控 | 完全可控 | 黑盒较多，需懂其生成逻辑 |
+
+- **代码生成器**：MP `AutoGenerator`（或 `mybatis-plus-generator`）按表结构一键出 `Entity / Mapper / Service / Controller / XML`，配 `StrategyConfig`（表前缀、字段命名驼峰）、`GlobalConfig`（输出路径）、`DataSourceConfig`。注意：生成代码仅作脚手架，**复杂查询与业务逻辑仍需手写**，生成的 `updateById` 只更非 null 字段（想置 null 用 `UpdateWrapper.set`）。
+- **选型**：简单 CRUD 多、想省样板 → MP；复杂报表/极致性能/可读 SQL → 原生 MyBatis；二者可共存（MP 管简单读写，XML 管复杂 SQL）。

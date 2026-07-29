@@ -318,3 +318,118 @@ sequenceDiagram
 - `REPEATABLE_READ`（MySQL 默认）：防脏读 + 不可重复读，配合 MVCC + Next-Key Lock 防幻读（快照读）。
 - `SERIALIZABLE`：最高隔离、锁最重，仅极端一致性要求用。
 - 隔离级别越高一致性越强但并发越低；按业务读一致性需求选，别盲目用最高。
+
+---
+
+# 第三轮深度优化：Spring6 循环依赖变更 / @Transactional 全失效 / 事件驱动 / 条件装配 / WebFlux选型 / Actuator监控
+
+## 一、循环依赖在 Spring 6 / Spring Boot 3 的变更
+
+- **默认禁止构造器循环依赖**：Spring 自 2.6 起默认 `spring.main.allow-circular-references=false`（之前默认 true）；Spring 6 / Boot 3 延续此默认——一旦发现构造器注入的循环依赖，直接抛 `UnsatisfiedDependencyException`，**启动即失败**，而非运行时才暴露。
+- **setter/字段注入仍能解析**：三级缓存（前文已述）仍支持单例的 setter/字段循环，但官方**不鼓励**——循环依赖是设计坏味道，应重构解耦。
+- **为什么禁止构造器循环**：构造器注入在实例化阶段就要依赖 Bean，此时对方还没 `createBeanInstance`，三级缓存救不了（三级缓存是实例化之后才放 ObjectFactory）。Spring 索性默认禁止，逼你改设计。
+- **迁移应对**：
+  - 首选：用 `@Lazy` 打破（注入代理，首次使用才创建）；或拆出公共依赖、引入接口反转依赖方向。
+  - 兜底：显式 `spring.main.allow-circular-references=true` 临时兼容，但属技术债。
+- **诊断**：启动报 `Requested bean is currently in creation: Is there an unresolvable circular reference?`，用 `--debug` 看 `ConditionEvaluationReport`，或 `BeanCurrentlyInCreationException` 栈里两个 Bean 名即循环双方。
+
+## 二、`@Transactional` 七种失效场景全解
+
+1. **自调用（同对象方法互调）**：`this.methodB()` 不经过 AOP 代理，事务不开启。解决：拆类、或 `AopContext.currentProxy()`（需 `@EnableAspectJAutoProxy(exposeProxy=true)`）。
+2. **非 public 方法**：Spring AOP 默认只代理 public，private/protected 上的 `@Transactional` 被忽略。
+3. **异常被 catch 吞掉**：未抛到代理层，默认只对 `RuntimeException`/`Error` 回滚；catch 后没 rethrow → 提交。
+4. **异常类型不匹配**：抛 checked 异常（如 `IOException`）但没配 `rollbackFor`，不回滚。
+5. **数据库引擎不支持事务**：MyISAM、某些 NoSQL 不支持，注解无效。
+6. **Connection 未由 Spring 管理**：自己 `new` 的 `Connection`、或用了非 Spring 事务管理器管理的数据源。
+7. **多线程调用**：事务绑定在 ThreadLocal 的 Connection，新线程拿不到上下文，子线程操作不在同一事务。
+- **额外 8/9**：传播行为设为 `NOT_SUPPORTED`/`NEVER` 显式非事务；`final` 方法无法被 CGLIB/JDK 代理（CGLIB 也绕不过 final）。
+- **排查套路**：先确认是代理对象（`AopUtils.isAopProxy(bean)`）、方法是否 public、异常是否抛出到代理、是否自调用、数据源是否交给 `PlatformTransactionManager`。
+
+## 三、事件驱动（`@EventListener` + `@Async` + 事务事件）
+
+- **基础发布订阅**：
+  ```java
+  @Service
+  public class OrderService {
+      @Autowired ApplicationEventPublisher publisher;
+      public void create(Order o){
+          // ... 落库
+          publisher.publishEvent(new OrderCreatedEvent(o.getId(), o.getAmount()));
+      }
+  }
+  @Component
+  public class NotifyListener {
+      @EventListener
+      public void on(OrderCreatedEvent e){ /* 发通知、清缓存、推 MQ */ }
+  }
+  ```
+- **条件过滤**：`@EventListener(condition = "#e.amount > 100")` 用 SpEL 过滤；`@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)` 在事务提交后才触发，避免消费者读到未提交的 DB 数据（**推荐用于跨部门取数据**）。
+- **异步 + 事务**：`@EventListener` + `@Async`（需 `@EnableAsync`）让监听跑在独立线程池，不阻塞主流程；组合 `@TransactionalEventListener(AFTER_COMMIT)` + `@Async` = "提交后异步处理"。
+  ```java
+  @Async
+  @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+  public void afterCommit(OrderCreatedEvent e){ pushToMq(e); }
+  ```
+- **坑**：异步事件异常被默认吞，需 `AsyncUncaughtExceptionHandler`；事务上下文不跨线程；事件链路不该放核心一致性逻辑（发了事件下游失败 = 半成品），改用 Outbox 表 + 定时/CDC 投递保证可靠。
+
+## 四、条件化装配（`@Conditional` 系列）实战
+
+- **派生注解**：`@ConditionalOnClass`（classpath 有某类才装配，常用于 starter 探测）、`@ConditionalOnMissingBean`（用户未自定义才用默认，**用户 Bean 覆盖默认的核心机制**）、`@ConditionalOnProperty`（按配置开关）、`@ConditionalOnWebApplication`（仅 Web 环境）、`@ConditionalOnBean`（容器内已有某 Bean）。
+- **实战一（starter 默认值）**：
+  ```java
+  @Configuration
+  @ConditionalOnClass(RedisTemplate.class)
+  @ConditionalOnMissingBean(CacheService.class)
+  public class CacheAutoConfiguration {
+      @Bean
+      public CacheService cacheService() { return new RedisCacheService(); }
+  }
+  ```
+  用户自定义 `CacheService` Bean 即覆盖；没引入 Redis 则不装配。这就是 Spring Boot "约定优于配置" 的底座。
+- **实战二（按属性开关）**：`@ConditionalOnProperty(name="feature.x.enabled", havingValue="true")` 控制某功能是否装配，配合配置中心热推送 + `@RefreshScope` 动态生效。
+- **顺序**：用户 `@Bean` > 自动配置；自动配置间用 `@AutoConfigureBefore/After` 控制；`--debug` 打印 Positive/Negative matches 看清谁生效谁没生效及原因。
+
+## 五、WebFlux 与 MVC 选型
+
+| 维度 | Spring MVC | Spring WebFlux |
+| --- | --- | --- |
+| 编程模型 | 同步阻塞、每人线程 | 响应式非阻塞、少量事件循环线程 |
+| 底层 | Servlet API / Tomcat | Reactor + Netty（也可 Servlet 3.1+） |
+| 并发模型 | 一请求一线程（线程池） | 少量线程处理海量 IO |
+| 适用 | 多数业务 CRUD、JDBC 生态成熟 | 高并发 IO 密集、网关、流式推送 |
+| 局限 | 线程数受限、阻塞拖垮 | 阻塞调用（JDBC）卡事件循环，需 `Schedulers.boundedElastic()` 迁走 |
+
+- **选型**：传统业务、强事务、JDBC/MyBatis 主导、团队熟悉 → **MVC 首选**；网关/代理/高并发流式（SSE、WebSocket 推送）、延迟敏感且全程非阻塞（R2DBC）→ WebFlux。混合：MVC 主应用 + WebFlux 做网关/推送，不要一个服务内混用两套阻塞模型。
+- **陷阱**：在 WebFlux 里调 JDBC 或同步 SDK 会卡 Netty 事件循环，必须用 `Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic())`；否则吞吐反而暴跌。下游未全链路响应式前，别盲目上 WebFlux。
+
+## 六、Actuator + Micrometer 生产监控接入
+
+- **Actuator 端点**：引入 `spring-boot-starter-actuator`，开 `management.endpoints.web.exposure.include=health,info,metrics,prometheus`。常用：`/actuator/health`（存活/就绪/存活探针 split：`liveness`/`readiness`）、`/actuator/metrics`（JVM/线程/HTTP 指标）、`/actuator/prometheus`（供 Prometheus 拉）。
+- **Micrometer 埋点**：Spring Boot 默认用 Micrometer 作为 Metrics 门面，自动采集 JVM、Tomcat 线程、HTTP 请求计数/RT、DataSource 连接池：
+  ```java
+  @Autowired MeterRegistry registry;
+  public void biz(){
+      Timer.Sample s = Timer.start(registry);
+      try { /* 业务逻辑 */ } finally { s.stop(registry.timer("order.create", "type", "vip")); }
+  }
+  // 计数器
+  registry.counter("biz.error", "code", "TIMEOUT").increment();
+  ```
+- **关键指标**：JVM 内存/GC（`jvm.memory.used`/`gc.pause`）、HTTP RT 与错误率（`http.server.requests`，用 P99 而非 avg）、DB 连接池活跃/等待（`hikaricp.connections.*`）、线程池活跃数。配 Grafana 面板 + 基于 SLO 的告警（如 P99>500ms 持续 5min）。
+- **健康探针**：K8s 用 `readiness`（就绪：能接流量，依赖就绪才 true）与 `liveness`（存活：崩了才重启）分开，避免依赖慢导致误重启。生产务必开 `management.endpoint.health.probes.enabled=true`。
+- **安全**：`/actuator` 别公网暴露，配 `management.endpoint.health.show-details=when_authorized` + Spring Security 限制内网/鉴权访问。
+
+## 七、生产就绪检查清单（Spring 视角）
+
+上线前逐项核对，把个人经验变团队流程：
+
+1. **配置外置**：敏感配置走配置中心/KMS，绝不硬编码；`application-{profile}.yml` 按环境分离。
+2. **优雅停机**：`server.shutdown=graceful` + `spring.lifecycle.timeout-per-shutdown-phase` 让在途请求处理完再停；K8s `preStop` 配合。
+3. **探针分离**：`liveness`（崩了才重启）与 `readiness`（依赖就绪才接流量）分开配置，避免依赖慢导致误重启。
+4. **事务边界**：确认 `@Transactional` 不踩九种失效（自调用/非 public/吞异常/多线程/…）；跨服务用最终一致。
+5. **异步线程池**：`@Async` 配自定义 `ThreadPoolTaskExecutor`（禁默认每次 new 线程）；监控队列堆积。
+6. **监控埋点**：Micrometer 关键业务指标 + JVM/连接池/HTTP P99；Grafana 面板 + 基于 SLO 告警。
+7. **缓存一致性**：明确缓存更新策略（Cache-Aside + 删除）、TTL、防穿透/雪崩；多实例用 Redis 而非本地缓存。
+8. **限流降级**：入口与关键依赖调用都限流；非核心依赖加 Feature Flag 默认可关。
+9. **启动校验**：`@PostConstruct`/SmartLifecycle 做依赖就绪校验（DB 连通、配置合法），fail-fast。
+10. **日志与追踪**：MDC 透传 traceId；默认 INFO、DEBUG 动态开；敏感信息脱敏。

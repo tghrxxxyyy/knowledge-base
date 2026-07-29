@@ -327,3 +327,126 @@ relabel_configs:
 - [ ] 查询超时 → 是否全量扫、是否缺 record rule、区间是否过大。
 - [ ] 数据缺口 → 查 scrape 失败、remote_write 队列堆积、去重配置。
 - [ ] 磁盘满 → 查 retention、compaction 是否卡住、cardinality 是否失控。
+
+---
+
+## 10. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
+
+### 10.1 性能基准（推导 / 公开数字）
+
+- 写入吞吐：单实例受内存/ compaction 约束，活跃 series 建议 ≤ 200~500 万。
+- 压缩：1~2 B/点（约 1~3:1），弱于专用 TSDB。
+- 查询：热数据低延迟；跨月多 block 高延迟。
+
+推导：
+```text
+日磁盘(GB) ≈ samples/s × 86400 × 2B / 1024³
+例：1000 samples/s → 1000×86400×2/1e9 ≈ 0.17 GB/天（压缩后，实际更高因索引）
+```
+
+### 10.2 迁移实战：Prometheus → Thanos 双写切换 SOP
+
+```mermaid
+flowchart LR
+    A[Prometheus] -->|1. Sidecar 上传| B[对象存储 S3/OSS]
+    A -->|2. 照常抓取| A
+    C[Thanos Query] -->|全局查询| B
+    D[灰度切读\nGrafana 切 Thanos Query] --> C
+    D -->|稳定| E[长期存储外置完成]
+```
+
+SOP：
+1. **挂载 Sidecar**：每个 Prom 旁挂 Thanos Sidecar，上传 block 到对象存储。
+2. **部署 Query**：Thanos Query 聚合各 Prom + 对象存储，提供全局 PromQL。
+3. **灰度切读**：Grafana 数据源先 5% 切 Thanos Query，比对与本地一致。
+4. **降本地保留**：本地 retention 从 15d 降到 7d，历史走 Thanos。
+5. **多 Prom 分片**：超规模按 hashmod 分片，上层 Thanos 统一。
+
+```yaml
+# thanos sidecar
+args: [sidecar, --prometheus.url=http://localhost:9090, --objstore.config-file=/etc/thanos/s3.yml]
+# 降本地保留
+global: { external_labels: { cluster: a } }
+storage: { tsdb: { retention: 7d } }
+```
+
+### 10.3 与监控 / Grafana 全链路告警规则示例
+
+Alertmanager + recording rules 全链路：
+
+```yaml
+# alert rules
+groups:
+  - name: instance_down
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "实例 {{ $labels.instance }} 宕机" }
+      - record: instance:cpu:rate5m
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+全链路 Checklist：
+- [ ] Alertmanager 路由正确（email/钉钉/Slack）。
+- [ ] recording rule 输出非高基数；rule 自身 series 受控。
+- [ ] 长期查询走 Thanos/VM，本地只保热数据。
+
+### 10.4 与 Flink / Spark 实时计算联动代码
+
+Prometheus 作源：通过 remote_write 适配把样本送入 Kafka，Flink 消费富化。
+
+```bash
+# 用 prometheus-remote-write 适配（如自研/开源）把 remote_write 转 Kafka
+# Prometheus 侧：
+remote_write:
+  - url: http://adapter:9090/api/v1/write   # adapter 写 Kafka topic metrics
+```
+
+Flink SQL 消费：
+```sql
+CREATE TABLE prom_src (
+  metric STRING, instance STRING, value DOUBLE, ts TIMESTAMP(3)
+) WITH ('connector'='kafka','topic'='metrics', ...);
+
+INSERT INTO agg_sink
+SELECT metric, instance, AVG(value), TUMBLE_END(ts, INTERVAL '1' MINUTE)
+FROM prom_src GROUP BY metric, instance, TUMBLE(ts, INTERVAL '1' MINUTE);
+```
+
+Spark 读（通过 Thanos Query HTTP）：
+```scala
+// 用 HTTP 客户端访问 Thanos Query /api/v1/query_range，解析 JSON 为 DataFrame
+```
+
+联动要点：remote_write 到适配层实现「采集即流」；富化后再落 TSDB/数仓。
+
+### 10.5 成本优化（长期存储外置 / 降采样 / 保留）
+
+- **外置长期存储**：remote_write 到 VM/Thanos，本地只保 7~15d 热数据，省本地盘。
+- **降采样**：用 recording rule 预聚合，长期只查聚合序列；Thanos `downsampling` 自动生成 5m/1h 块。
+- **保留分层**：本地 7d → VM 12 月 → 对象存储归档。
+
+```yaml
+# 本地保留收紧
+storage: { tsdb: { retention: 7d } }
+# remote_write 到 VM 长期
+remote_write:
+  - url: http://vminsert:8480/insert/0/prometheus/api/v1/write
+```
+
+### 10.6 生产排障 SOP
+
+**Cardinality 治理**
+- [ ] `curl localhost:9090/api/v1/status/tsdb` 看 TopN 高基 metric。
+- [ ] `metric_relabel_configs` 丢弃 `user_id`/`trace_id` 等高基 label。
+- [ ] 单实例 series > 500 万即分片（hashmod）。
+
+**写入拒绝 / OOM SOP**
+- [ ] OOM → 砍基数、升内存、降 scrape 频率。
+- [ ] WAL 重放慢/重启久 → 查 block 数、head series。
+
+**查询超时 SOP**
+- [ ] 是否全量扫、区间过大；加 recording rule。
+- [ ] 远程读（remote_read）延迟高 → 查后端 VM/Thanos 状态。

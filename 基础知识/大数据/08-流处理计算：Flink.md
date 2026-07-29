@@ -128,6 +128,110 @@ env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
 - [ ] 大状态用 RocksDB 后端 + 增量 checkpoint。
 - [ ] 窗口迟到策略：`allowedLateness` + sideOutput 兜底。
 - [ ] 监控背压（`backpressure`）、checkpoint 时长/对齐、状态大小。
-- [ ] 升级用 Savepoint，先验证可恢复再切流量。
+  - [ ] 升级用 Savepoint，先验证可恢复再切流量。
 
 > 参考：Apache Flink 官方（What is Flink / Stateful Stream Processing）、Chandy-Lamport 快照算法、Flink 2.x on K8s 实践、Kafka 事务/TwoPhaseCommit 文档。
+
+## 十一、Watermark 与乱序实战
+
+```java
+// 允许 5 秒乱序
+WatermarkStrategy<Order> wm = WatermarkStrategy
+  .<Order>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+  .withTimestampAssigner((o, ts) -> o.getEventTime());
+
+stream.assignTimestampsAndWatermarks(wm)
+  .keyBy(Order::getUserId)
+  .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+  .allowedLateness(Time.minutes(1))          // 迟到 1 分钟仍收
+  .sideOutputLateData(lateTag)               // 超限旁路
+  .aggregate(new GmvAgg());
+```
+
+- Watermark = `maxEventTime - 5s`；窗口在 `watermark ≥ 窗口结束` 触发；迟到数据走 `sideOutput` 不影响主结果。
+
+## 十二、窗口类型代码
+
+```java
+// 滚动（不重叠）
+.window(TumblingEventTimeWindows.of(Time.minutes(5)))
+// 滑动（窗口=10min，步长=1min）
+.window(SlidingEventTimeWindows.of(Time.minutes(10), Time.minutes(1)))
+// 会话（间隔 30min 无活动则关）
+.window(EventTimeSessionWindows.withGap(Time.minutes(30)))
+// 全局（自定义 Trigger）
+.window(GlobalWindows.create()).trigger(/* 自定义 */)
+```
+
+## 十三、Checkpoint / Barrier 调优
+
+| 参数 | 建议 | 说明 |
+|------|------|------|
+| interval | 1~5 分钟 | 太频拖累吞吐，太疏恢复慢 |
+| timeout | 10 分钟 | 超时不算成功 |
+| minPauseBetween | =interval | 防重叠 |
+| maxConcurrent | 1 | 串行更稳 |
+| mode | EXACTLY_ONCE | 精确一次 |
+| unaligned | 高背压开 | 防 barrier 堵 |
+
+- 大状态用 **RocksDB + 增量 checkpoint**，存对象存储；`state.backend.incremental=true`。
+
+## 十四、状态后端与 TTL
+
+```java
+// RocksDB 状态后端（大状态首选）
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true)); // true=增量
+// 状态 TTL：自动清理过期 key，防状态无限膨胀
+StateTtlConfig ttl = StateTtlConfig.newBuilder(Time.days(7))
+  .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+  .cleanupInRocksdbCompactFilter(10_000_000)
+  .build();
+```
+
+## 十五、反压（Backpressure）排查
+
+```mermaid
+flowchart LR
+    A[反压: 吞吐掉/延迟涨] --> B[Web UI 看算子色块]
+    B --> C{哪个算子红?}
+    C -->|Source 红| D[Kafka lag/限速]
+    C -->|中间红| E[慢算: 数据倾斜/GC/锁]
+    C -->|Sink 红| F[下游写慢: DB/OLAP]
+    E --> G[加盐/优化 UDF/扩并行度]
+    F --> H[调 Sink 批量/扩容]
+```
+
+- 定位：Flink Web UI 的 **Backpressure 标签**看哪个算子 `OK/HIGH`；根因多为数据倾斜、GC、外部 Sink 慢。
+- 治理：keyBy 加盐打散热点、优化热 UDF、扩并行度、调 Sink 批量与重试。
+
+## 十六、Table API / SQL 实战
+
+```sql
+-- 流表（Kafka）+ 维表（JDBC）join
+CREATE TABLE orders (order_id BIGINT, user_id BIGINT, amount DECIMAL(18,2),
+  ts TIMESTAMP(3), WATERMARK FOR ts AS ts - INTERVAL '5' SECOND)
+  WITH ('connector'='kafka', 'topic'='orders', 'properties.bootstrap.servers'='k:9092',
+        'format'='json', 'scan.startup.mode'='latest-offset');
+
+CREATE TABLE user_dim (user_id BIGINT, name STRING, city STRING)
+  WITH ('connector'='jdbc', 'url'='jdbc:mysql://db/user', /* ... */);
+
+-- 5 分钟滚动窗口 GMV（维表打宽）
+INSERT INTO gmv_sink
+SELECT u.city, TUMBLE_START(o.ts, INTERVAL '5' MINUTE) AS w,
+       SUM(o.amount) AS gmv
+FROM orders o LEFT JOIN user_dim FOR SYSTEM_TIME AS OF o.ts u
+  ON o.user_id = u.user_id
+GROUP BY u.city, TUMBLE(o.ts, INTERVAL '5' MINUTE);
+```
+
+- Table API/SQL 让流与批**同一套 SQL**；`FOR SYSTEM_TIME AS OF` 做时态维表 join（实时打宽）。
+
+## 十七、生产 Checklist
+
+- [ ] Event Time + Watermark（按 P99 迟到），迟到走 sideOutput。
+- [ ] Checkpoint EXACTLY_ONCE + Sink 事务/幂等。
+- [ ] 大状态 RocksDB 增量 + 状态 TTL。
+- [ ] 反压先看 UI 红算子，再治倾斜/GC/Sink。
+- [ ] 流批用同一 SQL（Table API），维表 join 用时态表。
+- [ ] 升级用 Savepoint，先验证可恢复。

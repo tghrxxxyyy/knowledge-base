@@ -963,3 +963,54 @@ sc -d com.xxx.Class   # 类详情
 - **OOM**：`-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/path`；`-XX:ErrorFile=/path/hs_err.log`。
 - **诊断**：`-XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly`（看 JIT 汇编）；`-agentpath:async-profiler.so`（采样）。
 - **容器感知**：JDK 8u191+ 默认识别 cgroup 限制（`-XX:+UseContainerSupport`），避免容器内读到宿主机内存导致堆过大被 kill。
+
+## 十二、Full GC 排查与高阶实战（第三轮深度补充）
+
+### 12.1 一次 Full GC 频发实战排查（全链路）
+
+**现象**：服务 P99 周期性飙到 2s，GC 日志里 `Full GC (Ergonomics)` 每几分钟一次，老年代回收后回收不掉多少。
+
+**全链路定位步骤**：
+
+1. `jstat -gcutil <pid> 1000` 看 `O`（老年代）持续上涨不回落、`FGC` 计数猛增、`YGC` 后存活对象大量晋升 → 疑似内存泄漏或堆过小。
+2. `jmap -histo:live <pid> | head` 看占用最高的类，常是 `byte[]` / 自定义缓存 / `HashMap$Node` 异常多 → 定位泄漏对象类型。
+3. 抓堆 `jmap -dump:live,format=b,file=heap.hprof <pid>`，用 MAT/VisualVM 看 **Dominator Tree** 与 **GC Roots 引用链**，定位谁持有大对象不放（典型：static `Map` 缓存无上限、线程池 `ThreadLocal` 未清理、监听器未注销）。
+4. **生产不停机**用 `arthas`：`dashboard` 看实时、`heapdump` 抓堆、`monitor`/`trace` 跟方法、`ognl` 看运行期对象字段，免重启。
+5. **黑匣子** `JFR`：`-XX:StartFlightRecording=disk=true,filename=rec.jfr`，回放慢周期，看是分配速率高还是大对象直接进老年代。
+
+**根因**：本地缓存 `Map<Long, Order>` 无 TTL 无上限 → 老年代缓慢填满，每次 Full GC 只回收少量 → 频繁 Full GC + 晋升失败（promotion failed）。
+
+**治理**：换 `Caffeine`（有容量/过期），必要 `SoftReference`；`-Xmx` 不足以解决泄漏，必须修代码。
+
+### 12.2 ZGC / Shenandoah 调优参数与权衡实测
+
+- **ZGC 关键参数**：
+  - `-Xmx` 给足（Allocation Stall 多 = 并发回收跟不上分配，加堆或降分配速率）。
+  - `-XX:SoftMaxHeapSize` 软上限，让 ZGC 在低水位就回收，控内存占用。
+  - `-XX:ZCollectionInterval` 强制间隔、`-XX:ZAllocationSpikeTolerance` 调灵敏度（默认 2，突发分配调大）。
+  - 看日志 `Pause Mark Start` / `Pause Relocate Start` 都 < 1ms，关注 `Heap Usage` 与 `Load`。
+- **Shenandoah**：`-XX:ShenandoahGCHeuristics=adaptive`（默认）/ `compact`（碎片整理）/ `traversal`；读屏障带来 +1%~数% 固定开销，但停顿极短。
+- **实测权衡**：同压测下，Parallel 吞吐 100% 基准、G1 ≈ 95%、ZGC ≈ 85%~90%（CPU 多花在并发回收）；延迟 ZGC/Shenandoah P99 < 5ms，G1 在 30~100ms；**结论**：延迟敏感、CPU 有余 → ZGC；吞吐优先、预算紧 → G1/Parallel。
+
+### 12.3 native memory leak 排查（NMT）
+
+- 开启 `-XX:NativeMemoryTracking=detail`，跑 `jcmd <pid> VM.native_memory baseline` 建立基线，隔段时间 `jcmd <pid> VM.native_memory summary.diff` 看哪类 native 涨。
+- **常见泄漏点**：
+  1. **DirectBuffer**：`-XX:MaxDirectMemorySize` 设上限，`jcmd` 看 `Internal` 项；
+  2. **线程栈**：线程数暴涨（无界线程池）→ 比对 `jstack` 线程数与 `ulimit -u`；
+  3. **glibc arena**：多线程 `malloc` 膨胀，设 `MALLOC_ARENA_MAX=2` 抑制；
+  4. **mmap 文件 / JNI 分配**：用 `jemalloc` + `jeprof` 抓 native 栈。
+- 堆外泄漏不会触发 GC，表现「RES 涨但堆平稳」，`OutOfMemoryError: Direct buffer memory` 或容器 OOMKill。
+
+### 12.4 JVM 崩溃（crash dump / hs_err）解读
+
+- 崩溃产生 `hs_err_pid<pid>.log`（路径 `-XX:ErrorFile=/path/hs_err.log`），含崩溃线程、信号、寄存器、栈、加载的库。
+- **关键段**：`Problematic frame`（崩在哪个 so/方法，native 库或 JIT 代码）、`siginfo`（SIGSEGV 等）、`Native frames`、`Heap` 摘要、`VM state`（运行时/GC 中）。
+- **常见诱因**：JNI 库野指针、JIT 编译器 bug（可 `-Xint` 纯解释或 `-XX:CompileCommand` 排除某方法编译验证）、栈溢出（`StackOverflowError` 未捕获递归）、glibc 版本不兼容。
+- 配合 `gdb` 加载 core dump（`ulimit -c unlimited`）定位 native 栈；频繁崩先升级 JDK 小版本（已知 JIT bug 多已修）。
+
+### 12.5 容器环境 JVM 内存 / CPU 感知陷阱
+
+- **内存陷阱**：JDK 8u191 之前不识 cgroup，读到**宿主机**内存设堆 → 堆远超容器 limit → 被 cgroup OOMKill。务必 JDK 8u191+ 或 11+，且 `-XX:+UseContainerSupport`（默认开）。**正确做法**：`-Xmx` 设为容器内存 limit 的 70%~80%（留堆外 / metaspace / 线程栈 / native 空间）。
+- **CPU 陷阱**：容器内 `cpu quota` 限核（如 2 核），但 `Runtime.getRuntime().availableProcessors()` 旧版本读到宿主机核数 → GC 线程数、ForkJoinPool / 并行流并行度过多 → 上下文切换炸。JDK 11+ 已修复；自定义线程池别用 `availableProcessors()` 盲设，按 cgroup limit 配。
+- **探针联动**：K8s `liveness`/`readiness` 探针需考虑 JVM 启动与 GC 暂停，探针超时别设太短，避免 GC 长暂停被误判死掉反复重启。

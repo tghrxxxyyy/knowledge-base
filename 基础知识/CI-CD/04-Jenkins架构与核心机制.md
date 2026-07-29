@@ -306,3 +306,92 @@ role-strategy:latest
 > - Jenkins Configuration as Code 插件：https://plugins.jenkins.io/configuration-as-code/
 > - Kubernetes 插件：https://plugins.jenkins.io/kubernetes
 > - Blue Ocean 状态（2026-07 弃用）：https://www.jenkins.io/projects/blueocean/about/
+
+## 十、高可用 Jenkins：Controller / Agents / K8s 动态 Agent
+
+单 Controller 是瓶颈与单点。生产用"小 Controller + 弹性 Agent"：
+
+```mermaid
+flowchart TB
+    User[研发] -->|Webhook| C[Controller 主节点]
+    C -->|调度| Q[(Build Queue)]
+    Q --> A1[Agent VM]
+    Q --> A2[Agent Docker]
+    Q --> K8[Kubernetes 动态 Pod Agent]
+    K8 -->|起 Pod 用完即焚| Node[K8s Node]
+    C -->|配置即代码| JCasC[jenkins.yaml]
+```
+
+- **Controller 轻量化**：只管调度与 UI，不跑重构建；磁盘定期 `Build Discarder` 清理。
+- **Agent 反亲和**：构建型（maven）/ 镜像型（docker）/ GPU 型按 label 分组，避免互相争抢。
+- **K8s 动态 Agent**：高峰自动扩 Pod，闲时缩为 0，详见 [05-Jenkins Pipeline as Code](05-Jenkins Pipeline as Code.md) 第六节。
+- **JCasC 备份**：`JENKINS_HOME` 加密异地备份 + 配置进 Git，故障分钟级重建。
+
+```bash
+# 导出当前配置为 JCasC yaml（配合 configuration-as-code 插件）
+java -jar jenkins-cli.jar -s $JENKINS_URL \
+  export-configuration-as-yaml > jenkins.yaml
+```
+
+## 十一、Shared Library 实战
+
+把通用逻辑（构建/部署/通知）抽到共享库，Jenkinsfile 只留编排骨架：
+
+```
+# 仓库结构：corp-lib.git
+vars/
+  buildAndTest.groovy      # 全局函数
+  deployK8s.groovy
+  notifyFeishu.groovy
+src/com/corp/Utils.groovy  # 普通类
+```
+
+```groovy
+// vars/buildAndTest.groovy
+def call(String lang = 'maven') {
+    if (lang == 'maven') {
+        sh './mvnw -B clean verify'
+    } else {
+        sh 'npm ci && npm test'
+    }
+}
+```
+
+```groovy
+// Jenkinsfile 调用（锁版本 @v2.3.0）
+@Library('corp-lib@v2.3.0') _
+pipeline {
+    agent { label 'maven' }
+    stages {
+        stage('Build') { steps { buildAndTest() } }      // 来自共享库
+        stage('Deploy') { steps { deployK8s('prod') } }
+    }
+    post { failure { notifyFeishu('❌ 失败') } }
+}
+```
+
+> 共享库必须用 **SemVer tag 固定版本**；核心函数写 PipelineUnit 单测，避免"库一改全司流水线崩"。
+
+## 十二、性能瓶颈排查
+
+| 症状 | 可能根因 | 排查/治理 |
+|------|----------|-----------|
+| 队列长时间 pending | Agent 不足 / label 不匹配 | 看节点列表、加动态 Agent |
+| 构建越跑越慢 | 工作区/磁盘堆积 | `cleanWs()` + Build Discarder |
+| Controller CPU 飙高 | 过多任务 / 插件滥用 | 减插件、Agent 分担构建 |
+| 内存 OOM | 大产物 archive、heap 小 | 调 `-Xmx`、制品转存制品库 |
+| Webhook 不触发 | 钩子过期/网络 | 查 `/log`、重注册钩子 |
+
+```bash
+# 看 Jenkins 进程与 GC（诊断 OOM）
+jstat -gcutil $(pgrep -f jenkins.war) 1s
+# 线程栈（卡死时）
+jstack $(pgrep -f jenkins.war) > /tmp/jstack.txt
+```
+
+## 本篇补充 Checklist
+
+- [ ] Controller 轻量化 + Agent 弹性，K8s 动态 Agent 按需扩缩。
+- [ ] 通用逻辑入 Shared Library 并锁版本、写单测。
+- [ ] 用 `cleanWs()` / Build Discarder / 制品库外置治理磁盘与内存。
+- [ ] 队列 pending、OOM、磁盘堆积是三大高频瓶颈，配监控告警。

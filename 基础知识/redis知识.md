@@ -951,3 +951,50 @@ RESP3（Redis 6+）支持更多类型（map、set、push 等），并在 RESP2 �
 ## 十四、Pipeline 与事务替代
 
 - Pipeline 只减 RTT，不保证原子；需要原子用 `MULTI/EXEC`（或 Lua）。超大批量用 Pipeline 分批，防单次包过大阻塞。
+
+## 十五、bigkey/hotkey 治理与高阶实战（第三轮深度补充）
+
+### 15.1 bigkey / hotkey 线上定位与治理全流程
+
+- **bigkey 定位**：`redis-cli --bigkeys` 抽样扫描各类 top 大 key（注意是抽样，非全量精确）；精确用 `DEBUG OBJECT <key>` 看 `serializedlength`，或 `MEMORY USAGE <key>`；分析 RDB 用 `rdbtools`（`rdr` / `redis-rdb-tools`）离线找大 key。
+  - **危害**：删除/迁移大 key 阻塞主线程（DEL 一个大 hash 可卡秒级）；扩容时槽迁移慢；网络包大。
+  - **治理**：拆分（大 hash 按 `hashtag` 拆 100 个子 key）、用 `UNLINK`（异步懒删除，4.0+）替代 `DEL`、集合类分批 `SSCAN`/`HSCAN` 删除；value 压缩（snappy）。
+- **hotkey 定位**：`redis-cli --hotkeys`（需 maxmemory-policy 开启 LFU）、`INFO commandstats` 看高频命令、Proxy/客户端埋点统计、或使用 Redis 7 的 **客户端缓存 + 监控** 辅助；也可在 SDK 层做本地计数。
+  - **危害**：单分片/单线程 CPU 打满，成为性能瓶颈（即便集群其他节点空闲）。
+  - **治理**：本地缓存（二级缓存）+ 读分摊；hotkey 多副本（key 加随机后缀分散到不同分片，读时随机选一份）；写用合并；必要时互斥锁防击穿。
+
+### 15.2 缓存与数据库一致性极端场景
+
+- **双写不一致时序**：并发「更新 DB + 删缓存」与「读未命中回填」交叠，可能回填旧值。缓解：
+  1. **延迟双删**：更新 DB → 删缓存 → `sleep`(几百 ms) → 再删一次（覆盖回填窗口）。
+  2. **订阅 binlog 删缓存（Canal/Debezium）**：DB 提交后 binlog 驱动删/更新缓存，与业务解耦、时序最准，是大型系统主流方案。
+- **极端场景**：
+  - **击穿**（单热点过期）：互斥锁（`SETNX` 重建）或逻辑过期（不真删，后台异步刷新）。
+  - **雪崩**（大量 key 同时过期）：过期时间加随机抖动；多级缓存；Redis 高可用。
+  - **穿透**（查不存在的 key）：布隆过滤器拦截；缓存空值（短 TTL）。
+- **强一致**：Redis 做不到与 DB 强一致，金融核心"钱"的字段以 DB 为准，缓存仅加速读；需要强一致走「DB 事务 + 缓存删除失败重试/对账任务」。
+
+### 15.3 Redis 7.x 新特性（生产向）
+
+- **Function（取代 Lua 脚本管理）**：`FUNCTION LOAD` 把脚本注册为命名函数，避免每次 `EVAL` 传脚本体、可 `FCALL` 调用，支持 `EVALSHA` 演进、集群内传播一致。
+- **ACL v2**：更细粒度权限（key 级 `+@read`、按命令/模式授权）、`ACL SETUSER` 多用户隔离，`redis.conf` 可持久化；适合多租户安全。
+- **客户端缓存（Client-side Caching）增强**：`CLIENT TRACKING` + 服务端失效推送（见前文 十一），7.x 更稳定；配合本地 TTL 兜底防失效风暴。
+- **多 AOF（Multi-part AOF）**：AOF 按类型拆文件，重写更平滑、崩溃恢复更快；`list-max-listpack-size` 等 listpack 优化省内存。
+- **sharded pub/sub**：`SSUBSCRIBE` 按 slot 分片，突破单节点 pub/sub 瓶颈。
+
+### 15.4 集群扩缩容不停机实践（槽迁移监控）
+
+- **原理**：Redis Cluster 16384 个 slot，扩节点 = 把部分 slot 从老节点 `MIGRATE` 到新节点；迁移中 slot 处于 `MIGRATING`/`IMPORTING` 状态，客户端请求落到旧节点时若 key 已迁走会回 `ASK`/`MOVED` 重定向。
+- **操作**：`redis-cli --cluster reshard/add-node`；扩缩容用 `--cluster rebalance` 自动均衡。
+- **不停机要点**：
+  - 迁移是**逐 key** 拷贝 + 删旧，大 key 迁移会阻塞，先治 bigkey（15.1）。
+  - 监控 `cluster_state:ok`、`cluster_slots_assigned=16384`、迁移进度（`redis-cli --cluster check`）。
+  - 客户端必须支持 `MOVED`/`ASK` 重定向（Jedis/Lettuce 默认支持），否则重定向失败。
+  - 流量低峰操作，迁移限速避免打满带宽；观察 `migrate` 命令延迟与命中率抖动。
+
+### 15.5 Redisson 分布式锁源码级坑
+
+- **看门狗（Watchdog）**：未指定 `leaseTime` 时，Redisson 默认 30s 过期，并启后台 watchdog 每 10s 续期（`internalLockLeaseTime/3`），防业务未执行完锁过期。设了 `leaseTime` 则**不续期**，务必确保业务在 lease 内完成，否则锁提前释放 → 并发！这是最常踩的坑。
+- **锁重入**：基于 `Hash` 结构记录 `threadId -> 重入次数`，可重入；释放时次数减到 0 才真删。跨线程/跨 JVM 不可重入。
+- **释放安全性**：释放用 Lua 校验 `value`（UUID:threadId）一致才删，避免误删别人的锁；但**看门狗续期依赖客户端存活**，客户端宕机 watchdog 停 → 30s 后锁释放，需业务幂等兜底。
+- **红锁（RedLock）争议**：Redisson `RedLock` 基于多独立 master 多数派加锁；但 Kleppmann 指出依赖时钟、缺乏 fencing token，网络分区/GC 暂停下仍可能双持锁。结论：性能优先、可容忍极小概率重复用 Redis 锁（必须唯一 value + 过期 + 看门狗）；**强一致/防双写用 etcd/ZooKeeper（带 fencing）**。

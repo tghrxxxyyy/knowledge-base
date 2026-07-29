@@ -229,3 +229,146 @@ flowchart LR
 - 订单检索场景：订单号/用户ID 用 `keyword`（精确匹配 + 聚合），标题用 `text + ik`，状态/时间用 `keyword`/`date`，金额用 `scaled_float`（避免 double 精度问题）。
 - 避免 `dynamic: true` 自动加字段导致 mapping 爆炸（用 `dynamic: strict` 拒绝意外字段，或用 `runtime fields` 运行时字段按需计算不落存储）。
 - 写入用 `bulk` + 重试；查询用 `filter` + `search_after` 翻页；冷数据进 Warm/Cold 节点降成本；监控 segment 数与 refresh 开销。
+
+---
+
+# 第三轮深度优化：写入全链路监控 / 聚合性能 / 索引模板与 ILM / 压测调优 / ES vs ClickHouse / 故障 SOP
+
+## 一、写入全链路监控（refresh / flush / translog / merge 触发条件）
+
+第二轮讲了原理，本轮落到**可监控、可干预**。
+
+- **refresh 触发条件**：定时（`index.refresh_interval`，默认 1s）、`refresh=wait_for` 显式等待、bulk 默认不自动 refresh（除非 `?refresh=true`）。监控：`_stats/refresh` 看 `total_time_in_ms` 与 `external_total`（对外可见耗时）；refresh 过频 → 小 segment 暴涨、CPU 高；过稀 → 实时性差。
+- **flush 触发条件**：translog 达 `index.translog.flush_threshold_size`（默认 512MB）、`index.translog.flush_threshold_period`（默认 30min）、`flush` API 手动。监控：`_stats/flush`，关注 flush 频率——频繁 flush 说明写入突增或阈值偏低。
+- **translog 落盘策略**：`durability=request`（每次 fsync，默认）vs `async`（`sync_interval` 默认 5s 异步）。监控：`_stats/translog`，`uncommitted_operations` 表示尚未 flush 的写，宕机即靠它重放。
+- **segment merge 触发条件**：后台 `merge` 线程持续合并；`refresh` 产生新段即进入待合并队列；`forcemerge` 手动。监控：`_stats/merges`（当前合并数 `current`、耗时 `total_time_in_ms`）、`_cat/segments/{index}?v` 看单分片 segment 数量与大小。经验：单分片 segment 数 > 数百即影响查询，冷索引可 `forcemerge?max_num_segments=1`。
+- **写阻塞信号**：`_cat/thread_pool/write?v` 看 `queue`（满则拒绝 429）、`rejected`；`indices.store` 与 `refresh.total` 突增常是写入瓶颈前兆。
+
+```mermaid
+flowchart LR
+    A[Client bulk] --> B[In-Memory Buffer]
+    B -->|1s refresh| C[Segment OS Cache 可搜索]
+    B -->|顺序追加| D[Translog 磁盘]
+    C -->|512MB/30min flush| E[Disk 落盘 + commit point]
+    D -->|flush 后清空| E
+    C -->|后台 merge| F[大 Segment]
+    F -->|forcemerge 冷索引| G[单 Segment 极速查]
+```
+
+## 二、聚合性能优化（composite 深翻页 + pipeline 实战）
+
+- **深翻页用 composite**：`terms` 聚合受 `size` 上限与堆内存限制，导出全部分组统计时必用 `composite` + `after` 游标。示例（按用户 + 月份二维分组）：
+  ```json
+  {
+    "size": 0,
+    "aggs": {
+      "g": {
+        "composite": {
+          "size": 1000,
+          "sources": [
+            { "u": { "terms": { "field": "user_id" } } },
+            { "m": { "date_histogram": { "field": "ts", "calendar_interval": "month" } } }
+          ]
+        }
+      }
+    }
+  }
+  ```
+  续拉请求带 `"after": { "u": "<last user_id>", "m": "<last ts>" }`。注意 composite 不支持 `order` 跨 source 排序，需严格游标续拉。
+- **pipeline 实战**：`derivative`（环比增量）、`cumulative_sum`（累计和）、`bucket_script`（桶内算比率）、`bucket_sort`（桶内排序/截断分页）。示例——算每小时 UV 的环比增长率：
+  ```json
+  "aggs": {
+    "per_hour": { "date_histogram": { "field": "ts", "fixed_interval": "1h" },
+      "aggs": {
+        "uv": { "cardinality": { "field": "user_id" } },
+        "uv_growth": { "derivative": { "buckets_path": "uv" } }
+      }
+    }
+  }
+  ```
+- **聚合防 OOM**：聚合字段必须 `keyword`（禁 `fielddata` 上堆）；大基数 `terms` 用 `shard_size` 提升精度或减少精度换性能；`cardinality` 用 HyperLogLog 近似，调 `precision_threshold` 控制精度/内存；`max_buckets`（`search.max_buckets`，默认 65535）超限直接报错而非堆爆。
+
+## 三、索引模板与 ILM 生命周期管理（YAML 实战）
+
+- **组件模板（Component Template）**：定义可复用的 settings/mappings 片段，多个索引引用。
+  ```yaml
+  # component-template-logs.yaml
+  template:
+    settings:
+      number_of_shards: 3
+      number_of_replicas: 1
+      refresh_interval: 30s
+    mappings:
+      properties:
+        ts: { type: date }
+        msg: { type: text, analyzer: ik_max_word }
+  ```
+- **索引模板（Index Template）**：用通配符匹配索引名，关联组件模板 + 挂 ILM 策略。
+  ```yaml
+  # index-template-logs.yaml
+  index_patterns: ["logs-*"]
+  composed_of: [logs-component]
+  template:
+    settings:
+      index.lifecycle.name: logs-ilm
+      index.lifecycle.rollover_alias: logs-write
+  ```
+- **ILM 策略 YAML**：hot 写满滚动 → warm 降副本 → cold 冻结 → delete 删除。
+  ```yaml
+  # ilm-policy-logs.yaml
+  policy:
+    phases:
+      hot:
+        actions:
+          rollover: { max_size: 50gb, max_age: 7d }
+          set_priority: { priority: 100 }
+      warm:
+        min_age: 7d
+        actions:
+          shrink: { number_of_shards: 1 }
+          forcemerge: { max_num_segments: 1 }
+      cold:
+        min_age: 30d
+        actions:
+          freeze: {}
+          set_priority: { priority: 0 }
+      delete:
+        min_age: 90d
+        actions:
+          delete: {}
+  ```
+  应用：`PUT _ilm/policy/logs-ilm` + bootstrap 初始索引 `logs-000001` 并指向 alias `logs-write`；`ILM explain`（`GET logs-*/_ilm/explain`）看阶段卡点。注意：ILM 需 `index.lifecycle.name` 与 `rollover_alias` 同时配，且 bootstrap 索引必须是 `is_write_index: true`。
+
+## 四、写入吞吐压测与调优参数
+
+- **压测工具**：`esrally`（官方基准，可对比版本/参数）、自写 bulk 客户端（如 `elasticsearch-bulk` 脚本）。压测前固定变量：文档大小、并发、批大小、refresh 策略。
+- **调优参数清单**：
+  - 导入期：`refresh_interval: -1`（关闭）、`number_of_replicas: 0`（导入完改回，避免主副双写）、`translog.durability: async`（可容忍丢数秒）。
+  - bulk 批大小：5~15MB / 批，太大 GC 压力大、太小吞吐上不去；并发线程数 ≈ 数据节点数 × (1~2)。
+  - 磁盘：SSD 必选（HDD 在 merge/flush 时磁头抖动致命）；`index.merge.scheduler.max_thread_count` HDD 设 1。
+  - JVM：堆 ≤ 物理内存 50% 且 ≤ 32GB（保压缩指针），留一半给 page cache 缓存 segment。
+- **监控吞吐瓶颈**：`_nodes/hot_threads` 看 CPU 花在哪；`thread_pool.write.queue` 满 → 调大 `queue_size` 或降写入；`disk IO wait` 高 → 磁盘瓶颈；`refresh`/`merge` 占比高 → 调大 `refresh_interval` 与 merge 线程。
+- **典型收益**：关闭 refresh + 副本 0 后导入吞吐常提升 3~5 倍；导入完 `refresh` + 副本恢复 + `forcemerge` 冷索引。
+
+## 五、ES 与 ClickHouse 在 OLAP 场景的分工
+
+二者常被拿来对比，但**定位互补**而非替代：
+
+| 维度 | Elasticsearch | ClickHouse |
+| --- | --- | --- |
+| 核心能力 | 全文检索 + 交互式聚合探索 | 海量列存聚合（固定维度报表） |
+| 写入模型 | 近实时、单条/批量、更新靠标记删除 | 批量追加为主、弱更新、Mutation 异步 |
+| 查询模式 | 任意条件组合、模糊/分词、深翻页探索 | 大宽表、GROUP BY 多维度、扫描亿级极快 |
+| 交互体验 | Kibana 即席探索、Dev Tools 即查 | 交 SQL、BI 直连、物化视图预聚合 |
+| 成本 | 倒排 + doc_values 占空间大 | 列存压缩比高、空间省 |
+| 一致性 | 近实时最终一致 | 最终一致、弱事务 |
+
+- **组合打法**：日志/文档类"既要检索又要分析"——ES 做检索与交互式下钻，原始明细/指标落 ClickHouse 做 T+1 大报表；或 ES 承接在线探索、ClickHouse 承接离线宽表。经典链路：Kafka → ES（检索）+ ClickHouse（分析），MySQL 保交易源。
+- **何时选谁**：需要"关键词/分词/任意过滤/秒级可见"→ ES；需要"亿级固定维度聚合、SQL 分析、成本敏感"→ ClickHouse；两者都要就都上。
+
+## 六、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
+
+- **集群变红（Red）**：`GET _cluster/health` 看 `status=red`（主分片未分配）。排查：`GET _cat/indices?v&health=red` 定位红索引；`GET _cluster/allocation/explain` 看分片未分配原因（最常见：磁盘水位、节点离线、分片数超限）。红通常意味着有主分片丢失、数据可能已损，优先恢复节点而非强制分配（强制分配空分片会丢数据）。
+- **脑裂（Split-Brain）**：两主并存、元数据冲突。成因：网络分区 + `minimum_master_nodes` 配错（7.x 后由奇数节点 + `cluster.initial_master_nodes` 自动仲裁，但仍需节点数为奇数）。SOP：① 确认真正的主（看 `_cat/nodes?v&h=node,node.role,master` 中 `*` 标记）；② 隔离/重启"假主"节点让其重新加入；③ 网络恢复后 `GET _cluster/health` 回到 green；④ 长期：节点数奇数、跨可用区部署 `discovery.seed_hosts`、加 `cluster.fault_detection.*` 调优心跳。
+- **磁盘水位（Disk Watermark）**：ES 三档——`low`（默认 85%，停止分配新分片）、`high`（默认 90%，触发分片迁走）、`flood_stage`（默认 95%，强制所有索引只读 `index.blocks.read_only_allow_delete`）。SOP：① `GET _cat/allocation?v` 看各节点磁盘；② 清理磁盘/扩容后**必须手动解除只读**：`PUT */_settings { "index.blocks.read_only_allow_delete": null }`（flood_stage 触发的是只读块，要清对应 block）；③ 临时上调：`cluster.routing.allocation.disk.watermark.flood_stage: 97%`；④ 长期：ILM rollover + 冷数据降配、监控磁盘曲线设 80% 预警。
+- **通用排障清单**：`_cluster/health` → `_cat/nodes?v&h=...cpu,heap...` → `_cat/thread_pool?v` → `_cat/pending_tasks?v`（堆积说明 master 忙）→ `_nodes/hot_threads` + `_cat/slow_log`；变更前先 `GET _cluster/settings` 留底，回滚有据。

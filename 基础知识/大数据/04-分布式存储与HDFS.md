@@ -97,6 +97,68 @@ sequenceDiagram
 - [ ] NN 用 QJM 高可用，避免单点。
 - [ ] 小文件治理：合并、HAR、或用 HBase/对象存储。
 - [ ] 新平台优先对象存储 + 表格式，保留 HDFS 兼容旧作业。
-- [ ] 监控：容量、副本缺失、NN 延迟、DN 心跳。
+  - [ ] 监控：容量、副本缺失、NN 延迟、DN 心跳。
 
 > 参考：Apache Hadoop HDFS 架构文档、Google GFS 论文、对象存储（S3/OSS）文档、Apache Kudu 文档。
+
+## 七、HDFS 写入流程（源码级）
+
+1. `DFSClient.create()` 向 NameNode 申请租约（Lease）与块位置，NN 按**机架感知**返回 3 个 DataNode。
+2. 客户端把数据切为 64KB packet，经 **DataStreamer** 以管道写 DN1→DN2→DN3，每跳确认（ack queue）。
+3. 块写满或关闭时，`Complete` 上报 NN，NN 提交块、释放租约。
+4. 容错：`ResponseProcessor` 收到异常则从 ack queue 重发；DN 故障则换管、NN 后续补副本。
+
+```mermaid
+sequenceDiagram
+    participant C as DFSClient
+    participant NN as NameNode
+    participant DN as DataNode管道
+    C->>NN: create + addBlock(申请租约/位置)
+    NN-->>C: Lease + [DN1,DN2,DN3]
+    C->>DN: packet 流水线写(64KB)
+    DN-->>C: ack 逐跳回传
+    C->>NN: close → complete(提交块)
+    NN-->>C: 成功
+```
+
+## 八、副本放置策略（机架感知）
+
+- 默认 3 副本：**第 1 份本地节点**，第 2 份同机架另一节点，第 3 份**跨机架**节点。
+- 目的：本地读快（前两份常能本地/近地）+ 跨机架容灾（丢一机架不丢数据）。
+- 配置 `net.topology.script.file.name` 定义机架映射；云上常用可用区（AZ）替代机架。
+
+## 九、NameNode 元数据与高可用
+
+- **元数据**：`fsimage`（命名空间快照）+ `editlog`（增量操作），Secondary/Standby NN 定期合并。
+- **HA**：Active/Standby 两 NN，通过 **QJM（JournalNode 多数派）** 共享 editlog；**ZKFC** 监听健康、抢锁做故障转移。
+- 联邦（Federation）：多 NameService 横向扩展元数据，缓解单 NN 内存上限。
+
+## 十、小文件治理
+
+| 手段 | 做法 |
+|------|------|
+| 合并写 | Hive `INSERT OVERWRITE` 合并、Spark `coalesce` |
+| HAR 归档 | `hadoop archive` 把小文件打包为 har |
+| CombineInputFormat | 合并输入分片，减少 map 数 |
+| 对象存储+表格式 | 用 Iceberg 大文件 + compaction |
+| 避源头 | 控制分区粒度，避免按分钟分区 |
+
+- 经验法则：单文件 ≥ 128MB（与块对齐），分区不宜过细（日优于小时）。
+
+## 十一、纠删码（Erasure Coding）
+
+- 副本 3 份存储放大 3×；**EC（如 RS-6-3）** 用校验块替代副本，存储开销降到 ~1.5×，适合冷数据。
+- 代价：重建需网络读多块，计算开销高；默认对冷数据目录开启 `xor`/`rs` 策略。
+- 与对象存储的 EC 同理（S3 默认 EC），是降本关键。
+
+## 十二、HDFS vs 对象存储（工程对比）
+
+| 维度 | HDFS | 对象存储 |
+|------|------|---------|
+| 一致性 | 强（NN 中心） | 最终/强（取决于实现） |
+| 小文件 | 极差 | 好（无 NN 元数据瓶颈） |
+| 存算 | 耦合 | 分离 |
+| 运维 | 重 | 托管免运维 |
+| 生态 | Hadoop 原生 | Iceberg/Paimon 原生 |
+
+- 结论：新平台用对象存储 + 表格式；HDFS 保留跑存量 MR/Hive 作业。

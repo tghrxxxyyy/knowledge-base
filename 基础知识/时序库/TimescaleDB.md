@@ -409,3 +409,128 @@ GROUP BY m.device_id, o.region;
 - [ ] 连续聚合缺口 → 查刷新策略 `end_offset`、刷新任务是否失败。
 - [ ] 查询慢 → 是否命中聚合表，是否带时间下界。
 - [ ] 磁盘涨 → 保留策略/压缩策略是否生效，旧 chunk 是否被删。
+
+---
+
+## 11. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
+
+### 11.1 性能基准（推导 / 公开数字）
+
+- 写入吞吐：受 PG 行存约束，单实例常见 ~10~30 万 metrics/s（批写 + 压缩后改善）。
+- 压缩比：4~10:1（列式压缩 + segmentby）。
+- 查询：SQL 灵活，聚合命中连续聚合表时延迟低；跨月大范围未命中聚合则中。
+
+推导：
+```text
+写入 points/s ≈ 批写大小 / 单批耗时；建议 batch 1000~5000 行/批
+压缩后单 chunk 数 MB~数百 MB 为宜
+```
+
+### 11.2 迁移实战：InfluxDB → TimescaleDB 双写切换 SOP
+
+```mermaid
+flowchart LR
+    A[采集端] -->|1. 双写| B[InfluxDB]
+    A -->|1. 双写| C[TimescaleDB 超表]
+    D[历史回放\nInfluxQL→SQL 转换] --> C
+    E[校验] --> C
+    F[灰度切读\nGrafana 切 PG 源] --> C
+    F -->|稳定| G[InfluxDB 下线]
+```
+
+1. **建表**：把 measurement 映射为超表，tag→列/维度，field→数值列；时间列建 hypertable。
+2. **双写**：Telegraf 同时写 InfluxDB 与 PG（outputs.postgresql）；或应用双写。
+3. **回放**：用 `influx_inspect export` 导出 line protocol，转 SQL 批量导入。
+4. **校验**：抽样比对聚合值（SUM/AVG）。
+5. **切读**：Grafana 加 PostgreSQL 数据源，看板切到超表 + 连续聚合。
+
+### 11.3 与监控 / Grafana 全链路告警规则示例
+
+Grafana 用 PostgreSQL 数据源，对连续聚合表告警：
+
+```sql
+-- 告警查询：某设备 5 分钟平均温度 > 阈值
+SELECT device_id, AVG(temperature) AS v
+FROM readings_hourly
+WHERE bucket >= NOW() - INTERVAL '5 minutes'
+GROUP BY device_id
+HAVING AVG(temperature) > 80;
+```
+
+Grafana Unified Alerting 配置（示意）：
+```yaml
+apiVersion: 1
+groups:
+  - name: tsdb_temp_alert
+    rules:
+      - alert: HighTemp
+        sql: "SELECT device_id, AVG(temperature) v FROM readings_hourly WHERE bucket >= NOW()-'5 minutes' GROUP BY device_id HAVING AVG(temperature) > 80"
+        for: 5m
+        labels: { severity: critical }
+```
+
+全链路 Checklist：
+- [ ] 连续聚合刷新 `end_offset` 留 1h，避免看板缺口。
+- [ ] 查询命中聚合表，带时间下界。
+- [ ] 监控 `hypertable_size`、压缩比、刷新延迟。
+
+### 11.4 与 Flink / Spark 实时计算联动代码
+
+Spark 写 TimescaleDB（JDBC batch）：
+```scala
+df.write
+  .mode("append")
+  .format("jdbc")
+  .option("url", "jdbc:postgresql://tsdb:5432/metrics")
+  .option("dbtable", "sensor_readings")
+  .option("batchsize", "5000")
+  .save()
+```
+
+Flink SQL sink：
+```sql
+CREATE TABLE tsdb_sink (
+  time TIMESTAMP(3), device_id STRING, temperature DOUBLE
+) WITH (
+  'connector'='jdbc',
+  'url'='jdbc:postgresql://tsdb:5432/metrics',
+  'table-name'='sensor_readings'
+);
+INSERT INTO tsdb_sink SELECT ts, device_id, temperature FROM src;
+```
+
+联动要点：Flink 窗口聚合后写超表，避免单行高频写；历史回补先 `decompress_chunk` 再改。
+
+### 11.5 成本优化（chunk 压缩 / 降采样 / 保留）
+
+```sql
+-- 压缩 + 保留组合：先压缩再过期
+SELECT add_compression_policy('sensor_readings', INTERVAL '7 days');
+SELECT add_retention_policy('sensor_readings', INTERVAL '180 days');
+
+-- 分层聚合降本：明细→1m→1h→1d，长期只查聚合
+SELECT add_continuous_aggregate_policy('readings_1h',
+  start_offset=>INTERVAL '3 days', end_offset=>INTERVAL '1 hour',
+  schedule_interval=>INTERVAL '1 hour');
+```
+
+降本清单：
+- [ ] 压缩策略让冷 chunk 自动列压，省 4~10× 空间。
+- [ ] 保留策略删超期 chunk，避免磁盘无限涨。
+- [ ] 用连续聚合替代实时重算，降查询算力。
+- [ ] 旧 chunk `move_chunk` 到冷表空间（如 OSS 挂载盘）。
+
+### 11.6 生产排障 SOP
+
+**Cardinality / 写入慢**
+- [ ] 活跃 chunk 膨胀用 `VACUUM`/`pg_repack`；索引不宜过多。
+- [ ] `segmentby`/`orderby` 设对（高基数列 segmentby，time orderby）。
+- [ ] 压缩 chunk 视为不可变；UPDATE 历史触发解压重压，写放大。
+
+**写入拒绝（锁/磁盘满）SOP**
+- [ ] 查 `pg_stat_activity` 长事务、锁等待；查磁盘 `pg_tablespace`。
+- [ ] 提高 `max_wal_size`、`checkpoint_timeout` 缓解写放大。
+
+**查询超时 SOP**
+- [ ] 是否命中连续聚合；是否带时间下界。
+- [ ] `EXPLAIN` 看是否全 chunk 扫；缩小时间窗。

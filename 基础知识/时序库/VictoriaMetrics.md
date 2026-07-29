@@ -345,3 +345,113 @@ scrape_configs:
 - [ ] 图表锯齿/翻倍 → 查去重是否开启、时间戳是否对齐。
 - [ ] 查询慢 → vmselect 是否 CPU 瓶颈、是否大范围跨月查询。
 - [ ] 扩缩 vmstorage → 低峰期操作，一致性哈希环重平衡需预留容量。
+
+---
+
+## 10. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
+
+### 10.1 性能基准（TSBS 实测数字）
+
+- 写入吞吐：官方 TSBS 公开区间，单节点 ~150~200 万 metrics/s；cluster 线性扩展。
+- 压缩比：比 Prometheus 本地省 3~7×；每样本 ~0.5~1.5 B。
+- 查询：本地盘低延迟；多副本 dedup 后一致。
+
+推导：
+```text
+日磁盘(GB) ≈ samples/s × 86400 × 1.0B / 1024³
+例：5000 samples/s → 5000×86400×1/1e9 ≈ 0.43 GB/天（压缩后）
+```
+
+### 10.2 迁移实战：InfluxDB → VictoriaMetrics 双写切换 SOP
+
+VM 兼容 InfluxDB 行协议，迁移极顺。
+
+```mermaid
+flowchart LR
+    A[Prometheus/采集端] -->|1. 双写| B[InfluxDB]
+    A -->|1. 双写| C[VictoriaMetrics]
+    D[历史回放\nInflux 行协议导入] --> C
+    E[校验] --> C
+    F[灰度切读\nGrafana 切 VM] --> C
+    F -->|稳定| G[InfluxDB 下线]
+```
+
+1. **双写**：Prometheus `remote_write` 双指；VM 开 `-dedup.minScrapeInterval`。
+2. **回放**：InfluxDB 导出行协议，POST 到 `/insert/0/influx/write`。
+3. **校验**：`/api/v1/query` 比对同 `(metric,labels,ts)`。
+4. **切读**：Grafana 数据源切 vmselect。
+5. **下线**：InfluxDB 只读观察后停。
+
+### 10.3 与监控 / Grafana 全链路告警规则示例
+
+用 vmalert 定义告警（独立于 Prometheus）：
+
+```yaml
+# vmalert rules
+groups:
+  - name: vm_alerts
+    rules:
+      - alert: HighCPU
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "实例 {{ $labels.instance }} CPU > 85%"
+      - record: job:cpu:rate5m
+        expr: sum by (job) (rate(node_cpu_seconds_total[5m]))
+```
+
+Grafana 数据源指向 `vmselect:8481`，统一看板 + Alerting。
+
+全链路 Checklist：
+- [ ] vminsert 写队列不堆积；vmstorage 磁盘余量 > 30%。
+- [ ] 多副本场景全局去重已开。
+- [ ] 监控 cardinality（`/api/v1/status/tsdb`）。
+
+### 10.4 与 Flink / Spark 实时计算联动代码
+
+vmagent 做采集网关，多远端写 + 降采样：
+
+```bash
+./vmagent -promscrape.config=/etc/vmagent.yml \
+  -remoteWrite.url=http://vminsert:8480/insert/0/prometheus/api/v1/write \
+  -remoteWrite.url=http://flink-gateway:9090/api/v1/write \
+  -remoteWrite.maxSamplesPerSend=10000
+```
+
+Flink 消费 VM 暴露的 Prometheus 端点（remote_write 到 Flink 适配），或 Spark 读 VM：
+```scala
+// 通过 Prometheus 兼容 HTTP 读（Spark 需用 HTTP 客户端/自研）
+// 推荐：vmagent 双写一份到 Kafka，Flink 消费做富化
+```
+
+联动要点：vmagent「一份采集、多份 remote_write」天然适合流计算分发；降采样 rollup 在长期省空间。
+
+### 10.5 成本优化（容量公式 / 去重 / retention 降本）
+
+```bash
+# 降本关键：合理 retention + dedup + 降采样
+./vmstorage -retentionPeriod=12 -storageDataPath=/vm-data
+./vmselect -dedup.minScrapeInterval=30s
+```
+
+降本清单：
+- [ ] 砍高基 label 是最有效降本（内存、磁盘、索引三降）。
+- [ ] 降采样：长期只留 1m/1h 聚合（vmagent rollup 或 recording rule）。
+- [ ] retention 分层：热 1~3 月，长期下沉对象存储归档。
+- [ ] 限制大查询并发（`-maxConcurrentRequests`），避免为偶发大查盲目扩容。
+
+### 10.6 生产排障 SOP
+
+**Cardinality 治理**
+- [ ] `curl vmselect:8481/api/v1/status/tsdb` 看 TopN 高基 metric。
+- [ ] 用 `metric_relabel_configs` 在 vmagent 丢弃高基 label。
+- [ ] 设 `cardinality_limit`（企业版）硬熔断。
+
+**写入拒绝（429 / 队列满）SOP**
+- [ ] 查 vminsert 队列 `capacity`、vmstorage 磁盘、网络。
+- [ ] 调大 `max_samples_per_send`/capacity；临时降抓取频率。
+
+**查询超时 SOP**
+- [ ] vmselect CPU 瓶颈 → 加实例挂 LB。
+- [ ] 避免大范围跨月明细；用 recording rule 预聚合。

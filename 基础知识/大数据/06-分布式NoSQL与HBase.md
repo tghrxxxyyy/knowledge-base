@@ -96,6 +96,71 @@ flowchart LR
 - [ ] 设合理 TTL 与最大版本数，防无限增长。
 - [ ] 配置 BlockCache 与 MemStore 比例（读多/写多不同调优）。
 - [ ] 规划预分区，避免上线后频繁分裂。
-- [ ] 监控：Region 均衡、Compaction 积压、RS GC、HDFS 副本。
+  - [ ] 监控：Region 均衡、Compaction 积压、RS GC、HDFS 副本。
 
 > 参考：Apache HBase 官方文档（架构/数据模型/RowKey 设计）、Google BigTable 论文、各 NoSQL 对比实践。
+
+## 八、Region 分裂与合并
+
+- **分裂（Split）**：Region 达 `hbase.hregion.max.filesize`（默认 10GB）按 RowKey 中值一分为二，由 HMaster 调度，实现水平扩展。
+- **预分区**：建表用 `SPLITS` 预先切分，避免上线后"先写一台、再分裂"的热点。
+
+```bash
+create 'orders', 'info', {SPLITS => ['u10','u20','u30','u40']}
+```
+
+- **合并（Merge）**：Region 过小（如删除大量数据后）由管理员 `merge_region` 合并，减少管理开销。
+- **热点分裂陷阱**：若 RowKey 含时间戳，所有写入落末台 Region，分裂也救不了 → 必须加盐打散。
+
+## 九、RowKey 设计反模式
+
+| 反模式 | 后果 | 正解 |
+|--------|------|------|
+| 纯时间戳前缀 | 单 Region 热点 | 加盐/反转时间 |
+| 递增 ID 前缀 | 写集中末台 | hash 打散 |
+| 超长 RowKey | 内存/IO 浪费 | 8~20 字节 |
+| 随机无查询维度 | 无法范围扫 | 组合查询维度前缀 |
+| 单一维度 | join 难 | 多维组合 `dim1_dim2_id` |
+
+## 十、二级索引方案
+
+- **Phoenix**：在 HBase 上建 SQL 层与**全局/本地二级索引**，写主表时异步维护索引表，支持非 RowKey 列查询。
+- **协处理器（Coprocessor）**：在服务端 RS 执行 `Observer`（拦截写构建索引）/`Endpoint`（聚合下推），类似存储过程。
+- **外部索引**：写 HBase 同时双写 ES/Solr 做全文与多维检索（常见组合）。
+- 权衡：索引加速读但拖慢写、占空间；高写场景慎用全局索引。
+
+## 十一、读写优化实战
+
+| 优化点 | 做法 |
+|--------|------|
+| 写 | WAL 可选 `SKIP_WAL`（可丢数据时）、增大 `hbase.hregion.memstore.flush.size` |
+| 写 | 批量 `Put` + 异步 WAL（`ASYNC_WAL`） |
+| 读 | BlockCache 调大（读多）、BloomFilter=`ROW`/`ROWCOL` |
+| 读 | 列族隔离、Scan 加 `caching`/`batch` |
+| 压缩 | HFile 用 Snappy/ZSTD 降 IO |
+| 合并 | 定时 major compaction，清理过期版本 |
+
+- 经验：读多写少 → BlockCache 给 40%+；写多 → MemStore 给大、WAL 异步。
+
+## 十二、HBase vs Cassandra 深度对比
+
+| 维度 | HBase | Cassandra |
+|------|-------|-----------|
+| 一致性 | 强一致（单 master 行锁） | 最终一致（可调） |
+| 架构 | 依赖 HDFS + ZK | 纯 P2P，无单点 |
+| 多数据中心 | 弱 | **强**（跨 DC 复制） |
+| 运维 | 重 | 轻 |
+| 写吞吐 | 高 | **极高** |
+| 读 | 按 key 毫秒 | 需调一致性级别 |
+| 适用 | 单集群海量宽表 | 跨机房海量写 |
+
+- 选型：强一致+已有 Hadoop → HBase；多活跨机房+极简运维 → Cassandra。
+
+## 十三、生产 Checklist
+
+- [ ] 建表预分区，RowKey 防热点+贴查询。
+- [ ] 列族 1~3 个，设 TTL/最大版本。
+- [ ] 读多调 BlockCache，写多调 MemStore+异步 WAL。
+- [ ] 二级索引按需（Phoenix/ES），权衡写放大。
+- [ ] 定时 major compaction，监控 Region 均衡与 RS GC。
+- [ ] 大集群控制 Region 总数（避免 ZK 压力）。

@@ -513,3 +513,123 @@ jobs:
 > - Self-hosted runner 安全（不可信代码风险）：https://docs.github.com/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-security
 > - 2025 Actions 更新综述（YAML anchors、缓存上限、arm64、matrix 等）：https://github.blog/ 与 https://blog.csdn.net/MicrosoftReactor/article/details/156314142
 > - upload-artifact / download-artifact v4（graphite 后端，同 workflow 内）：https://github.com/actions/upload-artifact
+
+## 十三、reusable workflows 深度：分层与传参
+
+reusable workflow 用 `workflow_call` 接收 `inputs`/`secrets`，适合组织级分层编排（2025 上限：嵌套 10 级 / 50 调用）：
+
+```yaml
+# .github/workflows/build.yml（被复用）
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+    secrets:
+      REGISTRY_TOKEN:
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ${{ inputs.image }} .
+```
+
+```yaml
+# 主工作流
+jobs:
+  call-build:
+    uses: ./.github/workflows/build.yml
+    with: { image: "registry/app:${{ github.sha }}" }
+    secrets: inherit                       # 透传 secrets
+```
+
+## 十四、matrix 策略进阶
+
+```yaml
+test:
+  strategy:
+    fail-fast: false                       # 一个组合失败不杀其他
+    max-parallel: 4
+    matrix:
+      node: [18, 20, 22]
+      os: [ubuntu-latest, macos-latest]
+      include:                             # 补充组合
+        - node: 20
+          os: ubuntu-latest
+          coverage: true
+      exclude:                             # 排除无意义组合
+        - node: 18
+          os: macos-latest
+  runs-on: ${{ matrix.os }}
+  steps:
+    - run: npm test ${{ matrix.coverage && '--coverage' || '' }}
+```
+
+## 十五、self-hosted runner 安全加固
+
+```yaml
+# 仅受信任仓库启用；fragile 的 fork PR 用 pull_request（非 pull_request_target）
+on: pull_request                       # 不暴露 secrets 给 fork
+jobs:
+  build:
+    runs-on: [self-hosted, linux, docker]
+```
+
+安全清单：
+1. 受信任仓库才挂 self-hosted；不可信代码用 GitHub 托管 runner 或一次性容器。
+2. runner 以低权限用户运行，网络隔离，工作区用完即销。
+3. 不在 `pull_request_target` 里跑不可信代码（token 权限高）。
+4. 用 `concurrency` 防并发覆盖；用 ephemeral runner 最安全。
+
+## 十六、OIDC 免密钥部署云（实战）
+
+```yaml
+permissions:
+  id-token: write        # OIDC 必需
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-deploy
+          aws-region: cn-north-1
+      - run: kubectl set image deploy/app app=registry/app:${{ github.sha }}
+```
+
+> 云侧 trust policy 绑定 `sub: repo:OWNER/REPO:ref:refs/heads/main`，做到"按仓库/分支最小授权"，无静态密钥可泄露。
+
+## 十七、大型 monorepo 优化
+
+```yaml
+jobs:
+  detect:
+    outputs:
+      changed: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            order: ['services/order/**']
+            user:  ['services/user/**']
+  build-order:
+    needs: detect
+    if: contains(needs.detect.outputs.changed, 'order')
+    runs-on: ubuntu-latest
+    steps: [ ... ]
+```
+
+优化要点：路径过滤只跑变更子项目、`actions/cache` 复用依赖、matrix 并行、大仓用 Nx/Turbo 远程缓存、跳过 CI 用 `[skip ci]`。
+
+## 本篇补充 Checklist
+
+- [ ] reusable workflow 用 `workflow_call` 传 `inputs`/`secrets`，分层复用。
+- [ ] matrix：`fail-fast:false` + `include`/`exclude` 精确组合。
+- [ ] self-hosted 严守安全边界，不可信代码禁跑。
+- [ ] 云部署用 OIDC `id-token: write` 免静态密钥，trust policy 最小授权。
+- [ ] monorepo 用路径过滤 + 远程缓存，避免全量跑。

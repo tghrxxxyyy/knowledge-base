@@ -410,3 +410,112 @@ CREATE TABLE td_sink (
 - [ ] 查询慢 → 是否全表扫子表（缺 tag 过滤）、是否跨大时间范围。
 - [ ] 副本不同步 → 查 dnode 存活、网络分区、mnode 选主。
 - [ ] 磁盘涨 → 查 `KEEP` 保留策略、过期数据是否清理。
+
+---
+
+## 11. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
+
+### 11.1 性能基准（推导 / 公开数字）
+
+- 写入吞吐：官方宣称单 vnode 数十万~百万 points/s，集群可达千万级（一写者模型 + 列压）。
+- 压缩比：~10:1（官方白皮书，自研列压）。
+- 查询：单设备点查/短区间极低延迟；跨海量子表聚合中等。
+
+推导：
+```text
+写入 points/s ≈ vnode 数 × 单 vnode 吞吐
+例：32 vnode × 30 万 = 960 万 点/s（集群）
+```
+
+### 11.2 迁移实战：InfluxDB → TDengine 双写切换 SOP
+
+利用 taosAdapter 兼容 InfluxDB 行协议，迁移成本最低。
+
+```mermaid
+flowchart LR
+    A[采集端] -->|1. 双写| B[InfluxDB]
+    A -->|1. 双写| C[TDengine taosAdapter]
+    D[历史回放\nline protocol 重放] --> C
+    E[校验] --> C
+    F[灰度切读\nGrafana 切 TDengine] --> C
+    F -->|稳定| G[InfluxDB 下线]
+```
+
+1. **建模**：InfluxDB measurement→超级表，tag（低基数）→STABLE tag，field→列；`device_id` 作子表名。
+2. **双写**：采集端同时发 InfluxDB 行协议到 `:6041/influxdb/v1/write`。
+3. **回放**：历史数据按时间区间重放（注意乱序窗口）。
+4. **校验**：比对聚合值。
+5. **切读**：Grafana 用 TDengine 插件，看板切子表聚合。
+
+### 11.3 与监控 / Grafana 全链路告警规则示例
+
+TDengine 连续查询 + Grafana 插件告警（示意）：
+
+```sql
+-- 创建降采样超级表与告警视图
+CREATE STABLE IF NOT EXISTS cpu_agg (ts TIMESTAMP, avg_cpu FLOAT) TAGS (group_id INT);
+-- 用流计算/定时任务写入 1m 聚合
+INSERT INTO d_agg USING cpu_agg TAGS (1)
+SELECT _WSTART, AVG(current) FROM meters
+WHERE ts >= NOW - 1m INTERVAL(1m);
+```
+
+Grafana 对 `cpu_agg` 查询结果设阈值告警（avg_cpu > 85 触发）。
+
+全链路 Checklist：
+- [ ] 子表名用稳定设备 ID；tag 仅低基数维度。
+- [ ] 监控 vnode 均衡、WAL 堆积、慢查询。
+- [ ] 查询带 tag 过滤 + 时间下界，避免全子表扫。
+
+### 11.4 与 Flink / Spark 实时计算联动代码
+
+Flink JDBC sink（TAOS-RS）：
+```sql
+CREATE TABLE td_sink (
+  tbname STRING, ts TIMESTAMP(3), current DOUBLE, voltage INT
+) WITH (
+  'connector'='jdbc',
+  'url'='jdbc:TAOS-RS://tdengine:6041/iot',
+  'table-name'='meters'
+);
+INSERT INTO td_sink SELECT device_id, ts, current, voltage FROM src;
+```
+
+Spark 读 TDengine：
+```scala
+val df = spark.read.format("jdbc")
+  .option("url","jdbc:TAOS-RS://tdengine:6041/iot")
+  .option("query","SELECT tbname, ts, current FROM meters WHERE ts >= NOW - INTERVAL 1 HOUR")
+  .load()
+```
+
+联动要点：Flink 聚合写「聚合子表」，明细写「设备子表」，分层清晰；企业版 Topic 订阅可做写入即分发。
+
+### 11.5 成本优化（vnode / 降采样 / 保留）
+
+```sql
+-- 库级保留与 vnode：KEEP 365 天，32 vgroup，3 副本
+CREATE DATABASE iot KEEP 365 DAYS 10 BLOCKS 6 VGROUPS 32 REPLICA 3;
+-- 超期自动删，避免磁盘无限涨
+```
+
+降本清单：
+- [ ] 合理 vnode：单 dnode vnode ≈ CPU 核 1~2 倍，单 vnode 几十 GB。
+- [ ] `KEEP` 保留策略删旧数据；冷数据用企业版多级存储/归档。
+- [ ] 控制 tag 数（<16），保持高压缩比。
+- [ ] 聚合子表替代长周期明细查询，降算力。
+
+### 11.6 生产排障 SOP
+
+**Cardinality 治理（标签索引爆炸）**
+- [ ] 严禁 `TAGS(device_id)` 千万取值；device_id 作子表名。
+- [ ] 按设备类型分多张 STABLE，避免列稀疏。
+- [ ] 单 STABLE tag < 10~16 个。
+
+**写入拒绝 / 慢 SOP**
+- [ ] 查 WAL 堆积、vnode 倾斜、磁盘 IO。
+- [ ] 提升 `BLOCKS`、均衡 vnode；WAL 放 SSD。
+
+**查询超时 SOP**
+- [ ] 是否缺 tag 过滤导致全子表扫；是否跨超大时间范围。
+- [ ] 检查 mnode 选主、dnode 副本同步。

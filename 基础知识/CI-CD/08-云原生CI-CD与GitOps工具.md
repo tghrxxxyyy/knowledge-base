@@ -415,5 +415,108 @@ flowchart LR
 - Flux v2.1.0 发布说明（Kustomize/Helm/OCI 能力）：https://github.com/fluxcd/flux2/releases/v2.1.0
 - Argo Rollouts 渐进式交付（Red Hat / 51CTO / k8scockpit）：https://www.redhat.com/ja/blog/blue-green-canary-argo-rollouts 、https://k8scockpit.tech/posts/progressive-delivery-kubernetes
 - Drone vs Travis（Harness，2025-12 更新）、CircleCI vs Travis 2025、Woodpecker vs Drone：https://www.harness.io/comparison-guide/travisci-vs-drone 、https://softtech-reviews.com/compare/circleci-vs-travis-ci 、https://sumguy.com/woodpecker-ci-vs-drone-ci
+
+## 十一、Argo CD vs Flux 深度对比
+
+二者都是 K8s 原生 GitOps 控制器，但理念不同：
+
+| 维度 | Argo CD | Flux |
+|------|---------|------|
+| 产物形态 | 自带 UI + CLI，可视化强 | 偏 Git 优先，无官方 UI（用 Weave GitOps） |
+| 多应用管理 | AppProject / ApplicationSet | Kustomization / HelmRelease CRD |
+| 渐进式交付 | 原生集成 Argo Rollouts | 集成 Flagger |
+| 多集群 | ApplicationSet 集群生成器 | 多租 / 分库 |
+| 学习曲线 | 中（UI 友好） | 中高（纯声明、YAML 多） |
+| 适用 | 要可视化、要统一门户 | 要极简、Git 优先、强合规 |
+
+```bash
+# Argo CD：声明一个由 Git 调和的应用
+argocd app create app \
+  --repo https://git.corp/apps.git \
+  --path prod/order \
+  --dest-server https://k8s-prod \
+  --dest-namespace order \
+  --sync-policy automated --self-heal --auto-prune
+```
+
+## 十二、渐进式交付（Argo Rollouts）
+
+Rollouts 用 `Rollout` CRD 替代 `Deployment`，支持金丝雀按权重/按分析推进：
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: order }
+spec:
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: { duration: 5m }          # 观察 5 分钟
+        - setWeight: 30
+        - analysis:                        # 指标门禁，失败自动回滚
+            templates:
+              - templateName: error-rate
+        - setWeight: 100
+  selector: { matchLabels: { app: order } }
+  template:
+    spec:
+      containers:
+        - name: order
+          image: registry/order:{{ .Image }}
+```
+
+## 十三、多集群 GitOps
+
+```mermaid
+flowchart TB
+    Git[Git 仓库] -->|调和| Hub[Hub 集群 Argo/Flux]
+    Hub -->|推送/管理| C1[集群 A]
+    Hub -->|推送/管理| C2[集群 B]
+    Hub -->|推送/管理| C3[边缘集群]
+```
+
+- **Hub-Spoke**：中心集群管多环境，ApplicationSet 按集群生成器批量下发。
+- **分库治理**：infra repo 与 app repo 分层；环境用 `overlays/` 或 per-env values 表达晋级。
+- **故障隔离**：单一集群失联不影响其他；reconcile 间隔别过小，防 etcd 压力。
+
+## 十四、Secret 管理（Sealed Secrets / External Secrets）
+
+GitOps 里 Secret 不能直接进 Git（明文泄露）。两种主流方案：
+
+```yaml
+# Sealed Secrets：用公钥加密，只有集群内 controller 能解密
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata: { name: db-secret, namespace: order }
+spec:
+  encryptedData:
+    password: AgBc...密文...
+# kubeseal 加密：kubeseal --scope cluster-wide < secret.yaml > sealed.yaml
+```
+
+```yaml
+# External Secrets Operator：从 Vault/云 KMS 同步到 K8s Secret
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata: { name: db-secret }
+spec:
+  data:
+    - secretKey: password
+      remoteRef: { key: order/db, property: password }
+  refreshInterval: 1h
+```
+
+| 方案 | 来源 | 适用 |
+|------|------|------|
+| Sealed Secrets | 加密进 Git | 简单、纯 Git 流 |
+| External Secrets | Vault / AWS SM / GCP SM | 已有密钥中枢、动态轮换 |
+
+## 本篇补充 Checklist
+
+- [ ] Argo CD 重可视/统一门户；Flux 重 Git 优先/极简，按需选型。
+- [ ] 渐进式交付用 Rollouts（Argo）或 Flagger（Flux）+ 指标门禁自动回滚。
+- [ ] 多集群用 Hub-Spoke + ApplicationSet，环境晋级用 overlays/values。
+- [ ] Secret 进 Git 必加密（Sealed Secrets）或外挂同步（ESO），绝不明文。
 - CNCF OpenGitOps 四项原则：https://opengitops.dev/
 - Kubernetes 部署策略 2025（Blue-Green / Canary / Rolling）：https://devopsenginer.com/blog/kubernetes-deployment-strategies-2025-complete-guide

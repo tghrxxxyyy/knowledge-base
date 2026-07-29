@@ -427,3 +427,92 @@ spec:
 - Kustomize 官方文档: https://kustomize.io/
 - Harbor 官方文档 — 镜像签名与漏洞扫描: https://goharbor.io/docs/
 - 零停机滚动更新最佳实践（探针 + 优雅终止，2025）: https://devops.aibit.im/en/article/how-to-perform-zero-downtime-kubernetes-rolling-updates
+
+## 十一、安全构建：Kaniko / BuildKit（免 Docker daemon）
+
+CI 里跑 `docker build` 需挂载 daemon socket（root 权限，攻击面大）。改用无守护进程构建：
+
+| 工具 | 特点 | 适用 |
+|------|------|------|
+| Kaniko | 在容器内跑、不需 daemon、适合 K8s | Jenkins K8s Agent / GitLab |
+| BuildKit | 并行构建、缓存、secret 挂载安全 | GitHub Actions / 自建 |
+
+```dockerfile
+# Kaniko 在 K8s Agent 内构建（无 docker.sock）
+# 命令：/kaniko/executor \
+#   --destination=registry/app:${SHA} \
+#   --cache=true --cache-repo=registry/app-cache
+```
+
+```yaml
+# BuildKit 安全挂载密钥（构建期用，不进镜像层）
+# docker buildx build --secret id=npm,src=$NPMRC .
+# Dockerfile: RUN --mount=type=secret,id=npm,target=/root/.npmrc npm ci
+```
+
+> 安全要点：禁止把 `docker.sock` 挂进 runner；用 Kaniko/BuildKit 把构建降到非特权；secret 用 `--mount=secret` 而非 `ARG` 写层。
+
+## 十二、镜像瘦身
+
+```dockerfile
+# 多阶段：构建与运行分离
+FROM maven:3.9 AS build
+COPY . /src && RUN mvn -B package
+FROM eclipse-temurin:17-jre                     # 仅运行时不带 JDK
+COPY --from=build /src/target/app.jar /app.jar
+ENTRYPOINT ["java","-jar","/app.jar"]
+
+# distroless 进一步瘦身（无 shell/包管理，攻击面最小）
+# FROM gcr.io/distroless/java17-debian12
+```
+
+瘦身清单：多阶段构建、distroless/Alpine、`.dockerignore`、合并 RUN、非 root 用户、钉 digest。
+
+## 十三、K8s 滚动更新参数（零停机）
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1            # 最多多起 1 个新副本
+      maxUnavailable: 0      # 更新期间不允许少副本（零停机）
+  minReadySeconds: 10        # 就绪后等 10s 再继续
+  revisionHistoryLimit: 5    # 保留可回滚历史
+  template:
+    spec:
+      containers:
+        - name: app
+          readinessProbe:    # 就绪才接流量
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 5
+          livenessProbe:     # 不健康才重启
+            httpGet: { path: /health, port: 8080 }
+```
+
+## 十四、CI 集成 ephemeral K8s 测试环境
+
+每个 MR 起一套临时集群/命名空间跑集成测试，结束即回收：
+
+```bash
+# 用 kind 起临时集群跑 e2e，用完即删
+kind create cluster --name pr-${{ github.event.number }}
+helm install app ./charts -n pr-test
+npm run e2e
+kind delete cluster --name pr-${{ github.event.number }}
+```
+
+| 方案 | 速度 | 成本 | 适用 |
+|------|------|------|------|
+| kind / K3d | 秒级 | 低（本机/单节点） | 单仓库 e2e |
+| 命名空间隔离 | 快 | 低 | 共用集群多 PR |
+| 临时托管集群（ACK/EKS） | 慢 | 高 | 近生产验证 |
+
+## 本篇补充 Checklist
+
+- [ ] 免 daemon 构建用 Kaniko / BuildKit，不挂 docker.sock，secret 用 mount。
+- [ ] 镜像多阶段 + distroless + `.dockerignore` + 非 root + digest。
+- [ ] 滚动更新 `maxUnavailable:0` + 探针 + `revisionHistoryLimit` 保回滚。
+- [ ] 集成测试用 ephemeral 集群/命名空间，用完即销，控成本。

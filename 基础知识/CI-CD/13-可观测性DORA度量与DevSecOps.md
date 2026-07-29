@@ -402,3 +402,109 @@ flowchart TB
 - GitHub Copilot SDK（2026-01）：https://github.com/features/copilot
 - 2026 AI DevOps/CI-CD 工具综述（Launchable/Buildpulse/Harness AIDA/Datadog Watchdog）：https://superdots.sh/blog/ai-devops-tools/
 - SPDX 3.0 / CycloneDX 1.6 SBOM 规范：https://spdx.dev/ 、https://cyclonedx.org/
+
+## 十、DORA 四指标采集实战
+
+四指标需从 CI/CD 与 Issue 系统抽取，而非拍脑袋。常见采集链路：
+
+```mermaid
+flowchart LR
+    CI[CI/CD 事件] -->|webhook| DB[(指标仓库 Prometheus)]
+    VCS[Git 提交/PR] -->|API| DB
+    INC[Incident/告警] -->|API| DB
+    DB -->|计算| D[部署频率/前置时间/变更失败率/MTTR]
+    D -->|看板| G[Grafana]
+```
+
+| 指标 | 数据源 | 采集方式 |
+|------|--------|----------|
+| 部署频率 | CI 部署 job / Argo CD sync | 统计成功部署次数 |
+| 前置时间 | Git PR 创建→生产部署 | PR 时间戳差 |
+| 变更失败率 | 部署后 incident / 回滚 | 失败部署 / 总部署 |
+| MTTR | 告警开启→关闭 | incident 时长 |
+
+```yaml
+# 用 cicd-exporter / 自定义脚本把 Jenkins/GitLab 事件写入 Prometheus
+# 例：部署计数指标
+# - job_name: jenkins
+#   metrics_path: /prometheus
+# Grafana 面板按团队/服务分组展示四指标
+```
+
+## 十一、SLI / SLO 接入流水线
+
+把可靠性目标接入发布门禁：金丝雀/灰度期间若 SLI 跌破 SLO 阈值，自动暂停或回滚。
+
+| 概念 | 含义 | 示例 |
+|------|------|------|
+| SLI | 当前指标 | 错误率 0.5%、P99 220ms |
+| SLO | 目标阈值 | 错误率 < 1%、P99 < 300ms |
+| 错误预算 | 可容忍违规额度 | 每月 43min 不可用 |
+
+```yaml
+# Argo Rollouts AnalysisTemplate 用 SLI 作门禁
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+spec:
+  metrics:
+    - name: error-rate
+      successCondition: result < 0.01      # SLO：错误率 < 1%
+      provider:
+        prometheus:
+          query: sum(rate(http_errors[5m]))/sum(rate(http_total[5m]))
+```
+
+## 十二、供应链安全：SLSA / cosign / sigstore
+
+```mermaid
+flowchart LR
+    SRC[源码 Git] -->|SLSA provenance| BUILD[构建]
+    BUILD -->|cosign 签名| ART[制品/镜像]
+    ART -->|Rekor 透明日志| VERIFY[部署验签]
+    BUILD -->|in-toto 来源证明| VERIFY
+```
+
+- **SLSA**：构建来源等级（L1-L3），证明"谁、在哪、怎么构建"。
+- **cosign / sigstore**：keyless 签名（Fulcio 短期证书 + Rekor 日志）。
+- **in-toto / SLSA provenance**：生成来源证明，部署前校验。
+
+```bash
+# 生成 SLSA provenance 并签名
+cosign attest --yes --type slsaprovenance \
+  --predicate provenance.json registry/app@sha256:abc
+# 验签 + 验 provenance
+cosign verify-attestation registry/app@sha256:abc \
+  --certificate-identity-regexp '.*@corp.com'
+```
+
+## 十三、合规审计
+
+- **等保 / SOC2 / ISO27001**：要求制品不可变、可溯源、签名验签、密钥托管。
+- **审计证据自动化**：把 SBOM、签名、部署记录、审批日志汇成不可篡改证据链。
+- **OPA / Kyverno**：集群准入控制，禁止未签名镜像运行、强制 Pod 安全上下文。
+
+```yaml
+# Kyverno：禁止未签名镜像
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: require-signed }
+spec:
+  validationFailureAction: enforce
+  rules:
+    - name: check-signature
+      match: { resources: { kinds: [Pod] } }
+      verifyImages:
+        - image: "*"
+          attestors:
+            - entries:
+                - keyless:
+                    identities:
+                      - { issuer: https://oauth.corp.com }
+```
+
+## 本篇补充 Checklist
+
+- [ ] DORA 四指标从 CI/Git/Incident 自动抽取，Grafana 看板按团队分组。
+- [ ] SLI/SLO 接入发布门禁，跌破阈值自动暂停/回滚。
+- [ ] 供应链用 SLSA provenance + cosign keyless 签名 + Rekor 透明日志。
+- [ ] 合规审计：SBOM/签名/审批链自动化，Kyverno 禁未签名镜像。

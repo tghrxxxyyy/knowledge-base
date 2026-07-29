@@ -2003,3 +2003,95 @@ flowchart LR
 - **BNL（Block Nested Loop）**：无索引时把驱动表分批进 join buffer 内存比对；应尽量避免（加索引转 NLJ）。
 - **BKA（Batched Key Access）**：NLJ + MRR 批量回表，减少随机 IO。
 - **优化要点**：小表驱动大表、`JOIN` 列类型/字符集一致、被驱动表索引、避免 `SELECT *`、用 `STRAIGHT_JOIN` 强制驱动顺序（优化器选错时）。
+
+## 九、生产实战 · 故障复盘 · 高阶调优（第三轮深度补充）
+
+> 本节面向生产排障与面试压轴，假设读者已掌握索引/事务/锁基础，不再复述概念。
+
+### 9.1 真实故障复盘一：索引失效引发全表扫描雪崩
+
+- **现象**：某核心读接口 RT 从 5ms 突增至 3s，DB CPU 打满，连接池耗尽，上游大面积超时。
+- **定位链路**：`SHOW PROCESSLIST` 看到几十个线程卡在同一条 `SELECT`，状态 `Sending data`；抓一条 `EXPLAIN`，`type: ALL`、`key: NULL`、`rows` 接近全表 → 全表扫描。
+- **高频根因（按出现频率排序）**：
+  1. 对索引列套函数：`WHERE DATE(create_time) = ?` / `WHERE YEAR(...) = ?` → 优化器无法用索引，改写范围查询 `create_time >= ? AND create_time < ?`。
+  2. 隐式类型转换：`varchar` 列传数值、或字符集/排序规则不一致 → 索引失效走全表。
+  3. 前模糊 `LIKE '%abc'`、或 `OR` 连接非索引列。
+  4. 优化器误判：统计信息陈旧（`ANALYZE TABLE`）或 `ORDER BY` + `LIMIT` 小结果集被误导向全表。
+- **止血与治理**：应急 `FORCE INDEX(idx)` 强制走索引；长期把慢 SQL 纳入上线门禁（`EXPLAIN` 校验 + `long_query_time=0.5` 慢日志告警），用 `sys.statement_analysis` 视图持续盯 TOP SQL。
+
+### 9.2 真实故障复盘二：主从延迟引发脏读
+
+- **现象**：用户支付成功，前端立即查询仍显示"待支付"，数秒后自愈。
+- **定位**：`SHOW SLAVE STATUS\G` 显示 `Seconds_Behind_Master` 飙到 30s+，`Relay_Log` 重放明显落后。
+- **根因**：从库单线程重放一条大事务（一次 `UPDATE` 50w 行），或夜里批作业在从库重放巨量 DML。
+- **治理**：
+  - 拆大事务为小批量（每批 1w 行，`sleep` 让从库追平）。
+  - 开并行复制：`slave_parallel_workers=8` + `slave_parallel_type=LOGICAL_CLOCK`（基于 write set 依赖回放）。
+  - 强一致读场景：读走主库 / `SELECT ... FOR UPDATE`；或开半同步 `rpl_semi_sync_master_enabled=1` 缩小数据丢失窗口。
+  - 架构上读写分离加"读从库降级"：容忍延迟的业务才读从库。
+
+### 9.3 真实故障复盘三：死锁排查全过程
+
+- **定位**：`SHOW ENGINE INNODB STATUS\G` 看 `LATEST DETECTED DEADLOCK`，里面有事务 A/B 的 `WAITING FOR THE LOCK` 与 `HOLDS THE LOCK(S)`，据此还原加锁顺序。
+- **典型案例**：事务 A 先锁 `id=1` 再请求 `id=2`；事务 B 先锁 `id=2` 再请求 `id=1` → 交叉等待死锁。
+
+```mermaid
+sequenceDiagram
+    participant A as 事务A
+    participant B as 事务B
+    A->>A: 持有 id=1 锁
+    B->>B: 持有 id=2 锁
+    A->>B: 请求 id=2 锁（等待B）
+    B->>A: 请求 id=1 锁（等待A）
+    Note over A,B: 死锁检测介入，回滚代价小的一方
+```
+
+- **治理**：全局统一加锁顺序（按主键升序）；缩短事务、减少锁粒度；`innodb_lock_wait_timeout=3`（秒级快速失败）；应用层捕获 `Deadlock` 异常后幂等重试；热点行用 `SELECT ... FOR UPDATE` 预占而非 `INSERT ... ON DUPLICATE KEY` 隐式加锁。
+
+### 9.4 高并发写入优化：batch 写入
+
+- 单条 `INSERT` 改批量：`INSERT INTO t(c1,c2) VALUES (...),(...),...;` 每批 500~1000 行，大幅减少网络往返与 binlog 体积。
+- **关键**：MySQL Connector/J 必须加 `rewriteBatchedStatements=true`，否则 `addBatch` 仍被拆成单条发送。
+- 海量导入走 `LOAD DATA INFILE`（local 或服务端），绕过 SQL 解析层，比 `INSERT` 快一个数量级。
+- `INSERT ... ON DUPLICATE KEY UPDATE` 合并"存在则更新"，减少读判断。
+
+### 9.5 高并发写入优化：分区表
+
+- 按时间 `RANGE (TO_DAYS(create_time))` 做冷热分离，删除旧数据直接 `ALTER TABLE DROP PARTITION`（秒级、不写 redo，比 `DELETE` 轻得多）。
+- 分区裁剪（partition pruning）要求查询条件含分区键，否则退化为全分区扫描。
+- **坑**：分区数 > 1000 元数据开销激增；主键/唯一索引必须包含分区键；`NULL` 值永远落第一个分区。
+
+### 9.6 高并发写入优化：写入削峰
+
+- **异步化**：写请求进 MQ，消费者按 DB 承受速率匀速落库，削峰填谷（大促下单典型套路）。
+- **合并写**：计数类（点赞/库存）先在 `Redis` 累加，定时批量 `UPDATE`；或 `INSERT ... ON DUPLICATE KEY UPDATE` 合并同一行的多次变更。
+- **限流保护**：DB 前置entinel/网关限流，避免瞬间洪峰冲垮连接池。
+
+### 9.7 MySQL 8.0 / 9.0 新特性（生产可用清单）
+
+- **窗口函数**（8.0）：`ROW_NUMBER()/RANK()/DENSE_RANK()/SUM() OVER (PARTITION BY ... ORDER BY ...)` 做排名、累计、同比环比，替代又慢又难维护的自连接。
+- **不可见索引 INVISIBLE**：`ALTER TABLE t ALTER INDEX idx INVISIBLE;` 线上灰度验证删索引不影响性能后再 `DROP`，误删可秒级 `VISIBLE` 恢复，避免"删了才发现慢"。
+- **直方图**：`ANALYZE TABLE t UPDATE HISTOGRAM ON col WITH 100 BUCKETS;` 改善非索引列基数估计，缓解 `WHERE col=...` 无索引时的执行计划误判。
+- **克隆副本 CLONE INSTANCE**：`CLONE INSTANCE FROM 'donor'@'...':3306 IDENTIFIED BY '...';` 从 donor 直接克隆数据目录拉起新从库，搭节点从小时级降到分钟级。
+- **原子 DDL + INSTANT ADD COLUMN**（8.0.12+）：加列秒级完成不重写表（仅追加元数据）；DDL 不再留 `.frm`，要么全成要么全败。
+- **MySQL 9.0**：默认 `utf8mb4`、移除过期 `mysql_native_password`、增强 `EXPLAIN` 与 telemetry；升级前重点回归验证旧认证插件与存储过程兼容性。
+
+### 9.8 金融科技级高可用：MGR 多主 + 异地容灾
+
+- **MGR 多主**：`group_replication_single_primary_mode=OFF`，写可落到任意节点；业务需规避写冲突（按主键哈希分片到不同主），否则提交期冲突检测会回滚。
+- **异地容灾（两地三中心）**：同城多 AZ 用 MGR（Paxos 多数派），跨城异步 binlog 投递；全程依赖 `GTID` 保证位点连续可追。
+- **故障切换**：`MySQL Router`（智能路由）或 Orchestrator（拓扑管理与自动 failover）；RTO 秒级、RPO 同城近 0。
+- **数据零丢失**：`group_replication_consistency=AFTER`（读也走多数派确认）+ 半同步，牺牲少量延迟换强一致，金融核心账务必备。
+
+### 9.9 慢查询根因分析 Checklist（可直接当预案）
+
+1. `EXPLAIN` 看 `type`：`ALL`/`index`/`range`/`ref`/`eq_ref`，目标是 `ref` 以上；`key` 是否为 `NULL`。
+2. `rows` 估算扫描量 vs 实际返回量，偏差大说明统计信息不准 → `ANALYZE TABLE`。
+3. `Extra` 是否含 `Using filesort` / `Using temporary`（排序/分组无索引，最易踩）。
+4. 是否对索引列套函数或发生隐式转换（见 9.1）。
+5. 是否深分页 `LIMIT 100000,10` → 改业务游标 `id > ? ORDER BY id LIMIT 10`。
+6. 是否 `SELECT *`（多余回表 + 网络开销）。
+7. 索引选择性是否过低（性别/状态位单列无意义）。
+8. 锁等待：`sys.innodb_lock_waits` / `Innodb_row_lock_waits` 是否飙高。
+9. 缓冲池命中率：`Innodb_buffer_pool_read_hit` 低 → 内存不足导致物理读。
+10. 聚合分析：`pt-query-digest` 跑慢日志，抓 TOP 10 耗时/次数 SQL 优先治理。

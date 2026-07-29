@@ -83,6 +83,94 @@ flowchart LR
 - [ ] 状态外置 + 存算分离，让计算 Pod 可弹性重建。
 - [ ] 用 HPA/KEDA 按负载弹性（如按 Kafka lag 扩 Flink）。
 - [ ] 作业依赖用 Airflow/DolphinScheduler 编排，加 SLA 与告警。
-- [ ] 监控：队列资源使用、Pending 容器、作业失败率、调度延迟。
+  - [ ] 监控：队列资源使用、Pending 容器、作业失败率、调度延迟。
 
 > 参考：Apache YARN 架构与调度器文档、Spark/Kubernetes 集成指南、Flink Native Kubernetes 与 Operator 文档、Airflow/DolphinScheduler 文档。
+
+## 六、YARN 调度器配置实战
+
+```xml
+<!-- Capacity Scheduler: 多队列 + 资源保底 -->
+<property>
+  <name>yarn.scheduler.capacity.root.queues</name>
+  <value>realtime,batch</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.realtime.capacity</name>
+  <value>40</value>            <!-- 实时队列保底 40% -->
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.realtime.maximum-capacity</name>
+  <value>80</value>            <!-- 最多借到 80% -->
+</property>
+```
+
+- **Capacity**：给实时/核心业务保底，避免被离线大作业挤占（生产首选）。
+- **Fair**：资源动态均分，小作业快返回，适合交互/混合负载。
+
+## 七、Spark / Flink on Kubernetes 实战
+
+```yaml
+# Flink Native K8s JobManager Deployment（节选）
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: flink-jobmanager }
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: jobmanager
+        image: flink:1.18
+        args: ["jobmanager"]
+        resources:
+          requests: { cpu: "1", memory: "2Gi" }
+          limits:   { cpu: "2", memory: "4Gi" }
+# TaskManager 由 Flink Operator 按并行度拉起，状态外置对象存储
+```
+
+- Spark on K8s：`spark-submit --master k8s://... --deploy-mode cluster --conf spark.kubernetes.container.image=spark:3.5`。
+- 关键：**状态外置对象存储 + 远程状态后端**，Pod 无状态可弹性重建。
+
+## 八、Airflow vs DolphinScheduler 对比
+
+| 维度 | Airflow | DolphinScheduler |
+|------|---------|------------------|
+| 编排方式 | Python DAG 代码 | 可视化拖拽 DAG |
+| 定位 | 通用工作流 | **大数据专属** |
+| 调度 | 强（cron/数据集触发） | 强（依赖/定时/补数） |
+| 运维 | 较重（worker/调度器） | 中（去中心化） |
+| 国产生态 | 一般 | 强（中文、易用） |
+
+- 选型：云原生/工程团队 → Airflow；大数据团队/可视化 → DolphinScheduler。
+
+## 九、弹性伸缩：HPA / KEDA
+
+- **HPA（水平 Pod 自动扩缩）**：按 CPU/内存扩 Flink TM / Spark Executor Pod。
+- **KEDA**：按**业务指标**扩，如 Kafka consumer lag、队列深度：
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: flink-consumer }
+spec:
+  scaleTargetRef: { name: flink-taskmanager }
+  triggers:
+  - type: kafka
+    metadata:
+      topic: orders
+      bootstrapServers: kafka:9092
+      consumerGroup: flink-cg
+      lagThreshold: "50"     # lag>50 扩容
+```
+
+- 存算分离 + KEDA 让"峰时扩容、谷时缩容"，成本最优。
+
+## 十、调度与编排 Checklist
+
+- [ ] 多团队用 Capacity 队列隔离，实时保底。
+- [ ] Spark/Flink Native on K8s，状态外置、Pod 无状态。
+- [ ] 作业编排用 Airflow/DS，DAG 依赖 + SLA + 告警。
+- [ ] 弹性：HPA 按资源、KEDA 按 Kafka lag 扩缩。
+- [ ] 质量不过关阻断下游（与治理联动）。
+- [ ] 监控队列资源、Pending、作业失败率、调度延迟。
