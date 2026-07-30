@@ -203,7 +203,7 @@ Kubernetes 架构与核心概念笔记：集群架构、核心对象（Pod/Deplo
 
 ### 卷三 · 源码精读
 
-主流中间件与框架源码解析：RocketMQ、Nacos、ZooKeeper、Netty、Sentinel、Spring，以及 Java 基础。
+主流中间件与框架源码解析：RocketMQ、Nacos、ZooKeeper、Netty、Sentinel、Spring、Java 基础，以及 JVM 并发底层、并发集合、MyBatis、Dubbo。
 
 - 📝 [RocketMQ](源码系列/rocketMq.md)
 - 📝 [Nacos](源码系列/Nacos.md)
@@ -212,6 +212,10 @@ Kubernetes 架构与核心概念笔记：集群架构、核心对象（Pod/Deplo
 - 📝 [Sentinel](源码系列/sentinel.md)
 - 📝 [Spring](源码系列/spring.md)
 - 📝 [Java 基础](源码系列/java基础.md)
+- 📝 [JVM 与并发底层（synchronized/volatile/类加载）](源码系列/JVM与并发底层源码.md)
+- 📝 [ThreadLocal 与并发集合](源码系列/ThreadLocal与并发集合源码.md)
+- 📝 [MyBatis](源码系列/MyBatis源码.md)
+- 📝 [Dubbo](源码系列/Dubbo源码.md)
 
 👉 [进入文件夹 →](源码系列/)
 
