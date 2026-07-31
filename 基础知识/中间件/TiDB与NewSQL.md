@@ -6,6 +6,20 @@
 
 ---
 
+
+## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+
+**它是什么**：TiDB 是 PingCAP 开源的**分布式关系型数据库（NewSQL）**，兼容 MySQL 协议，计算存储分离，既保留 SQL + ACID，又具备水平扩展能力，是「MySQL 分库分表」的现代替代。
+
+**解决什么痛点**：单机 MySQL 有存储/并发上限；分库分表跨片 JOIN、全局事务、DDL 不停机都很难。NewSQL（TiDB/OceanBase/CockroachDB）兼得「SQL + 强一致 + 水平扩展」，数据量超 10TB 或单表 10 亿行时优势明显。
+
+**核心概念**：TiDB Server（无状态 SQL 层）、PD（Placement Driver，元数据+调度+全局 TSO）、TiKV（分布式 KV 存储，Raft 多副本，按 Region 分片）、TiFlash（列存，HTAP）、MVCC（Percolator 模型）、Online DDL、AUTO_RANDOM。
+
+**适用场景**：海量关系数据、跨分片 JOIN/事务、HTAP（OLTP+OLAP 一套）、MySQL 协议兼容的平滑迁移。
+**不适用**：超小数据量（运维成本高于单机 MySQL）、需 100% MySQL 私有语法特性。
+
+---
+
 ## 一、什么是 NewSQL
 
 NoSQL 解决了扩展，却丢了 SQL/ACID。NewSQL 的目标是：**像单机关系型一样用 SQL + 强一致事务，又像 NoSQL 一样水平扩展**。TiDB、CockroachDB、OceanBase 都属此列。
@@ -100,3 +114,51 @@ graph TB
 | 一致性 | Raft 多副本，RPO=0 |
 | 许可证 | Apache-2.0 |
 | 一句话 | 「MySQL 的分布式分身」——扩容不用分库分表 |
+
+---
+
+## 面试高频问题（20+ 条）
+
+1. **什么是 NewSQL，与 MySQL 分库分表区别？** NewSQL = SQL + 强一致 + 水平扩展。对比分库分表：跨分片 JOIN 原生支持（分库分表不支持）、跨分片事务（Percolator/2PC vs XA 慢不稳）、扩缩容自动 rebalance（分库分表手动重分片）、Online DDL（分库分表需 gh-ost）、业务几乎零改造（分库分表每张表改 shard key）。
+
+2. **TiDB 三层架构？** TiDB Server（无状态 SQL 层，解析优化，兼容 MySQL 协议）、PD（Placement Driver，元数据+调度+全局 TSO，奇数 3 节点）、TiKV（分布式 KV 存储，Raft 多副本，按 Region 分片）、TiFlash（列存，HTAP）。
+
+3. **PD 的作用？** 集群大脑：存 Region 分布与拓扑、分配全局事务 ID（TSO）、根据 TiKV 上报下发调度（均衡、故障恢复）。至少 3 节点高可用，建议奇数。
+
+4. **TiKV 的 Region 与 Raft？** 数据按 Key Range 切分为 Region（默认 96MB），每个 Region 默认 3 副本，通过 Raft 选主与同步，Leader 处理读写，2 副本故障 30 秒内自动恢复。
+
+5. **MVCC 与事务模型？** 基于 Percolator 模型 + MVCC，PD 分配全局版本号实现 Snapshot Isolation；分布式事务跨多 TiKV 透明提交。
+
+6. **TiDB 与 MySQL 兼容性？** 兼容 MySQL 协议/语法/工具链（mysql 客户端直连，端口 4000），多数场景可直接替换。但不 100% 兼容：auto_increment 非严格顺序（用 AUTO_RANDOM）、不支持 SELECT...INTO OUTFILE、部分存储过程/空间函数。
+
+7. **为什么用 AUTO_RANDOM？** 分布式下自增主键会产生写入热点（值单调落在同一 Region），AUTO_RANDOM 打散主键避免热点。
+
+8. **HTAP 怎么实现？** TiKV 行存负责 OLTP，TiFlash 列存异步同步 TiKV 数据（通过 Raft Learner），分析查询用 READ_FROM_STORAGE(TIFLASH[...]) 提示走列存，TP/AP 互不干扰。
+
+9. **与 CockroachDB 区别？** TiDB 兼容 MySQL 协议，CockroachDB 兼容 PostgreSQL 协议；二者都基于 Raft。TiDB 国内生态活跃，CockroachDB 全球化多区域强但国内支持弱。
+
+10. **与 OceanBase 区别？** OB 对称架构、兼容 MySQL/Oracle、LSM 高压缩、金融级容灾（RTO<8s）；TiDB 分层 HTAP、MySQL 兼容、TiUP 工具链完善。选型看协议栈与生态。
+
+11. **TiDB 的写入热点问题？** 单调自增主键/时间戳做主键会导致写集中单 Region。规避：用 AUTO_RANDOM、随机/散列分片键、避免热点索引。
+
+12. **何时选 TiDB？** 数据量超 10TB 或单表 10 亿行、跨分片 JOIN/事务频繁、需不停机扩容、想保留 MySQL 生态平滑迁移。
+
+13. **何时不该用 TiDB？** 数据量小（运维成本高）、需 100% MySQL 私有语法、超简单单机场景（单机 MySQL 更省）。
+
+14. **Online DDL 如何不停机？** TiDB 原生支持加索引/改表结构在线进行，不锁全表，业务无感；分库分表则需 gh-ost/pt-osc。
+
+15. **分布式事务性能代价？** 跨节点 2PC + MVCC，延迟比单节点高（10-100ms 级），不适合极致低延迟单点写；设计上尽量让事务落在单 Region。
+
+16. **TiFlash 与 ClickHouse 区别？** TiFlash 是 TiDB 内置列存、与行存实时同步、服务于 HTAP；ClickHouse 是独立 OLAP 列存库，擅长超大规模聚合。
+
+17. **TiDB 向量搜索（实验）？** 8.4+ 支持 VECTOR 类型与向量检索（实验特性），扩展多模能力。
+
+18. **二级索引性能？** TiDB 二级索引相对行存弱，全球索引/分区需规划；热点写会放大索引开销。
+
+19. **资源管控？** 7.1+ 支持资源组（Resource Group）流控，做多租户隔离，避免大查询拖垮全局。
+
+20. **备份与生态工具？** TiUP（部署运维）、BR（备份恢复）、DM（数据迁移）、CDC（增量同步）、TiDB Dashboard（管控界面）。
+
+21. **与 MongoDB 对比选型？** 要 SQL+事务+关联用 TiDB；要灵活 Schema+文档模型+弱事务用 MongoDB。
+
+22. **TiDB 的局限？** 组件多运维门槛高、分布式事务延迟、热点写需规避、非 100% MySQL 兼容、成本比单机 MySQL 高 2-5 倍。

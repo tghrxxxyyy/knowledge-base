@@ -6,6 +6,20 @@
 
 ---
 
+
+## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+
+**它是什么**：RabbitMQ 是基于 **AMQP 0-9-1 协议**的开源消息代理（Message Broker），用 Erlang 编写，以「灵活路由 + 高可靠 + 易运维」著称，是通用消息队列的代表。
+
+**解决什么痛点**：分布式系统需要异步解耦、削峰填谷、可靠投递、延迟队列。RabbitMQ 通过 Exchange→Queue→Binding 的路由模型支持丰富投递语义，并提供 Confirm、持久化、手动 ACK、死信队列等可靠性机制。
+
+**核心概念**：Producer/Consumer、Queue（FIFO）、Exchange（Direct/Fanout/Topic/Headers 四种类型）、Binding（路由规则）、Routing Key、Vhost（逻辑隔离）、Channel（轻量连接）、Publisher Confirm、死信队列（DLX）、镜像队列、惰性队列、QoS prefetch。
+
+**适用场景**：业务解耦、异步任务、延迟队列、复杂路由、企业级可靠消息。
+**不适用**：超高通量日志流（应选 Kafka/Pulsar）。
+
+---
+
 ## 一、它解决什么问题
 
 微服务/单体里，模块间直接调用会导致**强耦合、同步阻塞、故障扩散**。RabbitMQ 引入「Broker 中转」：
@@ -109,3 +123,51 @@ graph LR
 | 吞吐 | 5万~10万 msg/s（中等） |
 | 许可证 | MPL 2.0 + Apache 2.0 |
 | 一句话 | 「业务级消息」——可靠、路由灵活、好管理 |
+
+---
+
+## 面试高频问题（20+ 条）
+
+1. **RabbitMQ 是什么，核心组件？** 基于 AMQP 0-9-1 的开源消息代理，Erlang 编写。组件：Producer、Consumer、Queue（FIFO）、Exchange（路由）、Binding（规则）、Vhost（逻辑隔离）、Channel（轻量连接）。
+
+2. **四种 Exchange 类型？** Direct（精确匹配 Routing Key，点对点）；Fanout（广播到所有绑定队列）；Topic（模式匹配 * 单层、# 多层，日志/订阅）；Headers（按消息头匹配，性能差少用）。
+
+3. **如何保证消息不丢失（三层防护）？** 生产者：开启 Confirm 模式（异步 ACK）；Broker：Exchange/Queue/消息都 durable 持久化（delivery_mode=2）；消费者：关闭 autoAck，业务处理完手动 basicAck，失败 NACK/重入队或进死信队列。
+
+4. **死信队列（DLX）是什么？** 消息变成死信（被拒 requeue=false、TTL 过期、队列满）后，按 x-dead-letter-exchange 路由到死信队列。常用于异常隔离、重试、审计。
+
+5. **如何实现延迟队列？** 方案：① 死信交换机 + 消息/队列 TTL（过期后进 DLX）；② 官方 rabbitmq-delayed-message-exchange 插件（原生延迟，推荐）。
+
+6. **消息重复消费如何处理？** 消费端做幂等：数据库唯一索引、Redis SETNX、状态机（已支付再支付直接返回成功）、布隆过滤器去重 Message ID。
+
+7. **RabbitMQ 与 Kafka 核心区别？** 设计目标：RabbitMQ 通用队列/复杂路由，Kafka 高吞吐日志流；吞吐量：RabbitMQ 万级/秒，Kafka 十万~百万级/秒；消息模型：RabbitMQ 队列 Push/Pull，Kafka 分区日志 Pull；顺序：RabbitMQ 单队列有序，Kafka 分区内有序。
+
+8. **集群模式有哪些？** 普通集群（元数据共享，队列数据单节点）；镜像队列（队列数据同步多节点，HA，但 3.12+ 被 Quorum Queue 取代）；Federation（跨机房异步复制）；Shovel（跨集群主动搬运）。
+
+9. **镜像队列/Quorum Queue？** 镜像队列把队列数据复制到多节点防丢失；RabbitMQ 3.12+ 默认所有队列为惰性队列，推荐用 Quorum Queue（Raft 复制）替代老镜像队列做高可用。
+
+10. **内存告警与磁盘告警？** 内存超 vm_memory_high_watermark（默认 0.4）阻塞所有连接；磁盘低于 disk_free_limit（默认 50MB）阻塞生产者。可调水位或启用惰性队列。
+
+11. **什么是惰性队列（Lazy Queue）？** 消息直接写磁盘、不驻留内存，适合长队列/消息堆积/内存紧张；3.12+ 默认开启。恢复快（已在磁盘）。
+
+12. **Flow Control 流控？** 当内存/磁盘接近阈值，RabbitMQ 暂停接收消息防止过载，资源回落后自动恢复。
+
+13. **如何保证消息顺序？** 单队列 + 单消费者（性能低）；或用分片队列/单一消费者避免并发乱序。RabbitMQ 全局顺序难保证，网络分区下尤甚。
+
+14. **TTL 配置方式？** 消息级 expiration 属性；队列级 x-message-ttl 参数。过期消息移除，配 DLX 则进死信队列。
+
+15. **优先级队列？** 声明队列时 x-max-priority 指定最大优先级，发送时设 priority；高优先级先消费。
+
+16. **QoS / prefetch 作用？** channel.basic_qos(prefetch_count) 限制消费者未确认消息数，防止单消费者积压、实现公平分发（轮询 + 预取）。
+
+17. **脑裂（Network Partition）处理？** 策略：ignore（默认需人工）、autoheal（自动愈合）、pause_minority（少数派暂停）。建议生产配 autoheal 或 pause_minority。
+
+18. **Vhost 作用？** 单 Broker 上逻辑隔离，相当于独立 MQ 实例；不同业务用独立 Vhost + 权限控制（configure/write/read）。
+
+19. **消息积压怎么处理？** 增加消费者、优化消费逻辑、消息分流到多队列/Exchange、临时扩容、惰性队列抗堆积；必要时丢弃非关键消息。
+
+20. **安全机制？** 认证（内置/ LDAP/ OAuth2-JWT）、授权（Vhost + 权限）、传输 TLS/mTLS、防火墙限制端口（5672/15672/15674）。
+
+21. **性能瓶颈与解决？** 磁盘 IO（SSD、分离日志）、内存（加内存、惰性队列）、CPU（避免复杂 Topic 正则）、连接数（连接池 + 多 Channel）、队列过长（分片/联邦）。
+
+22. **RabbitMQ 选型场景？** 需精确路由、低延迟、可靠投递、延迟队列的业务解耦；超高通量日志流选 Kafka/Pulsar。

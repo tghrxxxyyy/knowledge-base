@@ -6,6 +6,20 @@
 
 ---
 
+
+## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+
+**它是什么**：Neo4j 是最主流的**原生图数据库**（Native Graph DB），数据以「节点-关系-属性」的图结构物理存储，而非模拟成关系表。查询语言为 Cypher（声明式图查询）。
+
+**解决什么痛点**：关系型数据库做「多跳关联」（如朋友的朋友、欺诈团伙、知识图谱推理）要靠层层 JOIN，复杂度随跳数指数级上升。Neo4j 用「免索引邻接（index-free adjacency）」——节点直接持有邻居指针，每跳 O(1)，多跳遍历复杂度只与局部邻居规模相关。
+
+**核心概念**：Node（节点/实体）、Relationship（关系，有方向+类型）、Property（属性）、Label（标签/分类）、Cypher（MATCH/WHERE/RETURN）、索引与约束、因果集群（Core + Read Replica）、超级节点（supernode）问题。
+
+**适用场景**：社交网络、知识图谱、金融风控反欺诈、推荐系统、物流路径规划等关联密集型数据。
+**不适用**：超大规模（百亿级关系）无分片的开源版、扁平大表批量分析。
+
+---
+
 ## 一、为什么需要图数据库
 
 关系型数据库靠「外键 + JOIN」重建实体关系。当关联深度 ≥ 3 跳（如「朋友的朋友」「风险传导链」），JOIN 数量指数增长、执行计划难优化、I/O 暴涨。
@@ -124,3 +138,51 @@ ORDER BY p2.age DESC
 | 高可用 | Causal Cluster（Raft）+ AuraDB 云 |
 | 许可证 | Community GPLv3 / Enterprise 商业 |
 | 一句话 | 「关系密集 + 多跳」场景的天然解 |
+
+---
+
+## 面试高频问题（20+ 条）
+
+1. **Neo4j 与关系型数据库核心区别？** 数据模型：Neo4j 图（节点-关系-属性），MySQL 表-行-列；关联查询：Neo4j 免索引邻接 O(1) 每跳，MySQL 多层 JOIN 复杂度 O(n^k)。深度关联 Neo4j 碾压。
+
+2. **什么是免索引邻接（index-free adjacency）？** 每个节点记录直接持有其关系链表的指针，遍历时顺着指针走，每跳 O(1)，与全库规模无关。这是图库比 SQL JOIN 快的根本原因。
+
+3. **数据模型三要素？** Node（节点/实体）、Relationship（关系，必须有方向和类型）、Property（属性，键值对）；Label（标签）给节点分类，一个节点可有多个标签。
+
+4. **Cypher 基础写法？** MATCH (p:Person {name:'张三'}) RETURN p 查节点；CREATE (a)-[:FRIENDS_WITH]->(b) 建关系；MATCH...OPTIONAL MATCH 类似 LEFT JOIN；变长路径用 -[:FOLLOWS*1..3]->。
+
+5. **MATCH 与 OPTIONAL MATCH 区别？** MATCH 必须匹配才返回；OPTIONAL MATCH 即使无匹配也返回（缺失部分 null），等价于 SQL LEFT JOIN。
+
+6. **索引类型与创建？** 对 :Label(prop) 建索引 CREATE INDEX；唯一约束 CREATE CONSTRAINT ... ASSERT u.id IS UNIQUE（同时加速+防重）。
+
+7. **如何优化查询？** 建标签+属性索引；必须指定标签避免全图扫描；限制遍历深度（*1..3）防止无限遍历；用参数化查询（防注入+提升缓存命中）。
+
+8. **关系必须有方向吗？** 是，Neo4j 关系必须有方向（且类型唯一），查询时可忽略方向（MATCH (a)-[:X]-(b)）。
+
+9. **超级节点（supernode）问题？** 一个节点关联极多关系（如「全部用户」节点），遍历会拖垮性能。缓解：拆分关系类型、时间分区关系、避免中心化节点。
+
+10. **高可用与集群？** 因果集群（Causal Clustering）：Core 节点（Raft 共识，负责写，最小 3） + Read Replica（只读副本，分担读）。企业版支持分片（Sharding）处理超大规模。
+
+11. **Neo4j 的水平扩展局限？** 开源社区版集群功能有限，写无法分布式分片；亿级以上关系需企业版或改用 NebulaGraph/Dgraph。
+
+12. **企业级应用场景？** 社交网络（好友推荐）、知识图谱、金融风控反欺诈（团伙识别）、电商推荐、物流路径规划。
+
+13. **与 ArangoDB / NebulaGraph 对比？** Neo4j 生态成熟、Cypher 易用，但开源版写扩展弱；NebulaGraph 开源、高性能、百亿级；ArangoDB 多模型（图+文档+KV）。
+
+14. **何时不该用 Neo4j？** 扁平大表、批量分析、超大规模无分片的写密集场景；此时关系型+递归 CTE 或专用 OLAP 更合适。
+
+15. **Bolt 协议与 REST API？** Bolt 是二进制高性能协议（端口 7687）；也提供 REST/HTTP 与 Neo4j Browser（7474）。
+
+16. **Spring 集成？** Spring Data Neo4j（SDN）：@Node 实体、@Relationship 关系、Neo4jRepository，与 Spring Boot 无缝衔接。
+
+17. **GDS 库是什么？** Graph Data Science 库，提供 PageRank、社区发现、路径算法等图算法，用于推荐/欺诈检测。
+
+18. **节点记录物理结构？** 节点记录存指向第一条关系的指针，关系记录双向链表连接相邻关系，从而实现免索引邻接。
+
+19. **事务与 ACID？** Neo4j 支持 ACID 事务，单实例写入串行化，保证一致性；因果集群下读写通过 Raft 同步。
+
+20. **数据建模最佳实践？** 实体做节点、关联做关系（关系上只存关联属性）；单一主标签分类；避免过度关联；合理拆分冗余节点。
+
+21. **多跳查询性能数量级？** 实测百万用户+500 万关系，查「3 度好友」Neo4j <10ms，MySQL 多表 JOIN >500ms。
+
+22. **Neo4j 与 RDF/知识图谱关系？** Neo4j 是属性图模型，适合落地知识图谱存储与查询；RDF 是另一套语义网标准，二者模型不同。

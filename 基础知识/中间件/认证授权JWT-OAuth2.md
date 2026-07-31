@@ -5,6 +5,20 @@
 
 ---
 
+
+## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+
+**它是什么**：认证（Authentication，你是谁）与授权（Authorization，你能干什么）是系统安全的两道门。JWT 是**无状态令牌标准**（RFC 7519），OAuth2 是**授权框架**（RFC 6749），OpenID Connect（OIDC）在 OAuth2 之上补「身份认证」。
+
+**解决什么痛点**：Session-Cookie 方案服务端要存会话、跨域/多端扩展难、微服务下需共享会话。JWT 把用户信息签名进令牌，服务端无需存储即可校验；OAuth2 解决「第三方代授权访问」（如用微信登录），避免把密码交给第三方。
+
+**核心概念**：JWT（Header/Payload/Signature 三段 Base64）、Access Token、Refresh Token、OAuth2 四种授权模式（授权码/PKCE/客户端凭证/隐式已弃用）、OIDC ID Token、Scope、PKCE、JWKS、算法混淆攻击（HS256/RS256）。
+
+**适用场景**：微服务/API 鉴权、多端（Web/App）统一身份、第三方登录（SSO）、前后端分离。
+**不适用**：需即时吊销且容忍不了短过期+黑名单的极高安全场景。
+
+---
+
 ## 一、认证 vs 授权（一字之差）
 
 | 概念 | 英文 | 回答 | 例子 |
@@ -156,18 +170,53 @@ public class SecurityConfig {
 
 ---
 
-## 八、面试高频速查
+## 面试高频问题（20+ 条）
 
-- **认证 vs 授权？** 认证确认身份（你是谁），授权判定权限（能做什么）。
-- **JWT 三段？** header（算法）+ payload（claims）+ signature（签名防篡改）。
-- **JWT 优缺点？** 无状态易扩展；缺点是无法主动失效、载荷可解码不能放敏感信息。
-- **怎么解决 JWT 无法注销？** 短过期 + refresh token；或 jti 黑名单（Redis）。
-- **OAuth2 最安全模式？** 授权码（PKCE for 公共客户端）。
-- **OAuth2 vs OIDC？** OAuth2 是授权框架；OIDC 在其上做认证（加 id_token）。
-- **Session vs JWT？** Session 服务端可控可踢人但需存储；JWT 无状态易扩展但难吊销。
+1. **认证 vs 授权？** 认证（Authentication）确认你是谁（登录）；授权（Authorization）确认你能干什么（权限）。OAuth2 是授权框架，OIDC 在其上加身份认证。
+
+2. **JWT 三段结构？** Header（算法/类型）、Payload（claims：sub/exp/iat 等）、Signature（前两段 Base64URL + 密钥签名）。三段用点连接，自包含、可校验。
+
+3. **JWT vs Session-Cookie？** Session 有状态（服务端存会话，可即时吊销，扩展需共享存储）；JWT 无状态（令牌自带信息，易横向扩展，但过期前难即时吊销）。微服务/多端选 JWT，传统单体可选 Session。
+
+4. **为什么不应把 JWT 存 localStorage？** localStorage 可被 JS 读，XSS 直接偷令牌；应存 HttpOnly + Secure + SameSite Cookie（防 XSS 读取、防 CSRF），或存内存。
+
+5. **Access Token 与 Refresh Token 分工？** Access Token 短效（5-15 分钟）用于访问 API；Refresh Token 长效（数天~数周）用于换发新 Access Token，减少频繁登录。
+
+6. **Refresh Token 轮换（Rotation）？** 每次用 Refresh Token 换发新令牌时，旧 Refresh Token 立即作废；若被盗用，合法用户下次刷新会检测到复用并吊销全部令牌，缩小危害窗口。
+
+7. **OAuth2 四种授权模式？** 授权码（最安全，有后端 Web 应用）、授权码+PKCE（SPA/移动端，无 client_secret）、客户端凭证（服务间 M2M，无用户）、隐式与密码模式已弃用。
+
+8. **PKCE 是什么，为什么重要？** Proof Key for Code Exchange：公开客户端（SPA/App）无法安全存 client_secret，PKCE 用 code_verifier+challenge 防授权码拦截。现推荐所有流都加 PKCE。
+
+9. **OAuth2 与 OIDC 区别？** OAuth2 回答「能访问什么」（授权）；OIDC 加 ID Token（JWT）回答「用户是谁」（认证）。仅凭 OAuth2 不知用户身份，OIDC 才补充身份。
+
+10. **ID Token 能发给 API 吗？** 不能。ID Token 的 aud 是客户端应用，用于客户端验证用户身份；API 访问应用 Access Token。混用有安全风险。
+
+11. **HS256 vs RS256 区别？** HS256 对称（一个 secret 签名+验签），适合单服务；RS256 非对称（私钥签、公钥验），微服务中仅认证服务器持私钥，其他服务用公钥验，更安全解耦。
+
+12. **算法混淆攻击（Algorithm Confusion）？** RS256 环境下攻击者把 alg 改成 HS256，用公开的公钥当 HS256 密钥伪造签名。防御：服务端固定允许算法，不信任令牌里的 alg。
+
+13. **如何实现令牌吊销？** JWT 无状态难即时吊销：① 黑名单（Redis 存已吊销 jti）；② 短过期 + 吊销 Refresh Token；③ 令牌版本号（用户级 token_version，不匹配即拒）。方案②最实用。
+
+14. **JWT 过期时间设置建议？** Access Token 短（15m 内），Refresh Token 长（7d 内）；避免 30d 长过期 Access Token（被盗危害大）。
+
+15. **CORS 与 OAuth2 关系？** SPA 请求 token 端点需 CORS（auth server 允许该 Origin）；授权码流 token 交换在后端，无 CORS 问题；前端 PKCE 直连需 CORS。
+
+16. **密码如何安全存储？** 用 bcrypt/Argon2（自带加盐，work factor≥12），绝不明文；校验用恒定时间比较防时序攻击。
+
+17. **Client Credentials 何时用？** 服务间通信（M2M）、批处理、cron，无用户上下文，无 Refresh Token，过期直接重请。
+
+18. **令牌存储最佳实践（前端）？** 拆分：Access 存内存 + Refresh 存 HttpOnly/Secure/SameSite Cookie；或 Access+Refresh 都存 HttpOnly Cookie（加 CSRF 防护）。
+
+19. **OAuth2 不是认证！** OAuth2 本身是授权，单独用无法确定用户身份；需要身份认证请用 OIDC（拿 ID Token）。
+
+20. **SAML vs OIDC？** SAML 老牌企业 SSO（XML，老 SaaS）；OIDC 新（JSON/JWT，移动/SPA/微服务友好）。新项目优先 OIDC。
+
+21. **DPoP（证明持有）？** RFC 9449：即使令牌被盗，攻击者因无客户端私钥签名也无法用；Access Token 与 DPoP Proof 一起提交，确保仅持有者可用。
+
+22. **令牌被盗（secret 泄露）应急？** 立即轮换签名密钥并部署，现有令牌全部失效迫使用户重登；长期用 RS256 分离公私钥，泄露公钥无碍。
 
 ---
-
 ## 九、与其他板块的关系
 
 - 和「**基础知识/API 网关**」：网关常做统一 JWT 校验（`JwtAuthFilter`）。

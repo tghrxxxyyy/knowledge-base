@@ -6,6 +6,20 @@
 
 ---
 
+
+## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+
+**它是什么**：Apache Pulsar 是 Yahoo 开源、现为 Apache 顶级项目的**云原生消息与流平台**，最大创新是「计算与存储分离」的分层架构：无状态 Broker + BookKeeper 存储层 + ZooKeeper 协调层。
+
+**解决什么痛点**：Kafka 把消息存在 Broker 本地盘、计算存储耦合，扩容要迁数据、运维重。Pulsar 的 Broker 无状态，故障秒级接管、扩容无需搬数据；BookKeeper 提供条目级多副本持久化；天然支持多租户、跨地域复制、四种订阅模式。
+
+**核心概念**：Tenant/Namespace（多租户）、Topic、Subscription（Exclusive/Shared/Failover/Key_Shared 四种）、Broker（无状态）、Bookie（BookKeeper 存储节点）、Ledger（账本/append-only）、Ensemble/Write Quorum/Ack Quorum、Geo-replication、Pulsar Functions、分层存储。
+
+**适用场景**：云原生消息流、多租户 SaaS、需要弹性扩缩与跨地域复制、兼具队列与流处理的平台。
+**不适用**：极简轻量单机消息（运维组件多，偏重）。
+
+---
+
 ## 一、它解决什么问题
 
 Kafka 是「存算一体」：分区日志物理绑定在 Broker 本地磁盘。痛点：
@@ -120,3 +134,51 @@ Pulsar 一个 topic 支持多种订阅，灵活兼顾「队列」和「流」：
 | 延迟消息 | ✅ 原生 |
 | 适用 | 云原生/多租户/SaaS/全球化 |
 | 一句话 | 「消息流统一 + 存算分离」，弹性与隔离的极致 |
+
+---
+
+## 面试高频问题（20+ 条）
+
+1. **Pulsar 最大架构特点？** 计算与存储分离：无状态 Broker（路由/协议转换/负载均衡）+ BookKeeper 存储层（Bookie 节点，Ledger 账本持久化）+ ZooKeeper 协调层。Broker 不存数据，故障秒级接管。
+
+2. **为什么存储计算分离是优势？** 弹性扩展：计算/存储独立扩缩，加 Broker 提吞吐、加 Bookie 提容量，无需迁数据；运维简化：Broker 无状态、恢复快；云原生友好（契合 K8s）。
+
+3. **BookKeeper 与 Ledger 是什么？** BookKeeper 是分布式 WAL 存储系统，节点叫 Bookie；Ledger 是 append-only 日志（类似分布式日志段），每 Ledger 单写者、多副本、关闭后只读。Topic 由一个或多个 Ledger 组成。
+
+4. **副本机制（Ensemble/Write/Ack Quorum）？** 每条 Entry 写 Ensemble 个 Bookie，Write Quorum 写几份，Ack Quorum 几个确认即返回。常见 E=3, W=2, A=2，容忍 1 个 Bookie 故障。
+
+5. **四种订阅模式？** Exclusive（独占，单消费者）、Shared（共享，轮询分发、可扩消费者）、Failover（故障转移，主备）、Key_Shared（按 Key 哈希分组，保证同 Key 有序且可并行）。这是 Pulsar 相对 Kafka 的独特优势。
+
+6. **消息回溯（Retention）？** 可配保留时间/大小，消费进度（Cursor）存 BookKeeper，支持重放历史消息，无需像 Kafka 那样受 offset 限制。
+
+7. **Pulsar vs Kafka 核心差异？** 架构：Pulsar 存算分离，Kafka 存算耦合（Broker 本地盘）；扩展：Pulsar 加节点即生效无需 rebalance 搬数据，Kafka 分区迁移需复制数据（耗时）；消费进度：Pulsar 在 BookKeeper（与 Broker 解耦），Kafka 在 Broker/ZK。
+
+8. **多租户怎么实现？** Tenant（租户）→ Namespace（命名空间）→ Topic 三级，天然支持 SaaS 多团队隔离、配额、鉴权。
+
+9. **跨地域复制（Geo-replication）？** 原生支持跨集群异步复制，适合异地多活、容灾。
+
+10. **Pulsar Functions 是什么？** 轻量级流处理（类似 Lambda），无需外部 Flink/Spark 即可在 Broker 侧做简单 ETL/过滤/聚合。
+
+11. **Schema Registry？** 内置支持 Avro/JSON/Protobuf，保障生产消费数据格式一致，避免脏数据。
+
+12. **延迟消息支持？** 原生支持延迟消息（无需插件/定时任务），相比 RabbitMQ 需插件或 DLX 更方便。
+
+13. **分层存储（Tiered Storage）？** 冷数据自动卸载到对象存储（S3 等），热数据在 Bookie，降本且保留长周期回溯。
+
+14. **写入流程与 ACK？** 消息并发写多个 Bookie，延迟取最慢节点；Journal 先 WAL 保持久，再异步写 Entry Log；Ack Quorum 多数确认即回客户端。
+
+15. **消费进度为何比 Kafka 更稳？** Cursor 作为特殊 Ledger 存 BookKeeper，Broker 重启/切换不丢进度；Kafka offset 与分区绑定，Broker 故障可能需恢复。
+
+16. **Pulsar 的运维代价？** 组件多（Broker + Bookie + ZooKeeper + 可能 BookKeeper 的元数据），比 Kafka 部署复杂，小团队需评估。
+
+17. **何时选 Pulsar 而非 Kafka？** 需要弹性扩缩、多租户、跨地域复制、队列+流统一、消息回溯长周期、云原生场景。
+
+18. **Pulsar 与 RabbitMQ 区别？** Pulsar 定位消息+流平台、云原生、超高扩展；RabbitMQ 偏服务端复杂路由/可靠投递，生态简单。二者场景不同。
+
+19. **Pulsar 的协议支持？** 原生 Pulsar 协议（TCP/HTTP），也兼容 Kafka 协议（KoP）、AMQP、MQTT（通过协议处理器），便于迁移。
+
+20. **BookKeeper 高可用如何保证？** 多 Bookie 副本 + Ack Quorum；单 Bookie 故障数据不丢；Ledger 关闭后只读保证一致性。
+
+21. **Pulsar 的分区（Partition）？** Topic 可分多个分区提升并行度，分区内有序，类似 Kafka 分区概念，但底层仍由 Ledger 组成。
+
+22. **Pulsar 在消息积压下的表现？** 存算分离使存储独立扩展，积压时加 Bookie 即可，不影响 Broker 计算；Kafka 积压需扩分区+迁数据更重。
