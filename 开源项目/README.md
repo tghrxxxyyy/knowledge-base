@@ -132,3 +132,7 @@ GitHub 上有数亿仓库，头部高星项目几乎定义了现代软件开发�
 - [githublb — Top Starred Repositories](http://githublb.vercel.app/)
 - [ghtrends — Best LLM projects on GitHub](https://ghtrends.dev/zh/trends/llm)
 - [attosol — Top 100 Projects on GitHub (2026)](https://www.attosol.com/posts/2026/top-100-projects-on-github/)
+
+---
+
+[← 返回首页](../README.md)

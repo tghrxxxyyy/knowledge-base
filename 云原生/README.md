@@ -13,6 +13,7 @@
 | [Service Mesh](ServiceMesh.md) | Istio / Envoy、Sidecar、流量治理、mTLS | ⭐⭐ |
 | [可观测性](可观测性.md) | Metrics / Logs / Traces 三支柱、Prometheus / Grafana / Loki / OpenTelemetry | ⭐⭐⭐ |
 | [GitOps](GitOps.md) | 以 Git 为唯一事实源、Argo CD / Flux、声明式持续交付 | ⭐⭐ |
+| 🖼️ [K8S（早期截图笔记）](K8S.md) | 从有道云笔记导出的截图笔记（正文以图片为主，未做文字转录） | ⭐⭐ |
 
 ## 二、推荐学习路径
 
@@ -32,3 +33,7 @@
 ## 四、关键口诀
 
 > 容器轻、编排重；声明式、调谐环；每 Pod 一 IP、Service 做负载；探针分生死、HPA 抗波动；Sidecar 收治理、三支柱管可观测；Git 是唯一真相源。
+
+---
+
+[← 返回首页](../README.md)
