@@ -119,7 +119,7 @@ graph LR
 
 ## 八、与其他板块的关系
 
-- 与 [消息队列 MQ](MQ.md)、[RabbitMQ](RabbitMQ.md)、[Apache Pulsar](ApachePulsar.md)：MQTT 是「设备侧协议」，RabbitMQ/Kafka/Pulsar 是「服务端消息中间件」。常 MQTT 在边缘、Kafka/Pulsar 在后端，桥接配合。
+- 与 [消息队列 MQ](../MQ.md)、[RabbitMQ](RabbitMQ.md)、[Apache Pulsar](ApachePulsar.md)：MQTT 是「设备侧协议」，RabbitMQ/Kafka/Pulsar 是「服务端消息中间件」。常 MQTT 在边缘、Kafka/Pulsar 在后端，桥接配合。
 - 与 [数据同步 CDC-Canal](数据同步CDC-Canal.md)：IoT 设备数据进 Kafka 后，可继续走 CDC/流处理链路。
 
 ---

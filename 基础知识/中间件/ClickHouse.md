@@ -120,10 +120,10 @@ ClickHouse 的「快」很大程度来自表引擎。Mergetree 系列是主力�
 
 ## 七、与其他板块的关系
 
-- 与 [大数据/HBase](大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。
-- 与 [ES 体系](ES体系.md)：ES 偏「搜索 + 明细检索 + 日志全文」，ClickHouse 偏「结构化聚合分析」。日志场景常 ClickHouse 做聚合 + ES 做检索，或 ClickHouse 取代部分 ES 聚合。
+- 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。
+- 与 [ES 体系](../ES体系.md)：ES 偏「搜索 + 明细检索 + 日志全文」，ClickHouse 偏「结构化聚合分析」。日志场景常 ClickHouse 做聚合 + ES 做检索，或 ClickHouse 取代部分 ES 聚合。
 - 与 [数据同步 CDC-Canal](数据同步CDC-Canal.md)：MySQL binlog → Kafka → ClickHouse 是常见实时数仓链路。
-- 与 [消息队列 MQ](MQ.md)：ClickHouse 常作为 Kafka 下游消费端，承载实时分析。
+- 与 [消息队列 MQ](../MQ.md)：ClickHouse 常作为 Kafka 下游消费端，承载实时分析。
 
 ---
 

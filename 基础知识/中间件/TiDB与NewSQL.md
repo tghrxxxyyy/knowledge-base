@@ -95,7 +95,7 @@ graph TB
 
 ## 六、与其他板块的关系
 
-- 与 [MySQL](mysql知识.md)、[分库分表 ShardingSphere](分库分表ShardingSphere.md)：TiDB 是「不分库分表也能水平扩展」的替代方案，sharding 是应用层手动分片，TiDB 是存储层自动分片（Region）。
+- 与 [MySQL](../mysql知识.md)、[分库分表 ShardingSphere](分库分表ShardingSphere.md)：TiDB 是「不分库分表也能水平扩展」的替代方案，sharding 是应用层手动分片，TiDB 是存储层自动分片（Region）。
 - 与 [MongoDB](MongoDB.md)：TiDB 保 ACID/SQL、强一致；MongoDB 保灵活 Schema/文档。事务强一致场景选 TiDB。
 - 与 [分布式事务 Seata](分布式事务Seata.md)：Seata 解决「多个独立数据源」的分布式事务；TiDB 自身内部已通过 Percolator 提供跨行 ACID，二者在不同层次。
 - 与 [ClickHouse](ClickHouse.md)：TiDB HTAP 的分析能力对许多场景够用；超大规模纯分析（单表聚合）仍 ClickHouse 更强，常见「TiDB 做事务 + ClickHouse 做分析」组合。

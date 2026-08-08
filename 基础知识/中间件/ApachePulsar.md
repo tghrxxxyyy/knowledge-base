@@ -115,7 +115,7 @@ Pulsar 一个 topic 支持多种订阅，灵活兼顾「队列」和「流」：
 
 ## 七、与其他板块的关系
 
-- 与 [RabbitMQ](RabbitMQ.md)、[消息队列 MQ](MQ.md)、[MQTT](MQTT与消息broker.md)：同属消息家族。Pulsar 是「云原生统一消息流」，RabbitMQ 是「业务路由」，MQTT 是「设备协议」。
+- 与 [RabbitMQ](RabbitMQ.md)、[消息队列 MQ](../MQ.md)、[MQTT](MQTT与消息broker.md)：同属消息家族。Pulsar 是「云原生统一消息流」，RabbitMQ 是「业务路由」，MQTT 是「设备协议」。
 - 与 [注册中心与配置中心](注册中心与配置中心.md)：Pulsar 自带元数据层，不依赖外部注册中心。
 - 与 [数据同步 CDC-Canal](数据同步CDC-Canal.md)：Pulsar 可作 CDC 事件的统一总线（多租户、跨地域）。
 

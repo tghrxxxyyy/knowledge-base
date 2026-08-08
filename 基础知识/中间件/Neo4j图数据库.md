@@ -121,7 +121,7 @@ ORDER BY p2.age DESC
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。
-- 与 [MySQL](mysql知识.md)：二者互补——事务在 MySQL，关系网络在 Neo4j，CDC 同步。
+- 与 [MySQL](../mysql知识.md)：二者互补——事务在 MySQL，关系网络在 Neo4j，CDC 同步。
 - 与 [大模型/知识图谱](大模型/)：Neo4j 是经典知识图谱存储底座，配合 LLM 做 RAG 中的「实体-关系」检索。
 
 ---
