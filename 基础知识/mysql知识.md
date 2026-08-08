@@ -153,10 +153,28 @@ index_subquery、range、index_merge、index、all
 
 这个列包含很多不适合在其它列显示的重要信息，有很多种，常用的有：
 
-> ⚠️ 待确认：原导出中 extra 列的说明表格被占位符（●）腐蚀，仅能确认下列两条片段，其余原内容已丢失。
+| Extra 值 | 含义 | 是否需关注 |
+|----------|------|-----------|
+| `Using index` | **覆盖索引**：查询所需列均在索引中，无需回表 | ✅ 最优 |
+| `Using index condition` | **索引条件下推（ICP）**：存储引擎层先用索引过滤部分条件，减少回表（`index condition pushdown` 优化） | ✅ 好 |
+| `Using where` | 存储引擎返回的记录**并不都符合查询条件**，需要在 server 层再次过滤 | ⚠️ 结合 rows 评估 |
+| `Using filesort` | 无法利用索引排序，MySQL 需要**额外的排序操作**（内存/磁盘） | ⚠️ 大结果集慎用 |
+| `Using temporary` | 使用了**临时表**（常见于 `GROUP BY` / `DISTINCT` / `UNION` / 大 `ORDER BY`） | ⚠️ 磁盘临时表很慢 |
+| `Using join buffer` | 连接查询使用了**连接缓冲区**（如 Block Nested-Loop），未走索引连接 | ⚠️ 检查连接列索引 |
+| `Using MRR` | 使用 **Multi-Range Read** 优化：回表前先按主键排序再批量回表，减少随机 IO | ✅ 好 |
+| `Using intersect / union / sort_union` | 对应 `index_merge` 的三种索引合并方式（交集 / 并集 / 排序并集） | ✅ 视情况 |
+| `Using index for group-by` | 松散索引扫描：仅扫描索引部分即可完成 `GROUP BY` | ✅ 最优 |
+| `Using index for skip scan` | 跳跃扫描（MySQL 8.0）：前导列非等值时跳过部分索引段 | ✅ 好 |
+| `Distinct` | 优化器发现 `DISTINCT` 匹配第一行即可停止，无需排序去重 | ✅ 好 |
+| `Select tables optimized away` | 仅用索引聚合（`MIN/MAX` 等）即可返回，无需访问表（8.0） | ✅ 最优 |
+| `Full scan on NULL key` | 子查询中涉及 NULL 时优化器走全表扫描 | ⚠️ 注意 |
+| `FirstMatch / LooseScan / Materialize` | 半连接（子查询 in 优化）的三种策略：首匹配 / 松散扫描 / 物化 | ✅ 视情况 |
+| `No tables used` | 查询没有使用任何表（如 `SELECT 1`） | ✅ 正常 |
+| `Impossible WHERE` | WHERE 条件恒为假，优化器直接返回空结果 | ✅ 正常 |
 
-- `Using index`：覆盖索引，查询所需列均在索引中，无需回表（常见含义，原文档描述缺失）。
-- （值待补全）：表示存储引擎返回的记录并不都符合查询条件，需要在 server 层再次过滤，性能较低。
+> 记忆口诀：**覆盖 index、下推 index condition 是好；filesort、temporary、join buffer 是差；出现在 5.7 之前的 `Using index condition` 需要开启 ICP 才生效。**
+
+> ⚠️ 待确认：原导出中 extra 列说明表格被占位符（●）腐蚀，上表已按 MySQL 官方文档重新整理补齐（含 `Using where` 对应"server 层二次过滤"的原文含义）。
 
 ### filtered 列
 

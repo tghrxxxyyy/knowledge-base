@@ -13,6 +13,7 @@
 | [Service Mesh](ServiceMesh.md) | Istio / Envoy、Sidecar、流量治理、mTLS | ⭐⭐ |
 | [可观测性](可观测性.md) | Metrics / Logs / Traces 三支柱、Prometheus / Grafana / Loki / OpenTelemetry | ⭐⭐⭐ |
 | [GitOps](GitOps.md) | 以 Git 为唯一事实源、Argo CD / Flux、声明式持续交付 | ⭐⭐ |
+| [Helm 与 Operator](Helm与Operator.md) | 应用打包交付（Chart/values/Release）、CRD + 控制器把运维代码化 | ⭐⭐ |
 | 🖼️ [K8S（早期截图笔记）](K8S.md) | 从有道云笔记导出的截图笔记（正文以图片为主，未做文字转录） | ⭐⭐ |
 
 ## 二、推荐学习路径
@@ -21,7 +22,8 @@
 2. **再懂编排**：读「Kubernetes 核心」，抓住三条主线——*声明式 API（Spec/Status 调谐循环）*、*调度（Filter→Score→Bind）*、*网络（每个 Pod 一个 IP，无 NAT 互通）*。
 3. **然后治理**：微服务多了以后，读「Service Mesh」理解把熔断/重试/灰度从业务代码下沉到 Sidecar。
 4. **可观测兜底**：读「可观测性」，把 Metrics/Logs/Traces 串成排障闭环。
-5. **最后交付**：读「GitOps」，把「改 YAML → 集群自动同步」变成工程常态。
+5. **最后交付**：读「GitOps」，把「改 YAML → 集群自动同步」变成工程常态；有状态关键应用再读「Helm 与 Operator」，理解交付工具与自愈控制器。
+6. **有状态应用**：数据库/消息/缓存等读「Helm 与 Operator」，把备份、自愈、升级策略声明化。
 
 ## 三、与其他板块的关联
 

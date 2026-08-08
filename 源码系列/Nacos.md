@@ -87,7 +87,123 @@ private long watchDelay = 30000;
 
 ## 如何支持高并发注册（异步任务与内存队列设计原理及源码剖析）
 
-> ⚠️ 本小节内容待补充。
+> 本小节省略分布式一致性协议细节（Raft 见「[ZooKeeper](zookeeper.md)」/ etcd 章节），聚焦 Nacos 1.x 服务端**注册写入的异步化设计**——这是支撑百万级服务实例注册的核心。
+
+### 1. 整体设计：请求薄处理 + 异步队列 + 内存表
+
+服务端注册接口只做三件事，然后立刻返回：
+
+1. **更新内存实例表**（`ServiceManager.serviceMap`，ConcurrentHashMap）。
+2. **数据变更入内存队列**（`Notifier.tasks`），由独立线程消费，串行派发给各 `DataProcessor`。
+3. **节点间同步入队**（`DistroConsistencyService.distroTasks`），由 distro 线程异步发给集群其他节点。
+
+```mermaid
+flowchart LR
+    C[客户端注册 HTTP 请求] --> R[InstanceController.register]
+    R --> IO[InstanceOperatorClient]
+    IO --> IS[InstanceService.addInstance]
+    IS --> SM[ServiceManager.addInstance]
+    SM --> MEM[写入内存实例表<br/>memoryClusters / persistentInstances]
+    MEM --> NT[Notifier.tasks 内存队列<br/>LinkedBlockingQueue 128K]
+    NT --> NTH[Notifier 单线程消费<br/>按 key 去重合并]
+    NTH --> DP[DistroClientDataProcessor.onPut<br/>更新本地 Datum 快照]
+    NTH --> DC[其他 processor<br/>如持久化 Raft / 服务推送]
+    SM --> DT[distroTasks 队列]
+    DT --> DSYNC[DistroHttpAgent.syncData<br/>版本号 Datum 广播其他节点]
+```
+
+### 2. 服务端入口与 ServiceManager
+
+```java
+// InstanceController.register() → InstanceService.addInstance → ServiceManager.addInstance
+public void addInstance(String namespaceId, String serviceName, boolean ephemeral,
+                        Instance... ips) throws NacosException {
+    Service service = getService(namespaceId, serviceName);
+    if (service == null) {
+        service = createServiceIfAbsent(namespaceId, serviceName, ephemeral);
+    }
+    // 1. 写内存实例表（CopyOnWriteArrayList，读多写少）
+    service.addInstance(ips);
+    // 2. 异步化：一致性服务 put（内部入队，不阻塞请求线程）
+    consistencyService.put(key, instances);
+}
+```
+
+- `serviceMap` 是 `ConcurrentHashMap<String, Service>`，`Service.addInstance` 只操作**内存中的实例列表**，不落库、不加锁阻塞——请求线程的耗时是 O(1) 级，这是能扛高并发注册的第一层。
+- 临时实例（ephemeral=true）走 `DistroConsistencyService`（最终一致、内存态）；持久实例走 `PersistentConsistencyService`（Raft 落盘），前者才是注册风暴的主要路径。
+
+### 3. Notifier：内存队列 + 去重合并（注册写的核心）
+
+```java
+public class Notifier implements Runnable {
+    private final BlockingQueue<Object> tasks = new LinkedBlockingQueue<>(128 * 1024);
+    private final ConcurrentMap<String, String> services = new ConcurrentHashMap<>(); // key -> datumKey
+
+    public void addTask(String datumKey, String key) {
+        // 去重合并：同 key 还在队列/处理中，直接丢弃新任务
+        if (services.containsKey(key) && services.get(key).equals(datumKey)) {
+            return;
+        }
+        try { tasks.put(new NotifyTask(datumKey, key)); }
+        catch (InterruptedException e) { ... }
+    }
+
+    @Override
+    public void run() {              // 独立消费线程
+        while (true) {
+            Object task = tasks.take();        // 阻塞取
+            if (task instanceof NotifyTask) {
+                NotifyTask t = (NotifyTask) task;
+                process(t);                    // 串行派发
+            }
+        }
+    }
+}
+```
+
+**为什么能支持高并发注册？** 关键在于「合并」：
+
+- 100 万实例同时注册同一服务，`addTask` 先检查 `services` 里该 key 是否已有**未处理**任务，有则直接 return——**只有第一个请求真正入队**。
+- 队列容量 128K，入队失败（满）会走 `NacosException` 快速失败，而不是无限堆积打垮内存。
+- 消费线程是单线程，串行调用各 `DataProcessor.onPut`，天然规避并发写实例表的问题；`onPut` 内部处理的是**最新快照**而非增量数据，所以"丢弃中间任务"不会丢信息。
+
+### 4. DistroConsistencyService：本地 onPut + 异步集群同步
+
+```java
+public void put(String key, Record value) throws NacosException {
+    onPut(key, value);   // 1. 先更新本节点
+    distroTasks.offer(Datum.create(key, value.increaseVersion(), timestamp)); // 2. 入同步队列
+}
+```
+
+- `Datum` 自带**版本号 + 时间戳**：各节点同步时先比版本，旧版本数据直接丢弃，防止网络乱序导致旧数据覆盖新数据。
+- distro 任务线程轮询 `distroTasks`，把 Datum 经 `DistroHttpAgent.syncData`（HTTP POST）批量发给集群其他节点；对端 `onPut` 更新本地快照，完成**节点间最终一致**。
+- 相比"每次注册都同步全量"，distro 是**合并后按 key 同步最新快照**，节点越多节省越多。
+
+### 5. 心跳续约：把"注册"从风暴降为常态
+
+客户端 `registerInstance` 对临时实例**只发一次注册请求**，之后每 5s 由 `BeatReactor` 发心跳：
+
+```java
+// 服务端 BeatController.beat
+if (instance == null) {
+    // 实例不存在（如服务端重启丢数据）→ 心跳驱动补注册
+    serviceManager.registerInstance(...);   // 重新走 addInstance
+} else {
+    service.setLastBeat(...);               // 只更新时间戳，不触发全量同步
+}
+```
+
+- 心跳是**轻量续约**：只刷新 `lastBeat`，不重新入队同步 → 即使 100 万实例同时心跳，压力也可控（每 5s 一次 vs 每次全量）。
+- 服务端**主动健康检查**：`HealthCheckTask` 扫描超过 15s 未心跳的临时实例，标记不健康并从可用列表摘除——心跳断了不会永远占坑。
+
+### 6. 面试高频
+
+1. **Nacos 服务端如何抗住百万级注册？** 三层异步：请求只写内存表；`Notifier` 内存队列按 key 合并去重、单线程串行消费；distro 队列异步同步集群，全程不阻塞、不落库（临时实例）。
+2. **为什么不落库？** 临时实例以内存态 + 集群同步为准（类似 AP 系统），重启靠心跳补注册恢复；持久实例才走 Raft 落盘。
+3. **合并任务会不会丢数据？** 不会。`onPut` 处理的是 key 对应的**最新快照**，丢弃的是"中间过程"，最终值一定被处理。
+4. **版本号的作用？** 防止网络乱序/延迟导致旧 Datum 覆盖新数据；同时让对端可以跳过无变化同步。
+5. **心跳能替代注册吗？** 不能，但心跳能在服务端丢数据后**自动补注册**，这是 Nacos 自愈的关键。
 
 ## nacos 的配置中心功能实现
 
