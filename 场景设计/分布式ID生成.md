@@ -121,4 +121,25 @@ flowchart TD
 - [ ] 监控：号段使用率、QPS、DB 访问耗时、workerId 冲突告警。
 - [ ] 分库分表键与业务 ID 解耦设计，ID 生成服务独立部署、多机房容灾。
 
+## 六、面试高频追问
+
+1. Q：为什么不用数据库自增当分布式主键？ A：跨库不全局唯一、主从切换可能重复；写热点集中在单库；无序写入加剧 InnoDB 页分裂。
+2. Q：Snowflake 的 ID 里能读出什么？ A：时间（高位时间戳）、机房/机器（workerId）、并发量（序列号）——所以订单 ID 不能裸用雪花，要加随机因子。
+3. Q：时钟回拨怎么办？ 分四层：等待/重启换 workerId/持久化校验/预生成窗口（RingBuffer）；（进阶）回拨超阈值时切号段兜底。
+4. Q：Leaf 号段为什么快？ A：DB 只负责「批号段」，业务内存中逐号发放；双 Buffer 预取消除 IO 毛刺。
+5. Q：ID 生成服务自己挂了怎么办？ A：本地缓存号段/workerId 兜底 + 独立部署 + 多机房 + 降级到备用方案（对照 SRE 容灾思路）。
+6. Q：ID 要不要趋势递增？ A：主键要（B+Tree 写入性能）；分布式消息/日志 key 不必，UUID 即可。
+
+## 七、选型决策速查
+
+| 你的场景 | 直接选 |
+|----------|--------|
+| 订单/支付主键，强一致高可靠 | **Leaf-segment**（不依赖时钟） |
+| 需要 ID 含时间语义 + 容器化百万 QPS | **UidGenerator Cached** |
+| 已有 ZK 且想用雪花语义 | **Leaf-snowflake** |
+| 幂等 Token / traceId / 日志 ID | **UUID**（简单，不进 DB 主键） |
+| 测试 / 原型 | 自增或简化雪花 |
+
+> 一句话总结：**核心业务主键首选号段（Leaf-segment），无时钟风险、有 DB 兜底；追求语义与极致性能再上雪花变体（配好时钟防护）；Token/traceId 用 UUID。**
+
 > 参考：美团 Leaf 技术博客与开源（tech.meituan.com / GitHub Meituan-Dianping/Leaf）、百度 UidGenerator、滴滴 TinyID、Twitter Snowflake 原始设计。
