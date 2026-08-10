@@ -77,6 +77,21 @@ Argo CD（约 21k Star）与 Flux（约 15k Star）代表了「以 Git 为唯一
 
 > 一句话趋势：声明式、GitOps、eBPF、IaC 左移，是 2026 年基础设施最确定的四条主线。
 
+### 关键机制速览（工程师视角）
+
+| 项目 | 关键机制 | 工程启示 |
+|------|----------|----------|
+| Kubernetes | 声明式 API + 控制循环（Reconcile）+ etcd 强一致 | 一切自动化都是"期望状态 vs 实际状态"的收敛 |
+| Docker/moby | namespace（隔离）+ cgroup（限额）+ overlayfs（分层镜像） | 容器 = 内核能力组合，不是虚拟机；分层让镜像可缓存 |
+| Helm | Chart 模板（Go template）+ 版本化发布（release） | 用模板化解决"同一套应用多环境"的重复配置 |
+| Terraform | HCL 声明 + 状态文件（state）+ provider 依赖图 | 基础设施也要"版本控制 + 可回滚"；state 是核心资产 |
+| Ansible | 无 Agent（SSH）+ YAML 剧本（playbook）+ 幂等 | 配置管理追求幂等，重复执行结果一致 |
+| Prometheus | 拉模型 + 指标标签（label）+ PromQL | 指标设计（命名/标签基数）决定查询效率与告警质量 |
+| Argo CD / Flux | Git 仓库 → 集群持续同步（reconcile） | 部署可审计可回滚；漂移会被自动纠偏 |
+| Envoy / Cilium | 数据面代理（L4/L7）；eBPF 内核态转发 | Service Mesh 与内核网络：性能与可观测性的新基线 |
+
+**面试必知**：K8s 为什么不用 Docker 了（CRI/containerd）？容器和虚机的本质区别（共享内核 vs 独立内核）？GitOps 与 CI 的边界（CI 出镜像、CD 落集群）？——这些是云原生面试的高频四连问。
+
 ## 四、与其他模块的关联
 
 - **云原生 / Kubernetes**：本篇半数项目围绕 K8s 生态（编排、Helm、可观测、GitOps），核心参见 [../云原生/K8S.md](../云原生/K8S.md)。

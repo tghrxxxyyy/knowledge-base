@@ -83,6 +83,22 @@ awesome-selfhosted 汇总了所有**可自托管**的免费软件：从笔记、
 
 > 口诀：**"自托管、数据留，隐私主权握在手。"**
 
+## 深挖：怎么高效用这些资源（方法论）
+
+| 场景 | 推荐组合 | 用法建议 |
+|------|----------|----------|
+| 转行/入门 | freeCodeCamp → developer-roadmap → project-based-learning | 课程打底后立刻做项目，别停在"看课" |
+| 系统补基础 | ossu/computer-science + CS-Notes + You-Dont-Know-JS | 按 CS 体系逐块补，中文资料做速查 |
+| 面试冲刺 | system-design-primer + tech-interview-handbook + CS-Notes | 系统设计刷例题、算法用 TheAlgorithms 复盘 |
+| 想深挖原理 | build-your-own-x | 每周挑一个"造一遍"：造 Redis/Git/容器 |
+| 查工具/找资料 | awesome 系列 + the-book-of-secret-knowledge | 先看清单再深入，避免信息过载 |
+| 数据主权 | awesome-selfhosted | 用 Docker 把常用服务自托管一遍 |
+
+**三条原则**：
+1. **按需取用，不收藏即学会**——清单的价值在"找到对的东西"，读起来才算数；
+2. **做中学**（build-your-own-x 登顶的原因）：造一个 Redis 胜过读十篇 Redis 博客；
+3. **与知识库联动**：清单是"地图"，本库的板块文档是"景点"，二者配合用。
+
 ## 与其他模块的关联
 
 - 与 [大数据板块](../基础知识/大数据/README.md)：awesome-python / TheAlgorithms 等清单中的库与算法，正是大数据处理的常用工具与底层基础。

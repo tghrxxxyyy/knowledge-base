@@ -14,6 +14,7 @@
 | [可观测性](可观测性.md) | Metrics / Logs / Traces 三支柱、Prometheus / Grafana / Loki / OpenTelemetry | ⭐⭐⭐ |
 | [GitOps](GitOps.md) | 以 Git 为唯一事实源、Argo CD / Flux、声明式持续交付 | ⭐⭐ |
 | [Helm 与 Operator](Helm与Operator.md) | 应用打包交付（Chart/values/Release）、CRD + 控制器把运维代码化 | ⭐⭐ |
+| [Serverless 与 FaaS](Serverless与FaaS.md) | 无服务器架构：事件驱动、冷启动、Lambda/Knative、成本模型与边界 | ⭐⭐ |
 | 🖼️ [K8S（早期截图笔记）](K8S.md) | 从有道云笔记导出的截图笔记（正文以图片为主，未做文字转录） | ⭐⭐ |
 
 ## 二、推荐学习路径
