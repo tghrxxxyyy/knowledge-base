@@ -4,7 +4,7 @@
 
 ## 子板块
 
-- 📁 [大数据（全链路体系）](大数据/README.md) — 数据采集/存储/计算/数仓/湖仓一体（14 篇）
+- 📁 [大数据（全链路体系）](大数据/README.md) — 数据采集/存储/计算/数仓/湖仓一体/场景实战/安全合规/成本优化/数据服务化（17 篇）
 - 📁 [CI/CD（持续集成与持续交付）](CI-CD/README.md) — 版本控制/Jenkins/GitLab CI/GitOps（14 篇）
 - 📁 [中间件（日常项目高频组件）](中间件/README.md) — Kafka/RocketMQ/ZooKeeper/etcd/Nginx/ELK 等（23 篇）
 - 📁 [时序库](时序库/README.md) — InfluxDB/TDengine/Prometheus 等（7 篇）
