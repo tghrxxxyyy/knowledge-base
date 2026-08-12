@@ -46,9 +46,15 @@ flowchart LR
         ELK[ELK 日志体系]
         SW[链路追踪<br/>SkyWalking]
     end
+    subgraph 云托管[云上托管生态]
+        CLOUD[云上中间件总览<br/>PaaS 全景/选型]
+        CMSG[云上消息与集成<br/>SQS/SNS/EventBridge/Kinesis]
+        CDB[云上数据库与缓存<br/>RDS/Aurora/DynamoDB/ElastiCache]
+        CDW[云上数仓与大数据<br/>Redshift/Snowflake/BigQuery]
+    end
 ```
 
-## 2. 目录（23 篇）
+## 2. 目录（27 篇）
 
 ### 消息与流
 
@@ -102,6 +108,17 @@ flowchart LR
 | [ELK 日志体系](./ELK日志体系.md) | 日志集中采集检索 | 排障第一站：检索/大盘/告警 |
 | [链路追踪 SkyWalking](./链路追踪SkyWalking.md) | APM 链路追踪 | 慢在哪一跳，一目了然 |
 
+### 云上托管生态（PaaS）
+
+| 组件 | 定位 | 一句话 |
+|------|------|--------|
+| [云上中间件体系总览](./云上中间件体系总览.md) | PaaS 托管全景 | 云 vs 自建、四厂商对照图谱、选型六问 |
+| [云上消息与集成生态](./云上消息与集成生态.md) | 队列/主题/事件/流 | SQS/SNS/EventBridge/Kinesis/PubSub/云 RocketMQ |
+| [云上数据库与缓存生态](./云上数据库与缓存生态.md) | 托管关系库/NoSQL/缓存 | RDS/Aurora/PolarDB/DynamoDB/Cosmos/ElastiCache |
+| [云上数仓与大数据生态](./云上数仓与大数据生态.md) | 云数仓/湖仓/流计算 | Redshift/BigQuery/Snowflake/Databricks/云 Flink |
+
+> 云上选型一句话：**先定 IO/存储模型 → 找开源协议兼容的托管服务（防锁定）→ 算 SLA + 弹性 + 按量计费账。**
+
 ## 3. 学习路径
 
 1. **入门**：先懂「为什么需要中间件」——[分布式系统理论总纲](../分布式系统.md) → 本文档地图。
@@ -110,7 +127,8 @@ flowchart LR
 4. **性能**：Redis → 缓存三问 → 本地缓存 → 多级缓存（见「场景设计」）。
 5. **治理**：API 网关 → Nginx → XXL-JOB → Seata → 分库分表。
 6. **观测**：ELK 日志 → SkyWalking 链路 → 可观测性（见「云原生」）。
-7. **深挖**：每篇末尾的「与其他板块的关系」跳「源码系列」对应源码篇。
+7. **云上**：先读「云上中间件体系总览」→ 按需要钻进消息/数据库/数仓三篇生态 → 对照自建篇学原理。
+8. **深挖**：每篇末尾的「与其他板块的关系」跳「源码系列」对应源码篇。
 
 ## 4. 与其他板块的关系
 
