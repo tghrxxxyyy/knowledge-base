@@ -16,19 +16,31 @@ flowchart LR
         P[Pulsar<br/>云原生流+队列]
         M[MQTT<br/>IoT 设备协议]
     end
-    subgraph 协调与服务[协调 / 服务治理]
+    subgraph 计算引擎[流批计算引擎]
+        FL[Flink<br/>流批一体低延迟]
+        SP[Spark<br/>批处理内存DAG]
+    end
+    subgraph RPC[RPC 与服务通信]
+        DB[Dubbo<br/>RPC+服务治理]
+    end
+    subgraph 协调与服务[协调 / 网关 / 服务代理]
         ZK[ZooKeeper<br/>分布式协调]
         E[etcd<br/>K8s 元数据/云原生]
         N[注册中心与配置中心<br/>Nacos/Apollo/Consul]
         G[API 网关<br/>路由/鉴权/限流]
         NG[Nginx<br/>入口反代/负载均衡]
+        KG[Kong/APISIX<br/>开源API网关]
+        EV[Envoy<br/>服务网格数据面]
     end
     subgraph 数据层[数据存储与同步]
         ES[Elasticsearch<br/>搜索/日志检索]
         CB[ClickHouse<br/>OLAP 列存]
         MDB[MongoDB<br/>文档型]
+        PG[PostgreSQL<br/>开源最强关系库]
         TI[TiDB<br/>NewSQL]
         N4[Neo4j<br/>图数据库]
+        HB[HBase<br/>列式NoSQL]
+        SR[Solr<br/>企业级搜索]
         TS[时序库板块<br/>InfluxDB/TDengine 等]
         CD[Canal CDC<br/>binlog 数据同步]
         OSS[对象存储<br/>MinIO/OSS]
@@ -36,15 +48,19 @@ flowchart LR
     subgraph 缓存[缓存]
         C1[Memcached<br/>分布式纯 KV]
         C2[本地缓存<br/>Caffeine/Guava]
-        C3[Redis<br/>见基础知识/redis知识]
+        C3[Redis 深度篇<br/>缓存/锁/集群]
     end
     subgraph 治理与观测[治理与可观测]
         XX[XXL-JOB<br/>任务调度]
+        XC[任务调度对比<br/>Quartz/XXL-JOB/...]
         ST[Seata<br/>分布式事务]
         SH[ShardingSphere<br/>分库分表]
         AUTH[认证授权<br/>JWT/OAuth2]
+        STL[Sentinel<br/>限流熔断降级]
         ELK[ELK 日志体系]
+        PM[Prometheus+Grafana<br/>监控告警]
         SW[链路追踪<br/>SkyWalking]
+        JR[Jaeger<br/>链路追踪]
     end
     subgraph 云托管[云上托管生态]
         CLOUD[云上中间件总览<br/>PaaS 全景/选型]
@@ -62,7 +78,7 @@ flowchart LR
     end
 ```
 
-## 2. 目录（35 篇）
+## 2. 目录（53 篇）
 
 ### 消息与流
 
@@ -76,7 +92,22 @@ flowchart LR
 
 > 消息选型：日志管道 → Kafka；业务事务 → RocketMQ；精细路由 → RabbitMQ；云原生多租户 → Pulsar。
 
-### 协调与服务治理
+### 流批计算引擎
+
+| 组件 | 定位 | 一句话 |
+|------|------|--------|
+| [Apache Flink（流处理）](./ApacheFlink流处理.md) | 流批一体计算引擎 | 真流式低延迟 + Exactly-once，流是批的超集 |
+| [Apache Spark（批处理）](./ApacheSpark批处理.md) | 大数据批处理事实标准 | 内存 DAG，比 MapReduce 快 10~100 倍 |
+
+> 流批选型：实时低延迟 → Flink；离线大规模批处理/ML → Spark；两者都是流批一体路线。
+
+### RPC 与服务通信
+
+| 组件 | 定位 | 一句话 |
+|------|------|--------|
+| [Apache Dubbo（RPC 框架）](./ApacheDubboRPC框架.md) | 高性能 RPC + 服务治理 | Triple 协议、透明远程调用，Java 微服务通信首选 |
+
+### 协调 / 网关 / 服务代理
 
 | 组件 | 定位 | 一句话 |
 |------|------|--------|
@@ -85,6 +116,8 @@ flowchart LR
 | [注册中心与配置中心](./注册中心与配置中心.md) | Nacos/Eureka/Consul/Apollo | 服务发现 + 动态配置的选型全解 |
 | [API 网关](./API网关.md) | 应用层路由治理 | 路由/鉴权/限流/灰度一体化 |
 | [Nginx](./Nginx.md) | 入口反代/负载均衡 | 流量看门人：静态/反代/HTTPS/限流 |
+| [Kong/APISIX 网关](./Kong与APISIX网关.md) | 开源 API 网关双雄 | 插件化 + 动态配置 + 高性能 |
+| [Envoy 服务代理](./Envoy服务代理.md) | 进程外代理/服务网格数据面 | xDS 动态配置，Istio 数据面 |
 
 ### 数据存储与同步
 
@@ -93,8 +126,16 @@ flowchart LR
 | [Elasticsearch](../ES体系.md) | 搜索引擎（见 ES 体系） | 倒排索引，搜索/日志/分析 |
 | [ClickHouse](./ClickHouse.md) | OLAP 列存分析 | 亿级数据秒级聚合 |
 | [MongoDB](./MongoDB.md) | 文档型 NoSQL | 灵活 Schema，海量文档 |
+| [PostgreSQL 深度篇](./PostgreSQL深度篇.md) | 开源最强关系库 | SQL 最全/扩展最强/PostGIS/JSON |
 | [TiDB 与 NewSQL](./TiDB与NewSQL.md) | 分布式关系型 | MySQL 协议 + 水平扩展 |
 | [Neo4j 图数据库](./Neo4j图数据库.md) | 图数据库 | 关系图谱/风控/推荐 |
+| [HBase 列式存储](./HBase列式存储.md) | 列式 NoSQL | HDFS 之上的海量随机读写 |
+| [Solr 搜索平台](./Solr搜索平台.md) | 企业级搜索平台 | 全文检索 + 分面 + 高亮 |
+| [向量数据库生态](./向量数据库生态.md) | 语义检索/RAG 底座 | HNSW/IVF + Milvus/Qdrant/pgvector 选型 |
+| [Doris 与 StarRocks](./Doris与StarRocks.md) | 分析型 MPP 数据库 | MySQL 协议 + 物化视图 + 极速点查 |
+| [Trino 联邦查询引擎](./Trino联邦查询引擎.md) | 多源联邦 SQL 查询 | 不存数据只算，湖仓查询层 |
+| [RocksDB 与嵌入式 KV](./RocksDB与嵌入式KV存储.md) | LSM-Tree 存储底座 | TiKV/Kafka/Flink 的地基砖 |
+| [Cassandra 与宽列存储](./Cassandra与宽列存储.md) | Dynamo 系宽列 NoSQL | 写强无单点多活，事件流首选 |
 | [数据同步 CDC（Canal）](./数据同步CDC-Canal.md) | binlog 订阅同步 | 缓存失效/异构同步/订阅变更 |
 | [对象存储 MinIO/OSS](./对象存储MinIO-OSS.md) | 海量文件存储 | 图片/文件/备份，S3 协议 |
 
@@ -103,18 +144,22 @@ flowchart LR
 | 组件 | 定位 | 一句话 |
 |------|------|--------|
 | [Memcached 与本地缓存](./Memcached与本地缓存.md) | 分布式纯 KV + 进程内缓存 | 分布式管共享、Caffeine 管最快 |
-| Redis | 缓存+数据结构 | 见「基础知识/redis知识」 |
+| [Redis 深度篇](./Redis深度篇.md) | 缓存+数据结构+锁+集群 | 深度拆解；基础见「基础知识/redis知识」 |
 
 ### 治理与可观测
 
 | 组件 | 定位 | 一句话 |
 |------|------|--------|
 | [任务调度 XXL-JOB](./任务调度XXL-JOB.md) | 分布式任务调度 | 中心化调度 + 分片广播 + 可视化 |
+| [分布式任务调度对比](./分布式任务调度对比.md) | Quartz/XXL-JOB/Elastic-Job/PowerJob | 六大调度器横向对比选型 |
 | [分布式事务 Seata](./分布式事务Seata.md) | 分布式事务框架 | AT/TCC/SAGA 一站式 |
 | [分库分表 ShardingSphere](./分库分表ShardingSphere.md) | 分片/读写分离中间件 | 对应用透明水平拆分 |
 | [认证授权 JWT/OAuth2](./认证授权JWT-OAuth2.md) | 认证授权体系 | 登录态/授权码/令牌 |
+| [Sentinel 限流熔断](./Sentinel限流熔断.md) | 流量治理组件 | 限流/熔断/降级/热点/系统保护 |
 | [ELK 日志体系](./ELK日志体系.md) | 日志集中采集检索 | 排障第一站：检索/大盘/告警 |
+| [Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md) | 监控告警事实标准 | Pull 模型 + PromQL，K8s 监控首选 |
 | [链路追踪 SkyWalking](./链路追踪SkyWalking.md) | APM 链路追踪 | 慢在哪一跳，一目了然 |
+| [Jaeger 链路追踪](./Jaeger链路追踪.md) | 云原生链路追踪 | OpenTelemetry 原生支持 |
 
 ### 云上托管生态（PaaS）—— 总览与消息/数据
 
@@ -149,21 +194,25 @@ flowchart LR
 
 1. **入门**：先懂「为什么需要中间件」——[分布式系统理论总纲](../分布式系统.md) → 本文档地图。
 2. **消息**：Kafka（吞吐原理）→ RocketMQ（事务/延迟）→ 对比选型。
-3. **协调**：etcd（Raft/Watch/Lease）→ ZooKeeper（ZAB）→ 注册中心与配置中心。
-4. **性能**：Redis → 缓存三问 → 本地缓存 → 多级缓存（见「场景设计」）。
-5. **治理**：API 网关 → Nginx → XXL-JOB → Seata → 分库分表。
-6. **观测**：ELK 日志 → SkyWalking 链路 → 可观测性（见「云原生」）。
-7. **云上（基础）**：先读「云上中间件体系总览」→ 按需要钻进消息/数据库/数仓三篇生态 → 对照自建篇学原理。
-8. **云上（进阶）**：可观测性体系（托管 Prom/X-Ray）→ 身份与访问管理（IAM/KMS）→ 安全体系（WAF/DDoS）→ 网络与流量接入（LB/Mesh）。
-9. **云上（高级）**：Serverless 与函数计算（Lambda/边缘）→ 容器编排与 DevOps（托管 K8s/GitOps）→ 配置与密钥管理（AppConfig/Vault）→ 事件驱动与集成（EventBridge/CloudEvents）。
-10. **深挖**：每篇末尾的「与其他板块的关系」跳「源码系列」对应源码篇。
+3. **计算**：Flink（流批一体/Exactly-once）→ Spark（批处理/DAG）→ 对照「大数据」板块。
+4. **RPC 与协调**：Dubbo（透明 RPC + 服务治理）→ 注册中心与配置中心 → etcd（Raft/Watch/Lease）→ ZooKeeper（ZAB）。
+5. **网关与服务代理**：API 网关 → Nginx → Kong/APISIX（插件化）→ Envoy（xDS 动态配置/服务网格数据面）。
+6. **性能**：Redis 深度篇 → 缓存三问 → 本地缓存 → 多级缓存（见「场景设计」）。
+7. **存储**：PostgreSQL 深度篇（关系库天花板）→ 分库分表 → TiDB → HBase/ClickHouse（大数据存储）→ Solr/ES（搜索）→ MongoDB。
+8. **治理**：Sentinel（限流/熔断/降级）→ Seata（分布式事务）→ 任务调度（XXL-JOB → 调度器横向对比）。
+9. **观测**：ELK 日志 → Prometheus/Grafana 监控 → SkyWalking/Jaeger 链路 → 可观测性（见「云原生」）。
+10. **云上（基础）**：先读「云上中间件体系总览」→ 按需要钻进消息/数据库/数仓三篇生态 → 对照自建篇学原理。
+11. **云上（进阶）**：可观测性体系（托管 Prom/X-Ray）→ 身份与访问管理（IAM/KMS）→ 安全体系（WAF/DDoS）→ 网络与流量接入（LB/Mesh）。
+12. **云上（高级）**：Serverless 与函数计算（Lambda/边缘）→ 容器编排与 DevOps（托管 K8s/GitOps）→ 配置与密钥管理（AppConfig/Vault）→ 事件驱动与集成（EventBridge/CloudEvents）。
+13. **深挖**：每篇末尾的「与其他板块的关系」跳「源码系列」对应源码篇。
 
 ## 4. 与其他板块的关系
 
-- 「源码系列」：Kafka / RocketMQ / ZooKeeper / Nacos / Sentinel / Netty 等源码精读。
+- 「源码系列」：Kafka / RocketMQ / ZooKeeper / Nacos / Sentinel / Netty 等源码精读（Dubbo 也已有源码篇）。
 - 「场景设计」：分布式锁、缓存三问、多级缓存、稳定性三板斧等实战场景。
 - 「技术选型」：04-主流技术域选型对比（数据库/缓存/MQ/搜索/网关）。
-- 「云原生」：K8s（etcd 底座）、Service Mesh、可观测性、Serverless。
-- 「大数据」「时序库」：Kafka/ClickHouse 与大数据、TSDB 体系的联动。
+- 「云原生」：K8s（etcd 底座）、Service Mesh（Envoy 数据面）、可观测性（Prometheus/Jaeger）、Serverless。
+- 「大数据」「时序库」：Flink/Spark/HBase 与 Kafka/ClickHouse 组成大数据体系，TSDB 另见时序库板块。
+- 「基础知识」：Redis 深度篇 ↔ redis知识、PostgreSQL 深度篇 ↔ MySQL/数据库基础、Solr/ES ↔ ES体系。
 - 「安全工程」：JWT/OAuth2 原理 → 云安全体系（WAF/DDoS/合规）的纵深延伸。
 - 「架构」：事件溯源 CQRS → 云原生事件驱动（EventBridge/CloudEvents）。
