@@ -103,6 +103,7 @@ GitHub 上有数亿仓库，头部高星项目几乎定义了现代软件开发�
 | [06-开发工具与终端效率](06-开发工具与终端效率.md) | 编辑器、终端、CLI 效率 | VS Code / Oh My Zsh / Neovim / fzf / ripgrep / n8n |
 | [07-学习资源与Awesome清单](07-学习资源与Awesome清单.md) | 教程、面经、路线、清单 | build-your-own-x / awesome / freeCodeCamp / system-design-primer |
 | [08-底层系统与知名项目](08-底层系统与知名项目.md) | 内核、经典基建、国民工具 | Linux / Bitcoin / Git / curl / vim / scrcpy / yt-dlp |
+| [09-数据基础设施与中间件](09-数据基础设施与中间件.md) | 消息、缓存、存储、计算引擎 | Kafka / Redis / ClickHouse / Flink / RocketMQ / ShardingSphere |
 
 ---
 
