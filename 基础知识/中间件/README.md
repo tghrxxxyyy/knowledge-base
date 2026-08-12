@@ -51,10 +51,18 @@ flowchart LR
         CMSG[云上消息与集成<br/>SQS/SNS/EventBridge/Kinesis]
         CDB[云上数据库与缓存<br/>RDS/Aurora/DynamoDB/ElastiCache]
         CDW[云上数仓与大数据<br/>Redshift/Snowflake/BigQuery]
+        COBS[云上可观测性<br/>CloudWatch/X-Ray/托管 Prom]
+        CIAM[云身份与访问管理<br/>IAM/SSO/权限治理]
+        CSEC[云安全体系<br/>KMS/WAF/DDoS/合规]
+        CNET[云网络与流量接入<br/>LB/CDN/DNS/Mesh]
+        CSVR[云Serverless与函数<br/>Lambda/边缘计算]
+        CDVC[云容器编排与DevOps<br/>托管K8s/GitOps/IaC]
+        CCFG[云配置与密钥管理<br/>AppConfig/Secrets Manager]
+        CEVT[云原生事件驱动<br/>EventBridge/CloudEvents]
     end
 ```
 
-## 2. 目录（27 篇）
+## 2. 目录（35 篇）
 
 ### 消息与流
 
@@ -108,16 +116,34 @@ flowchart LR
 | [ELK 日志体系](./ELK日志体系.md) | 日志集中采集检索 | 排障第一站：检索/大盘/告警 |
 | [链路追踪 SkyWalking](./链路追踪SkyWalking.md) | APM 链路追踪 | 慢在哪一跳，一目了然 |
 
-### 云上托管生态（PaaS）
+### 云上托管生态（PaaS）—— 总览与消息/数据
 
 | 组件 | 定位 | 一句话 |
 |------|------|--------|
-| [云上中间件体系总览](./云上中间件体系总览.md) | PaaS 托管全景 | 云 vs 自建、四厂商对照图谱、选型六问 |
+| [云上中间件体系总览](./云上中间件体系总览.md) | PaaS 托管全景 | 云 vs 自建、五厂商对照图谱、选型六问 |
 | [云上消息与集成生态](./云上消息与集成生态.md) | 队列/主题/事件/流 | SQS/SNS/EventBridge/Kinesis/PubSub/云 RocketMQ |
 | [云上数据库与缓存生态](./云上数据库与缓存生态.md) | 托管关系库/NoSQL/缓存 | RDS/Aurora/PolarDB/DynamoDB/Cosmos/ElastiCache |
 | [云上数仓与大数据生态](./云上数仓与大数据生态.md) | 云数仓/湖仓/流计算 | Redshift/BigQuery/Snowflake/Databricks/云 Flink |
 
-> 云上选型一句话：**先定 IO/存储模型 → 找开源协议兼容的托管服务（防锁定）→ 算 SLA + 弹性 + 按量计费账。**
+### 云上托管生态（PaaS）—— 可观测性 / 身份 / 安全
+
+| 组件 | 定位 | 一句话 |
+|------|------|--------|
+| [云上可观测性体系](./云上可观测性体系.md) | 监控/日志/链路/APM 托管 | CloudWatch/Cloud Monitoring/托管 Prometheus/X-Ray/ARMS |
+| [云身份与访问管理体系](./云身份与访问管理体系.md) | IAM/SSO/权限治理/密钥托管 | IAM/RAM/CAM、RBAC/ABAC、临时凭证、KMS |
+| [云安全体系](./云安全体系.md) | WAF/DDoS/证书/合规审计 | Shield/高防、WAF、ACM、CloudTrail/等保 |
+
+### 云上托管生态（PaaS）—— 网络 / Serverless / DevOps
+
+| 组件 | 定位 | 一句话 |
+|------|------|--------|
+| [云网络与流量接入体系](./云网络与流量接入体系.md) | LB/CDN/DNS/API 网关/服务网格 | ALB/NLB、CDN、Route53、Istio/App Mesh |
+| [云 Serverless 与函数计算体系](./云Serverless与函数计算体系.md) | FaaS/事件驱动/边缘计算 | Lambda/FC/SCF、Cloudflare Workers、Cloud Run |
+| [云容器编排与 DevOps 体系](./云容器编排与DevOps体系.md) | 托管 K8s / CI-CD / GitOps / IaC | EKS/AKS/GKE、GitHub Actions、ArgoCD、Terraform |
+| [云配置与密钥管理](./云配置与密钥管理.md) | 动态配置/密钥分发/自动轮换 | AppConfig/ACM、Secrets Manager/Vault、External Secrets |
+| [云原生事件驱动与集成](./云原生事件驱动与集成.md) | EventBridge/CloudEvents/Schema | EventBridge/EventGrid、CloudEvents 标准、Schema Registry |
+
+> 云上选型一句话：**先定 IO/存储模型 → 找开源协议兼容的托管服务（防锁定）→ 算 SLA + 弹性 + 按量计费账 → 用 CloudEvents/OpenTelemetry 标准防厂商锁定。**
 
 ## 3. 学习路径
 
@@ -127,13 +153,17 @@ flowchart LR
 4. **性能**：Redis → 缓存三问 → 本地缓存 → 多级缓存（见「场景设计」）。
 5. **治理**：API 网关 → Nginx → XXL-JOB → Seata → 分库分表。
 6. **观测**：ELK 日志 → SkyWalking 链路 → 可观测性（见「云原生」）。
-7. **云上**：先读「云上中间件体系总览」→ 按需要钻进消息/数据库/数仓三篇生态 → 对照自建篇学原理。
-8. **深挖**：每篇末尾的「与其他板块的关系」跳「源码系列」对应源码篇。
+7. **云上（基础）**：先读「云上中间件体系总览」→ 按需要钻进消息/数据库/数仓三篇生态 → 对照自建篇学原理。
+8. **云上（进阶）**：可观测性体系（托管 Prom/X-Ray）→ 身份与访问管理（IAM/KMS）→ 安全体系（WAF/DDoS）→ 网络与流量接入（LB/Mesh）。
+9. **云上（高级）**：Serverless 与函数计算（Lambda/边缘）→ 容器编排与 DevOps（托管 K8s/GitOps）→ 配置与密钥管理（AppConfig/Vault）→ 事件驱动与集成（EventBridge/CloudEvents）。
+10. **深挖**：每篇末尾的「与其他板块的关系」跳「源码系列」对应源码篇。
 
 ## 4. 与其他板块的关系
 
 - 「源码系列」：Kafka / RocketMQ / ZooKeeper / Nacos / Sentinel / Netty 等源码精读。
 - 「场景设计」：分布式锁、缓存三问、多级缓存、稳定性三板斧等实战场景。
 - 「技术选型」：04-主流技术域选型对比（数据库/缓存/MQ/搜索/网关）。
-- 「云原生」：K8s（etcd 底座）、Service Mesh、可观测性。
+- 「云原生」：K8s（etcd 底座）、Service Mesh、可观测性、Serverless。
 - 「大数据」「时序库」：Kafka/ClickHouse 与大数据、TSDB 体系的联动。
+- 「安全工程」：JWT/OAuth2 原理 → 云安全体系（WAF/DDoS/合规）的纵深延伸。
+- 「架构」：事件溯源 CQRS → 云原生事件驱动（EventBridge/CloudEvents）。
