@@ -17,10 +17,13 @@ flowchart LR
         M[MQTT<br/>IoT 设备协议]
         NT[NATS<br/>轻量/微秒延迟]
         EM[EMQX<br/>IoT Broker]
+        ACT[ActiveMQ<br/>JMS 老牌]
+        SR[Schema Registry<br/>消息契约治理]
     end
     subgraph 计算引擎[流批计算引擎]
         FL[Flink<br/>流批一体低延迟]
         SP[Spark<br/>批处理内存DAG]
+        KS[Kafka Streams<br/>库级流处理]
     end
     subgraph RPC[RPC 与服务通信]
         DB[Dubbo<br/>RPC+服务治理]
@@ -38,6 +41,7 @@ flowchart LR
         TF[Traefik<br/>云原生入口]
         HP[HAProxy/LVS<br/>L4 负载均衡]
         OR[OpenResty<br/>Nginx+Lua]
+        PSH[长连接推送<br/>WebSocket/SSE]
     end
     subgraph 数据层[数据存储与同步]
         ES[Elasticsearch<br/>搜索/日志检索]
@@ -53,6 +57,8 @@ flowchart LR
         DZ[Debezium<br/>CDC 事件流]
         OSS[对象存储<br/>MinIO/OSS]
         CP[Ceph<br/>统一存储]
+        ID[分布式 ID<br/>雪花/号段]
+        GRAPH[图库对比<br/>Neo4j/Nebula]
     end
     subgraph 缓存[缓存]
         C1[Memcached<br/>分布式纯 KV]
@@ -63,13 +69,17 @@ flowchart LR
         XX[XXL-JOB<br/>任务调度]
         XC[任务调度对比<br/>Quartz/XXL-JOB/...]
         DS[DolphinScheduler<br/>工作流调度]
+        AF[Airflow<br/>Python 编排]
         ST[Seata<br/>分布式事务]
         SH[ShardingSphere<br/>分库分表]
+        MC[MyCat/Vitess<br/>代理分片]
         AUTH[认证授权<br/>JWT/OAuth2]
         STL[Sentinel<br/>限流熔断降级]
         ELK[ELK 日志体系]
         LK[Loki<br/>轻量日志]
+        LGC[日志采集<br/>Filebeat/FluentBit]
         PM[Prometheus+Grafana<br/>监控告警]
+        ZB[Zabbix<br/>传统监控]
         SW[链路追踪<br/>SkyWalking]
         JR[Jaeger<br/>链路追踪]
         OT[OpenTelemetry<br/>三支柱标准]
@@ -90,7 +100,7 @@ flowchart LR
     end
 ```
 
-## 2. 目录（65 篇）
+## 2. 目录（75 篇）
 
 ### 消息与流
 
@@ -103,8 +113,10 @@ flowchart LR
 | [NATS](./NATS.md) | 云原生轻量消息 | 微秒级延迟 + Request-Reply + JetStream 持久化 |
 | [MQTT 与消息 Broker](./MQTT与消息broker.md) | IoT 设备协议 | 轻量发布订阅，物联网设备通信 |
 | [EMQX](./EMQX.md) | IoT 消息中间件 | 亿级设备连接 + 规则引擎桥接 |
+| [ActiveMQ 与 JMS](./ActiveMQ与JMS.md) | 老牌 JMS 消息中间件 | JMS 规范 + Artemis 新内核，存量 Java 系统 |
+| [Schema Registry 与消息序列化](./SchemaRegistry与消息序列化.md) | 消息契约治理 | Schema 版本化 + 兼容策略 + 自动编解码 |
 
-> 消息选型：日志管道 → Kafka；业务事务 → RocketMQ；精细路由 → RabbitMQ；云原生多租户 → Pulsar；微服务/边缘轻量 → NATS；IoT 设备 → EMQX。
+> 消息选型：日志管道 → Kafka；业务事务 → RocketMQ；精细路由 → RabbitMQ；云原生多租户 → Pulsar；微服务/边缘轻量 → NATS；IoT 设备 → EMQX；JMS 存量 → ActiveMQ。
 
 ### 流批计算引擎
 
@@ -112,6 +124,7 @@ flowchart LR
 |------|------|--------|
 | [Apache Flink（流处理）](./ApacheFlink流处理.md) | 流批一体计算引擎 | 真流式低延迟 + Exactly-once，流是批的超集 |
 | [Apache Spark（批处理）](./ApacheSpark批处理.md) | 大数据批处理事实标准 | 内存 DAG，比 MapReduce 快 10~100 倍 |
+| [Kafka Streams 与 ksqlDB](./KafkaStreams与ksqlDB.md) | Kafka 生态库级流处理 | 零集群嵌入应用，状态精确一次 |
 
 > 流批选型：实时低延迟 → Flink；离线大规模批处理/ML → Spark；两者都是流批一体路线。
 
@@ -139,6 +152,7 @@ flowchart LR
 | [Traefik](./Traefik.md) | 云原生入口/Ingress | 自动发现 + 自动 HTTPS + 中间件编排 |
 | [HAProxy 与 L4 负载均衡](./HAProxy与L4负载均衡.md) | L4/L7 负载均衡 + VIP 高可用 | LVS 扛量 + HAProxy 治理 + Keepalived 漂移 |
 | [OpenResty](./OpenResty.md) | Nginx+Lua 可编程网关 | 阶段模型 + LuaJIT + cosocket 动态决策 |
+| [长连接推送网关](./长连接推送网关.md) | WebSocket/SSE 实时推送 | 连接路由 + 心跳保活 + 离线补偿 |
 
 ### 数据存储与同步
 
@@ -161,6 +175,8 @@ flowchart LR
 | [Debezium](./Debezium.md) | CDC 事件流框架 | Kafka Connect 多库变更捕获，快照+增量一体 |
 | [对象存储 MinIO/OSS](./对象存储MinIO-OSS.md) | 海量文件存储 | 图片/文件/备份，S3 协议 |
 | [Ceph](./Ceph.md) | 统一分布式存储 | 对象/块/文件三接口 + CRUSH 无单点自愈 |
+| [分布式 ID 生成器](./分布式ID生成器.md) | 全局唯一 ID 设施 | 雪花/号段/UUID，本地生成高性能 |
+| [图数据库生态对比](./图数据库生态对比.md) | Neo4j/Nebula/JanusGraph/ArangoDB | 无索引邻接遍历，社交/风控/图谱 |
 
 ### 缓存
 
@@ -176,13 +192,17 @@ flowchart LR
 | [任务调度 XXL-JOB](./任务调度XXL-JOB.md) | 分布式任务调度 | 中心化调度 + 分片广播 + 可视化 |
 | [分布式任务调度对比](./分布式任务调度对比.md) | Quartz/XXL-JOB/Elastic-Job/PowerJob | 六大调度器横向对比选型 |
 | [DolphinScheduler](./DolphinScheduler.md) | 大数据工作流调度 | 可视化 DAG 编排 + 补数 + 多租户 |
+| [Apache Airflow](./Airflow.md) | Python 工作流编排 | DAG 即代码 + 回填/传感器/MLOps |
 | [分布式事务 Seata](./分布式事务Seata.md) | 分布式事务框架 | AT/TCC/SAGA 一站式 |
 | [分库分表 ShardingSphere](./分库分表ShardingSphere.md) | 分片/读写分离中间件 | 对应用透明水平拆分 |
+| [MyCat 与 Vitess](./MyCat与Vitess.md) | 代理模式分库分表 | 应用零改动，MySQL 入口 + 路由合并 |
 | [认证授权 JWT/OAuth2](./认证授权JWT-OAuth2.md) | 认证授权体系 | 登录态/授权码/令牌 |
 | [Sentinel 限流熔断](./Sentinel限流熔断.md) | 流量治理组件 | 限流/熔断/降级/热点/系统保护 |
 | [ELK 日志体系](./ELK日志体系.md) | 日志集中采集检索 | 排障第一站：检索/大盘/告警 |
 | [Loki](./Loki.md) | 轻量云原生日志 | 只索引标签，成本为 ES 的 1/3，LogQL 日志即指标 |
+| [日志采集与传输](./日志采集与传输.md) | Filebeat/Logstash/Fluent Bit | 采集→解析→缓冲→输出，第一公里 |
 | [Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md) | 监控告警事实标准 | Pull 模型 + PromQL，K8s 监控首选 |
+| [Zabbix](./Zabbix.md) | 传统企业监控 | Agent/SNMP + 触发器告警 + 报表，机房首选 |
 | [链路追踪 SkyWalking](./链路追踪SkyWalking.md) | APM 链路追踪 | 慢在哪一跳，一目了然 |
 | [Jaeger 链路追踪](./Jaeger链路追踪.md) | 云原生链路追踪 | OpenTelemetry 原生支持 |
 | [OpenTelemetry](./OpenTelemetry.md) | 可观测性统一标准 | 指标/日志/链路三支柱一套采集，后端随便换 |
@@ -219,14 +239,14 @@ flowchart LR
 ## 3. 学习路径
 
 1. **入门**：先懂「为什么需要中间件」——[分布式系统理论总纲](../分布式系统.md) → 本文档地图。
-2. **消息**：Kafka（吞吐原理）→ RocketMQ（事务/延迟）→ 对比选型 → NATS（轻量）→ EMQX（IoT）。
-3. **计算**：Flink（流批一体/Exactly-once）→ Spark（批处理/DAG）→ 对照「大数据」板块。
+2. **消息**：Kafka（吞吐原理）→ RocketMQ（事务/延迟）→ 对比选型 → NATS（轻量）→ EMQX（IoT）→ Schema Registry（契约治理）→ Kafka Streams/ksqlDB（库级流处理）。
+3. **计算**：Flink（流批一体/Exactly-once）→ Spark（批处理/DAG）→ Kafka Streams（应用内轻量流处理）→ 对照「大数据」板块。
 4. **RPC 与协调**：Dubbo（透明 RPC + 服务治理）→ gRPC（HTTP/2/Protobuf）→ 注册中心与配置中心 → etcd（Raft/Watch/Lease）→ ZooKeeper（ZAB）。
-5. **网关与服务代理**：API 网关 → Nginx → OpenResty（Nginx+Lua）→ Kong/APISIX（插件化）→ Spring Cloud Gateway（Java）→ Traefik（云原生入口）→ Envoy（xDS/服务网格数据面）→ HAProxy/LVS（L4 入口）。
+5. **网关与服务代理**：API 网关 → Nginx → OpenResty（Nginx+Lua）→ Kong/APISIX（插件化）→ Spring Cloud Gateway（Java）→ Traefik（云原生入口）→ Envoy（xDS/服务网格数据面）→ HAProxy/LVS（L4 入口）→ 长连接推送网关（WebSocket/SSE）。
 6. **性能**：Redis 深度篇 → 缓存三问 → 本地缓存 → 多级缓存（见「场景设计」）。
-7. **存储**：PostgreSQL 深度篇（关系库天花板）→ 分库分表 → TiDB → HBase/Cassandra/ClickHouse（大数据存储）→ Solr/ES（搜索）→ MongoDB → MinIO/Ceph（存储）。
-8. **治理**：Sentinel（限流/熔断/降级）→ Seata（分布式事务）→ 任务调度（XXL-JOB → 调度器横向对比 → DolphinScheduler 工作流）。
-9. **观测**：OpenTelemetry（三支柱标准）→ Prometheus/Grafana 监控 → ELK/Loki 日志 → SkyWalking/Jaeger 链路 → 可观测性（见「云原生」）。
+7. **存储**：PostgreSQL 深度篇（关系库天花板）→ 分库分表 → MyCat/Vitess（代理分片）→ TiDB → HBase/Cassandra/ClickHouse（大数据存储）→ Solr/ES（搜索）→ MongoDB → MinIO/Ceph（存储）→ 图数据库（Neo4j/Nebula）。
+8. **治理**：Sentinel（限流/熔断/降级）→ Seata（分布式事务）→ 分布式 ID（雪花/号段）→ 任务调度（XXL-JOB → 调度器横向对比 → DolphinScheduler → Airflow 工作流编排）。
+9. **观测**：OpenTelemetry（三支柱标准）→ Prometheus/Grafana 监控 → Zabbix（传统监控）→ ELK/Loki 日志 → 日志采集（Filebeat/Fluent Bit）→ SkyWalking/Jaeger 链路 → 可观测性（见「云原生」）。
 10. **云上（基础）**：先读「云上中间件体系总览」→ 按需要钻进消息/数据库/数仓三篇生态 → 对照自建篇学原理。
 11. **云上（进阶）**：可观测性体系（托管 Prom/X-Ray）→ 身份与访问管理（IAM/KMS）→ 安全体系（WAF/DDoS）→ 网络与流量接入（LB/Mesh）。
 12. **云上（高级）**：Serverless 与函数计算（Lambda/边缘）→ 容器编排与 DevOps（托管 K8s/GitOps）→ 配置与密钥管理（AppConfig/Vault）→ 事件驱动与集成（EventBridge/CloudEvents）。
