@@ -133,6 +133,17 @@ flowchart LR
 
 > 落地建议：确定性约定仍走 `CLAUDE.md`（等价 KV），涌现事实可同时写一份到向量库做语义检索，Markdown 索引仅作人读总览。这样既不污染版本化静态层，又补上语义召回能力。
 
+检索合并示意（KV 精确 + 向量语义 + 索引兜底）：
+
+```python
+def recall(user_id, task, mem_kv, mem_vec):
+    prefs = mem_kv.get(f"user:{user_id}:prefs")     # KV 精确
+    exps  = mem_vec.search(embed(task), top_k=5)      # 向量语义
+    return build_context(prefs, exps)                # 合并注入
+```
+
+> 💡 混合设计的关键：KV 保证「确定性偏好零延迟命中」，向量补「记了但想不起来的长尾经验」。静态指令层（CLAUDE.md/AGENTS.md）可视为系统级 KV。
+
 ## 五、记忆检索与遗忘策略（Claude 侧）
 
 **检索**
@@ -149,7 +160,8 @@ flowchart LR
 ```text
 检索：MEMORY.md(≤200行/25KB) → 按需读主题文件
 遗忘：人工 /memory 清理，无自动 TTL
-
+```
+ 
 ## 六、记忆检索与遗忘策略（代码实现）
 
 把 05 的文本策略落成可运行逻辑。核心三类操作：检索合并、TTL 过期、LRU/重要性淘汰。
@@ -190,35 +202,7 @@ class MemoryStore:
 
 > 💡 生产记忆必须有「遗忘」机制：无 TTL 的记忆会无限膨胀、噪声稀释高信号。KV 用 TTL/LRU，向量库用时间窗口+去重清理。
 
-## 七、向量 + KV 混合存储设计（深化）
-
-精确偏好走 KV、语义经验走向量，二者在「检索时合并注入」：
-
-```mermaid
-flowchart LR
-    T[任务/查询] --> KV[(KV: 用户偏好/开关)]
-    T --> VEC[(向量库: 语义经验)]
-    KV --> MERGE[合并进上下文]
-    VEC --> MERGE
-    MERGE --> LLM[LLM]
-```
-
-| 字段层 | 存储 | 示例 key/schema | 检索 |
-| --- | --- | --- | --- |
-| 偏好 | KV（Redis/SQLite） | `user:123:lang=zh` | 按 user_id 精确取 |
-| 经验 | 向量（pgvector/Milvus） | `embedding + text + tags` | 相似度 top-k |
-| 索引 | Markdown/JSON | `MEMORY.md` 人读总览 | 启动加载 |
-
-```python
-def recall(user_id, task, mem_kv, mem_vec):
-    prefs = mem_kv.get(f"user:{user_id}:prefs")     # KV 精确
-    exps  = mem_vec.search(embed(task), top_k=5)      # 向量语义
-    return build_context(prefs, exps)                # 合并注入
-```
-
-> 💡 混合设计的关键：KV 保证「确定性偏好零延迟命中」，向量补「记了但想不起来的长尾经验」。静态指令层（CLAUDE.md/AGENTS.md）可视为系统级 KV。
-
-## 八、多会话与多用户隔离
+## 七、多会话与多用户隔离
 
 记忆若不分租户，会出现「用户 A 看到用户 B 的偏好」或「会话互相污染」。隔离维度：
 
@@ -237,7 +221,7 @@ def user_memory_path(user_id, project_id):
 
 > ⚠️ 多用户场景**必须做隔离 + 鉴权**：记忆可能含 PII，越权读取即合规事故。向量库用 namespace/collection 隔离，KV 用 user_id 前缀，检索前校验权限。
 
-## 九、在 Agent 中落地的示例代码
+## 八、在 Agent 中落地的示例代码
 
 把记忆接入一个最简 Agent 循环：启动加载长期记忆、任务中写工作记忆、结束沉淀长期记忆。
 

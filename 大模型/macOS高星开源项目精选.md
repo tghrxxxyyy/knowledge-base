@@ -63,7 +63,7 @@
 | **MonitorControl** | 29k | [github.com/MonitorControl/MonitorControl](https://github.com/MonitorControl/MonitorControl) | 外接显示器亮度/音量控制，键盘调节 | `brew install --cask monitorcontrol` |
 | **Mac Mouse Fix** | 6k | [github.com/noah-nuebling/mac-mouse-fix](https://github.com/noah-nuebling/mac-mouse-fix) | 鼠标优化，让 $10 鼠标超越 Apple Trackpad | `brew install --cask mac-mouse-fix` |
 | **Karabiner-Elements** | 18k | [github.com/pqrs-org/Karabiner-Elements](https://github.com/pqrs-org/Karabiner-Elements) | 键盘改键，Caps Lock→Hyper/Escape，几乎每个 Mac 用户首选 | `brew install --cask karabiner-elements` |
-| **Hammerspoon** | 12k | [github.com/Hammerspoon/Hammersoon](https://github.com/Hammersoon/Hammerspoon) | macOS 自动化终极工具，Lua 脚本控制系统/窗口/热键 | `brew install --cask hammerspoon` |
+| **Hammerspoon** | 12k | [github.com/Hammerspoon/Hammerspoon](https://github.com/Hammerspoon/Hammerspoon) | macOS 自动化终极工具，Lua 脚本控制系统/窗口/热键 | `brew install --cask hammerspoon` |
 | **Keyboard Cowboy** | 5k | [github.com/zenangst/KeyboardCowboy](https://github.com/zenangst/KeyboardCowboy) | 键盘快捷键工具，应用启动/窗口管理/宏 | `brew install --cask keyboardcowboy` |
 | **Homerow** | 4k | [homerow.app](https://www.homerow.app) | Vimium 风格键盘导航，用键盘点击任何 UI 元素 | 官网下载 |
 

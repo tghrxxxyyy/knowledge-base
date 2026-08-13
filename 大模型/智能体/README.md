@@ -56,7 +56,7 @@
 - LangGraph / CrewAI / OpenAI Agents SDK 官方文档与示例
 - OWASP LLM Top 10、OpenTelemetry GenAI Semconv（安全与可观测标准）
 
-## 九、核心概念地图（Mermaid 概念全景）
+## 一、核心概念地图（Mermaid 概念全景）
 
 ```mermaid
 flowchart TD
@@ -71,7 +71,7 @@ flowchart TD
 
 > 上图把智能体置于五个子模块的交点：它由「提示词工程+上下文工程+RAG+记忆」共同支撑，通过工具/MCP 行动，经多智能体协作，最后落到生产化的评估与护栏。
 
-## 十、速查表（Cheat Sheet）
+## 二、速查表（Cheat Sheet）
 
 | 决策点 | 默认 | 何时调整 |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ flowchart TD
 | 生产 | eval+护栏+可观测 | 第一天就埋 |
 | 安全 | 最小权限+HITL | 破 Lethal Trifecta |
 
-## 十一、常见误区清单（汇总）
+## 三、常见误区清单（汇总）
 
 1. **智能体=必须多智能体**：单 agent+好工具常够，多 agent 是手段不是目标。
 2. **框架越重越专业**：简单可组合模式常胜复杂框架。
@@ -97,14 +97,14 @@ flowchart TD
 9. **按 star 选框架**：AutoGen star 多却已停更，按场景选。
 10. **把记忆当数据库**：记忆是启动注入的上下文，非可靠存储。
 
-## 十二、与其它子模块关系
+## 四、与其它子模块关系
 
 - **与提示词工程**：ReAct/Reflexion 等提示范式是 Agent 循环引擎；提示定人设与边界。
 - **与上下文工程**：上下文腐烂是 Agent 头号敌人，compaction/clearing/memory 杠杆直接服务 Agent。
 - **与 RAG**：RAG 是 Agent 的「知识检索工具」，由 Agent 决定是否调用。
 - **与记忆**：记忆给 Agent 跨会话状态保持，是连续性基础。
 
-## 十三、面试高频问题（速记）
+## 五、面试高频问题（速记）
 
 - Agent 定义？Workflow 与 Agent 的架构区别？
 - Agent Loop 是什么？与 ReAct 关系？
@@ -118,7 +118,7 @@ flowchart TD
 - 主流框架怎么选（LangGraph/OpenAI/CrewAI/Claude/ADK/AG2）？
 - 生产化三件套？评估指标与红队怎么做？
 
-## 十四、整合学习路径（五模块串起来）
+## 六、整合学习路径（五模块串起来）
 
 ```mermaid
 flowchart LR

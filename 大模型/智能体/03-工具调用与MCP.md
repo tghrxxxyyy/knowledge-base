@@ -161,7 +161,7 @@ agent = Agent(name="triager", output_type=Ticket)  # 产出必为 Ticket 结构
 - **影子模式**：早期对写操作先做「模拟执行」（log 不真正发送）。
 - **作用域隔离**：限制向量库/记忆的命名空间按用户/角色划分。
 
-## 参考来源
+## 六、参考来源
 
 - Anthropic — Introducing the Model Context Protocol：https://www.anthropic.com/news/model-context-protocol
 - MCP 规范仓库：https://github.com/modelcontextprotocol/modelcontextprotocol ｜ 文档：https://modelcontextprotocol.io
@@ -206,7 +206,7 @@ def safe_call(llm, tool, args):
 
 ## 八、MCP 协议细节深化
 
-03 篇讲了架构与原语，这里补「握手/协商/双向能力」的工程细节。
+上文第三节讲了 MCP 架构与原语，这里补「握手/协商/双向能力」的工程细节。
 
 **初始化握手（initialize）**：客户端发 `initialize` 请求，协商协议版本与能力（是否支持 sampling/roots/elicitation），服务器回 `InitializeResult` 后客户端发 `initialized` 通知完成握手。
 
