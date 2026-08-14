@@ -43,6 +43,22 @@ flowchart TD
     CK3 -->|否| EXEC[执行]
 ```
 
+### 2.3 Agent 身份与授权（OAuth 2.1 / 服务身份）
+
+企业 Agent 调企业内部/第三方 API，权限模型的三个层次：
+
+| 层 | 身份形态 | 说明 |
+| --- | --- | --- |
+| 用户委派（User Delegation） | OAuth 2.1 **Authorization Code + PKCE** | Agent 代表用户做事，权限 ≤ 用户权限 |
+| 服务身份（Service Identity） | **Client Credentials**（服务间调用） | Agent 平台自己的身份，走独立 scopes 配额 |
+| 用户 + 服务叠加 | Token exchange（OAuth Token Exchange） | 双重身份：既要用户上下文又要服务特权 |
+
+- **关键原则**：Agent 拿到的是**最小 scope、短期（几十分钟级）token**，且每个 Agent 用**独立 client_id**——便于审计「哪个 Agent 干的」；
+- **MCP 生态落地**：MCP 服务器的 OAuth 授权（2025-03 规范）+ 企业 MCP 网关统一签发（见「智能体/03」5.1）；
+- **敏感操作令牌升级**：低危操作用用户静默令牌，高危操作临时申请**提权令牌 + HITL 审批**（两步授权），防「一次授权、永久权限」。
+
+> 一句话：**企业 Agent 的权限 = 用户委派 × 服务身份 × 属性策略（ABAC）三乘叠加，最小权限 + 短期令牌 + 独立 client_id 是审计底线。**
+
 ---
 
 ## 三、长任务编排与状态
