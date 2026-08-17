@@ -1,8 +1,8 @@
 # 源码系列 · 板块导航
 
-> 主流中间件与框架源码解析：RocketMQ、Nacos、ZooKeeper、Netty、Sentinel、Spring、Java 基础，以及 JVM 并发底层、并发集合、MyBatis、Dubbo。
+> 主流中间件与框架源码解析：RocketMQ、Nacos、ZooKeeper、Netty、Sentinel、Spring、Java 基础，以及 JVM 并发底层、并发集合、MyBatis、Dubbo、etcd、Spring Cloud。
 
-## 文档列表
+## 文档列表（18 篇）
 
 - 📝 [RocketMQ](rocketMq.md)
 - 📝 [Nacos](Nacos.md)
@@ -20,6 +20,8 @@
 - 📝 [Tomcat](Tomcat源码.md)
 - 📝 [Spring Boot](SpringBoot源码.md)
 - 📝 [MySQL InnoDB](MySQL-InnoDB源码.md)
+- 📝 [etcd 源码](etcd源码.md) — Raft 共识 / MVCC / WAL / Watch
+- 📝 [Spring Cloud 源码](SpringCloud源码.md) — 服务发现 / Gateway / Sentinel
 
 ---
 

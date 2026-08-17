@@ -4,12 +4,16 @@
 
 > 说明：原 `云原生/K8S.md` 为早期从有道云笔记导出的**截图笔记**（🖼️，正文以图片为主，未做文字转录）。本索引下的 `Kubernetes核心.md` 是其对应的**结构化文字版**，二者内容互补，建议以文字版为准。
 
-## 一、本板块脉络
+## 一、本板块脉络（11 篇）
 
 | 文档 | 定位 | 阅读优先级 |
 |------|------|-----------|
 | [容器与 Docker](容器与Docker.md) | 容器本质：Namespace / cgroup / 镜像分层 / Dockerfile 最佳实践 | ⭐⭐⭐ |
 | [Kubernetes 核心](Kubernetes核心.md) | 控制平面、调度、Pod 生命周期、网络、存储、HPA、滚动更新、排查 | ⭐⭐⭐ |
+| [K8s 网络深挖](K8s网络深挖.md) | CNI / Service / Ingress / NetworkPolicy 深入 | ⭐⭐⭐ |
+| [K8s 存储深挖](K8s存储深挖.md) | PV / PVC / StorageClass / CSI 驱动深入 | ⭐⭐⭐ |
+| [K8s 故障排查手册](K8s故障排查手册.md) | Pod / Service / Ingress 常见问题排查 SOP | ⭐⭐⭐ |
+| [K8s 运维实战](K8s运维实战.md) | Helm / Operator 调试 / 日志排查 / 性能调优 / 故障恢复 | ⭐⭐⭐ |
 | [Service Mesh](ServiceMesh.md) | Istio / Envoy、Sidecar、流量治理、mTLS | ⭐⭐ |
 | [可观测性](可观测性.md) | Metrics / Logs / Traces 三支柱、Prometheus / Grafana / Loki / OpenTelemetry | ⭐⭐⭐ |
 | [GitOps](GitOps.md) | 以 Git 为唯一事实源、Argo CD / Flux、声明式持续交付 | ⭐⭐ |

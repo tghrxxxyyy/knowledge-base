@@ -177,6 +177,7 @@ flowchart LR
 | [Ceph](./Ceph.md) | 统一分布式存储 | 对象/块/文件三接口 + CRUSH 无单点自愈 |
 | [分布式 ID 生成器](./分布式ID生成器.md) | 全局唯一 ID 设施 | 雪花/号段/UUID，本地生成高性能 |
 | [图数据库生态对比](./图数据库生态对比.md) | Neo4j/Nebula/JanusGraph/ArangoDB | 无索引邻接遍历，社交/风控/图谱 |
+| [ES 集群调优](./ES集群调优.md) | 分片策略/JVM/查询优化 | 生产 ES 调优手册 |
 
 ### 缓存
 

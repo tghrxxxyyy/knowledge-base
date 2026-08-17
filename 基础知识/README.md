@@ -5,9 +5,9 @@
 ## 子板块
 
 - 📁 [大数据（全链路体系）](大数据/README.md) — 数据采集/存储/计算/数仓/湖仓一体/场景实战/安全合规/成本优化/数据服务化（17 篇）
-- 📁 [CI/CD（持续集成与持续交付）](CI-CD/README.md) — 版本控制/Jenkins/GitLab CI/GitOps（14 篇）
-- 📁 [中间件（日常项目高频组件）](中间件/README.md) — Kafka/RocketMQ/ZooKeeper/etcd/Nginx/ELK 等（35 篇）
-- 📁 [时序库](时序库/README.md) — InfluxDB/TDengine/Prometheus 等（7 篇）
+- 📁 [CI/CD（持续集成与持续交付）](CI-CD/README.md) — 版本控制/Jenkins/GitLab CI/GitOps（13 篇）
+- 📁 [中间件（日常项目高频组件）](中间件/README.md) — Kafka/RocketMQ/ZooKeeper/etcd/Nginx/ELK 等（75 篇）
+- 📁 [时序库](时序库/README.md) — InfluxDB/TDengine/Prometheus 等（6 篇）
 
 ## 独立文档
 
@@ -33,6 +33,7 @@
 - 📝 [分布式系统理论总纲](分布式系统.md)
 - 📝 [Web 安全](Web安全.md)
 - 📝 [Linux 性能排查手册](Linux排查.md)
+- 📝 [Go 语言体系（后端生态/并发模型/工程实践）](Go语言体系.md)
 
 ---
 
