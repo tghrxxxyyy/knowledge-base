@@ -34,6 +34,10 @@
 - 📝 [Web 安全](Web安全.md)
 - 📝 [Linux 性能排查手册](Linux排查.md)
 - 📝 [Go 语言体系（后端生态/并发模型/工程实践）](Go语言体系.md)
+- 📝 [Netty 网络编程深入（Reactor/ByteBuf/Pipeline/内存池/生产调优）](Netty网络编程.md)
+- 📝 [Docker 与 Kubernetes（容器原理/K8s 核心/Helm/排障）](Docker与Kubernetes.md)
+- 📝 [Spring Cloud 微服务整合（Nacos/Sentinel/Seata/Gateway/链路追踪）](SpringCloud微服务.md)
+- 📝 [单元测试工程（JUnit5/Mockito/测试金字塔/覆盖率/TDD）](单元测试.md)
 
 ---
 

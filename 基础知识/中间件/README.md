@@ -100,7 +100,7 @@ flowchart LR
     end
 ```
 
-## 2. 目录（75 篇）
+## 2. 目录（77 篇）
 
 ### 消息与流
 
@@ -178,6 +178,7 @@ flowchart LR
 | [分布式 ID 生成器](./分布式ID生成器.md) | 全局唯一 ID 设施 | 雪花/号段/UUID，本地生成高性能 |
 | [图数据库生态对比](./图数据库生态对比.md) | Neo4j/Nebula/JanusGraph/ArangoDB | 无索引邻接遍历，社交/风控/图谱 |
 | [ES 集群调优](./ES集群调优.md) | 分片策略/JVM/查询优化 | 生产 ES 调优手册 |
+| [数据库连接池原理](./数据库连接池.md) | HikariCP/Druid/DBCP 对比 | 连接复用+参数调优+慢SQL治理 |
 
 ### 缓存
 
@@ -199,6 +200,7 @@ flowchart LR
 | [MyCat 与 Vitess](./MyCat与Vitess.md) | 代理模式分库分表 | 应用零改动，MySQL 入口 + 路由合并 |
 | [认证授权 JWT/OAuth2](./认证授权JWT-OAuth2.md) | 认证授权体系 | 登录态/授权码/令牌 |
 | [Sentinel 限流熔断](./Sentinel限流熔断.md) | 流量治理组件 | 限流/熔断/降级/热点/系统保护 |
+| [分布式锁专题](./分布式锁专题.md) | Redis/ZK/etcd 锁统一对比 | Redlock争议+Fencing Token+生产踩坑 |
 | [ELK 日志体系](./ELK日志体系.md) | 日志集中采集检索 | 排障第一站：检索/大盘/告警 |
 | [Loki](./Loki.md) | 轻量云原生日志 | 只索引标签，成本为 ES 的 1/3，LogQL 日志即指标 |
 | [日志采集与传输](./日志采集与传输.md) | Filebeat/Logstash/Fluent Bit | 采集→解析→缓冲→输出，第一公里 |

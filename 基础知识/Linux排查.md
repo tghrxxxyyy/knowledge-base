@@ -1,121 +1,632 @@
-# Linux 性能排查手册
+# Linux 性能排查手册（深入版）
 
 ## 〇、本体介绍
 
 **Linux 排查**：线上出问题（CPU 飙、内存涨、IO 卡、网络抖、进程假死）时，用一套命令与工具**量化定位瓶颈**，而非瞎猜。它是后端工程师的「听诊器」。
 
-**四大资源维度**：CPU、内存、IO（磁盘/网络）、进程/线程。每类都有「看现象 → 找进程 → 定根因」的方法。
+**核心思路**：**先整体（top/负载）→ 再细分（per-资源工具）→ 最后进进程（strace/perf/火焰图）**。配合日志与可观测性（见 [云原生/可观测性](../云原生/可观测性.md)）。
 
-**核心思路**：**先整体（top/负载），再细分（per-资源工具），最后进进程（strace/perf/火焰图）**。配合日志与可观测性（见 云原生/可观测性.md）。
-
----
-
-## 一、CPU 排查
-
-- **整体**：`top` / `htop`（看 %CPU、负载 load average）、`uptime`（1/5/15 分钟负载）。
-- **负载高但 CPU 不高？** 多为 IO 等待（D 状态）或锁竞争，看 `wa%`、看进程状态。
-- **找热点**：`perf top` 实时看函数级 CPU 占用；`perf record -g` + `perf report` 抓调用栈。
-- **火焰图（Flame Graph）**：`perf script | stackcollapse | flamegraph.pl`，一眼看「哪段代码吃 CPU」。
-- **上下文切换**：`vmstat 1` 看 `cs`（cs 过高可能是大量线程争抢/锁）、`pidstat -w` 看进程切换。
+**排查顺序口诀**：整体→CPU→内存→IO→网络→进程→应用→日志
 
 ---
 
-## 二、内存排查
+## 一、整体概览
 
-- **整体**：`free -h`（看 available 而非 free，含缓存可回收）、`top` 的 RES。
-- **进程级**：`ps -eo pid,comm,rss` 按 RSS 排序找大头；`smem` 看 PSS（按比例共享）。
-- **泄漏**：`pmap -x <pid>` 看进程内存映射；长期监控 RSS 增长曲线；结合 JVM 的 `jstat`/堆 dump（Java 应用）。
-- **OOM**：`dmesg | grep -i oom` 看被谁杀；`/var/log/messages` 查 OOM Killer 记录。
-- **缓存**：`cache` 是页缓存（可回收），`available` 才是真可用；不要被 `free` 低吓到。
+### 1.1 系统负载
 
----
+```bash
+uptime
+# 14:30:01 up 45 days, load average: 2.35, 1.89, 1.67
+# 三个数字：1分钟/5分钟/15分钟的平均负载
+# 经验值：load < CPU核数 正常；load > 2×核数 需关注
 
-## 三、磁盘 IO 排查
+top
+# %Cpu(s): 25.3 us, 3.1 sy, 0.0 ni, 68.2 id, 2.8 wa, 0.0 hi, 0.6 si
+# us: 用户态CPU  sy: 内核态CPU  wa: IO等待  si: 软中断
+# 重点看 wa（IO等待）和 us（用户态）
 
-- **整体**：`iostat -x 1`（看 `%util`、`await`、`r/s w/s`）、`vmstat`（io 列）。
-- **找进程**：`iotop`（按进程看读写）、`pidstat -d`。
-- **文件系统**：`df -h`（空间）、`du -sh`（目录占用）、`lsof | grep deleted`（已删但仍被进程占用的文件，空间不释放）。
-- **慢盘/坏盘信号**：`await` 远大于 `svctm`、`%util` 接近 100%。
+# top 交互命令
+# P — 按CPU排序  M — 按内存排序  1 — 显示每核CPU  c — 显示完整命令
+```
 
----
+### 1.2 系统信息速查
 
-## 四、网络排查
+```bash
+# 系统版本
+cat /etc/os-release
+uname -r
 
-- **连通性**：`ping`（延迟/丢包）、`telnet/nc -vz`（端口通不通）、`traceroute/mtr`（路径与丢包点）。
-- **连接与监听**：`ss -lantp`（替代 netstat，看连接状态/监听）、`netstat -an | grep TIME_WAIT` 看短连接风暴。
-- **抓包**：`tcpdump -i any -n port 8080 -w x.pcap`（分析重传/乱序/握手）；Wireshark 离线看。
-- **DNS**：`dig` / `nslookup` / `getent hosts`；`/etc/resolv.conf` 配置。
-- **网卡/带宽**：`sar -n DEV 1`（吞吐）、`ethtool eth0`（速率/双工）。
-- **TIME_WAIT 过多**：调 `net.ipv4.tcp_tw_reuse`、用长连接 / 连接池。
+# CPU 信息
+lscpu | head -15
+cat /proc/cpuinfo | grep "model name" | head -1
 
----
+# 内存信息
+free -h
+cat /proc/meminfo | head -10
 
-## 五、进程与线程
+# 磁盘信息
+lsblk
+df -hT
 
-- **进程树**：`ps auxf` / `pstree`。
-- **线程**：`top -H -p <pid>`（看线程级 CPU）、`ps -eLf | grep <pid>`。
-- **死锁/卡住**：`strace -p <pid>` 看系统调用是否卡在某调用（如 futex 死锁、read 阻塞）；`cat /proc/<pid>/stack` 看内核栈。
-- **打开文件**：`lsof -p <pid>`、`ls /proc/<pid>/fd | wc -l`（fd 泄漏 → 报 "too many open files"，需调 `ulimit -n`）。
-
----
-
-## 六、JVM 应用专项（Java 后端）
-
-- `jps` 列进程；`jstack <pid>` 看线程栈（死锁/ BLOCKED / GC 频繁）；`jstat -gcutil` 看 GC；`jmap -dump` 抓堆（MAT 分析泄漏）；`arthas` 在线诊断（watch/trace）。
-
----
-
-## 七、经典排障 SOP（案例）
-
-- **案例 A：接口变慢** → `top` 看 CPU → `perf/火焰图` 定热点函数 → 优化算法/缓存。
-- **案例 B：内存涨到 OOM** → `free`/`dmesg oom` → `pmap`/`jmap` 找泄漏对象 → 修引用。
-- **案例 C：磁盘满** → `df`/`du` 定位大文件 → `lsof | grep deleted` 清被占已删文件。
-- **案例 D：连接不上** → `ss -lantp` 看监听 → `telnet` 测端口 → `tcpdump` 抓包看握手。
+# 网络信息
+ip addr show
+cat /proc/net/dev
+```
 
 ---
 
-## 八、与其他板块的关系
+## 二、CPU 排查
 
-- **基础知识 / 操作系统**：本手册是「机制」，「[操作系统](操作系统.md)」是「原理」——D 状态、上下文切换、OOM、页缓存都是那里的概念在命令层的落地。
-- **云原生 / K8s**：`kubectl exec` 进容器后就是这套命令；`kubectl logs/describe` 是容器层封装。
-- **云原生 / 可观测性**：指标/日志/链路是宏观，本手册是单机微观下钻。
-- **场景设计 / 问题定位**：本手册是其落地工具集。
+### 2.1 整体 CPU 分析
+
+```bash
+# 实时 CPU 监控（每秒刷新）
+top -d 1
+# 关注：%Cpu(s) 行的 us/sy/wa/si；进程列表的 %CPU
+
+# 多核 CPU 查看
+mpstat -P ALL 1
+# %usr/%sys/%iowait/%irq/%soft 每核细分
+
+# 历史 CPU 回看
+sar -u 1 10    # 每秒采样，共10次
+sar -u -f /var/log/sa/sa15  # 回看15号的历史数据
+```
+
+### 2.2 进程级 CPU 分析
+
+```bash
+# 按 CPU 排序找进程
+ps aux --sort=-%cpu | head -10
+
+# 实时看进程 CPU
+top -p <pid>     # 监控指定进程
+pidstat -u 1     # 所有进程 CPU 使用
+
+# 线程级 CPU（Java 多线程排查）
+top -H -p <pid>            # 看线程级 CPU
+ps -eLf | grep <pid> | wc -l  # 线程数
+```
+
+### 2.3 热点函数定位
+
+```bash
+# perf 实时看函数级 CPU 占用
+perf top -g
+# 输出：函数名 + 采样占比（最上面的最耗CPU）
+
+# 抓取调用栈（录制 30 秒）
+perf record -g -p <pid> -- sleep 30
+perf report
+# 交互界面：Enter 展开调用链
+
+# 火焰图（最直观）
+perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+# 横轴 = 采样时长占比，最宽的函数最耗CPU
+# 自底向上 = 调用链（从 main → handleRequest → queryDB）
+```
+
+### 2.4 上下文切换
+
+```bash
+# 系统级上下文切换
+vmstat 1
+# cs 列 = 上下文切换次数（正常几千，过高需关注）
+
+# 进程级上下文切换
+pidstat -w -p <pid> 1
+# cswch/s: 自愿切换（通常是 IO 等待）
+# nvcswch/s: 非自愿切换（时间片用完，CPU 抢占）
+# 非自愿过高 = 大量线程争抢 CPU
+
+# 进程内线程切换
+cat /proc/<pid>/status | grep voluntary
+```
+
+### 2.5 常见 CPU 问题
+
+| 现象 | 可能原因 | 排查 |
+|------|----------|------|
+| us 高 | 应用代码热点（计算密集） | perf top / 火焰图 |
+| sy 高 | 内核态开销（系统调用多/锁竞争） | strace -c 统计系统调用 |
+| wa 高 | IO 等待（磁盘慢/IO 密集） | iostat -x / iotop |
+| si 高 | 软中断（网络包处理） | cat /proc/softirqs / sar -I |
+| hi 高 | 硬中断（磁盘/网卡中断） | cat /proc/interrupts |
+| load 高但 CPU 不高 | 进程阻塞（D 状态） | ps aux | grep D |
 
 ---
 
-## 九、速查表
+## 三、内存排查
+
+### 3.1 整体内存分析
+
+```bash
+# 内存概览
+free -h
+# total   used   free   shared  buff/cache  available
+# 62Gi    45Gi   2.1Gi  128Mi   14Gi        15Gi
+# 关注 available（真正可用 = free + 可回收缓存）
+# 不要被 free 低吓到（buff/cache 可回收）
+
+# 内存详细信息
+cat /proc/meminfo | grep -E "MemTotal|MemFree|MemAvailable|Cached|Buffers|SwapTotal|SwapFree"
+
+# 实时内存监控
+vmstat 1
+# si/so = swap 换入换出（非零说明内存不足）
+```
+
+### 3.2 进程级内存
+
+```bash
+# 按内存排序找进程
+ps aux --sort=-%mem | head -10
+
+# 进程详细内存映射
+pmap -x <pid> | tail -5
+# total KB = 进程总内存占用
+
+# 更精细的内存分析
+smem -tk    # 按 PSS 排序（PSS = 按比例分摊共享内存）
+cat /proc/<pid>/smaps | grep -E "Pss|Rss" | awk '{sum+=$2} END{print sum/1024"MB"}'
+
+# Java 堆外内存
+jcmd <pid> VM.native_memory summary
+```
+
+### 3.3 内存泄漏定位
+
+```bash
+# 1. 监控 RSS 增长曲线
+while true; do
+    echo "$(date +%H:%M:%S) $(ps -o rss= -p <pid>)KB"
+    sleep 60
+done > rss_monitor.log
+
+# 2. 找内存增长点（Java）
+jmap -dump:live,format=b,file=heap.hprof <pid>
+# 用 MAT / VisualVM 分析
+
+# 3. 非 Java 进程
+pmap -x <pid> > pmap_start.txt
+# 等一段时间
+pmap -x <pid> > pmap_end.txt
+diff pmap_start.txt pmap_end.txt
+
+# 4. 内存分配跟踪（需 root）
+valgrind --tool=massif ./myapp
+ms_print massif.out.<pid>
+```
+
+### 3.4 OOM 排查
+
+```bash
+# 查看 OOM Killer 记录
+dmesg | grep -i "oom\|killed process" | tail -5
+# [12345.678] Out of memory: Kill process 12345 (java) score 800
+
+# 查看历史 OOM
+journalctl -k | grep -i "oom\|killed"
+
+# Java OOM 后
+# 1. 检查启动参数：-Xmx 是否超过物理内存的 70%
+# 2. 检查堆外内存：NIO direct buffer / metaspace
+# 3. 检查 cgroup 限制：cat /sys/fs/cgroup/memory/<container>/memory.limit_in_bytes
+```
+
+### 3.5 Swap 分析
+
+```bash
+# 查看 swap 使用
+swapon -s
+cat /proc/swaps
+
+# 查看哪些进程在用 swap
+for f in /proc/[0-9]*/status; do
+    awk '/VmSwap/{if($2>0)print FILENAME,$0}' "$f" 2>/dev/null
+done
+
+# Swap 偏好（控制 swap 使用倾向）
+cat /proc/sys/vm/swappiness
+# 0: 尽量不用 swap  # 60: 默认  # 100: 积极使用
+# Java 建议设 10-30（减少 swap 对 GC 的影响）
+```
+
+---
+
+## 四、磁盘 IO 排查
+
+### 4.1 整体 IO 分析
+
+```bash
+# 实时 IO 监控
+iostat -x 1
+# 关键指标：
+# %util: 磁盘利用率（>80% 接近瓶颈）
+# await: 平均 IO 等待时间（ms，越小越好）
+# r/s w/s: 读写次数
+# rkB/s wkB/s: 读写吞吐
+
+# 进程级 IO
+iotop -oP          # 只显示有 IO 的进程
+pidstat -d -p <pid> 1  # 指定进程 IO
+
+# 文件系统空间
+df -hT              # 各挂载点空间和类型
+du -sh /var/log/*   # 找大目录
+ncdu /              # 交互式磁盘占用分析
+```
+
+### 4.2 IO 问题定位
+
+```bash
+# 已删文件空间不释放（常见！）
+lsof | grep deleted
+# 找到占用的进程 → 重启进程 或 清空 /proc/<pid>/fd/<fd号>
+
+# 文件系统只读
+mount | grep "ro,"
+# 修复：remount rw 或 fsck
+
+# inode 耗尽（df -i 查看）
+df -i
+# 找大量小文件：find / -xdev -type f | wc -l
+```
+
+### 4.3 文件系统深入
+
+| 文件系统 | 特点 | 适用 |
+|----------|------|------|
+| ext4 | 成熟稳定、支持日志 | 通用 |
+| xfs | 高性能大文件、并行IO | 数据库/日志 |
+| btrfs | 快照/压缩/子卷 | 测试/备份 |
+| tmpfs | 内存文件系统 | 临时文件/IPC |
+
+```bash
+# 文件系统类型
+df -T / | tail -1
+
+# 挂载参数
+mount | grep " / "
+
+# 常用挂载选项（/etc/fstab）
+# noatime: 不更新访问时间（提升性能）
+# discard: SSD TRIM（SSD 必须）
+# barrier=0: 禁用写屏障（有 UPS 时可提升性能，但有风险）
+```
+
+---
+
+## 五、网络排查
+
+### 5.1 连通性
+
+```bash
+# 基础连通
+ping -c 4 <host>
+traceroute <host>       # 路径追踪
+mtr -n <host>          # 实时丢包率（比 traceroute 更好）
+nc -zv <host> <port>   # TCP 端口探测
+telnet <host> <port>   # 端口探测（经典）
+```
+
+### 5.2 连接状态
+
+```bash
+# 所有监听端口
+ss -lantp
+# 状态分布
+ss -ant | awk '{print $1}' | sort | uniq -c | sort -rn
+# LISTEN  SYN_RECV  ESTABLISHED  TIME_WAIT  CLOSE_WAIT
+
+# TIME_WAIT 过多（短连接风暴）
+ss -ant | grep TIME_WAIT | wc -l
+# 解决：长连接/连接池 + net.ipv4.tcp_tw_reuse=1
+
+# CLOSE_WAIT 过多（应用未关闭连接）
+ss -ant | grep CLOSE_WAIT
+# 原因：应用 bug（未调 close()）→ 检查代码
+```
+
+### 5.3 抓包分析
+
+```bash
+# 抓指定端口的包
+tcpdump -i any -n port 8080 -w capture.pcap
+# -i any: 所有网卡  -n: 不解析域名  -w: 写文件
+
+# 抓指定主机
+tcpdump -i any -n host 10.0.0.1 and port 3306
+
+# 实时查看（ASCII）
+tcpdump -i any -n port 8080 -A | head -50
+
+# 分析重传/乱序
+tcpdump -r capture.pcap | grep -i "retrans\|dup"
+
+# Wireshark 离线分析
+# 下载 .pcap 文件，用 Wireshark 打开
+```
+
+### 5.4 网络调优（sysctl）
+
+```bash
+# 查看当前值
+sysctl net.ipv4.tcp_tw_reuse
+sysctl net.core.somaxconn
+
+# 常用调优参数
+# TIME_WAIT 复用
+net.ipv4.tcp_tw_reuse = 1
+
+# 连接队列大小
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# 端口范围
+net.ipv4.ip_local_port_range = 1024 65535
+
+# TCP 缓冲区
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# SYN 洪泛防护
+net.ipv4.tcp_syncookies = 1
+
+# 生效方式
+sysctl -w net.ipv4.tcp_tw_reuse=1
+# 持久化：echo "net.ipv4.tcp_tw_reuse=1" >> /etc/sysctl.conf && sysctl -p
+```
+
+### 5.5 DNS 排查
+
+```bash
+# DNS 解析测试
+dig <domain> +short
+nslookup <domain>
+getent hosts <domain>   # 用系统解析（走 /etc/hosts + nsswitch）
+
+# DNS 配置
+cat /etc/resolv.conf
+cat /etc/nsswitch.conf   # 解析顺序：files dns
+
+# DNS 调试
+dig <domain> +trace      # 完整解析链路
+```
+
+---
+
+## 六、进程与线程
+
+### 6.1 进程管理
+
+```bash
+# 进程树
+ps auxf                  # 树形显示
+pstree -p                # 进程树 + PID
+
+# 进程资源
+ps -eo pid,ppid,comm,rss,vsz,%cpu,%mem --sort=-%mem | head -20
+
+# 进程打开的文件
+lsof -p <pid> | wc -l    # fd 数量
+ls /proc/<pid>/fd | wc -l # 同上
+
+# 进程环境变量
+cat /proc/<pid>/environ | tr '\0' '\n'
+```
+
+### 6.2 系统调用追踪
+
+```bash
+# strace 跟踪系统调用
+strace -p <pid> -c        # 统计系统调用次数/耗时
+strace -p <pid> -e trace=network  # 只看网络调用
+strace -p <pid> -e trace=file     # 只看文件操作
+strace -p <pid> -T         # 显示每个调用耗时
+
+# 进程卡死排查
+strace -p <pid>
+# 如果输出停在 futex(0x..., FUTEX_WAIT, ...) → 死锁
+# 如果停在 read(0x..., ...) → 等待输入
+# 如果停在 epoll_wait → 正常等待事件
+
+# 查看内核栈
+cat /proc/<pid>/stack
+# 常见：futex_wait_queue → 死锁/锁竞争
+# 常见：do_page_fault → 缺页/OOM
+```
+
+### 6.3 信号与终止
+
+```bash
+# 常用信号
+kill -15 <pid>   # SIGTERM（优雅终止，默认）
+kill -9 <pid>    # SIGKILL（强制终止，不可捕获）
+kill -1 <pid>    # SIGHUP（重载配置，如 nginx）
+
+# 批量杀进程
+kill $(ps aux | grep "myapp" | grep -v grep | awk '{print $2}')
+# 更安全
+pkill -f "myapp"
+```
+
+---
+
+## 七、JVM 应用专项
+
+```bash
+# 进程查找
+jps -l                    # 列出 Java 进程
+jps -v <pid>              # 查看启动参数
+
+# 线程分析
+jstack <pid>              # 线程快照
+jstack <pid> | grep -A 5 "BLOCKED"  # 查死锁
+jstack <pid> | grep "tid=" | wc -l  # 线程数
+
+# GC 分析
+jstat -gcutil <pid> 1000  # 每秒 GC 统计
+jstat -gccause <pid> 1000 # GC 原因
+
+# 堆分析
+jmap -heap <pid>          # 堆概览
+jmap -dump:live,format=b,file=heap.hprof <pid>
+# MAT / VisualVM 分析
+
+# Arthas 在线诊断（推荐）
+# 启动：java -jar arthas-boot.jar <pid>
+thread -n 3               # 最忙的3个线程
+thread -b                 # 阻塞线程
+trace com.example.Svc method  # 方法耗时
+watch com.example.Svc method returnObj  # 返回值
+stack com.example.Svc method  # 调用栈
+```
+
+---
+
+## 八、systemd 服务管理
+
+```bash
+# 查看服务状态
+systemctl status nginx
+systemctl list-units --type=service --state=failed
+
+# 服务管理
+systemctl start/stop/restart/reload nginx
+systemctl enable/disable nginx  # 开机自启
+
+# 查看服务日志
+journalctl -u nginx -f           # 实时日志
+journalctl -u nginx --since "1 hour ago"
+journalctl -u nginx -p err       # 只看错误
+
+# 自定义服务
+cat /etc/systemd/system/myapp.service
+```
+
+---
+
+## 九、iptables / nftables 防火墙
+
+```bash
+# 查看规则
+iptables -L -n -v
+iptables -L -n --line-numbers
+
+# 常用规则
+iptables -A INPUT -p tcp --dport 8080 -j ACCEPT    # 允许端口
+iptables -A INPUT -s 10.0.0.0/24 -j ACCEPT          # 允许网段
+iptables -A INPUT -j DROP                            # 默认拒绝
+
+# 删除规则
+iptables -D INPUT 3          # 删除第3条
+
+# nftables（iptables 后继）
+nft list ruleset
+nft add table inet filter
+nft add chain inet filter input { type filter hook input priority 0 \; }
+```
+
+---
+
+## 十、经典排障 SOP
+
+### 案例 A：接口变慢
+
+```bash
+# 1. 看整体负载
+uptime   # load average 高吗？
+top      # CPU us 高？wa 高？
+
+# 2. CPU 高 → 火焰图
+perf record -g -p <pid> -- sleep 30
+perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+# 3. wa 高 → IO 瓶颈
+iostat -x 1     # %util 高？
+iotop            # 哪个进程 IO 高？
+
+# 4. 结合日志
+tail -f /var/log/app.log | grep ERROR
+```
+
+### 案例 B：内存涨到 OOM
+
+```bash
+# 1. 确认 OOM
+dmesg | grep -i oom
+# 2. 看内存使用
+free -h
+ps aux --sort=-%mem | head -5
+# 3. Java 堆泄漏
+jmap -dump:live,format=b,file=heap.hprof <pid>
+# MAT 分析
+# 4. 非 Java 进程
+pmap -x <pid> > start.txt
+# 等 30 分钟
+pmap -x <pid> > end.txt
+diff start.txt end.txt | grep "total"
+```
+
+### 案例 C：磁盘满
+
+```bash
+# 1. 找大文件
+df -h
+du -sh /* 2>/dev/null | sort -rh | head -10
+du -sh /var/log/* | sort -rh | head -5
+
+# 2. 已删文件占空间
+lsof | grep deleted | sort -k7 -rn | head -5
+# 清空：> /proc/<pid>/fd/<fd号> 或 重启进程
+
+# 3. inode 耗尽
+df -i
+find / -xdev -type f | wc -l
+# 找小文件目录
+find / -xdev -type d -exec sh -c 'echo "$(find "$1" -maxdepth 1 -type f | wc -l) $1"' _ {} \; | sort -rn | head
+```
+
+### 案例 D：连接不上
+
+```bash
+# 1. 看监听
+ss -lantp | grep :8080
+# 2. 测端口
+telnet <host> 8080
+nc -zv <host> 8080
+# 3. 看防火墙
+iptables -L -n | grep 8080
+# 4. 抓包
+tcpdump -i any -n port 8080
+# SYN 没回 → 防火墙/端口没监听
+# RST → 服务拒绝
+# SYN-ACK → 三次握手成功，问题在应用层
+```
+
+---
+
+## 十一、速查表
 
 | 维度 | 先看 | 再细分 |
 |------|------|--------|
-| CPU | top / uptime | perf top / 火焰图 / vmstat(cs) |
-| 内存 | free -h / top RES | pmap / smem / dmesg oom |
-| IO | iostat -x / vmstat | iotop / pidstat -d / lsof deleted |
-| 网络 | ping / ss -lantp | tcpdump / sar -n DEV / dig |
-| 进程 | ps / top -H | strace / lsof / jstack |
+| CPU | `top` / `uptime` | `perf top` / 火焰图 / `vmstat` |
+| 内存 | `free -h` / `top RES` | `pmap` / `smem` / `dmesg oom` |
+| IO | `iostat -x` / `vmstat` | `iotop` / `pidstat -d` / `lsof deleted` |
+| 网络 | `ping` / `ss -lantp` | `tcpdump` / `sar -n DEV` / `dig` |
+| 进程 | `ps` / `top -H` | `strace` / `lsof` / `jstack` |
 
 ---
 
-## 面试高频问题（20+ 条）
+## 十二、与其他板块的关系
 
-1. **负载（load average）高怎么查？** 先看 top：CPU 高还是 wa/IO 等待；再 perf/iotop 细分。
-2. **load 高但 CPU 不高说明啥？** 多在等 IO（D 状态）或锁/上下文切换；看 wa%、cs。
-3. **如何找 CPU 热点函数？** perf top 实时；perf record+report 或火焰图定位。
-4. **火焰图怎么看？** 横轴是采样时长占比，最宽的函数最耗 CPU；自底向上是调用栈。
-5. **free 很低但 available 高？** 是页缓存占用，可回收，不算真缺内存。
-6. **OOM 怎么排查？** dmesg | grep oom 看被杀进程；查 /var/log/messages；优化内存/调 -Xmx。
-7. **内存泄漏怎么定位？** 监控 RSS 增长；pmap/jmap 抓映射/堆；MAT 分析泄漏对象。
-8. **磁盘 IO 瓶颈指标？** iostat -x 看 %util、await；接近 100% 且 await 高即瓶颈。
-9. **已删文件空间不释放？** 被进程占着（lsof | grep deleted），需重启进程或清空 fd。
-10. **TIME_WAIT 过多怎么办？** 复用连接/连接池；开 tcp_tw_reuse；避免短连接风暴。
-11. **怎么看某个端口谁在监听？** ss -lantp | grep :端口（比 netstat 快）。
-12. **tcpdump 怎么抓 8080？** tcpdump -i any -n port 8080 -w x.pcap，Wireshark 分析。
-13. **进程卡死怎么查？** strace -p 看卡在哪个系统调用；cat /proc/pid/stack 看内核栈。
-14. **too many open files 原因？** fd 泄漏；lsof 查进程 fd 数，调 ulimit -n。
-15. **上下文切换高意味着？** 大量线程切换/锁竞争；vmstat cs、pidstat -w 定位。
-16. **如何查 DNS 解析问题？** dig/nslookup/getent hosts；查 /etc/resolv.conf。
-17. **Java 应用排查工具？** jstack(线程)/jstat(GC)/jmap(堆)/arthas(在线 watch/trace)。
-18. **top 里 RES 和 VIRT 区别？** RES 实际物理内存；VIRT 含映射的虚拟（含未驻留）。
-19. **sar 是什么？** 系统活动报告，可回看历史 CPU/IO/网络（历史采样）。
-20. **网络带宽怎么看？** sar -n DEV 1 或 iftop；ethtool 看网卡速率。
-21. **如何确认是应用慢还是网络慢？** 本地 curl 测延迟 vs 跨网络；tcpdump 看握手/重传。
-22. **排查 SOP 顺序？** 整体(top/负载)→分资源(iostat/perf/ss)→进进程(strace/jstack)→结合日志。
+- 操作系统原理见「[操作系统](./操作系统.md)」；
+- K8s 排障见「[K8s 故障排查手册](../云原生/K8s故障排查手册.md)」；
+- K8s 运维见「[K8s 运维实战](../云原生/K8s运维实战.md)」；
+- 可观测性见「[云原生/可观测性](../云原生/可观测性.md)」；
+- 场景设计排障见「[场景设计/问题定位](../场景设计/问题定位.md)」。
+
+> 一句话：**Linux 排障三板斧：`top` 看整体 → `perf/strace` 定热点 → `jstack/jmap` 进应用——wa 高查 IO、us 高查代码、load 高查阻塞（D 状态）**。
