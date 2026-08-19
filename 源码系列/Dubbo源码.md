@@ -1,174 +1,267 @@
-# Dubbo 源码解析（面试高频）
+# Dubbo 源码解析（深入：Filter 链 / 线程模型 / 连接管理 / 优雅关闭）
 
-> Apache Dubbo 是 Java 生态最主流的 RPC / 微服务框架之一。面试常问 **十层架构、一次 RPC 调用链路、SPI 自适应扩展、集群容错与负载均衡**。本文按官方架构 + 调用流程串讲。
->
-> 源码仓库：[apache/dubbo](https://github.com/apache/dubbo)（The java implementation of Apache Dubbo. An RPC and microservice framework. Apache-2.0；模块清晰：dubbo-rpc / dubbo-cluster / dubbo-registry / dubbo-remoting / dubbo-serialization 等，适合源码级阅读）。
+> Apache Dubbo 是 Java 生态最主流的 RPC 框架。本篇深入拆解：Filter 链机制、线程模型、连接管理、优雅关闭、序列化选型。
 
 ---
 
-## 一、十层架构（官方代码架构）
-
-Dubbo 官方把代码组织成十层（蓝色虚线 = 启动组装链，红色实线 = 运行时调用链）：
+## 一、十层架构
 
 | 层 | 职责 | 核心接口 |
 |----|------|----------|
-| `Service` 服务层 | 业务接口（开发者定义） | 你的 `UserService` |
-| `Config` 配置层 | 对外配置，启动入口 | `ServiceConfig` / `ReferenceConfig` |
-| `Proxy` 代理层 | 透明代理，生成 Stub / Skeleton | `ProxyFactory` |
-| `Registry` 注册中心层 | 服务注册与发现 | `RegistryFactory` / `Registry` |
-| `Cluster` 集群层 | 多 Provider 路由、容错、负载均衡 | `Cluster` / `Directory` / `Router` / `LoadBalance` |
-| `Monitor` 监控层 | 调用次数 / 耗时统计 | `MonitorFactory` / `Monitor` |
-| `Protocol` 远程调用层 ★ | 封装 RPC 调用（核心） | `Protocol` / `Invoker` / `Exporter` |
-| `Exchange` 信息交换层 | 请求-响应模式，同步转异步 | `Exchanger` / `ExchangeChannel` |
-| `Transport` 网络传输层 | 抽象 Netty / Mina 为统一接口 | `Transporter` / `Channel` / `Client` / `Server` |
-| `Serialize` 序列化层 | 对象 ↔ 字节流 | `Serialization` / `ObjectInput/Output` |
-
-> 官方原话：**「Protocol 是核心层，只要有 Protocol + Invoker + Exporter 就能完成非透明 RPC 调用」**；Cluster 是外围概念——把多个 Invoker 伪装成一个，单 Provider 时不需要 Cluster。
+| Service | 业务接口（开发者定义） | 你的 `UserService` |
+| Config | 对外配置，启动入口 | `ServiceConfig` / `ReferenceConfig` |
+| Proxy | 透明代理，生成 Stub/Skeleton | `ProxyFactory` |
+| Registry | 服务注册与发现 | `RegistryFactory` / `Registry` |
+| Cluster | 多 Provider 路由、容错、负载均衡 | `Cluster` / `Directory` / `LoadBalance` |
+| Monitor | 调用次数/耗时统计 | `MonitorFactory` / `Monitor` |
+| Protocol ★ | 封装 RPC 调用（核心） | `Protocol` / `Invoker` / `Exporter` |
+| Exchange | 请求-响应模式，同步转异步 | `Exchanger` / `ExchangeChannel` |
+| Transport | 抽象 Netty 为统一接口 | `Transporter` / `Channel` |
+| Serialize | 对象 ↔ 字节流 | `Serialization` / `ObjectInput/Output` |
 
 ---
 
-## 二、一次 RPC 调用链路（Consumer → Provider）
-
-以 Consumer 调用 `userService.sayHello()` 为例，请求自上而下穿过各层，响应反向返回：
+## 二、一次 RPC 调用链路
 
 ```
-1.  Service 接口调用
-2.  Proxy 层：InvokerInvocationHandler.invoke() → 构造 RpcInvocation
-3.  Cluster 层：LoadBalance.select() 选一个 Provider Invoker
-4.  集群容错：FailoverClusterInvoker（失败重试）/ Failfast ...
-5.  Filter 链：ConsumerContextFilter → MonitorFilter → ...（监控/日志/限流）
-6.  Protocol 层：DubboProtocol.refer() 得到 DubboInvoker
-7.  Exchange 层：HeaderExchangeChannel.request() 生成 Request 对象（同步转异步）
-8.  Transport 层：NettyChannel.send() 写入 Socket
-9.  Serialize 层：Hessian2Serialization 把对象转字节流
+1. Service 接口调用
+2. Proxy 层：InvokerInvocationHandler.invoke() → 构造 RpcInvocation
+3. Cluster 层：LoadBalance.select() 选一个 Provider
+4. 集群容错：FailoverClusterInvoker（失败重试）
+5. Filter 链：ConsumerContextFilter → MonitorFilter → ExecuteLimitFilter → ...
+6. Protocol 层：DubboProtocol.refer() → DubboInvoker
+7. Exchange 层：HeaderExchangeChannel.request() 生成 Request
+8. Transport 层：NettyChannel.send() 写入 Socket
+9. Serialize 层：Hessian2Serialization 序列化
 --- 网络传输 ---
-10. Provider 接收：Netty Handler → 解码 → DubboProtocol.reply() → 调真实服务实现 → 返回
-11. Consumer 接收响应：解码 → 反序列化 → 经 Future 返回给调用方
+10. Provider：Netty Handler → 解码 → DubboProtocol.reply() → 调真实服务 → 返回
+11. Consumer：解码 → 反序列化 → Future 返回给调用方
 ```
-
-```mermaid
-sequenceDiagram
-    participant C as Consumer 应用
-    participant P as Proxy/Cluster
-    participant Pr as Protocol/Exchange
-    participant T as Netty Transport
-    participant S as Provider 应用
-    C->>P: userService.sayHello()
-    P->>Pr: Invoker.invoke(RpcInvocation)
-    Pr->>T: Request(序列化字节)
-    T->>S: 网络发送
-    S-->>T: Response
-    T-->>Pr: 解码/反序列化
-    Pr-->>P: Result
-    P-->>C: 返回值
-```
-
-> 核心模型是 **Invoker**：所有操作围绕 `Invoker.invoke(Invocation)` 展开。Consumer 端是 `DubboInvoker`（远程），Provider 端是 `AbstractProxyInvoker`（本地服务包装）。`Invocation` 封装方法名 + 参数，`Result` 封装返回值 / 异常。
 
 ---
 
-## 三、SPI 与 @Adaptive（Dubbo 扩展机制灵魂）
+## 三、Filter 链机制（深入）
 
-Dubbo 没有用 JDK 原生 SPI，而是自己实现了一套**更强大**的 SPI：支持**自适应扩展、自动包装（AOP）、自动激活**。
+### 3.1 概念
 
-### 3.1 基本机制
+```
+Filter = AOP 思想，在调用前后插入逻辑（如监控、限流、日志）
 
-扩展点接口用 `@SPI` 标注默认实现，实现类放在 `META-INF/dubbo/` 下的配置文件（key=实现类全限定名）：
-
-```java
-@SPI("dubbo")
-public interface Protocol {
-    @Adaptive
-    Exporter export(Invoker<?> invoker) throws RpcException;
-    @Adaptive
-    Invoker<?> refer(Class<?> type, URL url) throws RpcException;
-}
+Consumer 端 Filter：调用前插入（如 ConsumerContextFilter 设置隐式参数）
+Provider 端 Filter：请求到达后插入（如 ExecuteLimitFilter 限流）
 ```
 
-### 3.2 @Adaptive（自适应扩展）—— 面试重点
+### 3.2 核心源码
 
-`@Adaptive` 标注的方法会由框架**动态生成适配器类**：真正调用时**根据 URL 参数（如 `protocol=dubbo` 或 `loadbalance=roundrobin`）在运行期决定用哪个实现**，而不是启动期定死。这就是「自适应」——把扩展选择推迟到方法调用那一刻。
+```
+源码路径：
+  dubbo-rpc/dubbo-rpc-api/src/main/java/org/apache/dubbo/rpc/Filter.java
 
-```java
-// 自适应示例：根据 URL 的 loadbalance 参数动态选实现
-@SPI(RandomLoadBalance.NAME)
-public interface LoadBalance {
-    @Adaptive("loadbalance")
-    <T> Invoker<T> select(List<Invoker<T>> invokers, URL url, Invocation invocation);
-}
-// 调用时 url 带 loadbalance=roundrobin 就选加权轮询，否则默认随机
+SPI 扩展：
+  META-INF/dubbo/org.apache.dubbo.rpc.Filter
+  
+执行链：
+  Filter1 → Filter2 → Filter3 → Invoker.invoke()
+
+源码实现：
+  AbstractInvoker.invoke() → Filter chain → 真实调用
+  
+关键代码：
+  List<Filter> filters = getFilters(); // 从 SPI 加载
+  for (Filter filter : filters) {
+      result = filter.invoke(invoker, invocation);
+  }
 ```
 
-### 3.3 自动包装（Wrapper / AOP）
+### 3.3 内置 Filter
 
-若某个扩展实现类的构造器**参数是该扩展点接口本身**，框架会把它当作 Wrapper 自动层层包装（如 `ProtocolFilterWrapper`、`ProtocolListenerWrapper`），实现类似 AOP 的链式增强，无需手动织入。
+| Filter | 说明 | 端 |
+|--------|------|----|
+| ConsumerContextFilter | 设置隐式参数（如 traceId） | Consumer |
+| MonitorFilter | 统计调用次数/耗时 | 双端 |
+| ExecuteLimitFilter | 限流（执行限制） | Provider |
+| ActiveLimitFilter | 并发调用限制 | Consumer |
+| TimeoutFilter | 超时处理 | Provider |
+| GenericFilter | 泛化调用 | Provider |
+
+### 3.4 自定义 Filter
+
+```java
+@Activate(group = "consumer", order = 100)
+public class MyConsumerFilter implements Filter {
+    @Override
+    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        // 调用前逻辑
+        RpcContext.getContext().setAttachment("my_key", "my_value");
+        Result result = invoker.invoke(invocation);
+        // 调用后逻辑
+        return result;
+    }
+}
+```
 
 ---
 
-## 四、集群容错与负载均衡
+## 四、线程模型
 
-### 4.1 集群容错策略（Cluster）
+### 4.1 线程池配置
 
-| 策略 | 行为 | 适用 |
-|------|------|------|
-| `Failover`（默认） | 失败**自动切换**其他 Provider（可配 `retries`） | 读操作、幂等写 |
-| `Failfast` | **快速失败**，立即抛异常 | 非幂等写（如新增） |
-| `Failsafe` | 失败**忽略**，记日志 | 审计、非关键 |
-| `Failback` | 失败**定时重试**（后台） | 通知类 |
-| `Forking` | **并行**调多个 Provider，谁先返回用谁 | 实时性要求高的读 |
-| `Broadcast` | 广播给所有 Provider | 通知所有节点（如缓存更新） |
+```
+dubbo.protocol.threadpool=fixed
+dubbo.protocol.threads=200
+dubbo.protocol iothreads=4
 
-### 4.2 负载均衡（LoadBalance）
+固定大小（fixed）：线程数固定（默认 200）
+缓存（cached）：按需创建，空闲回收（不推荐生产）
+限制（limited）：只创建不回收
+```
 
-| 算法 | 说明 |
+### 4.2 IO 线程 vs 业务线程
+
+```
+IO 线程（Netty EventLoop）：
+  处理网络读写
+  解码/编码
+  不执行业务逻辑
+
+业务线程（dubbo 业务线程池）：
+  执行 Filter 链
+  调用真实业务方法
+  处理序列化/反序列化
+
+原则：IO 线程不阻塞，业务逻辑都放业务线程
+```
+
+### 4.3 Dispatcher 分发策略
+
+| 策略 | 说明 |
 |------|------|
-| `Random`（默认） | 加权随机 |
-| `RoundRobin` | 加权轮询（带平滑） |
-| `LeastActive` | 最少活跃调用数（谁最闲给谁） |
-| `ConsistentHash` | 一致性 Hash（同参数落同节点，用于有状态） |
-
-### 4.3 服务目录与路由
-
-- **`RegistryDirectory`**：动态监听注册中心，**服务列表变化实时刷新**（Provider 上下线自动感知，无需重启 Consumer）。
-- **`RouterChain`**：条件路由、标签路由、灰度路由等，决定「这次调用能用哪些 Provider」。
+| all | 所有消息分发到业务线程（默认） |
+| direct | 直接在 IO 线程处理（不推荐） |
+| message | 只分发请求消息到业务线程 |
+| execution | 只分发请求，不处理连接 |
+| connection | 只分发连接事件 |
 
 ---
 
-## 五、异步化与线程模型
+## 五、连接管理
 
-- **IO 与业务线程分离**：Netty 的 IO 线程**不执行业务逻辑**，请求经 `Dispatcher`（如 `all` / `message`）分发到业务线程池，避免 IO 线程被慢业务阻塞。
-- **全链路异步**：底层用 `CompletableFuture` 支撑，`RpcContext.getContext().asyncCall(...)` 显式异步；返回 `CompletableFuture` 可链式编排。
-- **长连接多路复用**：默认单连接上多路复用请求（`DefaultFuture` 用请求 ID 关联响应，复用 Request 对象），减少连接数。
-
-### 5.1 协议与编解码（Dubbo 协议头）
+### 5.1 连接模型
 
 ```
-| Magic(2B) | Flag(1B) | Status(1B) | ID(8B) | DataLength(4B) | Body... |
+Consumer → Provider：
+  默认单连接 + 多路复用（同一个 TCP 连接上传多个请求）
+  高吞吐场景可配多连接（connections=10）
+
+长连接优势：
+  - 减少 TCP 三次握手开销
+  - 减少连接数（K8s Pod 多时重要）
+  - 多路复用提升吞吐
 ```
-- 序列化支持 **Hessian2（默认）/ JSON / Kryo / Protobuf** 等；Hessian2 用对象池减少 GC。
-- 结果缓存 `CacheFilter`、限流 `ExecuteLimitFilter`、Mock 降级等都以 **Filter** 形式挂在调用链上。
+
+### 5.2 连接复用
+
+```
+Dubbo 协议：
+  请求 ID（8字节）关联响应
+  一个连接上多个请求并发
+  Provider 端按请求 ID 解码
+
+HTTP/2 协议：
+  天然支持多路复用
+  更适合云原生场景
+```
+
+### 5.3 连接池
+
+```
+连接数控制：
+  consumer.connections=1（默认单连接）
+  consumer.connections=10（高吞吐场景）
+  
+连接健康检查：
+  心跳检测（默认 60s）
+  断线重连
+  连接超时（默认 3s）
+```
 
 ---
 
-## 六、服务暴露与引用（启动组装）
+## 六、优雅关闭
 
-- **Provider 暴露**：`ServiceConfig` → `ProxyFactory` 把实现类包成 `Invoker` → `Protocol.export()` 暴露为远程服务（`DubboProtocol` 默认）→ `Registry` 向注册中心注册地址 → 启动 `NettyServer` 监听。
-- **Consumer 引用**：`ReferenceConfig` → `Registry` 订阅服务列表 → `ProxyFactory` 生成接口**代理对象**（默认 `JavassistProxyFactory`，用 Javassist 字节码生成，比 JDK 代理更快）→ 调用走上面第二节链路。
+### 6.1 Provider 优雅关闭
 
-```mermaid
-flowchart LR
-    subgraph Provider
-      A[ServiceConfig] --> B[ProxyFactory 包 Invoker]
-      B --> C[Protocol.export]
-      C --> D[Registry 注册 + NettyServer 监听]
-    end
-    subgraph Consumer
-      E[ReferenceConfig] --> F[Registry 订阅列表]
-      F --> G[ProxyFactory 生成代理]
-      G --> H[调用 → Cluster → Protocol → Netty]
-    end
-    D <-->|注册中心| F
-    H -->|RPC| D
+```
+收到 kill -15 信号后：
+  1. 标记为不可用（不接新请求）
+  2. 等待进行中的请求完成（默认 10s）
+  3. 从注册中心下线
+  4. 关闭连接
+  5. 释放资源
+
+配置：
+  dubbo.service.shutdown.wait=10000（等待时间 ms）
+  dubbo.registry.stop等待时间（注册中心下线等待时间）
 ```
 
-> 读源码建议：调用链抓 `InvokerInvocationHandler` → `ClusterInvoker` → `Filter` 链 → `DubboInvoker` → `HeaderExchangeChannel.request`；扩展机制抓 `@SPI` / `@Adaptive` 与 `ExtensionLoader`；容错抓 `FailoverClusterInvoker.select/invoke`。
+### 6.2 Consumer 优雅关闭
+
+```
+收到 kill -15 信号后：
+  1. 标记为不可用（不发新请求）
+  2. 等待进行中的请求完成
+  3. 取消订阅
+  4. 关闭连接
+
+关键：
+  Consumer 关闭顺序：先关 Dubbo，再关 Spring 容器
+  避免出现调用失败（Provider 已下线但 Consumer 还在调）
+```
+
+---
+
+## 七、序列化选型
+
+| 序列化 | 速度 | 体积 | 兼容性 | 适用 |
+|--------|------|------|--------|------|
+| Hessian2 | 快 | 小 | 好 | 默认推荐 |
+| JSON | 慢 | 大 | 极好 | 调试/跨语言 |
+| Kryo | 极快 | 小 | 差 | Java 内部 |
+| Protobuf | 快 | 最小 | 好 | 跨语言/gRPC |
+| FST | 快 | 小 | 差 | Java 内部 |
+
+---
+
+## 八、常见问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 调用超时 | 网络/Provider 慢 | 检查超时配置 + Provider 日志 |
+| 服务找不到 | 注册中心地址错误 | 检查注册中心配置 |
+| 序列化失败 | 类未实现 Serializable | 加 Serializable |
+| 线程池满 | 并发量超过线程池大小 | 调大线程池/限流 |
+| 连接断开 | 网络抖动/Provider 重启 | 检查心跳配置 |
+| 内存泄漏 | 对象未释放（如 ThreadLocal） | 检查 Filter/拦截器 |
+
+---
+
+## 九、读源码建议
+
+```
+调用链：InvokerInvocationHandler → ClusterInvoker → Filter 链 → DubboInvoker → HeaderExchangeChannel.request
+扩展：@SPI / @Adaptive 与 ExtensionLoader
+容错：FailoverClusterInvoker.select/invoke
+服务暴露：ServiceConfig → ProxyFactory → Protocol.export → Registry.register
+服务引用：ReferenceConfig → Registry → ProxyFactory 生成代理
+```
+
+---
+
+## 十、与其他板块的关系
+
+- Dubbo 使用见「[Dubbo](../基础知识/中间件/Dubbo.md)」；
+- Spring Cloud 对比见「[Spring Cloud 微服务](../基础知识/SpringCloud微服务.md)」；
+- gRPC 对比见「[gRPC](../基础知识/中间件/gRPC.md)」；
+- 负载均衡见「[分布式系统](../基础知识/分布式系统.md)」。
+
+> 一句话：**Dubbo = 十层架构 + SPI 扩展 + Filter AOP + IO/业务线程分离 + 长连接多路复用——核心模型是 Invoker，读源码从 Filter 链和 Invoker 入手**。
