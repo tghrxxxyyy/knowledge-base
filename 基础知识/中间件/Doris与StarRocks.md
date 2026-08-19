@@ -1,38 +1,28 @@
-# Doris / StarRocks（分析型数据库 MPP 双雄）
+# Doris / StarRocks 深入（物化视图实现 / 查询优化 / 数据导入 / 生产部署 / 冷热分层）
 
-> Doris 与 StarRocks 是**国产开源分析型数据库（OLAP）**的代表：MPP 架构 + 列式存储 + 极速点查，兼容 MySQL 协议，国内互联网「实时数仓/报表/BI」场景的当红选择。本篇讲「解决的问题 → 原理 → 特性 → 与 ClickHouse 对比 → 选型」。
-
----
-
-## 一、解决的问题与定位
-
-**解决的问题**：业务报表、用户画像、实时大屏、日志分析——「亿~万亿行数据，毫秒~秒级出结果」的分析查询。传统 MySQL 扛不住分析（行列混合、索引失效），Hadoop+Hive 太慢（分钟级），需要**秒级响应 + MySQL 生态友好**的分析引擎。
-
-**定位一句话**：**「面向在线分析（OLAP）的 MPP 列式数据库，兼容 MySQL 协议，查询快、上手快、运维省」。**
-
-核心场景：
-- BI 报表 / 数据大屏（极速点查与聚合）；
-- 用户画像与标签圈选（宽表 + 位图/字典编码）；
-- 实时数仓（Kafka → Doris 即查）；
-- 明细与审计查询（列式裁剪，扫亿行秒级）。
+> Doris 与 StarRocks 是**国产 MPP 列式 OLAP** 双雄。本篇深入拆解：物化视图增量刷新机制、查询优化器原理、多源导入链路、生产部署最佳实践、冷热分层架构。
 
 ---
 
-## 二、核心原理
+## 一、核心原理
 
-### 2.1 MPP + 列式存储
+### 1.1 MPP + 列式存储
 
 ```
-数据按分布键(分桶 key) 哈希/范围分散到 BE(Backend) 节点
-查询: FE(Frontend) 解析优化 → 分发到所有 BE 并行扫描切片 → 结果合并
+FE（Frontend）：SQL 解析、查询计划、元数据管理（类 HDFS NameNode）
+BE（Backend）：数据存储 + 计算执行（列式存储、向量化执行、多副本）
+
+查询流程：
+  SQL → FE 解析优化 → 生成查询计划
+  → 分发到所有 BE 并行扫描切片
+  → 结果合并返回
+
+列式 + 向量化：
+  按列压缩存储、按列批量计算（SIMD）
+  聚合（count/sum/avg）只扫需要的列，跳过无关列
 ```
 
-- **FE（Frontend）**：SQL 解析、查询计划、元数据管理（类 HDFS NameNode 角色，可多 FE）；
-- **BE（Backend）**：数据存储 + 计算执行（列式存储、向量化执行、多副本）；
-- **列式 + 向量化**：按列压缩存储、按列批量计算（SIMD），聚合（count/sum/avg）只扫需要的列；
-- **智能索引**：前缀索引 + 稀疏索引 + 布隆过滤，快速跳过无关数据块。
-
-### 2.2 两种表模型（核心选型点）
+### 1.2 三种表模型
 
 | 模型 | 语义 | 适用 |
 |------|------|------|
@@ -40,71 +30,195 @@
 | Aggregate（聚合） | 导入时按键聚合（SUM/MAX/MIN/REPLACE） | 指标表：PV/UV、余额快照 |
 | Unique（唯一键） | 按唯一键去重更新（REPLACE/UPDATE） | 用户表、订单实时更新 |
 
-### 2.3 物化视图（实时数仓利器）
+### 1.3 分桶键设计
 
-- 建 `materialized_view` 预聚合（如按天×商品预聚合），查询命中自动走物化视图，省扫描量 10~100 倍；
-- 支持**异步物化视图**：自动调度增量刷新（Kafka 导入后定时/事件触发刷新），是「实时数仓分层 ODS→DWD→ADS」的落地加速器。
+```
+分桶键 = 数据分布 + 查询性能的关键
 
----
+原则：
+  选择查询最常用的过滤字段（如 user_id / sku_id）
+  同 key 数据同节点（Colocate），避免跨节点 Shuffle
+  分桶数 = BE 数 × 副本数（合理分布）
 
-## 三、Doris vs StarRocks（同门师兄弟）
-
-StarRocks 是 Doris 社区 fork 的**性能优先分支**（前 Doris 核心开发者创立），两者高度同源：
-
-| 维度 | Doris（Apache） | StarRocks |
-|------|----------------|-----------|
-| 社区 | Apache 顶级项目 | StarRocks 基金会（商业化由 StarRocks Inc.） |
-| 核心定位 | 稳定、生态优先 | 性能极致（向量化执行更激进）、新特性快 |
-| 查询性能 | 优秀 | 略优（多数 benchmark 领先） |
-| 中文文档/生态 | 国内用户广 | 文档也很全 |
-| 适合 | 求稳标准 OLAP | 性能敏感、需要最新特性 |
-
-> 选型：**两者二选一即可，需求不极致时看团队已有运维经验**；StarRocks 官网常见「比 ClickHouse/Doris 快 X 倍」的对比（benchmark 场景差异大，自行压测为准）。
+反例：
+  用 timestamp 做分桶键 → 写入热点（所有新数据集中在一个桶）
+  用低基数字段做分桶键 → 数据倾斜
+```
 
 ---
 
-## 四、Doris/StarRocks vs ClickHouse（最常问的对比）
+## 二、物化视图（深入）
 
-| 维度 | ClickHouse | Doris / StarRocks |
-|------|-----------|-------------------|
-| 架构 | 分布式 + 本地表（无共享） | MPP：FE 元数据 + BE 执行（类似 Presto/Doris 全家桶） |
-| Join | 大表 join 弱（设计为单表/宽表） | **多表 Join 强**（分布式 join、Colocate Join） |
-| 更新 | 弱（主打一次写入追加） | Unique 模型支持实时更新场景 |
-| 并发 | 单查询快但并发有限 | **高并发点查更稳**（多副本 + 缓存） |
-| 协议 | HTTP 原生（无 JDBC 标准） | **MySQL 协议**（BI 工具/JDBC 直连） |
-| 生态 | 引擎强、周边弱 | 生态完整（BI/官方工具/物化视图） |
+### 2.1 同步物化视图
 
-> 结论：**单表超大聚合 & 日志分析 → ClickHouse；多表 Join、BI 明细查询、MySQL 生态团队 → Doris/StarRocks。** 二者常并存：CK 跑高频报表，Doris/StarRocks 跑 BI 与画像。
+```
+同步物化视图 = 建表时指定聚合/转换规则
+  → 数据导入时自动维护
+  → 查询命中时走物化视图，省扫描量 10~100 倍
+
+CREATE MATERIALIZED VIEW mv_sum
+AS SELECT user_id, SUM(amount) as total
+FROM orders GROUP BY user_id;
+
+工作原理：
+  导入数据 → 同步更新物化视图（增量）
+  查询 → FE 自动匹配最优物化视图
+```
+
+### 2.2 异步物化视图（实时数仓利器）
+
+```
+异步物化视图 = 手动/定时刷新的预聚合
+
+CREATE MATERIALIZED VIEW mv_daily
+BUILD IMMEDIATE REFRESH AUTO ON SCHEDULE
+DAILY INTERVAL 1 HOUR
+AS SELECT date, product_id, SUM(amount)
+FROM orders GROUP BY date, product_id;
+
+刷新机制：
+  增量刷新：检测 Base 表变化，只刷新变化分区
+  全量刷新：每次全量重建（小数据集可用）
+  定时刷新：按 CRON 表达式调度
+
+适用：实时数仓分层 ODS→DWD→ADS
+```
+
+### 2.3 物化视图选型
+
+| 类型 | 刷新 | 性能 | 适用 |
+|------|------|------|------|
+| 同步 | 导入时同步 | 极高 | 预聚合指标表 |
+| 异步 | 定时/事件 | 高 | 实时数仓分层 |
+| 同步 Rollup | 导入时同步 | 高 | 多维度预聚合 |
 
 ---
 
-## 五、生产实践要点
+## 三、查询优化器
 
-1. **分桶键**：选查询过滤最常用的字段（如 user_id / sku_id）做分桶键，保证同 key 数据同节点（Colocate）；
-2. **宽表设计**：维度字段冗余进事实表（退化维），减少 Join——画像/报表宽表是常用姿势；
-3. **导入链路**：Kafka → Routine Load（Doris 原生订阅）秒级可见；批量走 Stream Load；
-4. **实时数仓分层**：ODS 明细表（Duplicate）→ ADS 物化视图/聚合表，查询走物化视图；
-5. **容量**：BE 节点横向扩展（按副本数/数据量规划），冷热分层（历史分区迁移对象存储/冷存）。
+### 3.1 基于代价的优化器（CBO）
+
+```
+CBO = 基于代价估算选择最优查询计划
+
+核心能力：
+  Join 重排：多表 Join 选择最优顺序
+  分区裁剪：跳过不相关分区
+  物化视图匹配：自动选择最优物化视图
+  谓词下推：过滤条件推到存储层
+
+配置：
+  SET cbo_enable = true;
+  SET enable_pipeline_engine = true;  // 流水线执行引擎
+```
+
+### 3.2 查询调优手段
+
+| 手段 | 说明 |
+|------|------|
+| EXPLAIN | 查看查询计划，确认是否命中索引/物化视图 |
+| 分区裁剪 | WHERE 条件带分区键，跳过无关分区 |
+| 物化视图 | 预聚合加速 |
+| 向量化执行 | SIMD 批量计算，开启 pipeline engine |
+| Runtime Filter | Join 时动态生成过滤条件，减少扫描量 |
+| 物化视图选择 | FE 自动选择最优物化视图 |
 
 ---
 
-## 六、速查表
+## 四、多源导入链路
 
-| 主题 | 一句话 |
-|------|--------|
-| 定位 | MPP 列式 OLAP，MySQL 协议，秒级分析 |
-| 架构 | FE（元数据/计划）+ BE（存储/执行），多副本 |
-| 表模型 | Duplicate 明细 / Aggregate 聚合 / Unique 更新 |
-| 物化视图 | 预聚合 + 自动刷新，实时数仓加速器 |
-| vs ClickHouse | CK 单表快并发弱；Doris 多表 Join 强 + MySQL 生态 |
-| vs StarRocks | 同源，SR 性能略极致，Doris 更稳 |
+### 4.1 导入方式
+
+| 方式 | 特点 | 适用 |
+|------|------|------|
+| Stream Load | HTTP 接口，同步返回 | 小批量 CSV/JSON 导入 |
+| Broker Load | HDFS/S3 数据导入 | 大批量离线导入 |
+| Routine Load | Kafka 实时订阅 | 实时流式导入（秒级可见） |
+| Spark Load | Spark 作业导入 | 超大批量 ETL |
+| Multi-Catalog | 外部表直接查询 | 联邦查询（MySQL/Hive/ES） |
+
+### 4.2 Routine Load（实时数仓标配）
+
+```
+CREATE ROUTINE LOAD orders_kafka ON orders
+COLUMNS(kafka_topic, kafka_partitions, kafka_offsets)
+PROPERTIES("format"="json", "max_batch_interval"="10")
+FROM KAFKA("kafka_broker_list"="kafka:9092","kafka_topic"="orders");
+
+原理：
+  FE 定时（默认 10s）从 Kafka 拉取一批
+  → BE 写入（原子导入）
+  → 秒级可见（Flink 也是这样对接）
+
+注意：
+  每个 Routine Load 只能订阅一个 Topic
+  分区数变更需要手动调整
+  导入失败会自动重试（默认重试 3 次）
+```
+
+---
+
+## 五、生产部署最佳实践
+
+### 5.1 部署架构
+
+```
+3 FE（1 Leader + 2 Follower，主从同步）
+  → 元数据高可用
+
+3~N BE（数据分片 + 副本）
+  → 存储计算一体
+
+可选：
+  Broker（HDFS/S3 对接）
+  仲裁节点（Follower 选主）
+```
+
+### 5.2 集群规划
+
+| 配置 | 建议 |
+|------|------|
+| FE 数量 | 3 个（奇数，1 Leader + 2 Follower） |
+| BE 数量 | 按数据量 + 副本数规划（如 3 副本 × 3 BE） |
+| 副本数 | 默认 3（生产必配） |
+| 存储 | SSD（热数据）+ HDD/对象存储（冷数据） |
+| 内存 | BE 内存 = 数据量 × 10%~20%（向量化计算需要） |
+
+### 5.3 冷热分层
+
+```
+冷热分层 = 热数据 SSD，冷数据归档到对象存储（省 50%+ 成本）
+
+实现：
+  分区级别：按时间分区，热分区 SSD，冷分区迁移 S3
+  BE 存储：hot SSD + cold HDD（StarRocks 支持）
+  物化视图：热数据走物化视图，冷数据走原始表
+
+迁移策略：
+  7 天内：SSD（热）
+  7~30 天：HDD（温）
+  30 天后：S3/OSS（冷）
+```
+
+---
+
+## 六、常见问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 查询慢 | 未命中分区裁剪/物化视图 | EXPLAIN + 调整 WHERE + 建物化视图 |
+| 导入失败 | BE 磁盘满/网络抖动 | 检查 BE 状态 + 调整导入频率 |
+| OOM | 大查询/Join 超内存 | 调整 BE 内存 + 限制查询内存 |
+| 数据倾斜 | 分桶键选择不当 | 重新设计分桶键 |
+| 副本不一致 | 网络分区/磁盘故障 | 检查副本状态 + 手动修复 |
 
 ---
 
 ## 七、与其他板块的关系
 
-- 与「[ClickHouse](./ClickHouse.md)」同为 OLAP 引擎，互为选型对照；
-- 数仓分层与建模见「[基础知识/大数据/09-数据仓库与OLAP引擎](../大数据/09-数据仓库与OLAP引擎.md)」「[14-大数据场景设计实战](../大数据/14-大数据场景设计实战.md)」；
-- 云上对应见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」（AnalyticDB/云 Doris 等托管）。
+- ClickHouse 对比见「[ClickHouse](./ClickHouse.md)」；
+- 数仓分层见「[大数据/09-数据仓库与OLAP引擎](../大数据/09-数据仓库与OLAP引擎.md)」；
+- 云上对应见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
+- Flink 实时导入见「[Apache Flink 流处理](./ApacheFlink流处理.md)」。
 
-> 一句话：**Doris/StarRocks = 国内实时数仓与 BI 的首选分析库：MySQL 协议零迁移、MPP 并行快、物化视图省算力；单表极致聚合选 ClickHouse，多表 Join 与 BI 生态选它。**
+> 一句话：**Doris/StarRocks = MPP 列式 + MySQL 协议 + 物化视图 + 多源导入——查询调优三板斧：分区裁剪 + 物化视图 + 向量化执行；生产选 Retain 回收 + WaitForFirstConsumer + 冷热分层**。
