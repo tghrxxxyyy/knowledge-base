@@ -3,11 +3,11 @@
 > 为「海量数据的分析查询」而生的列式数据库，单表聚合查询性能极致、压缩率高。
 > 适合：日志/埋点分析、监控指标、用户行为（漏斗/路径）、实时 BI 报表、用户画像宽表。
 > 不适合：高频事务更新（UPDATE/DELETE 是异步合并）、强事务、复杂多表 JOIN 实时性要求高的场景。
+> 本文按「本体 → 为什么快 → 架构 → MergeTree 引擎 → 特性 → 对比 → 实践避坑」拆解。
 
 ---
 
-
-## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+## 〇、本体介绍
 
 **它是什么**：ClickHouse 是俄罗斯 Yandex 开源的列式（Columnar）OLAP 数据库，用 C++ 编写，主打「亿级数据亚秒聚合」，是实时分析、日志/埋点分析、BI 报表的利器。
 
@@ -34,7 +34,16 @@
 2. **高压缩**：同一列数据类型相同、相似度高，压缩率远优于行存。
 3. **向量化执行**：以「列块」为单位批量处理，吃满 CPU 缓存与 SIMD 指令。
 
-> 官方实测：1 亿行网络分析查询 92 毫秒（>10 亿行/秒）。仓库 `github.com/ClickHouse/ClickHouse`（C++/Rust，Apache-2.0 类，25 万+ commits，活跃度极高）。
+### 1.1 查询执行管线
+
+```
+SQL → 解析/分析 → 查询计划优化（下推谓词/裁剪列）
+  → 读列块（按需列 + 稀疏索引跳块 + 跳过索引）
+  → 向量化执行（列块批量算子：filter/aggregate/join）
+  → 合并中间结果 → 输出
+
+关键：全链路"列块级"操作，避免逐行解释执行（对比 MySQL 逐行）
+```
 
 ---
 
@@ -69,7 +78,40 @@ ClickHouse 的「快」很大程度来自表引擎。Mergetree 系列是主力�
 | **Collapsing / VersionedCollapsing** | 行折叠（正负抵消实现 UPDATE/DELETE 语义） |
 | **Log / TinyLog** | 轻量小表 |
 
-**写入模型**：数据先写内存 part → 落盘 → 后台异步 merge（类似 LSM）。因此 UPDATE/DELETE 不是即时生效，而是「标记 + 后台合并」，**不适合高频点更新**。
+### 3.1 写入与合并机制（LSM 风格）
+
+```
+写入模型：
+  数据先写内存 part → 周期性落盘（flush）
+  → 后台异步 merge 小 part 为大 part（类似 LSM）
+
+因此：
+  UPDATE/DELETE 不是即时生效，而是「标记 + 后台合并」
+  不适合高频点更新；点查不如 MySQL/HBase
+```
+
+```
+合并过程：
+  多个小 part（part_0_0_0）→ 后台线程合并 → 大 part（part_0_99_1）
+  合并是异步、有序的（按主键顺序），不阻塞读写
+  监控合并队列深度（part 数过多说明写入批次过小）
+```
+
+### 3.2 Order By / 主键 / 分区
+
+```
+ORDER BY：决定物理排序 + 稀疏索引（primary key 默认是 order by 前缀）
+  原则：最常用过滤字段放最前（如 service_name, event_time）
+  查询只扫命中的稀疏索引区间 → 跳过无关块
+
+PARTITION BY：单表内按天/业务切分
+  利于 DROP PARTITION 快速清历史
+  分区粒度：过大合并慢、过小 part 过多（通常按天）
+
+主键（稀疏索引）：
+  每 part 记录首尾 key（约 8192 行一个 granule）
+  只能范围跳块，不能单点精确定位（适合扫描聚合，不适合点查）
+```
 
 ---
 
@@ -77,17 +119,17 @@ ClickHouse 的「快」很大程度来自表引擎。Mergetree 系列是主力�
 
 1. **向量化执行引擎**：列块批量处理，吃满 SIMD。
 2. **完备 SQL**：支持 JOIN、子查询、窗口函数、CTE，兼容大多数 ANSI SQL。
-3. **数据跳过索引（Data Skipping Index）**：基于主键 + 跳数索引，大幅减少扫描。
+3. **数据跳过索引（Data Skipping Index）**：基于主键 + 跳数索引（minmax/bloom/ngram），大幅减少扫描。
 4. **物化视图**：预计算常用聚合，查询直接读结果，加速 BI。
 5. **Kafka Engine / S3 Engine**：原生消费 Kafka、读 S3，省 ETL。
 6. **分层存储**：热数据本地盘、冷数据 S3（降本）。
 7. **高写入吞吐**：追加写入友好，日志/埋点场景百万行/秒级导入。
+8. **LowCardinality / 字典编码**：低基数字段（service_name/log_level）字典编码，查询提速 2-5 倍。
+9. **TTL 自动过期**：表/列级 TTL 自动删除或迁移冷数据。
 
 ---
 
 ## 五、ClickHouse vs 其他 OLAP（StarRocks / Doris）
-
-来自 2025 年横向评测（TPC-H 100G 估算，典型场景）：
 
 | 维度 | ClickHouse | StarRocks | Apache Doris |
 |------|-----------|-----------|--------------|
@@ -108,13 +150,54 @@ ClickHouse 的「快」很大程度来自表引擎。Mergetree 系列是主力�
 
 ## 六、生产实践与避坑
 
+### 6.1 设计原则
+
 1. **宽表优先**：ClickHouse 不擅长多表 JOIN，常把数据打成一张大宽表（如用户行为宽表），用空间换 JOIN 性能。
 2. **分片键/排序键设计**：ORDER BY 决定主键排序与稀疏索引，直接影响查询裁剪。
 3. **避免高频 UPDATE**：用 ReplacingMergeTree / Collapsing 表达「最终一致」的更新语义，别当 MySQL 用。
 4. **物化视图预聚合**：大表上建物化视图承接实时指标，避免每次全表扫。
 5. **Kafka 直读**：用 Kafka Engine 直接消费，省一层 Flink（简单场景）。
-6. **监控**：Prometheus + Grafana，关注 merge 速度、part 数量、内存。
-7. **与 Java 集成**：JDBC driver 或 `clickhouse-jdbc`，MyBatis 亦可，注意批量写入用 `INSERT ... SELECT` 或 Native 协议。
+
+### 6.2 写入优化
+
+```
+Batch 是王道：
+  极其讨厌单条 INSERT（疯狂产生小 part，合并打满磁盘 IO）
+  应攒批：每批数千~数万行，或每秒一批
+  预排序数据可跳过排序步骤更快
+  async insert（异步插入）可缓解小批问题
+
+监控：part 数量、合并队列、后台合并线程
+```
+
+### 6.3 查询优化
+
+```
+ 尽量按分区/主键过滤（分区裁剪 + 稀疏索引跳块）
+ 小表 broadcast join 大表（join_algorithm=hash）
+ 用字典（Dictionary）替 join（低基数字段映射）
+ 避免大表 join 大表（先聚合再 join）
+ LowCardinality 声明低基数字段
+ 数据类型优化：整数替字符串、IPV4 类型、Date 替字符串
+```
+
+### 6.4 高并发与资源隔离
+
+```
+max_concurrent_queries 限并发
+per-user/per-role 配额（max_memory_usage）
+query_queue 优先级调度（大查询低优先级，关键业务高优先级）
+资源隔离：多业务分集群/分用户
+```
+
+### 6.5 监控与运维
+
+```
+Prometheus + Grafana
+关键指标：查询耗时、扫描行数/字节、内存、合并队列、part 数量、复制延迟
+调 background_merge_threads 控制合并对写入的影响
+合理分区避免过多小 part
+```
 
 ---
 
@@ -124,6 +207,7 @@ ClickHouse 的「快」很大程度来自表引擎。Mergetree 系列是主力�
 - 与 [ES 体系](../ES体系.md)：ES 偏「搜索 + 明细检索 + 日志全文」，ClickHouse 偏「结构化聚合分析」。日志场景常 ClickHouse 做聚合 + ES 做检索，或 ClickHouse 取代部分 ES 聚合。
 - 与 [数据同步 CDC-Canal](数据同步CDC-Canal.md)：MySQL binlog → Kafka → ClickHouse 是常见实时数仓链路。
 - 与 [消息队列 MQ](../MQ.md)：ClickHouse 常作为 Kafka 下游消费端，承载实时分析。
+- 与 [Doris与StarRocks](./Doris与StarRocks.md)：高并发/复杂 JOIN 场景选 StarRocks，单表聚合选 ClickHouse。
 
 ---
 
@@ -176,7 +260,7 @@ ClickHouse 的「快」很大程度来自表引擎。Mergetree 系列是主力�
 
 15. **与 StarRocks / Doris 区别？** StarRocks/Doris 是 MPP 架构、支持更优的多表 Join 与实时更新、并发更好；CH 在单表聚合与生态成熟度上强，但 Join 与高并发偏弱。
 
-16. **副本机制（ReplicatedMergeTree）？** 基于 ZooKeeper 协调多副本，保证数据冗余与高可用；写主副本同步到其他副本。
+16. **副本机制（ReplicatedMergeTree）？** 基于 ZooKeeper/ClickHouse Keeper 协调多副本，保证数据冗余与高可用；写主副本同步到其他副本。
 
 17. **稀疏索引 vs 稠密索引？** 稠密索引每行一个指针（MySQL B+ 树），稀疏索引每块一个（CH），更省空间但只能范围跳块，不适合点查。
 

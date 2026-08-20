@@ -75,10 +75,25 @@ HTTP/2:   一个连接多个流（多路复用）+ 头部压缩（HPACK）+ 二�
 ### 2.5 Protobuf 编码（Varint + ZigZag + TLV）
 
 - **Varint**：小整数用 1 字节（高位表示是否续段），数字越小编码越短；
+- **ZigZag**：负数映射为无符号数，避免大整数编码膨胀；
 - **Tag = 字段号<<3 | wire_type**：TLV 格式，解码不依赖 Schema 顺序；
 - **对比 JSON**：同样 payload 体积约为 JSON 的 1/5~1/3，编解码 CPU 开销低一个量级。
 
 **选型关注点**：Protobuf 不是人类可读的（调试需转 JSON 工具），适合内部服务通信而非对外 API。
+
+### 2.6 完整调用链路
+
+```
+Client Stub 调用
+  → 序列化参数为 Protobuf 二进制
+  → 组装 HTTP/2 帧（含 gRPC 帧头：1字节压缩标志 + 4字节长度）
+  → 通过 Channel 选连接发送（多路复用共享连接）
+  → 服务端 gRPC Server 解码分发到对应 Service 方法
+  → 返回结果序列化回传
+
+超时/取消通过 gRPC-Timeout Header + Context 传播
+元数据通过 :path + 自定义 Header 传递
+```
 
 ---
 
@@ -96,6 +111,8 @@ HTTP/2:   一个连接多个流（多路复用）+ 头部压缩（HPACK）+ 二�
 | 元数据 | Header 自定义 KV（类似 HTTP Header） |
 | TLS/mTLS | 原生支持，与 Envoy/Istio 无缝集成 |
 | gRPC-Web | 浏览器通过代理调用 gRPC（前端可直连） |
+| 健康检查 | grpc-health-probe 原生支持 K8s 探针 |
+| 反射 | Server Reflection 让 grpcurl 动态调用 |
 
 ---
 
@@ -130,6 +147,7 @@ HTTP/2:   一个连接多个流（多路复用）+ 头部压缩（HPACK）+ 二�
 | protoc-gen-validate | 参数校验代码生成 |
 | Envoy/Istio | gRPC 原生转发、重试、超时、mTLS |
 | grpc-health-probe | K8s 健康检查探针 |
+| buf | 新一代 proto 管理/编译工具（替代 protoc 部分场景） |
 
 ### 5.2 关键配置
 
@@ -140,13 +158,25 @@ HTTP/2:   一个连接多个流（多路复用）+ 头部压缩（HPACK）+ 二�
 | Keepalive | 设置 Ping 间隔（NAT 下防连接失效） |
 | 拦截器顺序 | 鉴权→限流→日志→业务（责任链） |
 | 重试策略 | 幂等操作可开重试（配合 Exponential Backoff） |
+| 连接池 | Channel 复用 + 负载均衡策略（round_robin/pick_first） |
 
 ### 5.3 常见坑
 
 - **阻塞式 stub 吃线程**：高并发用异步/流式 stub（或响应式框架）；
 - **元数据过大**：Header 不能太大（HPACK 动态表膨胀）；
 - **Deadline 传播**：Context 必须向下游传递（否则超时不生效）；
-- **嵌套 message 循环引用**：proto 不支持循环依赖，需拆包。
+- **嵌套 message 循环引用**：proto 不支持循环依赖，需拆包；
+- **流式内存泄漏**：大流需背压/限流，防止接收端内存被打满；
+- **跨语言类型映射**：timestamp/decimal 需注意各语言映射差异（用 well-known types）。
+
+### 5.4 与网关/服务网格集成
+
+```
+gRPC 在云原生中的位置：
+  网关：grpc-gateway（REST 转 gRPC）或 Envoy（HTTP/2 透传）
+  服务网格：Istio 对 gRPC 原生支持（mTLS/重试/超时/金丝雀）
+  可观测：OpenTelemetry gRPC 拦截器注入 trace
+```
 
 ---
 

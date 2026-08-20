@@ -61,6 +61,13 @@ Kafka 集群：输入 topic / 输出 topic / changelog topic（状态备份）
 - **幂等生产者**（enable.idempotence）+ **事务**（跨消费/生产原子提交）；
 - 消费 offset 与输出结果在同一事务提交——失败重放不会产生重复结果。
 
+```
+EOS 实现：
+  processing.guarantee=exactly_once_v2（Kafka 3.x）
+  事务协调器（Transaction Coordinator）协调两阶段提交
+  代价：事务有额外开销（非关键链路用 at-least-once + 幂等）
+```
+
 ### 2.5 窗口与时间
 
 | 窗口 | 说明 |
@@ -70,7 +77,23 @@ Kafka 集群：输入 topic / 输出 topic / changelog topic（状态备份）
 | Sliding | 按事件时间区间（Join 用） |
 | Session | 按活跃间隔（用户会话） |
 
-### 2.6 ksqlDB（SQL 化）
+```
+时间语义：
+  事件时间（event-time，推荐）vs 处理时间（processing-time）vs 摄入时间（ingestion-time）
+  水位线/延迟允许（grace period）：迟到的记录在允许窗口内仍计入
+  窗口结果有"最终确定性"问题：窗口关闭后迟到的数据如何处理（suppression/grace）
+```
+
+### 2.6 交互式查询（Interactive Queries）
+
+```
+State Store 是本地物化视图 → 通过 REST/API 直接查询
+  查询"当前累计金额/当前用户状态"
+  分布式：实例间需发现（K8s service / 服务发现）
+  与 ksqlDB 的 SELECT 联动（实时大屏直接查物化结果）
+```
+
+### 2.7 ksqlDB（SQL 化）
 
 ```sql
 -- 流与表
@@ -86,6 +109,13 @@ CREATE TABLE order_stats AS
 
 -- 交互查询（REST）：直接查物化视图
 SELECT * FROM order_stats WHERE user='u1' EMIT CHANGES;
+```
+
+```
+ksqlDB 服务端：独立进程（ksqlDB server），管理多个查询
+  用 SQL 把 Stream/Table 定义 + 连续查询 → 简化开发
+  EMIT CHANGES：持续推送结果（物化视图增量）
+  适合实时大屏/监控统计/轻量流 ETL
 ```
 
 **选型关注点**：ksqlDB 让「流处理 SQL 化 + 结果即表（可查询）」——实时大屏/监控统计场景开发效率极高。
@@ -147,7 +177,18 @@ SELECT * FROM order_stats WHERE user='u1' EMIT CHANGES;
 - **rebalance 风暴**：频繁重启/心跳超时导致反复重平衡 → 调大 session.timeout；
 - **状态膨胀**：无界聚合状态无限增长 → 窗口/压缩/TTL 策略；
 - **EOS 性能开销**：事务有额外开销，非关键链路用 at-least-once + 幂等；
-- **拓扑变更**：改拓扑/变更状态结构需要停机迁移（state store 版本管理）。
+- **拓扑变更**：改拓扑/变更状态结构需要停机迁移（state store 版本管理）；
+- **反序列化错误**：消息格式不匹配 → 配置 error handling / dead-letter topic；
+- **窗口延迟数据**：正确设置 grace 与 suppression，避免"结果回跳"。
+
+### 5.3 典型应用
+
+```
+实时监控：统计每分钟各服务错误数（窗口聚合 → 物化视图 → 大屏）
+实时推荐特征：用户行为流 + 用户画像表 join → 特征 topic
+实时风控：交易流 + 规则聚合 → 异常事件 topic
+流式 ETL：topic 清洗/格式转换 → 落湖/更新索引
+```
 
 ---
 
