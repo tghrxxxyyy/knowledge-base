@@ -1,6 +1,6 @@
-# MyCat 与 Vitess（分库分表中间件 / 数据库代理）
+# MyCat 与 Vitess 深入（代理架构 / vindex 路由 / 在线扩容 / 事务处理 / 决策树）
 
-> MyCat 是**国产经典分库分表中间件**（Java，源自 Cobar），Vitess 是 **YouTube 开源、CNCF 毕业的数据库集群系统**（对应用是 MySQL，对下是分片集群）。两者的共同价值：**对应用透明地做分库分表**。相比 ShardingSphere（客户端 SDK，侵入应用）、TiDB（NewSQL 原生分片）、云 PolarDB-X（托管），MyCat/Vitess 以「**代理模式：应用零改动，SQL 入口统一**」独树一帜。本篇按「解决的问题 → 原理 → 对比 → 选型关注点」拆解。
+> MyCat 是**国产经典分库分表中间件**（Java 代理），Vitess 是 **YouTube 开源、CNCF 毕业的数据库集群系统**（Go + K8s 原生）。共同价值：**对应用透明地做分库分表**。本篇深入拆解：代理架构细节、vindex 路由、在线扩容、分布式事务、选型决策树。
 
 ---
 
@@ -18,9 +18,7 @@
 
 ---
 
-## 二、核心原理
-
-### 2.1 MyCat 架构（Java 代理）
+## 二、MyCat 架构（Java 代理）
 
 ```
 应用 → MyCat（一个 MySQL 协议的入口）
@@ -32,13 +30,59 @@
   └── 全局序列（分片全局 ID：MyCat 号段）
 ```
 
-**分片规则配置**（schema.xml + rule.xml）：
-- **取模**：`order_id % 4` → 4 个分片（数据均匀但扩容难）；
-- **范围**：按 ID 区间（扩容友好，数据不均）；
-- **一致性哈希**：均匀 + 扩容影响小；
-- **枚举/日期**：按业务维度（地区/月份）。
+### 2.1 分片规则
 
-### 2.2 Vitess 架构（Go + K8s 原生）
+| 规则 | 原理 | 特点 |
+|------|------|------|
+| 取模 | `order_id % 4` | 数据均匀，扩容难 |
+| 范围 | 按 ID 区间 | 扩容友好，数据不均 |
+| 一致性哈希 | 哈希环 | 均匀 + 扩容影响小 |
+| 枚举/日期 | 按业务维度 | 按地区/月份 |
+
+### 2.2 MyCat 路由流程
+
+```
+SQL 解析：
+  INSERT/UPDATE/DELETE/SELECT → 提取分片键值
+  如：SELECT * FROM orders WHERE order_id = 10086
+  → 提取 order_id=10086 → 路由计算 → 命中分片 db2
+
+路由判断：
+  命中单分片：直接下发
+  命中多分片：下发所有 + 合并结果
+
+合并（MyCat 代理层）：
+  ORDER BY → 多分片结果排序（归并排序）
+  LIMIT → 先各分片取 limit，再合并取 limit
+  聚合（COUNT/SUM）→ 分片聚合后汇总
+  去重（DISTINCT）→ 分片去重后汇总
+```
+
+### 2.3 配置示例
+
+```xml
+<!-- schema.xml：表 → 分片规则 -->
+<schema name="testdb" checkSQLschema="false">
+  <table name="orders" dataNode="dn$1-4" rule="mod-order-id" />
+</schema>
+
+<!-- rule.xml：取模规则 -->
+<tableRule name="mod-order-id">
+  <rule>
+    <columns>order_id</columns>
+    <algorithm>mod-long</algorithm>
+  </rule>
+</tableRule>
+<function name="mod-long" class="io.mycat.route.function.PartitionByMod">
+  <property name="count">4</property>
+</function>
+```
+
+---
+
+## 三、Vitess 架构（Go + K8s 原生）
+
+### 3.1 组件
 
 ```
 应用 → VTGate（无状态 SQL 网关，像 MySQL）
@@ -53,44 +97,126 @@
   └── 自动故障转移：主挂 → 提升从（半同步保证不丢）
 ```
 
-**vindex 路由**：类似索引——`Primary Vindex`（哈希/唯一）决定行存哪个分片，二级 vindex 支持跨分片查询优化。
+### 3.2 vindex 路由（深入）
 
-### 2.3 分片扩容对比
+```
+vindex = Vitess 的「分片索引」
 
-| 方案 | MyCat | Vitess |
-|------|-------|--------|
-| 扩容方式 | 重路由（需停机/双写）或预分片（一次拆够） | **垂直拆分 + 水平再分片（自动 re-shard，在线）** |
-| 实践建议 | 预分片（2 的幂，一次拆到位） | 官方在线迁移工具（SplitClone） |
+Primary Vindex（必选，决定行存哪个分片）：
+  hash：哈希取模（均匀）
+  unicode_loose_md5：字符串哈希
+  binary：二进制哈希
+  numeric：数值直接映射
+  reverse_bits：反转位（分布均匀）
+  lookup：查表（自定义映射）
 
-**选型关注点**：Vitess 的在线 re-shard 是其核心优势；MyCat 扩容靠「预分片」规避（规划 2^n 分片）。
+二级 vindex（可选，跨分片查询优化）：
+  按其他字段快速定位分片（减少全片扫描）
 
-### 2.4 跨分片能力
+定义（VSchema）：
+{
+  "sharded": true,
+  "vindexes": {
+    "user_hash": {"type": "hash"}
+  },
+  "tables": {
+    "users": {
+      "column_vindexes": [
+        {"column": "user_id", "name": "user_hash"}
+      ]
+    }
+  }
+}
+```
 
-| 能力 | MyCat | Vitess |
-|------|-------|--------|
-| 跨片 Join | 支持（多表路由，限制多） | 支持（跨分片 Join 有约束） |
-| 分布式事务 | XA（性能差）/弱一致 | **2PC 协调（VTGate 事务）** |
-| 聚合/排序 | 代理层合并 | VTGate 合并 |
-| 全局唯一 ID | MyCat 序列 | 应用自建（与 ID 生成器配合） |
+### 3.3 查询路由
+
+```
+单分片查询（高效）：
+  SELECT * FROM users WHERE user_id = 5
+  → vindex 计算 → 直达分片
+
+跨分片查询（代价高）：
+  SELECT * FROM orders WHERE status = 'PAID'
+  → 无 vindex 可用 → 广播所有分片 → VTGate 合并
+
+路由优化：
+  二级 vindex（按字段定位分片）
+  聚合函数（COUNT/SUM）→ 分片聚合 + 汇总
+  分片感知优化（shard-targeting）
+```
 
 ---
 
-## 三、核心特性
+## 四、在线扩容（re-shard）
 
-| 特性 | MyCat | Vitess |
-|------|-------|--------|
-| 语言/生态 | Java/国内文档全 | Go/CNCF/K8s 原生 |
-| 应用透明 | 是（MySQL 协议） | 是（MySQL 协议） |
-| 高可用 | 后端库主从 + 心跳 | VTTablet 自动故障转移（半同步） |
-| 事务 | XA（重）/弱事务 | 2PC 协调 |
-| 扩容 | 预分片 | 在线 re-shard |
-| 监控 | 管理台（弱） | Prometheus 原生指标 |
-| 云原生 | 一般 | 强（Operator 部署） |
-| 活跃度 | 维护期 | 活跃（CNCF 毕业） |
+### 4.1 Vitess 在线扩容流程
+
+```
+垂直拆分（合并拆成多个库）：
+  业务表按域拆分（如订单域/用户域）
+  应用改连接 → 数据由 VTGate 路由
+
+水平拆分（单库拆成多分片）：
+  1. 定义新 vindex 方案（如 user_id hash 拆 4 片）
+  2. SplitClone：后台复制数据（不停服）
+  3. 增量同步（binlog 持续复制）
+  4. 验证一致性
+  5. 切换路由（VSchema 更新）
+  6. 清理旧分片
+
+优势：
+  全程不停服（在线迁移）
+  官方工具（vtctld SplitClone / MoveTables）
+```
+
+### 4.2 MyCat 扩容方式
+
+```
+预分片（推荐）：
+  一次性拆 2^n（如 32/64 片）
+  后续只加物理库不重分片（映射扩容）
+
+重路由（停机/双写）：
+  新分片规则 → 数据迁移（ETL）→ 切换
+  停机窗口 / 双写成本高
+
+对比：
+  Vitess：在线 re-shard（自动）
+  MyCat：预分片规避（规划 2^n）
+```
 
 ---
 
-## 四、MyCat vs Vitess vs ShardingSphere vs TiDB
+## 五、分布式事务处理
+
+### 5.1 事务模型对比
+
+| 方案 | 原理 | 性能 | 适用 |
+|------|------|------|------|
+| XA（MyCat） | 两阶段提交 | 差（锁资源） | 强一致低频 |
+| 2PC（Vitess） | VTGate 协调 | 中 | 跨分片事务 |
+| 弱事务 | 最终一致 | 高 | 可接受延迟 |
+
+### 5.2 业务设计（规避跨片事务）
+
+```
+最佳实践：按分片键聚合业务
+  订单 + 订单明细 → 同分片（order_id 为分片键）
+  用户 + 用户钱包 → 同分片（user_id 为分片键）
+
+避免：
+  跨分片事务（性能差）
+  跨分片 Join（广播查询代价高）
+
+兜底：
+  本地事务 + 消息最终一致
+  补偿事务（TCC/SAGA）
+```
+
+---
+
+## 六、MyCat vs Vitess vs ShardingSphere vs TiDB
 
 | 维度 | MyCat | Vitess | ShardingSphere | TiDB |
 |------|-------|--------|----------------|------|
@@ -110,29 +236,51 @@
 
 ---
 
-## 五、生产实践
+## 七、选型决策树
 
-### 5.1 关键实践
-
-| 实践 | 说明 |
-|------|------|
-| 分片键选择 | 高频查询必须带分片键（否则全片扫描）；选业务强相关列（userId/orderId） |
-| 预分片 | 一次性拆 2^n（如 32/64 片），避免二次扩容 |
-| 全局 ID | 与「分布式 ID」配合（雪花/号段）保证分片内有序 |
-| 分布式事务 | 尽量规避跨片事务（按分片键设计业务），必要时补偿（TCC/SAGA） |
-| 慢查询 | 跨片聚合 SQL 是性能杀手 → 分片键兜底 + 汇总表 |
-| 监控 | 各分片容量水位/延迟/连接数大盘 |
-
-### 5.2 常见坑
-
-- **分片键不带**：业务忘了带分片键 → 全片扫描（性能雪崩）；
-- **Join/事务跨片**：跨片操作能力弱 → 数据建模按分片键「同片聚合」（如订单+订单明细同键）；
-- **扩容停滞**：未预分片、又不用 Vitess → 扩容=大手术（建议预分片）；
-- **代理单点**：MyCat 集群化配置（多节点 + VIP），Vitess VTGate 天然无状态多副本。
+```mermaid
+flowchart TD
+    A{数据量超单库?} -->|否| M[单机 MySQL 够用]
+    A -->|是| B{想不改应用?}
+    B -->|是| C{规模/云原生?}
+    C -->|大/云原生| V[Vitess]
+    C -->|存量/Java| MC[MyCat]
+    B -->|否| D{Java 微服务?}
+    D -->|是| SS[ShardingSphere]
+    D -->|否| E{新系统?}
+    E -->|是| TI[TiDB]
+    E -->|否| V2[Vitess]
+```
 
 ---
 
-## 六、选型速查
+## 八、生产实践
+
+### 8.1 关键实践
+
+| 实践 | 说明 |
+|------|------|
+| 分片键选择 | 高频查询必须带分片键；选业务强相关列（userId/orderId） |
+| 预分片 | 一次性拆 2^n（如 32/64 片），避免二次扩容 |
+| 全局 ID | 与「分布式 ID」配合（雪花/号段）保证分片内有序 |
+| 分布式事务 | 尽量规避跨片事务（按分片键设计业务），必要时补偿 |
+| 慢查询 | 跨片聚合 SQL 是性能杀手 → 分片键兜底 + 汇总表 |
+| 监控 | 各分片容量水位/延迟/连接数大盘 |
+
+### 8.2 常见坑
+
+| 坑 | 说明 | 对策 |
+|----|------|------|
+| 分片键不带 | 全片扫描性能雪崩 | 规范 + SQL 审查 |
+| Join/事务跨片 | 能力弱 | 同片聚合设计 |
+| 扩容停滞 | 未预分片 | 预分片 2^n |
+| 代理单点 | MyCat 单点 | 多节点 + VIP |
+| 连接池耗尽 | 代理连接管理 | 前端/后端连接池配比 |
+| 全局 ID 冲突 | 自增主键跨片冲突 | 雪花/号段 |
+
+---
+
+## 九、选型速查
 
 | 需求 | 首选 | 备选 |
 |------|------|------|
@@ -145,11 +293,11 @@
 
 ---
 
-## 七、与其他板块的关系
+## 十、与其他板块的关系
 
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - TiDB（NewSQL）见「[TiDB 与 NewSQL](./TiDB与NewSQL.md)」；
-- 分库分表理论见「[分库分表与数据迁移板块](../../分库分表与数据迁移/)」；
+- 分布式事务见「[分布式事务 Seata](./分布式事务Seata.md)」；
 - 全局 ID 见「[分布式 ID 生成器](./分布式ID生成器.md)」。
 
-> 一句话：**代理分片 = 应用零改动的 MySQL 入口 + 路由（规则/vindex）+ 结果合并 + 扩容策略；选型先看「模式（代理透明→MyCat/Vitess，SDK 精细→ShardingSphere，原生→TiDB）」，再定「扩容路线（预分片 vs 在线 re-shard）」，最后守「分片键必带 + 同片聚合 + 全局 ID」**。
+> 一句话：**代理分片 = 应用零改动的 MySQL 入口 + 路由（规则/vindex）+ 结果合并 + 在线扩容（Vitess re-shard / MyCat 预分片）——选型先看「模式（代理→MyCat/Vitess，SDK→ShardingSphere，原生→TiDB）」，再定「扩容路线」，最后守「分片键必带 + 同片聚合 + 全局 ID」**。

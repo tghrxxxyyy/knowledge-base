@@ -1,164 +1,340 @@
-# TiDB 与 NewSQL（分布式关系型数据库）
+# TiDB 与 NewSQL 深入（架构原理 / Percolator 事务 / Region 调度 / HTAP / 迁移实践 / 选型）
 
-> TiDB 是**兼容 MySQL 的分布式 NewSQL 数据库**，兼具「水平扩展 + ACID 事务 + HTAP 分析」。
-> 适合：MySQL 遇到分库分表瓶颈、需要弹性扩容又不想改业务代码、事务+实时分析混合（HTAP）、SaaS 多租户。
-> 不适合：极简单机业务（运维 3 类节点有成本）、超复杂跨节点多表 JOIN（超大集群性能边际递减）。
+> TiDB 是 **NewSQL 代表**（PingCAP 开源，兼容 MySQL 协议），核心特性：**水平扩展（计算存储分离）+ 强一致分布式事务 + HTAP（行存列存双引擎）**。本篇深入拆解：整体架构、Percolator 分布式事务、Region 调度、TiFlash 列存、迁移实践、选型决策。
 
 ---
 
+## 一、要解决的问题
 
-## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+| 痛点 | 说明 |
+|------|------|
+| MySQL 扩容难 | 单库容量/写入瓶颈，分库分表复杂（MyCat/ShardingSphere） |
+| 分片运维重 | 预分片、扩容迁移、跨片事务——成本高 |
+| 事务限制 | 分片方案跨片事务弱/性能差 |
+| 分析查询弱 | 在线库做分析 → 影响业务 / 需要额外数仓 |
+| 高可用 | MySQL 主从切换有延迟/丢数据风险 |
 
-**它是什么**：TiDB 是 PingCAP 开源的**分布式关系型数据库（NewSQL）**，兼容 MySQL 协议，计算存储分离，既保留 SQL + ACID，又具备水平扩展能力，是「MySQL 分库分表」的现代替代。
-
-**解决什么痛点**：单机 MySQL 有存储/并发上限；分库分表跨片 JOIN、全局事务、DDL 不停机都很难。NewSQL（TiDB/OceanBase/CockroachDB）兼得「SQL + 强一致 + 水平扩展」，数据量超 10TB 或单表 10 亿行时优势明显。
-
-**核心概念**：TiDB Server（无状态 SQL 层）、PD（Placement Driver，元数据+调度+全局 TSO）、TiKV（分布式 KV 存储，Raft 多副本，按 Region 分片）、TiFlash（列存，HTAP）、MVCC（Percolator 模型）、Online DDL、AUTO_RANDOM。
-
-**适用场景**：海量关系数据、跨分片 JOIN/事务、HTAP（OLTP+OLAP 一套）、MySQL 协议兼容的平滑迁移。
-**不适用**：超小数据量（运维成本高于单机 MySQL）、需 100% MySQL 私有语法特性。
-
----
-
-## 一、什么是 NewSQL
-
-NoSQL 解决了扩展，却丢了 SQL/ACID。NewSQL 的目标是：**像单机关系型一样用 SQL + 强一致事务，又像 NoSQL 一样水平扩展**。TiDB、CockroachDB、OceanBase 都属此列。
-
-TiDB 的独特卖点：**100% 兼容 MySQL 协议**——应用几乎零改动迁移（不用像 CockroachDB 那样改 PostgreSQL 协议栈）。
-
-> 仓库 `github.com/pingcap/tidb`：Go 实现（TiKV 存储层为 Rust，已捐 CNCF），**Apache 2.0**，28k+ commits；官方定位 "open-source, cloud-native, distributed SQL database"，兼容 MySQL 8.0，支持 HTAP + 向量搜索。
+> 核心认知：**TiDB = 「MySQL 兼容 + 无限水平扩展 + 强一致事务 + 一库两用（OLTP+OLAP）的 NewSQL」**——把 MySQL 的痛点（分片、扩容、分析）从「应用层解决」变为「数据库层解决」。
 
 ---
 
-## 二、整体架构（计算存储分离）
+## 二、整体架构（计算与存储分离）
 
-```mermaid
-graph TB
-  App[应用 MySQL 协议] --> SQL[TiDB Server 无状态 SQL 层]
-  SQL --> PD[PD Placement Driver 调度/时间戳]
-  SQL --> KV[TiKV 行存 LSM+Raft]
-  SQL --> Flash[TiFlash 列存 向量化]
-  KV -.Multi-Raft Learner 实时同步.-> Flash
+```
+SQL 层（TiDB Server，无状态，可水平扩展）
+  ├── 解析 SQL → 生成执行计划
+  ├── 分布式优化器（下推计算：谓词/聚合/Join）
+  ├── 分布式执行引擎（并行扫描多 Region）
+  └── 兼容 MySQL 协议（连接/权限/语法）
+
+元数据与调度（PD - Placement Driver，PD Server）
+  ├── 集群元数据（表/Region 分布）
+  ├── Region 调度（分裂/合并/迁移/均衡）
+  ├── TSO 分配（全局单调时间戳）
+  └── 基于 Raft 的高可用（PD 集群）
+
+存储层（TiKV - 行存，分布式 KV）
+  ├── 数据按 Range 切 Region（默认 ~96MB）
+  ├── Region 内 Raft 复制组（3 副本强一致）
+  └── MVCC + Percolator 事务
+
+分析引擎（TiFlash - 列存）
+  ├── 列式存储（AP 查询加速）
+  ├── Raft Learner（异步实时同步行存数据）
+  └── TiDB 优化器自动选择行存/列存（HTAP）
 ```
 
-| 组件 | 角色 |
-|------|------|
-| **TiDB Server** | 无状态 SQL 层，解析/优化/执行，可多节点水平扩 QPS |
-| **TiKV** | 分布式 KV 存储，**RocksDB(LSM) + Raft 多副本强一致**，行存 |
-| **PD (Placement Driver)** | 集群大脑：元数据、时间戳分配（TSO）、调度均衡 |
-| **TiFlash** | 列存引擎，通过 **Multi-Raft Learner** 从 TiKV 实时复制，向量化执行分析查询 |
+---
 
-**HTAP 原理**：同一份数据，行存（TiKV）保事务、列存（TiFlash）保分析，Learner 实时同步，查询时引擎自动路由——事务走 TiKV、分析走 TiFlash，**互不干扰**。
+## 三、TiKV 存储引擎（深入）
+
+### 3.1 数据组织
+
+```
+表数据 → 编码为 KV：
+  t{tableID}_r{rowID} → 行数据
+  索引 → i{indexID}_... → 主键
+
+Region 划分：
+  数据按 Key Range 切成 Region（默认 96MB）
+  每个 Region 是复制/迁移的基本单位
+  热点 Region 自动分裂（写入热点 → 拆 Region）
+
+存储结构（RocksDB）：
+  行数据：Raft 日志落盘（WAL）→ MemTable → SST
+  列数据（TiFlash）：DeltaTree 存储
+```
+
+### 3.2 Region 与 Raft
+
+```
+每个 Region = 一个 Raft 组（Leader + Followers）
+
+Raft 共识：
+  Leader 处理读写（读在 Leader 线性一致 / 或 Learner）
+  写入：Leader → 复制到 Followers（多数派确认）→ 提交
+  选举：Leader 故障 → Followers 选举新 Leader
+
+3 副本容错：
+  任意 1 副本故障可用（多数派 2/3）
+  不丢数据（Raft 日志持久化）
+
+Region 状态：
+  Raft Leader / Follower / Learner（只同步不参与投票）
+  Region 分裂/合并（数据量变化自动调整）
+```
 
 ---
 
-## 三、关键能力
+## 四、分布式事务（Percolator 模型，深入）
 
-1. **水平扩展**：加 TiKV 节点即可扩存储/算力，扩 TiDB 节点即可提 QPS，无需停机、无需业务分片。
-2. **分布式 ACID 事务**：基于 **Percolator 模型 + 两阶段提交**，跨行跨表事务强一致；Raft 多副本（默认 3），RPO=0，节点故障自动选主自愈（RTO≈10s）。
-3. **MySQL 兼容**：兼容 MySQL 5.7/8.0 语法、索引、生态工具（DMP、Binlog、ORM 直接连）。
-4. **HTAP**：行列混合，实时分析不打扰在线事务。
-5. **高可用**：Raft 3 副本，自动故障转移。
-6. **生态工具**：TiDB DM（数据迁移）、TiCDC（增量同步到 Kafka/MySQL）、BR（备份恢复）、TiDB Operator（K8s 部署）。
+### 4.1 两阶段提交思想
 
----
+```
+Percolator = 基于 BigTable 的两阶段提交（2PC）+ 全局时间戳
 
-## 四、TiDB vs CockroachDB vs OceanBase
+时间戳：
+  PD 分配 TSO（全局单调递增）
+  事务 startTS / commitTS
 
-| 维度 | TiDB | CockroachDB | OceanBase |
-|------|------|-------------|-----------|
-| 定位 | 开源 NewSQL，MySQL 兼容+HTAP | 云原生强一致，跨地域 | 企业级金融，强一致+高可用 |
-| 协议 | ✅ MySQL 5.7/8.0 | PostgreSQL（部分） | MySQL/Oracle（企业版） |
-| 架构 | TiDB+TiKV+PD 分离 | P2P 对等（无中心） | 无共享+单元化 |
-| 一致性 | Raft，RC/Serial | Raft+HLC，Serializable | Paxos+Raft，Serializable |
-| HTAP | ✅ TiFlash | 弱（需外部 OLAP） | ✅ 分析+事务引擎 |
-| 开源 | Apache-2.0 | 2024 转 Enterprise 许可（社区反弹） | 社区版+商业版 |
-| 典型客户 | 美团/京东/知乎/平安 | Netflix/PayPal | 支付宝/工行/移动 |
+事务流程：
+  1. 写事务预写（Primary Key 写 Lock）
+  2. 提交：提交 Primary（写入 Commit 记录）
+  3. 提交 Secondary（异步批量）
+  4. 清理 Lock
+```
 
-**选型建议**
-- 团队熟 MySQL + 要开源 + 事务+简单分析混合 → **TiDB**
-- 跨国业务、全球分布、PostgreSQL 栈 → **CockroachDB**
-- 金融核心、极致高可用、预算充足 → **OceanBase**
+### 4.2 TiDB 事务细节
 
----
+```
+写路径（两阶段）：
+  Phase 1（prewrite）：
+    写事务数据 + 加锁（每个 Key 一个 Lock，标记 primary）
+    primary 加锁成功 = 预写成功
+  Phase 2（commit）：
+    提交 primary（commitTS 写入）
+    异步提交 secondary
 
-## 五、生产实践与避坑
+读路径（MVCC）：
+  读时检查版本（startTS 之前的提交版本）
+  遇锁：等待/回滚（resolve lock）
 
-1. **热点 Key**：自增主键会造成写入热点（全落一个 Region），改用**打散主键**（如 UUID 或 雪花 id 取模），让 Region 均匀分布。
-2. **大事务拆分**：TiDB 对超大事务（如一次性 update 全表）有限制，应分批。
-3. **JOIN 跨节点**：超大规模多表 JOIN 性能不如单机调优的专用数仓，分析场景优先 TiFlash 或下推。
-4. **PD 是关键**：PD 挂了影响调度/时间戳，需 3 节点高可用，别和 TiKV 混部抢资源。
-5. **TiFlash 同步延迟**：Learner 异步同步有秒级延迟，强一致分析需读 TiKV 或容忍延迟。
-6. **迁移**：用 TiDB DM 从 MySQL 全量+增量平滑迁移，几乎不中断。
+冲突处理：
+  写冲突（同 Key 并发写）→ 等待锁 / 重试（悲观锁模式）
+  事务重试 → 新 startTS（乐观模式）
+  死锁检测（Wait-for graph）
 
----
+隔离级别：
+  默认 REPEATABLE READ（快照隔离）
+  支持悲观锁模式（SELECT ... FOR UPDATE 等场景）
+```
 
-## 六、与其他板块的关系
+### 4.3 大事务注意事项
 
-- 与 [MySQL](../mysql知识.md)、[分库分表 ShardingSphere](分库分表ShardingSphere.md)：TiDB 是「不分库分表也能水平扩展」的替代方案，sharding 是应用层手动分片，TiDB 是存储层自动分片（Region）。
-- 与 [MongoDB](MongoDB.md)：TiDB 保 ACID/SQL、强一致；MongoDB 保灵活 Schema/文档。事务强一致场景选 TiDB。
-- 与 [分布式事务 Seata](分布式事务Seata.md)：Seata 解决「多个独立数据源」的分布式事务；TiDB 自身内部已通过 Percolator 提供跨行 ACID，二者在不同层次。
-- 与 [ClickHouse](ClickHouse.md)：TiDB HTAP 的分析能力对许多场景够用；超大规模纯分析（单表聚合）仍 ClickHouse 更强，常见「TiDB 做事务 + ClickHouse 做分析」组合。
+```
+限制：
+  事务大小限制（5.0+ 放宽）：单事务 KV 数 ≤ 300k（默认）
+  大事务提交慢（同步复制开销）
 
----
-
-## 七、速查表
-
-| 项 | 结论 |
-|----|------|
-| 类型 | 分布式 NewSQL（兼容 MySQL） |
-| 架构 | TiDB(无状态)+TiKV(Raft行存)+PD(调度)+TiFlash(列存) |
-| 事务 | 分布式 ACID（Percolator + 2PC） |
-| 扩展 | 计算存储分离，独立水平扩 |
-| HTAP | ✅ TiKV 行存 + TiFlash 列存实时同步 |
-| 一致性 | Raft 多副本，RPO=0 |
-| 许可证 | Apache-2.0 |
-| 一句话 | 「MySQL 的分布式分身」——扩容不用分库分表 |
+优化：
+  批量写入分批提交
+  避免大事务（拆小批）
+  批量删除用 DELETE ... LIMIT
+```
 
 ---
 
-## 面试高频问题（20+ 条）
+## 五、Region 调度（PD 核心职责）
 
-1. **什么是 NewSQL，与 MySQL 分库分表区别？** NewSQL = SQL + 强一致 + 水平扩展。对比分库分表：跨分片 JOIN 原生支持（分库分表不支持）、跨分片事务（Percolator/2PC vs XA 慢不稳）、扩缩容自动 rebalance（分库分表手动重分片）、Online DDL（分库分表需 gh-ost）、业务几乎零改造（分库分表每张表改 shard key）。
+### 5.1 调度机制
 
-2. **TiDB 三层架构？** TiDB Server（无状态 SQL 层，解析优化，兼容 MySQL 协议）、PD（Placement Driver，元数据+调度+全局 TSO，奇数 3 节点）、TiKV（分布式 KV 存储，Raft 多副本，按 Region 分片）、TiFlash（列存，HTAP）。
+```
+PD 收集 Region 状态（心跳）→ 决策调度 → 下发
 
-3. **PD 的作用？** 集群大脑：存 Region 分布与拓扑、分配全局事务 ID（TSO）、根据 TiKV 上报下发调度（均衡、故障恢复）。至少 3 节点高可用，建议奇数。
+调度类型：
+  均衡调度：Region 在 TiKV 间分布均衡（容量/读写负载）
+  热点调度：热点 Region 分裂/迁移（写入/读取热点）
+  故障恢复：节点故障 → Region 副本自动补齐
+  下线调度：TiKV 下线 → 数据迁走
+  分裂合并：Region 过大分裂 / 过小合并
 
-4. **TiKV 的 Region 与 Raft？** 数据按 Key Range 切分为 Region（默认 96MB），每个 Region 默认 3 副本，通过 Raft 选主与同步，Leader 处理读写，2 副本故障 30 秒内自动恢复。
+调度目标：
+  负载均衡（CPU/磁盘/网络）
+  数据安全（副本分散在不同故障域）
+  容量均衡（磁盘水位）
+```
 
-5. **MVCC 与事务模型？** 基于 Percolator 模型 + MVCC，PD 分配全局版本号实现 Snapshot Isolation；分布式事务跨多 TiKV 透明提交。
+### 5.2 故障恢复
 
-6. **TiDB 与 MySQL 兼容性？** 兼容 MySQL 协议/语法/工具链（mysql 客户端直连，端口 4000），多数场景可直接替换。但不 100% 兼容：auto_increment 非严格顺序（用 AUTO_RANDOM）、不支持 SELECT...INTO OUTFILE、部分存储过程/空间函数。
+```
+节点故障流程：
+  1. Leader 故障 → Raft 选举新 Leader（秒级）
+  2. 副本缺失 → PD 调度在健康节点补副本
+  3. 数据均衡恢复
 
-7. **为什么用 AUTO_RANDOM？** 分布式下自增主键会产生写入热点（值单调落在同一 Region），AUTO_RANDOM 打散主键避免热点。
+丢失数据保护：
+  Raft 日志（多数派已持久化 → 不丢）
+  Region 数据有 3 副本 → 单节点故障无损
 
-8. **HTAP 怎么实现？** TiKV 行存负责 OLTP，TiFlash 列存异步同步 TiKV 数据（通过 Raft Learner），分析查询用 READ_FROM_STORAGE(TIFLASH[...]) 提示走列存，TP/AP 互不干扰。
+多副本策略：
+  跨机架/跨可用区（placement rules）
+  数据本地性（就近副本）
+```
 
-9. **与 CockroachDB 区别？** TiDB 兼容 MySQL 协议，CockroachDB 兼容 PostgreSQL 协议；二者都基于 Raft。TiDB 国内生态活跃，CockroachDB 全球化多区域强但国内支持弱。
+---
 
-10. **与 OceanBase 区别？** OB 对称架构、兼容 MySQL/Oracle、LSM 高压缩、金融级容灾（RTO<8s）；TiDB 分层 HTAP、MySQL 兼容、TiUP 工具链完善。选型看协议栈与生态。
+## 六、HTAP 双引擎（深入）
 
-11. **TiDB 的写入热点问题？** 单调自增主键/时间戳做主键会导致写集中单 Region。规避：用 AUTO_RANDOM、随机/散列分片键、避免热点索引。
+### 6.1 原理
 
-12. **何时选 TiDB？** 数据量超 10TB 或单表 10 亿行、跨分片 JOIN/事务频繁、需不停机扩容、想保留 MySQL 生态平滑迁移。
+```
+TiFlash（列存）：
+  每个 Region 的 Learner 角色（同步行存数据到列存）
+  异步实时同步（秒级延迟，不阻塞行存写入）
 
-13. **何时不该用 TiDB？** 数据量小（运维成本高）、需 100% MySQL 私有语法、超简单单机场景（单机 MySQL 更省）。
+查询分流（TiDB 优化器决策）：
+  OLTP 查询（点查/小范围）→ TiKV（行存，低延迟）
+  OLAP 查询（聚合/扫描大表）→ TiFlash（列存，高吞吐）
+  自动选择 or 强制 Hint（/*+ read_from_storage(tiflash[t]) */）
 
-14. **Online DDL 如何不停机？** TiDB 原生支持加索引/改表结构在线进行，不锁全表，业务无感；分库分表则需 gh-ost/pt-osc。
+列存优势：
+  列式压缩（体积小）
+  向量化执行（批量计算）
+  MPP 引擎（并行多节点计算，Join 下推）
+```
 
-15. **分布式事务性能代价？** 跨节点 2PC + MVCC，延迟比单节点高（10-100ms 级），不适合极致低延迟单点写；设计上尽量让事务落在单 Region。
+### 6.2 HTAP 使用场景
 
-16. **TiFlash 与 ClickHouse 区别？** TiFlash 是 TiDB 内置列存、与行存实时同步、服务于 HTAP；ClickHouse 是独立 OLAP 列存库，擅长超大规模聚合。
+```
+在线分析：
+  业务报表实时查询（数据秒级可见）
+  实时大屏/指标看板
+  运营分析（不建数仓直接查）
 
-17. **TiDB 向量搜索（实验）？** 8.4+ 支持 VECTOR 类型与向量检索（实验特性），扩展多模能力。
+对比传统方案：
+  传统：业务库 → CDC → 数仓（T+1 或准实时）
+  HTAP：业务库 + TiFlash（无需数据搬运，实时性更强）
 
-18. **二级索引性能？** TiDB 二级索引相对行存弱，全球索引/分区需规划；热点写会放大索引开销。
+注意：
+  TiFlash 增加存储/内存成本（双份数据）
+  复杂分析仍建议大数据平台（数据湖/数仓）
+```
 
-19. **资源管控？** 7.1+ 支持资源组（Resource Group）流控，做多租户隔离，避免大查询拖垮全局。
+---
 
-20. **备份与生态工具？** TiUP（部署运维）、BR（备份恢复）、DM（数据迁移）、CDC（增量同步）、TiDB Dashboard（管控界面）。
+## 七、TiDB vs MySQL vs NewSQL 生态
 
-21. **与 MongoDB 对比选型？** 要 SQL+事务+关联用 TiDB；要灵活 Schema+文档模型+弱事务用 MongoDB。
+| 维度 | TiDB | MySQL | CockroachDB | OceanBase |
+|------|------|-------|-------------|-----------|
+| 协议兼容 | MySQL | 原生 | PostgreSQL | MySQL |
+| 水平扩展 | 原生 | 分片方案 | 原生 | 原生 |
+| 分布式事务 | Percolator 2PC | 无 | 串行化（2PC） | Paxos 事务 |
+| HTAP | TiKV+TiFlash | 无 | 无（扩展版有） | 有（列存） |
+| 生态工具 | 丰富（Lightning/CDC/DM） | 极丰富 | 一般 | 阿里系 |
+| 学习成本 | 中（MySQL 语法） | 低 | 中 | 中 |
+| 适用 | 海量数据 MySQL 兼容 | 中小规模 | 分布式 PG 需求 | 阿里生态 |
 
-22. **TiDB 的局限？** 组件多运维门槛高、分布式事务延迟、热点写需规避、非 100% MySQL 兼容、成本比单机 MySQL 高 2-5 倍。
+**选型关注点**：
+- MySQL 协议 + 海量数据扩展 → **TiDB**；
+- 开源自建 → **TiDB / CockroachDB**（PG 语法选后者）；
+- 阿里生态 → **OceanBase / PolarDB-X**；
+- 已有 MySQL 中小规模 → 优化/分片方案即可。
+
+---
+
+## 八、迁移实践（从 MySQL 到 TiDB）
+
+### 8.1 迁移路径
+
+```
+方案一：全量 + 增量（推荐）
+  DM（Data Migration）工具：
+    → 全量迁移（dumpling 导出 + Lightning 导入）
+    → 增量同步（binlog 持续复制）
+    → 切换（停写窗口短，秒级）
+
+方案二：双写 + 切换（无停服）
+  业务双写（MySQL + TiDB）→ 校验 → 切读 → 切写
+
+迁移要点：
+  语法兼容性检查（DDL/DML 差异）
+  索引/分区设计（TiDB 分区策略）
+  字符集/时区
+  大表优先迁移（分批）
+  验证数据一致性（checksum）
+```
+
+### 8.2 迁移后优化
+
+```
+表设计优化：
+  主键选择（避免自增热点 → 用雪花 ID/无序主键）
+  分区表（时间分区适合归档查询）
+  索引设计（TiDB 执行计划分析）
+
+热点优化：
+  自增主键热点 → 随机主键（Snowflake）
+  唯一索引 → 降低写热点
+  大表扫描 → 下推聚合（MPP）
+
+资源规划：
+  内存（TiKV 缓存 + TiFlash 列存）
+  磁盘（行存 + 列存双份）
+  网络（集群内部复制流量）
+```
+
+---
+
+## 九、运维与监控
+
+### 9.1 核心组件监控
+
+```
+TiDB：查询延迟/QPS/慢查询/执行计划
+PD：Region 数量/调度/TSO 延迟
+TiKV：写入延迟/磁盘 IO/Region 状态/GC 进度
+TiFlash：同步延迟/查询延迟
+
+关键指标：
+  TiKV 写入延迟 P99
+  Region 状态（异常数）
+  热点 Region
+  GC 落后（版本堆积 → 存储膨胀）
+  慢查询（EXPLAIN ANALYZE 定位）
+```
+
+### 9.2 常见坑
+
+| 坑 | 说明 | 对策 |
+|----|------|------|
+| 自增主键热点 | 单 Region 写热点 | 随机主键 |
+| 大事务 | 提交慢/内存高 | 拆批 |
+| GC 堆积 | 版本过多存储膨胀 | 监控 GC 进度 |
+| 慢查询 | 无索引扫描全表 | 执行计划分析 |
+| TSO 延迟 | PD 压力 | PD 扩容 |
+| TiFlash 落后 | 同步延迟 | 检查磁盘/网络 |
+
+---
+
+## 十、选型速查
+
+| 需求 | 首选 | 备选 |
+|------|------|------|
+| MySQL 兼容 + 海量数据扩展 | TiDB | OceanBase |
+| 新系统原生分布式 | TiDB | CockroachDB |
+| 在线分析（HTAP） | TiDB（TiFlash） | OceanBase |
+| 阿里云生态 | PolarDB-X | OceanBase |
+| 开源自建 | TiDB | CockroachDB |
+| PostgreSQL 语法 | CockroachDB | — |
+| 存量 MySQL 分片改造 | TiDB（DM 迁移） | Vitess/MyCat |
+
+---
+
+## 十一、与其他板块的关系
+
+- 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
+- 存储引擎见「[RocksDB 与嵌入式 KV 存储](./RocksDB与嵌入式KV存储.md)」；
+- MySQL 基础见「[MySQL 知识](../mysql知识.md)」；
+- 数据迁移生态见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」。
+
+> 一句话：**TiDB = TiDB（无状态 SQL 层）+ PD（元数据/TSO/调度）+ TiKV（Raft 行存）+ TiFlash（列存 HTAP）——事务走 Percolator 两阶段提交，扩展靠 Region 自动分裂迁移——选型先看「MySQL 兼容+海量数据→TiDB」，迁移走 DM 全量+增量，生产守则：随机主键防热点、大事务拆批、GC 监控、执行计划分析**。

@@ -1,6 +1,6 @@
-# Spring Cloud Gateway（Java 网关 / Spring 生态路由）
+# Spring Cloud Gateway 深入（WebFlux 模型 / 过滤器链 / 动态路由 / 限流实现 / 生产实践）
 
-> Spring Cloud Gateway 是 **Spring 官方出品的响应式网关**，基于 WebFlux（Netty + Reactor），以「非阻塞 + 路由断言 + 过滤器链 + 动态路由」成为 Java/Spring 生态微服务网关首选。相比 Zuul 1（Servlet 阻塞式，已停更）、Kong/APISIX（Lua 生态）、Envoy（云原生），它以「与 Spring Cloud 生态无缝集成 + Java 编程模型」独树一帜。本篇按「解决的问题 → 原理 → 特性 → 选型关注点」拆解。
+> Spring Cloud Gateway（SCG）是 **Spring 生态的 API 网关**（Spring WebFlux 响应式编程），Java 微服务事实标准网关。本篇深入拆解：WebFlux 响应式模型、过滤器链执行机制、动态路由实现、限流与熔断、生产实践。
 
 ---
 
@@ -8,33 +8,55 @@
 
 | 痛点 | 说明 |
 |------|------|
-| Spring 生态统一入口 | 微服务众多，需要与 Nacos/Eureka 注册中心联动的网关 |
-| 阻塞式网关瓶颈 | Zuul 1 基于 Servlet 线程池，高并发线程耗尽 |
-| 路由规则复杂 | 按路径/Host/Header/Query/权重灵活分发 |
-| 横切逻辑重复 | 鉴权/限流/日志在每个服务重复实现 |
-| 动态路由 | 服务上下线/规则调整需热生效 |
+| Java 微服务网关 | Spring Cloud 体系需要统一入口（路由/过滤） |
+| 配置灵活 | 路由配置支持代码/配置中心动态更新 |
+| 响应式性能 | 网关要处理海量请求，需非阻塞 IO |
+| 微服务治理 | 与注册中心（Nacos/Eureka）联动自动发现 |
+| 熔断限流 | 网关层保护后端（Sentinel/Resilience4j 集成） |
 
-> 核心认知：**Spring Cloud Gateway = 响应式（非阻塞）+ Route（路由）+ Predicate（断言）+ Filter（过滤器）**——请求按「断言」匹配「路由」，经过「过滤器链」处理。
+> 核心认知：**SCG = 「基于 WebFlux（Netty 非阻塞）的响应式网关」**——请求走「路由匹配 → 全局过滤器链 → 路由过滤器」流水线，线程不阻塞，IO 复用，性能远优于 Zuul 1.x。
 
 ---
 
-## 二、核心原理
+## 二、WebFlux 响应式模型（核心基础）
 
-### 2.1 架构
+### 2.1 阻塞 vs 非阻塞
 
 ```
-Client → Gateway HandlerMapping（匹配 Route）
-  ├── Predicate（断言：Path/Host/Method/Header/Query/Cookie/Weight...）
-  ├── Route（路由：id + 断言 + URI + 过滤器列表）
-  ├── Global Filter（全局过滤器：NettyRoutingFilter 等）
-  ├── Gateway Filter（路由级过滤器：限流/重写/熔断/重试）
-  └── Netty Routing Filter → 转发到下游服务（WebFlux 非阻塞）
+传统 Spring MVC（阻塞）：
+  每个请求一个线程 → 线程池耗尽 = 请求排队/超时
+  高并发下：线程切换开销 + 内存占用
+
+WebFlux（非阻塞）：
+  Netty EventLoop 线程处理大量请求
+  请求处理中不阻塞线程（异步回调/响应式流）
+  → 少量线程支撑高并发
+
+响应式流（Reactive Streams）：
+  Publisher（发布者）→ Subscriber（订阅者）
+  背压（Backpressure）：消费者控制流速
 ```
 
-- **底层是 WebFlux**：Netty 事件循环 + Reactor，**一个线程处理海量连接**（对比 Zuul 1 一请求一线程）；
-- **Route = id + Predicate + URI + Filters**：核心配置模型。
+### 2.2 SCG 内部模型
 
-### 2.2 路由配置（yml）
+```
+请求进入 → Netty HttpServer（EventLoop）
+  → ServerWebExchange（请求/响应上下文）
+  → 路由匹配（RouteLocator）
+  → 过滤器链执行（GlobalFilter + GatewayFilter）
+  → 转发到后端（HttpClient 非阻塞调用）
+  → 响应返回（异步）
+
+关键对象：
+  ServerWebExchange：请求/响应/属性（贯穿过滤器链）
+  Mono/Flux：响应式类型（异步处理）
+```
+
+---
+
+## 三、路由配置（深入）
+
+### 3.1 YAML 配置
 
 ```yaml
 spring:
@@ -42,122 +64,313 @@ spring:
     gateway:
       routes:
         - id: order-service
-          uri: lb://order-service        # lb:// 走注册中心负载均衡
+          uri: lb://order-service        # 负载均衡（注册中心）
           predicates:
-            - Path=/api/order/**
-            - Weight=group1, 90          # 权重路由（灰度）
+            - Path=/api/orders/**
+            - Method=GET,POST
+            - Header=X-Tenant, \d+
+            - Query=version, v[12]        # 参数匹配
+            - Cookie=session, ok
+            - Host=api.example.com
+            - Weight=group1, 90           # 权重路由（灰度）
           filters:
-            - StripPrefix=2              # 去掉 /api/order 前缀
-            - AddRequestHeader=X-Trace, 12345
-            - name: RequestRateLimiter   # 限流过滤器
+            - StripPrefix=2               # 去掉前两段路径
+            - AddRequestHeader=X-From, gateway
+            - RewritePath=/api/orders/(?<id>.*), /orders/$1
+```
+
+### 3.2 Predicate（路由谓词）
+
+| Predicate | 作用 | 示例 |
+|-----------|------|------|
+| Path | 路径匹配 | `/api/**` |
+| Method | 方法匹配 | GET,POST |
+| Header | Header 匹配 | `X-Id, \d+` |
+| Query | 参数匹配 | `debug, true` |
+| Cookie | Cookie 匹配 | `session, ok` |
+| Host | 域名匹配 | `**.example.com` |
+| RemoteAddr | IP 匹配 | `10.0.0.0/16` |
+| Weight | 权重分流 | `group1, 90` |
+| Before/After/Between | 时间匹配 | 灰度窗口 |
+| 自定义 | 实现 PredicateFactory | 业务条件 |
+
+### 3.3 代码配置（灵活路由）
+
+```java
+@Bean
+public RouteLocator customRoutes(RouteLocatorBuilder builder) {
+    return builder.routes()
+        .route("order-route", r -> r
+            .path("/api/orders/**")
+            .and().header("X-Tenant", "\\d+")
+            .filters(f -> f
+                .stripPrefix(2)
+                .addRequestHeader("X-Gateway", "scg"))
+            .uri("lb://order-service"))
+        .build();
+}
+```
+
+---
+
+## 四、过滤器链执行机制（深入）
+
+### 4.1 过滤器类型
+
+```
+GlobalFilter（全局，对所有路由生效）：
+  NettyRoutingFilter（转发）
+  LoadBalancerClientFilter（负载均衡）
+  WebClientHttpRoutingFilter（WebClient 转发）
+  GatewayMetricsFilter（指标）
+
+GatewayFilter（路由级，配置绑定）：
+  AddRequestHeader / StripPrefix / RewritePath
+  RequestRateLimiter（限流）
+  CircuitBreaker（熔断）
+  Retry（重试）
+  ......
+
+执行顺序：
+  1. GlobalFilter 按 order 排序
+  2. 与 GatewayFilter 合并排序（同优先级）
+  3. 链式执行：pre 处理 → 转发 → post 处理
+```
+
+### 4.2 过滤器链执行流程
+
+```
+请求 → filters 链（按 order 从小到大）：
+  [0] Pre 逻辑（改写/校验）→ chain.filter(exchange)
+       → 调用下一个过滤器（或转发后端）
+  [1] Pre → chain...
+      ...
+  [N] 转发（NettyRoutingFilter）→ 后端响应
+  响应 → 反向执行 Post 逻辑（响应处理/记录）
+
+Spring Cloud Gateway 默认过滤器（内建顺序）：
+  GatewayMetricsFilter (-1)
+  转发类过滤器（高优先级执行转发）
+  GatewayFilter（路由级）
+
+自定义全局过滤器：
+  @Component implements GlobalFilter, Ordered
+  实现 filter() 方法（pre/post 逻辑）
+```
+
+### 4.3 自定义过滤器示例
+
+```java
+@Component
+public class TraceIdFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String traceId = UUID.randomUUID().toString().replace("-", "");
+        // 生成/透传 traceId（pre）
+        ServerWebExchange mutated = exchange.mutate()
+            .request(r -> r.headers(h -> h.set("X-Trace-Id", traceId)))
+            .build();
+        return chain.filter(mutated)
+            // 响应后记录（post）
+            .then(Mono.fromRunnable(() ->
+                log.info("traceId={}, status={}", traceId,
+                    mutated.getResponse().getStatusCode())));
+    }
+
+    @Override
+    public int getOrder() {
+        return -100;  // 优先执行
+    }
+}
+```
+
+---
+
+## 五、限流实现（深入）
+
+### 5.1 内置限流：RequestRateLimiter
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://order-service
+          predicates: [Path=/api/orders/**]
+          filters:
+            - name: RequestRateLimiter
               args:
-                redis-rate-limiter.replenishRate: 10
-                redis-rate-limiter.burstCapacity: 20
-                key-resolver: "#{@userKeyResolver}"
+                redis-rate-limiter.replenishRate: 100   # 每秒补充令牌
+                redis-rate-limiter.burstCapacity: 200   # 桶容量
+                redis-rate-limiter.requestedTokens: 1   # 每请求消耗
+                key-resolver: "#{@userKeyResolver}"     # 限流键解析
 ```
 
-### 2.3 过滤器链（Filter 执行顺序）
+```java
+@Bean
+public KeyResolver userKeyResolver() {
+    return exchange -> {
+        String userId = exchange.getRequest().getHeaders()
+            .getFirst("X-User-Id");
+        return Mono.just(userId != null ? userId : "anonymous");
+    };
+}
+```
+
+### 5.2 限流原理（令牌桶 + Redis）
 
 ```
-请求 → ① 前置 Filter（鉴权/限流/Header 改写）
-     → ② 路由 Filter（熔断/重试/改写响应）
-     → ③ 后置 Filter（日志/指标）
+实现：Redis RateLimiter（Lua 脚本原子操作）
+  令牌桶：每 replenishRate 秒补充令牌
+  请求消耗 requestedTokens 个令牌
+  桶满 burstCapacity（突发容忍）
+  令牌不足 → 429 Too Many Requests
+
+限流维度：
+  按用户（KeyResolver 返回 user id）
+  按 IP / 按接口 / 按租户
+  按业务自定义
+
+注意：
+  Redis 是限流依赖（Redis 故障 → 限流失效/拒流）
+  限流键基数（用户量大 → Redis 内存）
 ```
 
-| Filter | 说明 |
-|--------|------|
-| GlobalFilter | 全局生效（自定义鉴权/日志） |
-| RequestRateLimiter | Redis + 令牌桶限流（配合 KeyResolver 按用户/IP 限流） |
-| CircuitBreaker | 集成 Resilience4J/Sentinel 熔断降级 |
-| Retry | 下游失败重试 |
-| RewritePath / StripPrefix | 路径重写 |
-| AddRequestHeader / AddResponseHeader | Header 注入 |
-| FallbackHeaders | 熔断降级响应 |
+### 5.3 熔断与重试
 
-### 2.4 动态路由（Nacos 集成）
+```yaml
+filters:
+  - name: CircuitBreaker
+    args:
+      name: orderCB
+      fallbackUri: forward:/fallback/order   # 降级路径
+      statusCodes: [500, 503]
+      # 底层用 Resilience4j 配置：失败率阈值/半开状态等
+  - name: Retry
+    args:
+      retries: 2
+      statuses: [SERVICE_UNAVAILABLE]
+      methods: [GET]
+```
 
-- 方式一：`spring.cloud.gateway.discovery.locator.enabled=true`（自动按服务名生成路由）；
-- 方式二：Nacos 配置中心下发路由配置，监听刷新（RouteDefinitionRepository 自定义）；
-- 方式三：Nacos 网关插件（`spring-cloud-starter-alibaba-nacos` 动态路由）。
+```
+熔断状态机（Resilience4j）：
+  关闭（正常）→ 失败率超阈值（如 50%）→ 打开（拒绝）
+  → 等待窗口（如 10s）→ 半开（放少量流量试探）
+  → 成功 → 关闭 / 失败 → 打开
 
-**选型关注点**：动态路由是生产刚需——服务扩容/灰度切流必须热生效，推荐 Nacos 下发 + 监听刷新。
+降级路径：fallbackUri 转发到本地处理（友好提示）
+```
 
 ---
 
-## 三、核心特性
+## 六、动态路由（配置中心热更新）
 
-| 特性 | 说明 |
+### 6.1 Nacos 动态路由
+
+```yaml
+spring:
+  cloud:
+    nacos:
+      config:
+        server-addr: nacos:8848
+        data-id: gateway-routes.yaml
+        group: DEFAULT_GROUP
+        file-extension: yaml
+```
+
+```
+原理：
+  路由配置存配置中心（Nacos/Consul/本地）
+  配置变更 → 监听器（RefreshScope）→ RouteLocator 刷新
+  → 新路由立即生效（无需重启）
+
+自定义动态路由（DB/接口存储）：
+  实现 RouteDefinitionRepository（增删改查路由定义）
+  修改后 publishEvent（RefreshRoutesEvent）→ 生效
+```
+
+---
+
+## 七、SCG vs Zuul 2.x vs 自研网关
+
+| 维度 | SCG（WebFlux） | Zuul 2.x | 自研（Netty） |
+|------|----------------|----------|---------------|
+| 模型 | 响应式（非阻塞） | 响应式（Netty） | 响应式 |
+| Spring 集成 | 原生 | 原生 | 需自己集成 |
+| 注册中心联动 | 原生（lb://） | 原生 | 需开发 |
+| 限流 | Redis 令牌桶 | 依赖 Sentinel | 需开发 |
+| 熔断 | Resilience4j | Sentinel/Hystrix | 需开发 |
+| 学习成本 | 中 | 中 | 高 |
+| 适用 | Spring 生态标准 | Spring 生态 | 特殊需求 |
+
+**选型关注点**：
+- Spring 微服务 → **SCG**（生态最好）；
+- 非 Spring 体系 → **Kong/APISIX**（见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」）；
+- 需要跨语言网关 → APISIX/Kong；
+- 特殊性能/定制 → 自研（成本高）。
+
+---
+
+## 八、生产实践
+
+### 8.1 最佳实践
+
+| 实践 | 说明 |
 |------|------|
-| 非阻塞 | WebFlux + Netty，高并发低资源占用 |
-| 断言丰富 | Path/Host/Method/Header/Query/Cookie/RemoteAddr/Weight |
-| 过滤器链 | 全局 + 路由级 + 自定义，编程友好 |
-| 注册中心集成 | lb:// + Nacos/Eureka 自动发现 |
-| 限流 | Redis 令牌桶（RequestRateLimiter） |
-| 熔断降级 | Resilience4J / Sentinel 集成 |
-| 重试 | 内置 RetryFilter（指数退避） |
-| 灰度 | Weight 断言 + Nacos 灰度路由 |
-| 可观测 | 内置 Metrics（Micrometer）+ 链路透传 |
-| CORS/WebSocket | 原生支持 |
+| 统一鉴权 | 全局过滤器做 JWT 校验 + 白名单放行 |
+| 统一限流 | Redis 令牌桶按用户/接口 |
+| 统一熔断 | CircuitBreaker + fallbackUri |
+| 全链路 traceId | 全局过滤器生成/透传（与 OTel 结合） |
+| 日志脱敏 | 网关层统一脱敏（手机号/Token） |
+| 性能 | 避免过滤器里做阻塞 IO（DB 查询） |
+| 监控 | 网关指标（QPS/延迟/错误）+ 告警 |
+
+### 8.2 常见坑
+
+| 坑 | 说明 | 对策 |
+|----|------|------|
+| 阻塞 IO | 过滤器里查 DB → 线程阻塞 | 响应式/异步化 |
+| 大文件上传 | 默认限制 | 调整请求大小限制 |
+| 超时未配 | 默认无超时 → 请求挂死 | 配置全局超时 |
+| Redis 依赖 | 限流依赖 Redis 单点 | Redis 高可用 |
+| 路由误配 | Predicate 冲突 | 测试 + 优先级 |
+| 响应式调试难 | 堆栈不直观 | 日志/链路追踪 |
+| 内存溢出 | 大响应体缓冲 | 限制响应大小 |
+
+### 8.3 监控指标
+
+```
+网关指标（Micrometer/Prometheus）：
+  请求 QPS / 延迟 P50/P99
+  各路由错误率
+  限流拒绝数（429）
+  熔断状态（打开数）
+  连接池状态
+```
 
 ---
 
-## 四、对比：Spring Cloud Gateway vs Kong/APISIX vs Zuul
-
-| 维度 | Spring Cloud Gateway | Kong/APISIX | Zuul 1（已停更） |
-|------|----------------------|-------------|------------------|
-| 语言 | Java（WebFlux/Netty） | Lua（OpenResty） | Java（Servlet） |
-| 模型 | 非阻塞响应式 | 非阻塞事件驱动 | 阻塞式（线程池） |
-| 性能 | 高 | 最高 | 低（线程耗尽） |
-| 路由配置 | yml + 代码 | Admin API + Dashboard | yml |
-| 动态生效 | 需配置中心配合 | 原生全动态 | 弱 |
-| 插件生态 | Java 编码 | 80+ 插件 | 弱 |
-| 注册中心 | Nacos/Eureka 原生 | 需插件 | Eureka |
-| 学习成本 | 低（Java 团队） | 中（Lua） | 低 |
-| 云原生 | 一般 | 强（Ingress/多语言插件） | 无 |
-
-**选型关注点**：纯 Java/Spring Cloud 生态 → **Spring Cloud Gateway**（开发效率最高）；跨语言/高性能/云原生 → **Kong/APISIX**；新项目禁止用 Zuul 1（阻塞 + 停更）。
-
----
-
-## 五、生产实践
-
-### 5.1 关键配置
-
-| 配置 | 建议 |
-|------|------|
-| 限流 | Redis 令牌桶 + 按用户/接口 KeyResolver |
-| 超时 | `httpclient.response-timeout` 设置下游超时（防线程挂起） |
-| 连接池 | `httpclient.pool.max-connections`（默认 500） |
-| 重试 | 只对 GET 等幂等请求开重试 |
-| 线程 | WebFlux 是事件循环，业务阻塞操作必须异步化（否则毁掉吞吐） |
-
-### 5.2 常见坑
-
-- **阻塞代码（JDBC/Thread.sleep）放进过滤器**：会阻塞 Netty 事件循环，务必用 `Mono.fromCallable(..., Schedulers.boundedElastic())`；
-- **默认无路由时 404**：注意 `RouteDefinitionLocator` 顺序/命名冲突；
-- **WebSocket 支持**：原生支持但需注意 `httpclient` 配置与 WebSocket 握手超时；
-- **链路透传**：需自定义 GlobalFilter 透传 TraceId（配合 SkyWalking/OTel）。
-
----
-
-## 六、选型速查
+## 九、选型速查
 
 | 需求 | 首选 | 备选 |
 |------|------|------|
-| Spring Cloud 微服务 | Spring Cloud Gateway | Kong/APISIX |
-| 高并发大流量 | Kong/APISIX | Spring Cloud Gateway |
-| Java 团队自定义逻辑 | Spring Cloud Gateway | — |
-| 云原生 Ingress | APISIX/Kong | Traefik |
-| 已有 Nginx 基础设施 | OpenResty | Kong |
+| Spring 微服务标准网关 | Spring Cloud Gateway | Zuul 2.x |
+| 跨语言/云原生网关 | APISIX | Kong |
+| 服务网格 | Istio | — |
+| 阿里生态 | Sentinel + SCG | — |
+| 高吞吐定制 | 自研 Netty | SCG |
 
 ---
 
-## 七、与其他板块的关系
+## 十、与其他板块的关系
 
-- 网关选型总览见「[API 网关](./API网关.md)」；
-- Kong/APISIX 对比见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」；
-- 注册中心（Nacos/Eureka）见「[注册中心与配置中心](./注册中心与配置中心.md)」；
-- 限流熔断见「[Sentinel 限流熔断](./Sentinel限流熔断.md)」；
-- 链路追踪见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」。
+- 网关选型整体见「[API 网关](./API网关.md)」；
+- 非 Java 网关见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」「[OpenResty](./OpenResty.md)」；
+- 微服务注册发现（lb:// 路由）见「[注册中心与配置中心](./注册中心与配置中心.md)」；
+- 熔断限流组件见「[Sentinel 限流熔断](./Sentinel限流熔断.md)」；
+- 全链路可观测见「[OpenTelemetry](./OpenTelemetry.md)」。
 
-> 一句话：**Spring Cloud Gateway = WebFlux 非阻塞 + Route/Predicate/Filter 三件套 + lb:// 注册中心路由；选型先看「生态（Java→Spring Cloud Gateway，跨语言→Kong/APISIX）」，再定「路由策略（断言 + 权重灰度）」，最后配「限流（Redis）+ 熔断（Resilience4J/Sentinel）+ 动态路由（Nacos）」**。
+> 一句话：**SCG = WebFlux 响应式（Netty 非阻塞）+ Route/Predicate/Filter 三层模型 + GlobalFilter 链（鉴权/限流/熔断/追踪）+ Redis 令牌桶限流 + 配置中心热更新——生产守则：无阻塞 IO、限流熔断全配、traceId 透传、监控告警齐全**。
