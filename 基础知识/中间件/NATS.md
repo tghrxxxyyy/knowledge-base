@@ -44,7 +44,48 @@ JetStream（流引擎，附加持久化）
 
 **选型关注点**：NATS 原生把「服务发现 + 调用 + 广播」统一在消息模型里——边缘/云原生服务通信首选。
 
-### 2.3 JetStream 持久化（核心）
+### 2.3 主题（Subject）设计深入
+
+```
+主题层级：用 "." 分隔（域名.服务.事件）
+  示例：orders.eu.paid / iot.device.123.temp / system.metrics.cpu
+
+通配符：
+  *：匹配一层（orders.*.paid）
+  >：匹配剩余所有层（orders.> 匹配 orders. 下所有）
+
+队列组（Queue Group）：
+  多个订阅者同主题同队列名 → 消息分摊（round-robin）
+  → 横向扩展（消费者组）
+
+请求应答（Request-Reply）：
+  请求发到 "orders.get" + _INBOX.{reqID} 响应主题
+  服务端监听请求主题 → 响应发回 _INBOX
+  客户端自动匹配响应（timeout 处理）
+  → 天然的 RPC 消息实现（带超时/并发）
+
+Subject 设计规范：
+  <域>.<服务>.<动作/事件>（如 app.orders.created）
+  避免混乱命名（可维护性 + 权限粒度）
+```
+
+### 2.4 性能为什么这么快
+
+```
+NATS 性能设计：
+  纯内存路由（无磁盘 IO，核心 NATS）
+  零拷贝优化（Go 高效网络栈）
+  无锁/轻锁（原子操作 + 环形缓冲）
+  单跳路由（主题匹配 → 直接投递）
+  → 微秒级延迟（单机百万 msg/s 级别）
+
+代价：
+  默认不持久化（在线才收，重启丢）
+  无复杂路由（无交换机/绑定）
+  → 简单性换性能，JetStream 补持久化
+```
+
+### 2.5 JetStream 持久化（核心）
 
 ```
 Stream 配置：
@@ -61,13 +102,51 @@ Consumer：
 
 **选型关注点**：JetStream 解决了「核心 NATS 不持久化」的短板——消息中间「新」的一极：轻量但有流式能力。
 
-### 2.4 集群与容错
+### 2.6 JetStream 深入（流与消费模型）
+
+```
+Stream（流）= 持久化消息日志：
+  Retention：
+    Limits：按 MaxAge/MaxBytes 保留（通用日志）
+    Interest：所有订阅者消费完才删除（队列语义）
+    WorkQueue：单消费者消费后删除（任务队列）
+  Storage：
+    File：落盘（生产必选）
+    Memory：内存（超高速，重启丢）
+
+Consumer（消费者）：
+  Push 模式：服务端推送（长连接，低延迟）
+  Pull 模式：客户端拉取（批量处理，可控性高）
+  AckPolicy：
+    Explicit（每条确认）→ 精确控制，Exactly-once 基础
+    All（一批确认）
+    None（不确认）
+  MaxDeliver（最大投递次数）→ 超过进 DLQ
+
+顺序与幂等：
+  Stream 内按序（消息序列号）
+  消费重放（从某个 seq 开始）→ 支持 Exactly-once 语义
+  → 配合下游幂等（幂等键）
+```
+
+### 2.7 集群与容错
 
 ```
 NATS Cluster（同一集群内自动互联 + 主题路由）
   ├── Raft 选主（JetStream 流复制）
   ├── Leaf Nodes（叶子节点：边缘/跨机房连接，不参与投票）
   └── 网关（Gateway）：跨集群主题互通（多数据中心）
+
+集群拓扑：
+  全连接集群（Cluster）：节点互相连接（主题全局路由）
+  叶节点（Leaf）：单向连接上层（边缘/隔离区）
+     → 设备数据 → 边缘 NATS → 中心集群（离线缓存）
+  网关（Gateway）：跨集群连接（多数据中心/故障域隔离）
+
+JetStream 复制：
+  每个 Stream 有 N 个副本（Raft 组）
+  写：Leader 确认（多数派）→ 强一致
+  故障：Leader 切换 → 自动恢复
 ```
 
 ---
@@ -85,6 +164,42 @@ NATS Cluster（同一集群内自动互联 + 主题路由）
 | 边缘友好 | Leaf Node 模式，弱网/离线重连 |
 | 可观测 | 内置监控端点 + Prometheus 指标 |
 | 部署形态 | 单机/集群/K8s（NATS Operator）/边缘 |
+
+### 3.1 多租户（Accounts）深入
+
+```
+Accounts = 租户隔离机制：
+  Global Account（默认）+ 自定义 Accounts（业务线）
+  每个 Account 有独立命名空间（Subject 隔离）
+  跨 Account 通信 → 需要显式导出/导入（权限控制）
+
+用户认证：
+  JWT 认证（用户凭据 = JWT 签名）
+  NKEY（NATS 密钥，Ed25519）
+
+典型配置：
+  每个业务线一个 Account（隔离）
+  Account 间桥接（Export/Import + 过滤）
+  → 多租户安全隔离 + 权限最小化
+
+```
+```yaml
+# NATS 配置示例（账号隔离 + JetStream）
+server {
+  jetstream { store_dir: "/data/jetstream" }
+  authorization {
+    admin: { users: [{ user: admin, password: "pw" }] }
+    app1: {
+      users: [{ user: app1user, password: "pw" }]
+      permissions: {
+        publish:   ["orders.>", "app1.>"]
+        subscribe: ["app1.>", "orders.*.events"]
+      }
+    }
+  }
+  accounts: { admin: {...}, app1: {...} }
+}
+```
 
 ---
 
@@ -108,6 +223,26 @@ NATS Cluster（同一集群内自动互联 + 主题路由）
 - 业务可靠消息 → **RabbitMQ/RocketMQ**；
 - 云原生多租户大平台 → **Pulsar**。
 
+### 4.1 与 Kafka 的本质差异
+
+```
+NATS vs Kafka（同为"流"思想但路线不同）：
+  Kafka：分区模型（Topic 分 Partition，顺序保证在分区内）
+    → 全局有序需单分区（吞吐受限）
+    → 高吞吐靠多分区（顺序丢失）
+  NATS JetStream：Stream 内有序（单流有序）
+    → 消费吞吐靠多 Consumer/队列组
+    → 顺序保证更直观
+
+Kafka 优势：生态最成熟（流处理/连接器/监控）
+NATS 优势：轻（20MB vs 数 GB）、快（微秒 vs 毫秒）、简单
+
+选择：
+  大数据管道/流处理生态 → Kafka
+  微服务通信/边缘/轻量场景 → NATS
+  两者可共存（NATS 做服务通信，Kafka 做数据管道）
+```
+
 ---
 
 ## 五、生产实践
@@ -123,12 +258,24 @@ NATS Cluster（同一集群内自动互联 + 主题路由）
 | 监控 | 内置 `nats top` + Prometheus exporter |
 | 集群 | 奇数节点（3/5），Raft 选举 |
 
-### 5.2 常见坑
+### 5.2 部署拓扑
+
+```
+单机：开发/小规模（无持久化风险？→ 开 JetStream）
+集群：生产（3 节点 + JetStream File + Raft）
+边缘：Leaf Node（设备区 → 中心集群）
+多数据中心：Gateway（跨区容灾 + 故障域隔离）
+K8s：NATS Operator（自动集群编排）
+```
+
+### 5.3 常见坑
 
 - **核心 NATS 不持久化**：默认订阅者离线丢消息——需要持久化必须上 JetStream；
 - **顺序保证有限**：多订阅者/多流并发下无全局顺序（接受「流内有序」）；
 - **消费积压**：Pull Consumer 要设置 MaxWaiting/Ack 超时，防止积压无感知；
-- **Subject 设计**：用 `域.服务.事件` 层级 + 通配符规划，别拍脑袋命名。
+- **Subject 设计**：用 `域.服务.事件` 层级 + 通配符规划，别拍脑袋命名；
+- **Stream 无限增长**：Retention/MaxAge 未配置 → 磁盘爆（必须设保留策略）；
+- **Ack 语义误用**：Explicit 不确认 → 消息重复投递（下游需幂等）。
 
 ---
 
@@ -142,6 +289,17 @@ NATS Cluster（同一集群内自动互联 + 主题路由）
 | 业务可靠消息 | RabbitMQ/RocketMQ | NATS JetStream |
 | 云原生多租户 | Pulsar | NATS |
 | 请求应答 | NATS Request-Reply | gRPC |
+| 任务队列 | NATS JetStream（WorkQueue） | RabbitMQ |
+
+### 6.1 决策树
+
+```
+延迟敏感/轻量/边缘 → NATS
+需要持久化/流处理 → NATS + JetStream（轻量）或 Kafka（生态）
+业务事务消息 → RabbitMQ/RocketMQ
+云原生多租户大平台 → Pulsar
+服务间调用 → NATS Request-Reply / gRPC
+```
 
 ---
 
@@ -153,4 +311,4 @@ NATS Cluster（同一集群内自动互联 + 主题路由）
 - MQTT（IoT 协议）见「[MQTT 与消息 Broker](./MQTT与消息broker.md)」；
 - 云上消息（SNS/SQS）见「[云上消息与集成生态](./云上消息与集成生态.md)」。
 
-> 一句话：**NATS = 主题 Pub/Sub + Request-Reply + JetStream 持久化 + 原生多租户——「最简单」就是它的竞争力；选型先看「延迟与重量（微服务/边缘→NATS，管道→Kafka）」，再定「持久化（需要→JetStream）」，最后配「Accounts 认证 + 集群 3 节点 + 监控」**。
+> 一句话：**NATS = 主题 Pub/Sub + Request-Reply + JetStream 持久化 + 原生多租户——「最简单」就是它的竞争力；选型先看「延迟与重量（微服务/边缘→NATS，管道→Kafka）」，再定「持久化（需要→JetStream：File + Raft + Explicit Ack）」，最后配「Accounts 认证 + 集群 3 节点 + Stream 保留策略 + 监控」**。

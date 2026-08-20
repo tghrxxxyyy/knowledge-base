@@ -48,7 +48,31 @@ Kafka（事件流落点，topic 按表命名：db.table）
 
 **选型关注点**：事件自带 before/after + 操作类型 + 来源元数据——下游可以做增量同步、审计、事件驱动，这是 CDC 的通用数据模型。
 
-### 2.3 快照 + 增量（增量快照机制）
+### 2.3 事件字段深入
+
+```
+op 字段：
+  c（create）：新增 → 下游 INSERT/upsert
+  u（update）：更新 → 下游 UPDATE
+  d（delete）：删除 → 下游 DELETE/软删
+  r（read）：快照阶段读取的历史数据（初始加载）
+
+source 字段（溯源元数据）：
+  version：Debezium 版本
+  connector：连接器类型（mysql/postgres）
+  db / schema / table：库表位置
+  ts_ms：变更发生时间（数据库侧）
+  pos / gtid / lsn：binlog/WAL 位置（精确位点）
+  snapshot：是否为快照阶段数据
+  file / row：binlog 文件名与偏移
+
+用途：
+  位点信息 → 重放/对齐/审计
+  库表信息 → 多源多表分流路由
+  before/after → 增量同步（upsert 直接拿新值）
+```
+
+### 2.4 快照 + 增量（增量快照机制）
 
 ```
 首次启动：Snapshot 全量读取 → 同时记录 binlog 位点
@@ -59,7 +83,26 @@ Kafka（事件流落点，topic 按表命名：db.table）
 - **增量快照（Incremental Snapshot）**：大表快照分块进行，不阻塞线上写入；
 - **Exactly-once 语义**：结合 Kafka 幂等/事务，保证下游不丢不重（配合 Sink 幂等）。
 
-### 2.4 部署模型（Kafka Connect）
+### 2.5 增量快照深入
+
+```
+传统快照问题：
+  大表（亿级行）全量快照耗时长 → 期间 binlog 积压
+  快照期间数据变更 → 快照数据与增量数据重复/错乱
+
+Incremental Snapshot（Chunked Snapshot）：
+  ① 表按主键范围分块（每块数千行）
+  ② 每块快照完成 → 标记位点（水位线）
+  ③ 块内数据 + 块间增量拼接（无缝隙、无重复）
+  ④ 快照与增量并行推进（在线增量，不阻塞业务）
+
+快照期间处理变更：
+  块快照时记录水位（binlog 位置）
+  块内变更：先快照后增量 → 用水位去重/覆盖
+  全表快照完 → 纯增量模式
+```
+
+### 2.6 部署模型（Kafka Connect）
 
 | 模式 | 说明 |
 |------|------|
@@ -69,6 +112,25 @@ Kafka（事件流落点，topic 按表命名：db.table）
 | Debezium Server | 无 Kafka 场景：CDC → Pulsar/Kinesis/HTTP（轻量） |
 
 **选型关注点**：生产用**分布式 Kafka Connect**（自带扩展/容错）；不想引 Kafka → Debezium Server 直出其他消息系统。
+
+### 2.7 分布式 Connect 容错机制
+
+```
+分布式 Connect：
+  多个 Worker 组成集群（同 group.id）
+  Connector/Task 分布到各 Worker（均衡分配）
+  Worker 故障 → 其上的 Task 自动迁移到其他 Worker（restart）
+  配置/状态存 Kafka（config topic / status topic / offset topic）
+
+Task 模型：
+  一个 Connector 拆多个 Task（按表/分区分片）
+  MySQL：Task 数 = 表分片数（chunk 并行）
+  并行度提升 → 吞吐提升
+
+Offset 管理：
+  消费位点存 Kafka offset topic（提交）
+  崩溃恢复 → 从提交位点继续（至少一次语义）
+```
 
 ---
 
@@ -85,6 +147,24 @@ Kafka（事件流落点，topic 按表命名：db.table）
 | Exactly-once | 配合 Kafka 事务语义 |
 | 免侵入 | 不碰业务代码，只读 binlog/WAL |
 | 高可用 | Connect 集群自动故障转移 |
+| 转换器 | SMT（Single Message Transform）字段/格式处理 |
+
+### 3.1 SMT（消息转换）
+
+```
+SMT = 在事件进入 Kafka 前做字段级处理（无需消费端处理）
+  常见 SMT：
+    字段重命名/过滤（RenameFields/FilterFields）
+    字段裁剪（PruneFields：去掉敏感字段）
+    时间戳转换（时间字段 → epoch/ISO）
+    主题路由（TopicRouting：按条件分主题）
+    值处理（ExtractNewRecordState：只保留 after 值）
+
+典型用途：
+  生产环境去掉身份证/手机号字段（脱敏前置）
+  只同步需要的字段（减少流量）
+  事件格式标准化（JSON/Avro 转换）
+```
 
 ---
 
@@ -121,14 +201,70 @@ Kafka（事件流落点，topic 按表命名：db.table）
 | 并发 | 大表多分区/分片 Connector（per-table 任务） |
 | 幂等 Sink | 下游消费必须幂等（重放安全） |
 | 监控 | Connect REST API + 指标（lag 关键指标） |
+| 快照配置 | 增量快照开启 + 分块大小（chunk）调优 |
 
-### 5.2 常见坑
+### 5.2 配置示例（MySQL Connector）
+
+```json
+{
+  "name": "mysql-orders-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql-host",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "debezium",
+    "database.server.id": "184054",
+    "database.server.name": "shop",
+    "database.include.list": "order_db",
+    "table.include.list": "order_db.orders,order_db.order_items",
+    "database.history.kafka.bootstrap.servers": "kafka:9092",
+    "database.history.kafka.topic": "schema-changes.shop",
+    "topic.prefix": "shop",
+    "snapshot.mode": "initial",
+    "incremental.snapshot.chunk.size": "4096",
+    "column.mask.with.length.chars": "4,card_no",
+    "offset.storage.file.filename": ""
+  }
+}
+```
+
+### 5.3 下游消费注意事项
+
+```
+① 至少一次语义 → 下游必须幂等（按主键 upsert）
+② delete 事件处理：物理删除 vs 软删（写删除标记）
+③ 大事务：单事务修改万行 → 事件洪峰 → 下游批量消费
+④ 顺序性：单主键事件按分区有序（同主键同分区）
+⑤ Schema 变更：加列 → 事件结构变化（Avro Registry 兼容校验）
+⑥ 位点监控：lag = 当前时间 - 最新事件时间（关键指标）
+```
+
+### 5.4 常见坑
 
 - **DDL 变更**：表结构变更（加列）可能导致解析失败 → 升级 Connector 版本/兼容策略；
 - **大事务阻塞**：超长事务的 binlog 解析延迟 → 关注 lag 告警；
 - **无主键表**：无主键 update/delete 事件不可靠 → 强制补主键/唯一键；
 - **版本兼容**：Debezium 版本与数据库小版本要匹配（尤其 PG/Oracle）；
-- **Topic 无限增长**：按保留策略清理旧事件（否则 Kafka 磁盘爆）。
+- **Topic 无限增长**：按保留策略清理旧事件（否则 Kafka 磁盘爆）；
+- **并行快照打爆源库**：增量快照 chunk 过小 + 并发高 → 源库 IO 压力 → chunk 调大/限流。
+
+### 5.5 监控指标
+
+```
+关键指标（JMX/Prometheus）：
+  lag（最新事件时间 vs 当前时间）—— 最核心
+  快照进度（快照中/完成比例）
+  已处理事件数/秒（吞吐）
+  错误事件数（解析失败）
+  Kafka Connect Task 状态（RUNNING/FAILED）
+  binlog 位点与 Kafka offset 差距（积压）
+
+告警：
+  lag > 阈值（如 5 分钟）→ 告警（同步中断/变慢）
+  Task FAILED → 立即告警
+  快照异常/超时 → 告警
+```
 
 ---
 
@@ -142,6 +278,17 @@ Kafka（事件流落点，topic 按表命名：db.table）
 | 缓存/ES 同步 | Debezium + Sink | Canal Adapter |
 | 阿里云 RDS | Canal | DTS（商业） |
 | 无 Kafka 场景 | Debezium Server | 云 DMS |
+| 数据脱敏前置 | Debezium SMT | 消费端处理 |
+
+### 6.1 决策树
+
+```
+数据库 > 1 种？→ 是 → Debezium（多库支持）
+纯 MySQL + 阿里系？→ Canal
+要 SQL 实时数仓？→ Flink CDC（SQL 友好）
+无 Kafka 基础设施？→ Debezium Server（直出 Pulsar/HTTP）
+简单 JSON 事件？→ Maxwell
+```
 
 ---
 
@@ -153,4 +300,4 @@ Kafka（事件流落点，topic 按表命名：db.table）
 - 分库分表（binlog 迁移）见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - 云上数据同步见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」。
 
-> 一句话：**Debezium = Kafka Connect + 多数据库（binlog/WAL）+ 快照增量一体 + 标准变更事件（before/after/op）；选型先看「数据库（多库→Debezium，纯 MySQL→Canal）」，再定「出口（Kafka→Connect，SQL 数仓→Flink CDC）」，最后配「ROW 格式 + 幂等 Sink + lag 监控」**。
+> 一句话：**Debezium = Kafka Connect + 多数据库（binlog/WAL）+ 快照增量一体 + 标准变更事件（before/after/op）；选型先看「数据库（多库→Debezium，纯 MySQL→Canal）」，再定「出口（Kafka→Connect，SQL 数仓→Flink CDC）」，最后配「ROW 格式 + 增量快照 + 幂等 Sink + lag 监控」**。
