@@ -217,3 +217,117 @@ JVM 参数：
 - 云上对应见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」（AWS Keyspaces/ScyllaDB Cloud）。
 
 > 一句话：**Cassandra = 写为王的去中心化宽列库：无主环 + 可调一致性 + vnode 免重分——生产关键：Compaction 策略选 TimeWindow + Tombstone 监控 + 多 DC 本地优先**。
+
+---
+
+## 六、Cassandra vs HBase vs DynamoDB
+
+| 维度 | Cassandra | HBase | DynamoDB |
+|------|-----------|-------|----------|
+| 架构 | 去中心化（无主） | 主从（HMaster + RegionServer） | 全托管 |
+| 数据模型 | 宽列 | 宽列 | KV + 文档 + 宽列 |
+| 一致性 | 可调（ONE/QUORUM/ALL） | 强一致 | 最终/强一致 |
+| 写性能 | 极高（无锁追加） | 高（LSM-Tree） | 高（托管） |
+| 读性能 | 中（需分区键） | 高（列族缓存） | 高（索引） |
+| 扩展 | 线性扩展 | Region 拆分 | 自动扩展 |
+| 运维 | 中（P2P 自愈） | 重（HDFS + ZK） | 免运维 |
+| 适用 | 时序/IoT/事件流 | 大数据宽表 | 通用 |
+
+---
+
+## 七、ScyllaDB（Cassandra 替代）
+
+ScyllaDB 是用 C++ 重写的 Cassandra 替代品：
+
+| 特性 | ScyllaDB | Cassandra |
+|------|----------|-----------|
+| 语言 | C++（无 GC） | Java（有 GC） |
+| 性能 | 10x+ 提升 | 基准 |
+| 延迟 | P99 更低 | 中等 |
+| 兼容性 | 完全兼容 CQL | CQL |
+| 资源占用 | 低 | 高（JVM） |
+| 运维 | 更简单 | 中等 |
+
+---
+
+## 八、生产 Checklist（扩展）
+
+| 检查项 | 说明 |
+|--------|------|
+| 副本数 | 生产 ≥ 3（跨 3 个可用区） |
+| 一致性级别 | 写 QUORUM + 读 ONE（或写 ONE + 读 QUORUM） |
+| Compaction | 时序数据选 TimeWindow |
+| Tombstone | 监控 Tombstone 数量，设置告警 |
+| GC Grace | 根据网络延迟调整（跨 DC 适当延长） |
+| 分区大小 | 单分区 < 100MB（避免大分区） |
+| 节点监控 | CPU/内存/磁盘/延迟 |
+| 备份 | 定期 Snapshot 备份 |
+| 多 DC | 本地优先读写，跨 DC 异步复制 |
+| 扩容 | 原地扩容（加节点 + 重分 token） |
+
+---
+
+## 九、CQL（Cassandra Query Language）
+
+```sql
+-- 创建表
+CREATE TABLE user_events (
+    user_id UUID,
+    event_time TIMESTAMP,
+    event_type TEXT,
+    event_data MAP<TEXT, TEXT>,
+    PRIMARY KEY ((user_id), event_time)
+) WITH CLUSTERING ORDER BY (event_time DESC);
+
+-- 查询（必须带 Partition Key）
+SELECT * FROM user_events WHERE user_id = ? AND event_time > '2026-01-01';
+
+-- 插入
+INSERT INTO user_events (user_id, event_time, event_type)
+VALUES (uuid(), toTimestamp(now()), 'login');
+
+-- 删除（写入 Tombstone）
+DELETE FROM user_events WHERE user_id = ? AND event_time = ?;
+
+-- TTL（自动过期）
+INSERT INTO user_events (user_id, event_time, event_type)
+VALUES (uuid(), toTimestamp(now()), 'session')
+USING TTL 86400;
+```
+
+### CQL vs SQL 区别
+
+| 特性 | CQL | SQL |
+|------|-----|-----|
+| WHERE | 必须带 Partition Key | 任意字段 |
+| JOIN | 不支持 | 支持 |
+| GROUP BY | 有限支持 | 完整支持 |
+| 二级索引 | 支持但性能差 | 支持 |
+| 事务 | 轻量事务（Paxos） | 完整事务 |
+
+---
+
+## 十、与其他板块的关系（扩展）
+
+- HBase 对比见「[HBase 列式存储](./HBase列式存储.md)」；
+- 大数据写入见「[大数据/06-分布式NoSQL与HBase](../大数据/06-分布式NoSQL与HBase.md)」；
+- 云上对应见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」（AWS Keyspaces/ScyllaDB Cloud）；
+- 时序场景见「[时序库](../时序库/README.md)」；
+- 对比 MongoDB 见「[MongoDB](./MongoDB.md)」。
+
+---
+
+## 十、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 去中心化宽列 NoSQL |
+| 架构 | Dynamo 风格（无主、gossip 协议） |
+| 一致性 | 可调（ONE/QUORUM/ALL） |
+| 存储 | LSM-Tree（SSTable + Commit Log） |
+| Compaction | SizeTiered / Leveled / TimeWindow |
+| Tombstone | 删除标记，GC Grace 后清理 |
+| 多 DC | NetworkTopologyStrategy（本地优先） |
+| 查询 | 必须按 Partition Key 查 |
+| 许可证 | Apache 2.0 |
+| 一句话 | 「写为王的去中心化宽列库——时序/IoT/事件流首选」 |

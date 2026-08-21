@@ -222,3 +222,79 @@ FROM KAFKA("kafka_broker_list"="kafka:9092","kafka_topic"="orders");
 - Flink 实时导入见「[Apache Flink 流处理](./ApacheFlink流处理.md)」。
 
 > 一句话：**Doris/StarRocks = MPP 列式 + MySQL 协议 + 物化视图 + 多源导入——查询调优三板斧：分区裁剪 + 物化视图 + 向量化执行；生产选 Retain 回收 + WaitForFirstConsumer + 冷热分层**。
+
+---
+
+## 六、Doris vs StarRocks 对比
+
+| 维度 | Doris | StarRocks |
+|------|-------|-----------|
+| 分支 | Apache 顶级项目 | 商业公司主导 |
+| CBO | 支持 | 支持（更成熟） |
+| 物化视图 | 同步/异步 | 同步/异步 |
+| 多源导入 | Stream/Broker/Routine/Spark | Stream/Broker/Routine |
+| 存储引擎 | 明细/聚合/唯一 | 明细/聚合/唯一 |
+| 向量化 | 支持 | 支持 |
+| 社区 | Apache 社区 | 商业+开源 |
+| 选型 | 开源优先/国内生态 | 性能优先/商业支持 |
+
+---
+
+## 七、生产调优深入
+
+### 7.1 查询调优 Checklist
+
+| 调优点 | 操作 |
+|--------|------|
+| 分区裁剪 | WHERE 条件带分区键 |
+| 物化视图 | 预聚合热点查询 |
+| 向量化执行 | 开启 pipeline engine |
+| Runtime Filter | Join 动态过滤 |
+| 物化视图选择 | FE 自动选择最优 |
+| 统计信息 | ANALYZE TABLE 更新统计 |
+
+### 7.2 导入调优
+
+| 调优点 | 说明 |
+|--------|------|
+| 批量大小 | 合理设置 batch size |
+| 并发度 | 调整导入并行度 |
+| 写 Buffer | 增加写缓冲 |
+| 限流 | 控制导入速率防打满 BE |
+
+---
+
+## 八、与其他板块的关系（扩展）
+
+- ClickHouse 对比见「[ClickHouse](./ClickHouse.md)」；
+- 数仓分层见「[大数据/09-数据仓库与OLAP引擎](../大数据/09-数据仓库与OLAP引擎.md)」；
+- 云上对应见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
+- Flink 实时导入见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；
+- 对比 Hive 见「[大数据/Hive](../大数据/Hive.md)」；
+- 对比 ClickHouse 见「[ClickHouse](./ClickHouse.md)」；
+- 实时数仓见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
+- 数据湖格式见「[Iceberg/Delta/Hudi](./云上数仓与大数据生态.md)」；
+- Kafka 实时导入见「[Kafka](./Kafka.md)」；
+- ETL 调度见「[DolphinScheduler](./DolphinScheduler.md)」；
+- 对比 Hive 见「[大数据/Hive](../大数据/Hive.md)」；
+- 向量化执行原理见「[ClickHouse](./ClickHouse.md)」。
+
+---
+
+## 九、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | MPP 列式 OLAP |
+| 表模型 | Duplicate / Aggregate / Unique |
+| 分桶键 | 查询高频字段，避免热点 |
+| 查询优化 | CBO + 向量化 + 物化视图 + Runtime Filter |
+| 导入 | Stream/Broker/Routine/Spark Load |
+| 部署 | FE(3节点) + BE(3+节点) |
+| 副本数 | 默认 3（生产必配） |
+| 冷热分层 | SSD(热) + HDD(温) + S3(冷) |
+| MySQL 协议 | 兼容 MySQL 客户端 |
+| Doris vs StarRocks | 开源 vs 商业，功能接近 |
+| 社区 | Apache 社区 vs 商业公司主导 |
+| 许可证 | Apache 2.0 |
+| 一句话 | 「国产 MPP 列式双雄——MySQL 协议 + 物化视图 + 多源导入」 |

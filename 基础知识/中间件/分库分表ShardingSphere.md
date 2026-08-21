@@ -217,3 +217,100 @@ ShardingSphere 内置多种事务模式：
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。
 - 和「**基础知识/MQ**」：分片后异构同步（如订单同步 ES）用 Canal + MQ。
 - 和「**基础知识/MySQL**」：分库分表建立在 MySQL 之上，索引 / 慢 SQL 优化仍是基础。
+- 和「**基础知识/分布式ID生成器**」：分片后需要分布式 ID（雪花/Leaf）。
+- 和「**云原生/微服务架构**」：ShardingSphere-JDBC 嵌入微服务，Sharding-Proxy 独立部署。
+- 和「**云原生/高可用架构**」：ShardingSphere + 读写分离 + 主从切换构成高可用方案。
+
+---
+
+## 十一、ShardingSphere 扩展能力
+
+### 11.1 数据加密
+
+```yaml
+# 字段级透明加密
+rules:
+  encrypt:
+    tables:
+      t_user:
+        columns:
+          phone:
+            cipher:
+              type: AES
+              props:
+                aes.key: 1234567890abcdef
+            plain:
+              type: PLAIN
+```
+
+### 11.2 影子库压测
+
+```yaml
+rules:
+  shadow:
+    data-sources:
+      shadow_ds:
+        source-data-source-name: ds
+        shadow-data-source-name: ds_shadow
+    tables:
+      t_order:
+        data-source-mapping: t_order_shadow
+```
+
+### 11.3 DistSQL（动态管理）
+
+```sql
+SHOW SHARDING TABLE RULES;
+CREATE SHARDING TABLE RULE t_order (...);
+ALTER SHARDING TABLE RULE t_order (...);
+DROP SHARDING TABLE RULE t_order;
+```
+
+### 11.4 数据脱敏
+
+```yaml
+rules:
+  mask:
+    tables:
+      t_user:
+        columns:
+          phone:
+            mask-algorithm: MD5
+```
+
+### 11.5 读写分离 + 分片组合
+
+```yaml
+rules:
+  readwrite-splitting:
+    data-sources:
+      ds_0:
+        write-data-source-name: ds_0_master
+        read-data-source-names: ds_0_slave
+      ds_1:
+        write-data-source-name: ds_1_master
+        read-data-source-names: ds_1_slave
+  sharding:
+    tables:
+      t_order:
+        actual-data-nodes: ds_${0..1}.t_order_${0..3}
+```
+
+---
+
+## 十二、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 数据库增强层（Database Plus） |
+| 接入端 | Sharding-JDBC（客户端）/ Sharding-Proxy（代理） |
+| 核心流程 | SQL 解析 → 路由 → 改写 → 执行 → 归并 |
+| 分片键 | 高基数、查询高频、避免热点 |
+| 分片算法 | Standard/Complex/Hint |
+| 绑定表 | 相同分片规则的主子表（避免笛卡尔积） |
+| 广播表 | 小表全量冗余（字典表/配置表） |
+| 分布式事务 | LOCAL / XA / Seata |
+| 扩展能力 | 数据加密 / 影子库压测 / DistSQL / 数据脱敏 |
+| 配置方式 | YAML / Java API / DistSQL（动态） |
+| 许可证 | Apache 2.0 |
+| 一句话 | 「分库分表的瑞士军刀——对业务透明的数据库增强层」 |

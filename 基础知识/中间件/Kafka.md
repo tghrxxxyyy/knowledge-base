@@ -220,3 +220,87 @@ flowchart LR
 | 元数据 | ZooKeeper（旧）/ KRaft（新，推荐） |
 | 许可证 | Apache 2.0 |
 | 一句话 | 「日志与流的事实标准」——高吞吐、可回放、生态最大 |
+
+---
+
+## 八、Kafka KRaft 模式（去 ZK）
+
+### 8.1 KRaft 是什么
+
+```
+KRaft = Kafka 自研 Raft 协议，替代 ZooKeeper 管理元数据
+
+旧架构：Broker + ZK（存储元数据/选 Controller）
+新架构：Broker + KRaft Controller（Raft 共识）
+
+优势：
+  - 去掉 ZK 依赖（运维简化）
+  - Controller 故障恢复更快
+  - 支持更多分区（百万级）
+  - 部署更简单
+```
+
+### 8.2 迁移建议
+
+| 阶段 | 建议 |
+|------|------|
+| 新集群 | 直接用 KRaft（3.x+） |
+| 存量集群 | 评估迁移成本（ZK→KRaft） |
+| 稳定性 | KRaft 已 GA（3.3+），生产可用 |
+
+---
+
+## 九、Kafka 安全
+
+### 9.1 认证
+
+| 机制 | 说明 |
+|------|------|
+| SASL/PLAIN | 用户名密码（简单） |
+| SASL/SCRAM | 挑战响应（更安全） |
+| SASL/GSSAPI | Kerberos（企业级） |
+| SSL/TLS | 证书认证 |
+
+### 9.2 授权
+
+```bash
+# ACL 管理
+kafka-acls.sh --add --allow-principal User:alice \
+  --operation Read --topic orders --group my-consumer
+```
+
+### 9.3 加密
+
+```
+传输加密：SSL/TLS（broker 间 + 客户端间）
+存储加密：磁盘加密（云盘加密/OS 级加密）
+```
+
+---
+
+## 十、与其他板块的关系（扩展）
+
+- 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。
+- 和「**基础知识/MQ**」：MQ.md 收录 Kafka 的 Producer 流程、ISR/LEO/HW、清理策略等零散精华；本篇是体系化实用版。
+- 和「**基础知识/中间件/ApachePulsar**」「**RabbitMQ**」「**RocketMQ**」：同属消息家族，选型见上文对比表。
+- 和「**基础知识/中间件/数据同步CDC-Canal**」：Canal/Debezium 发 Kafka 是「binlog → 下游异构系统」的黄金链路。
+- 和「**基础知识/大数据**」：Kafka 是大数据全链路（采集 → 数仓 → 实时计算）的传输底座。
+- 和「**基础知识/分布式系统**」：Kafka 的副本/ISR/一致性语义是分布式理论的最佳实践样本。
+- 和「**基础知识/中间件/KafkaStreams与ksqlDB**」：Kafka Streams 是 Kafka 官方流处理库。
+
+---
+
+## 十一、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 分布式消息队列 / 流平台 |
+| 核心 | Topic → Partition（日志段）→ Consumer Group |
+| 吞吐 | 百万级 msg/s（分区并行 + 顺序写 + 零拷贝） |
+| 语义 | at-least-once（默认）；幂等+事务可近似 exactly-once |
+| 顺序 | 分区内有序（同 key 同分区） |
+| 堆积 | 极强（磁盘 + 位移回放） |
+| 元数据 | ZooKeeper（旧）/ KRaft（新，推荐） |
+| 安全 | SASL/SSL/ACL |
+| 许可证 | Apache 2.0 |
+| 一句话 | 「日志与流的事实标准」——高吞吐、可回放、生态最大 |

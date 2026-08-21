@@ -211,3 +211,133 @@ db.orders.aggregate([
 21. **MongoDB vs Redis？** Redis 内存 KV、亚毫秒、适合缓存/会话；MongoDB 持久化文档、支持复杂查询。常组合：Redis 前置缓存 + MongoDB 持久存储。
 
 22. **Change Streams 是什么？** 实时捕获数据变更（类似 CDC），支持事件驱动架构，可用于监听变更同步到下游。
+
+---
+
+## 九、MongoDB 索引深度
+
+### 9.1 索引类型详解
+
+| 索引类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| 单字段索引 | 默认 `_id` 索引 | 等值查询 |
+| 复合索引 | 多字段组合，遵循最左前缀 | 多条件查询 |
+| 多键索引 | 自动为数组元素建索引 | 数组字段查询 |
+| 文本索引 | 全文搜索（分词） | 文章/评论搜索 |
+| 地理空间索引 | 2dsphere/2d | LBS 附近的人/店 |
+| 哈希索引 | 字段哈希值 | 等值查询（分片键） |
+| TTL 索引 | 自动过期删除 | 验证码/会话/日志 |
+| 唯一索引 | 字段唯一约束 | 手机号/邮箱去重 |
+| 部分索引 | 只索引满足条件的文档 | 低基数字段（如 status='active'） |
+| 稀疏索引 | 只索引非 null 值 | 可选字段查询 |
+| 复合唯一索引 | 多字段组合唯一 | 联合去重（如 user_id + order_no） |
+
+### 9.2 索引优化实践
+
+```javascript
+// 复合索引设计原则：等值在前，范围在后
+db.orders.createIndex({ user_id: 1, created_at: -1 })
+// 查询: db.orders.find({ user_id: "u1", created_at: { $gte: ISODate("2026-01-01") } })
+
+// 覆盖查询（Covered Query）
+db.orders.find({ user_id: "u1" }, { user_id: 1, amount: 1, _id: 0 })
+// 查询字段和返回字段都命中索引，无需回文档
+
+// 部分索引（只索引 active 状态）
+db.users.createIndex({ email: 1 }, { partialFilterExpression: { status: "active" } })
+
+// explain() 查看执行计划
+db.orders.find({ user_id: "u1" }).explain("executionStats")
+// IXSCAN = 索引扫描（好），COLLSCAN = 全表扫描（差）
+```
+
+### 9.3 索引陷阱
+
+| 陷阱 | 表现 | 解法 |
+|------|------|------|
+| 过多索引 | 写入变慢（每个索引都要更新） | 定期清理冗余索引 |
+| 大文档索引 | 索引体积大、缓存命中低 | 只索引必要字段 |
+| 数组索引爆炸 | 数组每个元素都建索引 | 控制数组大小 |
+| 深度复合索引 | 5+ 字段复合索引 | 按查询模式精简 |
+
+---
+
+## 十、MongoDB 事务深度
+
+### 10.1 事务语法
+
+```javascript
+const session = client.startSession();
+try {
+    session.startTransaction({
+        readConcern: { level: "snapshot" },
+        writeConcern: { w: "majority" },
+        readPreference: "primary"
+    });
+    
+    await ordersCollection.insertOne({ ... }, { session });
+    await inventoryCollection.updateOne({ ... }, { session });
+    
+    await session.commitTransaction();
+} catch (error) {
+    await session.abortTransaction();
+} finally {
+    session.endSession();
+}
+```
+
+### 10.2 事务限制与最佳实践
+
+| 限制 | 说明 |
+|------|------|
+| 隔离级别 | 仅 Read Committed（非可串行化） |
+| 文档大小 | 单文档 ≤ 16MB |
+| Oplog 条目 | 事务内操作 ≤ oplog 大小限制 |
+| 性能开销 | 事务越多性能越差（锁竞争） |
+| 最佳实践 | 尽量用单文档原子操作（`$set`/`$inc`） |
+
+---
+
+## 十一、MongoDB Change Streams
+
+```javascript
+// 监听集合变更
+const changeStream = ordersCollection.watch([
+    { $match: { "operationType": { $in: ["insert", "update", "delete"] } } }
+]);
+
+changeStream.on("change", (event) => {
+    console.log(event.operationType, event.fullDocument);
+    // 可用于：缓存同步、审计日志、事件驱动架构
+});
+```
+
+**适用场景**：MySQL→MongoDB 同步、缓存一致性、审计日志、事件驱动微服务。
+
+---
+
+## 十二、与其他板块的关系（扩展）
+
+- 与 [MySQL](../mysql知识.md)、[Redis](../redis知识.md)：MongoDB 补「文档/半结构 + 水平扩展」，Redis 补缓存/高性能 KV，MySQL 保强事务。
+- 与 [分库分表 ShardingSphere](分库分表ShardingSphere.md)：ShardingSphere 是「关系型分库分表」方案；MongoDB 原生分片可替代部分场景，二者选型看是否要保 ACID/SQL。
+- 与 [分布式事务 Seata](分布式事务Seata.md)：MongoDB 4.0+ 自带分布式事务，但与 Seata 的 TCC/Saga 思路不同，跨多数据源仍可用 Seata 编排。
+- 与 [Elasticsearch](ES体系.md)：MongoDB 存文档，ES 存检索，常通过 Change Streams 同步。
+- 与 [Redis](Redis.md)：热门查询缓存在 Redis，MongoDB 做持久存储。
+
+---
+
+## 十三、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 文档型 NoSQL |
+| 数据单元 | BSON 文档（类 JSON） |
+| 高可用 | Replica Set（自动故障转移） |
+| 水平扩展 | Sharding（分片键路由） |
+| 存储引擎 | WiredTiger（文档级锁 + 压缩） |
+| 事务 | 4.0+ 多文档 ACID（Read Committed） |
+| 索引 | 10+ 种类型（复合/文本/地理/TTL） |
+| Change Streams | 实时变更捕获（类 CDC） |
+| 聚合管道 | $match → $group → $lookup → $sort |
+| 许可证 | SSPL v1（2018-10 后） |
+| 一句话 | 「写文档」式灵活存储 + 原生水平扩展 |

@@ -214,3 +214,98 @@ flowchart LR
 | 标准 | OpenTelemetry（采集标准）+ Jaeger/SkyWalking（后端） |
 | 许可证 | Apache 2.0（三家） |
 | 一句话 | 「微服务排障第一视角」——慢在哪一跳、坏在哪一环，一目了然 |
+
+---
+
+## 九、SkyWalking 部署与配置
+
+### 9.1 OAP Server 部署
+
+```bash
+# Docker 部署
+docker run -d -p 11800:11800 -p 12800:12800 -p 1234:1234 \
+  -e SW_STORAGE=elasticsearch \
+  -e SW_STORAGE_ES_CLUSTER_NODES=es:9200 \
+  apache/skywalking-oap-server
+
+# 关键配置
+# 存储：ES / MySQL / TiDB / H2（测试）
+# 指标：天级别聚合 → 存储空间可控
+# 链路：按天索引 + 保留期（7~30 天）
+```
+
+### 9.2 Agent 接入
+
+```bash
+# Java Agent
+java -javaagent:/path/to/skywalking-agent.jar \
+  -Dskywalking.agent.service_name=user-service \
+  -Dskywalking.collector.backend_service=oap:11800 \
+  -jar app.jar
+
+# 关键配置
+# agent.service_name: 服务名（唯一标识）
+# collector.backend_service: OAP 地址
+# logging.level: 日志级别（调试时开 DEBUG）
+```
+
+### 9.3 告警配置
+
+```yaml
+# alarm-rules.yml
+rules:
+  - name: service_resp_time_rule
+    metrics_name: service_resp_time
+    op: ">"
+    threshold: 1000  # P99 > 1000ms
+    period: 10       # 10 分钟窗口
+    count: 3         # 连续 3 次触发
+    
+  - name: service_sla_rule
+    metrics_name: service_sla
+    op: "<"
+    threshold: 99    # SLA < 99%
+    period: 10
+    count: 3
+```
+
+---
+
+## 十、SkyWalking 常见坑与最佳实践
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| Agent 版本不兼容 | 数据上报失败 | Agent 与 OAP 版本匹配 |
+| 链路断在异步 | @Async/线程池断链 | 显式传递 ContextCarrier |
+| 采样率不一致 | 链路不完整 | 统一配置采样率 |
+| ES 存储爆炸 | 磁盘满 | 按天索引 + ILM + 保留期 |
+| 慢查询拖垮 OAP | 聚合查询超时 | 优化查询 + 限制聚合范围 |
+| 日志没打 traceId | 链路与日志脱节 | 统一输出 traceId |
+
+---
+
+## 十一、与其他板块的关系（扩展）
+
+- 和「**基础知识/中间件/ELK日志体系**」：链路 + 日志双剑合璧（traceId 关联），排障黄金组合。
+- 和「**云原生/可观测性**」：可观测性三支柱中，链路由 SkyWalking/Jaeger/OTel 承载，与 Prometheus（指标）、Loki/ELK（日志）并列。
+- 和「**基础知识/网络协议深挖**」：RPC/gRPC 调用的 context 透传是链路的跨进程载体。
+- 和「**SRE与稳定性工程/06-日志与告警规则库**」：告警模板里「慢 Span / 错误 Span」是 SLO 看护的重要手段。
+- 和「**场景设计/问题定位**」「**SRE与稳定性工程/04-On-call与事故管理**」：链路是事故定位的「第一视角」。
+- 和「**OpenTelemetry**」：OTel 是标准，SkyWalking 是后端，可对接。
+
+---
+
+## 十二、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 核心模型 | Trace（整链）+ Span（每跳）+ SpanContext（透传） |
+| 探针方式 | SkyWalking Java Agent 字节码注入（零侵入）/ OTel SDK |
+| 透传通道 | HTTP Header / MQ 属性 / gRPC metadata（W3C traceparent） |
+| 采样 | 头部采样为主 + 错误/慢请求强制采样 |
+| 国内主流 | SkyWalking（拓扑/指标/告警全家桶） |
+| 标准 | OpenTelemetry（采集标准）+ Jaeger/SkyWalking（后端） |
+| 部署 | OAP Server + Agent + ES/MySQL 存储 |
+| 告警 | 按指标阈值触发（P99/SLA/错误率） |
+| 许可证 | Apache 2.0（三家） |
+| 一句话 | 「微服务排障第一视角」——慢在哪一跳、坏在哪一环，一目了然 |

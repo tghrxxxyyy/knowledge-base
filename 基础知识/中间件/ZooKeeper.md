@@ -222,3 +222,108 @@ flowchart LR
 | 局限 | 吞吐不高、不存大数据、分区时不可写 |
 | 许可证 | Apache 2.0 |
 | 一句话 | 「分布式协调的老牌地基」——强一致的锁与选举，云原生时代让位于 etcd |
+
+---
+
+## 八、ZooKeeper 高级特性
+
+### 8.1 Curator 框架
+
+```java
+// 分布式锁
+InterProcessMutex lock = new InterProcessMutex(client, "/lock/order");
+if (lock.acquire(10, TimeUnit.SECONDS)) {
+    try {
+        // 业务逻辑
+    } finally {
+        lock.release();
+    }
+}
+
+// Leader 选举
+LeaderLatch latch = new LeaderLatch(client, "/leader/election");
+latch.start();
+if (latch.hasLeadership()) {
+    // 当前是 Leader
+}
+
+// PathChildrenCache（监听子节点变化）
+PathChildrenCache cache = new PathChildrenCache(client, "/services", true);
+cache.getListenable().addListener((curatorFramework, event) -> {
+    // 处理节点变化
+});
+cache.start();
+```
+
+### 8.2 ZooKeeper 动态配置
+
+```bash
+# 动态更新配置（无需重启）
+zkCli.sh set /config/db.url "jdbc:mysql://new-host:3306/mydb"
+
+# 客户端 Watcher 监听变更
+# 配置变更 → 实时感知 → 热更新
+```
+
+### 8.3 ZooKeeper ACL
+
+```bash
+# 创建带权限的节点
+create /secure/data "secret" digest:user:password:cdrwa
+
+# 授权
+addauth digest user:password
+setAcl /secure/data world:anyone:r
+```
+
+---
+
+## 九、ZooKeeper 生产运维
+
+### 9.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| zk_server_state | Leader/Follower | Leader 变化 |
+| zk_avg_latency | 平均延迟 | > 100ms |
+| zk_outstanding_requests | 排队请求数 | > 10 |
+| zk_num_alive_connections | 活跃连接数 | > 1000 |
+| zk_followers | Follower 数量 | < 预期 |
+
+### 9.2 常见故障排查
+
+| 故障 | 现象 | 排查 |
+|------|------|------|
+| 集群不可用 | 写超时 | 检查 Leader/磁盘/网络 |
+| 会话超时 | 临时节点被删 | 检查 sessionTimeout/网络 |
+| GC 卡顿 | 间歇性超时 | 调大堆 + 监控 GC |
+| 磁盘满 | 写失败 | 清理日志/扩容 |
+| Watcher 丢失 | 配置不更新 | 重注册 Watcher |
+
+---
+
+## 十、与其他板块的关系（扩展）
+
+- 和「**源码系列/zookeeper**」：本篇讲协议、场景与生产；源码篇有常见 ZK 面试题深挖。
+- 和「**基础知识/中间件/etcd**」：同是 CP 协调服务，etcd 是云原生替代者（对比见上）。
+- 和「**基础知识/中间件/注册中心与配置中心**」：ZK 可做注册中心（CP 型），与 Nacos/Eureka（AP）的取舍见该篇。
+- 和「**场景设计/分布式锁**」：ZK 锁是分布式锁三大实现之一（Redis / ZK / DB 行锁）。
+- 和「**基础知识/中间件/Kafka**」：Kafka 老版本元数据依赖 ZK，新版本 KRaft 已替代。
+- 和「**基础知识/分布式系统**」：ZAB、quorum、CAP 是分布式理论在真实组件上的落地。
+
+---
+
+## 十一、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 分布式协调服务（CP） |
+| 协议 | ZAB（崩溃恢复 + 原子广播，quorum 提交） |
+| 数据模型 | ZNode 树（持久/临时/顺序） |
+| 通知 | Watcher（一次性，触发需重注册） |
+| 场景 | 分布式锁 / 选举 / 元数据 / 命名配置 |
+| 集群 | 奇数节点（3/5/7），过半可用，可加 Observer 扩读 |
+| 客户端 | Curator（推荐，封装锁/选举/缓存） |
+| 局限 | 吞吐不高、不存大数据、分区时不可写 |
+| 许可证 | Apache 2.0 |
+| 一句话 | 「分布式协调的老牌地基」——强一致的锁与选举，云原生时代让位于 etcd |

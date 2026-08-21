@@ -214,3 +214,118 @@ sequenceDiagram
 | 局限 | 内存 KV 容量有限、写吞吐受磁盘限制 |
 | 许可证 | Apache 2.0 |
 | 一句话 | 「K8s 的大脑」——云原生协调的事实标准，Raft 工程范式 |
+
+---
+
+## 八、etcd 高级特性
+
+### 8.1 Compact 与 Defrag
+
+```bash
+# 压缩历史版本（保留当前 revision）
+etcdctl compact $(etcdctl endpoint status --write-out=json | jq '.header.revision')
+
+# 整理碎片（释放磁盘空间）
+etcdctl defrag
+
+# 自动压缩（K8s 默认）
+# --auto-compaction-retention=8h
+```
+
+### 8.2 成员变更与滚动升级
+
+```bash
+# 添加成员
+etcdctl member add node4 --peer-urls=http://node4:2380
+
+# 移除成员
+etcdctl member remove <member-id>
+
+# 滚动升级（逐个节点）
+# 1. 停止旧版本
+# 2. 替换二进制
+# 3. 启动新版本
+# 4. 验证健康
+# 5. 继续下一个节点
+```
+
+### 8.3 备份与恢复
+
+```bash
+# 完整备份
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d).db
+
+# 恢复
+etcdctl snapshot restore /backup/etcd-20260821.db \
+  --data-dir=/var/lib/etcd-restored
+
+# 恢复后需要重启 etcd
+```
+
+### 8.4 性能调优
+
+| 参数 | 建议 | 说明 |
+|------|------|------|
+| heartbeat-interval | 100ms | 心跳间隔（默认 100ms） |
+| election-timeout | 1000ms | 选举超时（默认 1000ms） |
+| quota-backend-bytes | 8GB | 后端存储大小限制 |
+| auto-compaction-retention | 8h | 自动压缩周期 |
+| snapshot-count | 10000 | 触发快照的事务数 |
+
+---
+
+## 九、etcd 在 K8s 中的运维
+
+### 9.1 etcd 健康检查
+
+```bash
+# 检查端点健康
+etcdctl endpoint health --cluster
+
+# 查看端点状态
+etcdctl endpoint status --cluster --write-out=table
+
+# 查看 DB 大小
+etcdctl endpoint status --write-out=json | jq '.dbSize'
+
+# 查看 Leader 信息
+etcdctl endpoint status --write-out=json | jq '.leader'
+```
+
+### 9.2 etcd 常见故障排查
+
+| 故障 | 现象 | 排查步骤 |
+|------|------|----------|
+| etcd 不可用 | K8s 集群只读/不可用 | 检查进程/证书/磁盘 |
+| DB 膨胀 | 磁盘使用率高 | compact + defrag |
+| Leader 抖动 | 写入间歇性失败 | 检查磁盘延迟/网络 |
+| 选举超时 | 集群不可写 | 检查网络/磁盘 |
+| 快照失败 | 备份失败 | 检查磁盘空间 |
+
+---
+
+## 十、与其他板块的关系（扩展）
+
+- 和「**基础知识/中间件/ZooKeeper**」：同为 CP 协调服务，etcd 是云原生替代者（对比见上）。
+- 和「**基础知识/中间件/注册中心与配置中心**」：etcd 可做轻量注册/配置中心，与 Nacos/Apollo 的取舍见该篇。
+- 和「**云原生/Kubernetes核心**」「**云原生/K8S**」：K8s 的存储后端就是 etcd，集群故障一半以上出在 etcd。
+- 和「**场景设计/分布式锁**」：etcd 锁（Lease+Txn）与 Redis 锁、ZK 锁并列三大方案。
+- 和「**基础知识/分布式系统**」：Raft、quorum、脑裂是分布式理论的活教材。
+
+---
+
+## 十一、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 分布式强一致 KV 存储（CP） |
+| 协议 | Raft（选主 + 日志复制 + quorum 提交） |
+| 能力 | Put/Get / Watch 流 / Lease / Txn |
+| 数据模型 | 扁平 KV + revision（MVCC）+ 前缀组织 |
+| 场景 | K8s 元数据 / 服务发现 / 配置 / 锁 / 选举 |
+| 集群 | 奇数节点（3/5），SSD + 定期 compact/defrag |
+| 备份 | snapshot save + WAL 增量 |
+| 调优 | heartbeat/election/quota/compaction |
+| 局限 | 内存 KV 容量有限、写吞吐受磁盘限制 |
+| 许可证 | Apache 2.0 |
+| 一句话 | 「K8s 的大脑」——云原生协调的事实标准，Raft 工程范式 |
