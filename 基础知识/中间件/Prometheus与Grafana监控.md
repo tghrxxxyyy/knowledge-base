@@ -12,6 +12,8 @@
 | 多维数据 | 监控指标需要按实例/服务/接口等多维度聚合 |
 | 告警联动 | 指标→告警→通知需要灵活配置 |
 | 可视化 | 通用 Dashboard 展示所有服务指标 |
+| 长期存储 | 本地存储容量有限，需要长期存储方案 |
+| 多云统一 | 多云/混合云场景需要统一监控 |
 
 > 核心认知：**Prometheus 是「指标监控系统」，不是日志系统（那是 ELK/Loki）**——两者互补。
 
@@ -56,10 +58,13 @@ Prometheus Server
 
 ### 2.4 PromQL（查询语言）
 
-- **即时查询**：`http_requests_total{job="api"}`
-- **范围查询**：`rate(http_requests_total[5m])`（5 分钟内的每秒速率）
-- **聚合**：`sum by (instance) (rate(...))`
-- **预测**：`predict_linear(node_disk_free[6h], 3600*24)`（预测 24 小时后磁盘满）
+| 功能 | 示例 |
+|------|------|
+| 即时查询 | `http_requests_total{job="api"}` |
+| 范围查询 | `rate(http_requests_total[5m])` |
+| 聚合 | `sum by (instance) (rate(...))` |
+| 预测 | `predict_linear(node_disk_free[6h], 3600*24)` |
+| 分位数 | `histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))` |
 
 **选型关注点**：PromQL 是 Prometheus 的核心竞争力，比 Zabbix 的触发器灵活得多。
 
@@ -170,4 +175,148 @@ kube-prometheus-stack（Helm 一键安装）
 - SRE 可观测性看护见「[SRE/可观测性与稳定性看护](../../SRE与稳定性工程/02-可观测性与稳定性看护.md)」；
 - Grafana Loki 日志见「[ELK 日志体系](./ELK日志体系.md)」。
 
-> 一句话：**Prometheus + Grafana = Pull + 多维时序 + PromQL + 服务发现 + Alertmanager（分组/抑制/路由）；选型先看「环境（K8s/传统/云）」，再定「规模（本地 TSDB/Thanos 长期存储）」，最后配「Exporter 生态」。**
+---
+
+## 十、Prometheus 生产配置清单
+
+### 10.1 prometheus.yml 关键配置
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+```
+
+### 10.2 告警规则示例
+
+```yaml
+groups:
+  - name: node-alerts
+    rules:
+      - alert: HighCPU
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          
+      - alert: DiskAlmostFull
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 15
+        for: 5m
+        labels:
+          severity: critical
+```
+
+### 10.3 Grafana Dashboard 推荐
+
+| Dashboard | 用途 |
+|-----------|------|
+| Node Exporter Full | 主机监控 |
+| Kubernetes Cluster | K8s 集群监控 |
+| MySQL Overview | MySQL 监控 |
+| Redis Dashboard | Redis 监控 |
+| Kafka Overview | Kafka 监控 |
+
+### 10.4 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 采集失败 | 网络不通/端口错 | 检查网络/端口 |
+| 告警漏发 | 规则配置错 | 检查 PromQL |
+| 存储满 | 保留期太长 | 缩短保留期/扩容 |
+| 查询慢 | 时间范围太大 | 缩小时间范围 |
+
+---
+
+## 十一、Prometheus 常用 PromQL
+
+| 场景 | PromQL |
+|------|--------|
+| CPU 使用率 | `100 - (avg by(instance)(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)` |
+| 内存使用率 | `(1 - node_memory_MemAvailable_bytes/node_memory_MemTotal_bytes) * 100` |
+| 磁盘使用率 | `(1 - node_filesystem_avail_bytes/node_filesystem_size_bytes) * 100` |
+| 网络流量 | `irate(node_network_receive_bytes_total{device="eth0"}[5m]) * 8` |
+| HTTP 请求速率 | `rate(http_requests_total[5m])` |
+| HTTP 错误率 | `rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])` |
+| 请求延迟 P99 | `histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))` |
+
+### 11.1 Grafana 常用变量
+
+```
+$datasource    # 数据源
+$interval      # 时间间隔（1m/5m/1h）
+$job           # 任务名称
+$instance      # 实例
+$legend        # 图例格式
+```
+
+---
+
+## 十二、Prometheus 告警规则最佳实践
+
+### 12.1 告警分级
+
+| 级别 | 响应时间 | 通知方式 | 示例 |
+|------|----------|----------|------|
+| Critical | 5分钟 | 电话+短信+IM | 服务宕机/数据丢失 |
+| Warning | 30分钟 | 短信+IM | CPU>80%/磁盘>85% |
+| Info | 工作时间 | 邮件 | 新实例加入 |
+
+### 12.2 告警抑制规则
+
+```yaml
+# 集群宕机时抑制单实例告警
+- source_match:
+    alertname: ClusterDown
+  target_match_re:
+    alertname: InstanceDown|HighCPU|HighMemory
+  equal: [cluster]
+```
+
+### 12.3 告警静默规则
+
+```bash
+# 维护期间静默告警
+amtool silence add alertname=InstanceDown instance=node1 --duration=2h --comment="维护中"
+```
+
+### 12.4 常用 Exporter 配置
+
+```yaml
+# node_exporter
+- job_name: 'node'
+  static_configs:
+    - targets: ['node1:9100', 'node2:9100']
+
+# mysql_exporter
+- job_name: 'mysql'
+  static_configs:
+    - targets: ['mysql:9104']
+
+# redis_exporter
+- job_name: 'redis'
+  static_configs:
+    - targets: ['redis:9121']
+```
+
+---
+
+> 一句话：**Prometheus + Grafana = Pull + 多维时序 + PromQL + 服务发现 + Alertmanager（分组/抑制/路由）；选型先看「环境（K8s/传统/云）」，再定「规模（本地 TSDB/Thanos 长期存储）」，最后配「Exporter 生态」**。

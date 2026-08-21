@@ -13,6 +13,7 @@
 | 资源耗尽 | CPU/内存到阈值，需系统自适应保护 |
 | 热点参数 | 某商品 ID 被疯狂访问，需热点参数限流 |
 | 流量不均 | 多实例负载不均，需流量塑形/匀速通过 |
+| 调用链过长 | 微服务调用链 N 层，任一层故障都需保护 |
 
 > 核心认知：**Sentinel 是「流量哨兵」**——站在入口/出口，对流量做识别、管控、塑形，保护系统不被打垮。
 
@@ -29,9 +30,10 @@
   │   ├── ClusterBuilderSlot（全局统计）
   │   ├── StatisticSlot（实时统计：QPS/线程数/异常）
   │   ├── FlowSlot（限流规则校验）
-  │   ├── CircuitBreakingSlot（熔断规则校验）
+  │   ├── DegradeSlot（熔断规则校验）
   │   ├── SystemSlot（系统保护规则校验）
-  │   └── AuthoritySlot（授权规则校验）
+  │   ├── AuthoritySlot（授权规则校验）
+  │   └── HotParamSlot（热点参数限流）
   ├── 规则匹配 → 通过/拒绝/等待
   └── 实时指标 → Sentinel Dashboard/控制台
 ```
@@ -40,7 +42,7 @@
 
 | 概念 | 说明 |
 |------|------|
-| 资源（Resource） | 被保护的对象（接口/方法/代码块），用 `SphU.entry("resourceName")` 标记 |
+| 资源（Resource） | 被保护的对象（接口/方法/代码块），用 `SphU.entry("name")` 标记 |
 | 规则（Rule） | 限流/熔断/降级/系统保护/热点/授权规则 |
 | 插槽（Slot） | 规则校验的执行单元（责任链） |
 | 上下文（Context） | 当前调用的上下文（资源/入口/调用者） |
@@ -51,7 +53,7 @@
 | 算法 | 原理 | 适用场景 |
 |------|------|----------|
 | 直接拒绝 | 超阈值直接抛异常 | 对延迟不敏感 |
-| Warm Up（冷启动） | 阈值从 `count/冷启动因子` 线性增长到 count | 系统从冷态到热态（避免冷启动打垮） |
+| Warm Up（冷启动） | 阈值从 `count/冷启动因子` 线性增长到 count | 系统从冷态到热态 |
 | 匀速排队（RateLimiter） | 请求以固定间隔通过（令牌桶） | 流量塑形（脉冲变平滑） |
 | 协同限流 | 全局 Token Server 统一分配 | 集群精确限流 |
 
@@ -69,10 +71,13 @@
 
 ### 2.5 流量控制（FlowControl）
 
-- **QPS 阈值**：每秒请求数上限
-- **线程数阈值**：同时处理该资源的线程数上限（信号量隔离）
-- **调用方区分**：按调用方（appkey）分别限流（防止某调用方打爆全局）
-- **关联限流**：资源 A 被限流时，资源 B 也被限流（如写库限流→读库也限流）
+| 维度 | 说明 |
+|------|------|
+| QPS 阈值 | 每秒请求数上限 |
+| 线程数阈值 | 同时处理该资源的线程数上限（信号量隔离） |
+| 调用方区分 | 按调用方（appkey）分别限流（防止某调用方打爆全局） |
+| 关联限流 | 资源 A 被限流时，资源 B 也被限流（如写库限流→读库也限流） |
+| 链路限流 | 指定入口来源限流（如只限 /api 来源，不限 /web 来源） |
 
 ---
 
@@ -140,6 +145,7 @@ public Order getOrder(String id) { ... }
 | ZooKeeper | 与 ZK 集成 |
 | Consul | 与 Consul 集成 |
 | etcd | 与 etcd 集成 |
+| MySQL | 通过 DataSource 扩展 |
 
 **选型关注点**：生产环境必须持久化（否则重启规则丢失），推荐 Nacos（与 Spring Cloud Alibaba 生态一致）。
 
@@ -168,4 +174,164 @@ public Order getOrder(String id) { ... }
 - 服务网格流量治理见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
 - 云上中间件总览见「[云上中间件体系总览](./云上中间件体系总览.md)」。
 
-> 一句话：**Sentinel = 限流（QPS/线程/匀速/WarmUp）+ 熔断（慢调用/异常）+ 热点参数 + 系统保护 + 授权 + 控制台动态规则；选型先看「生态（Spring Cloud Alibaba → Sentinel）」，再定「规则持久化（Nacos）」，最后配「控制台监控」。**
+---
+
+## 九、Sentinel 生产配置清单
+
+### 9.1 限流规则配置
+
+```json
+[
+  {
+    "resource": "getOrder",
+    "grade": 1,
+    "count": 100,
+    "strategy": 0,
+    "controlBehavior": 0
+  }
+]
+```
+
+| 参数 | 说明 |
+|------|------|
+| grade | 0=线程数限流，1=QPS 限流 |
+| count | 阈值 |
+| strategy | 0=直接，1=关联，2=链路 |
+| controlBehavior | 0=快速拒绝，1=Warm Up，2=匀速排队 |
+
+### 9.2 熔断规则配置
+
+```json
+[
+  {
+    "resource": "downstreamService",
+    "grade": 0,
+    "count": 0.5,
+    "timeWindow": 10,
+    "minRequestAmount": 5,
+    "statIntervalMs": 1000
+  }
+]
+```
+
+| 参数 | 说明 |
+|------|------|
+| grade | 0=慢调用比例，1=异常比例，2=异常数 |
+| count | 阈值 |
+| timeWindow | 熔断时长（秒） |
+| minRequestAmount | 最小请求数（低于此不触发） |
+
+### 9.3 监控指标
+
+```
+Sentinel 指标：
+  每秒通过数（QPS Pass）
+  每秒拒绝数（QPS Block）
+  每秒异常数（QPS Exception）
+  线程数（Thread Count）
+  响应时间（RT）
+```
+
+### 9.4 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 误限流 | 阈值设置过低 | 调整阈值 |
+| 熔断不生效 | 规则未持久化 | 配置 Nacos 持久化 |
+| 控制台无数据 | Agent 未连接 | 检查 Agent 配置 |
+| 性能影响 | Slot 过多 | 精简 Slot 配置 |
+
+---
+
+## 十、Sentinel 网关限流
+
+### 10.1 Spring Cloud Gateway 集成
+
+```java
+@Configuration
+public class GatewayConfig {
+    @Bean
+    public RouteLocator routeLocator(RouteLocatorBuilder builder) {
+        return builder.routes()
+            .route("order-service", r -> r
+                .path("/api/order/**")
+                .filters(f -> f
+                    .requestRateLimiter(config -> config
+                        .setRateLimiter(redisRateLimiter())
+                        .setKeyResolver(userKeyResolver())))
+                .uri("lb://order-service"))
+            .build();
+    }
+}
+```
+
+### 10.2 网关限流规则
+
+```json
+[
+  {
+    "resource": "order-service",
+    "grade": 1,
+    "count": 200,
+    "intervalSec": 1
+  }
+]
+```
+
+---
+
+## 十一、Sentinel 与微服务集成
+
+| 框架 | 集成方式 |
+|------|----------|
+| Spring Cloud | spring-cloud-starter-alibaba-sentinel |
+| Dubbo | sentinel-apache-dubbo-adapter |
+| Web Servlet | sentinel-web-servlet-adapter |
+| gRPC | sentinel-grpc-adapter |
+| Reactor | sentinel-reactor-adapter |
+
+---
+
+## 十二、Sentinel 与 OpenTelemetry 集成
+
+```java
+// 集成 OTel 进行分布式追踪
+@SentinelResource(value = "getOrder")
+public Order getOrder(String id) {
+    Span span = tracer.spanBuilder("getOrder").startSpan();
+    try {
+        // 业务逻辑
+        return orderService.findById(id);
+    } finally {
+        span.end();
+    }
+}
+```
+
+### 12.1 Sentinel + Micrometer 指标
+
+```yaml
+# 配置 Micrometer 暴露 Sentinel 指标
+management:
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: prometheus
+```
+
+### 12.2 Sentinel + Grafana 可视化
+
+```
+Grafana Dashboard 推荐：
+  - Sentinel Real-time Monitor：实时流量监控
+  - Sentinel Rule Dashboard：规则管理
+  - Sentinel Cluster Flow：集群流控
+```
+
+---
+
+> 一句话：**Sentinel = 限流（QPS/线程/匀速/WarmUp）+ 熔断（慢调用/异常）+ 热点参数 + 系统保护 + 授权 + 控制台动态规则；选型先看「生态（Spring Cloud Alibaba → Sentinel）」，再定「规则持久化（Nacos）」，最后配「控制台监控」**。

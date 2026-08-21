@@ -6,7 +6,6 @@
 
 ---
 
-
 ## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
 
 **它是什么**：RabbitMQ 是基于 **AMQP 0-9-1 协议**的开源消息代理（Message Broker），用 Erlang 编写，以「灵活路由 + 高可靠 + 易运维」著称，是通用消息队列的代表。
@@ -18,6 +17,8 @@
 **适用场景**：业务解耦、异步任务、延迟队列、复杂路由、企业级可靠消息。
 **不适用**：超高通量日志流（应选 Kafka/Pulsar）。
 
+> 仓库 `github.com/rabbitmq/rabbitmq-server`：Erlang 实现（CLI 用 Elixir），多协议（AMQP 0-9-1 / 1.0、MQTT、STOMP、Stream），**MPL 2.0 + Apache 2.0 双许可**，6.2 万+ commits，企业最流行通用 broker 之一。
+
 ---
 
 ## 一、它解决什么问题
@@ -26,8 +27,6 @@
 - 生产者发消息到 Broker，**不等消费者**，立即返回（异步解耦）。
 - Broker 负责**可靠存储、路由、投递、重试、死信**。
 - 消费者按自己节奏处理，故障时不丢消息。
-
-> 仓库 `github.com/rabbitmq/rabbitmq-server`：Erlang 实现（CLI 用 Elixir），多协议（AMQP 0-9-1 / 1.0、MQTT、STOMP、Stream），**MPL 2.0 + Apache 2.0 双许可**，6.2 万+ commits，企业最流行通用 broker 之一。
 
 ---
 
@@ -100,6 +99,8 @@ graph LR
 4. **Prefetch 限流**：`basic.qos` 控制未 ack 上限，削峰防消费者被打垮。
 5. **管理 UI**：自带 Management Plugin（15672 端口），可视化队列/连接/速率。
 6. **Spring 集成**：`spring-boot-starter-amqp` + `RabbitTemplate` / `@RabbitListener`，声明 Exchange/Queue/Binding 用 `BindingBuilder`。
+7. **集群部署**：3 节点起步，仲裁队列（Quorum Queue）替代镜像队列。
+8. **网络分区处理**：配 autoheal 或 pause_minority（默认 ignore 需人工介入）。
 
 ---
 
@@ -126,7 +127,7 @@ graph LR
 
 ---
 
-## 面试高频问题（20+ 条）
+## 九、面试高频问题（20+ 条）
 
 1. **RabbitMQ 是什么，核心组件？** 基于 AMQP 0-9-1 的开源消息代理，Erlang 编写。组件：Producer、Consumer、Queue（FIFO）、Exchange（路由）、Binding（规则）、Vhost（逻辑隔离）、Channel（轻量连接）。
 
@@ -171,3 +172,148 @@ graph LR
 21. **性能瓶颈与解决？** 磁盘 IO（SSD、分离日志）、内存（加内存、惰性队列）、CPU（避免复杂 Topic 正则）、连接数（连接池 + 多 Channel）、队列过长（分片/联邦）。
 
 22. **RabbitMQ 选型场景？** 需精确路由、低延迟、可靠投递、延迟队列的业务解耦；超高通量日志流选 Kafka/Pulsar。
+
+---
+
+## 十、RabbitMQ 生产配置清单
+
+### 10.1 rabbitmq.conf 关键配置
+
+```ini
+# 内存限制
+vm_memory_high_watermark.relative = 0.4
+vm_memory_high_watermark_paging_ratio = 0.75
+
+# 磁盘限制
+disk_free_limit.absolute = 50GB
+
+# 连接限制
+channel_max = 2048
+
+# 队列配置
+queue_master_locator = min-masters
+
+# 网络
+tcp_listen_options.backlog = 256
+tcp_listen_options.nodelay = true
+tcp_listen_options.sndbuf = 196608
+tcp_listen_options.recbuf = 196608
+```
+
+### 10.2 监控指标
+
+```
+RabbitMQ 指标：
+  队列长度（queue_length）
+  消息速率（publish_rate/consume_rate）
+  内存使用（mem_used）
+  磁盘使用（disk_free）
+  连接数（connections）
+  通道数（channels）
+  未确认消息数（messages_unacknowledged）
+```
+
+### 10.3 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 内存告警 | 消息堆积/内存限制低 | 增加内存/启用惰性队列 |
+| 消费者卡住 | 处理逻辑慢/未 ACK | 优化逻辑/手动 ACK |
+| 网络分区 | 网络不稳定 | 配置 autoheal/pause_minority |
+| 消息丢失 | 未持久化/未 Confirm | 开启持久化+Confirm |
+
+---
+
+## 十一、RabbitMQ 运维命令
+
+```bash
+# 队列管理
+rabbitmqctl list_queues name messages consumers
+rabbitmqctl purge_queue <queue_name>
+
+# 用户管理
+rabbitmqctl add_user <username> <password>
+rabbitmqctl set_user_tags <username> administrator
+rabbitmqctl set_permissions -p / <username> ".*" ".*" ".*"
+
+# 集群管理
+rabbitmqctl cluster_status
+rabbitmqctl join_cluster <node_name>
+
+# 插件管理
+rabbitmq-plugins enable rabbitmq_management
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+---
+
+## 十二、RabbitMQ Spring Boot 集成示例
+
+### 12.1 配置类
+
+```java
+@Configuration
+public class RabbitMQConfig {
+    @Bean
+    public DirectExchange orderExchange() {
+        return new DirectExchange("order.exchange");
+    }
+    
+    @Bean
+    public Queue orderQueue() {
+        return QueueBuilder.durable("order.queue")
+            .withArgument("x-dead-letter-exchange", "order.dlx.exchange")
+            .build();
+    }
+    
+    @Bean
+    public Binding orderBinding(Queue orderQueue, DirectExchange orderExchange) {
+        return BindingBuilder.bind(orderQueue).to(orderExchange).with("order.create");
+    }
+}
+```
+
+### 12.2 生产者
+
+```java
+@Service
+@RequiredArgsConstructor
+public class OrderProducer {
+    private final RabbitTemplate rabbitTemplate;
+    
+    public void sendOrder(Order order) {
+        rabbitTemplate.convertAndSend("order.exchange", "order.create", order);
+    }
+}
+```
+
+### 12.3 消费者
+
+```java
+@Component
+@RabbitListener(queues = "order.queue")
+public class OrderConsumer {
+    @RabbitHandler
+    public void handleOrder(Order order, Channel channel, Message message) {
+        try {
+            // 处理订单
+            channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        } catch (Exception e) {
+            channel.basicNack(message.getMessageProperties().getDeliveryTag(), false, true);
+        }
+    }
+}
+```
+
+### 12.4 死信消费者
+
+```java
+@Component
+@RabbitListener(queues = "order.dlq")
+public class DeadLetterConsumer {
+    @RabbitHandler
+    public void handleDeadLetter(Order order) {
+        // 记录日志/告警/人工处理
+    }
+}
+```

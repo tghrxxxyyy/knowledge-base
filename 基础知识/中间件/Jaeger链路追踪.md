@@ -12,6 +12,9 @@
 | 上下文传播 | 跨进程/跨线程/跨 MQ 如何串联？ |
 | 采样难题 | 全量追踪存储成本高，不采样找不到问题 |
 | 与 OpenTelemetry 集成 | OTel 已成为事实标准，追踪后端需原生支持 |
+| 性能归因 | 延迟高，哪个环节是瓶颈？ |
+| 错误定位 | 报错信息分散在多个服务，如何串联？ |
+| 依赖分析 | 服务间调用关系复杂，如何可视化？ |
 
 > 核心认知：**Jaeger = OpenTelemetry 原生后端**——OTel 采集的 trace 直接写 Jaeger，无需额外转换。
 
@@ -27,6 +30,11 @@
   ├── Jaeger Thrift（兼容旧版）
   └── Zipkin Thrift（兼容 Zipkin）
 
+Jaeger Agent（可选，边车/SDK 内嵌）
+  ├── 接收 trace
+  ├── 批量转发到 Collector
+  └── 采样策略下发
+
 Jaeger Collector（收集器）
   ├── 接收 trace（gRPC/HTTP）
   ├── 预处理（校验/丰富/采样）
@@ -40,6 +48,7 @@ Jaeger Query（查询服务）
   ├── Cassandra（大规模）
   ├── Elasticsearch（推荐，与日志联动）
   ├── Kafka（缓冲，异步写入存储）
+  ├── ClickHouse（高性能分析）
   └── 内存（开发测试）
 ```
 
@@ -53,6 +62,7 @@ Jaeger Query（查询服务）
 | Tag | Span 的标签（KV 对，用于查询） |
 | Log | Span 的时间线日志（事件+时间戳） |
 | Baggage | 跨 Span 的 KV 上下文（类似 HTTP Header 传播） |
+| Reference | Span 间关系（ChildOf / FollowsFrom） |
 
 ### 2.3 上下文传播（W3C Trace Context）
 
@@ -76,8 +86,19 @@ Jaeger Query（查询服务）
 | 概率采样 | 按比例（如 1%）随机采样 | 通用 |
 | 限速采样 | 每秒最多 N 个 trace | 限流保护 |
 | 属性采样 | 按属性（如错误=全部采样） | 错误优先 |
+| 远程采样 | 从 Jaeger Agent 动态获取采样策略 | 灵活调整 |
 
 **选型关注点**：高吞吐场景 → Head-based 概率采样；想找慢请求/错误 → Tail-based（Jaeger 支持）。
+
+### 2.5 存储选型
+
+| 存储 | 优势 | 劣势 | 适用场景 |
+|------|------|------|----------|
+| Cassandra | 高写入吞吐、线性扩展 | 运维复杂 | 大规模生产 |
+| Elasticsearch | 丰富查询、与日志联动 | 资源消耗大 | 中大规模、日志联动 |
+| ClickHouse | 高压缩、高查询性能 | 生态较新 | 高性能分析 |
+| Kafka | 异步缓冲、削峰 | 需二次消费 | 高吞吐写入 |
+| Memory | 最快 | 重启丢失 | 开发测试 |
 
 ---
 
@@ -89,13 +110,14 @@ Jaeger Query（查询服务）
 | 定位 | 专注追踪 | 轻量追踪 | APM 全栈（指标+日志+追踪） |
 | 采集协议 | OTLP 原生 | Zipkin Thrift | 自有探针（字节码增强） |
 | 语言支持 | 多语言（OTel SDK） | 多语言 | Java/.NET/Node/Go/PHP 等 |
-| 存储 | ES/Cassandra/Kafka | ES/Cassandra/内存 | ES/H2/MySQL/TiDB |
+| 存储 | ES/Cassandra/Kafka/ClickHouse | ES/Cassandra/内存 | ES/H2/MySQL/TiDB |
 | 性能损耗 | 低（OTel SDK） | 低 | 中（字节码增强） |
 | 无侵入 | 需 SDK 埋点 | 需 SDK 埋点 | Java 字节码增强（无侵入） |
 | 指标 | 无（需配 Prometheus） | 无 | 有（内置） |
 | 日志 | 无（配 ELK/Loki） | 无 | 有 |
 | 拓扑图 | 有 | 有 | 有 |
 | 告警 | 无（需配 Alertmanager） | 无 | 有 |
+| 采样 | Head/Tail-based | Head-based | 固定比例 |
 
 **选型关注点**：
 - 云原生 + OpenTelemetry → **Jaeger**（OTel 原生后端）
@@ -110,7 +132,7 @@ Jaeger Query（查询服务）
 ```
 应用代码（Java/Go/Python/Node...）
   ├── OpenTelemetry SDK（自动埋点：HTTP/gRPC/DB/MQ）
-  ├── OpenTelemetry Collector（接收/处理/导出）
+  ├── OTel Collector（接收/处理/导出）
   │   ├── 接收：OTLP/Jaeger/Zipkin/Prometheus
   │   ├── 处理：采样/过滤/丰富/批量
   │   └── 导出：Jaeger/Prometheus/云厂商
@@ -152,7 +174,7 @@ Jaeger Query（查询服务）
 | Java 无侵入 APM | SkyWalking | — |
 | 轻量追踪 | Zipkin | Jaeger |
 | 多云统一追踪 | Jaeger + OTel | Datadog APM |
-| 与日志联动 | Jaeger + ELK | SkyWalking |
+| 与日志联动 | Jaeger + ELK/Loki | SkyWalking |
 | 找慢请求 | Jaeger（Tail-based） | — |
 | 错误追踪 | Jaeger + Alertmanager | — |
 
@@ -165,4 +187,131 @@ Jaeger Query（查询服务）
 - 云原生可观测性见「[云原生/可观测性](../../云原生/可观测性.md)」；
 - 监控告警见「[Prometheus + Grafana](./Prometheus与Grafana监控.md)」。
 
-> 一句话：**Jaeger = OpenTelemetry 原生后端 + W3C Trace Context 传播 + 灵活采样（Head/Tail-based）+ ES/Cassandra 存储；选型先看「生态（云原生→Jaeger，Java→SkyWalking）」，再定「采样策略（高吞吐→概率采样，找问题→Tail-based）」**。
+---
+
+## 六、Jaeger 生产配置清单
+
+### 6.1 采样策略配置
+
+```yaml
+# 采样策略（可远程动态调整）
+{
+  "service_1": {
+    "default_strategy": {
+      "type": "probabilistic",
+      "param": 0.01
+    },
+    "operation_1": {
+      "type": "probabilistic",
+      "param": 1.0
+    }
+  }
+}
+```
+
+### 6.2 存储配置
+
+```yaml
+# ES 存储配置
+SPAN_STORAGE_TYPE=elasticsearch
+ES_SERVER_URLS=http://elasticsearch:9200
+ES_INDEX_SHARDS=5
+ES_INDEX_REPLICAS=1
+ES_NUM_SHARDS=5
+
+# 采样配置
+SAMPLING_STRATEGIES_FILE=/etc/jaeger/sampling.json
+```
+
+### 6.3 监控指标
+
+```
+Jaeger 指标（Prometheus）：
+  jaeger_collector_spans_received_total
+  jaeger_collector_spans_dropped_total
+  jaeger_collector_spans_saved_by_service_total
+  jaeger_query_latency_seconds
+  jaeger_query_requests_total
+```
+
+### 6.4 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| Trace 不完整 | 采样率太低 | 提高采样率 |
+| Trace 丢失 | Collector 过载 | 扩容 Collector |
+| 查询慢 | ES 索引不合理 | 优化索引/分片 |
+| 延迟高 | SDK 性能问题 | 检查 SDK 配置 |
+
+---
+
+## 七、Jaeger SDK 埋点示例
+
+### 7.1 Python 埋点
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+
+# 配置
+provider = TracerProvider()
+jaeger_exporter = JaegerExporter(
+    agent_host_name="localhost",
+    agent_port=6831,
+)
+provider.add_span_processor(BatchSpanProcessor(jaeger_exporter))
+trace.set_tracer_provider(provider)
+
+# 埋点
+tracer = trace.get_tracer(__name__)
+with tracer.start_as_current_span("my_operation") as span:
+    span.set_attribute("key", "value")
+    # 业务逻辑
+```
+
+### 7.2 Java 埋点
+
+```java
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.Tracer;
+
+Tracer tracer = GlobalOpenTelemetry.getTracer("my-service");
+Span span = tracer.spanBuilder("my-operation").startSpan();
+try {
+    span.setAttribute("key", "value");
+    // 业务逻辑
+} finally {
+    span.end();
+}
+```
+
+### 7.3 Go 埋点
+
+```go
+import "go.opentelemetry.io/otel"
+
+tracer := otel.Tracer("my-service")
+ctx, span := tracer.Start(ctx, "my-operation")
+defer span.End()
+
+span.SetAttributes(attribute.String("key", "value"))
+```
+
+---
+
+## 八、Jaeger 常见问题排查清单
+
+| 检查项 | 命令/方法 |
+|--------|-----------|
+| Collector 是否正常 | `curl http://jaeger-collector:14269/` |
+| Query 是否正常 | `curl http://jaeger-query:16687/` |
+| ES 连接是否正常 | `curl http://elasticsearch:9200/_cluster/health` |
+| 采样策略是否生效 | 检查 `/sampling` 端点 |
+| Agent 是否收到 trace | 查看 Agent 日志 |
+
+---
+
+> 一句话：**Jaeger = OpenTelemetry 原生后端 + W3C Trace Context 传播 + 灵活采样（Head/Tail-based）+ ES/Cassandra/ClickHouse 存储；选型先看「生态（云原生→Jaeger，Java→SkyWalking）」，再定「采样策略（高吞吐→概率采样，找问题→Tail-based）」**。
