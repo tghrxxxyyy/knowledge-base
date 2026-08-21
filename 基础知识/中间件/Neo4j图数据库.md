@@ -186,3 +186,154 @@ ORDER BY p2.age DESC
 21. **多跳查询性能数量级？** 实测百万用户+500 万关系，查「3 度好友」Neo4j <10ms，MySQL 多表 JOIN >500ms。
 
 22. **Neo4j 与 RDF/知识图谱关系？** Neo4j 是属性图模型，适合落地知识图谱存储与查询；RDF 是另一套语义网标准，二者模型不同。
+
+---
+
+## 十、Cypher 高级特性与性能陷阱
+
+### 10.1 可变长度路径（Variable-Length Paths）
+
+```cypher
+-- 查找 2~4 跳的路径
+MATCH path = (a:Person)-[:FRIEND*2..4]->(b:Person)
+WHERE a.name = '张三'
+RETURN b.name, length(path) AS hops
+```
+
+**陷阱**：`*1..N` 中 N 过大（如 `*1..10`）会导致组合爆炸——超级节点每跳扇出 1000，10 跳就是 1000^10 条路径。**必须配合 LIMIT + 过滤条件**。
+
+### 10.2 OPTIONAL MATCH（左连接等价）
+
+```cypher
+-- 查找所有 Person，附带其订单（没有订单也返回）
+MATCH (p:Person)
+OPTIONAL MATCH (p)-[:PLACED]->(o:Order)
+RETURN p.name, o.id
+```
+
+**注意**：OPTIONAL MATCH 的 WHERE 条件如果在 MATCH 部分会强制匹配（变成 INNER JOIN），需放在 RETURN/WITH 的 WHERE 中。
+
+### 10.3 MERGE（幂等创建）
+
+```cypher
+-- 存在则匹配，不存在则创建（避免重复）
+MERGE (p:Person {name: '王五'})
+ON CREATE SET p.created = datetime()
+ON MATCH SET p.accessed = datetime()
+```
+
+### 10.4 性能陷阱速查
+
+| 陷阱 | 表现 | 解法 |
+|------|------|------|
+| 全图扫描（无标签） | `MATCH (n) RETURN n` | 必须指定标签 `MATCH (n:Person)` |
+| 无索引入口 | 按 name 查但没建索引 | `CREATE INDEX FOR (p:Person) ON (p.name)` |
+| 超级节点遍历 | 热门商品被所有用户关联 | 拆关系类型/时间分区/采样 |
+| 无限路径 | `*0..` 不限制深度 | 始终指定上限 `*1..5` |
+| OPTIONAL MATCH 误用 | WHERE 条件位置错误导致意外过滤 | WHERE 放在 RETURN/WITH 后 |
+
+---
+
+## 十一、图算法（Graph Data Science 库）
+
+Neo4j 的 GDS（Graph Data Science）库提供 50+ 图算法，分为三大类：
+
+| 类别 | 代表算法 | 应用 |
+|------|----------|------|
+| **中心性** | PageRank、Betweenness、Degree | 识别关键节点（社交 KOL/欺诈核心） |
+| **社区发现** | Louvain、Label Propagation、Weakly Connected Components | 社群划分/团伙识别 |
+| **路径/相似度** | Shortest Path、A*、Node Similarity | 推荐系统/路径规划 |
+| **链接预测** | Adamic Adar | 好友推荐/关系预测 |
+
+```cypher
+-- PageRank 示例
+CALL gds.pageRank.stream('myGraph')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).name AS name, score
+ORDER BY score DESC LIMIT 10
+```
+
+**适用场景**：推荐系统（相似度/中心性）、反欺诈（社区发现识别团伙）、知识图谱推理（路径查询）。
+
+---
+
+## 十二、Spring Data Neo4j（SDN）集成
+
+```java
+@Node
+public class Person {
+    @Id @GeneratedValue private Long id;
+    private String name;
+    @Relationship(type = "FRIEND", direction = Relationship.Direction.OUTGOING)
+    private List<Person> friends;
+}
+
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    List<Person> findByName(String name);
+}
+
+// 使用
+@Service
+public class PersonService {
+    @Autowired PersonRepository repo;
+    
+    public Person createPerson(String name) {
+        Person p = new Person();
+        p.setName(name);
+        return repo.save(p);
+    }
+    
+    public List<Person> findFriends(String name) {
+        return repo.findByName(name).stream()
+            .flatMap(p -> p.getFriends().stream())
+            .collect(Collectors.toList());
+    }
+}
+```
+
+**SDN 核心注解**：`@Node`（实体映射）、`@Relationship`（关系映射）、`@DynamicProperties`（动态属性）、`@Query`（Cypher 查询）。
+
+---
+
+## 十三、Neo4j 与其他图数据库对比
+
+| 维度 | Neo4j | NebulaGraph | ArangoDB | Dgraph |
+|------|-------|-------------|----------|--------|
+| 数据模型 | 属性图 | 属性图 | 多模型（图+文档+KV） | 属性图/RDF |
+| 查询语言 | Cypher | nGQL（Cypher 变体） | AQL | GraphQL± |
+| 分布式 | 企业版集群 | 原生分布式（开源） | 单节点/集群 | 原生分布式 |
+| 超大规模 | 弱（开源版） | 强（百亿级） | 中 | 强 |
+| 生态成熟度 | 最高 | 中 | 中 | 中 |
+| 许可证 | GPLv3/商业 | Apache 2.0 | Apache 2.0 | Apache 2.0 |
+| 适用场景 | 中小规模/生态优先 | 超大规模/高性能 | 多模型/灵活性 | RDF/语义网 |
+
+**选型要点**：中小规模+生态成熟 → Neo4j；超大规模+开源 → NebulaGraph；多模型灵活性 → ArangoDB；RDF/语义网 → Dgraph。
+
+---
+
+## 十四、与其他板块的关系（扩展）
+
+- 与 [Neo4j 与 RDF/知识图谱关系](#)：Neo4j 是属性图模型，适合落地知识图谱存储与查询；RDF 是另一套语义网标准，二者模型不同。
+- 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。
+- 与 [MySQL](../mysql知识.md)：二者互补——事务在 MySQL，关系网络在 Neo4j，CDC 同步。
+- 与 [大模型/知识图谱](大模型/)：Neo4j 是经典知识图谱存储底座，配合 LLM 做 RAG 中的「实体-关系」检索。
+- 与 [Kafka](Kafka.md)：CDC 同步（MySQL→Neo4j）可通过 Kafka 解耦。
+- 与 [Redis](Redis.md)：热门关系可缓存在 Redis，减少图库遍历压力。
+
+---
+
+## 十五、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 属性图数据库 |
+| 模型 | Node + Relationship + Label + Property |
+| 查询 | Cypher（声明式模式匹配） |
+| 性能核心 | 原生图存储 + 免索引邻接（O(1) 跳转） |
+| 事务 | ACID |
+| 高可用 | Causal Cluster（Raft）+ AuraDB 云 |
+| 许可证 | Community GPLv3 / Enterprise 商业 |
+| 图算法 | GDS 库（中心性/社区/路径/相似度） |
+| Spring 集成 | SDN（@Node/@Relationship） |
+| 超大规模替代 | NebulaGraph/Dgraph |
+| 一句话 | 「关系密集 + 多跳」场景的天然解 |

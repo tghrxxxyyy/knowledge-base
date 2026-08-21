@@ -200,3 +200,148 @@ ZooKeeper
 - 云上中间件总览见「[云上中间件体系总览](./云上中间件体系总览.md)」。
 
 > 一句话：**Solr = Lucene 企业级封装 + 全文检索 + 分面搜索 + 高亮 + SolrCloud 分布式；选型先看「场景（传统企业搜索→Solr，日志/实时→ES）」，再定「分词器（中文→IKAnalyzer）」，最后调「缓存/段合并/JVM 堆」**。
+
+---
+
+## 八、Solr 查询语法与高级特性
+
+### 8.1 查询语法
+
+```
+# 基本查询
+q=title:solr AND content:search
+
+# 范围查询
+q=price:[100 TO 500]
+
+# 通配符
+q=title:sol*
+
+# 模糊查询（编辑距离）
+q=title:solr~1
+
+# 排序
+sort=price asc, score desc
+
+# 高亮
+hl=true&hl.fl=title,content&hl.snippets=3
+
+# 分面
+facet=true&facet.field=brand&facet.field=category
+```
+
+### 8.2 高级特性
+
+| 特性 | 说明 |
+|------|------|
+| Stats Component | 实时统计（min/max/mean/sum） |
+| Group/Field Collapsing | 结果分组/折叠 |
+| Real-time Get | 近实时获取刚索引的文档 |
+| Collapse/Expand | 结果折叠+展开 |
+| Debug Query | 查看评分细节 |
+| Stats JSON Facet | 嵌套分面（深度聚合） |
+
+### 8.3 SolrJ（Java 客户端）
+
+```java
+SolrClient client = new HttpSolrClient.Builder("http://localhost:8983/solr/mycore").build();
+SolrQuery query = new SolrQuery();
+query.setQuery("title:solr");
+query.addFilterQuery("price:[100 TO 500]");
+query.setFacet(true);
+query.addFacetField("brand");
+query.setRows(10);
+query.setSort("score", SolrQuery.ORDER.desc);
+QueryResponse response = client.query(query);
+SolrDocumentList docs = response.getResults();
+```
+
+---
+
+## 九、Solr 缓存体系详解
+
+| 缓存 | 说明 | 调优 |
+|------|------|------|
+| filterCache | 过滤器结果缓存（fq 查询） | 热门过滤条件命中率 |
+| queryResultCache | 查询结果缓存 | 高频相同查询命中 |
+| documentCache | 文档字段缓存 | 减少磁盘 I/O |
+| userValueCache | 自定义缓存 | 按业务需求 |
+
+**调优建议**：
+- `initialSize`：预估常用查询数量
+- `autowarmCount`：新缓存预热数量（旧缓存迁移）
+- `size`：缓存条目数（过大影响 GC）
+
+---
+
+## 十、Solr 高可用与跨数据中心
+
+### 10.1 SolrCloud 高可用
+
+```
+Collection: my_index
+  ├── Shard1
+  │   ├── Leader (node1)
+  │   ├── Replica (node2)
+  │   └── Replica (node3)
+  └── Shard2
+      ├── Leader (node4)
+      ├── Replica (node5)
+      └── Replica (node6)
+
+ZooKeeper 集群 (3节点)
+  ├── 集群状态管理
+  ├── Leader 选举
+  └── 路由表维护
+```
+
+### 10.2 跨数据中心复制（CDCR）
+
+```
+DC1 (北京) → CDCR → DC2 (上海)
+  ├── 双向异步复制
+  ├── 冲突检测（最后写入者胜）
+  └── 带宽控制（避免跨区流量爆炸）
+```
+
+---
+
+## 十一、Solr 常见坑与最佳实践
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| 分片数过大 | 协调开销大、查询变慢 | 按数据量和查询量规划 |
+| 段太多 | merge 跟不上，查询慢 | 调整 mergePolicy |
+| 全文检索+聚合 | text 字段做聚合 | 拆分 text（搜索）+ keyword（聚合） |
+| 深分页 | `start=10000` 性能崩溃 | 用 cursorMark |
+| 缓存驱逐 | 内存不足导致缓存失效 | 调大 JVM 堆 + 合理设置缓存大小 |
+| 数据导入全量 | DataImportHandler 性能差 | 用 SolrJ 批量写入 |
+| Schema 变更 | 新字段需改 Schema | 用 Managed Schema + Schemaless 模式 |
+
+---
+
+## 十二、与其他板块的关系（扩展）
+
+- Elasticsearch 见「[ES 体系](../ES体系.md)」；
+- Lucene 原理见「[搜索系统设计](../../场景设计/搜索系统设计.md)」；
+- 云上搜索服务见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」；
+- 云上中间件总览见「[云上中间件体系总览](./云上中间件体系总览.md)」；
+- 中文分词见「[IKAnalyzer](./IKAnalyzer.md)」；
+- 对比 Elasticsearch 见「[ES 集群部署与调优](./ES集群部署与调优.md)」。
+
+---
+
+## 十三、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 企业级搜索平台（Lucene 封装） |
+| 底层 | Lucene（倒排索引） |
+| 分布式 | SolrCloud（依赖 ZooKeeper） |
+| 分词器 | IKAnalyzer（中文）/ StandardTokenizer（英文） |
+| 缓存 | filterCache / queryResultCache / documentCache |
+| 高可用 | 多副本 + ZK 协调 |
+| 许可证 | Apache 2.0 |
+| 适用场景 | 传统企业搜索/电商分面搜索 |
+| 替代方案 | Elasticsearch（日志/实时/云原生） |
+| 一句话 | 「Lucene 企业级封装 + 全文检索 + 分面搜索」 |

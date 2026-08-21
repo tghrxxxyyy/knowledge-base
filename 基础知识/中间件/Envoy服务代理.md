@@ -198,3 +198,193 @@ Pod
 - 云上网络见「[云网络与流量接入体系](./云网络与流量接入体系.md)」。
 
 > 一句话：**Envoy = xDS 动态配置 + 过滤器链 + 内置可观测性 + HTTP/2/gRPC 原生；选型先看「场景（服务网格→Envoy，传统代理→Nginx）」，再定「扩展需求（Wasm/Lua 自定义过滤器）」**。
+
+---
+
+## 九、Envoy Wasm 扩展（云原生可编程代理）
+
+Envoy 支持 WebAssembly（Wasm）运行时扩展，无需重编译即可添加自定义过滤器：
+
+| 特性 | 说明 |
+|------|------|
+| 语言支持 | C++/Rust/Go/AssemblyScript 等编译为 Wasm |
+| 安全隔离 | 沙箱运行，崩溃不影响 Envoy 主进程 |
+| 热加载 | Wasm 模块可动态加载/更新 |
+| 性能 | 接近原生 C++（Wasm 2.0 JIT） |
+| 适用场景 | 自定义鉴权/协议转换/数据脱敏/流量染色 |
+
+**典型用例**：
+- 自定义 JWT 验证逻辑
+- 协议转换（gRPC → REST）
+- 流量染色（给请求打标签做灰度）
+- 数据脱敏（日志中自动遮蔽手机号）
+
+---
+
+## 十、Envoy 与 Istio 集成深度
+
+Istio 的数据面完全基于 Envoy，控制面（Istiod）通过 xDS 下发配置：
+
+```
+Istiod（控制面）
+  ├── Pilot（xDS 生成）
+  ├── Citadel（证书/mTLS）
+  └── Galley（配置验证）
+
+Envoy Sidecar（数据面）
+  ├── 接收 xDS 配置（LDS/RDS/CDS/EDS）
+  ├── mTLS（与 Citadel 集成）
+  ├── 流量治理（金丝雀/故障注入/重试）
+  └── 可观测（Metrics/Traces/Access Log）
+```
+
+**流量治理能力**：
+- 金丝雀发布：按权重/Header/URI 路由到不同版本
+- 故障注入：模拟延迟/错误测试弹性
+- 重试/超时：预算重试防雪崩
+- 熔断：连接池限制 + 异常检测驱逐
+
+---
+
+## 十一、Envoy 配置示例
+
+### 11.1 静态配置（最小示例）
+
+```yaml
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: service_backend }
+          http_filters:
+          - name: envoy.filters.http.router
+  clusters:
+  - name: service_backend
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: service_backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 9000
+```
+
+### 11.2 关键调优参数
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| `max_connections` | 1024 | 每上游最大连接数 |
+| `max_requests_per_connection` | 100 | 每连接最大请求数 |
+| `connect_timeout` | 1s | 连接超时 |
+| `interval` | 10s | 健康检查间隔 |
+| `healthy_threshold` | 2 | 健康判定阈值 |
+| `unhealthy_threshold` | 3 | 不健康判定阈值 |
+
+---
+
+## 十二、Envoy 可观测性详解
+
+Envoy 内置三种可观测性信号：
+
+### 12.1 指标（Stats）
+
+```
+# 内置指标类型
+envoy_listener_downstream_cx_total          # 下游连接总数
+envoy_cluster_upstream_rq_total             # 上游请求总数
+envoy_cluster_upstream_rq_time_bucket       # 请求延迟分布
+envoy_cluster_health_check_healthy          # 健康实例数
+envoy_http_downstream_cx_active             # 活跃连接数
+```
+
+**Prometheus 集成**：Envoy 暴露 `/stats/prometheus` 端点，Prometheus 直接拉取。
+
+### 12.2 链路追踪
+
+```yaml
+tracing:
+  provider:
+    name: envoy.tracers.zipkin
+    typed_config:
+      collector_cluster: zipkin
+      collector_endpoint: /api/v2/spans
+  max_path_tags: 8
+```
+
+支持 Zipkin / Jaeger / OpenTelemetry，自动采样或按规则采样。
+
+### 12.3 访问日志
+
+```yaml
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    path: /var/log/envoy/access.log
+    format: |
+      [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
+      %RESPONSE_CODE% %BYTES_RECEIVED% %DURATION% "%REQ(X-FORWARDED-FOR)%"
+```
+
+---
+
+## 十三、Envoy 高级特性
+
+| 特性 | 说明 |
+|------|------|
+| 原始目标寻址（Original Destination） | iptables 拦截后直接转发到原始 IP（Service Mesh 旁路） |
+| 内置 DNS | Envoy 自己做服务发现 DNS 解析 |
+| TCP 代理 | L4 层代理（Redis/Mongo/数据库） |
+| UDP 代理 | DNS over UDP / 游戏协议 |
+| 配置热更新 | xDS 流式推送，无需重启 |
+| 内存限制 | `--max-obj-name-len` 控制内存 |
+| 连接迁移 | 多 Worker 间连接迁移（负载均衡） |
+
+---
+
+## 十四、与其他板块的关系（扩展）
+
+- 服务网格（Istio + Envoy）见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
+- Nginx 原理见「[Nginx](./Nginx.md)」；
+- API 网关见「[Kong/APISIX](./Kong与APISIX网关.md)」；
+- 链路追踪见「[Jaeger 链路追踪](./Jaeger链路追踪.md)」；
+- 云上网络见「[云网络与流量接入体系](./云网络与流量接入体系.md)」；
+- 对比 HAProxy 见「[HAProxy与L4负载均衡](./HAProxy与L4负载均衡.md)」；
+- 限流见「[Sentinel 限流熔断](./Sentinel限流熔断.md)」；
+- mTLS 安全见「[云安全体系](./云安全体系.md)」。
+
+---
+
+## 十五、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 高性能服务代理/边车代理 |
+| 配置 | xDS 动态配置（无需重启） |
+| 过滤器 | Network Filter + HTTP Filter（C++/Wasm/Lua） |
+| 负载均衡 | Round Robin / Least Request / Ring Hash / Maglev |
+| 健康检查 | 主动（HTTP/TCP）+ 被动（异常检测） |
+| 安全 | mTLS / JWT / RBAC |
+| 可观测 | Stats / Access Log / Tracing |
+| 扩展 | Wasm / Lua / C++ |
+| 云原生 | Istio 数据面事实标准 |
+| 一句话 | 「xDS 动态配置 + 过滤器链 + 可观测性 + HTTP/2/gRPC」 |

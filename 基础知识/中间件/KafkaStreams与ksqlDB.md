@@ -212,3 +212,189 @@ ksqlDB 服务端：独立进程（ksqlDB server），管理多个查询
 - 实时数仓见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」。
 
 > 一句话：**Kafka Streams = 库形态（零集群）+ KStream/KTable 抽象 + RocksDB 状态（changelog 备份）+ EOS 事务；选型先看「形态（应用内轻量→Kafka Streams，独立平台→Flink）」，再定「编程（Java DSL→Streams，SQL→ksqlDB）」，最后配「并行度=分区数 + 状态磁盘 + 监控」**。
+
+---
+
+## 六、Kafka Streams DSL 详解
+
+### 6.1 KStream 操作（事件流）
+
+```java
+StreamsBuilder builder = new StreamsBuilder();
+KStream<String, Order> orders = builder.stream("orders");
+
+// 过滤 + 映射
+KStream<String, Order> bigOrders = orders
+    .filter((key, order) -> order.getAmount() > 1000)
+    .mapValues(order -> {
+        order.setStatus("HIGH_VALUE");
+        return order;
+    });
+
+// 分组聚合
+KTable<String, Long> countByUser = orders
+    .groupBy((key, order) -> order.getUserId())
+    .count();
+
+// 窗口聚合
+KTable<Windowed<String>, Long> minuteCount = orders
+    .groupBy((key, order) -> order.getUserId())
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+    .count();
+```
+
+### 6.2 KTable 操作（变更日志表）
+
+```java
+// KTable = 同 key 最新值（物化视图）
+KTable<String, UserProfile> profiles = builder.table("user-profiles");
+
+// KStream + KTable Join（富化）
+KStream<String, EnrichedOrder> enriched = orders
+    .join(profiles,
+        (order, profile) -> new EnrichedOrder(order, profile),
+        Joined.with(Serdes.String(), orderSerde, profileSerde)
+    );
+
+// GlobalKTable Join（小维表，全量广播）
+KTable<String, Product> products = builder.globalTable("products");
+KStream<String, OrderWithProduct> withProduct = orders
+    .join(products,
+        (order, product) -> new OrderWithProduct(order, product),
+        Joined.with(Serdes.String(), orderSerde, productSerde)
+    );
+```
+
+### 6.3 窗口类型详解
+
+| 窗口 | 语义 | 代码示例 |
+|------|------|----------|
+| Tumbling | 固定不重叠 | `TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5))` |
+| Hopping | 固定可滑动 | `TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)).advanceBy(Duration.ofMinutes(1))` |
+| Sliding | 区间滑动（Join 用） | `JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofMinutes(5))` |
+| Session | 活跃间隔 | `SessionWindows.ofInactivityGapAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1))` |
+
+---
+
+## 七、ksqlDB 高级特性
+
+### 7.1 流式查询
+
+```sql
+-- 创建流
+CREATE STREAM page_views (
+    user_id VARCHAR KEY,
+    page_id VARCHAR,
+    view_time TIMESTAMP
+) WITH (KAFKA_TOPIC='page_views', VALUE_FORMAT='AVRO');
+
+-- 持续聚合（物化视图）
+CREATE TABLE page_view_stats AS
+    SELECT page_id, COUNT(*) AS view_count
+    FROM page_views
+    WINDOW TUMBLING (SIZE 5 MINUTES)
+    GROUP BY page_id
+    EMIT CHANGES;
+
+-- 窗口连接（流-流 Join）
+CREATE STREAM enriched_clicks AS
+    SELECT c.user_id, c.page_id, u.name, u.age
+    FROM clicks c
+    JOIN users u ON c.user_id = u.user_id
+    WITHIN 5 MINUTES
+    EMIT CHANGES;
+```
+
+### 7.2 Push Query vs Pull Query
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| Push Query | 持续推送结果（EMIT CHANGES） | 实时大屏 |
+| Pull Query | 一次性查询当前状态 | 交互式查询 |
+
+```sql
+-- Pull Query（查当前物化视图）
+SELECT * FROM page_view_stats WHERE page_id = 'home' EMIT CHANGES;
+
+-- Pull Query（一次性查询，类似 SQL）
+SELECT * FROM page_view_stats WHERE page_id = 'home';
+```
+
+### 7.3 UDF（用户自定义函数）
+
+```java
+// 注册 UDF
+@UdfDescription(name = "parse_url", ...)
+public class ParseUrlUdf {
+    @Udf
+    public String parseUrl(String url, String part) {
+        // 自定义解析逻辑
+    }
+}
+```
+
+```sql
+-- 使用 UDF
+CREATE FUNCTION parse_url AS 'com.example.ParseUrlUdf';
+SELECT parse_url(url, 'host') AS host FROM urls;
+```
+
+---
+
+## 八、Kafka Streams vs Flink 深度对比
+
+| 维度 | Kafka Streams | Flink |
+|------|---------------|-------|
+| 部署 | 库嵌入应用（零集群） | 独立集群（需部署） |
+| 状态存储 | RocksDB + changelog | RocksDB / 堆内存 / 外部存储 |
+| 精确一次 | 事务（exactly_once_v2） | Checkpoint（exactly-once） |
+| 窗口 | 4种（Tumbling/Hopping/Sliding/Session） | 丰富（Event/Processing/Ingestion） |
+| 水位线 | 基于时间戳（简单） | 自定义水位线策略（灵活） |
+| 复杂事件处理 | 有限 | 强（CEP 库） |
+| 背压 | 依赖 Kafka | 反压机制（流量控制） |
+| 批流一体 | 不支持 | 原生支持 |
+| SQL | ksqlDB | Flink SQL |
+| 适用规模 | 中小（应用内处理） | 大（独立平台） |
+
+---
+
+## 九、Kafka Streams 生产最佳实践
+
+| 维度 | 建议 |
+|------|------|
+| 并行度 | 实例数 × 线程数 = 分区数 |
+| 状态目录 | 用 SSD（RocksDB 写磁盘） |
+| 精确一次 | 关键链路 `exactly_once_v2` |
+| 监控 | Kafka Lag + Streams Metrics |
+| 容错 | 消费者组自动故障转移 |
+| 拓扑变更 | 停机迁移 + 状态 store 版本管理 |
+| 错误处理 | dead-letter topic + 重试策略 |
+
+---
+
+## 十、与其他板块的关系（扩展）
+
+- Kafka 基础见「[Kafka](./Kafka.md)」；
+- Flink 对比见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；
+- Schema（Avro/Protobuf）见「[Schema Registry 与消息序列化](./SchemaRegistry与消息序列化.md)」；
+- 实时数仓见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
+- 对比 Spark Streaming 见「[Apache Spark 批处理](./ApacheSpark批处理.md)」；
+- ClickHouse 实时分析见「[ClickHouse](./ClickHouse.md)」。
+
+---
+
+## 十一、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | Kafka 官方轻量流处理库 |
+| 形态 | 库嵌入应用（零集群） |
+| 核心抽象 | KStream / KTable / GlobalKTable |
+| 状态存储 | RocksDB + changelog 备份 |
+| 精确一次 | 事务（exactly_once_v2） |
+| SQL 引擎 | ksqlDB（流式 SQL + 物化视图） |
+| 窗口 | Tumbling / Hopping / Sliding / Session |
+| 交互查询 | State Store 物化视图 REST 查询 |
+| 适用场景 | 服务内实时聚合/清洗/Join |
+| 替代方案 | Flink（复杂流处理）/ Spark（批流一体） |
+| 一句话 | 「零运维的轻量流处理——库形态 + KStream/KTable + RocksDB 状态」 |

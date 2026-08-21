@@ -189,3 +189,125 @@ Provider（提供者）
 - RPC 协议原理见「[网络协议深挖](../../基础知识/网络协议深挖.md)」。
 
 > 一句话：**Dubbo = 高性能 RPC（Dubbo/Triple 协议 + Hessian2/Protobuf 序列化）+ 服务治理（注册发现/负载均衡/集群容错/流量治理）+ 云原生（应用级发现 + Mesh 支持）；选型先看「语言栈（纯 Java → Dubbo，跨语言 → gRPC）」，再定「协议（内网 → Dubbo 协议，网关穿透 → Triple）」，最后配「注册中心（Nacos）」。**
+
+---
+
+## 九、Dubbo Filter 机制（拦截器/扩展点）
+
+Dubbo 的 Filter 是请求处理链的拦截器，类似 Servlet Filter / Spring Interceptor：
+
+```
+请求 → Consumer Filter 链 → 网络 → Provider Filter 雾 → 业务方法
+```
+
+| Filter | 说明 |
+|--------|------|
+| timeout | 超时控制（Provider 端也生效） |
+| activeLimit | Consumer 端并发限制 |
+| executeLimit | Provider 端并发限制 |
+| tps | TPS 限流 |
+| accesslog | 访问日志 |
+| generic | 泛化调用（无接口 stub 时） |
+| echo | 健康检查（$echo 服务） |
+| token | 令牌验证（防绕过注册中心） |
+| validation | 参数校验（JSR 303） |
+| cache | 结果缓存（LRU/ThreadLocal） |
+
+**自定义 Filter**：实现 `org.apache.dubbo.rpc.Filter` 接口 + `@Activate` 注解，META-INF/dubbo 目录注册。
+
+---
+
+## 十、Dubbo 与 Spring Cloud 选型深度对比
+
+| 维度 | Dubbo | Spring Cloud |
+|------|-------|--------------|
+| 通信方式 | 二进制 RPC（Dubbo/Triple） | HTTP/REST（JSON） |
+| 性能 | 高（二进制序列化+长连接） | 中（JSON+短连接） |
+| 服务治理 | 内置（路由/限流/降级/权重） | 需集成 Hystrix/Sentinel |
+| 注册中心 | Nacos/ZK/Consul/etcd | Eureka/Nacos/Consul |
+| 负载均衡 | 5种策略（Random/LeastActive/ConsistentHash等） | Ribbon/LoadBalancer（少） |
+| 网关 | Triple（HTTP/2）友好 | Spring Cloud Gateway |
+| 跨语言 | Triple 支持 | Java 为主 |
+| 学习曲线 | 中（需理解 Filter/Cluster/Protocol） | 低（Spring 注解） |
+| 适用规模 | 中大规模（阿里系） | 中小规模（Spring 生态） |
+| 维护方 | 阿里（活跃） | VMware（活跃） |
+
+**选型结论**：
+- **选 Dubbo**：纯 Java/性能敏感/强治理需求/Spring Cloud Alibaba 生态
+- **选 Spring Cloud**：快速迭代/轻量/REST 对外/团队熟悉 Spring
+- **混合使用**：内部 RPC 用 Dubbo，对外 API 用 Spring Cloud Gateway
+
+---
+
+## 十一、Dubbo 常见坑与最佳实践
+
+### 11.1 常见坑
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| 超时设置不合理 | 慢接口拖垮调用链 | 根据 P99 设置超时，写操作设 Failfast |
+| 重试导致重复扣款 | 非幂等操作重试 | 写操作 retries=0，用幂等令牌 |
+| 注册中心压力大 | 接口级注册（Dubbo 2） | 升级 Dubbo 3 应用级注册 |
+| 负载不均 | Random 权重配置不当 | 耗时差异大用 LeastActive |
+| 线程池打满 | Provider 处理慢 | 调整线程池 + 异步调用 |
+| 序列化兼容 | Hessian2 跨版本不兼容 | 升级 Protobuf（Triple 协议） |
+| 路由规则不生效 | 规则语法错误/未下发 | 用 Dubbo Admin 验证规则 |
+
+### 11.2 最佳实践
+
+- **超时**：Provider 端设默认超时，Consumer 端按场景覆盖
+- **重试**：读操作 retries=2-3，写操作 retries=0
+- **异步**：非阻塞调用用 `async=true` + `return=true`
+- **线程池**：Provider 按 CPU 核心数设置，避免 IO 密集型阻塞
+- **监控**：接入 Prometheus + Grafana，关注 QPS/RT/成功率
+- **版本管理**：`dubbo:service` 加 `group` + `version` 实现灰度
+
+---
+
+## 十二、Dubbo 3 Triple 协议深度
+
+Triple 是 Dubbo 3 的默认协议，基于 HTTP/2 + Protobuf：
+
+| 特性 | 说明 |
+|------|------|
+| 兼容 gRPC | 可直接与 gRPC 服务互通 |
+| 流式支持 | 四种模式（Unary/Server/Client/Bidi） |
+| 网关友好 | HTTP/2 可穿透大多数网关/API Gateway |
+| 元数据传递 | Header 传递（类似 HTTP Header） |
+| 跨语言 | Java/Go/Python/Node 等多语言 Stub |
+| 性能 | HTTP/2 多路复用 + Protobuf 二进制 |
+
+**Triple vs Dubbo 协议选型**：
+- 内网高性能 → Dubbo 协议（TCP 长连接）
+- 跨语言/网关穿透 → Triple（HTTP/2）
+- 新项目推荐 → Triple（Dubbo 3 默认）
+
+---
+
+## 十三、与其他板块的关系（扩展）
+
+- 源码精读见「[源码系列/Dubbo 源码](../../源码系列/Dubbo源码.md)」；
+- 注册中心见「[注册中心与配置中心](./注册中心与配置中心.md)」；
+- 限流熔断见「[Sentinel 限流熔断](./Sentinel限流熔断.md)」；
+- 链路追踪见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；
+- RPC 协议原理见「[网络协议深挖](../../基础知识/网络协议深挖.md)」；
+- 服务网格见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
+- 对比 gRPC 见「[gRPC](./gRPC.md)」；
+- 对比 Spring Cloud 见「[微服务架构](../../架构/微服务架构.md)」。
+
+---
+
+## 十四、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 高性能 RPC 框架 + 服务治理 |
+| 协议 | Dubbo（TCP）/ Triple（HTTP/2）/ REST |
+| 序列化 | Hessian2 / Protobuf / JSON |
+| 负载均衡 | Random / RoundRobin / LeastActive / ConsistentHash / ShortestResponse |
+| 集群容错 | Failover / Failfast / Failsafe / Forking / Broadcast |
+| 注册中心 | Nacos（推荐）/ ZooKeeper / Consul / etcd / K8s |
+| 版本 | Dubbo 3（Triple + 应用级发现） |
+| 扩展点 | Filter / Protocol / Registry / Cluster |
+| 云原生 | 支持 Mesh Sidecar 模式 |
+| 一句话 | 「Java 微服务 RPC + 治理」的首选 |

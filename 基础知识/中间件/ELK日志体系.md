@@ -186,6 +186,208 @@ flowchart LR
 
 ---
 
+## 八、Elasticsearch 高级特性
+
+### 8.1 聚合分析
+
+```json
+// 嵌套聚合：按服务统计错误数
+GET /logs-*/_search
+{
+  "size": 0,
+  "aggs": {
+    "by_service": {
+      "terms": { "field": "service.keyword", "size": 10 },
+      "aggs": {
+        "error_count": {
+          "filter": { "term": { "level": "ERROR" } }
+        },
+        "avg_latency": {
+          "avg": { "field": "duration_ms" }
+        }
+      }
+    }
+  }
+}
+```
+
+### 8.2 Pipeline 聚合
+
+```json
+// 计算错误率趋势
+"aggs": {
+  "errors_over_time": {
+    "date_histogram": { "field": "time", "calendar_interval": "hour" },
+    "aggs": {
+      "error_rate": {
+        "bucket_script": {
+          "buckets_path": { "errors": "error_count", "total": "_count" },
+          "script": "params.errors / params.total"
+        }
+      }
+    }
+  }
+}
+```
+
+### 8.3 索引模板与生命周期
+
+```json
+// 日志索引模板
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "logs-write"
+    }
+  }
+}
+
+// ILM 策略：热→温→冷→删除
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": { "actions": { "rollover": { "max_size": "50GB", "max_age": "1d" } } },
+      "warm": { "min_age": "7d", "actions": { "shrink": { "number_of_shards": 1 } } },
+      "cold": { "min_age": "30d", "actions": { "freeze": {} } },
+      "delete": { "min_age": "90d", "actions": { "delete": {} } }
+    }
+  }
+}
+```
+
+---
+
+## 九、Filebeat 高级配置
+
+### 9.1 多行日志合并
+
+```yaml
+filebeat.inputs:
+- type: log
+  paths: ["/var/log/app/*.log"]
+  multiline.pattern: '^\d{4}-\d{2}-\d{2}'
+  multiline.negate: true
+  multiline.match: after
+```
+
+### 9.2 字段提取与处理
+
+```yaml
+filebeat.inputs:
+- type: log
+  fields:
+    service: order-service
+    env: production
+  processors:
+  - add_kubernetes_metadata:
+      host: ${NODE_NAME}
+  - decode_json_fields:
+      fields: ["message"]
+      target: ""
+  - drop_fields:
+      fields: ["agent.ephemeral_id", "host.id"]
+```
+
+### 9.3 可靠性保证
+
+| 机制 | 说明 |
+|------|------|
+| registry 文件 | 记录文件读取位点（断点续传） |
+| 多实例 | 多个 Filebeat 实例读不同文件 |
+| Kafka 缓冲 | Filebeat → Kafka（削峰） |
+| ACK 机制 | 消费者确认后才推进位点 |
+
+---
+
+## 十、Logstash Pipeline 详解
+
+```ruby
+# logstash.conf
+input {
+  kafka {
+    bootstrap_servers => "kafka:9092"
+    topics => ["logs"]
+    group_id => "logstash-consumer"
+  }
+}
+
+filter {
+  grok {
+    match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:msg}" }
+  }
+  date {
+    match => [ "timestamp", "yyyy-MM-dd HH:mm:ss.SSS" ]
+    target => "@timestamp"
+  }
+  mutate {
+    convert => { "duration_ms" => "integer" }
+    remove_field => ["timestamp", "agent"]
+  }
+  if [level] == "ERROR" {
+    mutate { add_field => { "alert" => "true" } }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["es:9200"]
+    index => "logs-%{+YYYY.MM.dd}"
+  }
+}
+```
+
+---
+
+## 十一、ELK 常见坑与最佳实践
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| 分片过多 | 每天一个索引导致上千分片 | 按周/月索引 + ILM |
+| 映射爆炸 | dynamic mapping 生成大量字段 | 使用 strict mapping + 合理模板 |
+| 磁盘水位 | watermark 触发只读 | 清理旧索引 + 调 watermark |
+| 查询超时 | 深分页 + 聚合跨太多分片 | search_after + 限制聚合粒度 |
+| JVM OOM | 堆太大/查询太多 | 31GB 堆 + 查询限流 |
+| 日志风暴 | ERROR 日志爆炸 | 应用限流 + 日志级别控制 |
+| 数据重复 | Kafka 重复消费 | 按 doc id 去重 |
+| 索引别名 | 热点索引写满 | rollover + write alias |
+
+---
+
+## 十二、与其他板块的关系（扩展）
+
+- 和「**基础知识/ES体系**」「**基础知识/中间件/ClickHouse**」：ES 系检索细节见 ES 体系篇；日志分析报表可用 ClickHouse。
+- 和「**云原生/可观测性**」：可观测性三支柱（指标/日志/链路）中，ELK 管「日志」支柱，Prometheus/Grafana 管「指标」，SkyWalking/OTel 管「链路」。
+- 和「**基础知识/中间件/链路追踪SkyWalking**」：日志 + 链路配合排障（traceId 关联）。
+- 和「**基础知识/中间件/Kafka**」：Kafka 是日志采集链路的缓冲底座。
+- 和「**SRE与稳定性工程/06-日志与告警规则库**」：日志规范（分级/结构化/traceId/脱敏）与 ELK 采集落地直接相关。
+- 和「**云原生/Prometheus监控**」：指标用 Prometheus，日志用 ELK，互补。
+
+---
+
+## 十三、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 组成 | ES（存储检索）+ Logstash（加工）+ Kibana（可视化）+ Filebeat（采集）+ Kafka（缓冲） |
+| 核心原理 | 倒排索引（全文检索）+ 分片并行 + 近实时 segment |
+| 采集链路 | Filebeat → Kafka → Logstash → ES → Kibana |
+| 日志规范 | 结构化 JSON + traceId + 统一字段 + 脱敏 |
+| 容量治理 | 按天索引 + ILM 热温冷删 + 批量写 |
+| 替代方案 | Loki（轻量）/ ClickHouse（分析报表） |
+| ES 高级 | 聚合分析 + Pipeline + 索引模板 + ILM |
+| Filebeat | 断点续传 + 多行合并 + Kubernetes 元数据 |
+| Logstash | Grok 解析 + 字段提取 + 条件过滤 |
+| 许可证 | ES 部分 Elastic License / 组件 Apache 2.0 |
+| 一句话 | 「排障第一站」——日志集中化、秒级检索、可视化分析 |
+
+---
+
 ## 六、与其他板块的关系
 
 - 和「**基础知识/ES体系**」「**基础知识/中间件/ClickHouse**」：ES 系检索细节见 ES 体系篇；日志分析报表可用 ClickHouse。

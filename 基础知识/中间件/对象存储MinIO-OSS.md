@@ -200,3 +200,107 @@ s3.putObject(PutObjectRequest.builder().bucket("avatars").key("1.png").build(),
 - 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。
 - 和「**架构/企业架构**」：对象存储是「数据中台」非结构化数据底座之一。
 - 和「**基础知识/API 网关**」：文件上传常经网关，注意大文件超时 / 限流。
+- 和「**基础知识/Redis**」：热门文件可缓存 CDN + Redis，降低 OSS 带宽成本。
+- 和「**大数据/Hive/Spark**」：对象存储是数据湖底座（Hive 外部表直接读 S3）。
+
+---
+
+## 六、MinIO 分布式架构详解
+
+### 6.1 纠删码（Erasure Coding）原理
+
+```
+原始对象 → 分片（N 数据块 + M 校验块）
+  ├── 数据块：data_1, data_2, ..., data_N
+  ├── 校验块：parity_1, parity_2, ..., parity_M
+  └── 分散到不同节点/磁盘
+
+恢复：任意 ≤ M 个节点/磁盘故障可自动重建
+  存储效率 = N / (N + M)
+  如 10+4：效率 71%，容忍 4 盘故障
+  三副本：效率 33%，容忍 1 盘故障
+```
+
+### 6.2 集群部署拓扑
+
+```
+MinIO 集群（4节点 × 4磁盘 = 16盘）
+  ├── Node1: disk1, disk2, disk3, disk4
+  ├── Node2: disk1, disk2, disk3, disk4
+  ├── Node3: disk1, disk2, disk3, disk4
+  └── Node4: disk1, disk2, disk3, disk4
+
+负载均衡（Nginx/HAProxy/SLB）
+  ├── 前端统一入口
+  ├── 一致性哈希路由（请求路由到正确的节点）
+  └── 健康检查
+```
+
+### 6.3 K8s 部署（Operator/Helm）
+
+```yaml
+# Helm 安装
+helm repo add minio https://charts.min.io/
+helm install myminio minio/minio \
+  --set replicas=4 \
+  --set persistence.storageClass=fast \
+  --set resources.requests.memory=2Gi
+```
+
+---
+
+## 七、云 OSS 服务对比
+
+| 维度 | 阿里云 OSS | AWS S3 | 腾讯云 COS | 华为云 OBS |
+|------|-----------|--------|-----------|-----------|
+| S3 兼容 | 部分兼容 | 原生 | 部分兼容 | 部分兼容 |
+| 存储类型 | 标准/低频/归档/冷归档 | Standard/IA/Glacier | 标准/低频/归档 | 标准/低频/归档/深度归档 |
+| 加密 | SSE-OSS/SSE-KMS | SSE-S3/SSE-KMS | SSE-COS | SSE-OBS |
+| 跨区域复制 | 支持 | 支持 | 支持 | 支持 |
+| CDN 加速 | 内置 CDN | CloudFront | 内置 CDN | 内置 CDN |
+| 回源 | 支持 | 支持 | 支持 | 支持 |
+| 对象锁定 | 支持 | WORM | 支持 | 支持 |
+| 访问控制 | RAM/ACL/CORS | IAM/ACL | CAM/ACL | IAM/ACL |
+
+---
+
+## 八、MinIO 常见坑与最佳实践
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| 维护风险 | MinIO 官方已停维护 | 评估替代/商业支持 |
+| 小文件性能 | 大量小文件吞吐低 | 小文件合并（tar/zstd） |
+| 大文件上传 | 单次 PUT 超限失败 | 分片上传（Multipart） |
+| 桶策略太宽 | 被恶意刷文件 | 最小权限 + 文件类型校验 |
+| 无 CDN | 公网带宽贵且慢 | 前面挂 CDN |
+| 元数据性能 | 大量元数据查询慢 | 用 S3 Select 或 ES 索引元数据 |
+| 版本控制膨胀 | 历史版本无限保留 | 生命周期策略清理旧版本 |
+| 跨区域同步 | 带宽有限延迟高 | 用 mc mirror + 增量同步 |
+
+---
+
+## 九、与其他板块的关系（扩展）
+
+- 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。
+- 和「**架构/企业架构**」：对象存储是「数据中台」非结构化数据底座之一。
+- 和「**基础知识/API 网关**」：文件上传常经网关，注意大文件超时 / 限流。
+- 和「**基础知识/Redis**」：热门文件可缓存 CDN + Redis，降低 OSS 带宽成本。
+- 和「**大数据/Hive/Spark**」：对象存储是数据湖底座（Hive 外部表直接读 S3）。
+- 和「**云存储服务**」：云 OSS 是全托管方案，MinIO 是自建方案。
+
+---
+
+## 十、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 分布式对象存储 |
+| 协议 | S3 API（事实标准） |
+| 核心概念 | Bucket / Object / Key / Version |
+| 数据保护 | 纠删码（Erasure Coding） |
+| 加密 | SSE-S3 / SSE-C / SSE-KMS / 加密传输 TLS |
+| 访问控制 | IAM / Bucket Policy / ACL / STS 临时凭证 |
+| 分片上传 | Multipart Upload（>5MB 建议） |
+| 维护风险 | 官方已停维护，评估替代 |
+| 替代方案 | 云 OSS / Ceph RGW / SeaweedFS / Garage |
+| 一句话 | 「S3 兼容的自建对象存储——数据不出内网的首选」 |

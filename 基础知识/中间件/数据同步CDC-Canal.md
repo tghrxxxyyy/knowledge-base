@@ -207,3 +207,101 @@ esMapping:
 - 和「**基础知识/ES 体系**」：Canal 是把 MySQL 实时同步到 ES 的标准管道。
 - 和「**基础知识/Redis**」：Canal 是解决「缓存与 DB 一致性」的权威方案。
 - 和「**大数据/Flink**」：binlog → Kafka → Flink 构成实时数仓链路。
+
+---
+
+## 九、Canal 高可用架构
+
+### 9.1 多实例 + ZK 选主
+
+```
+Canal Server 集群
+  ├── Canal Server 1 (Active)
+  ├── Canal Server 2 (Standby)
+  └── Canal Server 3 (Standby)
+
+ZooKeeper 集群
+  ├── Leader 选举
+  ├── Instance 路由
+  └── 位点存储
+
+故障切换流程：
+  1. ZK 检测 Active 心跳超时
+  2. Standby 接管 Instance
+  3. 从位点继续消费（断点续传）
+  4. 通知下游消费者切换
+```
+
+### 9.2 Canal + Kafka 高可用
+
+```
+Canal Server → Kafka → Consumer Group
+  ├── Kafka 多副本保证消息不丢
+  ├── Consumer Group 多实例并行消费
+  ├── 位点管理由 Kafka Consumer 自动处理
+  └── 故障恢复：Consumer 重启后从 offset 继续
+```
+
+---
+
+## 十、Canal 与 Flink CDC 对比深度
+
+| 维度 | Canal | Flink CDC |
+|------|-------|-----------|
+| 原理 | 伪装 MySQL Slave | 基于 Debezium/Canal 连接器 |
+| 部署 | Canal Server + Adapter | Flink 集群（已有） |
+| 依赖 | ZooKeeper（可选） | Flink 集群 |
+| 精确一次 | 至少一次（需下游幂等） | 端到端精确一次（Flink Checkpoint） |
+| DDL 同步 | 支持（需手动处理） | 支持（自动同步） |
+| 多数据源 | MySQL 为主 | MySQL/PG/Oracle 等 |
+| 流处理 | 需接 Flink/Spark | 原生集成 |
+| 运维成本 | 中（Canal Admin） | 低（Flink 集群已有） |
+| 延迟 | 秒级 | 毫秒~秒级 |
+
+**选型结论**：
+- **选 Canal**：纯 MySQL 同步到缓存/ES，已有 Java 技术栈，需要可视化管控
+- **选 Flink CDC**：已有 Flink 集群，需要端到端精确一次，多数据源
+
+---
+
+## 十一、Canal 常见坑与最佳实践
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| binlog 格式 | 非 ROW 模式拿不到行级数据 | `binlog-format=ROW` |
+| server-id 冲突 | 与其他 slave 重复导致复制失败 | Canal slaveId 唯一 |
+| 大事务 binlog | 超大事务产生巨量 binlog | 拆分业务事务 |
+| 位点丢失 | ZK/文件损坏导致重头消费 | 定期备份位点 + 下游幂等 |
+| DDL 变更 | adapter 映射失效 | 监控 DDL 事件 + 自动更新 |
+| 消费堆积 | Canal 推送快、消费慢 | 增加消费并发 + Kafka 解耦 |
+| 乱序消费 | 缓存脏数据 | 版本号/时间戳保证最新 |
+| GTID 模式 | 主从切换后位点不连续 | 用 GTID 位点 |
+| 多表 Join | Canal 只捕获单表 | Flink 做流 Join |
+
+---
+
+## 十二、与其他板块的关系（扩展）
+
+- 和「**基础知识/MQ**」：Canal 常投递到 Kafka / RocketMQ，再由下游消费。
+- 和「**基础知识/ES 体系**」：Canal 是把 MySQL 实时同步到 ES 的标准管道。
+- 和「**基础知识/Redis**」：Canal 是解决「缓存与 DB 一致性」的权威方案。
+- 和「**大数据/Flink**」：binlog → Kafka → Flink 构成实时数仓链路。
+- 和「**基础知识/Kafka**」：Kafka 是 Canal 投递的缓冲层，保证消息不丢。
+- 和「**数据同步/DataX**」：DataX 离线批量 + Canal 实时增量，互补。
+
+---
+
+## 十三、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | MySQL binlog 增量订阅 & 消费 |
+| 原理 | 伪装 MySQL Slave，订阅 binlog（ROW 模式） |
+| 投递 | Kafka / RocketMQ / TCP / Adapter 直写 |
+| 高可用 | 多 Server + ZK 选主 |
+| 位点 | 支持 GTID / 文件位点 |
+| 精确一次 | 至少一次（需下游幂等） |
+| DDL | 支持（需手动处理） |
+| 替代方案 | Flink CDC / Debezium / Maxwell |
+| 适用场景 | MySQL→缓存/ES/数仓 实时同步 |
+| 一句话 | 「MySQL binlog 零侵入实时同步的标准方案」 |

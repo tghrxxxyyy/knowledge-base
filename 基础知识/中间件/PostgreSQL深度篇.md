@@ -205,3 +205,254 @@ PostgreSQL Server
 - 云上数据库见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」。
 
 > 一句话：**PostgreSQL = SQL 标准最完整 + JSONB + PostGIS + 扩展性极强；选型先看「功能需求（地理/全文/向量→PG）」，再定「规模（单机/Citus 分布式/TimescaleDB 时序）」，最后配「高可用（Patroni + 流复制）」**。
+
+---
+
+## 九、PostgreSQL 查询优化深度
+
+### 9.1 EXPLAIN ANALYZE 详解
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders WHERE user_id = 123 AND status = 'paid';
+
+-- 输出解读
+-- Seq Scan on orders  (cost=0.00..1234.56 rows=10 width=128) (actual time=0.015..12.345 rows=10 loops=1)
+--   Filter: (user_id = 123 AND status = 'paid')
+--   Rows Removed by Filter: 99990
+--   Buffers: shared hit=1000
+-- Planning Time: 0.1 ms
+-- Execution Time: 12.5 ms
+```
+
+| 指标 | 含义 |
+|------|------|
+| cost | 启动代价..总代价（估算） |
+| rows | 估算返回行数 |
+| actual time | 实际执行时间 |
+| Buffers | 共享缓冲区命中/读取 |
+| Rows Removed by Filter | 被过滤掉的行数 |
+
+### 9.2 执行计划类型
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| Seq Scan | 全表顺序扫描 | 小表/无索引 |
+| Index Scan | 索引扫描+回表 | 等值/范围查询 |
+| Index Only Scan | 纯索引扫描（无需回表） | 覆盖索引 |
+| Bitmap Index Scan | 位图索引扫描 | 多条件过滤 |
+| Nested Loop | 嵌套循环连接 | 小结果集+索引 |
+| Hash Join | 哈希连接 | 大结果集+等值连接 |
+| Merge Join | 归并连接 | 已排序数据连接 |
+
+### 9.3 统计信息与调优
+
+```sql
+-- 查看统计信息
+SELECT * FROM pg_stats WHERE tablename = 'orders';
+
+-- 手动更新统计
+ANALYZE orders;
+
+-- 调整统计采样精度
+ALTER TABLE orders ALTER COLUMN user_id SET STATISTICS 1000;
+```
+
+---
+
+## 十、PostgreSQL 分区表深度
+
+### 10.1 声明式分区
+
+```sql
+-- 范围分区（按时间）
+CREATE TABLE orders (
+    id BIGSERIAL,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at TIMESTAMPTZ
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE orders_2026_01 PARTITION OF orders
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE orders_2026_02 PARTITION OF orders
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+-- 列表分区（按地区）
+CREATE TABLE users (
+    id BIGSERIAL,
+    name TEXT,
+    region TEXT
+) PARTITION BY LIST (region);
+
+CREATE TABLE users_cn PARTITION OF users FOR VALUES IN ('中国');
+CREATE TABLE users_us PARTITION OF users FOR VALUES IN ('美国');
+```
+
+### 10.2 分区裁剪（Partition Pruning）
+
+```sql
+-- 自动分区裁剪（只扫描相关分区）
+EXPLAIN SELECT * FROM orders WHERE created_at >= '2026-02-01';
+-- → 只扫描 orders_2026_02 分区
+
+-- 手动设置
+SET enable_partition_pruning = on;
+```
+
+### 10.3 自动分区管理
+
+```sql
+-- pg_partman 自动创建分区
+CREATE EXTENSION pg_partman;
+SELECT partman.create_parent('public.orders', 'created_at', 'native', 'monthly');
+```
+
+---
+
+## 十一、PostgreSQL 逻辑复制与高可用
+
+### 11.1 逻辑复制
+
+```sql
+-- 发布端
+CREATE PUBLICATION my_pub FOR TABLE orders, users;
+
+-- 订阅端
+CREATE SUBSCRIPTION my_sub
+    CONNECTION 'host=master dbname=mydb user=replicator'
+    PUBLICATION my_pub;
+
+-- 支持：跨版本/跨库/部分表复制
+-- 不支持：DDL 复制
+```
+
+### 11.2 Patroni 高可用
+
+```
+Patroni + etcd/Consul
+  ├── 自动故障检测
+  ├── 自动主从切换
+  ├── 配置管理
+  └── 与 HAProxy/PgBouncer 集成
+
+架构：
+  etcd 集群 (3节点)
+    ├── Leader 选举
+    └── 配置存储
+
+  PostgreSQL 集群
+    ├── Primary (读写)
+    ├── Standby1 (只读副本)
+    └── Standby2 (只读副本)
+
+  Patroni Agent (每个节点)
+    ├── 监控 PostgreSQL 状态
+    ├── 向 etcd 注册
+    └── 执行切换
+```
+
+### 11.3 流复制 vs 逻辑复制
+
+| 维度 | 流复制 | 逻辑复制 |
+|------|--------|----------|
+| 复制级别 | 整个实例 | 指定表 |
+| 数据同步 | 物理 WAL 流 | 逻辑变更 |
+| 跨版本 | 不支持 | 支持 |
+| DDL | 复制 | 不复制 |
+| 用途 | 高可用/灾备 | 跨库同步/升级 |
+
+---
+
+## 十二、PostgreSQL 扩展深度
+
+### 12.1 TimescaleDB（时序扩展）
+
+```sql
+-- 创建超表（自动分区）
+CREATE EXTENSION timescaledb;
+SELECT create_hypertable('sensor_data', 'time');
+
+-- 自动压缩
+ALTER TABLE sensor_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id'
+);
+
+-- 连续聚合
+CREATE MATERIALIZED VIEW hourly_stats WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket, device_id, AVG(value)
+FROM sensor_data GROUP BY bucket, device_id;
+```
+
+### 12.2 Citus（分布式扩展）
+
+```sql
+-- 创建分布式表
+CREATE EXTENSION citus;
+SELECT create_distributed_table('orders', 'user_id');
+
+-- 创建引用表（小表广播到所有节点）
+SELECT create_reference_table('regions');
+```
+
+### 12.3 pgvector（向量检索）
+
+```sql
+CREATE EXTENSION vector;
+
+-- 创建向量列
+ALTER TABLE products ADD COLUMN embedding vector(1536);
+
+-- 创建 HNSW 索引
+CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops);
+
+-- 语义搜索
+SELECT * FROM products
+ORDER BY embedding <=> '[0.1, 0.2, ..., 0.1536]'
+LIMIT 10;
+```
+
+---
+
+## 十三、PostgreSQL 常见坑与最佳实践
+
+| 坑 | 表现 | 解法 |
+|----|------|------|
+| 事务 ID 回卷 | 长事务导致 XID wraparound | 定期 VACUUM + 监控 XID |
+| 死元组膨胀 | 未清理的旧版本占用空间 | Autovacuum + 手动 VACUUM |
+| 连接数耗尽 | max_connections 过大 | 连接池（PgBouncer） |
+| 长事务锁表 | 长事务持有锁 | 设置 statement_timeout |
+| 分区表维护 | 忘记创建新分区 | pg_partman 自动管理 |
+| WAL 日志堆积 | 复制槽未清理 | 监控复制延迟 + 删除无用槽 |
+| 统计信息过时 | 优化器选错执行计划 | 定期 ANALYZE |
+| 大表索引创建 | 长时间锁表 | CREATE INDEX CONCURRENTLY |
+
+---
+
+## 十四、与其他板块的关系（扩展）
+
+- MySQL 知识见「[基础知识/mysql知识](../mysql知识.md)」；
+- 分库分表见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」与「[分库分表板块](../../分库分表与数据迁移/)」；
+- 时序数据库见「[时序库](../时序库/README.md)」；
+- 云上数据库见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」；
+- 高可用方案见「[云原生/高可用架构](../../云原生/高可用架构.md)」；
+- 对比 MySQL 见「[MySQL 知识](../mysql知识.md)」。
+
+---
+
+## 十五、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 开源最强关系型数据库 |
+| SQL 标准 | 支持最完整 |
+| 核心特性 | JSONB / PostGIS / 全文搜索 / 扩展性 |
+| MVCC | 多版本并发控制（读写不阻塞） |
+| 索引 | B-Tree / GiST / GIN / BRIN / Hash |
+| 分区 | 声明式分区（范围/列表/哈希） |
+| 高可用 | Patroni + etcd + 流复制 |
+| 备份 | pg_dump / pg_basebackup / WAL 归档 / pgBackRest |
+| 扩展 | TimescaleDB / Citus / pgvector / PostGIS |
+| 云托管 | Aurora / Cloud SQL / PolarDB |
+| 一句话 | 「开源数据库的瑞士军刀——功能最全、扩展最强」 |

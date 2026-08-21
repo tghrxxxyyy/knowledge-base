@@ -201,3 +201,165 @@ gRPC 在云原生中的位置：
 - 云原生通信见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」。
 
 > 一句话：**gRPC = HTTP/2（多路复用）+ Protobuf（紧凑二进制）+ IDL 契约（跨语言）+ 四模式流式；选型先看「语言栈（跨语言→gRPC，纯 Java→Dubbo）」，再定「通信形态（一元/流式）」，最后配「超时 Deadline + 拦截器 + 网关（grpc-gateway/Envoy）」**。
+
+---
+
+## 六、gRPC 拦截器（Interceptors）
+
+gRPC 拦截器类似 Servlet Filter，分为 Unary 和 Streaming 两种：
+
+### 6.1 Unary 拦截器
+
+```go
+// 服务端拦截器（Go 示例）
+func loggingInterceptor(ctx context.Context, req interface{}, 
+    info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+    start := time.Now()
+    resp, err := handler(ctx, req)
+    log.Printf("method=%s duration=%v err=%v", info.FullMethod, time.Since(start), err)
+    return resp, err
+}
+
+server := grpc.NewServer(grpc.UnaryInterceptor(loggingInterceptor))
+```
+
+### 6.2 拦截器链
+
+```
+请求 → [鉴权拦截器] → [日志拦截器] → [限流拦截器] → [业务方法]
+响应 → [Metrics拦截器] → [错误处理拦截器] → 返回
+```
+
+### 6.3 常见拦截器用途
+
+| 用途 | 说明 |
+|------|------|
+| 鉴权 | JWT/Token 校验 |
+| 日志 | 请求/响应日志记录 |
+| 限流 | 基于令牌桶/滑动窗口 |
+| Metrics | 延迟/吞吐/错误率采集 |
+| 超时注入 | Deadline 传播 |
+| 重试 | 自动重试（幂等操作） |
+| 链路追踪 | OpenTelemetry Span 注入 |
+
+---
+
+## 七、gRPC 负载均衡策略
+
+gRPC 客户端侧负载均衡（不同于 Dubbo 服务端侧）：
+
+```
+客户端 Channel
+  ├── Name Resolver（服务发现：DNS/Consul/K8s）
+  ├── Balancer（负载均衡策略）
+  │   ├── pick_first（默认，选第一个）
+  │   └── round_robin（轮询所有连接）
+  └── Subconnections（每个后端一个连接）
+```
+
+| 策略 | 说明 |
+|------|------|
+| pick_first | 默认，连接第一个健康实例 |
+| round_robin | 轮询所有可用连接 |
+| weighted_round_robin | 加权轮询（需自定义） |
+
+**与 Istio 集成**：Istio 通过 xDS 下发负载均衡策略，gRPC 客户端自动应用。
+
+---
+
+## 八、gRPC 错误处理
+
+```protobuf
+// 定义错误码
+enum ErrorCode {
+  OK = 0;
+  INVALID_ARGUMENT = 3;
+  NOT_FOUND = 5;
+  ALREADY_EXISTS = 6;
+  PERMISSION_DENIED = 7;
+  UNAVAILABLE = 14;
+}
+```
+
+| gRPC 状态码 | HTTP 等价码 | 说明 |
+|-------------|-------------|------|
+| OK | 200 | 成功 |
+| INVALID_ARGUMENT | 400 | 参数错误 |
+| NOT_FOUND | 404 | 资源不存在 |
+| ALREADY_EXISTS | 409 | 资源已存在 |
+| PERMISSION_DENIED | 403 | 无权限 |
+| UNAUTHENTICATED | 401 | 未认证 |
+| RESOURCE_EXHAUSTED | 429 | 资源耗尽（限流） |
+| UNAVAILABLE | 503 | 服务不可用 |
+| INTERNAL | 500 | 内部错误 |
+| DEADLINE_EXCEEDED | 504 | 超时 |
+
+**最佳实践**：用 `google.rpc.Status` 携带错误详情（`google.rpc.ErrorInfo` + `google.rpc.BadRequest`）。
+
+---
+
+## 九、gRPC 与 Envoy/Istio 集成
+
+```
+Envoy 对 gRPC 的原生支持：
+  ├── HTTP/2 透传（无需协议转换）
+  ├── gRPC-JSON 转码（gRPC ↔ REST）
+  ├── gRPC-Web（浏览器直连）
+  ├── 重试/超时（xDS 下发）
+  ├── mTLS（自动双向认证）
+  └── 链路追踪（自动注入 Span）
+```
+
+**Envoy gRPC 转码示例**：
+
+```yaml
+http_filters:
+- name: envoy.filters.http.grpc_json_transcoder
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_json_transcoder.v3.GrpcJsonTranscoder
+    proto_descriptor: /etc/envoy/proto.pb
+    services: ["mypackage.UserService"]
+```
+
+---
+
+## 十、gRPC 性能调优
+
+| 维度 | 建议 |
+|------|------|
+| 连接复用 | 一个 Channel 复用所有请求（避免 N² 连接） |
+| 流式 | 大数据用流式而非多次 Unary |
+| Protobuf | 避免嵌套过深/大 repeated 字段 |
+| 消息大小 | 默认 4MB，大消息调 `MaxRecvMsgSize` |
+| Keepalive | 设置 Ping 间隔（NAT 防连接失效） |
+| 拦截器 | 鉴权/日志拦截器异步执行 |
+| 压缩 | 启用 gzip/snappy（CPU 换带宽） |
+
+---
+
+## 十一、与其他板块的关系（扩展）
+
+- Dubbo 对比见「[Apache Dubbo RPC 框架](./ApacheDubboRPC框架.md)」；
+- Envoy（gRPC 原生代理/网关转换）见「[Envoy 服务代理](./Envoy服务代理.md)」；
+- 网络协议（HTTP/2/HTTP/3）见「[网络协议深挖](../网络协议深挖.md)」；
+- 云原生通信见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
+- 对比 Thrift 见「[Apache Thrift](./ApacheThrift.md)」；
+- 服务网格见「[Istio 服务网格](../../云原生/Istio服务网格.md)」。
+
+---
+
+## 十二、速查表（扩展）
+
+| 项 | 结论 |
+|----|------|
+| 类型 | 跨语言高性能 RPC 框架 |
+| 传输 | HTTP/2（多路复用） |
+| 序列化 | Protobuf（二进制） |
+| 契约 | IDL（.proto 文件） |
+| 调用模式 | Unary / Server Streaming / Client Streaming / Bidi |
+| 拦截器 | 客户端/服务端拦截器（鉴权/日志/限流） |
+| 负载均衡 | 客户端侧（pick_first / round_robin） |
+| 错误处理 | gRPC 状态码（22种）+ Status 详情 |
+| 生态 | CNCF 毕业项目 / grpc-gateway / grpcurl / buf |
+| 网关 | grpc-gateway（REST 转 gRPC）/ Envoy（HTTP/2 透传） |
+| 一句话 | 「跨语言 RPC 的事实标准——HTTP/2 + Protobuf + IDL」 |
