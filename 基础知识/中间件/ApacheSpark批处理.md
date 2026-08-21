@@ -180,4 +180,130 @@ Cluster Manager（资源管理）
 - Hive（数据仓库）见「[基础知识/大数据](../大数据/README.md)」；
 - 云上大数据见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」。
 
+---
+
+## 八、Spark 生产配置清单
+
+### 8.1 spark-defaults.conf 关键配置
+
+```properties
+# 资源配置
+spark.executor.instances=4
+spark.executor.memory=8g
+spark.executor.cores=4
+spark.driver.memory=4g
+
+# Shuffle 配置
+spark.sql.shuffle.partitions=200
+spark.sql.adaptive.enabled=true
+spark.sql.adaptive.coalescePartitions.enabled=true
+
+# 序列化
+spark.serializer=org.apache.spark.serializer.KryoSerializer
+
+# 内存
+spark.memory.fraction=0.8
+spark.memory.storageFraction=0.3
+```
+
+### 8.2 监控指标
+
+```
+Spark 关键指标：
+  Job 成功/失败数
+  Stage 执行时间
+  Task 处理记录数
+  Shuffle 读写量
+  GC 时间占比
+  内存使用（Execution/Storage）
+```
+
+### 8.3 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 数据倾斜 | Key 分布不均 | 加盐/两阶段聚合/Broadcast Join |
+| OOM | 内存不足 | 增加 Executor 内存/减少 cache |
+| Shuffle 慢 | 分区数太多/太少 | 调整 shuffle.partitions |
+| GC 停顿 | 堆过大 | 减小 Executor 内存/用 G1GC |
+
+---
+
+## 九、Spark 性能调优清单
+
+| 调优项 | 建议 |
+|--------|------|
+| 并行度 | shuffle.partitions = 核心数 × 2~3 |
+| 序列化 | KryoSerializer（比 Java 快 10x） |
+| 内存 | execution:storage = 7:3 |
+| 广播 | 小表 < 10MB 自动广播 |
+| 数据本地性 | PROCESS_LOCAL > NODE_LOCAL |
+
+---
+
+## 十、Spark SQL 常用语法
+
+```sql
+-- 创建数据源
+CREATE TABLE spark_table (
+  id INT,
+  name STRING,
+  ts TIMESTAMP
+) USING parquet
+LOCATION '/data/spark_table';
+
+-- 窗口函数
+SELECT id, name, 
+  ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts DESC) as rn
+FROM spark_table;
+
+-- 多表 JOIN
+SELECT a.id, b.name
+FROM table_a a
+JOIN table_b b ON a.id = b.id;
+```
+
+---
+
+## 十、Spark MLlib 常用算法
+
+| 算法 | 说明 | 适用场景 |
+|------|------|----------|
+| LogisticRegression | 逻辑回归 | 二分类 |
+| RandomForest | 随机森林 | 分类/回归 |
+| GBTRegressor | 梯度提升树 | 回归 |
+| KMeans | K 均值聚类 | 聚类 |
+| ALS | 交替最小二乘 | 推荐系统 |
+
+---
+
+## 十一、Spark Streaming vs Structured Streaming
+
+| 维度 | Spark Streaming（DStream） | Structured Streaming |
+|------|---------------------------|----------------------|
+| API | DStream（RDD） | DataFrame/Dataset |
+| 处理模型 | 微批 | 微批（可调） |
+| 容错 | RDD 血统 | WAL + Checkpoint |
+| 事件时间 | 手动处理 | 原生支持 |
+| SQL | 不支持 | 支持 |
+
+---
+
+## 十二、Spark on Kubernetes 部署
+
+```yaml
+# spark-submit 配置
+spark-submit \
+  --master k8s://https://k8s-master:6443 \
+  --deploy-mode cluster \
+  --name spark-job \
+  --class com.example.Main \
+  --conf spark.kubernetes.container.image=my-spark:latest \
+  --conf spark.kubernetes.executor.instances=4 \
+  --conf spark.kubernetes.executor.memory=8g \
+  local:///opt/spark/jars/app.jar
+```
+
+---
+
 > 一句话：**Spark = 内存计算 + DAG 调度 + Catalyst 优化 + 丰富生态（SQL/ML/Graph）；选型先看「计算类型（批→Spark，流→Flink）」，再定「规模（YARN/K8s/托管）」，最后开「AQE + 广播 Join + 减少 Shuffle」**。

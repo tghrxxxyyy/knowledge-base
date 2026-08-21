@@ -170,4 +170,158 @@ spec:
 - K8s 基础见「[云原生/Kubernetes 核心](../../云原生/Kubernetes核心.md)」；
 - 云上流量接入（LB/CDN）见「[云网络与流量接入体系](./云网络与流量接入体系.md)」。
 
+---
+
+## 八、Traefik 中间件详解
+
+### 8.1 常用中间件
+
+| 中间件 | 说明 | 配置示例 |
+|--------|------|----------|
+| BasicAuth | 基本认证 | users: ["admin:$apr1$..."] |
+| ForwardAuth | 外部认证服务 | authAddress: http://auth-svc |
+| RateLimit | 限流 | average: 100, burst: 50 |
+| Retry | 重试 | attempts: 3, initialInterval: 100ms |
+| StripPrefix | 路径前缀剥离 | prefixes: ["/api"] |
+| Headers | 响应头修改 | customResponseHeaders: {X-Custom: "value"} |
+| Compress | 响压压缩 | excludedContentTypes: ["image/*"] |
+| CircuitBreaker | 熔断 | expression: "LatencyAtQuantileMS(50.0) > 100" |
+
+### 8.2 中间件组合示例
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-ratelimit
+spec:
+  chain:
+    middlewares:
+      - name: auth
+      - name: ratelimit
+        rateLimit:
+          average: 100
+          burst: 50
+      - name: compress
+```
+
+### 8.3 Traefik 可观测配置
+
+```yaml
+# Prometheus 指标
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+
+# 访问日志
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  bufferingSize: 100
+
+# Tracing（Jaeger/Zipkin）
+tracing:
+  jaeger:
+    localAgentHostPort: 127.0.0.1:6831
+```
+
+---
+
+## 九、Traefik 生产配置清单
+
+| 配置项 | 建议值 |
+|--------|--------|
+| Dashboard | 生产关闭或加 BasicAuth |
+| 优雅停机 | gracePeriod: 30s |
+| 连接超时 | transport.respondingTimeouts.readTimeout: 60s |
+| 重试 | retry.attempts: 3 |
+| 限流 | rateLimit.average: 100 |
+| 日志级别 | INFO（生产）/DEBUG（排查） |
+| TLS 版本 | minVersion: VersionTLS12 |
+| 密码套件 | TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 |
+
+### 9.1 IngressRoute 完整示例
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`api.example.com`) && PathPrefix(`/v1`)
+      kind: Rule
+      middlewares:
+        - name: rate-limit
+        - name: jwt-auth
+        - name: strip-prefix
+      services:
+        - name: api-service
+          port: 80
+          weight: 100
+    - match: Host(`api.example.com`) && PathPrefix(`/v2`)
+      kind: Rule
+      services:
+        - name: api-v2
+          port: 80
+  tls:
+    certResolver: letsencrypt
+```
+
+### 9.2 中间件配置示例
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+spec:
+  rateLimit:
+    average: 100
+    burst: 50
+    period: 1s
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: jwt-auth
+spec:
+  forwardAuth:
+    address: http://auth-service:8080/auth
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-User-ID
+      - X-User-Roles
+```
+
+### 9.3 部署架构
+
+```
+公网用户 → Cloud LB（NLB/CLB）
+  → Traefik Ingress Controller（K8s Pod）
+    → 中间件链（认证/限流/重试）
+      → K8s Service（ClusterIP）
+        → Pod（应用）
+```
+
+---
+
+## 十、Traefik 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 502/503 | 后端 Pod 不健康 | 检查 readiness probe |
+| 证书过期 | Let's Encrypt 续期失败 | 检查 ACME 配置/存储 |
+| 路由不生效 | IngressRoute 语法错 | kubectl describe 检查 |
+| 性能差 | 中间件过多 | 精简中间件链 |
+| 连接超时 | 后端响应慢 | 调整超时配置 |
+
+---
+
 > 一句话：**Traefik = Provider 自动发现 + 中间件编排 + Let's Encrypt 自动证书 + 单二进制部署；选型先看「环境（K8s/Docker 动态环境→Traefik，静态传统→Nginx）」，再定「治理深度（轻量→Traefik，企业级 API→Kong/APISIX）」，最后配「HTTPS（自动）+ 可观测（Prometheus 大盘）」**。

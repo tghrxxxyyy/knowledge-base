@@ -174,4 +174,185 @@
 - 网关选型见「[API 网关](./API网关.md)」；
 - 云上负载均衡（NLB/ALB/CLB）见「[云网络与流量接入体系](./云网络与流量接入体系.md)」。
 
+---
+
+## 八、HAProxy 生产配置清单
+
+### 8.1 haproxy.cfg 关键配置
+
+```ini
+global
+    maxconn 50000
+    log /dev/log local0
+    stats socket /var/run/haproxy.sock mode 660 level admin
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    option httplog
+    option dontlognull
+    option http-server-close
+    option forwardfor
+
+frontend http-in
+    bind *:80
+    bind *:443 ssl crt /etc/haproxy/certs/
+    redirect scheme https if !{ ssl_fc }
+    default_backend servers
+
+backend servers
+    balance roundrobin
+    option httpchk GET /healthz
+    server server1 192.168.1.10:8080 check inter 5s rise 2 fall 3
+    server server2 192.168.1.11:8080 check inter 5s rise 2 fall 3
+```
+
+### 8.2 监控指标
+
+```
+HAProxy 关键指标：
+  当前连接数（current）
+  最大连接数（maxconn）
+  会话率（sessions/sec）
+  后端健康状态（backend status）
+  队列长度（queue）
+  拒绝连接数（denied）
+  错误响应数（errors）
+```
+
+### 8.3 LVS + Keepalived 配置
+
+```bash
+# LVS DR 模式配置
+ipvsadm -A -t 192.168.1.100:80 -s rr
+ipvsadm -a -t 192.168.1.100:80 -r 192.168.1.11:80 -g
+ipvsadm -a -t 192.168.1.100:80 -r 192.168.1.12:80 -g
+
+# Keepalived 配置
+vrrp_script check_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight -20
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+    track_script {
+        check_haproxy
+    }
+}
+```
+
+### 8.4 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 连接数满 | maxconn 太小 | 调大 maxconn + ulimit |
+| 后端超时 | 服务器响应慢 | 调整 timeout server |
+| VIP 漂移 | 脑裂 | 检查 VRRP 优先级/仲裁 |
+| 502 错误 | 后端不可达 | 检查健康检查配置 |
+
+---
+
+## 九、负载均衡选型决策树
+
+```
+需要负载均衡？
+  ├── 超大流量入口 → LVS（DR）+ Keepalived
+  ├── 通用 L4/L7 → HAProxy
+  ├── Web 静态/L7 → Nginx
+  ├── 服务网格 → Envoy
+  └── 云上托管 → NLB/ALB/CLB
+```
+
+---
+
+## 十、LVS + HAProxy + Keepalived 完整配置
+
+### 10.1 LVS DR 模式配置脚本
+
+```bash
+#!/bin/bash
+# LVS DR 模式配置
+VIP=192.168.1.100
+RIP1=192.168.1.11
+RIP2=192.168.1.12
+
+# 配置虚拟网卡
+ifconfig eth0:0 $VIP broadcast $VIP netmask 255.255.255.255 up
+route add -host $VIP dev eth0:0
+
+# 配置 LVS
+ipvsadm -C
+ipvsadm -A -t $VIP:80 -s rr
+ipvsadm -a -t $VIP:80 -r $RIP1:80 -g
+ipvsadm -a -t $VIP:80 -r $RIP2:80 -g
+```
+
+### 10.2 Keepalived 完整配置
+
+```ini
+global_defs {
+    router_id LVS_MASTER
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1234
+    }
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+    track_script {
+        check_haproxy
+    }
+}
+
+vrrp_script check_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight -20
+}
+```
+
+### 10.3 后端 ARP 抑制配置
+
+```bash
+# 在 RS（Real Server）上执行
+echo 1 > /proc/sys/net/ipv4/conf/lo/arp_ignore
+echo 2 > /proc/sys/net/ipv4/conf/lo/arp_announce
+echo 1 > /proc/sys/net/ipv4/conf/all/arp_ignore
+echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce
+```
+
+---
+
+## 十一、负载均衡监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 当前连接数 | 活跃连接 | >80% maxconn |
+| 会话速率 | 每秒新建连接 | 突增 |
+| 后端健康 | UP/DOWN 状态 | DOWN |
+| 响应时间 | 后端响应延迟 | >1s |
+| 错误率 | 5xx 比例 | >1% |
+| 队列长度 | 等待队列 | >100 |
+
+---
+
 > 一句话：**入口高可用 = LVS（内核转发扛量）+ HAProxy（L4/L7 治理 + 健康检查 + 会话保持）+ Keepalived（VIP 漂移）；选型先定「层级（超大规模→LVS，通用→HAProxy）」，再定「会话保持策略（无状态优先）」，最后配「健康检查 + 超时 + 慢启动」**。

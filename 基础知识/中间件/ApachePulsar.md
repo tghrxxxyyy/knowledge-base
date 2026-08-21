@@ -182,3 +182,134 @@ Pulsar 一个 topic 支持多种订阅，灵活兼顾「队列」和「流」：
 21. **Pulsar 的分区（Partition）？** Topic 可分多个分区提升并行度，分区内有序，类似 Kafka 分区概念，但底层仍由 Ledger 组成。
 
 22. **Pulsar 在消息积压下的表现？** 存算分离使存储独立扩展，积压时加 Bookie 即可，不影响 Broker 计算；Kafka 积压需扩分区+迁数据更重。
+
+---
+
+## 九、Pulsar 生产配置清单
+
+### 9.1 关键配置
+
+```properties
+brokerServicePort=6650
+webServicePort=8080
+numPartitionsPerBroker=4
+defaultRetentionTimeInMinutes=10080
+defaultRetentionSizeInMB=-1
+bookieServerListenPort=3181
+journalDirectory=/data/bookkeeper/journal
+ledgerDirectories=/data/bookkeeper/ledgers
+```
+
+### 9.2 监控指标
+
+```
+Pulsar 关键指标：
+  消息入队/出队速率
+  订阅游标延迟
+  BookKeeper 写入延迟
+  Broker 内存使用
+  Topic 数量
+  消费者数量
+```
+
+### 9.3 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 写入延迟高 | BookKeeper 过载 | 扩容 Bookie |
+| 消费积压 | 消费者不足 | 增加消费者 |
+| Topic 过多 | 资源耗尽 | 合并 Topic |
+| BookKeeper 故障 | 磁盘/网络问题 | 检查 Bookie 节点 |
+
+---
+
+## 十、Pulsar 调优清单
+
+| 调优项 | 建议 |
+|--------|------|
+| Broker 数量 | CPU/内存密集，独立部署 |
+| Bookie 数量 | IO 密集，SSD 存储 |
+| 副本数 | E=3, W=2, A=2（默认） |
+| 保留期 | 按业务需求（7天/30天） |
+| 分区数 | 按并行度需求 |
+
+---
+
+## 十一、Pulsar 与 Kafka 选型决策
+
+| 调优项 | 建议 |
+|--------|------|
+| Broker 数量 | CPU/内存密集，独立部署 |
+| Bookie 数量 | IO 密集，SSD 存储 |
+| 副本数 | E=3, W=2, A=2（默认） |
+| 保留期 | 按业务需求（7天/30天） |
+| 分区数 | 按并行度需求 |
+
+---
+
+## 十一、Pulsar 与 Kafka 选型决策
+
+```
+已有 Kafka 生态？
+  ├── 是 + 日志/大数据 → 留 Kafka
+  ├── 是 + 云原生多租户 → 考虑迁移 Pulsar
+  └── 否 + 新建 → Pulsar（云原生优势）
+
+关键决策点：
+  需要多租户隔离 → Pulsar
+  需要跨地域复制 → Pulsar
+  需要队列+流统一 → Pulsar
+  已有 Kafka 生态 → 留 Kafka
+  极致吞吐 → Kafka
+```
+
+---
+
+## 十一、Pulsar Spring Boot 集成示例
+
+```java
+// 生产者
+@Service
+public class OrderProducer {
+    @Autowired
+    private PulsarTemplate<Order> pulsarTemplate;
+    
+    public void sendOrder(Order order) {
+        pulsarTemplate.send("persistent://public/default/orders", order);
+    }
+}
+
+// 消费者
+@Component
+@PulsarListener(
+    topics = "persistent://public/default/orders",
+    subscriptionName = "order-service",
+    subscriptionType = SubscriptionType.Shared
+)
+public class OrderConsumer {
+    public void handleOrder(Order order) {
+        // 处理订单
+    }
+}
+```
+
+---
+
+## 十二、Pulsar 运维命令
+
+```bash
+# 查看集群状态
+pulsar-admin clusters list
+
+# 查看 topic 列表
+pulsar-admin topics list persistent://public/default
+
+# 查看 topic 状态
+pulsar-admin topics stats persistent://public/default/orders
+
+# 创建租户
+pulsar-admin tenants create my-tenant
+
+# 创建命名空间
+pulsar-admin namespaces create my-tenant/my-ns
+```

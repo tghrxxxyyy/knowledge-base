@@ -184,3 +184,145 @@ flowchart LR
 | 缓存分层 | 本地（μs）→ 分布式（ms）→ DB；TTL/消息失效保一致 |
 | 选型口诀 | 全局共享用 Redis/Memcached，单进程热点用 Caffeine，要快叠加多级 |
 | 一句话 | 「缓存的另一半」——分布式缓存管共享，本地缓存管最快 |
+
+---
+
+## 六、Caffeine 高级配置
+
+### 6.1 写入监听
+
+```java
+Cache<String, Object> cache = Caffeine.newBuilder()
+    .removalListener((key, value, cause) -> {
+        log.info("Key {} removed: {}", key, cause);
+    })
+    .build();
+```
+
+### 6.2 异步加载
+
+```java
+AsyncLoadingCache<String, Object> cache = Caffeine.newBuilder()
+    .maximumSize(10_000)
+    .expireAfterWrite(5, TimeUnit.MINUTES)
+    .buildAsync(key -> loadFromDb(key));
+```
+
+### 6.3 权重淘汰
+
+```java
+Cache<String, Object> cache = Caffeine.newBuilder()
+    .maximumWeight(100_000)
+    .weigher((key, value) -> value.size())
+    .build();
+```
+
+---
+
+## 七、Memcached 运维命令
+
+```bash
+# 查看状态
+echo "stats" | nc localhost 11211
+
+# 查看所有 key
+echo "stats cachedump 1 100" | nc localhost 11211
+
+# 删除 key
+echo "delete mykey" | nc localhost 11211
+
+# 清空所有
+echo "flush_all" | nc localhost 11211
+```
+
+### 7.1 多级缓存配置示例
+
+```java
+// Spring Boot 多级缓存
+@Bean
+public CacheManager cacheManager() {
+    CaffeineCacheManager caffeineManager = new CaffeineCacheManager();
+    caffeineManager.setCaffeine(Caffeine.newBuilder()
+        .maximumSize(1000)
+        .expireAfterWrite(5, TimeUnit.MINUTES));
+    return caffeineManager;
+}
+```
+
+---
+
+## 八、缓存选型决策树
+
+```
+需要缓存？
+  ├── 数据量小/单机热点 → Caffeine（本地）
+  ├── 需要全局共享 → Redis（分布式）
+  ├── 纯 KV 大缓存 → Memcached
+  └── 混合场景 → 多级缓存（Caffeine + Redis）
+```
+
+---
+
+## 九、缓存一致性方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| TTL 收敛 | 各层设合理 TTL | 弱一致 |
+| 消息失效 | MQ 广播删除本地缓存 | 中一致 |
+| Canal 订阅 | DB binlog → 删除缓存 | 强一致 |
+| 版本号 | 缓存带版本号，不匹配则回源 | 强一致 |
+
+---
+
+## 十、多级缓存架构设计
+
+```
+请求 → 本地缓存（Caffeine）
+  ├── 命中 → 返回（μs 级）
+  └── miss → 分布式缓存（Redis）
+    ├── 命中 → 回填本地缓存 → 返回（ms 级）
+    └── miss → DB
+      ├── 返回 → 回填 Redis + 本地缓存
+      └── 写操作 → 更新 DB → 删除 Redis → 广播失效本地缓存
+```
+
+### 10.1 本地缓存配置建议
+
+| 配置 | Caffeine | 说明 |
+|------|----------|------|
+| maximumSize | 1000-10000 | 按数据量调整 |
+| expireAfterWrite | 5min | 写后过期 |
+| refreshAfterWrite | 4min | 异步刷新 |
+| recordStats | true | 命中率统计 |
+
+### 10.2 分布式缓存配置建议
+
+| 配置 | Redis | 说明 |
+|------|-------|------|
+| maxmemory | 60% 物理内存 | 预留系统内存 |
+| maxmemory-policy | allkeys-lru | LRU 淘汰 |
+| timeout | 3s | 连接超时 |
+| tcp-keepalive | 60s | 保活 |
+
+---
+
+## 十一、缓存性能监控
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 命中率 | hit / (hit + miss) | <80% |
+| 淘汰数 | evictions | 突增 |
+| 连接数 | connected clients | >80% max |
+| 内存使用 | used_memory | >80% maxmemory |
+| 延迟 | latency | >1ms |
+
+---
+
+## 十二、缓存常见问题与解决
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 缓存穿透 | 查不存在的 key | 布隆过滤器/空值缓存 |
+| 缓存击穿 | 热点 key 过期 | 互斥锁/永不过期 |
+| 缓存雪崩 | 大批 key 同时过期 | 随机过期时间 |
+| 数据不一致 | 缓存与 DB 不同步 | 延迟双删/Canal |
