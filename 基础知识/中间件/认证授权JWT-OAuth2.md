@@ -1,225 +1,868 @@
-# 认证授权（JWT / OAuth2）
+# 认证授权：JWT 与 OAuth2 体系
 
-> 用户登录后，系统怎么知道「你是谁、能干什么」？本文讲清 **认证（Authentication）与授权（Authorization）的区别**、**Session vs JWT**、**OAuth2 四种授权模式**，以及生产怎么落地。
-> 标准参考：JWT（[RFC 7519](https://datatracker.ietf.org/doc/html/rfc7519)）、OAuth 2.0（[RFC 6749](https://datatracker.ietf.org/doc/html/rfc6749)）；开源实现：[spring-projects/spring-security](https://github.com/spring-projects/spring-security)（Java 安全框架）、[keycloak/keycloak](https://github.com/keycloak/keycloak)（Identity and Access Management）。
+> **核心认知**：认证（Authentication）回答"你是谁"，授权（Authorization）回答"你能做什么"。JWT 解决的是分布式环境下的无状态身份凭证传递问题，OAuth2 解决的是第三方应用对用户资源的安全委托访问问题。二者常配合使用，但职责完全不同。
 
----
+## 要解决的问题
 
+| 问题 | 传统方案的痛点 | JWT/OAuth2 的解法 |
+|------|---------------|-------------------|
+| 分布式会话共享 | Session 依赖服务端存储，无法跨节点 | JWT 无状态令牌，服务端无需存储 |
+| 跨服务单点登录 | Session 同步复杂，耦合度高 | JWT + OAuth2 实现中心化认证 |
+| 第三方授权访问 | 用户需将密码交给第三方，风险极高 | OAuth2 委托授权，令牌限定范围 |
+| 微服务间认证 | 内部调用缺乏统一凭证 | JWT 内部传播 + JWT 声明携带权限 |
+| 前后端分离 | Cookie-based Session 不便跨域 | 无状态 Token 方案天然支持跨域 |
+| API 速率限制 | 无法按用户/应用区分限流 | OAuth2 scope 配合限流策略 |
 
-## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+## 认证 vs 授权：核心区别
 
-**它是什么**：认证（Authentication，你是谁）与授权（Authorization，你能干什么）是系统安全的两道门。JWT 是**无状态令牌标准**（RFC 7519），OAuth2 是**授权框架**（RFC 6749），OpenID Connect（OIDC）在 OAuth2 之上补「身份认证」。
+```mermaid
+graph LR
+    A[用户] -->|提供凭证| B[认证服务]
+    B -->|返回身份令牌| A
+    A -->|携带令牌| C[资源服务]
+    C -->|检查令牌权限| D{授权决策}
+    D -->|允许| E[返回资源]
+    D -->|拒绝| F[403 Forbidden]
+```
 
-**解决什么痛点**：Session-Cookie 方案服务端要存会话、跨域/多端扩展难、微服务下需共享会话。JWT 把用户信息签名进令牌，服务端无需存储即可校验；OAuth2 解决「第三方代授权访问」（如用微信登录），避免把密码交给第三方。
+- **认证（Authentication）**：验证用户身份 → 签发令牌
+- **授权（Authorization）**：检查令牌中的权限声明 → 决定是否放行
+- 认证是授权的前提，授权是认证的延伸
 
-**核心概念**：JWT（Header/Payload/Signature 三段 Base64）、Access Token、Refresh Token、OAuth2 四种授权模式（授权码/PKCE/客户端凭证/隐式已弃用）、OIDC ID Token、Scope、PKCE、JWKS、算法混淆攻击（HS256/RS256）。
+## JWT 详解
 
-**适用场景**：微服务/API 鉴权、多端（Web/App）统一身份、第三方登录（SSO）、前后端分离。
-**不适用**：需即时吊销且容忍不了短过期+黑名单的极高安全场景。
+### JWT 结构
 
----
+```
+Header.Payload.Signature
 
-## 一、认证 vs 授权（一字之差）
+Header (Base64URL):
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "key-id-123"
+}
 
-| 概念 | 英文 | 回答 | 例子 |
-|------|------|------|------|
-| **认证** | Authentication | 你是谁？ | 登录、验证码、指纹 |
-| **授权** | Authorization | 你能做什么？ | 角色权限、能否删数据 |
+Payload (Base64URL):
+{
+  "sub": "user-001",
+  "iss": "auth.example.com",
+  "aud": "api.example.com",
+  "exp": 1700000000,
+  "iat": 1699996400,
+  "scope": "read write",
+  "roles": ["admin", "editor"],
+  "org_id": "org-42"
+}
 
-> 先认证（确认身份），再授权（判定权限）。Spring Security 里 `Authentication`（是谁）和 `Authorization`（能访问啥）是两回事。
+Signature:
+RSASHA256(
+  base64UrlEncode(header) + "." + base64UrlEncode(payload),
+  privateKey
+)
+```
 
----
+### JWT 三部分职责
 
-## 二、Session-Cookie 方案（传统）
+| 部分 | 内容 | 作用 |
+|------|------|------|
+| Header | 算法、令牌类型、密钥 ID | 指定验证方式 |
+| Payload | 声明（claims） | 携带身份和权限信息 |
+| Signature | 数字签名 | 防篡改，验证令牌完整性 |
+
+### 常用 Claims
+
+| Claim | 全称 | 用途 |
+|-------|------|------|
+| `sub` | Subject | 用户唯一标识 |
+| `iss` | Issuer | 签发者（认证服务地址） |
+| `aud` | Audience | 受众（令牌预期使用者） |
+| `exp` | Expiration Time | 过期时间 |
+| `nbf` | Not Before | 生效时间 |
+| `iat` | Issued At | 签发时间 |
+| `jti` | JWT ID | 令牌唯一标识（防重放） |
+| `scope` | Scope | 权限范围 |
+
+### JWT 签名算法对比
+
+| 算法 | 类型 | 速度 | 安全性 | 适用场景 |
+|------|------|------|--------|----------|
+| HS256 | 对称 | 快 | 中 | 内部服务、简单场景 |
+| RS256 | 非对称 | 中 | 高 | 公开 API、跨组织 |
+| ES256 | 非对称 | 快 | 高 | 移动端、IoT |
+| PS256 | 非对称 | 慢 | 最高 | 高安全合规场景 |
+
+### JWT 安全考量
+
+| 风险 | 描述 | 防御措施 |
+|------|------|----------|
+| 算法混淆攻击 | 将 RS256 改为 HS256，用公钥签名 | 服务端严格指定验证算法 |
+| 令牌泄露 | JWT 被盗用 | 短有效期 + HTTPS + 刷新令牌 |
+| 声明注入 | 在 payload 中注入恶意 claims | 服务端校验所有声明，不信任客户端 |
+| 密钥泄露 | 私钥被盗，可伪造任意令牌 | HSM 存储 + 定期轮转 + 短期密钥 |
+
+## OAuth2 详解
+
+### 四种授权模式
+
+| 模式 | 流程 | 适用场景 | 安全性 |
+|------|------|----------|--------|
+| 授权码模式 | 前端获取 code → 后端换 token | Web 应用（最推荐） | 高 |
+| 隐式模式 | 直接返回 token（跳过 code） | 单页应用 SPA | 中 |
+| 密码模式 | 用户直接提供账号密码 | 受信任的自有应用 | 低 |
+| 客户端凭证 | 应用以自身身份获取 token | 服务间调用 | 高 |
+
+### 授权码模式完整流程
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant S as 服务端
-    U->>S: 登录(账号密码)
-    S->>S: 校验通过, 生成Session, 存Redis/内存
-    S-->>U: Set-Cookie: JSESSIONID=xxx
-    U->>S: 后续请求带 Cookie
-    S->>S: 查 Session 识别用户
+    participant C as 客户端
+    participant AS as 授权服务
+    participant RS as 资源服务
+
+    C->>U: 跳转到授权页面
+    U->>AS: 输入凭证并授权
+    AS->>C: 返回授权码 (code)
+    C->>AS: 用 code + client_secret 换取 token
+    AS->>C: 返回 access_token + refresh_token
+    C->>RS: 携带 access_token 访问资源
+    RS->>C: 返回资源数据
 ```
 
-- ✅ 服务端可控、可随时踢人（删 Session）、安全。
-- ❌ 服务端要存 Session（分布式要集中存 Redis）、跨域麻烦、移动端不友好。
+### Token 类型
 
----
+| Token 类型 | 用途 | 特点 |
+|------------|------|------|
+| Access Token | 访问资源的凭证 | 短期有效，如 15 分钟 |
+| Refresh Token | 刷新 Access Token | 长期有效，如 30 天 |
+| ID Token | 用户身份信息（OIDC） | 仅用于身份验证 |
+| JWT Token | 自包含的令牌 | 无需查后端，服务端可直接验证 |
 
-## 三、JWT 方案（无状态）
+### OAuth2 Scope 设计
 
-### 3.1 结构（三段 base64）
+```
+# 读写分离的 scope 设计
+scope:
+  - user:read      # 读取用户信息
+  - user:write     # 修改用户信息
+  - order:read     # 读取订单
+  - order:write    # 创建/修改订单
+  - admin:manage   # 管理后台权限
+```
 
-`header.payload.signature`
+## JWT + OAuth2 组合模式
 
-- **Header**：算法（HS256/RS256）、类型。
-- **Payload**：Claims（sub、exp、role、自定义）。
-- **Signature**：用密钥对前两段签名，防篡改。
+```mermaid
+graph TD
+    A[用户登录] --> B[认证服务]
+    B --> C[签发 JWT access_token]
+    C --> D[客户端存储 JWT]
+    D --> E[携带 JWT 访问 API]
+    E --> F[API 网关验证 JWT 签名]
+    F -->|有效| G[提取 scope 进行授权]
+    F -->|无效| H[401 Unauthorized]
+    G -->|有权限| I[返回资源]
+    G -->|无权限| J[403 Forbidden]
+```
+
+### 为什么用 JWT 作为 OAuth2 的 Access Token？
+
+| 优势 | 说明 |
+|------|------|
+| 无状态验证 | 资源服务无需查询授权服务 |
+| 自包含信息 | JWT payload 携带用户信息和权限 |
+| 跨服务传播 | Token 可在多个微服务间传递 |
+| 减少网络开销 | 避免每次请求都去认证服务验证 |
+
+## 实现要点
+
+### JWT 签发与验证
+
+```python
+# Python + PyJWT 示例
+import jwt
+from datetime import datetime, timedelta
+
+# 签发 JWT
+def create_token(user_id, scope):
+    payload = {
+        "sub": user_id,
+        "iss": "auth.example.com",
+        "scope": scope,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(minutes=15),
+        "jti": str(uuid.uuid4())
+    }
+    return jwt.encode(payload, private_key, algorithm="RS256")
+
+# 验证 JWT
+def verify_token(token):
+    try:
+        payload = jwt.decode(
+            token, public_key,
+            algorithms=["RS256"],
+            audience="api.example.com",
+            issuer="auth.example.com"
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise AuthError("Token expired")
+    except jwt.InvalidTokenError:
+        raise AuthError("Invalid token")
+```
+
+### 刷新令牌机制
+
+```
+Access Token 生命周期（15分钟）：
+  ├─ 过期前：正常使用
+  └─ 过期后：用 Refresh Token 获取新的 Access Token
+
+Refresh Token 安全策略：
+  ├─ 旋转（Rotation）：每次刷新生成新的 refresh_token
+  ├─ 重用检测：旧 refresh_token 被使用 → 全部吊销
+  └─ 绑定：绑定到特定 client_id 和 IP
+```
+
+### 令牌吊销
+
+| 方案 | 适用场景 | 延迟 |
+|------|----------|------|
+| 黑名单（Redis） | 需要即时吊销 | 低 |
+| 缩短有效期 | JWT 自然过期 | 高 |
+| Token Revocation Endpoint | OAuth2 标准方案 | 中 |
+| 密钥轮转 | 吊销所有旧令牌 | 高（但彻底） |
+
+## 常见安全陷阱
+
+| 陷阱 | 后果 | 正确做法 |
+|------|------|----------|
+| JWT 存储在 localStorage | XSS 攻击可窃取 | HttpOnly Cookie 或安全存储 |
+| 不验证 issuer/audience | Token 可被跨服务滥用 | 严格校验 iss/aud |
+| 使用弱密钥或共享密钥 | 密钥被暴力破解 | 使用 RSA/ECDSA 非对称加密 |
+| 不设置过期时间 | 被盗令牌永远有效 | 设置合理 exp + nbf |
+| 在 payload 存敏感数据 | Base64 可被解码 | 仅存非敏感声明 |
+| 不验证签名算法 | 算法混淆攻击 | 白名单指定允许算法 |
+
+## OIDC（OpenID Connect）
+
+### OIDC 是什么
+
+OIDC 是建立在 OAuth2 之上的身份层，它在 OAuth2 的 access_token 基础上增加了 **ID Token**，使 OAuth2 从"授权框架"升级为"认证+授权"协议。
+
+```
+OAuth2 = 授权框架（你能访问什么）
+OIDC = OAuth2 + 身份认证（你是谁 + 你能访问什么）
+```
+
+### OIDC 核心流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant C as 客户端
+    participant OP as OpenID Provider
+    participant RS as 资源服务
+
+    C->>U: 跳转授权（scope=openid profile email）
+    U->>OP: 登录并授权
+    OP->>C: 返回 authorization_code
+    C->>OP: 用 code 换 token
+    OP->>C: 返回 id_token + access_token + refresh_token
+    C->>C: 验证 id_token 签名和 claims
+    C->>RS: 携带 access_token 访问资源
+```
+
+### ID Token 结构
 
 ```json
-// payload 示例
-{"sub":"1001","name":"xuyu","role":"ADMIN","exp":1761897600}
+{
+  "iss": "https://auth.example.com",
+  "sub": "user-001",
+  "aud": "client-app-123",
+  "exp": 1700000000,
+  "iat": 1699996400,
+  "nonce": "n-0S6_WzA2Mj",
+  "name": "张三",
+  "email": "zhangsan@example.com",
+  "picture": "https://example.com/avatar.jpg",
+  "email_verified": true
+}
 ```
 
-### 3.2 流程
+### OIDC vs OAuth2 对比
+
+| 维度 | OAuth2 | OIDC |
+|------|--------|------|
+| 核心目标 | 资源授权 | 身份认证 + 资源授权 |
+| Token | access_token | id_token + access_token |
+| 标准 Scope | 自定义 | openid, profile, email, address, phone |
+| 用户信息 | 无标准接口 | /userinfo 端点 |
+| 发现文档 | 无 | /.well-known/openid-configuration |
+| 客户端注册 | 手动 | 支持动态注册 |
+
+### OIDC Discovery 文档
+
+```
+GET /.well-known/openid-configuration
+
+{
+  "issuer": "https://auth.example.com",
+  "authorization_endpoint": "https://auth.example.com/authorize",
+  "token_endpoint": "https://auth.example.com/token",
+  "userinfo_endpoint": "https://auth.example.com/userinfo",
+  "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
+  "supported_signing_alg_values": ["RS256", "ES256"],
+  "response_types_supported": ["code", "id_token", "token"],
+  "grant_types_supported": ["authorization_code", "refresh_token"],
+  "subject_types_supported": ["public"],
+  "id_token_signing_alg_values_supported": ["RS256", "ES256"]
+}
+```
+
+## JWT Token 存储最佳实践
+
+### 存储方案对比
+
+| 方案 | 安全性 | 易用性 | XSS 防护 | CSRF 防护 | 适用场景 |
+|------|--------|--------|----------|----------|----------|
+| HttpOnly Cookie | 高 | 中 | 防护（JS 不可读） | 需额外防护 | Web 应用（推荐） |
+| localStorage | 低 | 高 | 无防护 | 天然免疫 | 原型/内部工具 |
+| sessionStorage | 中 | 高 | 无防护 | 天然免疫 | 单标签页场景 |
+| 内存（变量） | 高 | 低 | 防护 | 天然免疫 | SPA（推荐） |
+| Secure Storage | 高 | 中 | 防护 | 天然免疫 | 移动端 |
+| Service Worker | 高 | 中 | 防护 | 天然免疫 | PWA |
+
+### HttpOnly Cookie + CSRF Token 组合
+
+```
+服务端设置：
+  Set-Cookie: access_token=xxx; HttpOnly; Secure; SameSite=Lax; Path=/
+
+客户端请求：
+  Cookie: access_token=xxx
+  X-CSRF-Token: csrf-token-value    ← CSRF 防护
+
+优点：
+  ├── JS 无法读取 Cookie（防 XSS 窃取）
+  ├── 浏览器自动携带（方便）
+  └── SameSite + CSRF Token 双重防 CSRF
+
+缺点：
+  ├── 需要 CSRF 防护机制
+  └── 跨域场景需要额外配置（CORS + credentials）
+```
+
+### SPA 内存存储模式
+
+```javascript
+// 推荐的 SPA Token 管理
+class TokenManager {
+  #accessToken = null;    // 私有变量，内存中
+  #refreshToken = null;
+
+  setTokens(access, refresh) {
+    this.#accessToken = access;
+    this.#refreshToken = refresh;
+  }
+
+  getAccessToken() {
+    return this.#accessToken;
+  }
+
+  async getValidToken() {
+    if (this.isTokenExpired(this.#accessToken)) {
+      await this.refreshTokens();
+    }
+    return this.#accessToken;
+  }
+
+  clear() {
+    this.#accessToken = null;
+    this.#refreshToken = null;
+  }
+}
+
+// 优点：XSS 无法直接读取
+// 缺点：刷新页面后丢失，需要重新认证或结合 refresh_token 机制
+```
+
+## Refresh Token 轮转机制
+
+### 轮转流程
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户
-    participant A as 认证服务
-    U->>A: 登录(账号密码)
-    A-->>U: 返回 JWT(签名令牌)
-    U->>A: 后续请求带 Authorization: Bearer xxx
-    A->>A: 验签名+过期+权限, 直接放行
+    participant C as 客户端
+    participant AS as Auth Server
+    participant DB as Token Store
+
+    C->>AS: 用 refresh_token_1 请求新 token
+    AS->>DB: 验证 refresh_token_1
+    DB-->>AS: 有效，标记已使用
+    AS->>C: 返回 access_token_new + refresh_token_2
+    AS->>DB: 删除 refresh_token_1
+    AS->>DB: 保存 refresh_token_2
+
+    Note over C,DB: 如果攻击者窃取了 refresh_token_1 并使用
+    C->>AS: 攻击者用 refresh_token_1 请求
+    AS->>DB: 验证 refresh_token_1
+    DB-->>AS: 已使用/已撤销
+    AS->>C: 401 Unauthorized
+    AS->>DB: 撤销该用户所有 refresh_token
 ```
 
-- ✅ **无状态**：服务端不存会话，JWT 自带身份信息，适合分布式 / 移动端 / 跨域。
-- ❌ **无法主动失效**：令牌到期前一直有效，除非加黑名单（又变有状态）。
-- ❌ 载荷可被 base64 解码（**别放敏感信息**），只靠签名防篡改不防泄露。
+### Token 轮转策略配置
 
-### 3.3 关键实践
+```yaml
+token_rotation:
+  access_token:
+    ttl: 900          # 15 分钟
+    algorithm: RS256
 
-- **短过期 + 刷新令牌（Refresh Token）**：access_token 短（如 15min），refresh_token 长（如 7d）存服务端可吊销；access 过期用 refresh 换新的。
-- **签名算法选 RS256（非对称）**：公钥验签、私钥签名，公钥可公开分发（网关验签无需私钥）。
-- **HTTPS 必选**：Bearer Token 明文传输，必须 TLS。
-- **黑名单 / 吊销**：退出登录 / 封号时，把 jti 放进 Redis 黑名单至过期。
-- **防重放**：加 `jti` + `nonce` + 时间戳。
+  refresh_token:
+    ttl: 2592000      # 30 天
+    rotation: true     # 每次使用后轮转
+    reuse_interval: 10 # 10 秒内的重用视为正常（网络重试）
+    maxReuse: 0        # 禁止重用
+    maxLifetime: 7776000  # 90 天最大生命周期
 
----
+  revocation:
+    on_reuse: all     # 重用时撤销该用户所有 token
+    on_password_change: all
+    on_logout: current  # 登出时只撤销当前 token
+```
 
-## 四、OAuth2（授权框架，不是认证）
+### Refresh Token 轮转实现
 
-OAuth2 解决「**第三方应用如何获得用户授权去访问资源**」，典型：用微信登录某 App。
+```python
+def refresh_access_token(old_refresh_token):
+    # 1. 查找并验证 refresh token
+    stored = db.get_refresh_token(old_refresh_token)
+    if not stored or stored.expired:
+        raise Unauthorized("Invalid refresh token")
 
-### 4.1 四种授权模式
+    # 2. 检测重用（可能被攻击者窃取）
+    if not stored.is_within_reuse_interval():
+        if stored.used:
+            # 重用检测：撤销该用户所有 token
+            db.revoke_all_tokens(stored.user_id)
+            raise Unauthorized("Token reuse detected")
+        raise Unauthorized("Token already used")
 
-| 模式 | 适用 | 说明 |
-|------|------|------|
-| **授权码（Authorization Code）** | 有后端的 Web 应用（最常用、最安全） | 先拿 code 再换 token，token 不暴露给浏览器 |
-| **授权码 + PKCE** | 公共客户端（SPA / 移动端） | 无 client_secret，用 code_verifier 防拦截 |
-| **隐式（Implicit）** | 老式 SPA（**已不推荐**） | 直接返回 token，易泄露 |
-| **密码（Password）** | 高度信任的第一方应用 | 用户把账号密码给客户端（不推荐第三方） |
-| **客户端凭证（Client Credentials）** | 服务到服务（机器对机器） | 无用户，用 client 凭证拿 token |
+    # 3. 标记旧 token 已使用
+    stored.mark_used()
 
-### 4.2 授权码模式流程
+    # 4. 生成新 token 对
+    new_access = create_access_token(stored.user_id)
+    new_refresh = create_refresh_token(stored.user_id)
+
+    # 5. 保存新 refresh token
+    db.save_refresh_token(new_refresh)
+
+    return new_access, new_refresh
+```
+
+## OAuth2 Device Flow（IoT 流程）
+
+### 适用场景
+
+IoT 设备（如智能电视、CLI 工具）无法展示完整登录页面，需要用户在另一个设备上完成授权。
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户
-    participant C as 第三方App
-    participant AS as 授权服务器
-    U->>C: 点击"微信登录"
-    C->>AS: 重定向, 带client_id/redirect_uri/scope
-    AS-->>U: 登录并授权
-    AS->>C: 回调 code
-    C->>AS: code + client_secret 换 token
-    AS-->>C: access_token
-    C->>AS: 带 token 调资源接口
+    participant D as IoT 设备
+    participant AS as Auth Server
+    participant U as 用户（手机/电脑）
+
+    D->>AS: POST /device/code (client_id, scope)
+    AS->>D: 返回 device_code + user_code + verification_uri
+
+    Note over D: 显示："请在手机上访问 https://auth.example.com/device 并输入 ABC-123"
+
+    D->>AS: 轮询 /token (device_code)
+    AS-->>D: 428 Authorization Pending
+
+    U->>AS: 访问 verification_uri
+    U->>AS: 输入 user_code 并授权
+
+    D->>AS: 轮询 /token (device_code)
+    AS->>D: 200 OK (access_token + refresh_token)
 ```
 
-> **OpenID Connect（OIDC）** = OAuth2 + 身份认证层（在 token 外多给 `id_token`），解决「认证」问题。用微信 / Google 登录实际是 OIDC。
+### Device Flow 请求/响应
 
----
+```http
+# 设备请求 device code
+POST /oauth/device/code
+Content-Type: application/x-www-form-urlencoded
 
-## 五、Spring Security 落地
+client_id=app-123&scope=read profile
+
+# 响应
+{
+  "device_code": "GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNh",
+  "user_code": "WDJB-MJHT",
+  "verification_uri": "https://auth.example.com/device",
+  "verification_uri_complete": "https://auth.example.com/device?user_code=WDJB-MJHT",
+  "expires_in": 600,
+  "interval": 5
+}
+```
+
+### 轮询实现要点
+
+```
+设备端轮询策略：
+  ├── 起始间隔：使用返回的 interval（通常 5s）
+  ├── 指数退避：超过 5 分钟后每次增加 1s
+  ├── 最大间隔：30s
+  ├── 超时处理：expires_in 到期后停止轮询
+  └── 错误处理：
+      ├── 428 → 继续轮询
+      ├── 400 → 设备码过期，重新获取
+      ├── 401 → 用户拒绝，提示重新操作
+      └── 403 → client_id 无效
+```
+
+## PKCE（Proof Key for Code Exchange）
+
+### 问题背景
+
+传统授权码模式中，client_secret 存储在客户端（SPA/移动端）不安全。PKCE 通过动态密钥解决了这个问题。
+
+```
+传统授权码模式：
+  Client → code + client_secret → AS → token
+  问题：SPA/移动端无法安全存储 client_secret
+
+PKCE 模式：
+  Client → code + code_verifier → AS → token
+  优势：无需 client_secret，通过密码学证明身份
+```
+
+### PKCE 流程
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant AS as Auth Server
+
+    C->>C: 生成 code_verifier (43-128 字符随机串)
+    C->>C: 计算 code_challenge = BASE64URL(SHA256(code_verifier))
+
+    C->>AS: /authorize?code_challenge=xxx&code_challenge_method=S256
+    AS->>AS: 存储 code_challenge
+
+    AS->>C: 返回 authorization_code
+
+    C->>AS: /token?code=xxx&code_verifier=yyy
+    AS->>C: 验证 SHA256(code_verifier) == code_challenge
+    AS->>C: 返回 access_token
+```
+
+### PKCE 实现代码
+
+```javascript
+// 生成 PKCE 参数
+function generatePKCE() {
+  // code_verifier: 43-128 字符的 [A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~"
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  const codeVerifier = base64urlEncode(array); // 43 字符
+
+  // code_challenge: BASE64URL(SHA256(code_verifier))
+  const encoder = new TextEncoder();
+  const data = encoder.encode(codeVerifier);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  const codeChallenge = base64urlEncode(new Uint8Array(digest));
+
+  return { codeVerifier, codeChallenge };
+}
+
+// 授权请求
+const { codeVerifier, codeChallenge } = await generatePKCE();
+window.location = `https://auth.example.com/authorize?
+  response_type=code&
+  client_id=app-123&
+  redirect_uri=https://myapp.com/callback&
+  code_challenge=${codeChallenge}&
+  code_challenge_method=S256`;
+
+// Token 交换
+const tokenResponse = await fetch('/token', {
+  method: 'POST',
+  body: new URLSearchParams({
+    grant_type: 'authorization_code',
+    code: authorizationCode,
+    redirect_uri: 'https://myapp.com/callback',
+    code_verifier: codeVerifier
+  })
+});
+```
+
+### code_challenge_method 对比
+
+| 方法 | 算法 | 安全性 | 性能 |
+|------|------|--------|------|
+| plain | 无哈希 | 低（需 TLS） | 快 |
+| S256 | SHA-256 | 高 | 快（推荐） |
+
+## Token Introspection Endpoint
+
+### 作用
+
+资源服务器通过 Introspection 端点验证 access_token 的有效性，适用于 opaque token（非 JWT）或需要即时吊销检查的场景。
+
+### 请求/响应
+
+```http
+# 请求
+POST /oauth/introspect
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic base64(client_id:client_secret)
+
+token=2YotnFZFEjr1zCsicMWpAA&token_type_hint=access_token
+
+# 响应（有效 token）
+{
+  "active": true,
+  "scope": "read write",
+  "client_id": "app-123",
+  "username": "zhangsan",
+  "token_type": "Bearer",
+  "exp": 1700000000,
+  "iat": 1699996400,
+  "sub": "user-001",
+  "aud": "api.example.com",
+  "iss": "https://auth.example.com"
+}
+
+# 响应（无效/过期 token）
+{
+  "active": false
+}
+```
+
+### Introspection vs JWT 自验证
+
+| 维度 | Introspection | JWT 自验证 |
+|------|--------------|-----------|
+| 网络开销 | 每次请求需调用 AS | 无网络开销 |
+| 实时性 | 实时（可即时吊销） | 延迟到 token 过期 |
+| 依赖 | 强依赖 AS 可用性 | 无外部依赖 |
+| 适用场景 | 高安全要求、opaque token | 高性能、分布式场景 |
+
+## JWT 密钥轮转策略
+
+### 轮转原因
+
+- 私钥泄露时能最小化影响范围
+- 满足合规要求（定期轮转密钥）
+- 降低长期密钥被破解的风险
+
+### 密钥轮转流程
+
+```mermaid
+sequenceDiagram
+    participant P as Producer (Auth Server)
+    participant V as Verifier (Resource Server)
+
+    Note over P: 阶段 1: 使用 key-1 签名
+    P->>V: JWT (kid=key-1)
+    V->>V: 获取 key-1 公钥并验证
+
+    Note over P: 阶段 2: 同时使用 key-1 和 key-2
+    P->>V: JWT (kid=key-2) ← 新请求
+    V->>V: 获取 key-2 公钥并验证
+    P->>V: JWT (kid=key-1) ← 旧请求仍有效
+    V->>V: 使用 key-1 验证
+
+    Note over P: 阶段 3: 撤销 key-1
+    P->>V: 通知撤销 key-1
+    V->>V: 拒绝 kid=key-1 的请求
+```
+
+### JWKS（JSON Web Key Set）管理
+
+```json
+// GET /.well-known/jwks.json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "key-2",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "0vx7agoebGcQSuu...",
+      "e": "AQAB"
+    },
+    {
+      "kty": "RSA",
+      "kid": "key-1",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "yK5mFz7..."
+      // 旧密钥，仍保留用于验证旧 token
+    }
+  ]
+}
+```
+
+### 密钥轮转最佳实践
+
+```
+轮转策略：
+  ├── 轮转周期：90 天（或根据安全要求调整）
+  ├── 并存期：至少 2 个密钥同时有效
+  │   ├── 新密钥用于签名新 token
+  │   └── 旧密钥用于验证未过期的旧 token
+  ├── 撤销期：密钥过期后保留 24h 验证
+  └── 自动化：使用 Vault/AWS KMS 管理密钥生命周期
+
+实现步骤：
+  1. 生成新密钥对
+  2. 将公钥发布到 JWKS 端点
+  3. 切换签名到新密钥（kid 在 JWT header 中标识）
+  4. 等待所有旧 token 过期
+  5. 从 JWKS 中移除旧密钥
+```
+
+## OAuth2 常见漏洞与防御
+
+### 漏洞清单
+
+| 漏洞 | 攻击方式 | 防御措施 |
+|------|----------|----------|
+| 授权码注入 | 窃取授权码在自己的会话中使用 | PKCE + state 参数 |
+| 开放重定向 | 授权服务跳转到恶意 URL | 严格校验 redirect_uri |
+| Token 泄露 | 日志/URL/Referer 泄露 token | Bearer token 不放 URL 参数 |
+| CSRF 攻击 | 伪造授权请求绑定受害者账户 | state 参数 + 客户端会话绑定 |
+| 混淆代理攻击 | 伪造 token 响应 | 严格校验 issuer + audience |
+| 资源服务器混淆 | 用 A 服务的 token 访问 B 服务 | token 绑定 audience claim |
+
+### 安全检查清单
+
+```
+OAuth2 实现安全审计清单：
+  ├── [ ] 所有请求携带 state 参数并验证
+  ├── [ ] redirect_uri 严格匹配（不允许通配）
+  ├── [ ] access_token 使用 Bearer 方式传递
+  ├── [ ] refresh_token 绑定到 client_id
+  ├── [ ] PKCE 强制用于公开客户端
+  ├── [ ] JWT 验证 iss / aud / exp / nbf
+  ├── [ ] TLS 强制（HSTS + 证书固定）
+  ├── [ ] Token 端点限流
+  ├── [ ] 错误信息不泄露内部细节
+  └── [ ] 定期轮转密钥和 client_secret
+```
+
+## Spring Security 实现 OAuth2 + JWT
+
+### 配置示例
 
 ```java
 @Configuration
-@EnableWebSecurity
-public class SecurityConfig {
+@EnableAuthorizationServer
+public class AuthServerConfig extends AuthorizationServerConfigurerAdapter {
+
+    @Override
+    public void configure(ClientDetailsServiceConfigurer clients) throws Exception {
+        clients.inMemory()
+            .withClient("web-app")
+            .authorizedGrantTypes("authorization_code", "refresh_token")
+            .scopes("read", "write")
+            .redirectUris("https://myapp.com/callback")
+            .and()
+            .withClient("iot-device")
+            .authorizedGrantTypes("device_code")
+            .scopes("read")
+            .autoApprove(true);
+    }
+
+    @Override
+    public void configure(AuthorizationServerEndpointsConfigurer endpoints) {
+        endpoints
+            .tokenStore(jwtTokenStore())
+            .accessTokenConverter(jwtAccessTokenConverter())
+            .reuseRefreshTokens(false);  // refresh token 轮转
+    }
+
     @Bean
-    public SecurityFilterChain chain(HttpSecurity http) throws Exception {
-        return http
-            .csrf(csrf -> csrf.disable())
-            .authorizeHttpRequests(a -> a
-                .requestMatchers("/public/**").permitAll()
-                .requestMatchers("/admin/**").hasRole("ADMIN")
-                .anyRequest().authenticated())
-            .oauth2ResourceServer(o -> o.jwt(Customizer.withDefaults())) // 验 JWT
-            .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
-            .build();
+    public JwtAccessTokenConverter jwtAccessTokenConverter() {
+        JwtAccessTokenConverter converter = new JwtAccessTokenConverter();
+        converter.setSigningKey(privateKey);
+        converter.setVerifierKey(publicKey);
+        return converter;
     }
 }
 ```
 
-- **资源服务器（Resource Server）**：只验 JWT（RS256 公钥），不登录。
-- **授权服务器（Authorization Server）**：发 token，可用 Spring Authorization Server 或 Keycloak。
-- **方法级授权**：`@PreAuthorize("hasRole('ADMIN')")`。
+### 资源服务器配置
+
+```java
+@Configuration
+@EnableResourceServer
+public class ResourceServerConfig extends ResourceServerConfigurerAdapter {
+
+    @Override
+    public void configure(HttpSecurity http) throws Exception {
+        http.authorizeRequests()
+            .antMatchers("/api/public/**").permitAll()
+            .antMatchers("/api/admin/**").hasAuthority("ROLE_ADMIN")
+            .anyRequest().authenticated()
+            .and()
+            .cors().and().csrf().disable();
+    }
+
+    @Override
+    public void configure(ResourceServerSecurityConfigurer resources) {
+        resources.tokenStore(jwtTokenStore());
+    }
+}
+```
+
+### 自定义 JWT Claims
+
+```java
+@Component
+public class CustomTokenEnhancer implements TokenEnhancer {
+
+    @Override
+    public OAuth2AccessToken enhance(OAuth2AccessToken accessToken,
+                                      OAuth2Authentication authentication) {
+        User user = (User) authentication.getPrincipal();
+        Map<String, Object> additionalInfo = new HashMap<>();
+        additionalInfo.put("org_id", user.getOrgId());
+        additionalInfo.put("roles", user.getRoles());
+        ((DefaultOAuth2AccessToken) accessToken)
+            .setAdditionalInformation(additionalInfo);
+        return accessToken;
+    }
+}
+```
+
+## 与其他板块的关系
+
+| 关联板块 | 关系描述 |
+|----------|----------|
+| **微服务架构** | JWT 是微服务间认证的事实标准，OAuth2 提供统一授权框架 |
+| **API 网关** | 网关统一验证 JWT，将用户信息透传给下游服务 |
+| **零信任安全** | JWT + OAuth2 是零信任架构中身份验证的核心组件 |
+| **SSO 单点登录** | OAuth2/OIDC 是实现跨域 SSO 的主流方案 |
+| **RBAC/ABAC** | JWT 的 scope/roles 声明驱动权限控制模型 |
+
+## 一句话总结
+
+JWT 是分布式环境下的无状态身份令牌，OAuth2 是第三方资源委托访问的安全框架；前者解决"如何证明你是谁"，后者解决"你有权访问什么资源"，二者配合构成现代微服务认证授权的基石。
 
 ---
 
-## 六、Keycloak（企业级 IAM）
+## 参考资料
 
-- 开源身份与访问管理，开箱即用的授权服务器（OIDC / OAuth2 / SAML）。
-- 提供用户管理、SSO、社交登录、LDAP 集成、细粒度授权。
-- 适合不想自己造授权服务器的团队：部署 Keycloak，应用只做资源服务器验 token。
-
----
-
-## 七、常见坑
-
-1. **JWT 放敏感信息**：payload 仅 base64，任何人可解码 → 只放非敏感 claims。
-2. **token 永久有效**：不设 exp 或过长 → 泄露即永久沦陷，必须短过期 + 刷新。
-3. **用 HS256 但密钥弱**：HS256 对称，密钥泄露全完蛋 → 高安全用 RS256。
-4. **退出登录没吊销**：JWT 无状态，退出只是前端删 token，后端仍认 → 加黑名单或短过期。
-5. **OAuth2 用 Implicit / 密码模式**：已不推荐，用授权码 + PKCE。
-6. **HTTP 传 token**：必须 HTTPS，否则被抓包。
-7. **权限写死**：用 RBAC（角色）或 ABAC（属性），别在代码里硬判断。
-
----
-
-## 面试高频问题（20+ 条）
-
-1. **认证 vs 授权？** 认证（Authentication）确认你是谁（登录）；授权（Authorization）确认你能干什么（权限）。OAuth2 是授权框架，OIDC 在其上加身份认证。
-
-2. **JWT 三段结构？** Header（算法/类型）、Payload（claims：sub/exp/iat 等）、Signature（前两段 Base64URL + 密钥签名）。三段用点连接，自包含、可校验。
-
-3. **JWT vs Session-Cookie？** Session 有状态（服务端存会话，可即时吊销，扩展需共享存储）；JWT 无状态（令牌自带信息，易横向扩展，但过期前难即时吊销）。微服务/多端选 JWT，传统单体可选 Session。
-
-4. **为什么不应把 JWT 存 localStorage？** localStorage 可被 JS 读，XSS 直接偷令牌；应存 HttpOnly + Secure + SameSite Cookie（防 XSS 读取、防 CSRF），或存内存。
-
-5. **Access Token 与 Refresh Token 分工？** Access Token 短效（5-15 分钟）用于访问 API；Refresh Token 长效（数天~数周）用于换发新 Access Token，减少频繁登录。
-
-6. **Refresh Token 轮换（Rotation）？** 每次用 Refresh Token 换发新令牌时，旧 Refresh Token 立即作废；若被盗用，合法用户下次刷新会检测到复用并吊销全部令牌，缩小危害窗口。
-
-7. **OAuth2 四种授权模式？** 授权码（最安全，有后端 Web 应用）、授权码+PKCE（SPA/移动端，无 client_secret）、客户端凭证（服务间 M2M，无用户）、隐式与密码模式已弃用。
-
-8. **PKCE 是什么，为什么重要？** Proof Key for Code Exchange：公开客户端（SPA/App）无法安全存 client_secret，PKCE 用 code_verifier+challenge 防授权码拦截。现推荐所有流都加 PKCE。
-
-9. **OAuth2 与 OIDC 区别？** OAuth2 回答「能访问什么」（授权）；OIDC 加 ID Token（JWT）回答「用户是谁」（认证）。仅凭 OAuth2 不知用户身份，OIDC 才补充身份。
-
-10. **ID Token 能发给 API 吗？** 不能。ID Token 的 aud 是客户端应用，用于客户端验证用户身份；API 访问应用 Access Token。混用有安全风险。
-
-11. **HS256 vs RS256 区别？** HS256 对称（一个 secret 签名+验签），适合单服务；RS256 非对称（私钥签、公钥验），微服务中仅认证服务器持私钥，其他服务用公钥验，更安全解耦。
-
-12. **算法混淆攻击（Algorithm Confusion）？** RS256 环境下攻击者把 alg 改成 HS256，用公开的公钥当 HS256 密钥伪造签名。防御：服务端固定允许算法，不信任令牌里的 alg。
-
-13. **如何实现令牌吊销？** JWT 无状态难即时吊销：① 黑名单（Redis 存已吊销 jti）；② 短过期 + 吊销 Refresh Token；③ 令牌版本号（用户级 token_version，不匹配即拒）。方案②最实用。
-
-14. **JWT 过期时间设置建议？** Access Token 短（15m 内），Refresh Token 长（7d 内）；避免 30d 长过期 Access Token（被盗危害大）。
-
-15. **CORS 与 OAuth2 关系？** SPA 请求 token 端点需 CORS（auth server 允许该 Origin）；授权码流 token 交换在后端，无 CORS 问题；前端 PKCE 直连需 CORS。
-
-16. **密码如何安全存储？** 用 bcrypt/Argon2（自带加盐，work factor≥12），绝不明文；校验用恒定时间比较防时序攻击。
-
-17. **Client Credentials 何时用？** 服务间通信（M2M）、批处理、cron，无用户上下文，无 Refresh Token，过期直接重请。
-
-18. **令牌存储最佳实践（前端）？** 拆分：Access 存内存 + Refresh 存 HttpOnly/Secure/SameSite Cookie；或 Access+Refresh 都存 HttpOnly Cookie（加 CSRF 防护）。
-
-19. **OAuth2 不是认证！** OAuth2 本身是授权，单独用无法确定用户身份；需要身份认证请用 OIDC（拿 ID Token）。
-
-20. **SAML vs OIDC？** SAML 老牌企业 SSO（XML，老 SaaS）；OIDC 新（JSON/JWT，移动/SPA/微服务友好）。新项目优先 OIDC。
-
-21. **DPoP（证明持有）？** RFC 9449：即使令牌被盗，攻击者因无客户端私钥签名也无法用；Access Token 与 DPoP Proof 一起提交，确保仅持有者可用。
-
-22. **令牌被盗（secret 泄露）应急？** 立即轮换签名密钥并部署，现有令牌全部失效迫使用户重登；长期用 RS256 分离公私钥，泄露公钥无碍。
-
----
-## 九、与其他板块的关系
-
-- 和「**基础知识/API 网关**」：网关常做统一 JWT 校验（`JwtAuthFilter`）。
-- 和「**基础知识/注册中心与配置中心**」：Keycloak / 授权服务器可注册到 Nacos。
-- 和「**架构/系统架构**」：认证授权是「安全层」，属横切关注点。
-- 和「**基础知识/中间件**」其他篇：各中间件自身的鉴权（如 MinIO 预签名、Kong JWT 插件）都基于此原理。
+- [JWT 官方规范 RFC 7519](https://datatracker.ietf.org/doc/html/rfc7519)
+- [OAuth 2.0 规范 RFC 6749](https://datatracker.ietf.org/doc/html/rfc6749)
+- [OpenID Connect 规范](https://openid.net/specs/openid-connect-core-1_0.html)
+- [OWASP JWT 安全指南](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html)
+- [Auth0 JWT 文档](https://auth0.com/docs/secure/tokens/json-web-tokens)

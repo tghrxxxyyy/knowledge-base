@@ -1,234 +1,711 @@
-# MQTT 与 IoT 消息 Broker
+# MQTT 与消息 Broker
 
-> MQTT 是**物联网（IoT）的轻量级发布/订阅协议**，专为低带宽、弱网、嵌入式设备设计。
-> 配套 Broker（服务端）如 EMQX、Mosquitto、HiveMQ、VerneMQ。
-> 适合：智能家居、车联网、工业 IoT、传感器上报、移动端实时推送。
-> 注意：MQTT **是协议不是消息队列**，虽常被叫「MQTT MQ」，但它和 RabbitMQ/Kafka 这种「业务消息队列」模型不同。
+> **核心认知**：MQTT 是为低带宽、高延迟、不可靠网络设计的轻量级发布/订阅协议，是 IoT 设备通信的事实标准。消息 Broker 是发布/订阅模式的核心枢纽，负责消息的路由、存储和投递。理解 MQTT 协议和 Broker 架构是构建大规模 IoT 系统的基础。
 
----
+## 要解决的问题
 
+| 问题 | 传统 HTTP 的痛点 | MQTT/Broker 的解法 |
+|------|-----------------|-------------------|
+| 低带宽网络 | HTTP 头部开销大 | MQTT 固定头部仅 2 字节 |
+| 不可靠网络 | 连接断开后消息丢失 | 三级 QoS + 遗嘱消息 |
+| 海量设备连接 | HTTP 短连接开销大 | 长连接 + 轻量协议 |
+| 实时推送 | HTTP 轮询延迟高 | Broker 主动推送 |
+| 异构设备 | 不同设备能力差异大 | 协议可裁剪，支持最小实现 |
+| 设备离线 | 离线期间消息丢失 | 持久化 + 遗嘱消息 |
 
-## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+## MQTT 协议详解
 
-**它是什么**：MQTT（Message Queuing Telemetry Transport）是**基于发布/订阅模式的轻量级物联网传输协议**，基于 TCP（也支持 WebSocket），协议头最小仅 2 字节，专为低带宽、高延迟、不稳定网络设计。由 IBM 提出，现为 OASIS 标准（v5.0）。
+### MQTT 消息结构
 
-**解决什么痛点**：HTTP 在物联网场景开销大（每请求数百字节头、频繁建连耗电、无法服务器主动下行、断网丢数据）。MQTT 用长连接 + 极简头 + QoS + 遗嘱/保留消息，完美适配受限设备与弱网。
+```
+MQTT 固定头部（2 字节）：
+  ├── 消息类型（4 bit）：CONNECT/PUBLISH/SUBSCRIBE/...
+  ├── DUP 标志（1 bit）：重发标记
+  ├── QoS 级别（2 bit）：0/1/2
+  └── RETAIN 标志（1 bit）：保留消息
 
-**核心概念**：Broker（服务端，如 EMQX/Mosquitto）、Client、Topic（层级主题，支持 +/# 通配符）、Payload（载荷）、QoS（0/1/2 三级）、Retained（保留消息）、Will（遗嘱消息）、KeepAlive（心跳保活）。
+可变头部：
+  ├── Packet ID（QoS > 0 时）
+  ├── Topic Name
+  └── Properties（v5.0 新增）
 
-**适用场景**：IoT 设备采集、车联网、智能家居、即时推送、移动弱网通信。
-**不适用**：需要复杂路由/事务/延迟队列的通用后端解耦（应选 RabbitMQ/Kafka）。
+有效载荷：
+  └── 消息体（应用数据）
+```
 
----
+### QoS 级别对比
 
-## 一、MQTT 是什么
+| QoS | 名称 | 投递保证 | 网络开销 | 适用场景 |
+|-----|------|----------|----------|----------|
+| 0 | At most once | 最多一次 | 最低 | 传感器数据（允许丢失） |
+| 1 | At least once | 至少一次 | 中 | 命令下发（允许重复） |
+| 2 | Exactly once | 恰好一次 | 最高 | 金融交易（不可丢失/重复） |
 
-MQTT（Message Queuing Telemetry Transport）1999 年诞生于 IBM，现为 OASIS 标准。设计目标：
-- **极小开销**：最小协议头仅 **2 字节**，适合嵌入式/移动网络。
-- **发布/订阅（Pub/Sub）**：设备向「主题 Topic」发消息，订阅该主题者收到。
-- **长连接 + Keep-Alive**：省电、弱网下友好。
-- **三种 QoS** 保证不同送达程度。
+### QoS 2 完整流程（四次握手）
 
----
+```
+发送方                        接收方
+  │── PUBLISH (QoS2) ────────>│
+  │<── PUBREC ────────────────│
+  │── PUBREL ────────────────>│
+  │<── PUBCOMP ───────────────│
+```
 
-## 二、核心模型
+### MQTT v3.1.1 vs v5.0
+
+| 特性 | v3.1.1 | v5.0 |
+|------|--------|------|
+| 属性（Properties） | 不支持 | 支持（元数据） |
+| 消息过期 | 不支持 | 支持 |
+| 共享订阅 | 不支持 | 原生支持 |
+| 请求/响应 | 不支持 | 支持 |
+| 认证增强 | 基础 | SASL + 自定义 |
+| 会话过期 | 不支持 | 支持 |
+| 流控 | 不支持 | 支持 |
+
+## 消息 Broker 架构
+
+### 发布/订阅模式
 
 ```mermaid
 graph LR
-  D1[设备A] -->|publish /sensor/temp| B[Broker EMQX]
-  D2[设备B] -->|publish /sensor/hum| B
-  B -->|push 匹配主题| S1[订阅 /sensor/+]
-  B -->|push| S2[订阅 /sensor/temp]
+    P1[发布者1] -->|publish| B[Broker]
+    P2[发布者2] -->|publish| B
+    B -->|subscribe| S1[订阅者1]
+    B -->|subscribe| S2[订阅者2]
+    B -->|subscribe| S3[订阅者3]
+    B -->|路由规则| B
 ```
 
-- **Broker**：中心服务端（EMQX 等），负责路由与分发。
-- **Topic**：分层字符串，支持通配符 `+`（单层）、`#`（多层）。如 `/sensor/temp`、`/factory/+/status`。
-- **发布者/订阅者**：设备可同时是两者（双向通信）。
-- **Session**：持久会话，断线重连可补发离线消息（QoS1/2）。
+### 消息路由模型
 
----
+```
+Topic 路由层次：
+  ├── 精确匹配：device/001/temperature
+  ├── 单层通配：device/+/temperature（匹配 device/001/temperature）
+  ├── 多层通配：device/#（匹配 device/001/temperature）
+  └── 共享订阅：$share/group/topic（负载均衡）
 
-## 三、QoS 三级
+消息投递流程：
+  1. 消息到达 Broker
+  2. 匹配 Topic 路由规则
+  3. 查找所有匹配的订阅者
+  4. 根据 QoS 级别投递消息
+  5. 持久化消息（可选）
+```
 
-| QoS | 语义 | 说明 |
-|-----|------|------|
-| 0 | At most once（最多一次） | 发完即忘，可能丢 |
-| 1 | At least once（至少一次） | 有确认，可能重复 |
-| 2 | Exactly once（恰好一次） | 四次握手，不丢不重，开销最大 |
+## 主流消息 Broker 对比
 
-还有 **Retained Message**（保留最后一条，新订阅者立即拿到）、**Last Will**（遗嘱消息，设备异常离线时 Broker 代发）。
+| 特性 | EMQX | Mosquitto | HiveMQ | RabbitMQ |
+|------|------|-----------|--------|----------|
+| 协议支持 | MQTT 3.1.1/5.0 + WebSocket | MQTT 3.1.1/5.0 | MQTT 3.1.1/5.0 | AMQP/MQTT |
+| 集群 | 分布式集群 | 单节点/桥接 | 分布式集群 | 镜像队列 |
+| 性能 | 百万级连接 | 千级连接 | 十万级连接 | 万级连接 |
+| 持久化 | 支持 | 支持 | 支持 | 支持 |
+| 规则引擎 | 内置 | 无 | 内置 | Exchange |
+| 语言 | Erlang/Elixir | C | Java | Erlang |
+| 适用场景 | 大规模 IoT | 嵌入式/轻量 | 企业 IoT | 企业消息 |
 
----
+## EMQX 深入
 
-## 四、MQTT vs 传统 MQ
-
-| 维度 | MQTT | RabbitMQ/Kafka/RocketMQ |
-|------|------|--------------------------|
-| 目标 | 设备-云、弱网友好 | 服务器间高吞吐/企业集成 |
-| 模型 | Pub/Sub，多对多广播 | Queue 点对点 / Exchange Pub-Sub |
-| 协议头 | 最小 2 字节 | 复杂（AMQP KB 级 / Kafka 动态） |
-| 保序 | 单主题内有序 | Kafka 分区内有序 |
-| 吞吐 | 单 Broker 万~十万 msg/s | Kafka 百万级/s |
-| 消费模型 | 所有订阅者都收到副本 | 竞争消费（一条只处理一次） |
-| 离线恢复 | QoS1/2 + 持久会话自动补 | 需手动 Rebalance 监听 |
-
-**关键区别**：标准 MQTT 是「广播」——主题下所有订阅者都收到一份；而 MQ 的 Queue 是「竞争消费」——一条消息只被一个消费者处理。**MQTT 不能直接当任务队列用**。但高级 Broker（如 EMQX 6.0）提供 **Shared Subscription（共享订阅）**，让一组客户端负载均衡，从而能胜任任务队列场景（弥合 MQTT 与 MQ 的鸿沟）。
-
----
-
-## 五、主流 MQTT Broker
-
-| Broker | 特点 | 许可证 |
-|--------|------|--------|
-| **EMQX** | 最可扩展，单集群 **1 亿+ 并发**、百万 msg/s、亚毫秒延迟，规则引擎+50+ 集成，支持 MQTT 5.0/3.1.1/3.1 + QUIC + CoAP/LwM2M/MQTT-SN，Cluster Linking 跨地域复制 | v5.9.0 起 **BSL 1.1**（前 Apache-2.0） |
-| **Mosquitto** | 极轻量，适合边缘/嵌入式，单机能跑 | EPL/EDL |
-| **HiveMQ** | 企业级，强合规与扩展 | 商业 + 社区 |
-| **VerneMQ** | 分布式，Erlang 实现 | Apache-2.0 |
-
-> EMQX 仓库 `github.com/emqx/emqx`：Erlang/OTP 实现，定位 "world's most scalable and reliable MQTT platform"，广泛用于 AI/IoT/IIoT/车联网。
-
----
-
-## 六、典型 IoT 架构（MQTT + Kafka 互补）
+### 集群架构
 
 ```mermaid
-graph LR
-  Devices[海量设备] -->|MQTT| Edge[EMQX 边缘 Broker]
-  Edge -->|Bridge 桥接| Kafka[(Kafka 后端)]
-  Kafka --> Flink[Flink 流处理]
-  Kafka --> Warehouse[(数据湖/ClickHouse)]
-  Flink --> App[业务系统/告警]
+graph TD
+    E1[EMQX Node 1] <-->|gossip| E2[EMQX Node 2]
+    E2 <-->|gossip| E3[EMQX Node 3]
+    E3 <-->|gossip| E1
+    D1[Device 1] --> E1
+    D2[Device 2] --> E2
+    D3[Device 3] --> E3
+    E1 --> DB[(Database)]
+    E2 --> DB
+    E3 --> DB
 ```
 
-- **边缘用 MQTT**：高效搞定设备接入（海量长连接、弱网、低开销）。
-- **后端用 Kafka**：承接高吞吐流处理、持久化、回放。
-- Broker 的 **规则引擎** 直接把 MQTT 消息桥接到 Kafka/HTTP/DB，省 ETL。
+### 规则引擎
 
----
+```
+规则引擎数据流：
+  事件 → 规则 → 动作
 
-## 七、生产实践与避坑
+事件源：
+  ├── 消息发布（message.publish）
+  ├── 消息到达（message.delivered）
+  ├── 客户端连接（client.connected）
+  └── 客户端断开（client.disconnected）
 
-1. **Topic 设计分层**：`/{domain}/{deviceId}/{metric}`，便于通配订阅与权限控制。
-2. **QoS 权衡**：遥测数据用 QoS0（允许丢），控制指令用 QoS1/2（必达）。
-3. **遗嘱 + 保留消息**：设备掉线用 Will 通知，状态类用 Retained 让新订阅者立即可见。
-4. **安全**：TLS/SSL 加密、JWT/X.509 认证、ACL 限制主题权限。
-5. **共享订阅做任务队列**：避免「所有订阅者都收到」导致的重复处理。
-6. **与 Java 集成**：Eclipse Paho（`org.eclipse.paho.client.mqttv3`）是常用客户端。
+动作类型：
+  ├── 数据持久化 → MySQL/PostgreSQL/TDengine
+  ├── 消息转发 → Kafka/AMQP/MQTT
+  ├── HTTP 推送 → Webhook
+  └── 计算处理 → 内置函数
+```
 
----
+### EMQX 配置示例
 
-## 七·五、大规模设备接入工程（百万设备怎么连）
+```hocon
+# emqx.conf
+listeners.tcp.default {
+  bind = "0.0.0.0:1883"
+  max_connections = 1000000
+}
 
-### 1. 设备身份与认证（接入第一关）
+broker {
+  session_expiry_interval = 2h
+  max_mqueue_len = 1000
+  prefetch_count = 100
+}
 
-| 方案 | 机制 | 适用 |
+rule_engine {
+  rules {
+    my_rule {
+      sql = "SELECT * FROM \"sensor/#\" WHERE temperature > 40"
+      actions = [
+        { function = "emqx_bridge_mqtt:publish", args = { topic = "alert/high-temp" } }
+      ]
+    }
+  }
+}
+```
+
+## IoT 场景消息模式
+
+### 设备上报模式
+
+```
+设备 → Broker → 应用服务器
+  ├── 遥测数据：温度、湿度、位置
+  ├── 状态数据：在线/离线、电量
+  └── 事件数据：告警、按钮触发
+```
+
+### 命令下发模式
+
+```
+应用服务器 → Broker → 设备
+  ├── 控制命令：开/关、调节参数
+  ├── 配置下发：OTA 升级包
+  └── 心跳请求：设备响应确认
+```
+
+### 双向通信模式
+
+```
+应用服务器 <--> Broker <--> 设备
+  ├── 请求/响应：RPC over MQTT
+  ├── 发布/订阅：事件广播
+  └── 共享订阅：设备组负载均衡
+```
+
+## 高可用设计
+
+| 层次 | 方案 | 说明 |
 |------|------|------|
-| 一机一密（DeviceSecret） | 每设备独立密钥，连接时校验 | 自研设备/网关（推荐） |
-| X.509 证书 | 双向 TLS，证书即身份 | 安全要求高（金融/车企） |
-| JWT/Token | 时间戳 + 签名换取临时凭证 | 移动端 App 接入 |
+| 连接层 | 负载均衡 + 多节点 | L4 LB 分发 TCP 连接 |
+| 会话层 | 会话持久化 | 连接断开后恢复订阅关系 |
+| 消息层 | 消息持久化 | 重启后恢复未消费消息 |
+| 数据层 | 数据库集群 | 规则引擎数据写入高可用 DB |
+| 监控层 | Prometheus + Grafana | 连接数、消息量、延迟 |
 
-- **产品级 vs 设备级权限**：ACL 按「产品（同一类设备）主题前缀」授权，而不是逐设备配置；
-- 设备注册在云端（product → device），连接时 Broker 校验「设备是否存在 + 凭证有效 + 未禁用」。
+## 常见陷阱
 
-### 2. 影子设备与配置下发（离线也能改配置）
+| 陷阱 | 后果 | 正确做法 |
+|------|------|----------|
+| QoS 2 滥用 | 性能严重下降 | 非关键消息用 QoS 0/1 |
+| 不设遗嘱消息 | 设备离线无人知晓 | 配置 Last Will + Testament |
+| Topic 设计不合理 | 路由效率低 | 规范 Topic 层次结构 |
+| 不限连接数 | 服务器被打垮 | 设置 max_connections |
+| 会话过期太长 | 资源浪费 | 根据设备特性设置 expiry |
+| 心跳间隔太长 | 检测断开延迟 | 合理设置 keepalive |
 
-- **Device Shadow**：云端保存「期望状态（desired）」与「上报状态（reported）」两份 JSON；
-- 设备离线时运营改 desired → 设备上线/重连时对比并同步，**断网场景下配置不丢**；
-- 下发类用 QoS1 + 回执确认（设备回复 applied），超时重发。
+## MQTT 共享订阅详解
 
-### 3. OTA 固件升级（IoT 特有的发布流程）
+### 共享订阅概念
+
+共享订阅允许多个订阅者共享同一 Topic 的消息，Broker 在订阅者之间轮询分发，实现负载均衡。适用于高吞吐场景，避免消息堆积。
 
 ```
-发布新版本 → 分批灰度(按设备ID取模/按批次) → 设备下载(断点续传) → 校验安装 → 上报结果 → 失败回滚
+普通订阅：
+  Topic: device/#
+  订阅者1 收到所有消息
+  订阅者2 收到所有消息（重复）
+  → 每个订阅者都收到全量消息
+
+共享订阅：
+  Topic: $share/group1/device/#
+  订阅者1 收到 50% 消息
+  订阅者2 收到 50% 消息
+  → 消息在订阅者之间分配
 ```
 
-- **灰度是硬要求**：全量推送 = 批量变砖事故（参考工业篇 OTA 坑）；
-- 升级与业务隔离：固件文件走对象存储（签名 URL），MQTT 只传「升级指令 + 版本号」；
-- 结果回执（success/fail）驱动升级进度看板，失败自动暂停灰度。
+### 共享订阅 Topic 格式
 
-### 4. 海量连接的容量工程
+```
+$share/<group>/<topic>
 
-| 瓶颈 | 手段 |
-|------|------|
-| 连接数 | Broker 集群水平扩展（EMQX 单集群 1 亿+），连接按节点分片 |
-| 心跳风暴 | 大规模场景心跳聚合（网关代设备心跳，设备与网关本地保活） |
-| 消息放大 | 遥测低频聚合 + 规则引擎过滤（只转发有意义消息） |
-| 离线风暴 | 批量断电/断网触发海量遗嘱 → 遗嘱去重 + 离线标记分级延迟 |
+示例：
+  $share/sensor-group/sensor/+/temperature
+  $share/consumer-group/#  → 通配符
+  $share/my-group/device/001/data  → 精确匹配
+```
 
-> 设备接入平台通用骨架：**接入层（Broker 集群）→ 规则引擎（过滤/转换/桥接）→ 存储层（时序库遥测 + Kafka 事件 + DB 设备台账）→ 应用层（监控/OTA/影子/告警）**。
+### 消息分发策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| Round Robin（默认） | 轮询分发 | 均衡负载 |
+| Random | 随机分发 | 均衡负载 |
+| Hash | 按 Topic/属性哈希 | 相关消息分发给同一订阅者 |
+| Sticky | 黏性分发（同一消息始终发给同一订阅者） | 有状态消费 |
+
+### EMQX 共享订阅配置
+
+```hocon
+# emqx.conf
+broker {
+  shared_subscription_strategy = round_robin
+  # 可选: random, hash, sticky
+  # hash 策略的 key: topic / clientid / username
+}
+```
+
+## MQTT v5.0 深入特性
+
+### 用户属性（User Properties）
+
+```
+MQTT v5.0 支持在 PUBLISH、CONNECT 等消息中携带自定义键值对：
+
+PUBLISH 消息示例：
+  User Properties:
+    - x-device-id: sensor-001
+    - x-trace-id: trace-abc-123
+    - x-source: edge-gateway
+    - x-priority: high
+
+使用场景：
+  ├── 分布式追踪（携带 trace-id）
+  ├── 设备元数据（设备型号、固件版本）
+  ├── 业务标记（订单号、用户ID）
+  └── 消息路由（根据属性动态路由）
+```
+
+### 原因码（Reason Codes）
+
+```
+MQTT v5.0 为所有 ACK 消息增加了原因码：
+
+CONNACK 原因码：
+  0x00 - Success
+  0x80 - Unspecified error
+  0x81 - Malformed Packet
+  0x82 - Protocol Error
+  0x86 - Server busy
+  0x87 - Banned
+  0x97 - Packet too large
+
+DISCONNECT 原因码：
+  0x00 - Normal disconnection
+  0x04 - Disconnect with Will Message
+  0x80 - Unspecified error
+  0x8B - Keep Alive timeout
+
+PUBACK / PUBREC / PUBREL / PUBCOMP 原因码：
+  0x00 - Success
+  0x16 - No matching subscribers
+  0x97 - Packet too large
+```
+
+### 流控（Flow Control）
+
+```
+MQTT v5.0 流控机制：
+
+接收最大值（Receive Maximum）：
+  ├── 客户端在 CONNECT 中声明接收最大值
+  ├── 服务端在 CONNACK 中返回自身接收最大值
+  ├── 双方在未收到 PUBREL 前，最多发送 N 条未确认消息
+  └── 超过限制 → Broker 拒绝（原因码 0x93）
+
+示例：
+  Client: Receive Maximum = 10
+  Server: Receive Maximum = 5
+  → Client 最多同时发送 5 条 QoS2 消息
+```
+
+### 会话过期（Session Expiry）
+
+```
+MQTT v5.0 会话管理：
+
+CONNECT 时设置 Session Expiry Interval：
+  0 = 会话立即过期
+  >0 = 会话保持指定秒数
+
+服务端行为：
+  ├── 客户端断开后，会话保持 Session Expiry Interval 秒
+  ├── 期间新消息缓存在会话中
+  ├── 客户端重连后恢复订阅关系和未消费消息
+  └── 超时后会话和订阅关系全部清除
+
+与 v3.1.1 的 Clean Session 对比：
+  v3.1.1: Clean Session = true/false（二元）
+  v5.0:   Session Expiry = 0/具体秒数（精确控制）
+```
+
+### 请求/响应模式
+
+```
+MQTT v5.0 Request/Response：
+
+客户端发送请求：
+  Topic: device/request
+  Response Topic: device/response/req-123
+  Correlation Data: req-123
+  Payload: {"action": "get_status"}
+
+服务端回复响应：
+  Topic: device/response/req-123
+  Correlation Data: req-123
+  Payload: {"status": "online", "battery": 85}
+
+与 HTTP Request/Response 的区别：
+  ├── 异步：不需要同步等待
+  ├── 解耦：请求和响应 Topic 可以不同
+  └── 灵活：支持 QoS 控制
+```
+
+## MQTT 桥接模式
+
+### 本地桥接
+
+```mermaid
+graph TD
+    D1[设备1] --> B1[本地 Broker 1]
+    D2[设备2] --> B1
+    B1 <-->|MQTT Bridge| B3[中心 Broker]
+    D3[设备3] --> B2[本地 Broker 2]
+    D4[设备4] --> B2
+    B2 <-->|MQTT Bridge| B3
+    B3 --> APP[应用服务器]
+```
+
+### 桥接配置
+
+```xml
+<!-- Mosquitto 桥接配置 -->
+<connection cloud-broker>
+  <address>mqtt.cloud.example.com:1883</address>
+  <bridge_protocol_version mqttv5="true">mqttv5</bridge_protocol_version>
+  <remote_username>bridge-user</remote_username>
+  <remote_password>bridge-pass</remote_password>
+  <bridge_qos>1</bridge_qos>
+  <notifications>true</notifications>
+  <topic device/# out 0 sensor/ ""</topic>
+  <topic sensor/# in 0 device/ ""</topic>
+</connection>
+```
+
+### 桥接 vs 共享订阅
+
+| 维度 | 桥接 | 共享订阅 |
+|------|------|----------|
+| 架构 | 多 Broker 互联 | 单 Broker 内部 |
+| 拓扑 | 树形/网状 | 扁平 |
+| 适用 | 多地域部署 | 单集群负载均衡 |
+| 延迟 | 较高（跨网络） | 低（本地） |
+| 消息同步 | 异步复制 | 实时 |
+
+## MQTT QoS 2 完整流程
+
+```
+QoS 2 完整流程（四次握手）：
+
+客户端                        服务端
+  │                               │
+  │── PUBLISH (msg_id=1) ────────>│  1. 客户端发送消息
+  │                               │     服务端存储消息，不投递
+  │<── PUBREC (msg_id=1) ────────│  2. 服务端确认收到
+  │                               │
+  │── PUBREL (msg_id=1) ────────>│  3. 客户端确认可以释放
+  │                               │     服务端投递消息给订阅者
+  │<── PUBCOMP (msg_id=1) ───────│  4. 服务端确认完成
+  │                               │     客户端释放消息
+
+状态机：
+  客户端：SEND → WAIT_PUBREC → WAIT_PUBCOMP → DONE
+  服务端：RECEIVED → WAIT_PUBREL → WAIT_PUBCOMP → DONE
+```
+
+## MQTT over WebSocket
+
+### WebSocket 集成架构
+
+```mermaid
+graph LR
+    B[浏览器] -->|WebSocket| LB[负载均衡]
+    LB --> GW[MQTT-WS Gateway]
+    GW -->|MQTT| B1[Broker Node 1]
+    GW -->|MQTT| B2[Broker Node 2]
+```
+
+### Mosquitto WebSocket 配置
+
+```conf
+# /etc/mosquitto/conf.d/websocket.conf
+listener 1883          # MQTT TCP
+protocol mqtt
+
+listener 8083          # MQTT over WebSocket
+protocol websockets
+cafile /etc/certs/ca.crt
+certfile /etc/certs/server.crt
+keyfile /etc/certs/server.key
+```
+
+### 浏览器端连接
+
+```javascript
+// 使用 MQTT.js 连接 WebSocket
+const mqtt = require('mqtt');
+
+const client = mqtt.connect('wss://mqtt.example.com:8083/mqtt', {
+  username: 'user',
+  password: 'pass',
+  clientId: 'browser-client-' + Math.random().toString(16).substr(2, 8)
+});
+
+client.on('connect', () => {
+  client.subscribe('sensor/temperature', { qos: 1 });
+});
+
+client.on('message', (topic, message) => {
+  console.log(`${topic}: ${message.toString()}`);
+  document.getElementById('temp').innerText = message.toString();
+});
+```
+
+## MQTT 安全防护
+
+### TLS 配置
+
+```
+MQTT TLS 配置要点：
+  ├── 端口：8883（MQTTS），8084（WebSocket over TLS）
+  ├── 证书：CA 签发的服务器证书
+  ├── 双向 TLS（可选）：客户端也需要证书
+  ├── 协议：TLS 1.2+，禁用 TLS 1.0/1.1
+  └── 密码套件：ECDHE-RSA-AES256-GCM-SHA384 等强套件
+```
+
+### ACL 访问控制
+
+```
+# Mosquitto ACL 配置
+# /etc/mosquitto/acl
+
+# 用户只能发布到自己的 Topic
+user sensor-001
+topic write device/sensor-001/#
+
+# 用户只能订阅自己的 Topic
+user sensor-002
+topic read device/sensor-002/#
+
+# 通配符规则
+pattern readwrite $SYS/%c/#
+
+# 匿名用户禁止
+allow_anonymous false
+```
+
+### 认证插件
+
+| 插件 | 认证方式 | 适用场景 |
+|------|----------|----------|
+| password_file | 用户名密码文件 | 小规模部署 |
+| MySQL | MySQL 数据库认证 | 中等规模 |
+| PostgreSQL | PostgreSQL 数据库认证 | 中等规模 |
+| LDAP | LDAP/AD 认证 | 企业环境 |
+| HTTP | HTTP API 认证 | 自定义认证逻辑 |
+| JWT | JWT Token 认证 | 微服务架构 |
+
+## MQTT 在智能家居中的应用
+
+### Home Assistant + MQTT
+
+```
+Home Assistant MQTT 架构：
+
+HA Core ←→ MQTT Broker ←→ IoT 设备
+                ├── Zigbee2MQTT
+                ├── Tasmota
+                ├── ESPHome
+                └── 自定义固件
+
+设备发现协议（MQTT Discovery）：
+  Topic: homeassistant/<component>/<node_id>/<object_id>/config
+  Payload: 设备能力描述 JSON
+
+示例 - 温度传感器：
+  Topic: homeassistant/sensor/001/temperature/config
+  Payload: {
+    "name": "客厅温度",
+    "unit_of_measurement": "°C",
+    "device_class": "temperature",
+    "state_topic": "device/001/temperature",
+    "value_template": "{{ value_json.temperature }}"
+  }
+```
+
+### 智能家居 MQTT Topic 设计
+
+```
+Topic 层次设计：
+  home/
+  ├── device/<device_id>/state      → 设备状态
+  ├── device/<device_id>/command    → 控制命令
+  ├── device/<device_id>/config     → 设备配置
+  ├── room/<room_id>/status         → 房间状态
+  ├── alert/<type>                  → 告警
+  └── automation/<rule_id>/status   → 自动化规则状态
+```
+
+## MQTT Broker 集群内部机制
+
+### EMQX 集群原理
+
+```
+EMQX 集群架构：
+  ├── 节点发现
+  │   ├── DNS 发现
+  │   ├── etcd 发现
+  │   ├── K8s API 发现
+  │   └── 手动配置
+  ├── 数据同步
+  │   ├── Gossip 协议（节点间同步路由信息）
+  │   ├── 共享订阅状态
+  │   └── 会话迁移
+  └── 消息路由
+      ├── 本地路由：订阅关系在本节点
+      ├── 远程路由：订阅关系在其他节点
+      └── 消息转发：跨节点路由消息
+
+集群内部通信：
+  ├── 端口 4370：节点间数据同步
+  ├── 端口 4371：节点间 RPC
+  └── 端口 4369：Erlang 分布式端口
+```
+
+### 会话迁移流程
+
+```
+客户端从 Node A 重连到 Node B：
+  1. Node B 发现客户端有 Session 在 Node A
+  2. Node B 向 Node A 请求 Session 数据
+  3. Node A 返回：
+     ├── 订阅关系列表
+     ├── 未消费消息队列
+     └── QoS 状态
+  4. Node B 在本地重建 Session
+  5. Node B 向所有节点广播更新路由
+  6. 未消费消息开始从 Broker 投递到 Node B
+```
+
+## 消息保留（Retained Message）
+
+### 保留消息概念
+
+```
+保留消息：Broker 存储 Topic 的最新一条消息
+新订阅者订阅时立即收到保留消息，无需等待新消息
+
+使用场景：
+  ├── 设备状态：设备上线时发布当前状态作为保留消息
+  │   Topic: device/001/status
+  │   Payload: {"online": true, "battery": 85}
+  ├── 配置下发：最新配置作为保留消息
+  │   Topic: device/config
+  │   Payload: {"interval": 60, "threshold": 40}
+  └── 传感器最新值：如温度、湿度
+      Topic: sensor/temperature
+      Payload: "25.5"
+```
+
+### 保留消息生命周期
+
+```
+设置保留消息：
+  PUBLISH (retain=1) → Broker 存储该消息
+
+删除保留消息：
+  PUBLISH (retain=1, payload=空) → Broker 删除该消息
+
+保留消息限制（Mosquitto）：
+  message_size_limit: 0（不限制）
+  max_queued_messages: 1000（队列上限）
+  retained_messages_limit: 10000（保留消息总数上限）
+```
+
+## 遗嘱消息详解
+
+### 遗嘱消息配置
+
+```
+CONNECT 消息中设置遗嘱：
+
+遗嘱消息（Will Message）：
+  Will Topic: device/001/status
+  Will Payload: {"online": false, "reason": "unexpected_disconnect"}
+  Will QoS: 1
+  Will Retain: true
+  Will Delay Interval: 60（v5.0，延迟 60s 发布）
+
+触发条件：
+  ├── 客户端非正常断开（网络异常、崩溃）
+  ├── 客户端发送 DISCONNECT with Reason Code > 0
+  └── 服务端检测到 Keep Alive 超时
+```
+
+### 遗嘱消息最佳实践
+
+```
+遗嘱消息设计：
+  ├── Topic：设备状态 Topic（与正常状态发布同一 Topic）
+  ├── Payload：与正常状态格式一致
+  │   正常在线：{"online": true, "ts": 1700000000}
+  │   遗嘱离线：{"online": false, "ts": 1700000000}
+  ├── QoS：至少一次（QoS 1）
+  ├── Retain：是（保留最新状态）
+  └── Delay Interval：避免短暂断开触发误报
+
+配合保留消息：
+  ├── 遗嘱消息 + Retain = 设备状态自动更新
+  ├── 设备上线：发布 online=true + retain
+  ├── 设备异常离线：遗嘱发布 online=false + retain
+  └── 应用订阅一次即可获取最新状态
+```
+
+## 与其他板块的关系
+
+| 关联板块 | 关系描述 |
+|----------|----------|
+| **IoT 平台** | MQTT 是 IoT 设备接入的核心协议 |
+| **边缘计算** | 边缘 Broker 处理本地消息，减少云端压力 |
+| **数据管道** | Broker + 规则引擎将设备数据导入大数据平台 |
+| **API 网关** | MQTT 网关桥接设备与云端 REST API |
+| **时序数据库** | 设备遥测数据写入 InfluxDB/TDengine |
+
+## 一句话总结
+
+MQTT 是 IoT 设备通信的轻量级协议，Broker 是发布/订阅模式的核心枢纽；二者结合解决了海量设备在低带宽、不可靠网络下的实时通信问题。
 
 ---
 
-## 八、与其他板块的关系
+## 参考资料
 
-- 与 [消息队列 MQ](../MQ.md)、[RabbitMQ](RabbitMQ.md)、[Apache Pulsar](ApachePulsar.md)：MQTT 是「设备侧协议」，RabbitMQ/Kafka/Pulsar 是「服务端消息中间件」。常 MQTT 在边缘、Kafka/Pulsar 在后端，桥接配合。
-- 与 [数据同步 CDC-Canal](数据同步CDC-Canal.md)：IoT 设备数据进 Kafka 后，可继续走 CDC/流处理链路。
-
----
-
-## 九、速查表
-
-| 项 | 结论 |
-|----|------|
-| 本质 | 轻量级 Pub/Sub **协议**（非 MQ 实现） |
-| 最小头 | 2 字节 |
-| QoS | 0 最多一次 / 1 至少一次 / 2 恰好一次 |
-| 模型 | 主题广播（共享订阅可做队列） |
-| 主流 Broker | EMQX（1 亿+ 并发）、Mosquitto、HiveMQ |
-| 场景 | IoT/车联网/弱网/移动推送 |
-| 许可证 | EMQX v5.9+ BSL 1.1 |
-| 一句话 | 「设备说话」的协议，专为省流量省电 |
-
----
-
-## 面试高频问题（20+ 条）
-
-1. **MQTT 是什么，特点？** 轻量级基于发布/订阅的物联网传输协议，基于 TCP，协议头最小 2 字节，支持长连接、QoS、遗嘱/保留消息，专为低带宽、高延迟、不稳定网络设计。
-
-2. **MQTT 与 HTTP 的核心区别？** 通信模式：MQTT 发布/订阅（事件驱动、解耦），HTTP 请求/响应（同步）；连接：MQTT 长连接，HTTP 短连接；头部：MQTT 2 字节起，HTTP 数百字节；MQTT 原生支持服务器主动下行，HTTP 需轮询/WebSocket。
-
-3. **三种 QoS 等级？** QoS 0 最多一次（可能丢，最快，如温湿度上报）；QoS 1 至少一次（保证送达但可能重复，如状态/控制指令）；QoS 2 恰好一次（四次握手，不丢不重，开销最大，如计费）。
-
-4. **QoS 1 流程？** 发布者发 PUBLISH → Broker 回 PUBACK；未收到 ACK 则重传，因此可能重复。消费端需做幂等。
-
-5. **遗嘱消息（LWT）是什么？** 客户端连接时预设一条遗嘱；当 Broker 检测到客户端异常离线（断电/断网/崩溃，非主动断开），自动向指定主题推送该消息，用于设备离线监控。
-
-6. **保留消息（Retained）是什么？** 发布时带 Retain 标记，Broker 持久化该主题最新一条；任何新订阅者立即收到最新状态，无需等下次上报（适合设备最新状态/配置下发）。
-
-7. **KeepAlive 心跳作用？** TCP 空闲时防火墙会断连；客户端定时发心跳证明存活。超过 1.5 倍 KeepAlive 无心跳，Broker 判定离线并触发遗嘱。
-
-8. **Topic 主题与通配符？** 层级用 / 分隔（factory/line1/temp）；+ 单层通配，# 多层通配。设计主题要兼顾层级粒度与订阅灵活性。
-
-9. **MQTT 5.0 相比 3.1.1 增强？** 原因码、共享订阅、消息过期、用户属性、主题别名、流控等，功能更完善。
-
-10. **主流 Broker？** Mosquitto（轻量，适合网关/测试）、EMQX（企业级，百万连接、规则引擎、认证鉴权）、HiveMQ（企业级、可观测性好）。
-
-11. **MQTT 与 AMQP/RabbitMQ 区别？** MQTT 极轻量、面向受限设备/弱网；RabbitMQ(AMQP) 面向服务端、路由复杂、功能全，不适合嵌入式小设备。
-
-12. **物联网为何不用 HTTP？** 高开销（头占比大）、频繁建连耗电、无法服务器主动推送、断网数据无 QoS 保障。
-
-13. **MQTT 与 Kafka 怎么配合？** 设备侧用 MQTT 采集（海量连接、弱网），Broker（如 EMQX）桥接/规则引擎转发到 Kafka 做流式处理与持久化，互补。
-
-14. **共享订阅（Shared Subscription）？** MQTT 5.0 特性，多个消费者分担同一主题负载，实现水平扩展、避免单消费者瓶颈（如 $share/group/topic）。
-
-15. **如何实现消息不丢？** 用 QoS≥1 + 保留/遗嘱 + Broker 持久化（会话保持）+ 消费端幂等。断网期间 QoS1/2 消息在 Broker 排队。
-
-16. **安全机制？** 用户名/密码、Token（JWT）、TLS/SSL 加密传输、ACL 主题级权限控制、客户端证书双向认证。
-
-17. **会话（Session）保持？** Clean Session=false 时，订阅与未确认消息在断线重连后保留，保证 QoS1/2 不丢。
-
-18. **MQTT 不适合什么？** 需要复杂路由/事务/延迟队列的通用后端解耦（用 RabbitMQ/Kafka）；超大数据载荷（应只传小消息，大文件走对象存储+URL）。
-
-19. **主题设计最佳实践？** 按「业务/设备类型/设备ID/指标」分层；避免过深或过浅；用通配符做聚合订阅；注意 ACL 粒度。
-
-20. **遗嘱 vs 保留消息区别？** 遗嘱是「异常离线时 Broker 主动发」；保留是「主题最新值常驻，新订阅者即收」。二者解决不同问题。
-
-21. **QoS 2 为什么少用？** 四次握手开销大、延迟高，Java 后端极少用；除非计费/交易等关键且不可重复场景。
-
-22. **设备海量连接如何架构？** EMQX 集群 + 负载均衡 + 规则引擎筛选/转发 + 后端 Kafka/时序库落盘 + 监控告警。
-
-23. **设备认证怎么做（一机一密）？** 每设备独立 DeviceSecret，连接时 Broker 校验「设备存在 + 凭证有效 + 未禁用」；ACL 按产品前缀授权；高安全场景用 X.509 双向 TLS。
-
-24. **影子设备是什么？** 云端保存设备「期望/上报」两份状态 JSON：离线时改配置 → 上线自动同步；解决设备弱网离线时的配置下发问题。
-
-25. **OTA 怎么安全发布？** 灰度分批推送 + 固件签名校验 + 断点续传 + 失败自动回滚 + 结果回执驱动进度；文件走对象存储，MQTT 只传升级指令。
+- [MQTT v5.0 规范](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)
+- [EMQX 官方文档](https://www.emqx.io/docs/en/latest/)
+- [Eclipse Mosquitto](https://mosquitto.org/)
+- [MQTT vs HTTP for IoT](https://www.hivemq.com/mqtt/mqtt-vs-http/)

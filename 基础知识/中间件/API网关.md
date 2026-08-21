@@ -1,228 +1,654 @@
 # API 网关
 
-> 微服务几十个，客户端不可能记住每个服务地址。网关就是「统一入口 + 流量治理 + 安全管控」。本文讲清网关做什么、主流方案（Spring Cloud Gateway / Kong / Nginx / Traefik / Envoy）怎么选、生产怎么落地。
-> 开源参考：Kong（[Kong/kong](https://github.com/Kong/kong)，基于 Nginx+OpenResty，Lua）、Spring Cloud Gateway（[spring-cloud/spring-cloud-gateway](https://github.com/spring-cloud/spring-cloud-gateway)，Java/WebFlux）、Envoy（[envoyproxy/envoy](https://github.com/envoyproxy/envoy)，C++，Service Mesh 事实标准）。
+> **核心认知**：API 网关是微服务架构的统一入口，它将路由、认证、限流、熔断、日志等横切关注点从业务服务中抽离出来，形成集中式流量管控层。网关不是简单的反向代理，而是微服务治理的第一道防线。
 
----
+## 要解决的问题
 
+| 问题 | 没有网关时 | 有网关后 |
+|------|-----------|----------|
+| 客户端复杂性 | 需要知道每个微服务地址 | 统一网关地址，内部路由透明 |
+| 认证授权 | 每个服务各自实现 | 网关统一认证，下游信任网关 |
+| 限流熔断 | 每个服务单独配置 | 网关层集中策略 |
+| 协议转换 | 客户端需适配多种协议 | 网关统一转换（HTTP/gRPC/WebSocket） |
+| 日志审计 | 分散在各服务，难以聚合 | 网关层统一采集请求日志 |
+| 灰度发布 | 每个服务实现路由规则 | 网关按规则分流流量 |
 
-## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+## 架构模式
 
-**它是什么**：API 网关是微服务架构的「统一入口」，位于客户端与后端服务之间，承担路由、鉴权、限流、灰度、日志、协议转换等横切职责，是「南北流量（外部→内部）」的总闸门。
+### 网关在架构中的位置
 
-**解决什么痛点**：没有网关时，每个服务都要自己处理认证、限流、跨域、日志，且客户端要记住几十个服务地址。网关把这些通用能力收口，客户端只连一个域名，后端服务可独立演进。
+```
+                    ┌─────────────┐
+                    │   客户端     │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  负载均衡    │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  API 网关    │  ← 统一入口
+                    │  (Gateway)  │
+                    └──────┬──────┘
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+   ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
+   │  用户服务    │ │  订单服务    │ │  商品服务    │
+   └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
+          │                │                │
+   ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
+   │    MySQL     │ │   MongoDB   │ │    Redis    │
+   └─────────────┘ └─────────────┘ └─────────────┘
+```
 
-**核心概念**：Route（路由：断言+过滤器）、Predicate（路由匹配条件）、Filter（全局/局部过滤器）、负载均衡、鉴权（JWT/OAuth2）、限流（令牌桶/漏桶）、灰度发布、Spring Cloud Gateway、Kong（插件化）、南北流量 vs 东西流量。
-
-**适用场景**：微服务统一入口、统一鉴权限流、灰度发布、API 聚合。
-**不适用**：服务间内部调用（东西流量，应走服务网格如 Istio）。
-
----
-
-## 一、网关解决什么问题
-
-| 直连微服务的痛点 | 网关的价值 |
-|------------------|------------|
-| 客户端要记所有服务地址 | 只需网关地址 |
-| 每个服务各做一套鉴权 | 统一安全管控（认证 / 限流 / 脱敏） |
-| 无统一限流 / 熔断 | 集中流量治理 |
-| 服务升级影响所有客户端 | 版本路由、灰度发布对客户端透明 |
-| 跨域 / 协议转换分散 | 统一处理 |
-
-**一句话**：网关 = 反向代理 + 路由 + 认证 + 限流 + 熔断 + 灰度 + 可观测，所有流量先把关。
-
----
-
-## 二、主流方案全景
+### 网关核心功能模块
 
 ```mermaid
-flowchart TB
-    C[客户端] --> G[网关层]
-    subgraph G
-        N[Nginx 边缘层 高性能]
-        K[Kong 插件化 多语言]
-        S[Spring Cloud Gateway 业务层 Java栈]
-        T[Traefik K8s原生]
-        E[Envoy 云原生/ServiceMesh]
-    end
-    G --> MS[微服务集群]
+graph TD
+    A[客户端请求] --> B[协议处理]
+    B --> C[路由匹配]
+    C --> D[认证鉴权]
+    D --> E[限流熔断]
+    E --> F[请求/响应转换]
+    F --> G[日志采集]
+    G --> H[后端服务]
+    H --> I[响应聚合]
+    I --> J[返回客户端]
 ```
 
-| 方案 | 语言 | 性能模型 | 特点 | 适用 |
-|------|------|----------|------|------|
-| **Nginx** | C | 多进程异步，极高 | 反向代理 / 负载均衡 / SSL 卸载强，动态路由弱 | 边缘流量入口、静态资源 |
-| **Spring Cloud Gateway** | Java (WebFlux/Netty) | 异步非阻塞 | 深度 Spring 整合、Java 自定义 Filter | Java 技术栈微服务内部网关 |
-| **Kong** | Lua (Nginx+OpenResty) | 事件驱动，高 | 插件生态 350+，JWT/OAuth2/ACL，多语言 | 企业级 API 管理、混合栈 |
-| **Traefik** | Go | 异步，极高 | K8s CRD 声明式、自动服务发现 | K8s 原生环境 |
-| **Envoy** | C++ | 极高 | 动态配置、xDS、Service Mesh 标准 | 云原生基础设施 / Istio 数据面 |
+## 核心功能详解
 
-> 性能量级参考（行业公开压测，单节点 QPS）：Nginx 10 万级 > Kong / Envoy 数万级 > Spring Cloud Gateway 数千~万级。Gateway 胜在生态整合而非极限性能。
-
----
-
-## 三、Spring Cloud Gateway 实战
-
-### 3.1 核心模型：Route / Predicate / Filter
-
-- **Route（路由）**：ID + 目标 URI + 断言 + 过滤器。
-- **Predicate（断言）**：匹配条件（Path、Header、Method、时间…）。
-- **Filter（过滤器）**：前置 / 后置处理（鉴权、改写、限流、重试）。
+### 1. 路由与负载均衡
 
 ```yaml
-spring:
-  cloud:
-    gateway:
-      routes:
-        - id: order-service
-          uri: lb://order-service
-          predicates:
-            - Path=/api/orders/**
-          filters:
-            - name: RequestRateLimiter   # 基于 Redis 的限流
-              args:
-                redis-rate-limiter.replenishRate: 10
-                redis-rate-limiter.burstCapacity: 20
-            - name: CircuitBreaker       # 熔断降级
-              args:
-                name: orderFallback
-                fallbackUri: forward:/fallback/order
+# 路由配置示例
+routes:
+  - match:
+      path: /api/users/**
+    route:
+      - service: user-service
+        weight: 90
+      - service: user-service-v2
+        weight: 10    # 金丝雀发布
+
+  - match:
+      path: /api/orders/**
+      headers:
+        x-debug: "true"
+    route:
+      - service: order-service-debug  # 调试流量路由
+
+  - match:
+      path: /api/products/**
+      method: GET
+    route:
+      - service: product-service-read  # 读写分离
 ```
 
-### 3.2 灰度发布（按请求头切流）
+### 2. 认证与授权
 
-```java
-@Bean
-public RouteLocator grayRoutes(RouteLocatorBuilder b) {
-    return b.routes()
-      .route("order-gray", r -> r.path("/api/orders/**")
-          .and().header("X-User-Group", "beta")
-          .uri("lb://order-service-gray"))
-      .route("order", r -> r.path("/api/orders/**")
-          .uri("lb://order-service"))
-      .build();
+```
+网关认证流程：
+  1. 提取 Authorization Header
+  2. 验证 JWT 签名和有效期
+  3. 提取 scope / roles / user_id
+  4. 检查路由权限（scope 与路由匹配）
+  5. 将用户信息注入 Header 传递给下游
+  6. 下游服务信任网关传递的身份信息
+```
+
+### 3. 限流策略
+
+| 限流维度 | 说明 | 典型配置 |
+|----------|------|----------|
+| 全局限流 | 整个网关的请求上限 | 10000 QPS |
+| 路由限流 | 单个 API 的请求上限 | /api/orders: 1000 QPS |
+| 用户限流 | 单个用户的请求上限 | 100 QPS/user |
+| IP 限流 | 单个 IP 的请求上限 | 50 QPS/IP |
+| 令牌桶 | 允许突发流量 | 100 QPS，桶容量 200 |
+| 滑动窗口 | 平滑限流 | 60s 内最多 1000 次 |
+
+### 4. 熔断与降级
+
+```mermaid
+stateDiagram-v2
+    [*] --> 关闭: 初始状态
+    关闭 --> 打开: 错误率 > 阈值
+    打开 --> 半开: 等待冷却时间
+    半开 --> 关闭: 探测请求成功
+    半开 --> 打开: 探测请求失败
+```
+
+### 5. 请求转换
+
+| 转换类型 | 场景 | 示例 |
+|----------|------|------|
+| Header 添加 | 传递追踪信息 | 添加 X-Request-ID |
+| Header 移除 | 安全考虑 | 移除内部认证 Header |
+| Body 转换 | 数据格式适配 | XML → JSON |
+| 路径重写 | 后端路径不一致 | /api/v1/users → /internal/users |
+| 响应聚合 | BFF 模式 | 调用多个服务，聚合结果 |
+
+## 主流 API 网关对比
+
+| 特性 | Kong | APISIX | Spring Cloud Gateway | Envoy |
+|------|------|--------|---------------------|-------|
+| 语言 | Lua/OpenResty | Lua/OpenResty | Java/Spring | C++ |
+| 性能 | 高 | 极高 | 中 | 极高 |
+| 扩展性 | 插件机制 | 插件机制 | Filter 链 | WASM/Lua |
+| 服务发现 | DNS/Consul | DNS/Consul/Eureka | Eureka/Nacos | xDS |
+| 配置管理 | Admin API | etcd | 配置文件 | xDS |
+| 学习曲线 | 中 | 中 | 低（Java 生态） | 高 |
+| 适用场景 | 通用 | 高性能场景 | Spring 生态 | Service Mesh |
+
+## 网关高可用设计
+
+```
+高可用策略：
+  ├── 多实例部署：至少 2 个网关节点
+  ├── 无状态设计：会话信息外置到 Redis
+  ├── 健康检查：主动探测后端服务状态
+  ├── 优雅降级：网关故障时直连后端
+  ├── 限流保护：防止网关被打垮
+  └── 监控告警：网关延迟/错误率/吞吐量
+```
+
+### 性能优化
+
+| 优化手段 | 效果 | 实现方式 |
+|----------|------|----------|
+| 连接池复用 | 减少 TCP 握手开销 | Keep-Alive + 连接池 |
+| 响应缓存 | 减少后端调用 | 缓存热点 API 响应 |
+| 异步 I/O | 提高并发处理能力 | 非阻塞事件驱动 |
+| 协议优化 | 减少传输开销 | HTTP/2、gRPC |
+| 本地缓存 | 减少配置查询延迟 | 路由规则本地缓存 |
+
+## 网关选型决策
+
+```
+选型路径：
+  ├── Java 技术栈？
+  │   ├── 是 → Spring Cloud Gateway
+  │   └── 否 ↓
+  ├── 需要高性能？
+  │   ├── 是 → APISIX 或 Envoy
+  │   └── 否 ↓
+  ├── 需要丰富插件？
+  │   ├── 是 → Kong
+  │   └── 否 ↓
+  └── Service Mesh 场景？
+      ├── 是 → Envoy (Istio 数据面)
+      └── 否 → 根据团队熟悉度选择
+```
+
+## 常见陷阱
+
+| 陷阱 | 后果 | 正确做法 |
+|------|------|----------|
+| 网关单点 | 故障时全部服务不可用 | 多实例 + 负载均衡 |
+| 网关做太多业务逻辑 | 网关膨胀，难以维护 | 仅处理横切关注点 |
+| 不限流 | 流量洪峰击垮后端 | 全局+路由+用户级限流 |
+| 证书管理混乱 | HTTPS 终止配置出错 | 集中证书管理 |
+| 不监控网关 | 故障时无法定位 | 完善的 metrics 和 tracing |
+
+## WebSocket 支持
+
+### 网关 WebSocket 代理
+
+```
+WebSocket 连接流程：
+  1. 客户端发起 HTTP Upgrade 请求
+  2. 网关验证 Token（通常在首次握手时）
+  3. 网关与后端建立 WebSocket 连接
+  4. 双向消息透传
+
+关键配置：
+  upgrade: websocket
+  proxy_read_timeout: 3600s    # 长连接超时
+  proxy_send_timeout: 3600s
+```
+
+### WebSocket vs HTTP 在网关中的差异
+
+| 维度 | HTTP 请求 | WebSocket |
+|------|-----------|-----------|
+| 连接模型 | 短连接/Keep-Alive | 长连接 |
+| 路由匹配 | Path + Method | Path（握手时） |
+| 限流方式 | 按请求次数 | 按连接数 + 消息数 |
+| 认证时机 | 每次请求 | 握手时一次性认证 |
+| 负载均衡 | L7 路由 | L4/L7 连接级路由 |
+| 健康检查 | HTTP 探测 | 连接存活检测 |
+
+### APISIX WebSocket 配置示例
+
+```yaml
+# routes 配置
+routes:
+  - uri: /ws/*
+    upstream:
+      type: roundrobin
+      nodes:
+        "ws-server-1:8080": 1
+        "ws-server-2:8080": 1
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/ws/(.*)"
+          - "/$1"
+```
+
+## gRPC 代理
+
+### gRPC 网关代理模式
+
+```mermaid
+graph LR
+    C[HTTP/JSON 客户端] -->|REST| GW[API 网关]
+    GW -->|gRPC-Web| G1[gRPC 服务1]
+    GW -->|gRPC| G2[gRPC 服务2]
+    C2[gRPC 客户端] -->|gRPC| GW
+```
+
+### gRPC 代理 vs HTTP 代理
+
+| 维度 | HTTP 代理 | gRPC 代理 |
+|------|-----------|-----------|
+| 协议 | HTTP/1.1, HTTP/2 | HTTP/2（强制） |
+| 序列化 | JSON/XML | Protobuf |
+| 流式 | 不支持 | 支持（单向/双向） |
+| 网关开销 | 序列化/反序列化 | 透传（低开销） |
+| 健康检查 | HTTP 端点 | gRPC Health Protocol |
+
+### Envoy gRPC 代理配置
+
+```yaml
+# Envoy 配置
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8443
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                route_config:
+                  virtual_hosts:
+                    - name: backend
+                      routes:
+                        - match:
+                            prefix: "/grpc.service/"
+                          route:
+                            cluster: grpc_backend
+                            timeout: 0s
+                            retry_policy:
+                              retry_conditions:
+                                - 5xx
+                              num_retries: 3
+
+  clusters:
+    - name: grpc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+```
+
+## 金丝雀发布
+
+### 基于网关的流量分割
+
+```mermaid
+graph TD
+    A[100% 流量] --> B{网关路由}
+    B -->|90%| C[服务 v1 稳定版]
+    B -->|10%| D[服务 v2 金丝雀版]
+    D -->|监控指标正常| E[逐步增加 v2 流量]
+    D -->|监控指标异常| F[自动回滚到 v1]
+```
+
+### 金丝雀发布策略配置
+
+```yaml
+# Kong 插件配置
+plugins:
+  - name: canary
+    config:
+      services:
+        - service: user-service
+          routes:
+            - route: user-api
+              canary:
+                upstream: user-service-v2
+                weight: 10          # 10% 流量到 v2
+                start_time: 2024-01-01T00:00:00Z
+                duration: 3600      # 持续 1 小时
+                criteria:
+                  - header: x-user-type
+                    value: "beta"    # Beta 用户走 v2
+                  - cookie: feature_flag
+                    value: "new_ui"
+```
+
+### 金丝雀发布监控指标
+
+| 指标 | 阈值（回滚条件） | 采集方式 |
+|------|------------------|----------|
+| 错误率 | > 1% | Access Log 统计 |
+| P99 延迟 | > 基线 1.5x | Metrics 监控 |
+| CPU 使用率 | > 80% | 节点 Exporter |
+| 内存使用率 | > 85% | 节点 Exporter |
+| 5xx 数量 | > 10/min | Access Log |
+
+## 网关可观测性
+
+### 三大支柱
+
+```mermaid
+graph TD
+    A[网关可观测性] --> B[Metrics 指标]
+    A --> C[Logging 日志]
+    A --> D[Tracing 链路追踪]
+
+    B --> B1[QPS / 延迟 / 错误率]
+    B --> B2[连接数 / 上游健康度]
+    B --> B3[限流触发次数]
+
+    C --> C1[Access Log 结构化日志]
+    C --> C2[Error Log]
+    C --> C3[慢查询日志]
+
+    D --> D1[OpenTelemetry 集成]
+    D --> D2[Jaeger / Zipkin]
+```
+
+### Access Log 结构化格式
+
+```json
+{
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "method": "POST",
+  "path": "/api/orders",
+  "status": 200,
+  "upstream_status": 200,
+  "upstream_service": "order-service",
+  "upstream_time": 45,
+  "gateway_time": 3,
+  "bytes_sent": 1234,
+  "request_id": "abc-123-def",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "user_id": "user-001",
+  "client_ip": "192.168.1.100",
+  "latency": 48
 }
 ```
 
-### 3.3 统一鉴权（JWT 校验全局过滤器）
+### Prometheus 指标配置
 
-```java
-public class JwtAuthFilter implements GlobalFilter, Ordered {
-    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
-        String token = exchange.getRequest().getHeaders().getFirst("Authorization");
-        if (!validate(token)) {
-            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
-            return exchange.getResponse().setComplete();
-        }
-        return chain.filter(exchange);
-    }
-}
+```yaml
+# Envoy Stats 指标
+metrics:
+  - name: http_requests_total
+    type: counter
+    labels:
+      method: "$method"
+      path: "$path"
+      status: "$status"
+      upstream: "$upstream_cluster"
+
+  - name: http_request_duration_seconds
+    type: histogram
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]
+    labels:
+      upstream: "$upstream_cluster"
+
+# Grafana Dashboard 关键 Panel
+# 1. 网关 QPS (按路由/状态码)
+# 2. 延迟 P50/P95/P99 (按路由)
+# 3. 错误率 (按路由/上游服务)
+# 4. 上游连接数 / 活跃连接数
+# 5. 限流触发次数
 ```
 
----
+## 限流算法详解
 
-## 四、Kong 实战（插件化）
+### 固定窗口（Fixed Window）
 
-Kong 用 Admin API / 声明式配置，强调插件：
+```
+时间窗口：[10:00:00, 10:00:01] 限流 100 QPS
 
-```bash
-# 注册服务
-curl -X POST http://localhost:8001/services --data "name=user-service" \
-     --data "url=http://user-service:8080"
-# 启用 JWT 插件
-curl -X POST http://localhost:8001/services/user-service/plugins \
-     --data "name=jwt"
-# 启用限流
-curl -X POST http://localhost:8001/services/user-service/plugins \
-     --data "name=rate-limiting" --data "config/second=100"
+10:00:00.000 → count=1   ✅
+10:00:00.500 → count=50  ✅
+10:00:00.999 → count=100 ✅
+10:00:01.000 → count=1   ✅  （窗口重置）
+...
+
+问题：窗口边界突发——999ms 内 100 请求 + 001ms 内 100 请求 = 200 QPS 突发
 ```
 
-- ✅ 插件生态丰富（认证 / 日志 / 限流 / AI 异常检测）。
-- ❌ 需维护 PostgreSQL/Cassandra；Lua 开发门槛；企业版部分功能收费。
+### 滑动窗口（Sliding Window Log）
+
+```
+维护一个时间戳列表，每次请求：
+  1. 移除窗口外的时间戳
+  2. 检查窗口内时间戳数量
+  3. 未超限 → 记录当前时间戳
+  4. 超限 → 拒绝
+
+优点：精确限流
+缺点：内存开销大（需存储每个请求的时间戳）
+实现：Redis ZSET (score=timestamp, member=unique_id)
+```
+
+### 令牌桶（Token Bucket）
+
+```
+配置：rate=100/s, capacity=200
+
+10:00:00.000 → tokens=200（满桶）
+10:00:00.000 → 请求 50 个 → tokens=150  ✅
+10:00:00.500 → 桶补充 50 → tokens=200（满桶）
+10:00:01.000 → 请求 250 个 → tokens=0（桶空）  ✅ 允许前 200 个
+10:00:01.001 → 请求 1 个 → tokens=-1  ❌ 拒绝
+
+特点：允许突发流量（burst），平均速率受 rate 控制
+```
+
+### 漏桶（Leaky Bucket）
+
+```
+配置：rate=100/s, capacity=200
+
+输入：请求进入队列（桶）
+输出：以固定速率（100/s）处理
+
+10:00:00.000 → 队列空
+10:00:00.000 → 突发 200 请求 → 队列满（200）
+10:00:00.000 → 突发 50 请求 → 队列溢出  ❌ 拒绝 50 个
+10:00:01.000 → 队列处理 100 → 剩余 100
+
+特点：流量整形（平滑输出），不允许突发
+```
+
+### 算法对比
+
+| 算法 | 精确度 | 突发允许 | 内存开销 | 实现复杂度 | 适用场景 |
+|------|--------|----------|----------|------------|----------|
+| 固定窗口 | 低 | 不允许 | 低 | 低 | 简单限流 |
+| 滑动窗口 | 高 | 不允许 | 高 | 中 | 精确计数 |
+| 令牌桶 | 中 | 允许（burst） | 低 | 中 | API 限流（推荐） |
+| 漏桶 | 中 | 不允许 | 低 | 中 | 流量整形 |
+
+### Redis 实现令牌桶
+
+```lua
+-- Lua 脚本：令牌桶限流
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])        -- 令牌生成速率（个/秒）
+local capacity = tonumber(ARGV[2])     -- 桶容量
+local now = tonumber(ARGV[3])          -- 当前时间戳（ms）
+local requested = tonumber(ARGV[4])    -- 请求的令牌数
+
+local last_tokens = tonumber(redis.call("GET", key) or capacity)
+local last_refreshed = tonumber(redis.call("GET", key .. ":ts") or now)
+
+-- 计算补充的令牌
+local delta = math.floor((now - last_refreshed) / 1000) * rate
+local tokens = math.min(capacity, last_tokens + delta)
+
+local allowed = 0
+if tokens >= requested then
+    tokens = tokens - requested
+    allowed = 1
+end
+
+redis.call("SET", key, tokens)
+redis.call("SET", key .. ":ts", now)
+redis.call("EXPIRE", key, math.ceil(capacity / rate) * 2)
+
+return { allowed, tokens }
+```
+
+## 网关迁移策略
+
+### 从单体到网关 + 微服务
+
+```mermaid
+graph TD
+    A[阶段 1: 单体应用] --> B[引入网关作为唯一入口]
+    B --> C[阶段 2: 网关 + 单体]
+    C --> D[逐步拆分微服务]
+    D --> E[阶段 3: 网关 + 多微服务]
+    E --> F[完全微服务化]
+```
+
+### 迁移步骤
+
+| 阶段 | 操作 | 风险 | 回滚方案 |
+|------|------|------|----------|
+| 1 | 网关部署，直连单体 | 低 | DNS 切回原地址 |
+| 2 | 认证逻辑迁移到网关 | 中 | 网关透传原认证 |
+| 3 | 拆分第一个微服务 | 高 | 网关回退到单体 |
+| 4 | 逐步迁移其他服务 | 中 | 灰度发布 + 监控 |
+
+### 流量切换策略
+
+```
+DNS 切换法：
+  1. 网关部署，验证健康
+  2. DNS TTL 调低（60s）
+  3. 切换 DNS 到网关 IP
+  4. 监控 30 分钟
+  5. 异常则 DNS 切回
+
+负载均衡切换法：
+  1. 网关加入 LB 池，权重设为 0
+  2. 逐步增加权重：0 → 10 → 50 → 100
+  3. 每步观察 15 分钟
+  4. 有问题则降低权重
+```
+
+## 网关安全防护
+
+### DDoS 防护
+
+```
+多层 DDoS 防护：
+  ├── 第 1 层：云厂商 DDoS 防护（如 AWS Shield）
+  │   └── 网络层攻击过滤（SYN Flood, UDP Flood）
+  ├── 第 2 层：WAF（如 AWS WAF, CloudFlare）
+  │   └── 应用层攻击检测（SQL 注入, XSS）
+  ├── 第 3 层：网关限流
+  │   └── 按 IP/User/App 维度限流
+  └── 第 4 层：后端限流 + 熔断
+      └── 保护后端服务不被打垮
+```
+
+### IP 白名单 / 黑名单
+
+```yaml
+# APISIX 配置
+plugins:
+  - name: ip-restriction
+    config:
+      whitelist:
+        - "10.0.0.0/8"       # 内网
+        - "203.0.113.0/24"   # 办公网
+      message: "Access denied"
+      status_code: 403
+
+  - name: consumer-restriction
+    config:
+      whitelist:
+        - consumer-1          # 允许特定消费者
+      rejected_code: 403
+```
+
+### Bot 检测
+
+```
+Bot 检测策略：
+  ├── User-Agent 分析
+  │   ├── 空/异常 UA → 拦截
+  │   ├── 已知恶意 Bot UA → 拦截
+  │   └── 合法 Bot（Googlebot）→ 放行但限流
+  ├── 行为分析
+  │   ├── 高频相同路径请求 → 限流
+  │   ├── 无 JavaScript 执行环境 → 拦截
+  │   └── 点击轨迹异常 → 验证码
+  ├── JavaScript Challenge
+  │   └── 要求客户端执行 JS 获取 token
+  └── CAPTCHA 验证
+      └── 疑似 Bot 时触发验证码
+```
+
+### 安全 Headers 配置
+
+```yaml
+# 网关统一注入安全 Headers
+plugins:
+  - name: response-rewrite
+    config:
+      headers:
+        add:
+          - "X-Content-Type-Options: nosniff"
+          - "X-Frame-Options: DENY"
+          - "X-XSS-Protection: 1; mode=block"
+          - "Strict-Transport-Security: max-age=31536000; includeSubDomains"
+          - "Content-Security-Policy: default-src 'self'"
+          - "Referrer-Policy: strict-origin-when-cross-origin"
+          - "Permissions-Policy: camera=(), microphone=(), geolocation=()"
+        remove:
+          - "Server"
+          - "X-Powered-By"
+```
+
+## 与其他板块的关系
+
+| 关联板块 | 关系描述 |
+|----------|----------|
+| **负载均衡** | 网关通常部署在负载均衡器之后，自身也做后端负载均衡 |
+| **微服务架构** | 网关是微服务架构的标配组件 |
+| **认证授权** | 网关是 OAuth2/JWT 认证的常见实施点 |
+| **Service Mesh** | Envoy 既是 API 网关也是 Mesh 的数据面 |
+| **监控体系** | 网关是 Metrics/Logging/Tracing 的关键采集点 |
+
+## 一句话总结
+
+API 网关是微服务的统一入口和流量管控层，将路由、认证、限流、熔断等横切关注点集中管理，是微服务架构中不可或缺的基础设施。
 
 ---
 
-## 五、生产设计要点
+## 参考资料
 
-1. **无状态化**：网关不存会话，状态用 JWT / 外部会话存。
-2. **分层部署**（大型系统推荐）：`Nginx（边缘，SSL 卸载/全局限流）→ Spring Cloud Gateway（业务层，鉴权/灰度）`。兼顾性能与微服务治理。
-3. **动态配置**：路由规则放 Nacos / Config，热更新不重启。
-4. **可观测性**：Micrometer 暴露 metrics → Prometheus + Grafana（延迟、错误率、QPS）。
-5. **重试只对幂等接口**：查询可重试，下单等写操作禁止重试。
-6. **防 DDoS**：Nginx 层 `limit_req` + 网关限流双重防护。
-7. **熔断降级**：非核心链路降级，保核心（如下单）。
-
----
-
-## 六、常见坑
-
-- **网关成单点 / 瓶颈**：多实例 + 前面挂 LB（Nginx / SLB）。
-- **鉴权逻辑太重**：网关只做「身份认证 + 粗粒度授权」，细粒度权限放业务服务。
-- **限流 key 设计差**：按 IP 限流会被 NAT / 网关后面真实 IP 丢失坑——要用 `X-Forwarded-For` 或 userId。
-- **重试放大故障**：写操作重试导致重复下单，务必只对 GET / 幂等接口重试。
-- **链路过长超时级联**：网关 → 服务 → 下游，超时设不合理会雪崩；用熔断 + 合理超时。
-
----
-
-## 七、选型结论
-
-- **Spring Cloud 技术栈**，要快速接鉴权 / 灰度 → **Spring Cloud Gateway**。
-- **多语言 / 企业级 API 管理 / 强插件** → **Kong**。
-- **K8s 原生、声明式** → **Traefik**。
-- **边缘超高并发 / 静态 / SSL** → **Nginx**。
-- **Service Mesh / 云原生** → **Envoy**（通常经 Istio）。
-
----
-
-## 面试高频问题（20+ 条）
-
-1. **网关解决什么问题？** 统一入口：路由、鉴权、限流、灰度、日志、跨域、协议转换，把横切能力从各服务收口，客户端只连一个域名。
-
-2. **网关 vs 服务（南北 vs 东西流量）？** 南北流量（外部客户端→内部服务）走网关；东西流量（服务间内部调用）应走服务网格（Istio/Linkerd），不应全压网关。
-
-3. **与 Nginx 区别？** Nginx 偏反向代理/静态/四七层负载，路由规则静态；API 网关是「七层 + 业务感知」，支持动态路由、鉴权、限流、灰度、插件化（Spring Cloud Gateway/Kong）。
-
-4. **与 Kong 区别？** Kong 基于 Nginx+OpenResty，插件化生态强（限流/鉴权/可观测），适合多语言异构；Spring Cloud Gateway 与 Java/Spring 生态深度集成，开发友好。
-
-5. **灰度发布如何实现？** 按请求头/用户标签/权重把部分流量切到新版本（如 10% 流量到 v2），验证无误再全量；Gateway 用自定义路由断言+过滤器实现。
-
-6. **统一鉴权怎么做？** 全局过滤器校验 JWT/OAuth2 Token，失败直接拦截，下游服务信任网关注入的用户上下文（如 Header），免重复认证。
-
-7. **限流算法？** 计数器、滑动窗口、令牌桶（允许突发）、漏桶（匀速）。网关常用令牌桶/漏桶保护后端，如按 IP/用户维度限流。
-
-8. **高可用怎么保障？** 网关节点多实例 + 负载均衡；自身无状态可水平扩展；下游超时/熔断（集成 Sentinel/Hystrix）；避免网关成为单点。
-
-9. **网关性能瓶颈？** 网关做加解密/鉴权/日志会增加延迟；用异步非阻塞（WebFlux/Netty）提升吞吐；避免重逻辑放网关。
-
-10. **Spring Cloud Gateway 核心模型？** Route（路由=断言+过滤器）、Predicate（匹配条件如 Path/Header/Method）、Filter（全局/局部，改写请求响应）。
-
-11. **限流维度？** 按 IP、用户、API、租户；结合 Redis 做集群级统一计数（如 RequestRateLimiter 网关过滤器）。
-
-12. **熔断降级？** 下游故障时网关快速失败/返回降级响应，防止雪崩；集成 Sentinel/Resilience4j。
-
-13. **协议转换？** 网关可将外部 HTTP 转为内部 gRPC/WebSocket，或聚合多个后端 API 为一个对外接口（API 聚合/BFF）。
-
-14. **跨域（CORS）处理？** 网关统一加 CORS 头（Access-Control-Allow-Origin 等），避免每个服务各自处理。
-
-15. **与注册中心配合？** 网关从 Nacos/Eureka 动态发现服务实例，路由目标无需写死，服务扩缩容自动感知。
-
-16. **请求日志与链路追踪？** 网关生成/透传 TraceId，统一收集访问日志，对接 ELK/SkyWalking 做全链路追踪。
-
-17. **安全防护？** 防 SQL 注入/XSS（入口校验）、WAF、限流防刷、HTTPS 终止、鉴权防越权。
-
-18. **网关选型结论？** Java 技术栈/Spring 生态 → Spring Cloud Gateway；多语言/插件化/高性能 → Kong；简单反向代理 → Nginx。
-
-19. **网关放太多逻辑的危害？** 变成「胖网关」，难维护、性能差、耦合业务；原则：网关只做横切，业务下沉服务。
-
-20. **与 BFF 关系？** BFF（Backend For Frontend）常由网关/聚合层承担，为不同端（Web/App）裁剪聚合 API，减少前端多次请求。
-
-21. **WebSocket/长连接网关？** 需网关支持长连接路由与会话保持；Kong/Spring Cloud Gateway 部分支持，重度长连接考虑专用网关。
-
-22. **网关如何做灰度与全链路压测？** 灰度用路由权重/标签；压测用影子流量（标记请求路由到影子环境），网关识别压测流量不打标真实数据。
-
----
-## 九、与其他板块的关系
-
-- 和「**基础知识/注册中心与配置中心**」：Gateway 从 Nacos / Eureka 做服务发现（`lb://`）。
-- 和「**基础知识/认证授权 JWT/OAuth2**」：网关统一 JWT 校验，具体协议见该篇。
-- 和「**基础知识/MQ**」：网关可把写请求转 MQ 异步削峰。
-- 和「**架构/系统架构**」：网关是「边界层」核心组件，详见系统架构的 API 网关选型。
+- [Kong 官方文档](https://docs.konghq.com/)
+- [Apache APISIX 文档](https://apisix.apache.org/docs/)
+- [Spring Cloud Gateway 文档](https://spring.io/projects/spring-cloud-gateway)
+- [Envoy 网关文档](https://www.envoyproxy.io/docs/envoy/latest/)
+- [Microservices Patterns - API Gateway](https://microservices.io/patterns/apigateway.html)

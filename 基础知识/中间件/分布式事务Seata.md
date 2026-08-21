@@ -1,242 +1,688 @@
-# 分布式事务 Seata
+# 分布式事务：Seata
 
-> 微服务下「下单一笔单子，要扣库存、扣余额、记积分、发消息」——任一步失败，数据就对不上了。本文讲清分布式事务的几种解法，重点拆解 **Seata 的 AT / TCC / SAGA / XA 四种模式**，以及怎么选型。
-> 开源参考：[apache/seata](https://github.com/apache/seata)（Java，Apache-2.0，源自阿里 TXC / 蚂蚁 XTS，2023 进入 Apache 孵化器、现为顶级项目，是目前 Java 微服务最主流的分布式事务框架）。
+> **核心认知**：Seata 是阿里巴巴开源的分布式事务解决方案，提供 AT、TCC、SAGA、XA 四种事务模式。AT 模式通过 SQL 解析自动生成反向回滚 SQL，是侵入性最低的方案；TCC 模式通过业务层面的 Try/Confirm/Cancel 实现，是灵活性最高的方案。理解不同模式的适用场景是正确使用 Seata 的关键。
 
----
+## 要解决的问题
 
+| 问题 | 单体事务的痛点 | 分布式事务的挑战 | Seata 的解法 |
+|------|---------------|-----------------|-------------|
+| 跨服务数据一致性 | 本地事务保证 ACID | 跨服务无法使用本地事务 | 全局事务协调 |
+| 跨库数据一致性 | 单库事务保证一致性 | 跨库无法使用本地事务 | 两阶段提交/补偿 |
+| 性能与一致性 | 强一致但性能低 | 强一致性能更差 | 多种模式按需选择 |
+| 补偿逻辑 | 不需要 | 需要手动实现补偿 | SAGA/TCC 内置补偿 |
+| 数据隔离 | 本地事务保证 | 分布式环境无隔离 | 全局锁 + 读写隔离 |
 
-## 〇、本体介绍（它是什么 / 适用场景 / 核心概念）
+## Seata 架构
 
-**它是什么**：Seata 是阿里开源的**分布式事务解决方案**，提供 AT、TCC、Saga、XA 四种模式，让跨多个微服务/数据源的写操作保持最终一致或强一致，对业务侵入度低（AT 模式基本无侵入）。
-
-**解决什么痛点**：单体本地事务（@Transactional）在微服务拆分后失效——一个业务要写订单库、库存库、账户库，任一步失败如何回滚？Seata 引入 TC（事务协调者）统一编排全局事务的两阶段提交/回滚。
-
-**核心概念**：TC（Transaction Coordinator，独立部署）、TM（Transaction Manager，发起方 @GlobalTransactional）、RM（Resource Manager，各分支）、XID（全局事务 ID）、Branch（分支事务）、undo_log（AT 回滚日志）、全局锁、两阶段提交。
-
-**适用场景**：跨服务下单扣库存、转账、电商核心链路的最终一致/强一致。
-**不适用**：单库事务（直接用本地事务即可）、超高性能极致低延迟（XA 模式性能差）。
-
----
-
-## 一、问题本质：为什么本地事务不够用
+### 核心组件
 
 ```mermaid
-flowchart LR
-    O[订单服务] -->|扣库存| I[(库存DB)]
-    O -->|扣余额| A[(账户DB)]
-    O -->|加积分| P[(积分DB)]
+graph TD
+    TM[事务管理器 TM] -->|开启全局事务| TC[事务协调器 TC]
+    TM -->|分支事务| RM1[资源管理器 RM1]
+    TM -->|分支事务| RM2[资源管理器 RM2]
+    RM1 -->|汇报分支状态| TC
+    RM2 -->|汇报分支状态| TC
+    TC -->|通知提交/回滚| RM1
+    TC -->|通知提交/回滚| RM2
+    TC[(Seata Server)]
 ```
 
-单体应用：一个本地事务（`@Transactional`）搞定，要么全成要么全回。
-微服务：每个服务**独立数据源**，本地事务只能管自己。扣了库存、扣余额时账户服务挂了 → 库存已扣、余额没扣 → **数据不一致**。
+### 四大角色
 
-核心矛盾：**跨多个独立事务资源，如何保证「整体」要么都成功、要么都回滚**。
-
----
-
-## 二、分布式事务的几种经典解法
-
-| 方案 | 一致性 | 侵入性 | 性能 | 适用场景 |
-|------|--------|--------|------|----------|
-| 2PC / XA | 强一致 | 低 | 差（锁资源） | 短事务、强一致核心业务 |
-| TCC | 强一致 | 高 | 好 | 高并发、可控业务 |
-| SAGA | 最终一致 | 中 | 好（无锁） | 长流程、跨系统 |
-| 本地消息表 / 事务消息 | 最终一致 | 中 | 好 | 异步通知、解耦 |
-
-**Seata 是「框架」**，把 AT / TCC / SAGA / XA 都封装好，让你按场景切换，不用自己造轮子。
-
----
-
-## 三、Seata 核心模型：TC / TM / RM
-
-```mermaid
-sequenceDiagram
-    participant TM as TM(事务管理器)
-    participant TC as TC(事务协调者)
-    participant RM1 as RM(分支1)
-    participant RM2 as RM(分支2)
-    TM->>TC: 开启全局事务(拿到XID)
-    TM->>RM1: 执行业务(带XID)
-    RM1->>TC: 注册分支事务 + 上报状态
-    TM->>RM2: 执行业务(带XID)
-    RM2->>TC: 注册分支事务 + 上报状态
-    TM->>TC: 提交/回滚全局事务
-    TC->>RM1: 提交/回滚分支
-    TC->>RM2: 提交/回滚分支
-```
-
-- **TC（Transaction Coordinator）**：独立部署的协调者，维护全局 / 分支事务状态，驱动提交或回滚。
-- **TM（Transaction Manager）**：定义在哪开始全局事务（`@GlobalTransactional`）。
-- **RM（Resource Manager）**：管理分支事务资源（数据源），向 TC 注册、上报、接收指令。
-- **XID**：全局事务 ID，通过 RPC 上下文（Dubbo / Spring Cloud / gRPC）透传到各分支。
-
----
-
-## 四、AT 模式（最常用，无侵入）
-
-### 4.1 原理
-
-AT 是「**非侵入的自动补偿**」——业务代码几乎不用改，引入 starter + 代理数据源即可。
-
-```mermaid
-flowchart TB
-    A[业务SQL: update account set balance=balance-100] --> B[RM拦截SQL, 解析]
-    B --> C[before image: 更新前行快照]
-    B --> D[执行业务SQL]
-    D --> E[after image: 更新后行快照]
-    C & E --> F[生成 undo_log, 与业务SQL同一本地事务提交]
-    F --> G{所有分支成功?}
-    G -->|是| H[TC通知删除undo_log]
-    G -->|否| I[TC通知用undo_log反向补偿回滚]
-```
-
-### 4.2 两阶段
-
-- **一阶段**：执行业务 SQL 的同时，RM 拦截并生成 **undo_log（前后镜像）**，和业务数据 **同一个本地事务** 提交。此时数据库已是「最终状态」，无需长期持锁。
-- **二阶段**：
-  - 提交：异步删除 undo_log（非常快）。
-  - 回滚：用 undo_log 生成反向 SQL，把数据恢复成 before image。
-
-### 4.3 全局锁与隔离
-
-- 为避免「脏写」，AT 在一阶段提交前会向 TC 申请 **全局锁**（行级）。别的事务要改同一行，拿不到全局锁就阻塞 / 失败。
-- 默认隔离级别 **读未提交**；要读已提交需在 `@GlobalTransactional` 上加 `@GlobalLock` 或开启 `selectForUpdate`。
-
-### 4.4 AT 的优缺点与坑
-
-- ✅ 无侵入、易上手、性能好（相比 XA 不长期持 DB 锁）。
-- ❌ 只支持关系型数据库（MySQL / Oracle / PostgreSQL / TiDB 等）。
-- ❌ 有全局锁冲突风险（热点行高并发写入会排队）。
-- ❌ 脏读 / 脏写需配全局锁；跨库多 SQL 的复杂分支要小心。
-- ❌ undo_log 表必须和业务表同库；要定期清理。
-
----
-
-## 五、TCC 模式（高性能强一致，侵入高）
-
-Try-Confirm-Cancel 三阶段，业务自己写：
-
-- **Try**：预留资源（如冻结金额）。
-- **Confirm**：确认提交（真正扣款）。**必须幂等**。
-- **Cancel**：释放预留（解冻）。**必须幂等**。
-
-要解决的三个经典问题：
-
-| 问题 | 说明 | 解法 |
+| 角色 | 全称 | 职责 |
 |------|------|------|
-| 空回滚 | 没收到 Try 就收到 Cancel | 记录事务状态，Cancel 时若 Try 未执行则记空回滚直接返回 |
-| 防悬挂 | Cancel 比 Try 先到，之后 Try 又执行 | 发现已有空回滚记录则 Try 不再执行 |
-| 幂等 | 网络重试导致 Confirm/Cancel 多次 | 用事务状态表（Seata 的 `tcc_fence_log`）去重 |
+| TC | Transaction Coordinator | 事务协调器，管理全局事务和分支事务状态 |
+| TM | Transaction Manager | 事务管理器，开启/提交/回滚全局事务 |
+| RM | Resource Manager | 资源管理器，管理分支事务资源 |
+| 应用 | Application | 业务代码，通过注解声明事务边界 |
 
-Seata 提供 `@TwoPhaseBusinessAction` + TCC fence 自动处理悬挂 / 幂等，大幅降低复杂度。
+## 四种事务模式
 
----
-
-## 六、SAGA 模式（长事务、最终一致）
-
-把大事务拆成多个本地事务，每个配一个**补偿操作**。失败则**逆序**执行补偿。
+### 1. AT 模式（Automatic Transaction）
 
 ```
-创建订单 → 扣库存 → 扣余额
-  ↑          ↑          ↓失败
-  └──── 补偿库存 ← 补偿订单 ←┘
+AT 模式原理：
+  第一阶段（执行）：
+    1. 解析业务 SQL，提取表名/条件/数据
+    2. 生成 before image（执行前快照）
+    3. 执行业务 SQL
+    4. 生成 after image（执行后快照）
+    5. 将 before/after image 存入 undo_log 表
+    6. 释放本地锁
+
+  第二阶段（提交/回滚）：
+    提交：删除 undo_log（异步）
+    回滚：
+      1. 读取 undo_log
+      2. 校验数据（dirty check）
+      3. 执行反向 SQL（INSERT → DELETE, UPDATE → 还原）
+      4. 删除 undo_log
 ```
 
-- ✅ 无全局锁，适合长流程、跨系统（如机票 + 酒店 + 接送机组合订单）。
-- ❌ 只能最终一致；补偿逻辑设计复杂。
-- Seata 用**状态机引擎**编排 Saga，可视化配置正向 / 补偿。
+**AT 模式 SQL 解析示例**：
+
+```
+原始 SQL：UPDATE account SET balance = balance - 100 WHERE user_id = 'A'
+
+Before Image：
+  user_id | balance
+  --------|--------
+  A       | 1000
+
+After Image：
+  user_id | balance
+  --------|--------
+  A       | 900
+
+回滚 SQL：
+  UPDATE account SET balance = 1000 WHERE user_id = 'A'
+```
+
+**AT 模式适用与限制**：
+
+| 维度 | 说明 |
+|------|------|
+| 适用 | 基于关系型数据库的 CRUD 操作 |
+| 优点 | 无侵入，自动解析 SQL |
+| 缺点 | 全局锁影响并发性能 |
+| 缺点 | 不支持非 SQL 的数据源（Redis/MQ） |
+| 缺点 | undo_log 表增加存储开销 |
+
+### 2. TCC 模式（Try-Confirm-Cancel）
+
+```
+TCC 模式流程：
+  Try：
+    检查资源 + 预留资源
+    例：冻结账户余额 100 元
+
+  Confirm：
+    确认预留资源
+    例：扣减冻结金额，真正扣减余额
+
+  Cancel：
+    取消预留资源
+    例：解冻账户余额
+```
+
+**TCC 接口定义示例**：
+
+```java
+@LocalTCC
+public interface AccountTccService {
+
+    @TwoPhaseBusinessAction(name = "deduct", commitMethod = "confirm", rollbackMethod = "cancel")
+    boolean tryDeduct(@BusinessActionContextParameter(paramName = "userId") String userId,
+                      @BusinessActionContextParameter(paramName = "amount") BigDecimal amount);
+
+    boolean confirm(BusinessActionContext context);
+    boolean cancel(BusinessActionContext context);
+}
+```
+
+**TCC 模式适用与限制**：
+
+| 维度 | 说明 |
+|------|------|
+| 适用 | 业务逻辑复杂的场景 |
+| 优点 | 无全局锁，性能高 |
+| 优点 | 支持非 SQL 数据源 |
+| 缺点 | 侵入性强，需实现三个接口 |
+| 缺点 | 空回滚/悬挂问题需处理 |
+
+### 3. SAGA 模式
+
+```
+SAGA 模式原理：
+  正向事务链：
+    T1 → T2 → T3 → T4（每个 Ti 是本地事务）
+
+  补偿事务链（失败时）：
+    T4 失败 → C3 → C2 → C1（反向执行补偿）
+
+  编排方式：
+    ├── 编排式（Orchestration）：中心协调器控制流程
+    └── 协同式（Choreography）：事件驱动，每个参与者监听事件
+```
+
+**SAGA 适用场景**：
+
+| 场景 | 说明 |
+|------|------|
+| 长事务 | 跨多个步骤的业务流程 |
+| 跨系统集成 | 与外部系统的交互 |
+| 无 Try 阶段 | 无法预留资源的场景 |
+| 最终一致性 | 允许短暂不一致 |
+
+### 4. XA 模式
+
+```
+XA 模式原理：
+  第一阶段（Prepare）：
+    所有参与者执行 SQL，锁定资源
+    向 TC 汇报 prepare 状态
+
+  第二阶段（Commit）：
+    TC 通知所有参与者提交
+    释放资源
+
+  特点：
+    ├── 强一致：数据库层面保证
+    ├── 性能低：资源锁定时间长
+    └── 兼容标准：符合 XA 规范
+```
+
+## 四种模式对比
+
+| 维度 | AT | TCC | SAGA | XA |
+|------|-----|-----|------|-----|
+| 侵入性 | 低 | 高 | 中 | 低 |
+| 一致性 | 强一致 | 强一致 | 最终一致 | 强一致 |
+| 性能 | 中 | 高 | 中 | 低 |
+| 补偿 | 自动 | 手动 | 手动 | 无需 |
+| 锁机制 | 全局锁 | 业务锁 | 无锁 | 数据库锁 |
+| 适用场景 | CRUD | 复杂业务 | 长事务 | 强一致要求 |
+| 实现难度 | 低 | 高 | 中 | 低 |
+
+## 高可用设计
+
+```
+Seata Server 高可用：
+  ├── 注册中心：Nacos/Eureka/ZooKeeper
+  ├── 配置中心：Nacos/Apollo
+  ├── 数据库：MySQL/PostgreSQL（存储全局事务状态）
+  ├── 多实例部署：至少 2 个 TC 节点
+  └── 容器化：K8s Deployment + Service
+
+客户端高可用：
+  ├── 重试机制：网络抖动自动重试
+  ├── 降级策略：TC 不可用时本地事务兜底
+  └── 超时处理：全局事务超时自动回滚
+```
+
+## 性能优化
+
+| 优化手段 | 效果 | 说明 |
+|----------|------|------|
+| 异步提交 | 提升吞吐 | 二阶段异步执行 |
+| 批量处理 | 减少网络开销 | 多个分支事务批量汇报 |
+| 本地缓存 | 减少 TC 查询 | 事务状态本地缓存 |
+| 连接池复用 | 减少连接开销 | TC 连接池管理 |
+| 合理超时 | 防止资源泄漏 | 设置全局事务超时时间 |
+
+## 常见陷阱
+
+| 陷阱 | 后果 | 正确做法 |
+|------|------|----------|
+| AT 模式不用 undo_log | 回滚失败 | 确保 undo_log 表存在 |
+| TCC 不处理空回滚 | 补偿失败 | Cancel 中检查 Try 是否执行 |
+| TCC 不处理悬挂 | 资源锁定 | 添加全局事务状态检查 |
+| SAGA 不幂等 | 补偿重复执行 | 补偿操作必须幂等 |
+| 不设超时 | 资源长期锁定 | 合理设置全局事务超时 |
+| 全局锁等待过长 | 并发性能差 | 优化事务粒度 |
+
+## Seata TC 集群部署详解
+
+### TC Server 集群架构
+
+```
+Seata TC 集群部署拓扑：
+  ┌─────────────────────────────────────────┐
+  │              Nginx 负载均衡              │
+  │         (轮询/权重/一致性哈希)           │
+  └──────┬──────────┬──────────┬────────────┘
+         │          │          │
+    ┌────▼───┐ ┌────▼───┐ ┌────▼───┐
+    │ TC-1   │ │ TC-2   │ │ TC-3   │
+    │ (主)   │ │ (从)   │ │ (从)   │
+    └────┬───┘ └────┬───┘ └────┬───┘
+         │          │          │
+    ┌────▼──────────▼──────────▼────┐
+    │     MySQL (事务日志存储)       │
+    │   global_table / branch_table │
+    │   lock_table / undo_log       │
+    └───────────────────────────────┘
+```
+
+### TC 集群配置
+
+```yaml
+# seata-server.yml 集群配置
+server:
+  port: 8091
+
+store:
+  mode: db
+  db:
+    datasource: druid
+    db-type: mysql
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/seata?useSSL=false&characterEncoding=utf8
+    user: root
+    password: root
+
+registry:
+  type: nacos
+  nacos:
+    application: seata-server
+    server-addr: 127.0.0.1:8848
+    group: SEATA_GROUP
+    namespace: ""
+    cluster: default
+
+config:
+  type: nacos
+  nacos:
+    server-addr: 127.0.0.1:8848
+    group: SEATA_GROUP
+    namespace: ""
+```
+
+### TC 集群部署步骤
+
+```
+生产环境 TC 集群部署：
+  1. 准备 MySQL 数据库，执行 seata-server.sql 初始化表
+  2. 部署 Nacos 集群作为注册中心和配置中心
+  3. 部署 3 个 TC 节点，配置相同的 store.db 和 registry
+  4. Nginx 配置 upstream 负载均衡
+  5. 客户端配置多个 TC 地址（逗号分隔）
+  6. 验证集群状态：nacos 控制台查看 seata-server 实例
+
+TC 节点容灾：
+  ├── 至少 3 个节点，任意 1 个宕机不影响服务
+  ├── 节点间通过 DB 共享状态，无节点间直接通信
+  ├── 客户端自动切换到可用 TC 节点
+  └── 监控 TC 节点健康状态，自动摘除故障节点
+```
+
+## Seata + Spring Boot 集成
+
+### 依赖配置
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>io.seata</groupId>
+    <artifactId>seata-spring-boot-starter</artifactId>
+    <version>1.7.0</version>
+</dependency>
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+</dependency>
+```
+
+```yaml
+# application.yml
+seata:
+  enabled: true
+  application-id: order-service
+  tx-service-group: my_tx_group
+  service:
+    vgroup-mapping:
+      my_tx_group: default
+  registry:
+    type: nacos
+    nacos:
+      server-addr: 127.0.0.1:8848
+  config:
+    type: nacos
+    nacos:
+      server-addr: 127.0.0.1:8848
+```
+
+### AT 模式使用示例
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderMapper orderMapper;
+    @Autowired
+    private AccountClient accountClient;
+    @Autowired
+    private StorageClient storageClient;
+
+    @GlobalTransactional(name = "create-order", rollbackFor = Exception.class)
+    public void createOrder(OrderDTO orderDTO) {
+        Order order = new Order();
+        order.setUserId(orderDTO.getUserId());
+        order.setProductId(orderDTO.getProductId());
+        order.setCount(orderDTO.getCount());
+        order.setAmount(orderDTO.getAmount());
+        orderMapper.insert(order);
+
+        storageClient.deduct(orderDTO.getProductId(), orderDTO.getCount());
+        accountClient.deduct(orderDTO.getUserId(), orderDTO.getAmount());
+    }
+}
+```
+
+### TCC 模式完整实现
+
+```java
+@LocalTCC
+public interface AccountTccService {
+
+    @TwoPhaseBusinessAction(
+        name = "deduct",
+        commitMethod = "confirm",
+        rollbackMethod = "cancel"
+    )
+    boolean tryDeduct(
+        @BusinessActionContextParameter(paramName = "userId") String userId,
+        @BusinessActionContextParameter(paramName = "amount") BigDecimal amount
+    );
+
+    boolean confirm(BusinessActionContext context);
+    boolean cancel(BusinessActionContext context);
+}
+
+@Service
+public class AccountTccServiceImpl implements AccountTccService {
+
+    @Autowired
+    private AccountMapper accountMapper;
+    @Autowired
+    private FrozenAccountMapper frozenMapper;
+
+    @Override
+    public boolean tryDeduct(String userId, BigDecimal amount) {
+        Account account = accountMapper.selectByUserId(userId);
+        if (account.getBalance().compareTo(amount) < 0) {
+            throw new RuntimeException("余额不足");
+        }
+        account.setBalance(account.getBalance().subtract(amount));
+        accountMapper.updateBalance(account);
+
+        FrozenAccount frozen = new FrozenAccount();
+        frozen.setUserId(userId);
+        frozen.setFrozenAmount(amount);
+        frozenMapper.insert(frozen);
+        return true;
+    }
+
+    @Override
+    public boolean confirm(BusinessActionContext context) {
+        String userId = context.getActionContext("userId").toString();
+        BigDecimal amount = (BigDecimal) context.getActionContext("amount");
+        frozenMapper.deleteByUserIdAndAmount(userId, amount);
+        return true;
+    }
+
+    @Override
+    public boolean cancel(BusinessActionContext context) {
+        String userId = context.getActionContext("userId").toString();
+        BigDecimal amount = (BigDecimal) context.getActionContext("amount");
+        FrozenAccount frozen = frozenMapper.selectByUserIdAndAmount(userId, amount);
+        if (frozen == null) {
+            insertCancelMark(userId, amount);
+            return true;
+        }
+        Account account = accountMapper.selectByUserId(userId);
+        account.setBalance(account.getBalance().add(amount));
+        accountMapper.updateBalance(account);
+        frozenMapper.deleteByUserIdAndAmount(userId, amount);
+        return true;
+    }
+}
+```
+
+## AT 模式 undo_log 表结构
+
+```sql
+CREATE TABLE IF NOT EXISTS `undo_log` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `branch_id` BIGINT NOT NULL COMMENT '分支事务ID',
+    `xid` VARCHAR(100) NOT NULL COMMENT '全局事务ID',
+    `context` VARCHAR(128) NOT NULL COMMENT '序列化上下文',
+    `rollback_info` LONGBLOB NOT NULL COMMENT '回滚信息',
+    `log_status` INT NOT NULL COMMENT '0:正常 1:已回滚',
+    `log_created` DATETIME NOT NULL COMMENT '日志创建时间',
+    `log_modified` DATETIME NOT NULL COMMENT '日志修改时间',
+    `ext` VARCHAR(100) DEFAULT NULL COMMENT '扩展字段',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `ux_undo_log` (`xid`, `branch_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AT模式回滚日志';
+```
+
+## TCC 空回滚与悬挂处理
+
+### 空回滚问题
+
+```
+空回滚场景：
+  1. 分支事务 Try 方法未执行（网络超时/TC 超时）
+  2. TC 直接发起 Cancel 回滚
+  3. Cancel 方法执行时无冻结数据需要处理
+
+  时序：
+    TM -> TC：开启全局事务
+    TM -> RM：Try（网络超时，未到达 RM）
+    TM -> TC：回滚
+    TC -> RM：Cancel（此时 Try 未执行）
+    RM Cancel：无冻结数据，空回滚
+```
+
+```java
+@Override
+public boolean cancel(BusinessActionContext context) {
+    String userId = context.getActionContext("userId").toString();
+    BigDecimal amount = (BigDecimal) context.getActionContext("amount");
+
+    FrozenAccount frozen = frozenMapper.selectByUserIdAndAmount(userId, amount);
+    if (frozen == null) {
+        insertCancelMark(userId, amount);
+        return true;
+    }
+
+    Account account = accountMapper.selectByUserId(userId);
+    account.setBalance(account.getBalance().add(amount));
+    accountMapper.updateBalance(account);
+    frozenMapper.deleteByUserIdAndAmount(userId, amount);
+    return true;
+}
+```
+
+### 悬挂问题
+
+```
+悬挂场景：
+  1. Try 超时未执行
+  2. Cancel 先到达并执行（空回滚）
+  3. Try 后到达并执行（但全局事务已回滚）
+  结果：资源被永久锁定
+
+  解决方案：
+    Cancel 中插入空回滚标记
+    Try 中检查空回滚标记，存在则拒绝执行
+```
+
+```java
+@Override
+public boolean tryDeduct(String userId, BigDecimal amount) {
+    CancelMark mark = cancelMarkMapper.selectByUserIdAndAmount(userId, amount);
+    if (mark != null) {
+        throw new RuntimeException("Try rejected: cancel already executed");
+    }
+
+    Account account = accountMapper.selectByUserId(userId);
+    if (account.getBalance().compareTo(amount) < 0) {
+        throw new RuntimeException("余额不足");
+    }
+    account.setBalance(account.getBalance().subtract(amount));
+    accountMapper.updateBalance(account);
+
+    FrozenAccount frozen = new FrozenAccount();
+    frozen.setUserId(userId);
+    frozen.setFrozenAmount(amount);
+    frozenMapper.insert(frozen);
+    return true;
+}
+```
+
+## SAGA 状态机定义
+
+```
+SAGA 状态机定义（Seata SAGA 模式）：
+  ├── 状态定义：STARTED, RUNNING, SUSPENDED, ABORTED, STOPPED, FINISHED, COMPENSATING
+  ├── 状态转换：定义每个状态的合法后继状态
+  ├── 事务节点：每个节点对应一个本地事务
+  ├── 补偿节点：每个事务节点对应一个补偿事务
+  └── 决策节点：根据条件选择不同分支
+```
+
+```json
+{
+  "Name": "createOrderSaga",
+  "StartState": "CreateOrder",
+  "States": {
+    "CreateOrder": {
+      "Type": "ServiceTask",
+      "ServiceName": "orderService",
+      "ServiceMethod": "create",
+      "CompensateState": "CancelOrder",
+      "Next": "DeductInventory"
+    },
+    "DeductInventory": {
+      "Type": "ServiceTask",
+      "ServiceName": "storageService",
+      "ServiceMethod": "deduct",
+      "CompensateState": "RestoreInventory",
+      "Next": "DeductBalance"
+    },
+    "DeductBalance": {
+      "Type": "ServiceTask",
+      "ServiceName": "accountService",
+      "ServiceMethod": "deduct",
+      "CompensateState": "RestoreBalance",
+      "Next": "Succeeded"
+    },
+    "CancelOrder": {
+      "Type": "ServiceTask",
+      "ServiceName": "orderService",
+      "ServiceMethod": "cancel"
+    },
+    "RestoreInventory": {
+      "Type": "ServiceTask",
+      "ServiceName": "storageService",
+      "ServiceMethod": "restore"
+    },
+    "RestoreBalance": {
+      "Type": "ServiceTask",
+      "ServiceName": "accountService",
+      "ServiceMethod": "restore"
+    },
+    "Succeeded": { "Type": "Succeed" },
+    "Failed": { "Type": "Fail" }
+  }
+}
+```
+
+## Seata 性能调优
+
+| 调优方向 | 参数 | 推荐值 | 说明 |
+|----------|------|--------|------|
+| TC 内存 | server.maxCommitRetryTimeout | -1 | 提交重试超时，-1 不限制 |
+| TC 内存 | server.maxRollbackRetryTimeout | -1 | 回滚重试超时 |
+| TC 连接 | server.rollbackRetryTimeoutUnlockEnable | true | 回滚超时释放锁 |
+| 客户端 | client.rm.asyncCommitBufferLimit | 10000 | 异步提交缓冲区大小 |
+| 客户端 | client.rm.reportRetryCount | 5 | 分支事务汇报重试次数 |
+| 客户端 | client.tm.defaultGlobalTransactionTimeout | 60000 | 全局事务默认超时（ms） |
+| 数据库 | lock.retryTimes | 30 | 全局锁获取重试次数 |
+| 数据库 | lock.retryInterval | 10 | 全局锁获取重试间隔（ms） |
+
+```
+性能优化要点：
+  1. AT 模式：减少全局锁持有时间，缩短事务粒度
+  2. TCC 模式：Confirm/Cancel 尽量快速执行
+  3. TC 调优：增大 redo_log 清理线程数，加快日志清理
+  4. 网络优化：TC 与 RM 部署在同机房，减少网络延迟
+  5. 连接池：TC 使用连接池复用数据库连接
+  6. 异步提交：二阶段提交使用异步模式
+```
+
+## Seata 与其他分布式事务方案对比
+
+| 维度 | Seata AT | Seata TCC | RocketMQ 事务消息 | 本地消息表 | 最大努力通知 |
+|------|----------|-----------|-------------------|------------|-------------|
+| 一致性 | 强一致 | 强一致 | 最终一致 | 最终一致 | 最终一致 |
+| 侵入性 | 低 | 高 | 中 | 中 | 低 |
+| 性能 | 中 | 高 | 高 | 高 | 高 |
+| 复杂度 | 低 | 高 | 中 | 中 | 低 |
+| 适用场景 | CRUD 业务 | 复杂业务 | 异步解耦 | 同步场景 | 跨平台通知 |
+| 数据库依赖 | 关系型 DB | 任意 | 任意 | 任意 | 任意 |
+
+```
+方案选型建议：
+  ├── 同步场景 + CRUD：Seata AT 模式
+  ├── 同步场景 + 复杂业务：Seata TCC 模式
+  ├── 异步解耦：RocketMQ 事务消息
+  ├── 简单最终一致：本地消息表 + 定时补偿
+  ├── 跨平台/跨组织：最大努力通知
+  └── 长事务/跨系统：Seata SAGA 模式
+```
+
+## 微服务架构中的 Seata 模式
+
+```
+Seata 在微服务架构中的典型部署：
+
+  API Gateway
+      │
+  ┌───▼───┐
+  │  TM   │  (订单服务 - 事务发起者)
+  └───┬───┘
+      │ @GlobalTransactional
+      ├── 分支事务1 ──→ [RM] 库存服务
+      ├── 分支事务2 ──→ [RM] 账户服务
+      └── 分支事务3 ──→ [RM] 积分服务
+      │
+  ┌───▼───┐
+  │  TC   │  (Seata Server 集群)
+  └───────┘
+      │
+  MySQL (全局事务状态)
+
+事务协调流程：
+  1. TM 开启全局事务，获取全局事务 ID（XID）
+  2. TM 调用各微服务，XID 通过 RPC 传播（ThreadLocal/Feign Interceptor）
+  3. 各 RM 注册分支事务到 TC
+  4. 所有分支事务执行完毕
+  5. TM 提交/回滚全局事务
+  6. TC 通知所有 RM 提交/回滚
+```
+
+```
+XID 传播机制：
+  ├── Dubbo：通过 RpcContext Filter 传播
+  ├── Feign：通过 RequestInterceptor 在 Header 中传递
+  ├── RestTemplate：通过 RestTemplateInterceptor 传递
+  └── WebFlux：通过 WebFilter 传递
+```
+
+## 与其他板块的关系
+
+| 关联板块 | 关系描述 |
+|----------|----------|
+| **微服务架构** | Seata 是微服务分布式事务的核心解决方案 |
+| **数据库** | AT/XA 模式依赖数据库 SQL 解析 |
+| **消息队列** | 事务消息可配合 SAGA 模式实现最终一致 |
+| **缓存** | 分布式事务需保证缓存与数据库一致性 |
+| **监控体系** | Seata Dashboard 监控事务状态 |
+
+## 一句话总结
+
+Seata 提供 AT/TCC/SAGA/XA 四种分布式事务模式，AT 模式通过 SQL 解析实现零侵入的分布式事务，是大多数场景的首选；TCC 模式适合复杂业务逻辑，SAGA 模式适合长事务场景。
 
 ---
 
-## 七、XA 模式（强一致，性能差）
+## 参考资料
 
-基于数据库原生 XA 接口（2PC）。Seata 在框架内管理 XA 事务。
-
-- ✅ 强一致、无侵入。
-- ❌ 全程持锁（Prepare 阶段锁资源到 Commit），性能差、协调者风险。
-- 适合对一致性极度敏感、并发不高的核心业务。
-
----
-
-## 八、和「本地消息表 / 事务消息」怎么选
-
-Seata 之外，还有一类**基于 MQ 的最终一致方案**：
-
-- **本地消息表（Outbox）**：业务表 + 消息表同事务写，定时任务扫描投递 MQ，消费端幂等。
-- **RocketMQ 事务消息**：半消息 → 本地事务 → Commit/Rollback，MQ 回查确认。
-
-| 维度 | Seata AT | 本地消息表 / 事务消息 |
-|------|----------|----------------------|
-| 一致性 | 近强一致（短窗口） | 最终一致（有延迟） |
-| 依赖 | 独立 TC 服务 | 仅 MQ |
-| 跨语言 | Java 为主 | 任意（MQ 多语言） |
-| 适合 | 同步跨服务写 | 异步解耦（如发通知、写 ES） |
-
-**经验**：同步强一致用 Seata；异步通知 / 异构同步（如刷新缓存、写 ES）用事务消息更轻。
-
----
-
-## 九、生产落地与坑
-
-1. **TC 高可用**：TC 独立部署集群，存储可用 DB 或 Raft（新版本 beta）。别让它单点。
-2. **undo_log 表**：每个参与 AT 的库都要建 `undo_log` 表，且与业务同库同事务。
-3. **热点行冲突**：高并发改同一行（如账户余额）用 AT 会全局锁排队 → 这种场景考虑 TCC 或本地消息表。
-4. **事务边界**：`@GlobalTransactional` 别包太大，长事务拖垮 TC。
-5. **只读查询别进全局事务**：避免无谓加锁。
-6. **与 MQ 配合**：AT 保证同步一致，事务消息保证异步一致，二者互补。
-
----
-
-## 面试高频问题（20+ 条）
-
-1. **Seata 的三种核心角色？** TC（Transaction Coordinator，独立部署的事务协调者）、TM（Transaction Manager，带 @GlobalTransactional 的发起方）、RM（Resource Manager，各分支资源）。它们通过 XID 串联全局事务。
-
-2. **AT 模式原理（两阶段）？** 一阶段：本地事务提交前，拦截 SQL，生成 before/after 快照存入 undo_log，业务数据与 undo_log 同库同事务提交；二阶段：TC 通知提交则异步删 undo_log，通知回滚则按 undo_log 反向补偿。对业务零侵入。
-
-3. **AT 模式的全局锁？** 一阶段本地提交时会申请全局锁（防止其他事务同时改同一数据造成脏写），二阶段结束释放。全局锁保证 AT 的写隔离。
-
-4. **AT 的脏写/脏读问题？** 未用 Seata 的本地事务可能绕过全局锁直接改，造成脏写；AT 默认读不加全局锁可能读到中间态（脏读）。解决办法：关键读也走 Seata 或加 @GlobalLock。
-
-5. **TCC 模式是什么？** Try-Confirm-Cancel：Try 预留资源（如冻结金额），Confirm 真正提交，Cancel 释放预留。高性能强一致但业务侵入高（要手写三方法）。
-
-6. **TCC 空回滚/幂等/悬挂？** 空回滚：Try 未执行却收到 Cancel（网络丢 Try），Cancel 要能识别并直接成功；幂等：同分支可能重复调用，Confirm/Cancel 要幂等；悬挂：Cancel 比 Try 先到（资源未预留），要记录并忽略后续 Try。三者是 TCC 必处理的经典问题。
-
-7. **Saga 模式适用什么？** 长事务、最终一致。把流程拆成一系列本地事务+补偿操作，某步失败则反向依次补偿。适合跨多服务、耗时长的业务流程（如旅行预订）。
-
-8. **XA 模式特点？** 基于数据库 XA 协议，强一致、无业务侵入，但资源长时间锁占用、性能差，高并发慎用。
-
-9. **Seata 与本地消息表/事务消息区别？** 本地消息表/事务消息（RocketMQ）是「最大努力通知 + 最终一致」，侵入中、性能较好；Seata AT/TCC 提供更强一致编排。选型看一致性要求与性能。
-
-10. **AT 与 TCC 怎么选？** 一般业务用 AT（无侵入）；高性能强一致、需精细控制资源用 TCC；跨多数据源且不能改代码用 XA；长流程用 Saga。
-
-11. **undo_log 表作用？** 存数据修改前后快照，是 AT 回滚的依据；必须在业务库同库同事务，保证本地提交即可回滚。
-
-12. **全局事务 ID（XID）怎么传播？** 通过 RPC 上下文（如 Dubbo/Feign 透传）把 XID 带到下游 RM，下游注册为分支事务，保证同属一个全局事务。
-
-13. **Seata 支持哪些注册/配置中心？** 支持 Nacos、Eureka、Redis、ZK、Consul 等做 TC 注册发现，配置可用 Nacos/Apollo 等。
-
-14. **AT 模式适用前提？** 基于支持 ACID 的关系库（MySQL/Oracle/PG），且表有主键（回滚定位用）。无主键表 AT 不支持。
-
-15. **TC 高可用怎么部署？** TC 自身无状态，可集群部署，注册到注册中心，前端通过负载均衡访问；事务日志建议存 DB 或 Redis 保证重启不丢。
-
-16. **Seata 与 Spring Cloud / Dubbo 集成？** 通过 @GlobalTransactional 注解 + 数据源代理（DataSourceProxy）+ RPC 拦截器透传 XID，开箱即用。
-
-17. **AT 的读隔离级别？** 默认 Read Uncommitted（可能脏读），如需 Read Committed 要用 @GlobalLock 或 SELECT FOR UPDATE 代理。
-
-18. **生产落地常见坑？** undo_log 表未建/不在同库；数据源未代理导致不走 Seata；XID 未透传使分支未纳入全局事务；大事务全局锁竞争导致超时。
-
-19. **Seata 与消息队列的最终一致方案怎么配合？** 强一致链路用 Seata；异步解耦/削峰用 MQ；也可用「Seata 事务内发可靠消息」保证本地与消息同时成功。
-
-20. **TCC 业务侵入体现在哪？** 需把每个参与服务改造成 Try/Confirm/Cancel 三个接口，且要考虑空回滚、幂等、悬挂，开发成本明显高于 AT。
-
-21. **Seata 的事务模式优先级？** 优先 AT（无侵入覆盖多数场景），其次 TCC（高性能），长事务 Saga，强一致但性能差才 XA。
-
-22. **Seata 与 RocketMQ 事务消息本质差异？** 事务消息是解决「本地事务 + 消息发送」原子性（半消息+回查），保证下游最终一致；Seata 是解决「多数据源/多服务写」的全局一致编排。场景互补。
-
----
-## 十一、与其他板块的关系
-
-- 和「**基础知识/MQ**」：事务消息是分布式事务的另一条路；Seata 也可接入 RocketMQ 做最终一致。
-- 和「**基础知识/分库分表 ShardingSphere**」：ShardingSphere 内置 XA / Seata 事务模式，跨库事务可走 Seata。
-- 和「**基础知识/注册中心与配置中心**」：Seata 的 TC 注册发现常用 Nacos / Eureka。
+- [Seata 官方文档](https://seata.io/zh-cn/docs/)
+- [Seata GitHub](https://github.com/seata/seata)
+- [分布式事务模式对比](https://seata.io/zh-cn/docs/dev/mode/at-mode.html)
+- [Seata AT 模式原理](https://seata.io/zh-cn/docs/dev/mode/at-mode.html)
