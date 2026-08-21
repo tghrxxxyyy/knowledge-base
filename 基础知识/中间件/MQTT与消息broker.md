@@ -687,6 +687,375 @@ CONNECT 消息中设置遗嘱：
   └── 应用订阅一次即可获取最新状态
 ```
 
+## MQTT over QUIC（MQTT v5.0 + QUIC 传输）
+
+### QUIC 传输优势
+
+```
+MQTT over QUIC 架构：
+  客户端 → QUIC 连接 → Broker
+
+QUIC 优势（相比 TCP）：
+  ├── 0-RTT 建连：QUIC 握手比 TCP+TLS 快 300ms+
+  ├── 多路复用：一个连接传输多个 Stream，无队头阻塞
+  ├── 连接迁移：WiFi 切 4G 时连接不中断
+  ├── 内置加密：QUIC 原生 TLS 1.3
+  └── 前向纠错：FEC 机制减少重传
+
+适用场景：
+  ├── 移动设备：频繁切换网络
+  ├── 弱网环境：高丢包率网络
+  ├── 低延迟要求：实时控制场景
+  └── 海量连接：QUIC 连接更轻量
+```
+
+### EMQX QUIC 配置
+
+```hocon
+# emqx.conf
+listeners.quic.default {
+  bind = "0.0.0.0:8883"
+  max_connections = 500000
+  ssl_options {
+    certfile = "/etc/certs/server.crt"
+    keyfile = "/etc/certs/server.key"
+    cacertfile = "/etc/certs/ca.crt"
+  }
+}
+```
+
+## MQTT 会话状态管理内部机制
+
+### 会话状态数据结构
+
+```
+MQTT 会话状态：
+  ├── 订阅关系（Subscription）
+  │   ├── topic_filter → qos 映射
+  │   └── 共享订阅组信息
+  ├── 未确认消息队列（Inflight Messages）
+  │   ├── QoS 1: 等待 PUBACK 的消息
+  │   └── QoS 2: 等待 PUBREC/PUBREL/PUBCOMP 的消息
+  ├── 离线消息队列（Offline Queue）
+  │   └── 客户端离线期间缓存的消息
+  └── QoS 状态
+      ├── 发送方状态：message_id → 消息内容
+      └── 接收方状态：message_id → 确认状态
+
+会话存储位置：
+  ├── 本地存储：单节点 Broker（Mosquitto）
+  ├── 分布式存储：集群模式（EMQX → Mnesia/RocksDB）
+  └── 外部存储：Redis/Database（高可用场景）
+```
+
+### 会话迁移内部流程
+
+```
+EMQX 会话迁移：
+  1. 新节点发现客户端有 Session 在旧节点
+  2. 新节点向旧节点发送 RPC 请求
+  3. 旧节点序列化 Session 数据（订阅 + 消息队列）
+  4. 新节点反序列化并重建 Session
+  5. 新节点向集群广播路由更新
+  6. 消息开始路由到新节点
+
+性能优化：
+  ├── 增量迁移：仅迁移变化的订阅
+  ├── 批量迁移：一次性迁移所有 Session 状态
+  └── 异步迁移：不阻塞新连接
+```
+
+## MQTT QoS 2 性能优化
+
+### QoS 2 性能瓶颈
+
+```
+QoS 2 四次握手开销：
+  ├── 4 次网络往返
+  ├── 2 次消息持久化
+  └── 状态机维护
+
+性能数据（EMQX 基准）：
+  ├── QoS 0: 100,000 msg/s
+  ├── QoS 1: 50,000 msg/s
+  └── QoS 2: 15,000 msg/s
+
+优化策略：
+  ├── 批量确认：合并多个 QoS 2 消息的确认
+  ├── 状态压缩：减少状态机存储开销
+  ├── 异步持久化：消息先写内存再异步刷盘
+  └── 连接级流控：限制未确认消息数量
+```
+
+### QoS 2 最佳实践
+
+```
+QoS 2 使用建议：
+  ├── 仅用于关键消息：支付确认、设备控制指令
+  ├── 配合接收最大值：限制并发 QoS 2 消息数
+  ├── 设置合理超时：避免状态机堆积
+  └── 监控 QoS 2 队列长度：告警阈值
+
+EMQX 配置：
+  max_inflight = 20        # 最大未确认 QoS 2 消息
+  max_mqueue_len = 1000    # 离线消息队列上限
+  mqueue_store_qos0 = false # 不存储 QoS 0 离线消息
+```
+
+## MQTT 车联网（V2X）场景
+
+### V2X 通信架构
+
+```
+V2X MQTT 架构：
+  车载终端 → 车载网关 → MQTT Broker → 云端服务
+                    ↓
+              边缘 Broker（本地处理）
+
+消息类型：
+  ├── BSM（Basic Safety Message）：车辆状态
+  │   Topic: v2x/vehicle/{vehicle_id}/bsm
+  │   频率：10Hz（100ms）
+  │   QoS：0（允许丢失）
+  ├── MAP（Map Data）：地图数据
+  │   Topic: v2x/map/{region_id}
+  │   QoS：1（至少一次）
+  ├── SPaT（Signal Phase and Timing）：信号灯
+  │   Topic: v2x/signal/{intersection_id}/spat
+  │   QoS：1
+  └── RSA（Roadside Safety Alert）：路侧告警
+      Topic: v2x/alert/{road_id}
+      QoS：1
+```
+
+### 车联网 MQTT 配置
+
+```
+车载终端 MQTT 配置：
+  ├── 连接方式：MQTT over TLS + 证书认证
+  ├── 会话：Clean Session = false（保持订阅）
+  ├── 遗嘱消息：车辆离线通知
+  ├── 心跳：30s（检测车辆在线状态）
+  ├── 发布 QoS：遥测数据 QoS 0，控制指令 QoS 1
+  └── 订阅 QoS：云端指令 QoS 1
+
+边缘 Broker 配置：
+  ├── 本地缓存：未送达消息本地存储
+  ├── 桥接：与云端 Broker 同步
+  ├── 本地规则引擎：紧急告警本地处理
+  └── 低延迟：消息本地处理 < 10ms
+```
+
+## MQTT Broker 基准测试
+
+### 测试工具
+
+```
+mqtt-stresser：
+  docker run -i mqtt-stresser \
+    -broker tcp://broker:1883 \
+    -total 100000 \
+    -ca 1000 \
+    -num 10
+
+  测试指标：
+    ├── 发布延迟（P50/P95/P99）
+    ├── 吞吐量（msg/s）
+    └── 连接建立时间
+
+mqttx CLI：
+  mqttx bench pub -h broker -p 1883 \
+    -c 1000 -t "test/%c" -s 256 -q 1
+
+  测试场景：
+    ├── 发布性能：1000 客户端并发发布
+    ├── 订阅性能：1000 客户端订阅
+    └── 混合负载：50% 发布 + 50% 订阅
+
+emqtt-bench（EMQX 官方）：
+  emqtt_bench pub -h broker -c 10000 -t "bench/%c" -s 256
+
+  测试规模：
+    ├── 连接：100,000+ 并发连接
+    ├── 发布：500,000+ msg/s
+    └── 订阅：100,000+ 订阅者
+```
+
+### 性能基准数据
+
+| Broker | 并发连接 | 发布 TPS | 订阅 TPS | 延迟 P99 |
+|--------|---------|---------|---------|---------|
+| EMQX 5.0 | 5,000,000+ | 800,000+ | 2,000,000+ | < 1ms |
+| Mosquitto | 10,000 | 50,000 | 100,000 | < 5ms |
+| HiveMQ | 1,000,000 | 200,000 | 500,000 | < 2ms |
+
+## OPC UA over MQTT（工业 IoT）
+
+### OPC UA MQTT 架构
+
+```
+工业 IoT 架构：
+  OPC UA 设备 → OPC UA Server → MQTT Broker → 工业云平台
+                              ↓
+                        规则引擎 → 数据库/告警
+
+消息格式：
+  ├── Topic：opcua/{node_id}/{variable}
+  ├── Payload：JSON（OPC UA 数据格式）
+  ├── QoS：1（工业场景至少一次）
+  └── Retain：保留最新设备状态
+```
+
+### OPC UA 消息示例
+
+```json
+{
+  "nodeId": "ns=2;s=Temperature",
+  "displayName": "Temperature",
+  "value": 25.5,
+  "dataType": "Double",
+  "sourceTimestamp": "2024-01-15T10:30:00Z",
+  "serverTimestamp": "2024-01-15T10:30:00.123Z",
+  "statusCode": "Good"
+}
+```
+
+## MQTT 访问控制（ACL）模式
+
+### Topic 级别 ACL
+
+```
+ACL 策略：
+  ├── 基于客户端 ID：设备只能发布/订阅自己的 Topic
+  ├── 基于用户名：不同用户不同权限
+  ├── 基于 IP：限制来源网络
+  └── 基于通配符：分级授权
+
+EMQX ACL 配置：
+  rules:
+    - clientid = "sensor-*"
+      topic = "device/${clientid}/#"
+      action = pubsub
+      permission = allow
+
+    - clientid = "app-*"
+      topic = "device/#"
+      action = subscribe
+      permission = allow
+
+    - clientid = "app-*"
+      topic = "command/${clientid}"
+      action = publish
+      permission = allow
+```
+
+### ACL 实现
+
+```python
+# HTTP ACL 认证
+@app.post("/mqtt/acl")
+def mqtt_acl(request):
+    client_id = request.form["clientid"]
+    username = request.form["username"]
+    topic = request.form["topic"]
+    action = request.form["action"]  # publish/subscribe
+
+    # 检查权限
+    if action == "publish":
+        # 只能发布到自己的 Topic
+        if topic.startswith(f"device/{client_id}/"):
+            return {"result": "allow"}
+    elif action == "subscribe":
+        # 可以订阅自己的 Topic 和命令 Topic
+        if topic.startswith(f"device/{client_id}/") or \
+           topic.startswith("command/"):
+            return {"result": "allow"}
+
+    return {"result": "deny"}
+```
+
+## Retained 消息使用场景与陷阱
+
+### Retained 消息最佳实践
+
+```
+使用场景：
+  ├── 设备状态：设备上线时发布在线状态
+  ├── 配置下发：最新配置作为 Retained 消息
+  ├── 最新数据：传感器最新值（温度、湿度）
+  └── 全局公告：系统公告、版本信息
+
+陷阱：
+  ├── 滥用 Retained：每个消息都 Retained → 内存爆炸
+  ├── 不清理 Retained：设备下线后状态仍保留
+  ├── 大消息 Retained：大 payload 占用大量内存
+  └── 频繁更新：高频更新的 Retained 消息导致性能问题
+```
+
+### Retained 消息管理
+
+```
+正确做法：
+  ├── 仅关键状态使用 Retained：设备在线/离线状态
+  ├── 设置合理的消息大小限制：≤ 1KB
+  ├── 定期清理过期 Retained 消息
+  ├── 使用 QoS 1（至少一次投递）
+  └── 设备下线时发布空 payload + Retain 删除 Retained 消息
+
+配置（Mosquitto）：
+  retained_messages_limit: 10000    # 最大 Retained 消息数
+  message_size_limit: 0              # 不限制消息大小
+```
+
+## 遗嘱消息真实场景
+
+### 遗嘱消息使用模式
+
+```
+场景 1：设备离线检测
+  ├── 遗嘱消息：{"online": false, "reason": "unexpected"}
+  ├── 正常上线消息：{"online": true, "battery": 85}
+  ├── Retain：保留最新状态
+  └── 应用订阅一次即可获取最新状态
+
+场景 2：设备健康监控
+  ├── 遗嘱消息：{"status": "offline", "last_seen": "2024-01-15T10:00:00Z"}
+  ├── 心跳消息：每 30s 发布 {"status": "online", "cpu": 45, "mem": 60}
+  └── 告警系统：设备离线 > 5 分钟 → 告警
+
+场景 3：会话状态清理
+  ├── 遗嘱消息：发布到系统 Topic 通知其他服务
+  └── 应用服务器：清理该设备的缓存和状态
+```
+
+### 遗嘱消息实现代码
+
+```python
+# MQTT 客户端遗嘱消息配置
+import paho.mqtt.client as mqtt
+
+client = mqtt.Client(client_id="sensor-001")
+
+# 设置遗嘱消息
+client.will_set(
+    topic="device/sensor-001/status",
+    payload='{"online": false, "reason": "unexpected_disconnect"}',
+    qos=1,
+    retain=True
+)
+
+# 连接
+client.connect("broker.example.com", 1883, 60)
+
+# 上线后发布在线状态
+client.publish(
+    "device/sensor-001/status",
+    '{"online": true, "battery": 85}',
+    qos=1,
+    retain=True
+)
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

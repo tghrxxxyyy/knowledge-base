@@ -664,6 +664,662 @@ XID 传播机制：
   └── WebFlux：通过 WebFilter 传递
 ```
 
+## Seata 在电商下单流程中的完整实现
+
+### 电商下单场景全链路代码
+
+```
+电商下单流程：
+  用户下单 → 1.创建订单 → 2.扣减库存 → 3.扣减余额 → 4.发送通知
+  
+  涉及服务：
+    ├── order-service：创建订单（TM 角色）
+    ├── inventory-service：扣减库存（RM 角色）
+    ├── account-service：扣减余额（RM 角色）
+    └── notification-service：发送通知（可选 RM）
+```
+
+```java
+// ========== order-service ==========
+@Service
+public class OrderCreateService {
+
+    @Autowired
+    private OrderMapper orderMapper;
+    @Autowired
+    private InventoryFeignClient inventoryClient;
+    @Autowired
+    private AccountFeignClient accountClient;
+
+    @GlobalTransactional(
+        name = "create-order",
+        rollbackFor = Exception.class,
+        timeoutMills = 30000
+    )
+    public OrderResult createOrder(OrderCreateDTO dto) {
+        // 1. 创建订单
+        Order order = new Order();
+        order.setOrderNo(generateOrderNo());
+        order.setUserId(dto.getUserId());
+        order.setProductId(dto.getProductId());
+        order.setQuantity(dto.getQuantity());
+        order.setTotalAmount(dto.getTotalAmount());
+        order.setStatus(OrderStatus.CREATED.getCode());
+        orderMapper.insert(order);
+
+        // 2. 扣减库存（远程调用，XID 自动传播）
+        inventoryClient.deductStock(
+            InventoryDeductDTO.builder()
+                .productId(dto.getProductId())
+                .quantity(dto.getQuantity())
+                .orderNo(order.getOrderNo())
+                .build()
+        );
+
+        // 3. 扣减余额
+        accountClient.deductBalance(
+            AccountDeductDTO.builder()
+                .userId(dto.getUserId())
+                .amount(dto.getTotalAmount())
+                .orderNo(order.getOrderNo())
+                .build()
+        );
+
+        // 4. 更新订单状态
+        order.setStatus(OrderStatus.PAID.getCode());
+        orderMapper.updateStatus(order);
+
+        return OrderResult.success(order.getOrderNo());
+    }
+}
+```
+
+```java
+// ========== inventory-service ==========
+@Service
+public class InventoryDeductService {
+
+    @Autowired
+    private InventoryMapper inventoryMapper;
+
+    @GlobalTransactionalContext
+    public void deductStock(InventoryDeductDTO dto) {
+        // 1. 检查库存
+        Inventory inventory = inventoryMapper.selectByProductId(dto.getProductId());
+        if (inventory == null || inventory.getAvailableQty() < dto.getQuantity()) {
+            throw new BizException("库存不足");
+        }
+
+        // 2. 扣减可用库存
+        inventoryMapper.deductAvailable(dto.getProductId(), dto.getQuantity());
+
+        // 3. 增加已扣减库存（用于回滚恢复）
+        inventoryMapper.addDeducted(dto.getProductId(), dto.getQuantity());
+    }
+}
+```
+
+```java
+// ========== account-service ==========
+@Service
+public class AccountDeductService {
+
+    @Autowired
+    private AccountMapper accountMapper;
+
+    @GlobalTransactionalContext
+    public void deductBalance(AccountDeductDTO dto) {
+        Account account = accountMapper.selectByUserId(dto.getUserId());
+        if (account.getBalance().compareTo(dto.getAmount()) < 0) {
+            throw new BizException("余额不足");
+        }
+
+        accountMapper.deductBalance(dto.getUserId(), dto.getAmount());
+        accountMapper.addFrozenAmount(dto.getUserId(), dto.getAmount());
+    }
+}
+```
+
+## Seata TC 集群生产部署（3 节点 + 外部数据库）
+
+### 生产部署拓扑
+
+```
+生产环境 Seata TC 集群部署：
+  ┌──────────────────────────────────────────────────────┐
+  │                    Nginx 负载均衡                      │
+  │         upstream seata { server tc1:8091; ... }       │
+  └───────┬──────────────┬──────────────┬────────────────┘
+          │              │              │
+     ┌────▼───┐    ┌────▼───┐    ┌────▼───┐
+     │ TC-1   │    │ TC-2   │    │ TC-3   │
+     │ 2C4G   │    │ 2C4G   │    │ 2C4G   │
+     └────┬───┘    └────┬───┘    └────┬───┘
+          │              │              │
+     ┌────▼──────────────▼──────────────▼────┐
+     │     MySQL 8.0 主从集群 (3节点)          │
+     │  ┌──────┐    ┌──────┐    ┌──────┐    │
+     │  │Master│ ──▶│Slave1│    │Slave2│    │
+     │  └──────┘    └──────┘    └──────┘    │
+     └───────────────────────────────────────┘
+```
+
+### 生产配置模板
+
+```yaml
+# seata-server.yml 生产环境配置
+server:
+  port: 8091
+
+store:
+  mode: db
+  db:
+    datasource: druid
+    db-type: mysql
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://seata-mysql:3306/seata?useSSL=true&requireSSL=true&verifyServerCertificate=false&characterEncoding=utf8mb4&serverTimezone=Asia/Shanghai
+    user: seata_prod
+    password: ${SEATA_DB_PASSWORD}
+    min-conn: 20
+    max-conn: 100
+    max-wait: 5000
+    validation-query: SELECT 1
+    driver-data-source-properties:
+      useServerPrepStmts: true
+      cachePrepStmts: true
+      prepStmtCacheSize: 250
+      prepStmtCacheSqlLimit: 2048
+
+registry:
+  type: nacos
+  nacos:
+    application: seata-server
+    server-addr: nacos-cluster:8848
+    group: SEATA_GROUP
+    namespace: prod
+    cluster: seata-cluster
+    username: ${NACOS_USERNAME}
+    password: ${NACOS_PASSWORD}
+
+config:
+  type: nacos
+  nacos:
+    server-addr: nacos-cluster:8848
+    group: SEATA_GROUP
+    namespace: prod
+    username: ${NACOS_USERNAME}
+    password: ${NACOS_PASSWORD}
+
+metrics:
+  enabled: true
+  registry-type: prometheus
+  exporter-type: prometheus
+  port: 9090
+```
+
+### TC 集群 MySQL 初始化脚本
+
+```sql
+-- seata 生产数据库初始化
+CREATE DATABASE IF NOT EXISTS seata
+  DEFAULT CHARACTER SET utf8mb4
+  COLLATE utf8mb4_general_ci;
+
+-- 全局事务表
+CREATE TABLE global_table (
+    xid VARCHAR(128) NOT NULL,
+    transaction_id BIGINT,
+    status TINYINT NOT NULL COMMENT '0:初始化 1:已提交 2:已回滚 3:已回滚(部分提交)',
+    application_id VARCHAR(32),
+    transaction_service_group VARCHAR(32),
+    transaction_name VARCHAR(128),
+    timeout INT,
+    begin_time BIGINT,
+    application_data VARCHAR(2000),
+    gmt_create DATETIME,
+    gmt_modified DATETIME,
+    PRIMARY KEY (xid),
+    KEY idx_status_gmt_modified_status (gmt_modified, status),
+    KEY idx_transaction_id (transaction_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 分支事务表
+CREATE TABLE branch_table (
+    branch_id BIGINT NOT NULL,
+    xid VARCHAR(128) NOT NULL,
+    transaction_id BIGINT,
+    resource_group_id VARCHAR(32),
+    resource_id VARCHAR(256),
+    branch_type VARCHAR(8),
+    status TINYINT,
+    client_id VARCHAR(64),
+    application_data VARCHAR(2000),
+    gmt_create DATETIME,
+    gmt_modified DATETIME,
+    PRIMARY KEY (branch_id, xid),
+    KEY idx_xid (xid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 全局锁表
+CREATE TABLE lock_table (
+    row_key VARCHAR(128) NOT NULL,
+    xid VARCHAR(128),
+    transaction_id BIGINT,
+    branch_id BIGINT NOT NULL,
+    resource_id VARCHAR(256),
+    table_name VARCHAR(32),
+    pk VARCHAR(36),
+    gmt_create DATETIME,
+    gmt_modified DATETIME,
+    PRIMARY KEY (row_key),
+    KEY idx_branch_id (branch_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- undo_log 表（每个业务库都需要）
+CREATE TABLE undo_log (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    branch_id BIGINT NOT NULL,
+    xid VARCHAR(100) NOT NULL,
+    context VARCHAR(128) NOT NULL,
+    rollback_info LONGBLOB NOT NULL,
+    log_status INT NOT NULL,
+    log_created DATETIME NOT NULL,
+    log_modified DATETIME NOT NULL,
+    ext VARCHAR(100) DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY ux_undo_log (xid, branch_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AT模式回滚日志';
+```
+
+## AT 模式性能开销分析
+
+### 锁竞争与 undo_log 开销
+
+```
+AT 模式性能开销分解：
+  ├── SQL 解析开销：每次执行前解析 SQL（~1ms/条）
+  ├── Before Image 快照：SELECT 查询额外 IO（~2ms/条）
+  ├── After Image 快照：SELECT 查询额外 IO（~2ms/条）
+  ├── undo_log 写入：INSERT 写 undo_log 表（~1ms/条）
+  ├── 全局锁获取：等待 TC 分配锁（~5-50ms，取决于竞争）
+  └── 全局锁释放：提交/回滚后释放锁
+
+  典型开销：
+    单条 UPDATE：+10-20ms 延迟
+    批量 100 条：+200-500ms 延迟
+    高并发场景：全局锁竞争导致吞吐下降 30-50%
+```
+
+### 全局锁竞争优化策略
+
+| 场景 | 问题 | 优化方案 |
+|------|------|----------|
+| 热点行更新 | 大量事务竞争同一行锁 | 乐观锁 + 重试，或拆分数据 |
+| 大事务 | 持锁时间长，阻塞其他事务 | 缩小事务粒度，拆分为多个小事务 |
+| 长事务 | 全局锁长时间不释放 | 设置合理超时，监控慢事务 |
+| 跨库事务 | 多库 undo_log 一致性 | 统一 undo_log 管理或使用 TCC |
+| 批量操作 | 逐行生成 undo_log，开销大 | 改为批量 SQL，减少锁粒度 |
+
+### undo_log 清理策略
+
+```
+undo_log 清理配置：
+  ├── 异步清理：二阶段提交后异步删除 undo_log
+  ├── 定时清理：cron 定期清理已回滚的 undo_log
+  ├── 过期清理：清理超过 7 天的 undo_log
+  └── 分区清理：按时间分区，直接删除分区
+
+  配置示例：
+    client.undo.logSerialization: jackson
+    client.undo.onlyUpdateIfExists: true
+    client.undo.dataValidation: true
+    client.undo.compressors: jackson
+
+  监控指标：
+    undo_log 表行数：正常 < 10000
+    undo_log 表大小：< 1GB
+    清理延迟：< 1小时
+```
+
+## TCC 模式在支付系统中的完整实现
+
+### 支付场景 TCC 设计
+
+```
+支付系统 TCC 流程：
+  Try：冻结账户余额
+    ├── 检查账户状态
+    ├── 检查可用余额
+    ├── 冻结支付金额（写入冻结记录）
+    └── 扣减可用余额
+
+  Confirm：确认扣款
+    ├── 删除冻结记录
+    └── 不修改余额（Try 已扣减）
+
+  Cancel：取消扣款
+    ├── 检查冻结记录是否存在
+    ├── 恢复可用余额
+    └── 删除冻结记录
+```
+
+```java
+@LocalTCC
+public interface PaymentTccService {
+
+    @TwoPhaseBusinessAction(
+        name = "pay",
+        commitMethod = "confirm",
+        rollbackMethod = "cancel"
+    )
+    boolean tryPay(
+        @BusinessActionContextParameter(paramName = "orderId") String orderId,
+        @BusinessActionContextParameter(paramName = "userId") String userId,
+        @BusinessActionContextParameter(paramName = "amount") BigDecimal amount
+    );
+
+    boolean confirm(BusinessActionContext context);
+    boolean cancel(BusinessActionContext context);
+}
+
+@Service
+@Slf4j
+public class PaymentTccServiceImpl implements PaymentTccService {
+
+    @Autowired
+    private FreezeRecordMapper freezeMapper;
+    @Autowired
+    private AccountMapper accountMapper;
+
+    @Override
+    @Transactional
+    public boolean tryPay(String orderId, String userId, BigDecimal amount) {
+        log.info("[TCC Try] orderId={}, userId={}, amount={}", orderId, userId, amount);
+
+        // 1. 检查是否重复 Try（防悬挂）
+        FreezeRecord existing = freezeMapper.selectByOrderId(orderId);
+        if (existing != null) {
+            log.warn("[TCC Try] 重复Try, orderId={}", orderId);
+            return true;
+        }
+
+        // 2. 检查账户状态
+        Account account = accountMapper.selectByUserId(userId);
+        if (account == null || account.getStatus() != AccountStatus.NORMAL) {
+            throw new BizException("账户状态异常");
+        }
+
+        // 3. 检查可用余额
+        if (account.getAvailableBalance().compareTo(amount) < 0) {
+            throw new BizException("可用余额不足");
+        }
+
+        // 4. 冻结金额
+        accountMapper.deductAvailableBalance(userId, amount);
+
+        // 5. 写入冻结记录
+        FreezeRecord freeze = FreezeRecord.builder()
+            .orderId(orderId)
+            .userId(userId)
+            .frozenAmount(amount)
+            .status(FreezeStatus.FROZEN)
+            .build();
+        freezeMapper.insert(freeze);
+
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean confirm(BusinessActionContext context) {
+        String orderId = context.getActionContext("orderId").toString();
+        log.info("[TCC Confirm] orderId={}", orderId);
+
+        // 删除冻结记录（扣款已在 Try 阶段完成）
+        freezeMapper.deleteByOrderId(orderId);
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean cancel(BusinessActionContext context) {
+        String orderId = context.getActionContext("orderId").toString();
+        String userId = context.getActionContext("userId").toString();
+        BigDecimal amount = (BigDecimal) context.getActionContext("amount");
+        log.info("[TCC Cancel] orderId={}, userId={}, amount={}", orderId, userId, amount);
+
+        // 1. 检查冻结记录（处理空回滚）
+        FreezeRecord freeze = freezeMapper.selectByOrderId(orderId);
+        if (freeze == null) {
+            log.warn("[TCC Cancel] 空回滚, orderId={}", orderId);
+            // 插入空回滚标记，防止悬挂
+            freezeMapper.insertCancelMark(orderId, userId, amount);
+            return true;
+        }
+
+        // 2. 恢复可用余额
+        accountMapper.addAvailableBalance(userId, amount);
+
+        // 3. 更新冻结记录状态
+        freezeMapper.updateStatus(orderId, FreezeStatus.CANCELLED);
+
+        return true;
+    }
+}
+```
+
+## Seata + Spring Cloud Alibaba 集成
+
+### 完整依赖配置
+
+```xml
+<!-- pom.xml -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+            <version>2023.0.1.0</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<dependencies>
+    <dependency>
+        <groupId>com.alibaba.cloud</groupId>
+        <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.seata</groupId>
+        <artifactId>seata-spring-boot-starter</artifactId>
+        <version>1.7.0</version>
+    </dependency>
+</dependencies>
+```
+
+```yaml
+# application.yml
+spring:
+  application:
+    name: order-service
+  cloud:
+    alibaba:
+      seata:
+        tx-service-group: production_tx_group
+        enabled: true
+
+seata:
+  application-id: order-service
+  tx-service-group: production_tx_group
+  service:
+    vgroup-mapping:
+      production_tx_group: seata-cluster
+    grouplist:
+      default:
+        - tc1:8091
+        - tc2:8091
+        - tc3:8091
+    disable-global-transaction: false
+  registry:
+    type: nacos
+    nacos:
+      server-addr: nacos-cluster:8848
+      namespace: prod
+      group: SEATA_GROUP
+      application: seata-server
+  config:
+    type: nacos
+    nacos:
+      server-addr: nacos-cluster:8848
+      namespace: prod
+      group: SEATA_GROUP
+  client:
+    rm:
+      async-commit-buffer-limit: 10000
+      report-retry-count: 5
+      table-meta-check-enable: false
+      sql-parser-type: druid
+      report-success-enable: false
+    tm:
+      default-global-transaction-timeout: 30000
+      commit-retry-count: 5
+      rollback-retry-count: 5
+    undo:
+      log-serialization: jackson
+      only-update-if-exists: true
+```
+
+### XID 传播配置
+
+```java
+// Feign 拦截器传播 XID
+@Configuration
+public class FeignSeataInterceptor implements RequestInterceptor {
+
+    @Override
+    public void apply(RequestTemplate template) {
+        String xid = RootContext.getXID();
+        if (StringUtils.hasText(xid)) {
+            template.header(RootContext.XID_HEADER, xid);
+        }
+    }
+}
+
+// RestTemplate 拦截器传播 XID
+@Configuration
+public class RestTemplateSeataInterceptor implements ClientHttpRequestInterceptor {
+
+    @Override
+    public ClientHttpResponse intercept(
+            HttpRequest request, byte[] body,
+            ClientHttpRequestExecution execution) throws IOException {
+        String xid = RootContext.getXID();
+        if (StringUtils.hasText(xid)) {
+            request.getHeaders().add(RootContext.XID_HEADER, xid);
+        }
+        return execution.execute(request, body);
+    }
+}
+```
+
+## 分布式事务反模式
+
+| 反模式 | 问题描述 | 正确做法 |
+|--------|----------|----------|
+| 滥用全局事务 | 所有操作都加 @GlobalTransactional | 只在关键路径使用，非关键操作异步化 |
+| 大事务 | 一个事务包含太多远程调用 | 拆分为多个小事务，每个事务只做一件事 |
+| 事务嵌套 | 服务 A 调服务 B，B 又发起全局事务 | 避免嵌套全局事务，使用本地事务传播 |
+| 忽略幂等 | 回滚/重试导致重复执行 | 所有操作必须幂等，使用唯一键防重 |
+| 忽略超时 | 不设全局事务超时 | 合理设置超时，避免资源长期锁定 |
+| 锁粒度过粗 | 整表加全局锁 | 只锁需要修改的行，减少锁冲突 |
+| 忽略空回滚 | TCC Cancel 不处理空回滚 | 检查 Try 是否执行，插入空回滚标记 |
+| 同步阻塞 | 同步等待所有分支完成 | 非关键分支异步提交，提升吞吐 |
+
+## Seata 监控与告警配置
+
+```
+Seata 监控指标：
+  TC 指标（Prometheus）：
+    seata_tc_session_active：活跃全局事务数
+    seata_tc_session_committed：已提交事务数
+    seata_tc_session_rollbacked：已回滚事务数
+    seata_tc_branch_active：活跃分支事务数
+    seata_tc_lock_waiting：锁等待数
+    seata_tc_lock_total：总锁数
+
+  客户端指标：
+    seata_client_tm_commit_success：提交成功数
+    seata_client_tm_rollback_success：回滚成功数
+    seata_client_rm_branch_register：分支注册数
+    seata_client_rm_branch_report：分支汇报数
+
+  Grafana Dashboard 配置：
+    ├── 全局事务成功率 = committed / (committed + rollbacked)
+    ├── 平均事务耗时 = sum(duration) / count
+    ├── 锁等待数趋势 = lock_waiting 时间序列
+    └── 分支事务数 = branch_active 实时值
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: seata_alerts
+    rules:
+      - alert: SeataHighRollbackRate
+        expr: rate(seata_tc_session_rollbacked_total[5m]) / rate(seata_tc_session_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Seata 回滚率过高"
+
+      - alert: SeataLockWaiting
+        expr: seata_tc_lock_waiting > 100
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Seata 锁等待数过多"
+
+      - alert: SeataTCCDown
+        expr: up{job="seata-tc"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Seata TC 节点不可用"
+```
+
+## Seata vs Saga vs TCC 决策矩阵
+
+| 决策维度 | 选 Seata AT | 选 Seata TCC | 选 Seata SAGA | 选 RocketMQ 事务消息 |
+|----------|-------------|--------------|---------------|---------------------|
+| 业务复杂度 | 简单 CRUD | 复杂业务逻辑 | 长流程/跨系统 | 异步解耦 |
+| 一致性要求 | 强一致 | 强一致 | 最终一致 | 最终一致 |
+| 性能要求 | 中等（1000 TPS） | 高（5000+ TPS） | 中等（500 TPS） | 高（10000+ TPS） |
+| 侵入性要求 | 低（SQL 解析） | 高（实现三接口） | 中（补偿逻辑） | 中（消息处理） |
+| 数据源类型 | 关系型数据库 | 任意 | 任意 | 任意 |
+| 开发成本 | 低 | 高 | 中 | 中 |
+| 运维成本 | 低 | 低 | 中 | 中 |
+| 典型场景 | 电商下单 | 资金交易 | 跨系统集成 | 事件驱动 |
+
+```
+选型决策树：
+  需要分布式事务？
+    ├── 是 → 数据源是关系型数据库？
+    │     ├── 是 → 业务简单？
+    │     │     ├── 是 → Seata AT 模式（首选）
+    │     │     └── 否 → 业务复杂？ → Seata TCC 模式
+    │     └── 否 → 跨系统/长流程？
+    │           ├── 是 → Seata SAGA 模式
+    │           └── 否 → RocketMQ 事务消息
+    └── 否 → 最终一致即可？
+          ├── 是 → 本地消息表 + 定时补偿
+          └── 否 → 最大努力通知
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

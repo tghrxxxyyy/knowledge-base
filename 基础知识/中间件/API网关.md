@@ -629,6 +629,611 @@ plugins:
           - "X-Powered-By"
 ```
 
+## API 网关迁移实战案例
+
+### 单体到微服务的网关迁移
+
+```
+案例背景：
+  电商系统从单体迁移到微服务
+  日均 PV：5000 万，峰值 QPS：8000
+
+迁移路径：
+  阶段 1（2 周）：
+    ├── 部署 Kong 集群（3 节点）
+    ├── 配置路由指向原单体应用
+    ├── 验证网关性能和稳定性
+    └── DNS 切换到网关（灰度 10% → 50% → 100%）
+
+  阶段 2（4 周）：
+    ├── 认证逻辑迁移到网关（JWT 验证）
+    ├── 限流策略配置（按用户/接口）
+    ├── 日志采集统一到 ELK
+    └── 拆分第一个微服务（用户服务）
+
+  阶段 3（持续）：
+    ├── 逐步拆分其他服务
+    ├── 网关承担路由+认证+限流
+    └── 业务服务专注业务逻辑
+
+回滚方案：
+  DNS 切回原单体地址（TTL 提前调低到 60s）
+  回滚时间：< 5 分钟
+```
+
+## 网关限流的 Redis 实现
+
+### 分布式限流方案
+
+```lua
+-- Redis Lua 脚本：滑动窗口限流
+local key = KEYS[1]                -- 限流 key
+local window = tonumber(ARGV[1])   -- 窗口大小（秒）
+local limit = tonumber(ARGV[2])    -- 请求数上限
+local now = tonumber(ARGV[3])      -- 当前时间戳（毫秒）
+
+-- 移除窗口外的请求
+redis.call("ZREMRANGEBYSCORE", key, 0, now - window * 1000)
+
+-- 获取窗口内请求数
+local count = redis.call("ZCARD", key)
+
+if count < limit then
+    -- 未超限，记录当前请求
+    redis.call("ZADD", key, now, now .. math.random())
+    redis.call("EXPIRE", key, window)
+    return {1, limit - count}  -- allowed, remaining
+else
+    return {0, 0}  -- rejected, remaining=0
+end
+```
+
+### 限流配置最佳实践
+
+```yaml
+# 网关限流策略配置
+rate_limiting:
+  global:
+    requests_per_second: 10000
+    burst_capacity: 20000
+
+  per_route:
+    "/api/orders":
+      requests_per_second: 1000
+      burst_capacity: 2000
+    "/api/search":
+      requests_per_second: 500
+      burst_capacity: 1000
+
+  per_user:
+    default:
+      requests_per_second: 100
+      burst_capacity: 200
+    premium:
+      requests_per_second: 500
+      burst_capacity: 1000
+
+  per_ip:
+    requests_per_second: 50
+    burst_capacity: 100
+    whitelist:
+      - "10.0.0.0/8"
+```
+
+## API 版本管理策略
+
+### 版本策略对比
+
+| 策略 | 实现方式 | 优点 | 缺点 |
+|------|----------|------|------|
+| URL 路径 | /api/v1/users | 直观、缓存友好 | URL 膨胀 |
+| 请求头 | Accept: application/vnd.api.v1+json | URL 简洁 | 调试不便 |
+| 查询参数 | /api/users?version=1 | 简单 | 非 RESTful |
+| 内容协商 | Content-Type 版本化 | 符合 HTTP 规范 | 实现复杂 |
+
+### 版本路由配置
+
+```yaml
+# Kong 路由配置
+routes:
+  - name: users-v1
+    paths:
+      - /api/v1/users
+    service: user-service-v1
+
+  - name: users-v2
+    paths:
+      - /api/v2/users
+    service: user-service-v2
+
+plugins:
+  - name: request-transformer
+    config:
+      add:
+        headers:
+          - "X-API-Version: v2"
+```
+
+## 网关缓存模式
+
+### 响应缓存
+
+```
+缓存策略：
+  ├── 全局缓存：所有 GET 响应默认缓存
+  ├── 路由级缓存：特定 API 启用缓存
+  ├── Header 控制：Cache-Control / ETag
+  └── 缓存失效：版本号 / 时间戳 / 主动失效
+
+缓存键设计：
+  method + uri + query_params + accept_header + user_id
+  示例：GET:/api/products?category=phone:application/json:user-123
+
+缓存存储：
+  本地缓存（性能高，容量小）
+  Redis 缓存（容量大，分布式）
+  混合缓存（L1 本地 + L2 Redis）
+```
+
+### 缓存配置示例
+
+```yaml
+# APISIX 缓存插件
+plugins:
+  - name: proxy-cache
+    config:
+      cache_strategy: memory
+      cache_ttl: 300
+      cache_key: "$uri$is_args$args"
+      cache_http_status:
+        - 200
+        - 301
+        - 302
+      cache_control: true  # 尊重 Cache-Control header
+```
+
+## 熔断器模式：Hystrix vs Resilience4j
+
+### 对比
+
+| 维度 | Hystrix | Resilience4j |
+|------|---------|--------------|
+| 状态 | 已停止维护 | 活跃维护 |
+| 语言 | Java | Java/Kotlin |
+| 轻量级 | 较重 | 轻量 |
+| 函数式 | 不支持 | 支持（函数式编程） |
+| 与 Spring | 集成好 | Spring Boot Starter |
+| Circuit Breaker | 支持 | 支持（更多策略） |
+| Rate Limiter | 不支持 | 支持 |
+| Retry | 不支持 | 支持 |
+| Bulkhead | 信号量/线程池 | 信号量/线程池 |
+
+### Resilience4j 配置
+
+```yaml
+# 配置示例
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        slidingWindowSize: 100
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 10
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+
+  retry:
+    instances:
+      paymentService:
+        maxAttempts: 3
+        waitDuration: 500ms
+        enableExponentialBackoff: true
+
+  bulkhead:
+    instances:
+      paymentService:
+        maxConcurrentCalls: 25
+        maxWaitDuration: 0
+```
+
+## 网关性能基准测试
+
+### 测试方法论
+
+```
+测试工具：wrk / hey / k6 / vegeta
+
+测试场景：
+  1. 纯代理转发（无插件）
+     wrk -t12 -c400 -d30s http://gateway/api/health
+
+  2. 认证 + 限流
+     wrk -t12 -c400 -d30s -H "Authorization: Bearer $TOKEN" \
+         http://gateway/api/users
+
+  3. 响应缓存
+     wrk -t12 -c400 -d30s http://gateway/api/products/123
+
+  4. WebSocket 长连接
+     k6 测试 WebSocket 连接数和消息吞吐
+
+关键指标：
+  ├── QPS（每秒请求数）
+  ├── P50/P95/P99 延迟
+  ├── 错误率
+  ├── CPU / 内存使用率
+  └── 连接数
+```
+
+### 性能基准数据参考
+
+| 网关 | 纯代理 QPS | 认证+限流 QPS | 延迟 P99 |
+|------|-----------|--------------|----------|
+| Kong (OpenResty) | 50,000+ | 30,000+ | < 5ms |
+| APISIX (OpenResty) | 60,000+ | 40,000+ | < 3ms |
+| Envoy | 40,000+ | 25,000+ | < 5ms |
+| Spring Cloud Gateway | 20,000+ | 15,000+ | < 10ms |
+
+## Serverless API 网关
+
+### Kong on Lambda
+
+```
+部署方式：
+  ├── Kong Gateway → AWS API Gateway → Lambda
+  ├── Kong Gateway → Lambda 集成（直接调用）
+  └── Kong + Lambda 插件（Kong Enterprise）
+
+配置示例：
+  路由规则：
+    /api/orders → Lambda: order-handler
+    /api/users → Lambda: user-handler
+
+  插件链：
+    JWT 验证 → 限流 → Lambda 调用 → 响应转换
+```
+
+### APISIX on FaaS
+
+```yaml
+# APISIX serverless 函数插件
+plugins:
+  - name: serverless-pre-function
+    phase: access
+    config:
+      phase: access
+      functions:
+        - |
+          return function(conf, ctx)
+            local core = require("apisix.core")
+            core.log.info("custom access logic")
+          end
+```
+
+## API 网关迁移实战案例
+
+### 单体到微服务的网关迁移
+
+```
+案例背景：
+  电商平台从单体迁移到微服务
+  日均 PV：5000 万，峰值 QPS：8000
+
+迁移路径：
+  阶段 1：引入网关作为唯一入口
+    ├── 部署 Kong 集群（3 节点）
+    ├── 配置路由指向原单体应用
+    ├── 验证网关性能和稳定性
+    └── DNS 切换到网关（灰度 10% → 50% → 100%）
+
+  阶段 2：认证逻辑迁移
+    ├── 原单体内认证逻辑抽取到网关
+    ├── JWT 验证统一在网关层
+    ├── 下游服务信任网关传递的用户信息
+    └── 双跑验证：网关 + 单体同时验证 1 周
+
+  阶段 3：拆分微服务
+    ├── 第一个拆分：用户服务（低风险）
+    ├── 网关路由：/api/users → user-service
+    └── 逐步拆分订单、商品、支付服务
+
+  阶段 4：完全微服务化
+    ├── 所有路由指向微服务
+    ├── 网关承担认证、限流、日志
+    └── 原单体应用下线
+
+回滚方案：
+  DNS 回切到原单体（TTL 提前调低到 60s）
+  网关故障时直连后端（优雅降级）
+```
+
+### 流量切换详细步骤
+
+```yaml
+# 灰度发布配置（Kong + 插件）
+plugins:
+  - name: canary
+    config:
+      services:
+        - service: order-service
+          canary:
+            upstream: order-service-v2
+            weight: 5            # 5% 流量到新服务
+            start_time: 2024-01-15T10:00:00Z
+            duration: 3600       # 持续 1 小时
+            criteria:
+              header: x-canary
+              value: "true"       # 特定 Header 走新服务
+
+# 监控对比
+# 1. 对比 v1 vs v2 的错误率
+# 2. 对比 P99 延迟
+# 3. 对比业务指标（订单成功率）
+# 4. 无异常 → 逐步增加 weight: 5 → 20 → 50 → 100
+```
+
+## 网关 Rate Limiting 的 Redis 实现
+
+### 滑动窗口 + Redis
+
+```lua
+-- Redis Lua 脚本：滑动窗口限流
+local key = KEYS[1]
+local window = tonumber(ARGV[1])    -- 窗口大小（秒）
+local limit = tonumber(ARGV[2])     -- 请求数上限
+local now = tonumber(ARGV[3])       -- 当前时间戳（ms）
+local window_start = now - window * 1000
+
+-- 移除窗口外的请求
+redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
+
+-- 获取窗口内请求数
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+    -- 未超限，添加当前请求
+    redis.call('ZADD', key, now, now .. '-' .. math.random(1000000))
+    redis.call('PEXPIRE', key, window * 1000)
+    return {1, limit - count - 1}  -- allowed, remaining
+else
+    return {0, 0}  -- rejected, remaining=0
+end
+```
+
+### 多维度限流配置
+
+```yaml
+# 网关限流策略（APISIX 配置）
+plugins:
+  - name: limit-count
+    config:
+      count: 100                    # 100 次
+      time_window: 60               # 60 秒
+      key_type: var                 # 按变量限流
+      key: remote_addr              # 按 IP
+      rejected_code: 429
+      rejected_msg: "Rate limit exceeded"
+
+  - name: limit-count
+    config:
+      count: 1000                   # 1000 次
+      time_window: 60
+      key: http_x_api_key           # 按 API Key
+      rejected_code: 429
+
+  - name: limit-count
+    config:
+      count: 50
+      time_window: 1
+      key: consumer_name            # 按消费者
+      rejected_code: 429
+```
+
+## API 版本管理策略
+
+### 版本策略对比
+
+| 策略 | 实现 | 优点 | 缺点 |
+|------|------|------|------|
+| URL 路径 | /api/v1/users | 直观、缓存友好 | URL 膨胀 |
+| 请求头 | X-API-Version: 1 | URL 简洁 | 调试不直观 |
+| 查询参数 | ?api-version=1 | 灵活 | 缓存键复杂 |
+| 内容协商 | Accept: application/vnd.api.v1+json | 符合 HTTP 规范 | 实现复杂 |
+
+### 版本路由配置
+
+```yaml
+# APISIX 多版本路由
+routes:
+  # v1 路由
+  - uri: /api/v1/users
+    upstream:
+      nodes:
+        "user-service-v1:8080": 1
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/v1/(.*)"
+          - "/$1"
+
+  # v2 路由
+  - uri: /api/v2/users
+    upstream:
+      nodes:
+        "user-service-v2:8080": 1
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/v2/(.*)"
+          - "/$1"
+```
+
+## 网关缓存模式
+
+### 响应缓存策略
+
+```
+缓存层次：
+  ├── 网关层缓存（CDN → 网关）
+  │   适用于：公开 API、静态资源
+  │   实现：Nginx proxy_cache / Kong proxy-cache 插件
+  ├── 应用层缓存
+  │   适用于：业务逻辑缓存
+  │   实现：Redis / 本地缓存
+  └── 数据库缓存
+      适用于：查询结果缓存
+      实现：MySQL Query Cache / Redis
+
+网关缓存配置（Kong）：
+  插件：proxy-cache
+  config:
+    response_code: [200, 301, 302]
+    request_method: [GET, HEAD]
+    content_type: [application/json]
+    cache_ttl: 300          # 5 分钟
+    cache_key: "${uri}${args}"
+    storage: redis
+    redis_host: redis-cluster
+```
+
+### 缓存失效策略
+
+```
+主动失效：
+  ├── 版本号失效：缓存 key 包含版本号
+  ├── 时间失效：TTL 自动过期
+  ├── 主动清除：业务事件触发缓存清除
+  └── 版本化 URL：/api/v1/users → 缓存自动失效
+
+被动失效：
+  ├── LRU 淘汰：缓存满时淘汰最久未使用
+  ├── TTL 过期：定时清除过期缓存
+  └── 主动刷新：请求时发现过期则刷新
+```
+
+## 熔断器模式：Hystrix vs Resilience4j
+
+### 对比
+
+| 维度 | Hystrix | Resilience4j |
+|------|---------|--------------|
+| 维护状态 | 已停止维护 | 活跃维护 |
+| 线程模型 | 线程池隔离 | 信号量隔离（默认） |
+| 轻量级 | 重（依赖 RxJava） | 轻量（纯 Java） |
+| 函数式支持 | 不支持 | 支持（函数式编程） |
+| 指标收集 | 内置 Hystrix Dashboard | 集成 Micrometer |
+| Spring Cloud | 已弃用 | 推荐替代 Hystrix |
+
+### Resilience4j 网关配置
+
+```java
+// Resilience4j Circuit Breaker 配置
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)           // 失败率阈值 50%
+    .waitDurationInOpenState(Duration.ofSeconds(10))  // 等待 10s
+    .slidingWindowSize(100)             // 滑动窗口 100 个请求
+    .minimumNumberOfCalls(10)           // 至少 10 个请求才计算
+    .build();
+
+CircuitBreaker breaker = CircuitBreaker.of("paymentService", config);
+
+// 装饰调用
+Supplier<Response> decoratedSupplier = Decorators
+    .ofSupplier(() -> callPaymentService(request))
+    .withCircuitBreaker(breaker)
+    .withRetry(Retry.of("retry", retryConfig))
+    .withFallback(CallNotPermittedException.class,
+        e -> fallbackResponse())
+    .decorate();
+
+Try<Response> result = Try.ofSupplier(decoratedSupplier);
+```
+
+## 网关性能基准测试
+
+### 测试方法论
+
+```
+测试工具：wrk / hey / k6 / JMeter
+
+测试场景：
+  1. 纯代理转发（无插件）
+     wrk -t12 -c400 -d30s http://gateway/api/test
+
+  2. 认证 + 限流（JWT 验证 + Rate Limit）
+     wrk -t12 -c400 -d30s -H "Authorization: Bearer $TOKEN" \
+         http://gateway/api/protected
+
+  3. 响应聚合（BFF 模式）
+     wrk -t12 -c200 -d30s http://gateway/api/aggregation
+
+关键指标：
+  ├── QPS（吞吐量）
+  ├── P50 / P95 / P99 延迟
+  ├── 错误率
+  ├── CPU / 内存使用率
+  └── GC 暂停时间
+```
+
+### 性能基准数据参考
+
+| 网关 | 纯代理 QPS | 认证+限流 QPS | P99 延迟 |
+|------|-----------|--------------|---------|
+| Kong | 30,000+ | 20,000+ | < 5ms |
+| APISIX | 40,000+ | 30,000+ | < 3ms |
+| Envoy | 50,000+ | 35,000+ | < 2ms |
+| Spring Cloud Gateway | 15,000+ | 10,000+ | < 10ms |
+
+## Serverless API 网关
+
+### Kong on Lambda
+
+```
+部署架构：
+  客户端 → API Gateway (Kong) → Lambda 函数
+                ↓
+          插件处理（认证、限流、日志）
+
+配置示例：
+  路由：
+    uri: /api/invoke
+    service:
+      name: lambda-service
+      url: "arn:aws:lambda:region:function-name"
+
+  插件：
+    - jwt：验证调用方身份
+    - rate-limiting：防止 Lambda 被滥用
+    - logging：调用日志写入 CloudWatch
+```
+
+### APISIX on FaaS
+
+```yaml
+# APISIX + FaaS 插件配置
+plugins:
+  - name: serverless-pre-function
+    phase: access
+    config:
+      phase: access
+      functions:
+        - |
+          return function(conf, ctx)
+            local core = require("apisix.core")
+            core.log.info("FaaS pre-processing")
+          end
+
+  - name: serverless-post-function
+    phase: header_filter
+    config:
+      phase: header_filter
+      functions:
+        - |
+          return function(conf, ctx)
+            ngx.header["X-Processed"] = "true"
+          end
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

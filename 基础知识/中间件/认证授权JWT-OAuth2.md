@@ -843,6 +843,540 @@ public class CustomTokenEnhancer implements TokenEnhancer {
 }
 ```
 
+## OAuth2 真实攻击向量与代码级防御
+
+### CSRF 攻击：伪造授权请求
+
+```
+攻击场景：
+  1. 攻击者构造恶意授权链接：
+     https://auth.example.com/authorize?
+       response_type=code&
+       client_id=victim-app&
+       redirect_uri=https://attacker.com/callback&
+       state=attacker-controlled-state
+  2. 用户点击链接 → 授权成功 → code 发送到攻击者服务器
+  3. 攻击者用 code 换取 token
+
+防御措施（代码级）：
+  服务端生成不可预测的 state 参数，绑定到用户 session
+  用户回调时验证 state 是否与 session 中存储的一致
+  state 有效期设为 5 分钟，防止长期暴露
+```
+
+### Redirect URI 操纵攻击
+
+```
+攻击手法：
+  ├── 注册时提交：https://app.example.com/callback
+  ├── 攻击时提交：https://app.example.com/callback?next=https://evil.com
+  ├── 部分实现只验证前缀 → 被绕过
+  └── 利用 open redirect 漏洞获取 code
+
+防御代码（严格匹配）：
+  def validate_redirect_uri(uri, registered_uri):
+      parsed = urlparse(uri)
+      registered = urlparse(registered_uri)
+      # 严格匹配 scheme + host + port + path（不允许查询参数）
+      return (parsed.scheme == registered.scheme
+              and parsed.hostname == registered.hostname
+              and parsed.port == registered.port
+              and parsed.path.rstrip('/') == registered.path.rstrip('/'))
+```
+
+### Token 泄露场景
+
+```
+泄露途径：
+  ├── URL 参数泄露（Referer header 暴露 token）
+  ├── 日志记录（access.log 记录 Authorization header）
+  ├── 浏览器历史记录（token 在 URL 中）
+  ├── 中间人攻击（未使用 HTTPS）
+  └── XSS 窃取（localStorage 中的 token）
+
+防御策略：
+  1. Token 绝不放 URL 参数（始终用 Authorization header）
+  2. 服务端 Access Log 脱敏（mask Authorization header）
+  3. CSP 头防止 XSS（Content-Security-Policy）
+  4. HTTPS 强制 + HSTS
+  5. Token 短有效期（15分钟）+ Refresh Token 轮转
+```
+
+### 混淆代理攻击（Confused Deputy）
+
+```
+攻击原理：
+  攻击者将 A 服务的 token 发送给 B 服务
+  B 服务误以为是自己的 token，用它调用 A 服务
+  A 服务验证 token 有效 → 攻击者借 B 服务之手调用 A
+
+防御：
+  ├── JWT 中携带 audience (aud) claim
+  ├── 资源服务严格验证 aud 是否匹配自身标识
+  ├── Token 绑定（Token Binding）或 DPoP
+  └── mTLS 客户端证书绑定
+```
+
+## JWT 微服务间 Token 传播模式
+
+### Token Propagation 模式
+
+```
+模式 1：Token 透传（Passthrough）
+  Client → Gateway → Service A → Service B
+  传递方式：原始 JWT 原封不动传递
+  优点：简单、无状态
+  缺点：token 膨胀（claims 累积）、下游可看到上游的所有信息
+
+模式 2：Token 交换（Token Exchange, RFC 8693）
+  Client → Gateway → Service A → Auth Server → Service B
+  传递方式：Service A 用自己的 token 换取适合 Service B 的 token
+  优点：最小权限、token 精简
+  缺点：额外网络开销
+
+模式 3：Token 派生（Token Derivation）
+  Client → Gateway → Service A → Service B
+  传递方式：Service A 用 JWT 签发一个受限的子 token
+  优点：无需调用 Auth Server、可自定义 claims
+  缺点：下游需信任上游的签名
+```
+
+### Token Exchange RFC 8693 实现
+
+```python
+# 服务间 Token Exchange
+def exchange_token(original_token, target_service):
+    """RFC 8693 Token Exchange"""
+    response = requests.post(
+        "https://auth.example.com/oauth/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": original_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "audience": target_service,  # 目标服务标识
+            "scope": "read:data write:data",  # 最小权限
+        },
+        headers={"Authorization": f"Bearer {service_token}"}
+    )
+    return response.json()["access_token"]
+
+# 使用派生 token 调用下游
+new_token = exchange_token(current_token, "payment-service")
+downstream_call(headers={"Authorization": f"Bearer {new_token}"})
+```
+
+## OAuth2 移动端实现
+
+### AppAuth 推荐架构
+
+```
+iOS/Android OAuth2 流程：
+  1. 使用系统浏览器（SFSafariViewController / Chrome Custom Tabs）
+  2. 通过 Deep Link / Claimed HTTPS URI 回调
+  3. Authorization Code + PKCE 交换 token
+  4. Token 存储在 Secure Storage（Keychain / KeyStore）
+
+Deep Link 配置：
+  iOS: myapp://callback
+  Android: myapp://callback
+
+Claimed HTTPS URI（更安全）：
+  https://app.example.com/.well-known/apple-app-site-association
+  https://app.example.com/.well-known/assetlinks.json
+```
+
+### 移动端安全存储
+
+```kotlin
+// Android KeyStore 示例
+val keyStore = KeyStore.getInstance("AndroidKeyStore")
+keyStore.load(null)
+
+val entry = KeyStore.SecretKeyEntry(secretKey)
+keyStore.setEntry("oauth_token", entry,
+    KeyStoreProtectionParameter("password"))
+
+// 存储 token
+val encryptedData = cipher.doFinal(token.toByteArray())
+sharedPrefs.edit().putString("token", Base64.encodeToString(encryptedData)).apply()
+```
+
+## Single Logout (SLO) 模式
+
+### OIDC Single Logout 流程
+
+```
+SLO 步骤：
+  1. 用户在 App A 登出
+  2. App A 调用 OP 的 end_session_endpoint
+  3. OP 向所有已知的客户端发送 Logout Notification
+  4. 各客户端清除本地 session 和 token
+  5. OP 清除自己的 session
+
+实现方式：
+  ├── 前端通道（Front-channel）：通过 iframe 通知各 RP
+  │   优点：简单
+  │   缺点：依赖浏览器、可能被拦截
+  ├── 后端通道（Back-channel）：OP 直接调用 RP 的 logout URI
+  │   优点：可靠、可审计
+  │   缺点：RP 必须在线
+  └── RP-Initiated Logout：RP 主动发起 logout
+      调用 OP 的 end_session_endpoint
+      携带 id_token_hint 用于 OP 识别用户
+```
+
+### Back-channel Logout 代码
+
+```python
+# 接收 OP 的 logout 通知
+@app.post("/backchannel-logout")
+def backchannel_logout(request):
+    # 验证 JWT 签名（OP 的签名）
+    logout_token = verify_logout_token(request.body, op_public_key)
+
+    # 验证 iss 和 aud
+    assert logout_token["iss"] == OP_ISSUER
+    assert logout_token["aud"] == CLIENT_ID
+
+    # 获取 sid (Session ID) 或 sub (Subject)
+    sid = logout_token.get("sid")
+    sub = logout_token.get("sub")
+
+    # 清除该用户的所有本地 session
+    if sid:
+        db.delete_session_by_sid(sid)
+    elif sub:
+        db.delete_all_sessions_for_user(sub)
+
+    return {"status": "ok"}
+```
+
+## Token Exchange RFC 8693 详解
+
+### 使用场景
+
+```
+场景 1：跨服务委托
+  API Gateway 收到用户 token → 换成内部服务 token → 调用下游
+
+场景 2：权限降级
+  管理员 token → 换成普通用户 token → 调用普通 API
+
+场景 3：跨域访问
+  Service A 的 token → 换成 Service B 可识别的 token
+
+场景 4：Impersonation（模拟）
+  管理员 impersonate 普通用户 → 以用户身份调用服务
+```
+
+### 完整请求/响应
+
+```http
+POST /oauth/token HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+&subject_token=eyJhbGciOiJSUzI1NiJ9...
+&subject_token_type=urn:ietf:params:oauth:token-type:access_token
+&audience=payment-service
+&requested_token_type=urn:ietf:params:oauth:token-type:access_token
+&scope=payment:read payment:write
+&actor_token=eyJhbGciOiJSUzI1NiJ9...
+&actor_token_type=urn:ietf:params:oauth:token-type:access_token
+
+# 响应
+{
+  "access_token": "eyJhbGciOiJSUzI1NiJ9...",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+  "token_type": "Bearer",
+  "expires_in": 300,
+  "scope": "payment:read payment:write"
+}
+```
+
+## Keycloak vs Auth0 vs 自建方案对比
+
+### 功能对比
+
+| 功能 | Keycloak | Auth0 | 自建 |
+|------|----------|-------|------|
+| 部署方式 | 自托管 / Kubernetes | SaaS | 自托管 |
+| 成本 | 免费开源 | 按 MAU 计费 | 开发成本高 |
+| OIDC/SAML | 完整支持 | 完整支持 | 需自行实现 |
+| Multi-Tenancy | 支持 | 支持 | 需自行实现 |
+| User Federation | LDAP/AD 集成 | 企业连接器 | 需自行开发 |
+| 自定义主题 | 支持 | 有限支持 | 完全自定义 |
+| 审计日志 | 内置 | 内置 | 需自行实现 |
+| 高可用 | 集群部署 | 内置 | 需自行实现 |
+| 维护成本 | 中等 | 低 | 高 |
+
+### 选型决策
+
+```
+选型路径：
+  ├── 预算充足 + 快速上线 → Auth0
+  ├── 需要私有化部署 → Keycloak
+  ├── 有特殊安全合规要求 → 自建 + HSM
+  ├── 团队有能力维护 → Keycloak（推荐）
+  └── 超大规模 + 定制需求 → 自建核心 + Keycloak 组件
+```
+
+## OAuth2 真实攻击向量与防御
+
+### CSRF 攻击
+
+```
+攻击场景：
+  攻击者诱导用户访问恶意页面，该页面自动发起 OAuth2 授权请求
+  将攻击者的账号绑定到受害者会话
+
+防御：state 参数 + PKCE
+  1. 生成随机 state 值，存储在用户 Session
+  2. 授权请求携带 state
+  3. 回调时验证 state 是否匹配
+  4. state 不匹配 → 拒绝授权
+```
+
+```python
+# CSRF 防御实现
+def generate_oauth_state():
+    state = secrets.token_urlsafe(32)
+    session["oauth_state"] = state
+    return state
+
+def verify_oauth_state(callback_state):
+    expected = session.pop("oauth_state", None)
+    if not expected or expected != callback_state:
+        raise SecurityError("CSRF detected: state mismatch")
+```
+
+### Redirect URI 操纵攻击
+
+```
+攻击手法：
+  ├── 字符串比较绕过：https://app.com/callback vs https://app.com/callback/../
+  ├── 子路径注册：注册 https://app.com/callback → 访问 https://app.com/callback/malicious
+  ├── 协议降级：https://app.com → http://app.com
+  ├── 端口操纵：https://app.com:443 vs https://app.com:8443
+  └── 大小写混淆：https://App.com vs https://app.com
+
+防御：
+  ├── 严格字符串匹配（不使用 URI 解析）
+  ├── 精确匹配 path（不允许子路径）
+  ├── 强制 HTTPS
+  ├── 禁止通配符
+  └── 仅允许已注册的 redirect_uri
+```
+
+### Token 泄露场景
+
+```
+泄露途径：
+  ├── URL 参数泄露：token 放在 URL 中 → 浏览器历史、Referer Header、服务器日志
+  ├── 日志泄露：access_token 被打印到应用日志
+  ├── 浏览器存储：localStorage 被 XSS 读取
+  ├── 网络嗅探：非 HTTPS 传输
+  ├── 第三方脚本：页面中的第三方 JS 读取 token
+  └── 服务器端：token 被反序列化到日志/监控系统
+
+防御措施：
+  ├── 永远使用 Bearer Token（Header 传递）
+  ├── 浏览器端内存存储（不落盘）
+  ├── 服务端日志脱敏
+  ├── HTTPS 强制（HSTS）
+  ├── CSP 策略限制第三方脚本
+  └── Token 有效期 ≤ 15 分钟
+```
+
+## JWT 微服务间 Token 传播模式
+
+### Token Propagation 架构
+
+```
+模式 1：Token 透传（推荐）
+  客户端 → API 网关 → 微服务 A → 微服务 B
+  全程使用同一个 access_token
+
+  优点：简单、无状态
+  缺点：token 可能包含过多信息
+
+模式 2：Token 交换（RFC 8693）
+  客户端 → 网关 → 微服务 A → Token Exchange → 新 token → 微服务 B
+  微服务 A 用原始 token 换取限定 scope 的新 token
+
+  优点：最小权限原则
+  缺点：多一次网络调用
+
+模式 3：内部证书（Service-to-Service）
+  微服务间使用 mTLS 证书认证，不依赖用户 token
+  网关注入 X-User-Id Header，下游信任该 Header
+
+  优点：性能最高
+  缺点：需要 PKI 基础设施
+```
+
+### Service Account Token 模式
+
+```yaml
+# 服务间调用认证配置
+service_auth:
+  mode: "jwt"
+  issuer: "internal-auth-service"
+  audience: "order-service"
+  claims:
+    service_name: "inventory-service"
+    permissions: ["order:read", "inventory:write"]
+  token_ttl: 300  # 5 分钟短期 token
+```
+
+## Token Exchange（RFC 8693）
+
+### 场景与用途
+
+```
+Token Exchange 典型场景：
+  ├── 委托访问：用户 A 授权服务 B 代表其访问服务 C
+  ├── 跨域认证：从 IdP A 获取 token 用于 IdP B 的服务
+  ├── 降级权限：将宽泛 token 换取限定 scope 的 token
+  └── 协议转换：将 SAML token 转换为 OAuth2 token
+
+请求格式：
+  POST /token
+  grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+  &subject_token=原始token
+  &subject_token_type=urn:ietf:params:oauth:token-type:access_token
+  &audience=目标服务
+  &scope=read
+
+响应：
+  {
+    "access_token": "新token",
+    "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "token_type": "Bearer",
+    "expires_in": 300
+  }
+```
+
+## OAuth2 移动端实现
+
+### AppAuth 模式（iOS/Android 推荐）
+
+```
+iOS AppAuth 流程：
+  1. App 调用 ASWebAuthenticationSession
+  2. 系统浏览器打开授权页面
+  3. 用户登录授权
+  4. 系统浏览器通过 Universal Link / Custom Scheme 回调 App
+  5. App 接收 authorization_code
+  6. App 后端用 code 换取 token
+
+安全要点：
+  ├── 使用 Claimed HTTPS URI（通用链接）
+  │   iOS: apple-app-site-association
+  │   Android: assetlinks.json
+  ├── 不使用自定义 scheme（容易被劫持）
+  ├── PKCE 必须（移动端无 client_secret）
+  └── 证书绑定（Certificate Pinning）
+```
+
+### Deep Link 安全配置
+
+```
+# iOS Universal Link 配置
+# apple-app-site-association
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "TEAM_ID.com.example.myapp",
+        "paths": ["/oauth/callback"]
+      }
+    ]
+  }
+}
+
+# Android Asset Links 配置
+# .well-known/assetlinks.json
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.example.myapp",
+    "sha256_cert_fingerprints": ["AA:BB:CC:..."]
+  }
+}]
+```
+
+## 单点登出（SLO）模式
+
+### OIDC Single Logout 流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant RP as 应用(RP)
+    participant OP as OpenID Provider
+
+    U->>RP: 请求登出
+    RP->>RP: 清除本地 Session
+    RP->>OP: POST /logout (id_token_hint)
+    OP->>OP: 标记会话为已登出
+    OP->>OP: 通知所有 RP（Back-Channel/Front-Channel）
+    OP->>U: 重定向到登出确认页
+```
+
+### SLO 实现方式
+
+```
+Front-Channel Logout：
+  OP 向每个 RP 的 logout_uri 发送 iframe
+  RP 清除 Session
+  缺点：依赖浏览器，不可靠
+
+Back-Channel Logout（推荐）：
+  OP 直接调用 RP 的后端 logout_endpoint
+  RP 验证 logout_token 后清除 Session
+  优点：可靠、不依赖浏览器
+
+Session Management：
+  OP 定期检查 RP 的 Session 状态
+  使用 check_session_iframe 嵌入
+  RP 可检测 OP 会话是否过期
+```
+
+## Keycloak vs Auth0 vs 自建方案
+
+### 功能对比
+
+| 维度 | Keycloak | Auth0 | 自建（Spring Security） |
+|------|----------|-------|------------------------|
+| 部署方式 | 自托管 | SaaS | 自托管 |
+| 成本 | 免费（开源） | 按 MAU 计费 | 开发成本高 |
+| 协议支持 | OIDC/SAML/CAS | OIDC/SAML | 需自行实现 |
+| 用户管理 | 完整 | 完整 | 需自行开发 |
+| 多租户 | 支持 | 支持 | 需自行开发 |
+| 高可用 | 集群部署 | 内置 | 需自行设计 |
+| 自定义主题 | 支持 | 有限 | 完全自定义 |
+| 运维复杂度 | 中 | 低 | 高 |
+| 适用规模 | 中大型 | 中小型 | 小型/定制需求 |
+
+### 选型决策
+
+```
+选型路径：
+  ├── 团队 < 5 人 + 预算有限？
+  │   └── Keycloak（免费、功能完整）
+  ├── 快速上线 + 不想运维？
+  │   └── Auth0（SaaS、分钟级集成）
+  ├── 有强烈定制需求？
+  │   └── 自建（Spring Security + OAuth2）
+  ├── 企业合规要求数据不出境？
+  │   └── Keycloak（自托管）
+  └── 微服务数量 < 5？
+      └── 简单 JWT 验证即可（无需完整 IdP）
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

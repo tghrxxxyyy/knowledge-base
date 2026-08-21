@@ -646,6 +646,534 @@ public void dataExtract() {
 }
 ```
 
+## XXL-JOB 在数仓 ETL 调度中的应用
+
+### 数仓分层调度架构
+
+```
+数仓 ETL 调度流程：
+
+  ODS 层（原始数据）：
+    ├── 数据抽取：每小时抽取业务库增量数据
+    ├── 调度策略：cron = 0 0/60 * * * ?
+    ├── 执行器：data-warehouse-executor
+    └── 分片策略：按 source_id 分片
+
+  DWD 层（明细数据）：
+    ├── 数据清洗：依赖 ODS 层完成
+    ├── 调度策略：ODS 完成后触发
+    ├── 任务链：ODS → DWD → DWS
+    └── 并行度：按业务域拆分
+
+  DWS 层（汇总数据）：
+    ├── 数据聚合：依赖 DWD 层完成
+    ├── 调度策略：DWD 完成后触发
+    ├── 统计粒度：小时/天/周/月
+    └── 输出：指标表 + 报表数据
+
+  ADS 层（应用数据）：
+    ├── 报表生成：依赖 DWS 层完成
+    ├── 调度策略：DWS 完成后触发
+    ├── 输出：报表接口 + 数据看板
+    └── 告警：数据质量检查
+```
+
+### 数仓调度任务配置示例
+
+```java
+// ODS 层抽取任务（分片广播模式）
+@XxlJob("odsExtractJob")
+public void odsExtract() {
+    int shardIndex = XxlJobHelper.getShardIndex();
+    int shardTotal = XxlJobHelper.getShardTotal();
+
+    List<String> tables = Arrays.asList(
+        "orders", "users", "products", "payments"
+    );
+
+    for (int i = 0; i < tables.size(); i++) {
+        if (i % shardTotal != shardIndex) continue;
+
+        String table = tables.get(i);
+        try {
+            long count = extractIncrementData(table);
+            XxlJobHelper.log("表 {} 增量抽取完成，记录数: {}", table, count);
+        } catch (Exception e) {
+            XxlJobHelper.log("表 {} 抽取失败: {}", table, e.getMessage());
+            XxlJobHelper.handleFail("抽取失败: " + e.getMessage());
+            return;
+        }
+    }
+    XxlJobHelper.handleSuccess("所有表抽取完成");
+}
+
+// DWD 层清洗任务
+@XxlJob("dwdCleanJob")
+public void dwdClean() {
+    // 依赖 ODS 层完成（通过任务链配置）
+    List<String> cleanJobs = Arrays.asList(
+        "clean_orders", "clean_users", "clean_products"
+    );
+
+    ExecutorService executor = Executors.newFixedThreadPool(3);
+    List<Future<Boolean>> futures = cleanJobs.stream()
+        .map(job -> executor.submit(() -> runCleanJob(job)))
+        .collect(Collectors.toList());
+
+    for (Future<Boolean> future : futures) {
+        try {
+            if (!future.get()) {
+                XxlJobHelper.handleFail("清洗任务失败");
+                return;
+            }
+        } catch (Exception e) {
+            XxlJobHelper.handleFail("清洗异常: " + e.getMessage());
+            return;
+        }
+    }
+    XxlJobHelper.handleSuccess("所有清洗任务完成");
+}
+```
+
+## 任务失败重试与指数退避
+
+### 指数退避重试实现
+
+```java
+@Component
+@Slf4j
+public class ExponentialBackoffRetry {
+
+    @Value("${retry.max-attempts:5}")
+    private int maxAttempts;
+
+    @Value("${retry.base-delay:1000}")
+    private long baseDelay;
+
+    @Value("${retry.max-delay:30000}")
+    private long maxDelay;
+
+    @Value("${retry.multiplier:2.0}")
+    private double multiplier;
+
+    public <T> T executeWithRetry(Supplier<T> operation, String taskName) {
+        int attempt = 0;
+        while (attempt < maxAttempts) {
+            try {
+                return operation.get();
+            } catch (Exception e) {
+                attempt++;
+                if (attempt >= maxAttempts) {
+                    log.error("[{}] 达到最大重试次数 {}", taskName, maxAttempts);
+                    throw new RetryExhaustedException(taskName, maxAttempts, e);
+                }
+
+                long delay = calculateDelay(attempt);
+                log.warn("[{}] 第 {} 次重试失败，{}ms 后重试: {}",
+                    taskName, attempt, delay, e.getMessage());
+
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("重试被中断", ie);
+                }
+            }
+        }
+        throw new IllegalStateException("不应到达此处");
+    }
+
+    private long calculateDelay(int attempt) {
+        double delay = baseDelay * Math.pow(multiplier, attempt - 1);
+        delay = delay + ThreadLocalRandom.current().nextDouble(0, delay * 0.1);
+        return Math.min((long) delay, maxDelay);
+    }
+}
+
+// 使用示例
+@XxlJob("externalApiCallJob")
+public void externalApiCall() {
+    ExponentialBackoffRetry retry = new ExponentialBackoffRetry();
+
+    List<ApiTask> tasks = taskMapper.selectPendingTasks();
+    for (ApiTask task : tasks) {
+        try {
+            retry.executeWithRetry(() -> {
+                callExternalApi(task);
+                return null;
+            }, "API-" + task.getId());
+
+            taskMapper.updateStatus(task.getId(), TaskStatus.SUCCESS);
+        } catch (RetryExhaustedException e) {
+            taskMapper.updateStatus(task.getId(), TaskStatus.FAILED);
+            taskMapper.updateRetryCount(task.getId(), maxAttempts);
+            XxlJobHelper.log("任务 {} 重试耗尽: {}", task.getId(), e.getMessage());
+        }
+    }
+}
+```
+
+### 重试配置最佳实践
+
+| 任务类型 | 最大重试次数 | 基础延迟 | 退避倍数 | 最大延迟 |
+|----------|-------------|----------|----------|----------|
+| 数据库操作 | 3 | 1s | 2 | 10s |
+| 外部 API 调用 | 5 | 1s | 2 | 30s |
+| 消息发送 | 5 | 500ms | 2 | 10s |
+| 文件处理 | 3 | 2s | 3 | 60s |
+| 数据同步 | 5 | 1s | 2 | 30s |
+
+## XXL-JOB vs Airflow 对比
+
+| 维度 | XXL-JOB | Airflow |
+|------|---------|---------|
+| 语言 | Java | Python |
+| 调度方式 | 中心化（数据库锁） | 分布式（Celery/Redis） |
+| 任务定义 | @XxlJob 注解 | Python DAG |
+| 任务依赖 | 配置化（任务链） | 代码化（DAG 定义） |
+| 监控告警 | Web 控制台 + 邮件 | Web UI + Slack |
+| 扩展性 | 执行器水平扩展 | Worker 水平扩展 |
+| 运维成本 | 低（Java 生态） | 中（Python + Celery） |
+| 学习曲线 | 低 | 中 |
+| 社区生态 | 国内流行 | 国际流行 |
+| 适用场景 | 定时任务/批处理 | 复杂工作流/数据管道 |
+
+```
+选型建议：
+  ├── 简单定时任务：XXL-JOB（轻量、易部署）
+  ├── 复杂工作流：Airflow（DAG 定义灵活）
+  ├── Java 技术栈：XXL-JOB（无缝集成）
+  ├── Python 技术栈：Airflow（原生支持）
+  ├── 需要 Web UI：两者均支持
+  └── 需要动态 DAG：Airflow（代码生成 DAG）
+```
+
+## 自定义路由策略实现
+
+```java
+@Component
+public class BusinessHourRouteStrategy implements ExecutorRouter {
+
+    @Override
+    public ExecutorRoute route(String invokeParam, List<String> addressList) {
+        int hour = LocalTime.now().getHour();
+
+        if (hour >= 9 && hour < 18) {
+            // 工作时间：优先使用主节点
+            return new ExecutorRouteFirst();
+        } else if (hour >= 18 && hour < 22) {
+            // 晚间：轮询分担负载
+            return new ExecutorRouteRound();
+        } else {
+            // 凌晨：使用最后一个节点（备用节点）
+            return new ExecutorRouteLast();
+        }
+    }
+}
+
+// 基于权重的路由策略
+@Component
+public class WeightedRouteStrategy implements ExecutorRouter {
+
+    private final Map<String, Integer> weightMap = Map.of(
+        "192.168.1.100:9999", 5,
+        "192.168.1.101:9999", 3,
+        "192.168.1.102:9999", 2
+    );
+
+    @Override
+    public ExecutorRoute route(String invokeParam, List<String> addressList) {
+        int totalWeight = addressList.stream()
+            .mapToInt(addr -> weightMap.getOrDefault(addr, 1))
+            .sum();
+
+        int randomWeight = ThreadLocalRandom.current().nextInt(totalWeight);
+        int currentWeight = 0;
+
+        for (String address : addressList) {
+            currentWeight += weightMap.getOrDefault(address, 1);
+            if (randomWeight < currentWeight) {
+                return new ExecutorRouteAddress(address);
+            }
+        }
+
+        return new ExecutorRouteFirst();
+    }
+}
+
+// 基于机器负载的路由策略
+@Component
+public class LoadBasedRouteStrategy implements ExecutorRouter {
+
+    @Autowired
+    private ExecutorMonitorClient monitorClient;
+
+    @Override
+    public ExecutorRoute route(String invokeParam, List<String> addressList) {
+        // 获取每台机器的 CPU 使用率
+        Map<String, Double> loadMap = monitorClient.getExecutorLoad(addressList);
+
+        // 选择负载最低的节点
+        String target = addressList.stream()
+            .min(Comparator.comparingDouble(
+                addr -> loadMap.getOrDefault(addr, 0.0)))
+            .orElse(addressList.get(0));
+
+        return new ExecutorRouteAddress(target);
+    }
+}
+```
+
+## 任务执行日志分析模式
+
+```
+日志分析场景：
+  1. 任务执行耗时分析
+     ├── 统计每个任务的平均执行时间
+     ├── 识别执行时间异常的任务
+     └── 分析执行时间趋势
+
+  2. 任务失败分析
+     ├── 统计失败率最高的任务
+     ├── 分析失败原因分类
+     └── 识别失败时间段规律
+
+  3. 资源使用分析
+     ├── 分析每个执行器的任务负载
+     ├── 识别资源瓶颈
+     └── 优化执行器分配
+
+  4. 数据质量分析
+     ├── 监控数据量变化
+     ├── 检测数据异常
+     └── 生成质量报告
+```
+
+```sql
+-- 任务执行耗时分析
+SELECT
+    job_id,
+    job_desc,
+    COUNT(*) as total_count,
+    AVG(TIMESTAMPDIFF(SECOND, handle_time, trigger_time)) as avg_duration,
+    MAX(TIMESTAMPDIFF(SECOND, handle_time, trigger_time)) as max_duration,
+    SUM(CASE WHEN handle_code != 200 THEN 1 ELSE 0 END) as fail_count,
+    ROUND(SUM(CASE WHEN handle_code != 200 THEN 1 ELSE 0 END) / COUNT(*) * 100, 2) as fail_rate
+FROM xxl_job_log
+WHERE trigger_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+GROUP BY job_id, job_desc
+ORDER BY avg_duration DESC;
+
+-- 失败任务分析
+SELECT
+    job_id,
+    job_desc,
+    DATE(trigger_time) as fail_date,
+    handle_msg,
+    COUNT(*) as fail_count
+FROM xxl_job_log
+WHERE handle_code != 200
+  AND trigger_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+GROUP BY job_id, job_desc, DATE(trigger_time), handle_msg
+ORDER BY fail_count DESC;
+
+-- 执行器负载分析
+SELECT
+    executor_address,
+    COUNT(*) as task_count,
+    AVG(TIMESTAMPDIFF(SECOND, handle_time, trigger_time)) as avg_duration,
+    SUM(CASE WHEN handle_code != 200 THEN 1 ELSE 0 END) as fail_count
+FROM xxl_job_log
+WHERE trigger_time >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+GROUP BY executor_address
+ORDER BY task_count DESC;
+```
+
+## 任务依赖图可视化
+
+```
+任务依赖图构建：
+  数据来源：
+    ├── xxl_job_info：任务定义
+    ├── xxl_job_info.spawn_executor_param：任务参数
+    └── 任务链配置：父子任务关系
+
+  可视化方案：
+    ├── 前端：D3.js / AntV G6 / Mermaid
+    ├── 后端：解析任务依赖关系
+    └── 实时更新：WebSocket 推送任务状态
+
+  节点状态：
+    ├── 等待中：灰色
+    ├── 运行中：蓝色
+    ├── 成功：绿色
+    ├── 失败：红色
+    └── 跳过：黄色
+```
+
+```javascript
+// 任务依赖图前端渲染（D3.js 示例）
+const dagData = {
+    nodes: [
+        { id: "1", name: "数据抽取", status: "success" },
+        { id: "2", name: "数据清洗", status: "running" },
+        { id: "3", name: "数据转换", status: "waiting" },
+        { id: "4", name: "数据加载", status: "waiting" },
+        { id: "5", name: "数据验证", status: "waiting" }
+    ],
+    edges: [
+        { source: "1", target: "2" },
+        { source: "2", target: "3" },
+        { source: "3", target: "4" },
+        { source: "4", target: "5" }
+    ]
+};
+
+// 状态颜色映射
+const statusColors = {
+    waiting: "#d9d9d9",
+    running: "#1890ff",
+    success: "#52c41a",
+    failed: "#ff4d4f",
+    skipped: "#faad14"
+};
+
+// 渲染 DAG 图
+function renderDag(data) {
+    const svg = d3.select("#dag-container");
+    const width = svg.attr("width");
+    const height = svg.attr("height");
+
+    // 节点布局（分层）
+    const layers = topologicalSort(data.nodes, data.edges);
+
+    // 绘制节点
+    const nodes = svg.selectAll(".node")
+        .data(data.nodes)
+        .enter()
+        .append("g")
+        .attr("class", "node")
+        .attr("transform", (d, i) => {
+            const layer = layers[d.id];
+            const x = 100 + layer * 150;
+            const y = 50 + i * 80;
+            return `translate(${x},${y})`;
+        });
+
+    nodes.append("rect")
+        .attr("width", 120)
+        .attr("height", 40)
+        .attr("rx", 5)
+        .style("fill", d => statusColors[d.status]);
+
+    nodes.append("text")
+        .attr("x", 60)
+        .attr("y", 25)
+        .attr("text-anchor", "middle")
+        .text(d => d.name);
+}
+```
+
+## XXL-JOB API 编程式任务管理
+
+```java
+@Component
+@Slf4j
+public class XxlJobAdminClient {
+
+    @Value("${xxl.job.admin.address}")
+    private String adminAddress;
+
+    @Value("${xxl.job.admin.accessToken}")
+    private String accessToken;
+
+    private final RestTemplate restTemplate;
+
+    public XxlJobAdminClient(RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
+    }
+
+    // 创建任务
+    public int createJob(JobInfo jobInfo) {
+        String url = adminAddress + "/api/add";
+        MultiValueMap<String, String> params = buildJobParams(jobInfo);
+        String result = postWithToken(url, params);
+        JSONObject json = JSONObject.parseObject(result);
+        if (json.getIntValue("code") == 200) {
+            return json.getJSONObject("content").getIntValue("id");
+        }
+        throw new RuntimeException("创建任务失败: " + result);
+    }
+
+    // 更新任务
+    public boolean updateJob(JobInfo jobInfo) {
+        String url = adminAddress + "/api/update";
+        MultiValueMap<String, String> params = buildJobParams(jobInfo);
+        String result = postWithToken(url, params);
+        return JSONObject.parseObject(result).getIntValue("code") == 200;
+    }
+
+    // 触发任务
+    public boolean triggerJob(int jobId, String executorParam) {
+        String url = adminAddress + "/api/trigger";
+        MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+        params.add("jobId", String.valueOf(jobId));
+        params.add("executorParam", executorParam);
+        params.add("address", "");
+        String result = postWithToken(url, params);
+        return JSONObject.parseObject(result).getIntValue("code") == 200;
+    }
+
+    // 批量创建 ETL 任务链
+    public List<Integer> createEtlJobChain(List<JobInfo> jobs) {
+        List<Integer> jobIds = new ArrayList<>();
+        for (JobInfo job : jobs) {
+            int jobId = createJob(job);
+            jobIds.add(jobId);
+            log.info("创建 ETL 任务: id={}, desc={}", jobId, job.getJobDesc());
+        }
+
+        // 配置任务依赖关系
+        for (int i = 0; i < jobIds.size() - 1; i++) {
+            configureDependency(jobIds.get(i), jobIds.get(i + 1));
+        }
+
+        return jobIds;
+    }
+
+    // 获取任务执行统计
+    public Map<String, Object> getJobStats(int jobId, int days) {
+        String url = adminAddress + "/api/loglist?jobId=" + jobId;
+        String result = getWithToken(url);
+        JSONObject json = JSONObject.parseObject(result);
+
+        JSONArray logList = json.getJSONObject("content").getJSONArray("logList");
+        long total = logList.size();
+        long failed = logList.stream()
+            .filter(log -> ((JSONObject) log).getIntValue("handleCode") != 200)
+            .count();
+
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("total", total);
+        stats.put("failed", failed);
+        stats.put("successRate", (total - failed) * 100.0 / total);
+        return stats;
+    }
+
+    private String postWithToken(String url, MultiValueMap<String, String> params) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("XXL-JOB-ACCESS-TOKEN", accessToken);
+        return restTemplate.postForObject(url, new HttpEntity<>(params, headers), String.class);
+    }
+
+    private String getWithToken(String url) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("XXL-JOB-ACCESS-TOKEN", accessToken);
+        return restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(headers), String.class).getBody();
+    }
+}
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |
