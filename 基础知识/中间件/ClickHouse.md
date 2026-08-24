@@ -201,7 +201,513 @@ Prometheus + Grafana
 
 ---
 
-## 七、与其他板块的关系
+## 七、MergeTree 引擎家族深度解析
+
+### 7.1 MergeTree 核心机制
+
+```
+MergeTree 写入流程：
+  INSERT 数据 → 内存缓冲区（每表独立）
+  → 按 block 大小（max_insert_block_size，默认 1048576 行）刷写到磁盘
+  → 生成一个 data part（按 ORDER BY 排序的列文件集合）
+  → 后台 merge 线程合并小 part 为大 part（基于 size_ratio 合并策略）
+
+MergeTree 数据目录结构：
+  /var/lib/clickhouse/data/{database}/{table}/
+    ├── {partition_id}/
+    │   ├── all_1_1_0/          # part 名：all_{min_block}_{max_block}_{level}
+    │   │   ├── data.bin        # 列数据（压缩）
+    │   │   ├── data.mrk3       # mark 文件（稀疏索引到数据偏移映射）
+    │   │   ├── primary.idx     # 主键稀疏索引
+    │   │   ├── count.txt       # 行数
+    │   │   ├── columns.txt     # 列定义
+    │   │   └── partition.dat   # 分区值
+    │   └── all_2_2_0/
+    └── detached/               # 分离的 part（ALTER DETACH）
+```
+
+### 7.2 MergeTree 变体引擎详解
+
+| 引擎 | 核心机制 | 适用场景 | 关键配置 |
+|------|----------|----------|----------|
+| **ReplacingMergeTree** | 后台合并时按 ORDER BY 去重，保留最新版本行 | 维度表更新、CDC 写入 | `ver` 参数指定版本列 |
+| **SummingMergeTree** | 合并时对 ORDER BY 以外的数值列自动求和 | 预聚合计数/求和 | 指定求和列或全部数值列 |
+| **AggregatingMergeTree** | 合并时对列执行聚合函数（需配合 State 函数） | 复杂预聚合（avg/uniq/quantile） | 配合物化视图 + -State/-Merge 函数 |
+| **CollapsingMergeTree** | 通过 sign 列（+1/-1）行折叠实现逻辑更新 | CDC 场景、订单状态变更 | `sign` 列，`version` 可选 |
+| **VersionedCollapsingMergeTree** | 在 Collapsing 基础上增加 version 列保证折叠顺序 | 并发写入场景 | `sign` + `version` 列 |
+
+### 7.3 ReplacingMergeTree 使用模式
+
+```sql
+-- 维度表：用户信息（CDC 写入）
+CREATE TABLE user_dim ON CLUSTER cluster (
+    user_id UInt64,
+    name String,
+    age UInt8,
+    update_time DateTime,
+    ver UInt32  -- 版本号（时间戳或自增）
+) ENGINE = ReplacingMergeTree(ver)
+PARTITION BY toYYYYMM(update_time)
+ORDER BY (user_id);
+
+-- 查询时需用 FINAL 去重（否则可能查到多个版本）
+SELECT * FROM user_dim FINAL WHERE user_id = 123;
+
+-- 不加 FINAL 的风险：查询可能返回旧版本行（合并尚未完成）
+-- FINAL 的代价：查询时实时去重，性能下降
+```
+
+### 7.4 AggregatingMergeTree + 物化视图实时聚合
+
+```sql
+-- 原始日志表
+CREATE TABLE access_log (
+    service_name LowCardinality(String),
+    event_time DateTime,
+    status_code UInt16,
+    response_time_ms Float32
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMMDD(event_time)
+ORDER BY (service_name, event_time);
+
+-- 聚合物化视图（每分钟指标预聚合）
+CREATE MATERIALIZED VIEW mv_service_metrics
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(window_start)
+ORDER BY (service_name, window_start)
+AS SELECT
+    service_name,
+    toStartOfMinute(event_time) AS window_start,
+    countState() AS request_count,
+    avgState(response_time_ms) AS avg_latency,
+    uniqState(status_code) AS status_codes
+FROM access_log
+GROUP BY service_name, window_start;
+
+-- 查询聚合结果（必须用 -Merge 函数读取 State 列）
+SELECT
+    service_name,
+    window_start,
+    countMerge(request_count),
+    avgMerge(avg_latency),
+    uniqMerge(status_codes)
+FROM mv_service_metrics
+WHERE window_start > now() - INTERVAL 1 HOUR
+GROUP BY service_name, window_start;
+```
+
+---
+
+## 八、Projections（投影）与分布式表
+
+### 8.1 Projections（投影）
+
+```
+Projection = 一份数据的「另一种物理排序/预聚合」副本
+  随主表写入自动维护
+  查询时自动选择最优投影（基于 WHERE/ORDER BY）
+  代价：写放大（写一份数据，同时维护多个投影）
+
+适用场景：
+  - 同一表有多种查询模式（不同 ORDER BY）
+  - 高频聚合查询
+```
+
+```sql
+-- 创建投影：按不同维度排序
+ALTER TABLE access_log ADD PROJECTION projection_by_status (
+    SELECT *
+    ORDER BY (status_code, event_time)
+);
+
+-- 创建投影：预聚合
+ALTER TABLE access_log ADD PROJECTION projection_daily_metrics (
+    SELECT
+        service_name,
+        toStartOfDay(event_time) AS day,
+        count() AS cnt,
+        avg(response_time_ms) AS avg_lat
+    GROUP BY service_name, day
+);
+
+-- 激活已有投影
+ALTER TABLE access_log MATERIALIZE PROJECTION projection_by_status;
+```
+
+### 8.2 分布式表（Distributed Engine）
+
+```sql
+-- 本地表（实际存储数据）
+CREATE TABLE events_local ON CLUSTER cluster (
+    event_time DateTime,
+    user_id UInt64,
+    event_type LowCardinality(String)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (user_id, event_time);
+
+-- 分布式表（查询入口，自动路由到分片）
+CREATE TABLE events ON CLUSTER cluster AS events_local
+ENGINE = Distributed(cluster, default, events_local, xxHash64(user_id));
+--                                        分片键：按 user_id 哈希路由
+
+-- Distributed 引擎参数：
+--   cluster: 集群名
+--   database: 数据库名
+--   local_table: 本地表名
+--   sharding_key: 分片键（决定数据路由）
+
+-- 查询分布式表：
+SELECT count() FROM events WHERE event_time > now() - INTERVAL 1 DAY;
+-- Coordinator 将查询分发到所有分片 → 并行执行 → 合并结果
+```
+
+### 8.3 全局表（Global Table）广播
+
+```sql
+-- 小表广播到所有节点（避免 JOIN 时跨网络拉取）
+CREATE TABLE config_dict ON CLUSTER cluster (
+    key String,
+    value String
+) ENGINE = ReplicatedReplacingMergeTree()
+ORDER BY key
+SETTINGS modes = 'global';  -- 全局表模式
+
+-- JOIN 时自动使用本地副本
+SELECT * FROM events e
+JOIN config_dict c ON e.event_type = c.key;
+-- 每个分片本地都有 config_dict 的完整副本，无需跨分片 JOIN
+```
+
+---
+
+## 九、Kafka Engine 与 Buffer Engine
+
+### 9.1 Kafka Engine 集成
+
+```sql
+-- 创建 Kafka 消费表（不存储数据，实时消费）
+CREATE TABLE kafka_consumer (
+    message String,
+    topic LowCardinality(String),
+    partition UInt32,
+    offset UInt64
+) ENGINE = Kafka()
+SETTINGS
+    kafka_broker_list = 'kafka1:9092,kafka2:9092',
+    kafka_topic_list = 'access_log',
+    kafka_group_name = 'clickhouse_consumer',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 4,
+    kafka_max_block_size = 1048576;
+
+-- Kafka Engine 不存储数据！必须配合物化视图落地
+CREATE MATERIALIZED VIEW kafka_to_local
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (event_time)
+AS SELECT
+    JSONExtractString(message, 'service') AS service_name,
+    toDateTime(JSONExtractString(message, 'timestamp')) AS event_time,
+    JSONExtractFloat(message, 'latency') AS latency
+FROM kafka_consumer;
+
+-- Kafka Engine 配置项：
+--   kafka_num_consumers: 消费者数（≤ topic 分区数）
+--   kafka_max_block_size: 每批最大行数（控制刷写频率）
+--   kafka_skip_broken_messages: 跳过解析失败的消息数
+```
+
+### 9.2 Buffer Engine（缓冲写入）
+
+```sql
+-- Buffer 表：内存缓冲区，批量刷写到目标表
+CREATE TABLE events_buffer AS events_local
+ENGINE = Buffer(
+    default,          -- 数据库
+    events_local,     -- 目标表
+    16,               -- 最小层数
+    10,               -- 最大层数
+    100,              -- 每层最小时间（秒）
+    10000,            -- 每层最大行数
+    10000000,         -- 每层最小字节
+    100000000,        -- 每层最大字节
+    10000000,         -- 目标缓冲行数
+    1000000000        -- 目标缓冲字节
+);
+
+-- 写入 Buffer 表（高频小批量写入友好）
+INSERT INTO events_buffer VALUES (...);
+
+-- Buffer 表原理：
+--   写入先到内存（多层缓冲）
+--   达到阈值后批量 flush 到目标 MergeTree 表
+--   服务重启会丢失未 flush 数据（非持久化）
+--   适用：高频小批量写入，合并到目标表后自动清理
+```
+
+---
+
+## 十、Sampling（采样）与 JOIN 算法
+
+### 10.1 Sampling 采样查询
+
+```sql
+-- 创建采样表
+CREATE TABLE events_sampled (
+    event_time DateTime,
+    user_id UInt64,
+    event_type String
+) ENGINE = MergeTree()
+ORDER BY (user_id, event_time)
+SAMPLE BY user_id;  -- 按 user_id 采样（同一 user_id 的所有行一起采样）
+
+-- 采样查询：TABLESAMPLE SYSTEM SAMPLE 0.1（10% 采样）
+SELECT count() / 0.1 AS estimated_total  -- 估算全量
+FROM events_sampled
+SAMPLE 0.1
+WHERE event_type = 'click';
+
+-- 采样要求：
+--   采样键必须是 ORDER BY 的前缀
+--   采样比例必须是 2 的幂倒数（1/2^n），如 0.1 不是合法值
+--   合法值：1/1024, 1/512, 1/256, 1/128, 1/64, 1/32, 1/16, 1/8, 1/4, 1/2, 1
+```
+
+### 10.2 JOIN 算法详解
+
+```
+ClickHouse JOIN 算法：
+  1. hash join（默认）：小表构建哈希表，大表探测
+     - 适用：小表 < 几百 MB
+     - 配置：join_algorithm = 'hash'
+
+  2. partial_merge join：左右表都排序，归并式合并
+     - 适用：大表 JOIN 大表，内存有限
+     - 配置：join_algorithm = 'partial_merge'
+
+  3. grace_hash join：分桶式哈希 JOIN（两阶段）
+     - 适用：大表 JOIN 大表，内存充足
+     - 配置：join_algorithm = 'grace_hash'
+
+  4. cross_join（笛卡尔积）：Nested Loop
+     - 性能极差，应避免
+
+  最佳实践：
+    小表 broadcast → hash join（最快）
+    大表 JOIN 大表 → 先聚合再 JOIN（避免 shuffle）
+    字典替代 JOIN → Dictionary 表（零 JOIN 开销）
+```
+
+```sql
+-- 小表广播 JOIN（推荐）
+SELECT
+    u.name,
+    count() AS order_count
+FROM users_small u          -- 小表（< 几百 MB）
+JOIN orders_large o ON u.id = o.user_id
+GROUP BY u.name;
+
+-- 字典表替代 JOIN
+CREATE DICTIONARY user_dict (
+    id UInt64,
+    name String,
+    age UInt8
+) PRIMARY KEY id
+SOURCE(CLICKHOUSE(HOST 'localhost' PORT 9000 DATABASE 'default' TABLE 'users'))
+LIFETIME(MIN 300 MAX 3600)
+LAYOUT(HASHED());
+
+SELECT dictGet('user_dict', 'name', user_id) AS user_name
+FROM orders_large;
+```
+
+---
+
+## 十一、Dictionary（字典）表
+
+```sql
+-- 字典 = 内存中的 KV/映射表（极快的 lookup）
+CREATE DICTIONARY region_dict (
+    region_id UInt32,
+    region_name String,
+    parent_id UInt32
+) PRIMARY KEY region_id
+SOURCE(CLICKHOUSE(HOST 'localhost' PORT 9000 DATABASE 'default' TABLE 'regions'))
+LIFETIME(MIN 600 MAX 3600)    -- 刷新间隔
+LAYOUT(HASHED());              -- 内存布局：HASHED/FLAT/COMPLEX_KEY_HASHED/RANGE_HASHED
+
+-- 字典布局：
+--   FLAT: 最多 10000 行，数组存储
+--   HASHED: 哈希表，任意行数
+--   COMPLEX_KEY_HASHED: 复合键
+--   RANGE_HASHED: 范围查找（如时间区间映射）
+
+-- 使用 dictGet 查询（O(1) 复杂度）
+SELECT
+    dictGet('region_dict', 'region_name', region_id) AS region
+FROM user_events;
+
+-- 字典 vs JOIN 性能对比：
+--   字典：O(1) 内存查找，无网络开销
+--   JOIN：哈希表构建 + 探测，可能跨分片
+--   结论：低基数映射优先用字典
+```
+
+---
+
+## 十二、ClickHouse vs Doris vs StarRocks 详细对比
+
+| 维度 | ClickHouse | Apache Doris | StarRocks |
+|------|-----------|--------------|-----------|
+| **架构** | Shared-Nothing，无中心调度 | FE（元数据）+ BE（计算存储） | FE + CN（计算）/BE（存储） |
+| **MPP** | 查询级并行（无专门 Exchange） | 原生 MPP（Exchange 算子） | 原生 MPP（向量化 Pipeline） |
+| **JOIN** | 小表 broadcast，大表需手动优化 | CBO 自动选择 JOIN 策略 | CBO + 向量化 JOIN（极快） |
+| **高并发** | 一般（资源竞争） | 好（Pipeline 调度） | 极好（Pipeline + 槽位） |
+| **实时更新** | 异步合并（弱） | 主键模型（MoW） | 主键模型（实时更新） |
+| **数据湖** | 外部表（Hive/MySQL） | Catalog（Hive/Iceberg/Hudi） | Catalog（同 Doris） |
+| **物化视图** | 强（多引擎支持） | 强（透明重写） | 强（同步异步） |
+| **生态** | 最成熟（Apache 项目） | 国内社区活跃 | 商业公司主导 |
+| **运维复杂度** | 高（配置项多） | 中 | 中 |
+| **适用** | 日志/监控/单表聚合 | 通用 OLAP（国产首选） | 高并发 BI + 实时更新 |
+
+### 选型决策矩阵
+
+```
+场景 → 选型：
+  日志/监控/追加写 → ClickHouse（压缩+单表聚合极快）
+  高并发 BI（>1000 QPS）→ StarRocks / Doris
+  实时更新维度表 → StarRocks（主键表）/ Doris（MoW）
+  复杂多表 JOIN → StarRocks（CBO 最优）/ Doris
+  小团队低成本 → Doris（运维最简单）
+  存算分离 → StarRocks（shared-nothing 模式）/ Doris（实验性）
+  已有 ClickHouse → 保持 + StarRocks 补 JOIN 场景
+```
+
+---
+
+## 十三、生产部署容量规划与备份策略
+
+### 13.1 容量规划
+
+```
+单节点容量估算：
+  磁盘 = 原始数据量 / 压缩比（通常 5~10x）
+  内存 = 每查询最大内存 × 并发数 + 系统预留
+  CPU 核 = 每查询 ~2~4 核 × 并发数
+
+示例：10TB 原始数据，压缩后 1.5TB
+  磁盘：2TB SSD（留 30% 余量）
+  内存：128GB（32 查询并发 × 3GB + 32GB 系统）
+  CPU：32 核
+  网络：10Gbps（分片间 shuffle）
+
+分片数估算：
+  单分片数据量 < 5TB（避免合并慢）
+  分片数 = 总数据量 / 单分片目标
+  副本数 ≥ 2（高可用）
+```
+
+### 13.2 备份策略
+
+```bash
+# ClickHouse 备份工具：clickhouse-backup（官方推荐）
+# 安装
+curl https://clickhouse.com/ | sh
+sudo clickhouse-backup install
+
+# 备份命令
+clickhouse-backup create daily_backup_$(date +%Y%m%d)
+#   → 快速备份（利用 hardlink，秒级完成）
+#   → 存储到 /var/lib/clickhouse/backup/
+
+# 推送到 S3
+clickhouse-backup upload daily_backup_20240101 --s3-bucket my-backup
+
+# 恢复
+clickhouse-backup restore daily_backup_20240101
+
+# 备份策略：
+#   全量备份：每天一次
+#   增量备份：每小时（利用 part 级别增量）
+#   保留策略：本地 7 天，S3 30 天
+#   跨集群恢复：恢复到另一集群做数据迁移
+```
+
+### 13.3 监控查询（运维必备）
+
+```sql
+-- 慢查询监控
+SELECT
+    query_id,
+    user,
+    query_duration_ms,
+    read_rows,
+    formatReadableSize(memory_usage) AS mem
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND query_duration_ms > 10000
+ORDER BY query_duration_ms DESC
+LIMIT 20;
+
+-- Part 数量告警
+SELECT
+    table,
+    count() AS part_count,
+    sum(rows) AS total_rows,
+    formatReadableSize(sum(bytes_on_disk)) AS disk_size
+FROM system.parts
+WHERE active = 1
+GROUP BY table
+HAVING part_count > 100
+ORDER BY part_count DESC;
+
+-- 合并队列监控
+SELECT
+    table,
+    count() AS parts_to_merge,
+    sum(rows) AS total_rows
+FROM system.parts
+WHERE active = 1
+GROUP BY table
+ORDER BY parts_to_merge DESC;
+
+-- 复制延迟
+SELECT
+    database,
+    table,
+    is_leader,
+    future_parts,
+    parts_to_check,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue
+FROM system.replicas
+WHERE future_parts > 5 OR queue_size > 10;
+
+-- 内存使用 Top 查询
+SELECT
+    query_id,
+    user,
+    formatReadableSize(memory_usage) AS mem,
+    query
+FROM system.processes
+ORDER BY memory_usage DESC
+LIMIT 10;
+
+-- Kafka 消费延迟
+SELECT
+    table,
+    comment,
+    is_readonly,
+    absolute_delay
+FROM system.replicas
+WHERE engine = 'Kafka';
+```
+
+---
+
+## 十四、与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。
 - 与 [ES 体系](../ES体系.md)：ES 偏「搜索 + 明细检索 + 日志全文」，ClickHouse 偏「结构化聚合分析」。日志场景常 ClickHouse 做聚合 + ES 做检索，或 ClickHouse 取代部分 ES 聚合。

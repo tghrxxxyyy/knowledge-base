@@ -253,7 +253,451 @@ ulimit -n 65535                        # 文件描述符
 
 ---
 
-## 六、与其他板块的关系
+## 六、Nginx 事件驱动架构深入
+
+### 6.1 事件驱动模型详解
+
+```
+Nginx 事件循环（单 Worker 内部）：
+
+while (true) {
+    // 1. 更新定时器
+    timer = ngx_event_find_timer();
+
+    // 2. IO 多路复用（epoll_wait 阻塞等待事件）
+    events = epoll_wait(epfd, event_list, max_events, timer);
+
+    // 3. 处理 IO 事件
+    for (i = 0; i < events; i++) {
+        if (event[i] == ACCEPT) {
+            // 新连接事件
+            ngx_event_accept(cycle);
+        } else if (event[i] == READ) {
+            // 可读事件（request header/body）
+            ngx_http_process_request(cycle);
+        } else if (event[i] == WRITE) {
+            // 可写事件（sendfile 响应）
+            ngx_http_write_handler(cycle);
+        } else if (event[i] == TIMER) {
+            // 定时器事件（keepalive 超时清理）
+            ngx_event_expire_timers();
+        }
+    }
+
+    // 4. 后处理（延迟事件、post 操作）
+    ngx_event_process_posted(cycle);
+}
+```
+
+### 6.2 Worker 进程模型
+
+```
+Master-Worker 协作机制：
+
+Master 进程：
+  ├── 读取/验证配置（nginx -t）
+  ├── 创建 Socket 并 listen
+  ├── Fork Worker 进程
+  ├── 管理 Worker 生命周期（crash 自动重启）
+  ├── 接收信号：SIGHUP → reload（平滑重启）
+  │                       SIGTERM → graceful shutdown
+  │                       SIGUSR1 → reopen 日志文件
+  └── 不处理任何连接
+
+Worker 进程（= CPU 核数）：
+  ├── 独立进程，互不影响
+  ├── 各自运行 epoll 事件循环
+  ├── 共享 Listen Socket（accept 竞争）
+  ├── 处理所有连接（读/写/代理/缓存）
+  └── 父进程 fork 后独立运行，crash 不影响其他 Worker
+
+连接处理流程：
+  1. Client 发起连接 → Kernel 放入 accept queue
+  2. 多个 Worker 的 epoll 同时监听 Listen Socket
+  3. 哪个 Worker 的 epoll_wait 先醒来 → 哪个 Worker accept
+  4. 该 Worker 负责整个连接生命周期（读请求→处理→写响应→关闭）
+```
+
+### 6.3 连接处理与 Keepalive
+
+```nginx
+# HTTP Keepalive 配置（客户端侧）
+keepalive_timeout 65;           # 客户端 keepalive 超时（秒）
+keepalive_requests 1000;        # 单连接最大请求数
+
+# Upstream Keepalive（后端侧）
+upstream backend {
+    server 10.0.0.1:8080;
+    keepalive 32;               # 每 Worker 维持 32 个到后端的空闲长连接
+    keepalive_requests 100;     # 单连接最大复用次数
+    keepalive_timeout 60s;      # 空闲连接超时
+}
+
+# 连接复用减少开销：
+#   无 keepalive：每个请求 TCP 三次握手 + SSL 握手（200ms+）
+#   有 keepalive：复用 TCP 连接，延迟降低 50%+
+```
+
+---
+
+## 七、负载均衡算法深度对比
+
+| 算法 | 配置 | 原理 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|------|----------|
+| **round-robin** | `least_conn;` 不配即默认 | 按顺序轮流分发 | 简单均匀 | 不考虑后端负载 | 后端处理时间相近 |
+| **weight** | `server 10.0.0.1:8080 weight=3;` | 按权重比例分发 | 可分配不同流量比例 | 配置复杂 | 混合机型部署 |
+| **ip_hash** | `ip_hash;` | 客户端 IP 哈希固定后端 | 会话粘性 | 热点 IP 不均 | 遗留 Session 场景 |
+| **least_conn** | `least_conn;` | 发给当前活跃连接最少的后端 | 自适应负载 | 短连接效果好，长连接差 | 后端处理时间不均 |
+| **hash $uri** | `hash $uri consistent;` | 一致性哈希 | 缓存亲和 | 哈希冲突 | CDN/缓存场景 |
+| **hash $request** | `hash $request_uri consistent;` | 按请求哈希 | 分布均匀 | 无负载感知 | 无状态服务 |
+| **least_time** | `least_time last_received_time;` | 选响应最快的后端 | 自适应最优 | 需记录响应时间 | 对延迟敏感 |
+| **random** | `random two least_conn;` | 随机选两个取负载低的 | 避免全局竞争 | 理论最优需随机数 | 超大规模集群 |
+
+---
+
+## 八、SSL/TLS 优化与安全加固
+
+```nginx
+# SSL/TLS 优化配置
+ssl_protocols TLSv1.2 TLSv1.3;              # 仅允许安全版本
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384;
+ssl_prefer_server_ciphers on;                # 服务端决定加密套件
+ssl_session_cache shared:SSL:50m;            # 会话缓存（减少握手）
+ssl_session_timeout 1d;                      # 会话超时
+ssl_session_tickets on;                      # Ticket 机制（跨重启复用）
+ssl_buffer_size 16k;                         # 缓冲区大小（影响 TTFB）
+
+# OCSP Stapling（加速证书验证）
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 8.8.8.8 114.114.114.114 valid=300s;
+
+# HTTP/2 优化
+http2_max_concurrent_streams 128;            # 并发流数
+http2_recv_buffer_size 256k;
+
+# 安全头
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
+add_header X-Content-Type-Options nosniff;
+add_header X-Frame-Options SAMEORIGIN;
+add_header X-XSS-Protection "1; mode=block";
+```
+
+---
+
+## 九、gzip/brotli 压缩与 open_file_cache
+
+### 9.1 压缩配置
+
+```nginx
+# Gzip 压缩
+gzip on;
+gzip_vary on;                    # 添加 Vary: Accept-Encoding
+gzip_proxied any;                # 代理响应也压缩
+gzip_comp_level 6;               # 压缩级别（1-9，6 最优）
+gzip_min_length 256;             # 最小压缩长度
+gzip_types
+    text/plain
+    text/css
+    text/xml
+    text/javascript
+    application/json
+    application/javascript
+    application/xml
+    image/svg+xml;
+
+# Brotli 压缩（需 ngx_brotli 模块，压缩率比 gzip 高 15-25%）
+brotli on;
+brotli_comp_level 6;
+brotli_types text/plain text/css application/json application/javascript
+             text/xml application/xml image/svg+xml;
+
+# 压缩效果：
+#   gzip level 6：CPU 换 IO（推荐）
+#   brotli level 6：比 gzip 压缩率高 15-25%
+#   静态文件预压缩：gzip_static on; brotli_static on;
+#     → 预生成 .gz/.br 文件，零 CPU 开销
+```
+
+### 9.2 open_file_cache（文件缓存）
+
+```nginx
+# open_file_cache：缓存文件描述符、大小、修改时间
+open_file_cache max=10000 inactive=60s;
+#   max=10000: 最多缓存 10000 个文件
+#   inactive=60s: 60 秒未访问自动清除
+
+open_file_cache_valid 30s;
+#   每 30 秒重新验证缓存条目（文件是否被修改）
+
+open_file_cache_min_uses 2;
+#   60 秒内至少被访问 2 次才缓存（防止冷文件占用）
+
+open_file_cache_errors on;
+#   缓存文件查找错误（如 404），避免重复 stat
+
+# 效果：静态文件场景减少 30-50% 的 stat 系统调用
+```
+
+---
+
+## 十、limit_req/limit_conn 深度与 proxy_buffer 调优
+
+### 10.1 限流深入
+
+```nginx
+# limit_req：漏桶算法限流
+limit_req_zone $binary_remote_addr zone=login:10m rate=5r/s;
+#   rate=5r/s: 每秒 5 个请求（允许突发）
+#   zone=login:10m: 共享内存区域 10MB（约 16 万个 IP）
+
+location /login {
+    limit_req zone=login burst=10 nodelay;
+    #   burst=10: 允许突发 10 个请求（排队）
+    #   nodelay: 突发请求不排队直接处理（超过 burst 返回 503）
+    #   不加 nodelay: 超过 rate 的请求排队等待
+}
+
+# limit_req_status: 自定义拒绝状态码
+limit_req_status 429;   # 返回 429 Too Many Requests
+
+# limit_conn：并发连接限制
+limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
+limit_conn_zone $server_name zone=conn_total:10m;
+
+location /download {
+    limit_conn conn_per_ip 5;      # 单 IP 最大 5 个并发连接
+    limit_conn conn_total 1000;    # 全站最大 1000 个并发连接
+    limit_rate 500k;               # 单连接限速 500KB/s
+    limit_rate_after 10m;          # 前 10MB 不限速
+}
+
+# 分布式限流（多 Nginx 节点）
+# 使用 lua-resty-limit-traffic + Redis 做分布式计数器
+```
+
+### 10.2 proxy_buffer 调优
+
+```nginx
+# proxy_buffer：控制 Nginx 与后端之间的缓冲
+location /api/ {
+    proxy_pass http://backend;
+
+    # 缓冲区大小
+    proxy_buffer_size 16k;           # 响应头缓冲区
+    proxy_buffers 4 32k;             # 响应体缓冲区（4 个 × 32KB）
+    proxy_busy_buffers_size 64k;     # 在忙碌状态下的最大缓冲
+
+    # 临时文件
+    proxy_temp_file_write_size 64k;
+    proxy_temp_path /tmp/nginx_proxy_temp 1 2;
+
+    # 行为控制
+    proxy_buffering on;              # 开启缓冲（默认开启）
+    proxy_request_buffering on;      # 请求体缓冲
+
+    # 优化建议：
+    #   API 场景：缓冲区适当加大（减少磁盘 IO）
+    #   大文件下载：关闭缓冲 proxy_buffering off;
+    #   WebSocket：关闭缓冲 proxy_buffering off;
+    #   监控：$upstream_buffered 看是否溢出到临时文件
+}
+
+# proxy_buffer 溢出问题排查：
+#   症状：响应慢，Nginx 日志无报错
+#   原因：后端响应过大，缓冲区不够，溢出到磁盘临时文件
+#   解决：调大 proxy_buffers 或 proxy_buffer_size
+```
+
+---
+
+## 十一、Upstream 健康检查与 API 网关模式
+
+### 11.1 健康检查
+
+```nginx
+# 被动健康检查（默认）
+upstream backend {
+    server 10.0.0.1:8080 max_fails=3 fail_timeout=30s;
+    #   max_fails=3: 连续失败 3 次标记为不可用
+    #   fail_timeout=30s: 30 秒后重试
+    server 10.0.0.2:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.0.3:8080 backup;  # 备用节点
+}
+
+# 主动健康检查（Nginx Plus 商业版 / OpenResty）
+# 商业版配置
+upstream backend {
+    zone backend 64k;               # 共享内存
+    server 10.0.0.1:8080;
+    health_check interval=10s fails=3 passes=2 uri=/health;
+    #   每 10 秒检查一次 /health 端点
+    #   连续 3 次失败标记下线，连续 2 次成功恢复上线
+}
+
+# OpenResty 主动健康检查（lua-resty-upstream-healthcheck）
+lua_shared_dict healthcheck 1m;
+init_worker_by_lua_block {
+    local hc = require("resty.upstream.healthcheck")
+    local checker = hc.new({
+        type = "http",
+        http_req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        timeout = 2,
+        interval = 5000,
+        falls = 3,
+        rises = 2,
+    })
+    -- 注册后端
+    checker:add_target("backend", "10.0.0.1", 8080)
+    -- 定时检查
+    ngx.timer.every(5, function()
+        checker:check()
+    end)
+}
+```
+
+### 11.2 Nginx 作为 API 网关
+
+```nginx
+# API 网关模式：路由 + 鉴权 + 限流 + 灰度 + 熔断
+upstream api_v1 {
+    server 10.0.0.1:8080 weight=3;
+    server 10.0.0.2:8080 weight=1;
+    keepalive 64;
+}
+upstream api_v2 {
+    server 10.0.0.3:8080;
+    server 10.0.0.4:8080;
+    keepalive 64;
+}
+
+map $http_x_api_version $backend {
+    default api_v1;
+    "2.0"   api_v2;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    # 限流
+    limit_req zone=api burst=20 nodelay;
+
+    # 鉴权（OpenResty Lua）
+    access_by_lua_block {
+        local auth = require "auth"
+        local ok, err = auth.verify_jwt(ngx.var.http_authorization)
+        if not ok then
+            ngx.status = 401
+            ngx.say('{"error":"' .. err .. '"}')
+            return ngx.exit(401)
+        end
+    }
+
+    # 路由
+    location /api/ {
+        proxy_pass http://$backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 灰度：按 Cookie 分流
+    map $cookie_canary $canary_backend {
+        default api_v1;
+        "true"  api_v2;
+    }
+    location /canary/ {
+        proxy_pass http://$canary_backend;
+    }
+}
+```
+
+---
+
+## 十二、OpenResty/Lua 集成与性能压测
+
+### 12.1 OpenResty 集成
+
+```nginx
+# OpenResty = Nginx + LuaJIT（可编程网关）
+# Lua 执行阶段：
+#   init_by_lua: 启动时（加载配置/路由表）
+#   init_worker_by_lua: 每 Worker 启动（定时器/健康检查）
+#   set_by_lua: 变量设置阶段
+#   rewrite_by_lua: 重写阶段（鉴权/限流/路由）
+#   access_by_lua: 访问阶段（权限检查）
+#   content_by_lua: 内容生成（业务逻辑）
+#   log_by_lua: 日志阶段（审计/上报）
+
+# 示例：限流 + JWT 鉴权 + 路由
+location /api/ {
+    rewrite_by_lua_block {
+        local limit = require "resty限流"
+        local jwt = require "jwt验证"
+
+        -- 限流检查
+        local lim, err = limit.new("rate_limit", 100, 1)
+        if not lim then ngx.exit(500) end
+        local delay, err = lim:incoming(ngx.var.binary_remote_addr, true)
+        if not delay then ngx.exit(429) end
+
+        -- JWT 验证
+        local token = ngx.var.http_authorization
+        local payload, err = jwt.verify(token)
+        if not payload then ngx.exit(401) end
+
+        -- 动态路由
+        ngx.var.upstream = payload.service or "default"
+    }
+    proxy_pass http://$upstream;
+}
+```
+
+### 12.2 性能压测方法论
+
+```bash
+# 压测工具选择
+#   wrk: 推荐（HTTP 基准压测）
+#   ab: Apache Bench（简单快速）
+#   wrk2: 带延迟直方图的 wrk
+#   k6: 脚本化压测（Grafana 生态）
+
+# wrk 压测示例
+wrk -t12 -c400 -d30s --latency http://localhost/api/test
+#   -t12: 12 个线程
+#   -c400: 400 个并发连接
+#   -d30s: 持续 30 秒
+#   --latency: 输出延迟分布
+
+# 压测关键指标：
+#   Requests/sec: QPS（每秒请求数）
+#   Latency 分布: P50/P90/P99/P999（尾延迟）
+#   Transfer/sec: 吞吐量（带宽）
+#   Socket errors: 连接错误（超时/拒绝/重置）
+
+# 压测方法论：
+#   1. 基线测试：无负载下性能
+#   2. 递增负载：逐步增加并发，找到拐点
+#   3. 持续高负载：找到内存泄漏/连接泄漏
+#   4. 对比测试：配置变更前后对比
+
+# Nginx 监控配合压测
+curl http://localhost/nginx_status
+# Active connections: 291
+# server accepts handled requests
+#  16630948 16630948 31070465
+# Reading: 6 Writing: 179 Waiting: 106
+#   accepts/handled 比值 = 1 说明无连接丢失
+#   Reading: 正在读请求头的连接数
+#   Writing: 正在写响应的连接数
+#   Waiting: keepalive 空闲连接数
+```
+
+---
+
+## 十三、与其他板块的关系
 
 - 和「**基础知识/中间件/API网关**」：Nginx 是「入口层（南北向）」，网关（Spring Cloud Gateway/APISIX）做「应用层路由治理」，常串联使用。
 - 和「**基础知识/网络**」「**网络协议深挖**」：Nginx 是 TCP/HTTP、keepalive、TLS、零拷贝原理的最佳实践观察点。

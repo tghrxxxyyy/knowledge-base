@@ -277,7 +277,320 @@ IoT → MQTT（EMQX/Mosquitto）
 
 ---
 
-## 七、与其他板块的关系
+## 七、JMS 2.0 特性与高级功能
+
+### 7.1 JMS 2.0 新特性
+
+```
+JMS 2.0（JSR 343）在 JMS 1.1 基础上增加：
+
+1. 简化 API（JMSContext）：
+   JMSContext = Connection + Session（合并）
+   一行代码创建上下文：
+     JMSContext ctx = connectionFactory.createContext();
+     ctx.createProducer().send(queue, "message");
+
+2. 共享订阅（Shared Durable Subscription）：
+   多个消费者共享一个持久订阅（负载均衡）
+   JMS 1.1 的 Durable Subscription 只能单消费者
+   JMS 2.0 允许多消费者共享 → 水平扩展消费能力
+
+3. 异步消费增强：
+   CompletionListener（异步发送确认）
+   Sestination.createSharedConsumer()
+
+4. 消息延迟（Delivery Delay）：
+   producer.setDeliveryDelay(5000);  // 延迟 5 秒投递
+   （JMS 1.1 需要 Broker 特定扩展）
+
+5. 消息大小（Body Size）：
+   message.getBodyLength()  获取消息体大小
+```
+
+### 7.2 消息组（Message Groups）深入
+
+```
+消息组 = 同一 GroupID 的消息路由到同一消费者（粘性）
+
+实现机制：
+  消息属性 JMSXGroupID = "order_123"
+  Broker 按 GroupID 哈希 → 路由到固定消费者
+  组内消息保序，组间并行
+
+使用场景：
+  1. 订单状态机：同一订单的所有操作必须按顺序
+  2. 用户行为：同一用户的事件按时间排序
+  3. 流处理：同一 key 的事件需要状态一致
+
+配置（ActiveMQ Artemis）：
+  消息属性：
+    JMSXGroupID = "order_123"
+    JMSXGroupSequence = 1  （可选，组内序号）
+
+注意事项：
+  消费者崩溃 → 组内未确认消息重新分配到其他消费者
+  消费者重启 → 可能收到之前组的消息（需幂等）
+  组大小无限制，但过多组会导致路由开销
+```
+
+### 7.3 Browser（浏览器目的地）
+
+```java
+// JMS Browser：预览队列消息（不消费）
+Browser browser = session.createBrowser(queue);
+Enumeration enumeration = browser.getEnumeration();
+while (enumeration.hasMoreElements()) {
+    Message msg = (Message) enumeration.nextElement();
+    // 查看消息属性/内容，不触发消费
+    System.out.println(msg.getStringProperty("order_id"));
+}
+browser.close();
+
+// 适用场景：
+//   运维查看队列消息内容
+//   调试消息格式
+//   不影响消费流程的监控
+```
+
+### 7.4 XA 分布式事务
+
+```
+JMS XA 事务 = 消息收发与业务操作同事务（ACID）
+
+流程：
+  XAConnection → XA Session
+  → 分支 1：JMS 消息发送/接收
+  → 分支 2：数据库操作（JDBC）
+  → XAResource.prepare() → 两阶段提交第一阶段
+  → XAResource.commit() → 第二阶段
+
+  保证：消息发送与数据库写入要么同时成功，要么同时回滚
+
+配置（Spring Boot）：
+  spring.jms.pub-sub-domain=false
+  spring.activemq.pool.enabled=true
+  spring.activemq.pool.xa.enabled=true  # XA 连接池
+
+性能影响：
+  XA 事务比本地事务慢 3-5 倍（两阶段提交开销）
+  生产建议：
+    同库操作 → 本地事务（Session 事务）
+    跨资源（JMS + DB）→ XA 或消息最终一致性
+    极高性能要求 → 避免 XA，用可靠消息最终一致
+```
+
+### 7.5 JMS 消息属性详解
+
+```java
+// 标准属性（JMS 规范定义）
+msg.setJMSCorrelationID("order_123");     // 关联 ID（请求-响应匹配）
+msg.setJMSDeliveryMode DeliveryMode.PERSISTENT;  // 持久化
+msg.setJMSPriority(4);                    // 优先级（0-9）
+msg.setJMSExpiration(System.currentTimeMillis() + 3600000); // TTL 1小时
+msg.setJMSReplyTo(replyQueue);            // 回复队列
+
+// 自定义属性（用于消息选择器）
+msg.setStringProperty("region", "shanghai");
+msg.setIntProperty("priority", 1);
+msg.setBooleanProperty("vip", true);
+
+// 消息选择器（消费端过滤）
+MessageConsumer consumer = session.createConsumer(
+    queue,
+    "region = 'shanghai' AND priority > 5"
+);
+// Broker 根据选择器过滤消息 → 只投递匹配的消息
+// 选择器基于 SQL 语法（WHERE 子句）
+
+// 注意：选择器在 Broker 端执行（消息路由时过滤）
+//   不是消费端过滤 → 减少网络传输
+//   但会增加 Broker CPU 开销
+```
+
+---
+
+## 八、ActiveMQ 网络拓扑与高可用
+
+### 8.1 Network of Brokers（网络连接器）
+
+```
+Network of Brokers = 多 Broker 互联（跨机房/负载分摊）
+
+拓扑模式：
+  1. Network Connector（默认单向）：
+     Broker A → Broker B（A 的消息自动路由到 B）
+
+  2. Duplex Connector（双向）：
+     Broker A ↔ Broker B（双向路由）
+
+  3. Hub-Spoke（中心辐射）：
+     中心 Broker 连接所有边缘 Broker
+
+配置示例（activemq.xml）：
+  <networkConnectors>
+    <networkConnector
+        name="bridge"
+        uri="static:(tcp://broker-b:61616)"
+        duplex="true"
+        decreaseNetworkConsumerPriority="true"
+        networkTTL="2"
+        dynamicOnly="false">
+      <excludedDestinations>
+        <queue physicalName="admin.>" />
+      </excludedDestinations>
+    </networkConnector>
+  </networkConnectors>
+
+参数说明：
+  networkTTL: 消息在网络中的最大跳数（防环路）
+  decreaseNetworkConsumerPriority: 降低远程消费者优先级
+  dynamicOnly: 只在有消费者时才路由消息
+  excludedDestinations: 排除不需要路由的目的地
+```
+
+### 8.2 Master-Slave vs Network
+
+```
+高可用方案对比：
+
+Master-Slave（主备）：
+  共享存储（Shared Store）：
+    多 Broker 共用 JDBC/文件系统
+    主 Broker 故障 → 备 Broker 接管存储
+    优点：数据零丢失
+    缺点：存储是单点（必须高可用存储）
+
+  复制（Replication）：
+    主 Broker 异步/同步复制到备
+    优点：无共享存储单点
+    缺点：同步复制影响性能，异步可能丢数据
+
+Network of Brokers：
+  多 Broker 独立存储 + 网络路由
+  优点：水平扩展 + 分布式
+  缺点：消息路由延迟 + 管理复杂
+
+生产建议：
+  中小规模 → Master-Slave（简单可靠）
+  大规模/跨机房 → Network of Brokers
+  混合方案 → Master-Slave + Network（每组内主备，组间互联）
+```
+
+---
+
+## 九、ActiveMQ 在企业集成模式中的应用
+
+### 9.1 经典集成模式
+
+```
+1. 消息通道（Message Channel）：
+   Queue/Topic = 应用间的解耦通道
+   Producer 不知道 Consumer → 独立演进
+
+2. 发布-订阅（Publish-Subscribe）：
+   Topic 模式 → 一个消息多个消费者
+   适用：事件通知、状态广播
+
+3. 消息路由器（Message Router）：
+   消息选择器/Network Connector → 按规则路由到不同目的地
+
+4. 消息转换器（Message Translator）：
+   消息格式转换（XML → JSON）
+   JMS MessageListener 中做格式转换
+
+5. 消息增强器（Message Enricher）：
+   消息中添加额外信息（如用户信息、地区信息）
+
+6. 消息过滤器（Message Filter）：
+   JMS 消息选择器 → Broker 端过滤
+
+7. 消息聚合器（Message Aggregator）：
+   多个响应聚合为一个（JMSCorrelationID 匹配）
+
+8. 消息分解器（Message Splitter）：
+   一个消息拆分为多个（如批量订单拆分单个处理）
+
+9. 请求-回复模式（Request-Reply）：
+   JMSReplyTo + JMSCorrelationID → 异步请求-响应
+
+10. 死信队列（Dead Letter Queue）：
+    消费失败消息路由到 DLQ → 人工处理/重试
+```
+
+### 9.2 ActiveMQ 在 ESB 中的角色
+
+```
+企业服务总线（ESB）中 ActiveMQ 的定位：
+
+  应用 A ──┐
+  应用 B ──┤── ActiveMQ ── ESB 路由 ── 服务 X
+  应用 C ──┘
+
+  作用：
+    消息缓冲：削峰填谷
+    协议转换：JMS ↔ AMQP/MQTT
+    消息路由：按内容/属性路由
+    可靠投递：持久化 + 确认 + 重试
+    事务保证：XA 分布式事务
+
+  不适用场景：
+    高吞吐流处理（用 Kafka）
+    实时 RPC（用 gRPC/Dubbo）
+    事件溯源（用 Kafka Streams）
+```
+
+---
+
+## 十、ActiveMQ vs RabbitMQ vs RocketMQ 详细对比
+
+| 维度 | ActiveMQ | RabbitMQ | RocketMQ |
+|------|----------|----------|----------|
+| **协议** | JMS/OpenWire/AMQP/MQTT | AMQP/STOMP/MQTT | 自研（Remoting） |
+| **语言** | Java | Erlang | Java |
+| **存储** | KahaDB/Journal/LevelDB | Mnesia + 索引文件 | CommitLog + ConsumeQueue |
+| **吞吐** | 中（万级/秒） | 中（万级/秒） | 高（十万级/秒） |
+| **延迟** | 毫秒级 | 微秒级（Erlang） | 毫秒级 |
+| **消息模型** | Queue/Topic/Virtual Topic | Exchange + Queue | Queue/Tag/消费组 |
+| **事务消息** | JMS XA | 不支持 | **半消息事务（核心特性）** |
+| **消息回溯** | 不支持 | 不支持 | 支持（按时间/offset） |
+| **顺序消息** | 消息组 | 有限支持 | **队列内严格有序** |
+| **延迟消息** | 内置支持 | 插件支持 | **开箱即用** |
+| **消息追踪** | JMX/Hawtio | Management UI | **消息轨迹（全链路追踪）** |
+| **运维** | 轻量 | 轻量 | 中等 |
+| **中文社区** | 弱 | 弱 | 强（阿里开源） |
+| **适用** | 老 Java 系统/JMS | 通用企业消息 | **国内高可靠业务消息** |
+
+### 消息模型差异
+
+```
+ActiveMQ：
+  Queue（点对点）→ 一个消费者消费
+  Topic（发布订阅）→ 多个消费者消费（不持久化）
+  Virtual Topic → Topic 发布 + 每消费者独立队列（广播 + 可靠）
+
+RabbitMQ：
+  Exchange（路由）+ Queue（存储）
+  Direct Exchange → 精确路由（routing key）
+  Fanout Exchange → 广播（binding key 忽略）
+  Topic Exchange → 模式匹配路由
+  Headers Exchange → 按消息头路由
+
+RocketMQ：
+  Topic + Tag（二级分类）
+  Queue（队列内有序）
+  ConsumerGroup（消费组，组内负载均衡）
+  MessageExt（扩展属性丰富）
+
+选型关注点：
+  JMS 规范 → ActiveMQ
+  灵活路由 → RabbitMQ（Exchange 机制）
+  高可靠 + 事务消息 → RocketMQ
+  日志/流处理 → Kafka
+```
+
+---
+
+## 十一、与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；
 - AMQP 协议生态见「[RabbitMQ](./RabbitMQ.md)」；

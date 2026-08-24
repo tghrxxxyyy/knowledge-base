@@ -270,6 +270,416 @@ K8s/容器 → Prometheus
 
 ---
 
+## Zabbix 架构深入：Server / Proxy / Agent 全景
+
+### 架构组件详解
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Zabbix Server                         │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐    │
+│  │ 调度器    │  │ 触发器   │  │ 事件管理器          │    │
+│  │ Poller   │  │ Eval     │  │ Event Manager      │    │
+│  └──────────┘  └──────────┘  └────────────────────┘    │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐    │
+│  │ Trapper  │  │ 自发现    │  │ 告警发送器          │    │
+│  │ 接收端   │  │ Disc     │  │ Alerter            │    │
+│  └──────────┘  └──────────┘  └────────────────────┘    │
+│                      ↕                                  │
+│              MySQL / PostgreSQL                          │
+└─────────────────────────────────────────────────────────┘
+          ↕ (主动/被动)          ↕ (主动/被动)
+┌──────────────────┐    ┌──────────────────┐
+│  Zabbix Proxy    │    │  Zabbix Proxy    │
+│  (数据中心A)     │    │  (数据中心B)     │
+│  ┌────────┐      │    │  ┌────────┐      │
+│  │本地缓存│      │    │  │本地缓存│      │
+│  └────────┘      │    │  └────────┘      │
+└──────────────────┘    └──────────────────┘
+      ↕ (10050/10051)         ↕
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│ Agent       │  │ Agent       │  │ Agent       │
+│ (被监控主机)│  │ (被监控主机)│  │ (被监控主机)│
+└─────────────┘  └─────────────┘  └─────────────┘
+```
+
+### Zabbix Agent 2 vs Agent 1 对比
+
+| 维度 | Agent 1 | Agent 2 |
+|------|---------|---------|
+| 语言 | C | Go |
+| 插件机制 | 无（编译时内置） | 无限插件架构（Go plugin） |
+| 预处理 | 服务器端预处理 | 客户端预处理（减少 Server 压力） |
+| 并发采集 | 单线程 | 原生并发（Go goroutine） |
+| 内存占用 | ~10MB | ~30MB（但功能更强） |
+| 支持协议 | Agent/SNMP/JMX | Agent/SNMP/JMX/HTTP/MySQL/PostgreSQL/Podman |
+| 证书认证 | 无 | 支持 TLS 证书双向认证 |
+| 可靠性 | 本地文件存储状态 | SQLite 存储状态（更可靠） |
+
+### Agent 2 插件架构
+
+```yaml
+# agent2 配置示例（插件化）
+Plugins:
+  MySQL:
+    Enabled: true
+    DSN: "tcp(127.0.0.1:3306)/"
+    Username: "zabbix"
+    Password: "{$MYSQL_PASSWORD}"
+  PostgreSQL:
+    Enabled: true
+    DSN: "host=127.0.0.1 port=5432 user=zabbix"
+  HTTPAgent:
+    Enabled: true
+    Timeout: 5s
+  MQTT:
+    Enabled: true
+    Broker: "tcp://127.0.0.1:1883"
+```
+
+---
+
+## 模板系统与 LLD（Low Level Discovery）
+
+### 模板层次体系
+
+```mermaid
+graph TD
+    A[全局模板] --> B[操作系统模板]
+    A --> C[数据库模板]
+    A --> D[中间件模板]
+    B --> B1[Linux by Zabbix Agent]
+    B --> B2[Windows by Zabbix Agent]
+    C --> C1[MySQL by Zabbix Agent]
+    C --> C2[PostgreSQL by Zabbix Agent]
+    D --> D1[Nginx by Zabbix Agent]
+    D --> D2[Redis by Zabbix Agent]
+    B1 --> E[业务自定义模板]
+    C1 --> E
+    D1 --> E
+```
+
+### LLD 低级发现原理
+
+```
+LLD 工作流程：
+  ① 发现规则（Discovery Rule）→ 执行发现脚本/命令
+  ② 返回 JSON 格式发现数据（Macros 变量）
+  ③ 根据发现数据自动创建 Item + Trigger + Graph
+  ④ 当新实体出现/消失时自动增删监控
+
+LLD 发现类型：
+  文件系统发现 → 自动监控每个分区
+  网络接口发现 → 自动监控每张网卡
+  Docker 容器发现 → 自动监控每个容器
+  K8s Pod 发现 → 自动监控每个 Pod
+  自定义发现 → 自定义脚本返回 JSON
+
+LLD JSON 示例：
+  {
+    "data": [
+      {"/{#DISK}": "/", "{#FSTYPE}": "ext4"},
+      {"/{#DISK}": "/data", "{#FSTYPE}": "xfs"}
+    ]
+  }
+```
+
+### LLD 宏变量映射
+
+| 宏 | 说明 | 示例 |
+|----|------|------|
+| `{#FSNAME}` | 文件系统名 | /, /data |
+| `{#FSTYPE}` | 文件系统类型 | ext4, xfs |
+| `{#IFNAME}` | 网络接口名 | eth0, eth1 |
+| `{#CONTAINER}` | Docker 容器名 | nginx-abc123 |
+| `{#PODNAME}` | K8s Pod 名 | web-7d4b8f |
+
+---
+
+## Zabbix Trigger 表达式深入
+
+### 触发器函数详解
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| `last()` | 最近 N 次值 | `last(3)#3 > 90`（最近 3 次均超 90） |
+| `avg()` | 时间窗口平均值 | `avg(5m) > 80`（5 分钟平均 >80） |
+| `min()` | 时间窗口最小值 | `min(10m) < 10`（10 分钟最低 <10） |
+| `max()` | 时间窗口最大值 | `max(3m) > 95`（3 分钟最高 >95） |
+| `count()` | 时间窗口值计数 | `count(1h,100,"gt")`（1 小时内 >100 的次数） |
+| `nodata()` | 数据缺失检测 | `nodata(5m)=1`（5 分钟无数据） |
+| `change()` | 值变化检测 | `change(1h) > 0`（1 小时内有变化） |
+| `diff()` | 与前值比较 | `diff()=1`（与上一值不同） |
+| `band()` | 按位与 | `band(last(),1)=0`（最低位为 0） |
+| `forecast()` | 趋势预测 | `forecast(1h,2h) > 100`（预测 2 小时后超 100） |
+
+### 复杂触发器示例
+
+```
+# CPU 连续 3 次超 90% 且 5 分钟平均超 80%
+{Host:system.cpu.util.avg(5m)}>80 and {Host:system.cpu.util.last(3)}>90
+
+# 磁盘使用率 > 90% 且 inode 使用率 > 80%
+{Host:vfs.fs.size[/,pused].last()}>90 and {Host:vfs.fs.inode[/,pused].last()}>80
+
+# 网络流量突增（当前值 > 平均值 3 倍）
+{Host:net.if.in[eth0].last()} > 3*{Host:net.if.in[eth0].avg(1h)}
+
+# 数据库连接数超阈值 + 慢查询数突增
+{DB:db.connections.active.last()}>500 and {DB:db.slow_queries.count(5m)}>10
+```
+
+---
+
+## 告警升级（Escalation）机制
+
+```mermaid
+graph TD
+    A[触发器 Problem] --> B{持续 5 分钟?}
+    B -->|是| C[第 1 级：邮件通知运维]
+    B -->|否| Z[等待]
+    C --> D{持续 15 分钟?}
+    D -->|是| E[第 2 级：钉钉通知团队]
+    D -->|否| Z
+    E --> F{持续 30 分钟?}
+    F -->|是| G[第 3 级：电话通知负责人]
+    F -->|否| Z
+    G --> H{持续 60 分钟?}
+    H -->|是| I[第 4 级：短信通知 CTO]
+    H -->|否| Z
+    I --> J{触发器 Resolved}
+    J --> K[发送恢复通知]
+```
+
+### 告警升级配置
+
+| 步骤 | 时间 | 动作 | 媒介 |
+|------|------|------|------|
+| 1 | 立即 | 通知运维组 | 邮件 |
+| 2 | 持续 10 分钟 | 升级到团队负责人 | 钉钉 |
+| 3 | 持续 30 分钟 | 升级到部门经理 | 短信 + 邮件 |
+| 4 | 持续 60 分钟 | 升级到 CTO | 电话 |
+| 恢复 | 任意时刻 | 发送恢复通知 | 所有已通知媒介 |
+
+---
+
+## Zabbix Proxy 分布式监控
+
+### Proxy 工作原理
+
+```
+Zabbix Proxy 核心机制：
+  ① 代理采集：Proxy 代替 Server 采集 Agent 数据
+  ② 本地缓存：断网时数据存本地磁盘（SQLite/MySQL）
+  ③ 数据转发：网络恢复后批量回传 Server
+  ④ 心跳机制：Proxy 定期向 Server 报告存活
+  ⑤ 配置同步：Server 下发监控配置到 Proxy
+
+部署模式：
+  模式一：Proxy 仅采集（推荐，最常见）
+  模式二：Proxy 采集 + 简单触发器评估（减少 Server 压力）
+
+适用场景：
+  跨机房/跨地域监控（带宽受限）
+  大规模监控（分担 Server 采集压力）
+  防火墙/NAT 穿透（Agent → Proxy → Server）
+```
+
+### Proxy 高可用
+
+| 组件 | HA 方案 | 说明 |
+|------|---------|------|
+| Proxy | 主备 Proxy | 同一网段部署两个 Proxy，共享 Agent 列表 |
+| Server | 主备 Server | 共享数据库，VIP 切换 |
+| 数据库 | MySQL 主从 | 半同步复制，防止数据丢失 |
+| 网络 | 多链路 | Proxy 到 Server 有备用网络路径 |
+
+---
+
+## Zabbix API 与自动化
+
+### API 核心接口
+
+```python
+# Zabbix API 调用示例
+import jsonrpc
+
+# 认证
+zabbix = jsonrpc.ServerProxy("http://zabbix-server/api_jsonrpc.php")
+auth = zabbix.user.login("Admin", "zabbix")
+# 返回: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 获取主机列表
+hosts = zabbix.host.get({
+    "auth": auth,
+    "params": {
+        "output": ["hostid", "host", "name"],
+        "selectInterfaces": ["ip"],
+        "filter": {"status": 0}
+    }
+})
+
+# 批量创建监控项
+items = zabbix.item.create({
+    "auth": auth,
+    "params": {
+        "hostid": "10001",
+        "name": "CPU Load",
+        "key_": "system.cpu.load[percpu,avg1]",
+        "type": 0,  # 0=Zabbix Agent
+        "value_type": 0,  # 0=浮点数
+        "delay": "30s"
+    }
+})
+
+# 导出模板
+export = zabbix.configuration.export({
+    "auth": auth,
+    "params": {
+        "format": "yaml",
+        "options": {"templates": ["10001"]}
+    }
+})
+```
+
+### 自动化集成场景
+
+| 场景 | 实现方式 |
+|------|----------|
+| 自动纳管新主机 | Zabbix Agent 自动注册 + API 批量关联模板 |
+| 配置批量变更 | API 批量修改 Item/Trigger 参数 |
+| 监控即代码 | API + Terraform/Ansible 实现监控配置版本化 |
+| CMDB 联动 | API 拉取主机清单 → 自动创建/删除监控 |
+| 告警自动工单 | Webhook 告警 → Jira/ServiceNow 自动创建工单 |
+
+---
+
+## 自定义 Item 采集
+
+### 自定义 Key 配置
+
+```bash
+# Agent 配置文件（zabbix_agentd.conf）
+UserParameter=mysql.connections[*],mysql -u$1 -p$2 -e "show status" 2>/dev/null | grep "Threads_connected" | awk '{print $$2}'
+UserParameter=nginx.requests[*],curl -s "http://$1/nginx_status" | grep "accepts" | awk '{print $$3}'
+UserParameter=docker.container.cpu[*],docker stats --no-stream --format "{{.CPUPerc}}" $1 | tr -d '%'
+```
+
+### 采集方式对比
+
+| 方式 | 延迟 | 准确性 | 适用 |
+|------|------|--------|------|
+| Zabbix Agent（被动） | 秒级 | 高 | 常规监控 |
+| Zabbix Agent（主动） | 秒级 | 高 | 跨网段/NAT |
+| SNMP | 秒级 | 中 | 网络设备 |
+| JMX Gateway | 秒级 | 高 | Java 应用 |
+| HTTP Agent | 秒级 | 高 | REST API 指标 |
+| 计算项 | 实时 | 高 | 派生指标 |
+| 聚合项 | 实时 | 高 | 跨主机聚合 |
+
+---
+
+## Zabbix vs Prometheus vs Datadog 对比
+
+| 维度 | Zabbix | Prometheus | Datadog |
+|------|--------|------------|---------|
+| 部署模式 | 自建（Server+Agent+DB） | 自建（Server+Agent） | SaaS（免运维） |
+| 数据模型 | 主机+Item（树状） | 指标+标签（多维） | 指标+标签（多维） |
+| 采集模型 | 主动推送+被动拉取 | Pull（拉模型） | Agent 推送 |
+| 存储 | MySQL/PG（关系型） | 本地 TSDB（时间序列） | 云端 TSDB |
+| 查询语言 | 函数表达式 | PromQL | DQL（私有） |
+| 告警 | 升级/确认/媒介 | Alertmanager | 内置告警 |
+| 可视化 | 内置 Web UI | Grafana | 内置 Dashboard |
+| 云原生 | 弱 | 强（K8s 原生） | 强（多云） |
+| 成本 | 开源免费（运维成本） | 开源免费（运维成本） | 按主机计费（$15+/主机/月） |
+| 扩展性 | Proxy 分布式 | Federation/远程写 | 自动扩展 |
+
+### 成本估算对比
+
+```
+1000 台主机监控年成本估算：
+  Zabbix（自建）：
+    服务器：2 台 Server + 1 台 DB = ¥5 万/年
+    运维人力：1 人 × 20% = ¥5 万/年
+    总计：~¥10 万/年
+
+  Prometheus（自建）：
+    服务器：3 台（HA）= ¥8 万/年
+    运维人力：1 人 × 20% = ¥5 万/年
+    总计：~¥13 万/年
+
+  Datadog（SaaS）：
+    1000 主机 × $15/月 × 12 = $180,000/年 ≈ ¥130 万/年
+
+  结论：
+    小规模（<100 台）→ Datadog 最省心
+    中大规模（>500 台）→ Zabbix/Prometheus 自建更经济
+    混合环境 → Zabbix（基础设施）+ Prometheus（云原生）
+```
+
+---
+
+## 生产部署容量规划
+
+### Server 规格推荐
+
+| 监控规模 | Server 配置 | DB 配置 | Proxy 数量 |
+|----------|-------------|---------|------------|
+| <500 主机 | 4C/8G | 4C/8G | 0 |
+| 500~2000 主机 | 8C/16G | 8C/16G（独立） | 1~2 |
+| 2000~10000 主机 | 16C/32G | 16C/32G（主从） | 3~5 |
+| >10000 主机 | 32C/64G（集群） | 32C/64G（集群） | 5+ |
+
+### 数据量估算
+
+```
+数据量计算公式：
+  每天数据量 = 主机数 × Item数 × (86400/采集间隔) × 每条大小(~100B)
+
+示例（1000 主机，每主机 100 Item，60s 间隔）：
+  = 1000 × 100 × (86400/60) × 100B
+  = 1000 × 100 × 1440 × 100B
+  ≈ 14.4 GB/天（原始数据）
+
+清理策略：
+  原始数据：保留 30 天 → ~432 GB
+  趋势数据（每小时聚合）：保留 1 年 → ~5 GB
+  快照数据：保留 30 天 → 较小
+  → 总存储需求：~500 GB（需分区表 + 自动清理）
+```
+
+---
+
+## Zabbix 在云原生监控中的定位
+
+```mermaid
+graph TD
+    A[云原生监控体系] --> B[基础设施层]
+    A --> C[应用层]
+    A --> D[业务层]
+    B --> B1[Zabbix: 物理机/网络设备]
+    B --> B2[云监控: 云资源指标]
+    C --> C1[Prometheus: K8s/Pod/Service]
+    C --> C2[OpenTelemetry: 分布式追踪]
+    D --> D1[自定义监控: 业务指标]
+    D --> D2[APM: 应用性能]
+    B1 --> E[Grafana: 统一可视化]
+    B2 --> E
+    C1 --> E
+    D1 --> E
+```
+
+### Zabbix 云原生集成方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| Zabbix Agent 2 on K8s | DaemonSet 部署 Agent 2 | K8s 节点+容器监控 |
+| Zabbix + Prometheus Exporter | Zabbix 采集 Prometheus 指标 | 混合环境过渡 |
+| Zabbix + 云 API | 直接调用云 API 采集云资源 | 深度云资源监控 |
+| Zabbix + OpenTelemetry | OTel Collector 转发到 Zabbix | 统一可观测性 |
+
+---
+
 ## 七、与其他板块的关系
 
 - 云原生监控对比见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；

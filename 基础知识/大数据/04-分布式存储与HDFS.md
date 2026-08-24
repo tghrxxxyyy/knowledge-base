@@ -265,6 +265,229 @@ flowchart TD
 
 ---
 
+## HDFS Federation 与 Erasure Coding
+
+### HDFS Federation（联邦）
+
+```
+单NameNode瓶颈：
+  元数据内存受限 → 10亿文件需150GB+堆内存
+  吞吐受限 → 所有请求经单NN
+
+Federation解决：
+  多NameService（NN1、NN2...）横向扩展
+  每个NN管理独立命名空间（/data/a、/data/b）
+  共享底层DataNode存储池
+  客户端挂载表（Mount Table）统一入口
+
+架构：
+  NN1 → /data/a/*（DN1,DN2,DN3）
+  NN2 → /data/b/*（DN1,DN2,DN3）
+  DN同时注册到多个NN
+  Client通过挂载表路由到对应NN
+
+适用：超大集群（万级节点）、多租户隔离
+```
+
+### HDFS Erasure Coding（纠删码）
+
+```
+副本次本 vs EC：
+  3副本：3×存储开销，任2块丢失可恢复
+  RS-6-3：1.5×开销，6数据+3校验，任3块丢失可恢复
+  RS-10-4：1.4×开销，10数据+4校验
+
+EC原理：
+  数据块切分为6个单元
+  生成3个校验块（XOR/Reed-Solomon）
+  存储9个块到不同节点
+  恢复时读取剩余块，数学计算恢复丢失块
+
+代价：
+  写入需计算校验（CPU开销）
+  恢复需网络读多个块（重建慢）
+  不适合频繁写入场景
+
+适用：
+  冷数据目录（归档/日志）
+  WORM数据（Write Once Read Many）
+  存储成本敏感场景
+
+配置：
+  hdfs ec -enablePolicy -policy RS-6-3-1024k /cold_data
+  hdfs ec -setPolicy -path /cold_data -policy RS-6-3-1024k
+```
+
+### HDFS 存储策略
+
+| 策略 | 副本/EC | 适用数据 | 存储介质 |
+|------|--------|---------|---------|
+| HOT | 3副本 | 频繁访问 | 高性能磁盘 |
+| WARM | 1副本+EC | 低频访问 | 标准磁盘 |
+| COLD | EC-6-3 | 极少访问 | 低频存储 |
+| ALL_SSD | 3副本(SSD) | 实时分析 | SSD |
+| ONE_SSD | 1副本(SSD)+2副本磁盘 | 混合 | SSD+磁盘 |
+| LAZY_PERSIST | 内存→异步落盘 | 临时数据 | 内存+磁盘 |
+
+```
+策略切换：
+  hdfs storagepolicies -setStoragePolicy -path /data -policy WARM
+  hdfs mover -p /data（触发数据迁移）
+
+自动分层：
+  结合访问热度（块访问统计）
+  定期执行mover迁移数据
+  与对象存储Lifecycle类似
+```
+
+### HDFS Balancer
+
+```
+问题：新节点加入后数据不均衡，老节点过载
+解决：HDFS Balancer在节点间迁移数据块
+
+执行：
+  hdfs balancer -threshold 10（允许10%偏差）
+  按带宽限制：dfs.datanode.balance.bandwidthPerSec
+
+自动平衡：
+  定时调度（如每周一次）
+  阈值设为5%~10%
+  注意：迁移时占用网络带宽，避峰执行
+
+云上替代：
+  对象存储自动均衡（无需手动balancer）
+  HDFS → 对象存储迁移替代balancer
+```
+
+### DataNode Decommissioning（退役）
+
+```
+退役流程：
+  1. 配置退役节点名单（dfs.hosts.exclude）
+  2. NameNode检测到退役节点
+  3. 后台复制该节点所有块到其他节点
+  4. 副本数恢复后，节点进入退役完成状态
+  5. 物理下线节点
+
+注意：
+  退役期间占网络带宽（副本复制）
+  同时退役多节点可能导致副本不足
+  监控：副本不足告警、退役进度
+```
+
+### 云存储对比：S3 vs HDFS vs GCS vs ADLS
+
+| 维度 | S3 | HDFS | GCS | ADLS |
+|------|-----|------|-----|------|
+| 类型 | 对象存储 | 分布式文件系统 | 对象存储 | 对象存储 |
+| 接口 | REST API | HDFS API | REST API | REST API |
+| 一致性 | 最终一致 | 强一致 | 最终一致 | 最终一致 |
+| 定价 | $0.023/GB/月 | 自管硬件 | $0.020/GB/月 | $0.018/GB/月 |
+| 小文件 | 无限制 | 受NN限制 | 无限制 | 无限制 |
+| 生态 | AWS全栈+Iceberg | Hadoop全栈 | GCP BigQuery | Azure Synapse |
+| 加密 | SSE/SSE-KMS | 传输+静态 | CMEK | SSE |
+| 生命周期 | 自动分层 | 手动策略 | 自动分层 | 自动分层 |
+
+```
+选型建议：
+  云原生 → S3/GCS/ADLS（免运维、按量付费）
+  混合云 → HDFS（本地）+ S3（云端）用DistCp同步
+  湖仓底座 → 对象存储 + Iceberg（最通用）
+  传统Hadoop → HDFS（兼容性最好）
+```
+
+### MinIO 作为 HDFS 替代
+
+```
+MinIO定位：高性能对象存储（S3兼容API）
+
+优势：
+  100% S3 API兼容，HDFS数据可无缝迁移
+  部署简单：单二进制、K8s原生
+  性能：NVMe SSD，单对象读写极快
+  扩展：线性扩展，PB级
+  开源：AGPLv3许可
+
+与HDFS对比：
+  MinIO：REST API、无元数据单点、云原生
+  HDFS：HDFS API、NameNode单点、Hadoop生态
+
+适用场景：
+  替代小规模HDFS集群
+  湖仓底座（+Iceberg/Hudi）
+  K8s原生数据平台
+  多云/混合云存储统一
+
+迁移路径：
+  HDFS → DistCp → S3A → MinIO
+  Iceberg表：直接修改catalog指向MinIO
+```
+
+### 数据湖存储格式深度对比
+
+| 维度 | Delta Lake | Apache Iceberg | Apache Hudi |
+|------|-----------|---------------|-------------|
+| ACID事务 | ✅ | ✅ | ✅ |
+| 时间旅行 | ✅ | ✅ | ✅ |
+| Schema演进 | ✅ | ✅ | ✅ |
+| 分区演进 | 有限 | ✅ 隐藏分区 | ✅ |
+| 流式写入 | 有限 | 增强中 | ✅ Flink集成 |
+| 流式读取 | 有限 | 增量读 | ✅ |
+| 引擎支持 | Spark为主 | 全引擎 | Spark/Flink |
+| 开放程度 | 半开放 | Apache顶级 | Apache顶级 |
+| 社区 | Databricks主导 | 社区驱动 | Uber发起 |
+
+```
+选型决策：
+  Databricks生态 → Delta Lake
+  通用互操作+多引擎 → Iceberg（推荐）
+  Flink实时链路 → Paimon（Apache孵化）
+  传统Hive+Hudi → Hudi
+
+2025趋势：
+  Iceberg成为事实标准（Snowflake/Databricks/AWS共支持）
+  Paimon在Flink生态崛起
+  DuckLake探索元数据简化
+```
+
+### 存储分层策略
+
+```mermaid
+flowchart TD
+    A[数据写入] --> B{访问频率?}
+    B -->|日/小时| C[热层: SSD/高性能]
+    B -->|周/月| D[温层: 标准存储]
+    B -->|季度/年| E[冷层: 低频存储]
+    B -->|极少| F[冰层: 归档]
+    C -->|30天未访问| D
+    D -->|90天未访问| E
+    E -->|1年未访问| F
+    F -->|合规到期| G[删除]
+```
+
+| 层级 | 媒介 | $/GB/月 | 访问延迟 | 适用 |
+|------|------|---------|---------|------|
+| Hot | SSD | $0.10 | ms级 | 实时分析 |
+| Warm | 标准S3 | $0.023 | 100ms | 日常查询 |
+| Cold | S3 IA | $0.0125 | 分钟级 | 季度报表 |
+| Archive | Glacier | $0.004 | 小时级 | 合规归档 |
+
+```
+成本收益：
+  Hot→Warm：降成本75%
+  Warm→Cold：降成本50%
+  Cold→Archive：降成本70%
+  合理分层可降存储总成本40%~60%
+
+执行方式：
+  对象存储：Lifecycle Policy自动迁移
+  Iceberg：按分区时间戳归档到低频
+  HDFS：Storage Policy + HDFS Mover
+```
+
+---
+
 ## 十一、与其他板块的关系
 
 - 文件/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
