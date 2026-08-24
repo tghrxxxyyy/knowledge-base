@@ -303,7 +303,348 @@ K8s：NATS Operator（自动集群编排）
 
 ---
 
-## 七、与其他板块的关系
+## NATS Core Pub/Sub
+
+### 核心发布订阅
+
+```
+NATS 核心 Pub/Sub = 纯内存路由，微秒级延迟
+
+发布：
+  nc.publish("orders.paid", []byte(`{"order_id": 123}`))
+
+订阅：
+  nc.Subscribe("orders.paid", func(msg *nats.Msg) {
+      fmt.Printf("Received: %s\n", string(msg.Data))
+  })
+
+通配符：
+  *：匹配一层
+    orders.*.paid → orders.us.paid, orders.eu.paid
+  >：匹配剩余所有层
+    orders.> → orders.us.paid, orders.eu.received
+
+队列组（Queue Group）：
+  nc.QueueSubscribe("orders.paid", "workers", handler)
+  多个订阅者同 queue name → 消息分摊（负载均衡）
+
+特点：
+  纯内存路由（无持久化）
+  在线才收到（离线丢）
+  微秒级延迟（百万 msg/s）
+```
+
+## NATS JetStream Persistence Deep
+
+### Stream 深入
+
+```
+Stream = 持久化消息日志
+
+创建 Stream：
+  js.AddStream(&nats.StreamConfig{
+      Name:     "ORDERS",
+      Subjects: []string{"orders.>"},
+      Storage:  nats.FileStorage,    // File 或 Memory
+      Replicas: 3,                   // Raft 副本数
+      Retention: nats.LimitsPolicy,  // 保留策略
+      MaxAge:   24 * time.Hour,      // 最大保留时间
+      MaxBytes: 1 << 30,            // 最大保留大小
+      Discard:  nats.DiscardOld,    // 超限策略
+  })
+
+保留策略：
+  LimitsPolicy：按 MaxAge/MaxBytes 保留（超限丢弃）
+  InterestPolicy：所有消费者消费完才删除（队列语义）
+  WorkQueue：单消费者消费后删除（任务队列）
+```
+
+### Consumer 深入
+
+```
+Consumer = 消费游标
+
+Push Consumer（推送）：
+  sub, _ := js.Subscribe("orders.>", func(msg *nats.Msg) {
+      process(msg)
+      msg.Ack()
+  }, nats.Durable("worker1"))
+
+Pull Consumer（拉取）：
+  sub, _ := js.PullSubscribe("orders.>", "worker1")
+  msgs, _ := sub.Fetch(10, nats.MaxWait(5*time.Second))
+  for _, msg := range msgs {
+      process(msg)
+      msg.Ack()
+  }
+
+AckPolicy：
+  Explicit：每条确认（精确控制）
+  All：一批确认（高效）
+  None：不确认（消息不重发）
+
+MaxDeliver：最大投递次数
+  超过 → 进入 Dead Letter Queue（DLQ）
+```
+
+## NATS Consumer Groups
+
+### Pull Consumer Groups
+
+```
+Pull Consumer Groups = 消费者组（类似 Kafka Consumer Group）
+
+创建：
+  sub, _ := js.PullSubscribe("orders.>", "order-group")
+  
+每个消费者组内：
+  多个 Consumer 实例分摊消息
+  每条消息只被一个实例消费
+
+与 Kafka Consumer Group 对比：
+  NATS：Pull Consumer 自动负载均衡
+  Kafka：Partition 级别负载均衡
+
+优势：
+  消费者组内自动负载均衡
+  支持动态扩缩容（增加 Consumer 实例）
+  消费进度持久化（Stream offset）
+```
+
+### Push Consumer Groups
+
+```
+Push Consumer = 服务端推送到长连接
+
+sub, _ := js.QueueSubscribe("orders.>", "workers", handler)
+
+Queue Group：
+  多个订阅者同 queue name
+  消息 round-robin 分发
+  
+与 Pull 对比：
+  Push：低延迟（服务端推送）
+  Pull：可控性高（客户端拉取）
+
+适用：
+  Push：实时性要求高（事件处理）
+  Pull：批量处理（可控吞吐）
+```
+
+## NATS Request-Reply Pattern
+
+```
+Request-Reply = NATS 原生 RPC 模式
+
+请求方：
+  msg, err := nc.Request("orders.get", []byte(`{"id":123}`), time.Second)
+  if err != nil { ... }
+  fmt.Println(string(msg.Data))
+
+服务方：
+  nc.Subscribe("orders.get", func(msg *nats.Msg) {
+      // 处理请求
+      result := process(msg.Data)
+      msg.Respond(result)
+  })
+
+实现原理：
+  请求方创建临时 Inbox（_INBOX.{reqID}）
+  请求发到 orders.get + 响应主题
+  服务方响应发回 Inbox
+  客户端自动匹配（超时处理）
+
+适用：
+  微服务调用（替代 RPC）
+  健康检查
+  配置查询
+
+对比 gRPC：
+  NATS：消息模式，解耦更彻底
+  gRPC：RPC 模式，接口契约更明确
+```
+
+## NATS Leaf Nodes
+
+```
+Leaf Nodes = 边缘节点（弱网/离线连接）
+
+场景：
+  IoT 网关 → 边缘 NATS（Leaf Node）
+  → 中心集群（Hub）
+
+架构：
+  Hub Cluster（3节点）
+    └── Leaf Node（边缘）
+        ├── 本地 Pub/Sub（离线可用）
+        └── 断线重连（缓存消息）
+
+配置：
+  leafnodes {
+    remotes [
+      { urls: ["nats://hub1:4222", "nats://hub2:4222"] }
+    ]
+  }
+
+优势：
+  边缘设备离线可用
+  断线消息缓存（重新连接后补发）
+  带宽优化（只同步必要消息）
+```
+
+## NATS Account Isolation
+
+### Account 隔离
+
+```
+Accounts = 多租户隔离
+
+配置：
+  accounts {
+    global { }
+    
+    app1 {
+      users: [{user: app1, password: "pw"}]
+      exports: [{subjects: ["app1.>"], type: stream}]
+    }
+    
+    app2 {
+      users: [{user: app2, password: "pw"}]
+      imports: [{subject: "app1.>", account: app1}]
+    }
+  }
+
+隔离规则：
+  默认：Account 间完全隔离
+  显式导出/导入：跨 Account 通信
+
+安全：
+  每个 Account 独立命名空间
+  权限最小化（publish/subscribe 白名单）
+  JWT 认证（用户凭据 = JWT 签名）
+```
+
+### JWT 认证
+
+```yaml
+# JWT 配置示例
+authorization {
+  account: app1
+  users: [{
+    user: app1user
+    password: ""
+    permissions: {
+      publish: ["app1.>", "orders.*.events"]
+      subscribe: ["app1.>", "orders.*.events"]
+    }
+  }]
+}
+
+# JWT Token 生成
+nk -gen user -account app1 -name app1user > app1user.creds
+```
+
+## NATS vs Kafka vs RabbitMQ
+
+| 维度 | NATS | Kafka | RabbitMQ |
+|------|------|-------|----------|
+| 定位 | 轻量消息/服务通信 | 高吞吐流平台 | 业务消息 |
+| 延迟 | 微秒 | 毫秒 | 毫秒 |
+| 吞吐 | 高 | 最高 | 中 |
+| 持久化 | JetStream（可选） | 强（磁盘日志） | 强 |
+| 顺序保证 | 流内有序 | 分区内有序 | 队列有序 |
+| 运维成本 | 最低 | 高（ZK/KRaft） | 中 |
+| 多租户 | 原生（Accounts） | 弱 | 弱 |
+| 适用 | 边缘/微服务/实时 | 日志/管道/流处理 | 业务解耦 |
+
+## NATS in Edge Computing
+
+```
+NATS 边缘计算场景：
+
+架构：
+  Edge Device → Edge NATS（Leaf Node）
+    → 本地处理（Pub/Sub）
+    → 断线缓存
+    → 重连后同步到 Cloud
+
+优势：
+  极轻量（单二进制 ~20MB）
+  内存占用小（适合边缘设备）
+  离线可用（Leaf Node 本地路由）
+  低延迟（微秒级）
+
+场景：
+  IoT 网关数据采集
+  工业控制系统
+  车联网 V2X
+  边缘 AI 推理结果分发
+```
+
+## NATS Clustering Internals
+
+```
+NATS 集群内部机制：
+
+Raft 选主：
+  JetStream 流使用 Raft 共识
+  Leader 处理写入 → 同步到 Follower
+  多数派确认 → 写入成功
+
+Gossip 协议：
+  节点间状态同步（元数据/负载）
+  心跳检测（防假死）
+  新节点自动发现
+
+主题路由：
+  集群内主题全局路由
+  订阅者在任意节点 → 消息路由到该节点
+
+配置：
+  cluster {
+    name: my-cluster
+    listen: 0.0.0.0:6222
+    routes: [
+      nats-route://node1:6222
+      nats-route://node2:6222
+      nats-route://node3:6222
+    ]
+  }
+```
+
+## NATS Security
+
+```
+NATS 安全机制：
+
+1. TLS 加密
+   tls {
+     cert_file: "/path/to/server.crt"
+     key_file: "/path/to/server.key"
+     ca_file: "/path/to/ca.crt"
+   }
+
+2. 认证
+   password: "secret"
+   token: "my-secret-token"
+   jwt: "/path/to/creds"  # JWT 认证
+
+3. 授权
+   authorization {
+     user: admin
+     password: "secret"
+     permissions {
+       publish: "orders.>"
+       subscribe: "orders.>"
+     }
+   }
+
+4. 账户隔离
+   每个业务线一个 Account（隔离）
+   跨 Account 通信需显式导出/导入
+```
+
+## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；
 - Pulsar 对比见「[Apache Pulsar](./ApachePulsar.md)」；

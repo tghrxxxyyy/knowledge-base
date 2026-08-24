@@ -214,6 +214,339 @@ FROM KAFKA("kafka_broker_list"="kafka:9092","kafka_topic"="orders");
 
 ---
 
+## Doris FE/BE Architecture
+
+### FE 架构深度
+
+```
+FE（Frontend）= 元数据 + SQL 解析 + 调度
+
+Leader/Follower/Observer：
+  Leader: 处理写请求（DDL/导入），Raft 一致性
+  Follower: 同步 Leader 数据，可读
+  Observer: 只读副本，不参与选举
+
+元数据管理：
+  ├── Catalog/Database/Table 元数据
+  ├── Partition/Segment 信息
+  ├── Tablet 副本分布
+  └── 导入任务状态
+
+SQL 解析流程：
+  1. SQL Parser（基于 JavaCC）
+  2. Analyzer（语义分析/类型检查）
+  3. Planner（逻辑计划/物理计划）
+  4. Optimizer（CBO 优化/谓词下推）
+  5. 生成 Fragment 树（分发到 BE 执行）
+
+配置：
+  fe:
+    priority_networks: 10.0.0.0/24
+    meta_dir: /opt/doris/fe/meta
+    max_running_txn_num_per_db: 1000
+```
+
+### BE 架构深度
+
+```
+BE（Backend）= 数据存储 + 计算执行
+
+组件：
+  ├── Tablet Manager（管理 Tablet 副本）
+  ├── Segment Writer/Reader（数据写入/读取）
+  ├── CompactionManager（后台 Compaction）
+  ├── Pipeline Engine（向量化执行引擎）
+  └── MemTable/MemPool（内存管理）
+
+存储引擎（LSM-Tree）：
+  MemTable（写入缓存）→ Flush → Segment（磁盘）
+  → Compaction 合并 → 最终 Segment
+  
+  Segment 格式：
+    数据列 + 索引（Bloom Filter/Zonemap/Bitmap）
+    
+副本管理：
+  每个 Tablet 默认 3 副本
+  副本分布在不同 BE 节点
+  副本间异步同步（半同步复制）
+
+配置：
+  be:
+    priority_networks: 10.0.0.0/24
+    storage_root_path: /opt/doris/storage
+    tablet_map_shard_size: 16
+    max_compaction_threads: 4
+```
+
+## Doris MPP Query Engine
+
+### 查询执行流程
+
+```
+SQL → FE 解析优化 → 物理计划
+  → 分发到 BE（Fragment）
+  → BE 执行 Pipeline（向量化）
+  → 结果合并返回
+
+MPP 模式：
+  每个 Fragment → 多个 ScanNode → 并行扫描
+  → ExchangeNode（Shuffle）→ 数据重分布
+  → AggregationNode（聚合）→ 最终结果
+
+Pipeline Engine：
+  一个 Fragment → 多个 Operator 组成 Pipeline
+  Pipeline 内算子并行执行（向量化批量处理）
+  Pipeline 间流水线执行（不等一个 Fragment 完成）
+
+配置：
+  SET enable_pipeline_engine = true;
+  SET parallel_fragment_exec_instance_num = 8;  # 并行度
+```
+
+### Join 策略
+
+```
+Doris Join 策略：
+  ├── Broadcast Join（小表广播）
+  │   小表 → 广播到所有 BE → 本地 Join
+  │   适用：小表 < 100MB
+  │
+  ├── Shuffle Join（数据重分布）
+  │   两张表按 Join Key → Hash 分桶 → 相同桶 Join
+  │   适用：大表 Join 大表
+  │
+  ├── Bucket Shuffle Join（同桶 Join）
+  │   两张表分桶键相同 → 同节点 Join（无 Shuffle）
+  │   适用：Colocate 表
+  │
+  └── Runtime Filter（动态过滤）
+      Join 时生成 Bloom Filter → 下推到 Scan
+      减少扫描数据量（10x+ 加速）
+
+CBO 优化：
+  基于统计信息估算 Join 代价
+  自动选择最优 Join 策略
+```
+
+## Doris Vectorized Execution
+
+```
+向量化执行 = 按列批量处理（SIMD 加速）
+
+传统行存执行：
+  逐行处理 → 函数调用多 → 缓存不友好
+
+向量化列存执行：
+  按列批量处理（1024 行/批）
+  SIMD 指令并行处理
+  缓存命中率高（连续内存访问）
+
+Pipeline 算子：
+  ├── ScanOperator（列存扫描）
+  ├── ProjectOperator（列投影）
+  ├── FilterOperator（过滤）
+  ├── AggregationOperator（聚合）
+  ├── SortOperator（排序）
+  └── JoinOperator（Join）
+
+性能对比：
+  向量化 vs 行存：聚合查询 5-10x 提升
+  SIMD 加速：数值计算 2-4x 提升
+```
+
+## StarRocks CBO Optimizer
+
+```
+StarRocks CBO（Cost-Based Optimizer）= 基于代价的查询优化器
+
+核心能力：
+  1. 统计信息收集
+     ANALYZE TABLE orders UPDATE HISTOGRAM;
+     → 收集列分布/NDV/空值率等统计信息
+
+  2. Join 重排
+     多表 Join → CBO 估算所有 Join 顺序 → 选最优
+     例：A JOIN B JOIN C → 可能 B JOIN C JOIN A 更优
+
+  3. 分区裁剪
+     WHERE date >= '2024-01-01' → 跳过 2024 年前分区
+
+  4. 谓词下推
+     过滤条件 → 下推到 Scan 减少 I/O
+
+  5. 物化视图选择
+     查询 → 自动匹配最优物化视图
+
+配置：
+  SET cbo_enable = true;
+  SET cbo_use_node_stats_for_distributed = true;
+  SET enable_pipeline_engine = true;
+```
+
+## StarRocks Lakehouse
+
+```
+StarRocks Lakehouse = 外部表直接查询数据湖
+
+支持格式：
+  ├── Apache Iceberg
+  ├── Apache Hudi
+  ├── Delta Lake
+  └── Apache Hive
+
+配置示例：
+  CREATE EXTERNAL CATALOG hive_catalog
+  PROPERTIES (
+    "type" = "hive",
+    "hive.metastore.uris" = "thrift://metastore:9083"
+  );
+  
+  SELECT * FROM hive_catalog.db.table WHERE date = '2024-01-01';
+
+查询优化：
+  分区裁剪：跳过外部表不相关分区
+  谓词下推：过滤条件下推到数据湖
+  缓存：本地缓存热数据（避免重复读取）
+
+优势：
+  无需 ETL → 直接查询数据湖
+  统一 SQL 接口
+  高性能向量化执行
+```
+
+## Doris vs StarRocks Benchmark
+
+```
+性能对比（标准测试集）：
+
+| 场景 | Doris 2.1 | StarRocks 3.x |
+|------|-----------|---------------|
+| 单表聚合 | 1.0x | 0.9x |
+| 多表 Join | 1.0x | 0.85x |
+| 实时导入 | 1.0x | 1.0x |
+| 物化视图 | 1.0x | 0.95x |
+| 冷热分层 | 支持 | 支持 |
+
+功能对比：
+  | 功能 | Doris | StarRocks |
+  |------|-------|-----------|
+  | CBO | 支持 | 支持（更成熟） |
+  | 向量化 | 支持 | 支持 |
+  | Pipeline | 支持 | 支持 |
+  | 外部表 | 支持 | 支持 |
+  | 物化视图 | 同步/异步 | 同步/异步 |
+
+选型建议：
+  开源优先/国内生态 → Doris
+  性能优先/商业支持 → StarRocks
+  功能接近，差异在细节
+```
+
+## Real-time Analytics with Doris
+
+```
+实时数仓架构：
+
+Kafka → Doris（Routine Load）
+  → 秒级可见
+  → 实时分析
+
+架构：
+  数据源（MySQL Binlog/Kafka）→ Flink → Kafka
+  → Doris（Routine Load 秒级导入）
+  → BI 工具（查询分析）
+
+关键配置：
+  Routine Load:
+    max_batch_interval = 10s    # 导入频率
+    max_batch_rows = 200000     # 批次大小
+    max_batch_interval_bytes = 104857600  # 批次大小
+
+  导入优化：
+    format = json
+    strip_outer_array = true
+    num_as_string = false
+    
+监控：
+    routine_load_running_num   # 运行中的导入任务
+    routine_load_success_num   # 成功导入数
+    routine_load_fail_num      # 失败导入数
+```
+
+## Doris Rollup
+
+```
+Rollup = 同步物化视图（预聚合）
+
+创建 Rollup：
+  ALTER TABLE orders ADD ROLLUP rollup_daily (date, product_id, amount);
+
+工作原理：
+  数据导入 → 自动维护 Rollup
+  查询 WHERE date AND product_id → 走 Rollup（省扫描量）
+
+Rollup 选择：
+  FE 自动选择最优 Rollup
+  EXPLAIN 查看是否命中 Rollup
+  
+最佳实践：
+  高频查询字段 → 建 Rollup
+  避免过多 Rollup（影响写性能）
+  定期 ANALYZE TABLE 更新统计信息
+```
+
+## StarRocks Primary Keys
+
+```
+Primary Key 模型 = 实时更新（Replace/聚合）
+
+StarRocks 3.0+ Primary Key:
+  支持部分列更新（Partial Update）
+  支持条件更新（Conditional Update）
+
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    status VARCHAR(20),
+    amount DECIMAL(10,2)
+) PRIMARY KEY (order_id)
+DISTRIBUTED BY HASH(order_id) BUCKETS 8
+PROPERTIES (
+    "replication_num" = "3",
+    "enable_unique_key_merge_on_write" = true  -- 写时合并（推荐）
+);
+
+优势：
+  实时更新（毫秒级可见）
+  无需 Compaction（写时合并）
+  支持部分列更新（节省带宽）
+```
+
+## Shared-Data Architecture
+
+```
+StarRocks Shared-Data = 存算分离架构
+
+原理：
+  FE → 调度查询
+  BE → 只负责计算（无本地存储）
+  数据存 → 对象存储（S3/OSS/HDFS）
+
+优势：
+  计算存储独立扩展
+  云上成本优化（冷数据存 S3）
+  快速弹性扩缩容
+
+配置：
+  fe:
+    shared_data_endpoint = s3://bucket/path
+    
+适用：
+  云原生部署
+  冷热分层（热数据 SSD，冷数据 S3）
+  弹性计算需求
+```
+
 ## 七、与其他板块的关系
 
 - ClickHouse 对比见「[ClickHouse](./ClickHouse.md)」；

@@ -309,6 +309,291 @@ C#：Confluent.SchemaRegistry
 
 ---
 
+## Schema Registry Compatibility Modes Deep
+
+### BACKWARD 兼容
+
+```
+BACKWARD = 新 Schema 能读老数据（消费者先升级）
+
+允许操作：
+  ✅ 加字段（带默认值）
+  ✅ 删字段
+  ✅ 改默认值
+  ❌ 加字段（无默认值）
+  ❌ 改类型
+  ❌ 重命名字段
+
+场景：
+  消费者先升级到新版本
+  生产者继续发老格式
+  消费者能处理两种格式
+
+示例：
+  v1: {name, email}
+  v2: {name, email, phone(default: "")}  ✅
+  v2: {name, email, phone}                ❌（无默认值）
+```
+
+### FORWARD 兼容
+
+```
+FORWARD = 老 Schema 能读新数据（生产者先升级）
+
+允许操作：
+  ✅ 加字段
+  ✅ 删字段（有默认值）
+  ❌ 删字段（无默认值）
+  ❌ 改类型
+
+场景：
+  生产者先升级到新版本
+  消费者继续用老版本
+  老消费者能处理新格式
+
+示例：
+  v1: {name, email}
+  v2: {name, email, phone}  ✅（老 Schema 忽略 phone）
+  v2: {name, phone}         ❌（老 Schema 读不到 email）
+```
+
+### FULL 兼容
+
+```
+FULL = 双向兼容（严格契约）
+
+允许操作：
+  ✅ 加字段（带默认值）
+  ✅ 删字段
+  ❌ 加字段（无默认值）
+  ❌ 改类型
+  ❌ 重命名字段
+
+场景：
+  生产者和消费者无法确定升级顺序
+  需要严格保证兼容性
+
+选择：
+  默认用 BACKWARD（消费者先升级）
+  严格场景用 FULL
+  确定顺序用 FORWARD
+```
+
+## Avro vs Protobuf vs JSON Schema
+
+| 维度 | Avro | Protobuf | JSON Schema |
+|------|------|----------|-------------|
+| Schema 位置 | 注册中心（数据不携带） | .proto 编译 | 数据可携带 |
+| 编码 | ZigZag + varint | varint + TLV | 文本 |
+| 字段标识 | 按名称匹配 | 按字段号匹配 | 按名称匹配 |
+| 兼容性工具 | Registry 自动校验 | 需手动管理 | 需手动管理 |
+| 跨语言 | 一般 | 强（生态广） | 强 |
+| 数据湖导出 | Avro 文件原生 | 需转换 | 可直接读 |
+| 体积 | 最小 | 小 | 大 |
+| 适用 | Kafka 生态 | 微服务 RPC | 简单/调试 |
+
+## Confluent Schema Registry
+
+```
+Confluent Schema Registry = Kafka Schema 管理中心
+
+架构：
+  Producer → Schema Registry（注册 Schema）
+            → Kafka（消息 + schemaId）
+  Consumer ← Schema Registry（获取 Schema）
+
+REST API：
+  POST /subjects/{subject}/versions  注册 Schema
+  GET /schemas/ids/{id}              获取 Schema
+  GET /subjects/{subject}/versions   查看版本
+  DELETE /subjects/{subject}         删除 Subject
+
+配置：
+  schema.registry.url=http://registry:8081
+  schema.compatibility.level=BACKWARD
+  leader.election.interval=1000
+
+高可用：
+  多实例 + Leader 选举
+  Leader 处理写，Follower 只读
+  故障自动切换
+```
+
+## Schema Evolution Strategies
+
+```
+Schema 演进策略：
+
+1. 渐进式演进
+   v1 → v2（加字段带默认值）→ v3（加字段带默认值）
+   每次只做一个小改动
+   全程无停服
+
+2. 大版本升级
+   新 Topic + 新 Schema（隔离验证）
+   双写（新旧并行）
+   消费者切新 Topic
+   老 Topic 保留期后清理
+
+3. 字段废弃流程
+   1. 新 Schema 加 deprecated 标记
+   2. 消费者停止使用该字段
+   3. 生产者停止填充
+   4. 下个版本删除字段
+
+4. 类型变更
+   不支持直接改类型
+   方案：加新字段 → 迁移数据 → 删旧字段
+
+最佳实践：
+  CI/CD 中校验兼容性
+  禁用 auto.register（生产）
+  定期清理废弃 Schema
+```
+
+## Schema Registry with Kafka Connect
+
+```json
+// Kafka Connect 配置 Schema Registry
+{
+  "name": "my-source-connector",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSourceConnector",
+    "connection.url": "jdbc:mysql://localhost:3306/mydb",
+    "topic.prefix": "my-",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://registry:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://registry:8081",
+    "value.converter.subject.name.strategy": "io.confluent.connect.storage.class.TopicSubjectNameStrategy"
+  }
+}
+
+Converter 配置：
+  AvroConverter：Avro 序列化 + Schema 注册
+  ProtobufConverter：Protobuf 序列化
+  JsonSchemaConverter：JSON Schema
+
+NameStrategy：
+  TopicNameStrategy：topic-value（默认）
+  RecordNameStrategy：record name（跨 Topic 共享 Schema）
+```
+
+## Schema Validation
+
+```
+Schema 校验 = 注册时自动检查兼容性
+
+校验流程：
+  1. 生产者发送消息
+  2. Serializer 检查本地缓存 → 无
+  3. 请求 Registry 校验兼容性
+  4. 不兼容 → 拒绝注册 → 抛异常
+  5. 兼容 → 注册新版本 → 返回 schemaId
+
+校验维度：
+  字段类型兼容性
+  默认值存在性
+  字段重命名检测
+  向后/向前兼容性
+
+配置：
+  auto.register.schemas=false  # 生产禁用自动注册
+  latest.compatibility.strict=true  # 严格兼容性检查
+```
+
+## Schema Registry in APISIX
+
+```yaml
+# APISIX Schema Registry 配置
+plugins:
+  - kafka-logger
+  - avro-serialization
+
+# 自定义插件：Avro 序列化
+local schema_registry = require "apisix.plugins.avro-serialization"
+
+schema_registry.configure({
+    url = "http://schema-registry:8081",
+    auto_register = false,
+    cache_ttl = 300
+})
+
+# 使用
+routes:
+  - uri: /api/orders
+    plugins:
+      avro-serialization:
+        subject: orders-value
+        schema_registry_url: http://schema-registry:8081
+```
+
+## Schema Registry in Pulsar
+
+```
+Pulsar Schema Registry = 内置 Schema 管理
+
+功能：
+  Schema 注册（Avro/Protobuf/JSON）
+  版本管理
+  兼容性校验
+  客户端自动编解码
+
+使用：
+  Producer<String> producer = client.newProducer(Schema.AVRO(Order.class))
+      .topic("orders")
+      .create();
+  
+  Consumer<Order> consumer = client.newConsumer(Schema.AVRO(Order.class))
+      .topic("orders")
+      .subscribe();
+
+Schema 演进：
+  支持 BACKWARD/FORWARD/FULL 兼容
+  自动注册新 Schema
+  版本化管理
+
+对比 Confluent：
+  Pulsar：内置 Schema Registry（无需额外组件）
+  Confluent：独立 Schema Registry（更灵活）
+```
+
+## Schema Governance
+
+```
+Schema 治理体系：
+
+1. 设计评审
+   新 Schema 必须评审
+   检查命名规范/字段命名/默认值
+   防止 Schema 爆炸
+
+2. 注册审批
+   CI 中校验兼容性
+   人工审批（防乱注册）
+   auto.register.schemas=false
+
+3. 版本管理
+   版本化 + 变更记录
+   谁改了什么（审计）
+   废弃 Schema 归档
+
+4. 使用追踪
+   Subject 引用统计
+   谁在用哪个版本
+   依赖关系可视化
+
+5. 清理
+   废弃 Subject 归档
+   过期 Schema 删除
+   定期审计
+
+工具：
+  Confluent Schema Registry UI
+  自定义管理界面
+  CI/CD 集成（GitHub Actions）
+```
+
 ## 九、与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；

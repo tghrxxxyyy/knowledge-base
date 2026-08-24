@@ -180,6 +180,414 @@ Provider（提供者）
 
 ---
 
+## Dubbo 协议 Internals
+
+### Dubbo 协议头结构
+
+```
+Dubbo 协议帧格式（TCP 长连接）：
+  +--------+--------+--------+--------+--------+
+  | Magic  | Flag   | Status | Length | Id     | Body
+  | 2 bytes| 1 byte | 1 byte | 4 bytes| 8 bytes| N bytes
+  +--------+--------+--------+--------+--------+
+
+Magic: 0xdabb（魔数，标识 Dubbo 协议）
+Flag:  请求/响应标志位
+  ├── bit 0: 1=请求, 0=响应
+  ├── bit 1: 1=双向（需要响应）, 0=单向
+  ├── bit 2: 1=事件消息（心跳）
+  ├── bit 3: 1=序列化类型
+  └── bits 4-7: 序列化 ID（2=Hessian2, 6=Protobuf）
+Status: 响应状态码（20=OK, 30=服务端异常, 40=客户端异常）
+Length: 消息体长度（含头部）
+Id: 请求 ID（用于匹配请求-响应）
+```
+
+### 心跳机制
+
+```
+心跳检测（保持长连接）：
+  客户端 → 服务端: 心跳请求（event=true, body=空）
+  服务端 → 客户端: 心跳响应
+  
+默认配置：
+  heartbeat: 60000ms（60秒）
+  timeout: 1000ms（调用超时）
+  reconnect: 2000ms（断线重连）
+
+重连策略：
+  指数退避：2s → 4s → 8s → 16s → 30s（最大）
+  线程池满：拒绝新连接（防雪崩）
+  
+监控：
+  dubbo_removing_connections（断开连接数）
+  dubbo_request_duration_seconds（调用延迟）
+```
+
+## Dubbo SPI Mechanism
+
+### SPI 扩展点加载
+
+```
+Dubbo SPI = Service Provider Interface 扩展机制
+  比 Java SPI 更灵活：按名称加载 + 条件激活
+
+加载流程：
+  1. 扫描 META-INF/dubbo/ 目录
+  2. 读取扩展点配置文件（key=实现类全限定名）
+  3. 按名称加载指定实现
+
+配置文件格式（META-INF/dubbo/org.apache.dubbo.rpc.Filter）：
+  timeout=com.alibaba.dubbo.rpc.filter.TimeoutFilter
+  execute=com.alibaba.dubbo.rpc.filter.ExecuteLimitFilter
+  tps=com.alibaba.dubbo.rpc.filter.TpsLimitFilter
+```
+
+### Adaptive 扩展（自适应）
+
+```java
+// Adaptive = 根据运行时参数动态选择实现
+@SPI("random")
+public interface LoadBalance {
+    @Adaptive("loadbalance")  // 从 URL 参数 "loadbalance" 取值
+    <T> Invoker<T> select(List<Invoker<T>> invokers, 
+                          URL url, Invocation invocation);
+}
+
+// 运行时 URL: dubbo://host:20880/com.example.UserService?loadbalance=leastactive
+// → 自动选择 LeastActiveLoadBalance
+```
+
+### Extension 自定义扩展
+
+```java
+// 自定义 Filter
+@Activate(group = "provider", order = 100)
+public class MyCustomFilter implements Filter {
+    
+    @Override
+    public Result invoke(Invoker<?> invoker, Invocation invocation) {
+        // 前置处理
+        long start = System.currentTimeMillis();
+        
+        Result result = invoker.invoke(invocation);
+        
+        // 后置处理
+        long elapsed = System.currentTimeMillis() - start;
+        log.info("Call {} took {}ms", invocation.getMethodName(), elapsed);
+        
+        return result;
+    }
+}
+
+// 注册：META-INF/dubbo/org.apache.dubbo.rpc.Filter
+myCustom=com.example.MyCustomFilter
+```
+
+## Dubbo Filter Chain
+
+### Provider 端 Filter 链
+
+```
+请求 → Provider Filter Chain → 业务方法 → Provider Filter Chain（反向）
+  ├── timeout          超时控制（Provider 端兜底）
+  ├── activeLimit      并发限制（防过载）
+  ├── executeLimit     执行期并发限制
+  ├── tps              TPS 限流
+  ├── accesslog        访问日志记录
+  ├── generic          泛化调用
+  ├── echo             健康检查（$echo 服务）
+  ├── token            令牌验证（防绕过注册中心）
+  ├── validation       参数校验（JSR 303）
+  └── trace            链路追踪
+```
+
+### Consumer 端 Filter 链
+
+```
+调用 → Consumer Filter Chain → 网络 → Provider
+  ├── cluster          集群容错
+  ├── timeout          超时控制（Consumer 端）
+  ├── retries          重试逻辑
+  ├── loadbalance      负载均衡
+  ├── generic          泛化调用
+  ├── filter           通用过滤器
+  ├── activeLimit      Consumer 端并发限制
+  └── monitor          监控数据采集
+```
+
+### Filter 执行顺序
+
+```java
+// Order 值越小越先执行
+@Activate(group = "provider", order = -10000)
+public class FirstFilter implements Filter { ... }
+
+@Activate(group = "provider", order = 10000)
+public class LastFilter implements Filter { ... }
+
+// 调试：查看实际 Filter 链
+// -Ddubbo.filter.trace=true
+```
+
+## Dubbo Cluster Fault Tolerance
+
+### Failover（失败重试）
+
+```
+Failover = 默认策略，失败自动切换其他实例重试
+
+流程：
+  Consumer 调用 → 选择实例 A → 失败
+  → 自动切换实例 B → 成功 → 返回
+  
+  retries=2 表示最多重试 2 次（共 3 次调用）
+
+注意：
+  重试必须保证幂等（防重复扣款）
+  写操作建议 retries=0（Failfast）
+  
+配置：
+  @DubboService(retries = 2, loadbalance = "random")
+  或 consumer 端：@DubboReference(retries = 2)
+```
+
+### Failfast（快速失败）
+
+```
+Failfast = 调用失败立即报错，不重试
+
+适用：
+  非幂等写操作（创建订单、扣款）
+  数据库唯一约束冲突
+  
+配置：
+  @DubboService(cluster = "failfast")
+```
+
+### Failsafe（失败安全）
+
+```
+Failsafe = 调用失败忽略，只记日志
+
+适用：
+  不重要的旁路操作（日志写入、审计）
+  缓存更新失败不影响主流程
+
+配置：
+  @DubboService(cluster = "failsafe")
+```
+
+### Forking（并行调用）
+
+```
+Forking = 并行调用多个实例，取第一个成功返回
+
+适用：
+  实时性要求极高（如推荐结果）
+  可以用冗余换取成功率
+
+配置：
+  @DubboService(cluster = "forking", forking = 2)
+  # 并行调 2 个实例，第一个成功即返回
+```
+
+## Dubbo Load Balancing Deep
+
+### ConsistentHash 一致性哈希
+
+```
+一致性哈希环：
+  0 ──────────────────── 2^32
+  │                       │
+  Instance A ───────── Instance B
+  │                       │
+  └───────── Instance C ──┘
+
+虚拟节点（解决数据倾斜）：
+  每个真实节点 160 个虚拟节点（均匀分布）
+  增删节点只影响相邻 key（~1/N 的数据迁移）
+
+适用场景：
+  有状态服务（购物车、会话）
+  缓存亲和性（同一用户请求同一实例）
+  数据库连接复用
+```
+
+### LeastActive 最少活跃
+
+```
+LeastActive = 选当前活跃调用最少的实例
+
+原理：
+  每个实例维护 activeCount（活跃请求数）
+  选择 activeCount 最小的实例
+  如果多个实例相同，降级为 Random
+
+适用：
+  请求耗时差异大的场景
+  快实例自动分担更多请求
+  
+配置：
+  @DubboService(loadbalance = "leastactive")
+```
+
+## Dubbo Registry Deep
+
+### Nacos 注册中心
+
+```
+Nacos 作为 Dubbo 注册中心：
+
+注册流程：
+  Provider 启动 → 注册服务实例到 Nacos
+  Consumer 启动 → 订阅服务列表
+  Provider 变更 → Nacos 推送通知 Consumer
+
+心跳机制：
+  Provider → Nacos: 每 5 秒发送心跳
+  Nacos → 检测: 15 秒未收到心跳 → 标记不健康
+  → 30 秒未收到 → 自动摘除
+
+配置：
+  dubbo.registry.address=nacos://nacos-server:8848
+  dubbo.registry.parameters.namespace=dev
+  dubbo.registry.parameters.group=DEFAULT_GROUP
+```
+
+### ZooKeeper 注册中心
+
+```
+ZooKeeper 作为 Dubbo 注册中心：
+
+节点结构：
+  /dubbo
+    └── com.example.UserService
+        ├── providers
+        │   ├── dubbo://host1:20880/com.example.UserService
+        │   └── dubbo://host2:20880/com.example.UserService
+        ├── consumers
+        │   └── consumer://host3/com.example.UserService
+        ├── configurators
+        └── routers
+
+Watch 机制：
+  Consumer watch providers 节点
+  Provider 上下线 → ZK 临时节点变更 → 触发 watch
+  Consumer 重新拉取服务列表
+
+注意：
+  ZK 是 CP 系统（强一致），Nacos 是 AP 系统（高可用）
+  大规模服务注册推荐 Nacos（性能更好）
+```
+
+## Dubbo Triple Protocol Deep
+
+### Triple 协议详解
+
+```
+Triple = Dubbo 3 默认协议，基于 HTTP/2 + Protobuf
+
+帧格式（HTTP/2）：
+  HEADERS 帧: method, path, content-type
+  DATA 帧: Protobuf 二进制 payload
+  END_STREAM: 标记流结束
+
+四种调用模式：
+  1. Unary（一元调用）: Request → Response
+  2. Server Streaming: Request → Stream Response
+  3. Client Streaming: Stream Request → Response
+  4. Bidi Streaming: Stream Request → Stream Response
+
+性能对比：
+  Triple (HTTP/2) vs Dubbo (TCP):
+  吞吐: 差距 < 10%（HTTP/2 多路复用优化）
+  延迟: Triple 略高（HTTP/2 帧开销）
+  跨语言: Triple 天然支持
+  网关穿透: Triple 优于 Dubbo（HTTP/2 友好）
+```
+
+### Triple 在 K8s Ingress
+
+```
+K8s Ingress 配置 Triple：
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  spec:
+    rules:
+      - host: grpc.example.com
+        http:
+          paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: my-dubbo-service
+                  port:
+                    number: 50051
+
+优势：
+  HTTP/2 + TLS 一次握手
+  穿透大多数网关/负载均衡器
+  支持双向流（实时推送）
+```
+
+## Dubbo vs gRPC vs Thrift
+
+| 维度 | Dubbo | gRPC | Thrift |
+|------|-------|------|--------|
+| 序列化 | Hessian2/Protobuf | Protobuf | Thrift Binary |
+| 传输 | TCP/HTTP/2 | HTTP/2 | TCP |
+| 服务治理 | 强（内置） | 弱（需自建） | 弱（需自建） |
+| 负载均衡 | 5种策略 | 需自建 | 需自建 |
+| 跨语言 | Triple 支持 | 原生支持 | 原生支持 |
+| 注册中心 | Nacos/ZK/Consul | 需自建 | 需自建 |
+| 连接模型 | 长连接 + 连接池 | 长连接 | 长连接 |
+| 适用场景 | Java 微服务 + 治理 | 跨语言微服务 | 高性能 RPC |
+
+## Dubbo in Spring Cloud
+
+```java
+// Dubbo + Spring Cloud Alibaba 集成
+@EnableDubbo
+@SpringBootApplication
+public class ProviderApp {
+    public static void main(String[] args) {
+        SpringApplication.run(ProviderApp.class, args);
+    }
+}
+
+// 服务提供者
+@DubboService(version = "1.0", group = "order")
+public class OrderServiceImpl implements OrderService {
+    @Override
+    public Order getOrder(Long orderId) {
+        return orderRepository.findById(orderId);
+    }
+}
+
+// 服务消费者
+@DubboReference(version = "1.0", group = "order",
+                loadbalance = "roundrobin",
+                timeout = 3000,
+                retries = 2)
+private OrderService orderService;
+
+// 配置
+dubbo:
+  registry:
+    address: nacos://nacos-server:8848
+  protocol:
+    name: tri
+    port: 50051
+  scan:
+    base-packages: com.example.service
+```
+
 ## 八、与其他板块的关系
 
 - 源码精读见「[源码系列/Dubbo 源码](../../源码系列/Dubbo源码.md)」；

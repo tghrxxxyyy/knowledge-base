@@ -234,6 +234,415 @@ tolerations:
 
 ---
 
+## Airflow 2.x Scheduler Internals
+
+### Scheduler 架构深度
+
+```
+Airflow 2.x Scheduler 核心组件：
+  ├── DagFileProcessorManager
+  │   ├── 扫描 DAG 目录（min_file_process_interval 控制）
+  │   ├── 多进程解析 DAG 文件（parsing_processes 控制并发）
+  │   └── 生成 DAGBag（解析后的 DAG 对象缓存）
+  ├── DagRunManager
+  │   ├── 按 Timetable 生成 DagRun
+  │   ├── 依赖检查（TaskInstance 状态）
+  │   └── 触发就绪的 TaskInstance
+  ├── TaskInstanceManager
+  │   ├── 分配 TaskInstance 到 Executor
+  │   ├── 状态管理（queued→running→success/failed）
+  │   └── 重试逻辑（retry_delay 控制）
+  └── TriggerManager
+      ├── 管理 deferrable operator 的触发器
+      └── Triggerer 进程处理异步回调
+```
+
+```python
+# Scheduler 调度循环伪代码
+class SchedulerJob:
+    def _do_scheduling(self):
+        # 1. 扫描 DAG 文件 → 解析
+        self.dag_file_processor_manager.start()
+        
+        # 2. 生成 DagRun（按 Timetable）
+        for dag in self.dagbag.dags:
+            runs = self.dag_run_manager.create_dag_runs(dag)
+        
+        # 3. 检查依赖 → 触发 TaskInstance
+        for run in active_runs:
+            for ti in run.task_instances:
+                if ti.are_dependencies_met():
+                    self._enqueue_task_instances(ti)
+        
+        # 4. 分发到 Executor
+        executor.queue_task(task_instances)
+```
+
+### Scheduler 高可用
+
+```
+Airflow 2.x 多 Scheduler：
+  - 多个 SchedulerJob 进程共享 Metadata DB
+  - 通过数据库锁（SELECT FOR UPDATE）协调
+  - 一个 Scheduler 挂了，另一个接管
+  - DAG 文件变更自动感知（多节点扫描同一 DAG 目录）
+
+配置：
+  [scheduler]
+  parsing_processes = 4          # 并行解析进程数
+  min_file_process_interval = 30 # 文件扫描间隔
+  max_tis_per_query = 512        # 单次查询最大 TaskInstance 数
+  scheduler_heartbeat_sec = 5    # 心跳间隔
+```
+
+### DAG Serialization 机制
+
+```
+DAG 序列化 = 将 Python DAG 对象转为可存储格式，避免 Webserver 重新解析
+
+序列化流程：
+  1. Scheduler 解析 DAG 文件 → 生成 DAG 对象
+  2. 序列化为 JSON（dags 表 serialized_dag 字段）
+  3. Webserver 读取序列化结果（无需重新解析）
+  4. DAG 文件变更 → 触发重新序列化
+
+优势：
+  Webserver 启动快（无需扫描 DAG 目录）
+  多 Scheduler 共享序列化结果
+  减少 Webserver 内存占用
+
+配置：
+  [core]
+  min_serialized_dag_fetch_interval = 10  # 序列化刷新间隔
+  max_serialized_dag_size_kb = 2048       # 最大 DAG 序列化大小
+```
+
+## XCom Patterns（任务间数据传递）
+
+### XCom 最佳实践
+
+```python
+# 1. TaskFlow API 自动推送（推荐）
+from airflow.decorators import task
+
+@task
+def extract():
+    data = load_from_source()
+    return data  # 自动推送到 XCom
+
+@task
+def transform(data: dict):
+    result = process(data)
+    return {"key": result}
+
+@task
+def load(data: dict):
+    save(data)
+
+# 2. 手动推送/拉取
+from airflow.models.xcom import BaseXCom
+
+# 推送
+ti.xcom_push(key="result", value={"count": 100})
+# 拉取
+result = ti.xcom_pull(task_ids="extract", key="result")
+
+# 3. 自定义 XCom Backend（大对象存 S3/Redis）
+class S3XCom(BaseXCom):
+    @staticmethod
+    def serialize_value(value):
+        # 上传到 S3，返回 S3 key
+        s3_key = upload_to_s3(value)
+        return s3_key
+    
+    @staticmethod
+    def deserialize_value(result):
+        # 从 S3 下载
+        return download_from_s3(result)
+```
+
+### XCom 限制与替代方案
+
+| 场景 | 方案 | 说明 |
+|------|------|------|
+| 小数据传递 | XCom | 默认后端，< 48KB |
+| 大对象 | 自定义 Backend | S3/GCS/Redis |
+| 跨 DAG 传递 | ExternalTaskSensor + XCom | 通过参数传递 |
+| 文件传递 | OSS/S3 | XCom 只存引用 |
+| 结果缓存 | Variable | 全局配置 |
+
+## TaskFlow API 深入
+
+```python
+from airflow.decorators import dag, task
+from datetime import datetime
+
+@dag(
+    schedule="@daily",
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=["etl"],
+    default_args={"retries": 2, "retry_delay": timedelta(minutes=5)}
+)
+def etl_pipeline():
+    
+    @task
+    def extract():
+        """提取数据"""
+        import pandas as pd
+        df = pd.read_sql("SELECT * FROM orders", conn)
+        return df.to_dict()
+    
+    @task(multiple_outputs=True)
+    def transform(raw_data: dict):
+        """转换数据 - 多输出"""
+        df = pd.DataFrame(raw_data)
+        return {
+            "aggregated": df.groupby("user_id").sum().to_dict(),
+            "filtered": df[df["amount"] > 100].to_dict()
+        }
+    
+    @task
+    def load(transformed: dict):
+        """加载数据"""
+        save_to_db(transformed["aggregated"])
+    
+    @task
+    def notify(aggregated: dict):
+        """通知"""
+        send_email(f"处理 {len(aggregated)} 条记录")
+    
+    # 依赖自动推断
+    raw = extract()
+    agg, filtered = transform(raw)
+    load(agg)
+    notify(agg)
+
+# 调用 DAG 定义
+etl_dag = etl_pipeline()
+```
+
+## Airflow Providers Ecosystem
+
+```
+Airflow Providers 生态（pip install apache-airflow-providers-xxx）：
+
+云平台：
+  ├── providers-amazon (S3/Lambda/Redshift/EMR/EKS)
+  ├── providers-google (GCS/Dataflow/BigQuery/Vertex AI)
+  └── providers-azure (Blob/ADLS/Synapse/Databricks)
+
+数据库：
+  ├── providers-mysql / postgresql / oracle / mssql
+  ├── providers-snowflake / bigquery / redshift
+  └── providers-mongo / elasticsearch
+
+大数据：
+  ├── providers-apache-spark (SparkSubmitOperator)
+  ├── providers-apache-flink (FlinkOperator)
+  ├── providers-apache-hive (HiveOperator)
+  └── providers-apache-kafka (KafkaOperator)
+
+消息/通知：
+  ├── providers-slack (SlackWebhookOperator)
+  ├── providers-microsoft-teams (MsTeamsWebhookOperator)
+  └── providers-sendgrid / pagerduty
+
+运维工具：
+  ├── providers-cncf-kubernetes (KubernetesPodOperator)
+  ├── providers-docker (DockerOperator)
+  └── providers-ssh (SSHHook/SSHOperator)
+```
+
+## Airflow on Kubernetes（KubernetesPodOperator）
+
+```python
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+
+# 每个任务一个 Pod（资源隔离）
+etl_task = KubernetesPodOperator(
+    task_id="etl_job",
+    namespace="airflow",
+    image="my-etl-image:latest",
+    cmds=["python", "etl.py"],
+    arguments=["--date", "{{ ds }}"],
+    env_vars={
+        "DB_HOST": Variable.get("db_host"),
+        "DB_PASS": Variable.get("db_pass", deserialize_json=True)
+    },
+    resources={
+        "request_memory": "1Gi",
+        "request_cpu": "500m",
+        "limit_memory": "4Gi",
+        "limit_cpu": "2"
+    },
+    tolerations=[
+        {"key": "data", "operator": "Equal", "value": "true", "effect": "NoSchedule"}
+    ],
+    node_selector={"node-role": "data-worker"},
+    image_pull_policy="IfNotPresent",
+    get_logs=True,
+    is_delete_operator_pod=True,  # 完成后删除 Pod
+    startup_timeout_seconds=600,
+    # Pod 模板（复用配置）
+    pod_template_file="templates/etl_pod.yaml"
+)
+```
+
+## Airflow vs Prefect vs Dagster
+
+| 维度 | Airflow | Prefect | Dagster |
+|------|---------|---------|---------|
+| 定义方式 | Python DAG | Python Flow | Python Asset/Op |
+| 调度 | 时间驱动 | 事件驱动 | 资产驱动 |
+| 状态管理 | 元数据 DB | Prefect Cloud | Dagit |
+| 调试 | 测试环境 | 本地运行 | 实时预览 |
+| 生态 | 最强（Operators） | 中 | 中 |
+| 学习曲线 | 中 | 低 | 中 |
+| 适用场景 | 数据管道编排 | 数据流编排 | 数据资产开发 |
+
+```python
+# Prefect 示例
+from prefect import flow, task
+
+@task
+def extract():
+    return load_data()
+
+@flow(name="etl-pipeline")
+def etl():
+    data = extract()
+    transformed = transform(data)
+    load(transformed)
+
+# Dagster 示例
+from dagster import op, job
+
+@op
+def extract_op():
+    return load_data()
+
+@job
+def etl_job():
+    data = extract_op()
+    load(transform(transform(data)))
+```
+
+## SLA Miss Handling
+
+```
+SLA（Service Level Agreement）= 任务期望完成时间
+
+配置：
+  SLA missed → 触发回调（邮件/Slack）
+  可设置任务级/DAG 级 SLA
+
+PythonOperator(
+    task_id="sla_task",
+    sla=timedelta(hours=2),  # 2小时内必须完成
+    on_sla_miss_callback=sla_miss_handler,
+    ...
+)
+
+SLA Miss 回调：
+  def sla_miss_handler(dag, task_list, blocking_task_list, 
+                       slas, blocking_tis):
+      # 发送告警
+      send_alert(f"SLA missed for {dag.dag_id}")
+
+监控指标：
+  sla_misses (Prometheus)
+  ti.sla_missed (数据库标记)
+```
+
+## Dynamic DAG Generation
+
+```python
+# 动态生成 DAG（配置驱动）
+import json
+
+with open("dags_config.json") as f:
+    configs = json.load(f)
+
+for config in configs:
+    dag_id = f"etl_{config['name']}"
+    
+    with DAG(
+        dag_id=dag_id,
+        schedule=config["schedule"],
+        start_date=datetime(2024, 1, 1),
+        catchup=False
+    ) as dag:
+        
+        extract = BashOperator(
+            task_id="extract",
+            bash_command=f"python extract.py --source {config['source']}"
+        )
+        
+        transform = PythonOperator(
+            task_id="transform",
+            python_callable=transform_fn,
+            op_kwargs={"config": config}
+        )
+        
+        load = BashOperator(
+            task_id="load",
+            bash_command=f"python load.py --target {config['target']}"
+        )
+        
+        extract >> transform >> load
+    
+    globals()[dag_id] = dag
+```
+
+## Connection Management
+
+```
+Connection 管理：
+  Airflow UI → Admin → Connections
+  或 Variable 存储（Secret Backend）
+
+Hook 封装连接逻辑：
+  MySqlHook → 获取 MySQL 连接
+  S3Hook → 获取 S3 客户端
+  SlackWebhookHook → 获取 Slack 客户端
+
+自定义 Hook：
+  class MyServiceHook(BaseHook):
+      def __init__(self, conn_id):
+          conn = self.get_connection(conn_id)
+          self.host = conn.host
+          self.port = conn.port
+      
+      def get_client(self):
+          return MyServiceClient(self.host, self.port)
+```
+
+## Secrets Backend
+
+```
+Airflow Secrets Backend：
+  敏感信息存外部系统（Vault/AWS Secrets Manager）
+
+配置：
+  [secrets]
+  backend = airflow.providers.hashicorp.secrets.vault.VaultBackend
+  backend_kwargs = {"connections_path": "airflow/connections",
+                    "variables_path": "airflow/variables",
+                    "url": "http://vault:8200",
+                    "token": "s.xxxx"}
+
+使用：
+  conn = BaseHook.get_connection("my_conn")  # 自动从 Vault 读取
+  Variable.get("api_key")  # 自动从 Vault 读取
+
+支持后端：
+  HashiCorp Vault
+  AWS Secrets Manager
+  GCP Secret Manager
+  Azure Key Vault
+```
+
 ## 七、与其他板块的关系
 
 - DolphinScheduler 对比见「[DolphinScheduler](./DolphinScheduler.md)」；

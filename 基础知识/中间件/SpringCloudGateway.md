@@ -365,6 +365,407 @@ spring:
 
 ---
 
+## SCG Predicate Factories Deep
+
+### Predicate 工厂详解
+
+```yaml
+# 路径匹配
+predicates:
+  - Path=/api/orders/**
+  - Path=/api/users/{id}
+
+# Header 匹配
+predicates:
+  - Header=X-Tenant, \d+
+  - Header=X-Request-Id, .+
+
+# Cookie 匹配
+predicates:
+  - Cookie=session, .+
+
+# 方法匹配
+predicates:
+  - Method=GET,POST
+
+# 参数匹配
+predicates:
+  - Query=version, v[12]
+  - Query=debug
+
+# 主机匹配
+predicates:
+  - Host=api.example.com
+  - Host=**.example.com
+
+# 权重匹配（灰度）
+predicates:
+  - Weight=group1, 90  # 90% 流量到 group1
+
+# 时间匹配
+predicates:
+  - After=2024-01-01T00:00:00+08:00
+  - Before=2024-12-31T23:59:59+08:00
+  - Between=2024-01-01T00:00:00+08:00, 2024-12-31T23:59:59+08:00
+
+# RemoteAddr 匹配
+predicates:
+  - RemoteAddr=10.0.0.0/16
+```
+
+### 自定义 Predicate
+
+```java
+@Component
+public class MyPredicateFactory implements PredicateFactory {
+    
+    @Override
+    public Config getConfig() {
+        return new Config();
+    }
+    
+    @Override
+    public Predicate apply(Config config) {
+        return exchange -> {
+            String header = exchange.getRequest().getHeaders()
+                .getFirst(config.getHeaderName());
+            return header != null && header.equals(config.getExpectedValue());
+        };
+    }
+    
+    @Data
+    public static class Config {
+        private String headerName;
+        private String expectedValue;
+    }
+}
+```
+
+## SCG Filter Factories Deep
+
+### 过滤器工厂详解
+
+```yaml
+filters:
+  # 添加请求头
+  - AddRequestHeader=X-From, gateway
+  - AddRequestHeader=X-Trace-Id, #{T(java.util.UUID).randomUUID().toString()}
+
+  # 添加请求参数
+  - AddRequestParameter=version, v1
+
+  # 添加响应头
+  - AddResponseHeader=X-Response-Time, #{T(System.currentTimeMillis())}
+
+  # 重写路径
+  - RewritePath=/api/orders/(?<id>.*), /orders/$1
+
+  # 去掉路径前缀
+  - StripPrefix=2
+
+  # 设置路径
+  - SetPath=/new-path
+
+  # 重试
+  - Retry:
+      retries: 3
+      statuses: BAD_GATEWAY, SERVICE_UNAVAILABLE
+      methods: GET
+      backoff:
+        firstBackoff: 100ms
+        maxBackoff: 5000ms
+        factor: 2
+
+  # 熔断
+  - CircuitBreaker:
+      name: orderCB
+      fallbackUri: forward:/fallback
+      statusCodes: 500, 503
+      fallbackHeaders:
+        - name: X-Fallback-Reason
+          value: Circuit breaker triggered
+```
+
+## SCG Global Filters
+
+```java
+// 全局过滤器 = 对所有路由生效
+@Component
+public class GlobalAuthFilter implements GlobalFilter, Ordered {
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // 获取 Token
+        String token = exchange.getRequest().getHeaders()
+            .getFirst("Authorization");
+        
+        if (token == null || !isValid(token)) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+        
+        // 传递用户信息到下游
+        ServerWebExchange mutated = exchange.mutate()
+            .request(r -> r.headers(h -> 
+                h.set("X-User-Id", extractUserId(token))))
+            .build();
+        
+        return chain.filter(mutated);
+    }
+    
+    @Override
+    public int getOrder() {
+        return -100;  // 优先执行
+    }
+}
+
+// 指标过滤器
+@Component
+public class MetricsFilter implements GlobalFilter, Ordered {
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        long start = System.currentTimeMillis();
+        
+        return chain.filter(exchange)
+            .then(Mono.fromRunnable(() -> {
+                long duration = System.currentTimeMillis() - start;
+                meterRegistry.timer("gateway.request.duration")
+                    .tag("path", exchange.getRequest().getPath().value())
+                    .tag("status", exchange.getResponse().getStatusCode().name())
+                    .record(duration, TimeUnit.MILLISECONDS);
+            }));
+    }
+    
+    @Override
+    public int getOrder() {
+        return -200;  // 最先执行（计时）
+    }
+}
+```
+
+## SCG Custom Filter Development
+
+```java
+// 自定义 GatewayFilter（路由级）
+@Component
+public class MyGatewayFilterFactory 
+        extends AbstractGatewayFilterFactory<MyGatewayFilterFactory.Config> {
+    
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            // 前置处理
+            log.info("Request: {}", exchange.getRequest().getPath());
+            
+            return chain.filter(exchange)
+                .then(Mono.fromRunnable(() -> {
+                    // 后置处理
+                    log.info("Response: {}", exchange.getResponse().getStatusCode());
+                }));
+        };
+    }
+    
+    @Data
+    public static class Config {
+        private boolean enabled = true;
+    }
+}
+
+// 使用：
+// filters:
+//   - MyGateway=true
+```
+
+## SCG Rate Limiting Deep
+
+### Redis + TokenBucket
+
+```yaml
+# 限流配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@ipKeyResolver}"
+```
+
+```java
+// 限流键解析器
+@Bean
+public KeyResolver ipKeyResolver() {
+    return exchange -> Mono.just(
+        exchange.getRequest().getRemoteAddress().getAddress().getHostAddress()
+    );
+}
+
+// Lua 脚本原理：
+// 令牌桶算法：
+//   1. 计算时间差 → 应补充的令牌数
+//   2. 当前令牌数 + 补充令牌 → 不超过桶容量
+//   3. 请求消耗一个令牌
+//   4. 令牌不足 → 返回 429
+
+// Redis Lua 脚本（原子操作）：
+// local tokens = redis.call('get', KEYS[1]) or capacity
+// local last_time = redis.call('get', KEYS[2]) or now
+// local elapsed = now - last_time
+// local new_tokens = math.min(capacity, tokens + elapsed * rate)
+// if new_tokens >= requested then
+//   redis.call('set', KEYS[1], new_tokens - requested)
+//   redis.call('set', KEYS[2], now)
+//   return 1
+// else
+//   return 0
+// end
+```
+
+## SCG Retry
+
+```yaml
+# 重试配置
+filters:
+  - name: Retry
+    args:
+      retries: 3
+      statuses: BAD_GATEWAY, SERVICE_UNAVAILABLE, GATEWAY_TIMEOUT
+      methods: GET, HEAD
+      backoff:
+        firstBackoff: 100ms
+        maxBackoff: 5000ms
+        factor: 2
+        basedOnPreviousValue: false
+
+# 重试策略：
+#   1. 首次失败 → 100ms 后重试
+#   2. 第二次失败 → 200ms 后重试
+#   3. 第三次失败 → 400ms 后重试
+#   4. 最大重试 3 次
+
+# 注意：
+#   只重试幂等操作（GET/HEAD）
+#   写操作需业务保证幂等
+#   重试次数不宜过多（防雪崩）
+```
+
+## SCG WebSocket Support
+
+```yaml
+# WebSocket 路由
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: websocket-route
+          uri: ws://websocket-server:8080
+          predicates:
+            - Path=/ws/**
+          filters:
+            - StripPrefix=1
+
+# 或使用 lb:// 负载均衡
+        - id: websocket-lb
+          uri: lb:ws://websocket-service
+          predicates:
+            - Path=/ws/**
+```
+
+```java
+// WebSocket 处理
+@Component
+public class WebSocketHandler implements WebSocketHandler {
+    
+    @Override
+    public Mono<Void> handle(WebSocketSession session) {
+        return session.receive()
+            .map(msg -> {
+                String payload = msg.getPayloadAsText();
+                // 处理消息
+                return session.textMessage("Echo: " + payload);
+            })
+            .flatMap(session::send);
+    }
+}
+
+// 路由配置
+@Bean
+public RouterFunction<ServerResponse> websocketRoute() {
+    return RouterFunctions.route()
+        .path("/ws", builder -> builder
+            .GET("", websocketHandler()))
+        .build();
+}
+```
+
+## SCG Integration with Consul/Nacos
+
+```yaml
+# Consul 动态路由
+spring:
+  cloud:
+    consul:
+      host: consul
+      port: 8500
+      discovery:
+        enabled: true
+        service-name: ${spring.application.name}
+      config:
+        enabled: true
+        prefix: config
+        default-context: application
+        data-key: gateway-routes.yaml
+
+# Nacos 动态路由
+spring:
+  cloud:
+    nacos:
+      config:
+        server-addr: nacos:8848
+        data-id: gateway-routes.yaml
+        group: DEFAULT_GROUP
+        file-extension: yaml
+        refresh-enabled: true
+```
+
+```java
+// 动态路由刷新
+@Component
+public class DynamicRouteRefresh implements ApplicationEventPublisherAware {
+    
+    @Autowired
+    private RouteDefinitionWriter routeDefinitionWriter;
+    
+    @Autowired
+    private ApplicationEventPublisher publisher;
+    
+    public void refreshRoutes(List<RouteDefinition> routes) {
+        routes.forEach(route -> {
+            routeDefinitionWriter.delete(Mono.just(route.getId()));
+            routeDefinitionWriter.save(Mono.just(route)).subscribe();
+        });
+        publisher.publishEvent(new RefreshRoutesEvent(this));
+    }
+}
+```
+
+## SCG vs Zuul vs Kong Performance
+
+| 维度 | SCG | Zuul 2.x | Kong |
+|------|-----|----------|------|
+| 模型 | WebFlux（非阻塞） | Netty（非阻塞） | OpenResty（非阻塞） |
+| 吞吐 | 高（万级 QPS） | 高 | 最高（十万级 QPS） |
+| 延迟 | 中 | 中 | 低 |
+| 内存 | 中（JVM） | 中（JVM） | 低（C） |
+| 扩展 | Java 生态 | Java 生态 | Lua/Go 插件 |
+| 适用 | Spring 微服务 | Spring 生态 | 跨语言/高性能 |
+
 ## 十、与其他板块的关系
 
 - 网关选型整体见「[API 网关](./API网关.md)」；

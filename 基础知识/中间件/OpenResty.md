@@ -323,6 +323,349 @@ body_filter_by_lua_block {
 
 ---
 
+## OpenResty Lua Module System
+
+### Lua 模块系统
+
+```lua
+-- 模块定义
+local _M = {}
+
+_M.version = "1.0"
+
+function _M.process(request)
+    -- 处理逻辑
+    return {status = 200}
+end
+
+return _M
+
+-- 模块加载
+local mymodule = require "mymodule"
+mymodule.process(ngx.req)
+
+-- 模块路径配置
+lua_package_path "/usr/local/openresty/nginx/lua/?.lua;;";
+lua_package_cpath "/usr/local/openresty/nginx/lua/?.so;;";
+```
+
+### 模块缓存
+
+```lua
+-- 全局模块缓存（worker 级）
+-- 首次 require 后缓存到 package.loaded
+local cached_module = require "mymodule"  -- 第一次加载
+local same_module = require "mymodule"  -- 直接返回缓存
+
+-- 清除缓存（重新加载）
+package.loaded["mymodule"] = nil
+local fresh_module = require "mymodule"
+
+-- 注意：
+-- 模块在 worker 启动时加载一次
+-- 全局变量（模块级）在 worker 间共享
+-- 不要在模块里存请求级数据
+```
+
+## OpenResty Shared Dictionary
+
+### 共享内存字典
+
+```lua
+-- 共享字典 = 跨 worker 进程的共享内存
+lua_shared_dict my_cache 10m;        -- LRU 缓存
+lua_shared_dict rate_limit 5m;       -- 限流计数
+lua_shared_dict lock_dict 1m;        -- 分布式锁
+
+-- 使用示例
+local cache = ngx.shared.my_cache
+
+-- 写入
+cache:set("key", "value", 300)  -- 300秒过期
+cache:add("key", "value", 300)  -- 不存在才写入
+cache:replace("key", "new_value", 300)  -- 存在才替换
+
+-- 读取
+local value, flags = cache:get("key")
+if value then
+    ngx.say("Cache hit: ", value)
+end
+
+-- 删除
+cache:delete("key")
+
+-- 递增（原子操作）
+local new_val, err = cache:incr("counter", 1, 0)
+
+-- 过期回调
+cache:flush_all()  -- 清空所有
+```
+
+### 共享字典限制
+
+```
+限制与注意事项：
+  1. 容量固定（写满报错/拒绝写入）
+  2. 数据在 worker 间共享（无锁竞争需注意）
+  3. 无持久化（重启丢失）
+  4. 不支持复杂数据结构（只存字符串）
+
+容量规划：
+  热点数据量 × 1.5 余量
+  避免过度使用（内存竞争）
+
+调试：
+  查看状态：ngx.shared.my_cache:free_space()
+  监控：hit_rate / miss_rate / evictions
+```
+
+## OpenResty Cosocket (Non-blocking IO)
+
+### Cosocket 原理
+
+```
+cosocket = coroutine + socket（协程非阻塞 IO）
+
+原理：
+  Lua 协程发起 socket 请求
+  → Nginx 事件循环注册事件
+  → 协程挂起（不占线程）
+  → 响应到达 → 协程恢复
+
+优势：
+  代码像同步写（无回调地狱）
+  请求挂起不阻塞 worker（数千并发）
+  
+限制：
+  只能在 rewrite/access/content 等阶段用
+  不能跨 worker
+
+超时配置（必配）：
+  local sock = ngx.socket.tcp()
+  sock:settimeouts(1000, 1000, 1000)  -- connect/send/read
+```
+
+### 连接池
+
+```lua
+-- 连接池 = 复用 TCP 连接（性能关键）
+local red = require "resty.redis"
+local red = red:new()
+
+red:set_timeouts(1000, 1000, 1000)
+
+-- 连接
+local ok, err = red:connect("127.0.0.1", 6379)
+if not ok then
+    ngx.log(ngx.ERR, "connect failed: ", err)
+    return
+end
+
+-- 使用
+red:set("key", "value")
+local val = red:get("key")
+
+-- 归还连接池（重要！）
+red:set_keepalive(10000, 100)  -- 10秒空闲超时，最大100个连接
+
+-- 连接池监控
+local ok, err = red:get_reused_times()
+ngx.log(ngx.INFO, "reused times: ", ok)
+```
+
+## OpenResty Request Handling Phases
+
+### 请求阶段详解
+
+```lua
+-- 1. init_by_lua（进程级，只执行一次）
+init_by_lua_block {
+    -- 加载配置/预热缓存
+    require "init"
+    ngx.log(ngx.INFO, "Nginx initialized")
+}
+
+-- 2. init_worker_by_lua（每个 worker 启动）
+init_worker_by_lua_block {
+    -- 启动后台任务
+    local function heartbeat()
+        while true do
+            ngx.sleep(60)
+            -- 发送心跳
+        end
+    end
+    ngx.timer.at(0, heartbeat)
+}
+
+-- 3. rewrite_by_lua（URL 重写/重定向）
+rewrite_by_lua_block {
+    -- 检查认证
+    local token = ngx.var.http_authorization
+    if not token then
+        return ngx.exit(401)
+    end
+}
+
+-- 4. access_by_lua（访问控制）
+access_by_lua_block {
+    -- 限流
+    local limit_req = require "resty.limit.req"
+    local lim, err = limit_req.new("limit_store", 100, 10)
+    local delay, err = lim:incoming(ngx.var.binary_remote_addr, true)
+    if not delay then
+        return ngx.exit(503)
+    end
+}
+
+-- 5. content_by_lua（内容生成）
+content_by_lua_block {
+    -- 业务逻辑
+    local res = ngx.location.capture("/internal/api")
+    ngx.say(res.body)
+}
+```
+
+## OpenResty in API Gateway
+
+```
+OpenResty API 网关架构：
+
+请求流程：
+  Client → Nginx（OpenResty）
+    → rewrite（路由/鉴权）
+    → access（限流/IP 黑名单）
+    → content（转发/聚合）
+    → header_filter（响应头修改）
+    → body_filter（脱敏/压缩）
+    → log（日志/指标）
+
+功能实现：
+  路由：Lua 读取 Redis 配置（动态路由）
+  鉴权：JWT 校验（lua-resty-jwt）
+  限流：令牌桶（lua-resty-limit）
+  聚合：多次 cosocket 调用后端 → 聚合响应
+  灰度：按 header/参数/比例选版本
+
+对比传统网关：
+  OpenResty：Lua 脚本灵活，性能接近原生 Nginx
+  Kong/APISIX：基于 OpenResty 的产品化网关
+  SCG：Java 生态，响应式模型
+```
+
+## OpenResty vs Nginx+Lua
+
+| 维度 | OpenResty | Nginx+Lua（mod_lua） |
+|------|-----------|----------------------|
+| LuaJIT | 完整 LuaJIT | 旧版 Lua |
+| 并发模型 | 协程（cosocket） | 线程池 |
+| IO | 非阻塞 | 阻塞 |
+| 性能 | 更高 | 中 |
+| 生态 | 丰富（lua-resty-*） | 有限 |
+| 维护 | 活跃 | 慢 |
+
+## OpenResty Rate Limiting
+
+```lua
+-- lua-resty-limit-traffic 限流库
+
+-- 1. 令牌桶（平滑限流）
+local limit_req = require "resty.limit.req"
+local lim, err = limit_req.new("limit_store", 100, 10)  -- rate=100, burst=10
+
+local key = ngx.var.binary_remote_addr
+local delay, err = lim:incoming(key, true)
+if not delay then
+    return ngx.exit(503)  -- 超过限流
+end
+
+if delay > 0 then
+    ngx.sleep(delay)  -- 平滑延迟
+end
+
+-- 2. 漏斗限流
+local limit_traffic = require "resty.limit.traffic"
+local lim, err = limit_traffic.new("limit_store", 100, 200)  -- rate=100, burst=200
+
+-- 3. 连接数限流
+local limit_conn = require "resty.limit.conn"
+local lim, err = limit_conn.new("limit_store", 100, 50)  -- rate=100, burst=50
+```
+
+## OpenResty JWT Validation
+
+```lua
+-- JWT 校验（lua-resty-jwt）
+local jwt = require "resty.jwt"
+
+local function validate_jwt()
+    local auth_header = ngx.var.http_authorization
+    if not auth_header then
+        return nil, "Missing Authorization header"
+    end
+    
+    local token = auth_header:match("Bearer%s+(.+)")
+    if not token then
+        return nil, "Invalid Authorization format"
+    end
+    
+    local jwt_obj = jwt:verify("secret-key", token)
+    if not jwt_obj.verified then
+        return nil, "Invalid JWT: " .. jwt_obj.reason
+    end
+    
+    return jwt_obj.payload, nil
+end
+
+-- 使用
+local payload, err = validate_jwt()
+if err then
+    return ngx.exit(401)
+end
+
+ngx.var.user_id = payload.sub
+```
+
+## OpenResty in WAF
+
+```
+OpenResty WAF（Web Application Firewall）：
+
+功能实现：
+  IP 黑白名单（lua-resty-iputils）
+  SQL 注入检测（正则匹配）
+  XSS 检测（关键词过滤）
+  路径遍历检测（../ 等）
+  请求频率限制（防 CC 攻击）
+
+-- WAF 检测示例
+local function waf_check()
+    local ip = ngx.var.binary_remote_addr
+    
+    -- IP 黑名单
+    if ip_blacklist[ip] then
+        return ngx.exit(403)
+    end
+    
+    -- SQL 注入检测
+    local args = ngx.req.get_uri_args()
+    for _, v in pairs(args) do
+        if ngx.re.find(v, "union.*select|or.*1.*=", "jo") then
+            return ngx.exit(403)
+        end
+    end
+    
+    -- 路径遍历检测
+    if ngx.re.find(ngx.var.uri, "\\.\\./|\\.env|phpmyadmin", "jo") then
+        return ngx.exit(403)
+    end
+end
+
+适用：
+  高性能 WAF（接近原生 Nginx 性能）
+  定制化安全规则
+  API 安全防护
+```
+
 ## 九、与其他板块的关系
 
 - 网关体系见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」与「[Spring Cloud Gateway](./SpringCloudGateway.md)」；

@@ -210,6 +210,329 @@ JVM 参数：
 
 ---
 
+## Cassandra Consistent Hashing（VNode）
+
+### 一致性哈希与虚拟节点
+
+```
+Cassandra 一致性哈希环：
+  Token Range: 0 ──────────── 2^127
+  │                              │
+  Node A (token=100)           Node B (token=500)
+  │                              │
+  └─────── Node C (token=800) ──┘
+
+虚拟节点（VNode）：
+  每个物理节点 → 多个 Token（VNode）
+  默认 256 VNode/节点
+  
+  优势：
+  ├── 数据均匀分布（避免热点）
+  ├── 增删节点影响范围小
+  └── 异构硬件可分配不同 VNode 数
+
+配置：
+  cassandra.yaml:
+    num_tokens: 256           # 每节点 VNode 数
+    allocate_tokens_for_local_replication_factor: 3
+
+扩容流程：
+  1. 新节点加入集群
+  2. Gossip 协议传播新节点信息
+  3. 新节点从相邻节点接收数据（Streaming）
+  4. 旧节点删除已迁移数据
+  5. 集群达到新平衡（无需重启）
+```
+
+## Cassandra Read Path
+
+### 读取路径详解
+
+```
+Client 读取流程：
+  1. Coordinator 收到读请求
+  2. 根据 Partition Key 计算 Token
+  3. 路由到副本节点（按一致性级别）
+  
+  读一致性级别 = 读几个副本
+    ONE: 读 1 个副本（最快，可能脏读）
+    QUORUM: 读 ⌈N/2⌉+1 个副本（强一致）
+    ALL: 读所有副本（最一致，最慢）
+  
+  4. 合并多个副本结果（反熵修复）
+  5. 返回最新数据
+
+反熵修复（Read Repair）：
+  读取时发现副本数据不一致
+  → 自动修复（将最新数据写回过期副本）
+  
+  配置：
+    read_repair_chance: 0.1          # 读修复概率
+    dclocal_read_repair_chance: 0.1  # 本地 DC 读修复
+```
+
+### Bloom Filter 加速
+
+```
+Bloom Filter = 快速判断分区是否存在
+
+原理：
+  写入时：每个 SSTable 的分区键 → N 个哈希函数 → 标记位数组
+  读取时：检查位数组 → 全为 1（可能存在）→ 有 0（一定不存在）
+
+作用：
+  避免不存在的分区键扫描所有 SSTable
+  误判率默认 10%（内存约 10 bytes/key）
+
+配置：
+  bloom_filter_fp_chance: 0.1  # 误判率（越低内存越大）
+```
+
+## Cassandra Write Path
+
+### 写入路径详解
+
+```
+Client 写入流程：
+  1. Coordinator 收到写请求
+  2. 根据 Partition Key 计算 Token
+  3. 路由到副本节点
+
+  写一致性级别 = 需要几个副本确认
+    ONE: 1 个副本确认（最快）
+    QUORUM: ⌈N/2⌉+1 个副本确认
+    ALL: 所有副本确认
+  
+  4. 每个副本节点：
+     ├── 写 Commit Log（WAL，保证持久化）
+     ├── 写 Memtable（内存缓存，写入最快）
+     └── 返回确认
+
+  5. Memtable 满 → Flush 到 SSTable（磁盘）
+  6. 异步 Compaction 合并 SSTable
+
+Commit Log 配置：
+  commitlog_sync: batch          # 每次写入同步
+  commitlog_sync_batch_window_in_ms: 2  # 批量同步窗口
+  commitlog_total_space_in_mb: 8192      # Commit Log 总大小
+```
+
+## SSTable Structure
+
+```
+SSTable（Sorted String Table）= Cassandra 的磁盘存储格式
+
+结构：
+  Data.db     数据文件（实际数据）
+  Index.db    分区索引（Partition Key → 数据位置）
+  Filter.db   布隆过滤器
+  Statistics.db 统计信息
+  Compression.db 压缩信息
+
+特点：
+  只追加不修改（Immutable）
+  按 Partition Key 排序
+  压缩存储（LZ4/Snappy/Zstd）
+  
+读取流程：
+  1. 检查 Bloom Filter → 可能存在
+  2. 查 Index.db → 定位数据位置
+  3. 读 Data.db → 获取数据
+  4. 合并多个 SSTable 结果
+```
+
+## Compaction Strategies Deep
+
+### STCS（SizeTiered Compaction Strategy）
+
+```
+STCS = 按大小合并 SSTable
+
+原理：
+  收集大小相近的 SSTable（4 个以上）
+  合并成更大的 SSTable
+  
+写放大: 低（合并次数少）
+空间放大: 高（合并期间占用额外空间）
+读放大: 高（可能存在重叠数据）
+
+适用场景：
+  写密集（日志/事件流）
+  时序数据（数据按时间追加）
+  数据很少更新
+
+配置：
+  compaction = {'class': 'SizeTieredCompactionStrategy',
+                'min_threshold': 4,
+                'max_threshold': 32}
+```
+
+### LCS（Leveled Compaction Strategy）
+
+```
+LCS = 分层合并，保证层内无重叠
+
+原理：
+  Level 0: SSTable 可重叠（最大 4 个）
+  Level 1: 大小 = 10MB，SSTable 无重叠
+  Level 2: 大小 = 100MB，SSTable 无重叠
+  Level 3: 大小 = 1GB，SSTable 无重叠
+  
+  每层合并：选一个 SSTable + 重叠的 SSTable 合并
+
+写放大: 高（频繁合并）
+空间放大: 低（层内无重叠）
+读放大: 低（每层最多一个 SSTable 包含目标 Key）
+
+适用场景：
+  读密集
+  数据频繁更新
+  对空间敏感
+
+配置：
+  compaction = {'class': 'LeveledCompactionStrategy',
+                'sstable_size_in_mb': 160}
+```
+
+### TWCS（TimeWindowCompaction Strategy）
+
+```
+TWCS = 按时间窗口合并
+
+原理：
+  按时间窗口分组（如 1 小时）
+  窗口内数据 Flush 后不再合并
+  只合并不同窗口的数据（如果时间跨度小）
+  
+写放大: 最低（几乎不合并）
+空间放大: 中（窗口内可能有重叠）
+读放大: 中（需要读多个窗口）
+
+适用场景：
+  时序数据（IoT/监控日志）
+  数据按时间追加且很少更新
+  TTL 自动过期
+
+配置：
+  compaction = {'class': 'TimeWindowCompactionStrategy',
+                'compaction_window_size': 1,
+                'compaction_window_unit': 'HOURS',
+                'unsafe_aggressive_sstable_expiration': true}
+```
+
+## Secondary Indexes
+
+```
+Cassandra 二级索引：
+  在非分区键字段上建索引
+  
+CREATE INDEX idx_status ON orders(status);
+
+限制：
+  索引存储在本地（每个节点只索引本地数据）
+  高基数字段索引效率低（如 user_id）
+  跨分区查询性能差（需要扫描所有节点）
+
+最佳实践：
+  用 SAI（Storage Attached Index）替代传统索引
+  SAI 支持列式存储 + 更好的查询性能
+
+CREATE CUSTOM INDEX idx_status ON orders(status)
+USING 'org.apache.cassandra.index.sai.StorageAttachedIndex';
+```
+
+## Materialized Views
+
+```
+Materialized Views = 自动维护的查询视图
+
+CREATE MATERIALIZED VIEW orders_by_status
+AS SELECT order_id, user_id, status, amount
+FROM orders
+WHERE status IS NOT NULL AND order_id IS NOT NULL
+PRIMARY KEY (status, order_id);
+
+原理：
+  写入 orders 表 → 自动更新 orders_by_status 视图
+  查询 WHERE status = 'PAID' → 走视图（高效）
+
+注意：
+  视图更新是异步的（可能短暂不一致）
+  不支持 UPDATE/DELETE（需通过原表操作）
+  大量视图会影响写性能
+```
+
+## Cassandra Driver Pooling
+
+```java
+// Java Driver 配置
+CqlSession session = CqlSession.builder()
+    .addContactPoint(new InetSocketAddress("10.0.0.1", 9042))
+    .withLocalDatacenter("dc1")
+    .withConfigLoader(DriverConfigLoader.fromString(
+        "advanced.connection.pool.local.size = 10\n" +
+        "advanced.connection.pool.remote.size = 5\n" +
+        "advanced.connection.max-requests-per-connection = 1024\n" +
+        "advanced.connection.connect-timeout = 5s\n" +
+        "advanced.reconnect-on-init = true"
+    ))
+    .build();
+
+连接池策略：
+  每个节点维护 N 个连接（local.size）
+  每个连接最大请求数（max-requests-per-connection）
+  超过限制 → 创建新连接
+  空闲连接自动回收
+```
+
+## Cassandra vs HBase vs ScyllaDB
+
+| 维度 | Cassandra | HBase | ScyllaDB |
+|------|-----------|-------|----------|
+| 架构 | 去中心化（P2P） | 主从（HMaster） | 去中心化（P2P） |
+| 数据模型 | 宽列 | 宽列 | 宽列（CQL 兼容） |
+| 一致性 | 可调（ONE/QUORUM） | 强一致 | 可调（CQL 兼容） |
+| 写性能 | 极高（无锁追加） | 高（LSM-Tree） | 10x+ Cassandra |
+| 读性能 | 中（需分区键） | 高（列族缓存） | 高（C++ 无 GC） |
+| 扩展 | 线性扩展 | Region 拆分 | 线性扩展 |
+| 运维 | 中（P2P 自愈） | 重（HDFS+ZK） | 更简单（C++） |
+| 生态 | 成熟 | 大数据生态 | 兼容 Cassandra |
+| 适用 | 时序/IoT/事件流 | Hadoop 生态 | 高性能 Cassandra 替代 |
+
+## Cassandra in Time-Series
+
+```
+Cassandra + 时序数据：
+
+数据模型设计：
+  CREATE TABLE sensor_data (
+      sensor_id UUID,
+      event_time TIMESTAMP,
+      temperature DOUBLE,
+      humidity DOUBLE,
+      PRIMARY KEY ((sensor_id), event_time)
+  ) WITH CLUSTERING ORDER BY (event_time DESC)
+    AND default_time_to_live = 7776000  -- 90 天 TTL
+    AND compaction = {
+      'class': 'TimeWindowCompactionStrategy',
+      'compaction_window_size': 1,
+      'compaction_window_unit': 'HOURS'
+    };
+
+查询模式：
+  按 sensor_id + 时间范围查询（单分区范围查询）
+  高效：只读一个分区的数据
+
+写入优化：
+  批量写同一 sensor_id（原子性）
+  降低一致性（写 ONE）
+  使用 TWCS（写放大最低）
+
+TTL 自动过期：
+  旧数据自动清理（无需手动删除）
+  TWCS 优化过期数据的清理效率
+```
+
 ## 七、与其他板块的关系
 
 - HBase 对比见「[HBase 列式存储](./HBase列式存储.md)」；

@@ -118,6 +118,323 @@ ORDER BY p2.age DESC
 
 ---
 
+## Neo4j Cypher Query Optimization
+
+### Cypher 查询优化技巧
+
+```cypher
+-- 1. 建索引入口（必须指定标签）
+CREATE INDEX FOR (p:Person) ON (p.name);
+CREATE INDEX FOR (p:Person) ON (p.age);
+CREATE CONSTRAINT FOR (p:Person) REQUIRE p.id IS UNIQUE;
+
+-- 2. 避免全图扫描
+MATCH (n:Person) RETURN n  -- 正确（指定标签）
+MATCH (n) RETURN n         -- 错误（全图扫描）
+
+-- 3. 限制遍历深度
+MATCH (u:User)-[:FRIEND*1..3]->(f:User)  -- 正确（限制深度）
+MATCH (u:User)-[:FRIEND*]->(f:User)      -- 错误（无限遍历）
+
+-- 4. WHERE 条件尽早过滤
+MATCH (p:Person)-[:FRIEND]->(f:Person)
+WHERE p.age > 25 AND f.city = '北京'  -- 前置过滤
+RETURN f.name
+
+-- 5. 使用 EXPLAIN 查看执行计划
+EXPLAIN MATCH (p:Person {name: '张三'})-[:FRIEND]->(f:Person)
+RETURN f.name
+
+-- 执行计划关键指标：
+--   DbHits: 数据库访问次数（越少越好）
+--   Rows: 返回行数
+--   EstimatedRows: 估计行数（CBO）
+```
+
+### 索引类型
+
+```
+Neo4j 索引类型：
+
+1. B-Tree 索引（默认）
+   CREATE INDEX FOR (p:Person) ON (p.name);
+   适用：等值查询、范围查询
+
+2. 全文索引
+   CREATE FULLTEXT INDEX personFulltext FOR (p:Person) ON EACH [p.name, p.bio];
+   MATCH (p:Person)
+   WHERE fulltextIndex = '张三'  -- 全文检索
+   RETURN p.name
+
+3. 空间索引
+   CREATE POINT INDEX locationIndex FOR (l:Location) ON (l.point);
+   MATCH (l:Location)
+   WHERE point.distance(l.point, point({x: 1.0, y: 2.0})) < 1000
+   RETURN l.name
+
+4. 范围索引
+   CREATE RANGE INDEX FOR (p:Person) ON (p.age);
+   优化范围查询性能
+
+选择：
+  等值/范围查询 → B-Tree
+  全文检索 → 全文索引
+  地理位置 → 空间索引
+```
+
+## Neo4j APOC Library
+
+### APOC 核心功能
+
+```cypher
+-- APOC = Awesome Procedures On Cypher（扩展函数库）
+
+-- 1. 数据转换
+CALL apoc.convert.toJson({name: '张三', age: 30});
+CALL apoc.convert.fromJsonList('[{"name":"张三"}]', 'MAP');
+CALL apoc.number.format(1234567.89, '###,###.##');
+
+-- 2. 路径查询
+CALL apoc.path.expand(p, "FRIEND", "Person", 1, 3);
+CALL apoc.path.spanningTree(p, {}, "FRIEND", "Person");
+CALL apoc.algo.dijkstra(p1, p2, "FRIEND", "distance");
+
+-- 3. 并行处理
+CALL apoc.periodic.iterate(
+  "MATCH (p:Person) RETURN p",
+  "SET p.processed = true",
+  {batchSize: 1000, parallel: true}
+);
+
+-- 4. 数据库操作
+CALL apoc.export.csv.all("/data/export.csv");
+CALL apoc.import.csv("/data/import.csv", {skipLines: 1});
+CALL apoc.refactor.rename.type("OLD_TYPE", "NEW_TYPE");
+
+-- 5. 索引管理
+CALL apoc.schema.assert({Person: ['name', 'age']});
+```
+
+## Neo4j Clustering (Core/Read Replicas)
+
+### 因果集群架构
+
+```
+Causal Cluster = Neo4j 高可用方案
+
+Core 节点（Raft 共识）：
+  最少 3 个（奇数）
+  写入通过 Raft 同步
+  保证强一致
+  
+Read Replica（只读副本）：
+  只读扩展（分担读压力）
+  异步复制（最终一致）
+  支持多个
+
+部署：
+  3 Core + 2 Read Replica = 生产配置
+  
+配置：
+  dbms.mode=CORE（Core 节点）
+  dbms.mode=READ_REPLICA（副本节点）
+  causal_clustering.initial_discovery_members=core1:5000,core2:5000,core3:5000
+
+读写分离：
+  写操作 → Core 节点
+  读操作 → Read Replica（就近读）
+  强一致读 → Core 节点
+```
+
+## Neo4j Bloom
+
+```
+Neo4j Bloom = 图可视化探索工具
+
+功能：
+  自然语言搜索（不需要 Cypher 知识）
+  可视化图探索（节点/关系/属性）
+  路径发现（多跳关联）
+  模式匹配（查找相似结构）
+
+使用：
+  1. 打开 Bloom（Neo4j Browser 集成）
+  2. 输入搜索词：张三
+  3. 自动匹配 Person 节点
+  4. 点击节点展开关系
+  5. 发现路径（朋友的朋友）
+
+场景：
+  业务人员自助查询（无需学 Cypher）
+  欺诈团伙可视化（关系网络）
+  知识图谱探索（实体关联）
+```
+
+## Neo4j Fabric (分布式查询)
+
+```
+Fabric = Neo4j 的分布式查询（企业版）
+
+原理：
+  跨多个 Neo4j 实例的联合查询
+  每个实例存储一部分数据
+  Fabric 路由查询到对应实例
+
+配置：
+  fabric.database name: "users"
+  fabric.graph databases: ["users", "orders"]
+  
+使用：
+  USE users
+  MATCH (p:Person) RETURN p.name
+  
+  USE orders
+  MATCH (o:Order) RETURN o.id
+
+场景：
+  数据按域拆分（users/ orders/ products）
+  跨域关联查询（Fabric 路由）
+  
+注意：
+  企业版功能
+  跨实例查询有网络开销
+  需要合理设计数据分布
+```
+
+## Neo4j in Knowledge Graphs
+
+```
+Neo4j 知识图谱应用：
+
+数据模型：
+  实体 = 节点（Entity）
+  关系 = 关系（Relation）
+  属性 = 属性（Property）
+
+示例：
+  (p:Person {name: '张三'})
+  (c:Company {name: '阿里巴巴'})
+  (p)-[:WORKS_AT {since: 2020}]->(c)
+  (p)-[:KNOWS]->(p2:Person {name: '李四'})
+
+查询：
+  // 查找同事关系
+  MATCH (p1:Person)-[:WORKS_AT]->(c:Company)<-[:WORKS_AT]-(p2:Person)
+  WHERE p1 <> p2
+  RETURN p1.name, p2.name, c.name
+
+  // 查找 3 度人脉
+  MATCH (p:Person {name: '张三'})-[:KNOWS*1..3]->(friend:Person)
+  RETURN friend.name
+
+与 LLM 结合：
+  Neo4j 作为知识图谱存储底座
+  LLM 生成 Cypher 查询
+  图数据库返回结构化知识
+  → RAG 增强（实体-关系检索）
+```
+
+## Neo4j vs JanusGraph vs NebulaGraph
+
+| 维度 | Neo4j | JanusGraph | NebulaGraph |
+|------|-------|------------|-------------|
+| 数据模型 | 属性图 | 属性图 | 属性图 |
+| 查询语言 | Cypher | Gremlin | nGQL |
+| 分布式 | 企业版集群 | HBase/Cassandra | 原生分布式（开源） |
+| 超大规模 | 弱（开源版） | 强（依赖后端） | 强（百亿级） |
+| 生态成熟度 | 最高 | 中 | 中 |
+| 许可证 | GPLv3/商业 | Apache 2.0 | Apache 2.0 |
+| 适用场景 | 中小规模/生态优先 | 大规模/多后端 | 超大规模/高性能 |
+
+## Neo4j Performance Tuning
+
+```
+性能调优要点：
+
+1. JVM 调优
+   -Xms4G -Xmx4G（避免动态调整）
+   -XX:+UseG1GC（推荐 G1GC）
+   -XX:MaxGCPauseMillis=200
+
+2. 内存配置
+   dbms.memory.heap.initial_size=4G
+   dbms.memory.heap.max_size=4G
+   dbms.memory.pagecache.size=8G（页缓存，最重要）
+
+3. 查询优化
+   必须建索引（入口查询）
+   限制遍历深度（*1..N）
+   使用参数化查询（缓存命中）
+   减少返回数据量（RETURN 指定字段）
+
+4. 监控
+   CALL dbms.queryJmx("org.neo4j:instance=kernel#0,name=Page cache")
+   -- 检查页缓存命中率（>99%）
+```
+
+## Neo4j Backup/Restore
+
+```bash
+# 备份
+neo4j-admin database dump \
+  --to-path=/backup/neo4j.dump \
+  --database=neo4j
+
+# 恢复
+neo4j-admin database load \
+  --from-path=/backup/neo4j.dump \
+  --database=neo4j
+
+# 在线备份（企业版）
+neo4j-admin backup \
+  --backup-dir=/backup \
+  --from=neo4j://core1:6362
+
+# 恢复
+neo4j-admin restore \
+  --from=/backup/neo4j-2024-01-01 \
+  --database=neo4j
+
+最佳实践：
+  定期备份（每日/每小时）
+  备份到异地（容灾）
+  恢复前停止写入
+```
+
+## Neo4j GDS Library Deep
+
+```
+GDS = Graph Data Science 库（图算法）
+
+中心性算法：
+  CALL gds.pageRank.stream('myGraph')
+  YIELD nodeId, score
+  RETURN gds.util.asNode(nodeId).name, score
+  ORDER BY score DESC LIMIT 10
+
+社区发现：
+  CALL gds.louvain.stream('myGraph')
+  YIELD nodeId, communityId
+  RETURN communityId, count(*) as size
+  ORDER BY size DESC
+
+路径查询：
+  CALL gds.allShortestPaths.stream('myGraph', {
+    sourceNode: gds.util.asNode(0)
+  })
+  YIELD sourceNode, targetNode, distance
+
+相似度：
+  CALL gds.nodeSimilarity.stream('myGraph')
+  YIELD node1, node2, similarity
+  WHERE similarity > 0.5
+
+使用场景：
+  推荐系统（相似度/中心性）
+  反欺诈（社区发现识别团伙）
+  知识图谱推理（路径查询）
+```
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。

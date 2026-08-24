@@ -293,7 +293,321 @@ flowchart TD
 
 ---
 
-## 十、与其他板块的关系
+## MyCat Schema Design Rules
+
+### Schema 设计规则
+
+```xml
+<!-- MyCat Schema 规则 -->
+<schema name="testdb" checkSQLschema="false" sqlMaxLimit="100">
+  <!-- 逻辑库 → 物理库映射 -->
+  <table name="orders" dataNode="dn$1-4" rule="mod-order-id">
+    <!-- 子表（ER 分片） -->
+    <childTable name="order_items" joinKey="order_id" parentKey="id"/>
+  </table>
+  
+  <!-- 全局表（广播到所有分片） -->
+  <table name="dict_region" type="global" dataNode="dn1,dn2,dn3,dn4"/>
+  
+  <!-- 全局表场景：字典表/配置表/地域表 -->
+  <!-- 所有分片都有完整数据，Join 无需跨片 -->
+</schema>
+
+ER 分片设计：
+  主表 + 子表按相同分片键 → 同一物理库
+  orders (order_id) → order_items (order_id)
+  → 避免跨片 Join
+```
+
+### 全局序列方案
+
+```
+MyCat 全局序列 = 分片唯一 ID
+
+方案一：本地文件（性能最高）
+  <sequenceHandler type="io.mycat.server.handler.ServerIncreHandler">
+    <property name="handlerProperties">
+      <!-- 配置文件：sequence_conf.properties -->
+    </property>
+  </sequenceHandler>
+
+方案二：数据库号段（推荐）
+  <sequenceHandler type="io.mycat.server.handler.IncrTimeChainHandler">
+    <property name="bizName">orders</property>
+    <property name="step">1000</property>  <!-- 每次取1000个ID -->
+  </sequenceHandler>
+
+方案三：雪花算法（推荐）
+  <sequenceHandler type="io.mycat.server.handler.SnowflakeIdHandler">
+    <property name="workerId">1</property>     <!-- 工作节点 ID -->
+    <property name="datacenterId">1</property>  <!-- 数据中心 ID -->
+  </sequenceHandler>
+
+选择：
+  性能最高：本地文件（单点风险）
+  生产推荐：数据库号段（高可用）
+  分布式：雪花算法（时钟依赖）
+```
+
+### MyCat Data Sharding Rules
+
+```
+分片规则详解：
+
+1. 取模（Mod）
+   <function name="mod-long" class="io.mycat.route.function.PartitionByMod">
+     <property name="count">4</property>
+   </function>
+   order_id % 4 → 分片 0-3
+   优点：数据均匀
+   缺点：扩容需数据迁移
+
+2. 范围（Range）
+   <function name="range-long" class="io.mycat.route.function.PartitionByRange">
+     <property name="mapFile">partition-range.txt</property>
+   </function>
+   0-1000万 → 分片1，1001-2000万 → 分片2
+   优点：扩容友好
+   缺点：数据不均，可能热点
+
+3. 一致性哈希（ConsistentHash）
+   <function name="consistent-hash" class="io.mycat.route.function.ConsistentHash">
+     <property name="count">4</property>
+   </function>
+   哈希环 + 虚拟节点
+   优点：均匀 + 扩容影响小
+   缺点：实现复杂
+
+4. 枚举（Enum）
+   <function name="enum-sharding" class="io.mycat.route.function.PartitionByFileMap">
+     <property name="mapFile">enum-sharding.txt</property>
+   </function>
+   北京→分片1，上海→分片2
+   适用：按地域/业务维度分片
+```
+
+## Vitess VTGate/VTTablet Architecture
+
+### VTGate 架构
+
+```
+VTGate = 无状态 SQL 网关（类 MySQL）
+
+功能：
+  SQL 解析（MySQL 协议兼容）
+  路由计算（VSchema 驱动）
+  事务协调（2PC）
+  结果合并（排序/聚合/去重）
+  负载均衡（请求分发）
+
+部署：
+  无状态 → 水平扩展
+  多 VTGate 实例 → 无协调开销
+  
+  vtgate -port 3306 \
+    -tablet_health_concurrency=5 \
+    -transaction_mode=SINGLE
+
+配置：
+  VSchema JSON：
+  {
+    "sharded": true,
+    "vindexes": { "hash_vdx": {"type": "hash"} },
+    "tables": {
+      "users": {
+        "column_vindexes": [{"column": "user_id", "name": "hash_vdx"}]
+      }
+    }
+  }
+```
+
+### VTTablet 架构
+
+```
+VTTablet = 每 MySQL 一个边车（Sidecar）
+
+功能：
+  复制管理（主从同步/故障转移）
+  健康检查（上报 VTGate）
+  查询代理（执行 SQL）
+  备份恢复
+
+部署：
+  每个 MySQL 实例一个 VTTablet
+  VTTablet ← MySQL 复制 → MySQL
+  
+  vttablet -port 15100 \
+    -tablet-path=zone1-0000000101 \
+    -init_tablet_type=replica \
+    -health_check_interval=10s
+
+故障转移：
+  主 VTTablet 挂了
+  → VTGate 检测
+  → 选择最优从提升为主
+  → 更新路由
+  → 全程自动（秒级）
+```
+
+## Vitess VStream (CDC)
+
+```
+VStream = Vitess 的 CDC（Change Data Capture）
+
+原理：
+  订阅 MySQL binlog → 转换为 VStream 事件
+  消费者订阅 → 获取实时变更
+
+使用：
+  VStream API：
+  VStream(ctx, "customer@master", nil, "SELECT * FROM customer")
+
+事件类型：
+  INSERT / UPDATE / DELETE
+  GTID（全局事务 ID）
+  TABLE（表结构变更）
+
+应用场景：
+  数据同步（MySQL → ES/Redis）
+  事件驱动架构
+  数据审计
+  
+对比 Kafka Connect：
+  VStream: Vitess 内置，MySQL binlog 直接消费
+  Kafka Connect: 通用，支持多源
+```
+
+## Vitess Resharding
+
+### Vertical Resharding
+
+```
+垂直拆分（合并拆成多个库）：
+
+场景：
+  单库表太多 → 按域拆分
+  
+步骤：
+  1. 创建目标集群（user/ order/ product）
+  2. MoveTables：在线迁移表
+     vtctlclient MoveTables \
+       -source=commerce -tables=customer \
+       customer@commerce
+  3. 验证一致性
+  4. 切换流量（VSchema 更新）
+  5. 清理旧数据
+
+优势：
+  全程不停服
+  数据一致性保证
+```
+
+### Horizontal Resharding
+
+```
+水平拆分（单库拆成多分片）：
+
+场景：
+  单库数据量/压力大 → 按分片键拆分
+
+步骤：
+  1. 定义 VSchema（分片键 + 路由规则）
+  2. SplitClone：后台数据复制（不停服）
+     vtctlclient SplitClone \
+       -chunk_count=10 \
+      commerce/-80,80-
+  3. 增量同步（binlog 持续复制）
+  4. 验证一致性
+  5. 切换路由（VSchema 更新）
+  6. 清理旧分片
+
+对比 MyCat：
+  Vitess: 在线 re-shard（自动）
+  MyCat: 预分片规避（规划 2^n）
+```
+
+## Vitess vs ShardingSphere vs MyCat
+
+| 维度 | Vitess | ShardingSphere | MyCat |
+|------|--------|----------------|-------|
+| 模式 | 代理（透明） | 客户端 SDK | 代理（透明） |
+| 对应用 | MySQL 协议 | 改连接/加依赖 | MySQL 协议 |
+| 分片 | vindex | 规则路由 | 规则路由 |
+| 事务 | 2PC | 强（分布式事务） | XA/弱 |
+| 扩容 | 在线 re-shard | 难 | 预分片 |
+| 运维 | 中（组件多） | 低（嵌入） | 中 |
+| 社区 | CNCF 毕业 | Apache | 国内社区 |
+| 适用 | 超大规模/K8s | Java 微服务 | 存量 MySQL |
+
+## Vitess Operator for K8s
+
+```yaml
+# Vitess Operator 部署
+apiVersion: planetscale.com/v2
+kind: VitessCluster
+metadata:
+  name: vitess
+spec:
+  cells:
+    - name: zone1
+      zone: us-east1-b
+      keyspaces:
+        - name: commerce
+          routingRules:
+            - from: customer
+              to: commerce.customer[0][-80],commerce.customer[80][-]
+          partitionings:
+            - equalParts: 2  # 水平分 2 片
+      mysql:
+        replicas: 2
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "1"
+  
+  vtgate:
+    replicas: 3
+    resources:
+      requests:
+        memory: 512Mi
+  
+ vtctld:
+    replicas: 1
+  
+  vtorc:
+    replicas: 1
+```
+
+## Vitess at YouTube Scale
+
+```
+Vitess 在 YouTube 的应用：
+
+规模：
+  数百万 QPS
+  数十 TB 数据
+  数千分片
+  
+挑战：
+  YouTube 视频元数据（vast 数据量）
+  高并发读写
+  全球多数据中心
+
+Vitess 解决方案：
+  1. 自动分片（水平拆分）
+  2. 在线重分片（不停服扩容）
+  3. 连接池（前端连接数收敛）
+  4. 故障转移（自动主从切换）
+  5. 查询缓存（热点查询加速）
+
+YouTube 贡献：
+  早期 Vitess 核心功能
+  在线重分片（vtctl SplitClone）
+  连接池管理
+  MySQL 兼容性
+```
+
+## 与其他板块的关系
 
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - TiDB（NewSQL）见「[TiDB 与 NewSQL](./TiDB与NewSQL.md)」；

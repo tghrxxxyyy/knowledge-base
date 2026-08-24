@@ -180,6 +180,344 @@ Jaeger Query（查询服务）
 
 ---
 
+## Jaeger Agent/Collector/Query Architecture
+
+### Agent 架构
+
+```
+Jaeger Agent = 边车/SDK 内嵌组件
+
+部署模式：
+  1. Sidecar 模式（K8s 每 Pod 一个 Agent）
+  2. DaemonSet 模式（每节点一个 Agent）
+  3. SDK 内嵌（应用内嵌 Agent）
+
+功能：
+  接收 SDK 发送的 Span（UDP/HTTP）
+  本地批量聚合（减少网络开销）
+  异步转发到 Collector
+  采样策略下发（Remote Sampling）
+
+配置：
+  agent:
+    collector:
+      host: jaeger-collector
+      port: 14267  # HTTP
+      port_grpc: 14250  # gRPC
+    sampling:
+      server_url: http://jaeger-collector:5778
+```
+
+### Collector 架构
+
+```
+Jaeger Collector = 收集器（接收/处理/存储）
+
+组件：
+  ├── Receiver（接收 Span）
+  │   ├── Jaeger Thrift Receiver
+  │   ├── Zipkin Thrift Receiver
+  │   └── OTLP Receiver（推荐）
+  │
+  ├── Processor（处理）
+  │   ├── 采样判断（按策略决定是否存储）
+  │   ├── Span 验证（校验 traceID/spanID）
+  │   └── 丰富（添加 Pod/Node 信息）
+  │
+  └── Writer（写入存储）
+      ├── Cassandra Writer
+      ├── Elasticsearch Writer
+      └── Kafka Writer（异步缓冲）
+
+水平扩展：
+  Collector 无状态 → 多实例水平扩展
+  每个实例独立处理 → 无协调开销
+
+配置：
+  collector:
+    num_workers: 50  # 处理线程数
+    otel:
+      exporter:
+        endpoint: jaeger-collector:4317  # OTLP gRPC
+```
+
+### Query 架构
+
+```
+Jaeger Query = 查询服务
+
+组件：
+  ├── API Server（REST API）
+  │   GET /api/traces/{traceID}
+  │   GET /api/traces?service=xxx&operation=xxx
+  │
+  ├── 依赖图（Service Dependency Graph）
+  │   基于 Span 统计 → 生成服务间调用关系图
+  │
+  └── UI（React 前端）
+      Trace Timeline（时间线视图）
+      Trace Comparison（对比视图）
+      Service Dependency（依赖图）
+
+性能优化：
+  Query 缓存（热点 Trace）
+  读写分离（Query 只读副本）
+  索引优化（按时间/服务/操作建索引）
+```
+
+## Jaeger Sampling Strategies Deep
+
+### 概率采样
+
+```json
+{
+  "service_1": {
+    "default_strategy": {
+      "type": "probabilistic",
+      "param": 0.01  // 1% 采样率
+    },
+    "operation_1": {
+      "type": "probabilistic",
+      "param": 1.0   // 100% 采样（关键接口）
+    }
+  }
+}
+```
+
+### 限速采样
+
+```json
+{
+  "service_1": {
+    "default_strategy": {
+      "type": "rateLimiting",
+      "param": 100  // 每秒最多 100 个 trace
+    }
+  }
+}
+```
+
+### 远程采样
+
+```
+远程采样 = Agent 从 Collector 动态获取采样策略
+
+流程：
+  1. Collector 暴露 /sampling API
+  2. Agent 定时拉取采样策略
+  3. Agent 应用策略到本地
+
+优势：
+  动态调整采样率（无需重启）
+  按服务/操作配置不同采样率
+  
+配置：
+  agent:
+    sampling:
+      server_url: http://jaeger-collector:5778
+      refresh_interval: 60s
+```
+
+## Jaeger OpenTelemetry Integration
+
+```
+OpenTelemetry + Jaeger = 云原生追踪标准
+
+架构：
+  App → OTel SDK → OTLP → OTel Collector → Jaeger
+
+OTel Collector 配置：
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  
+  processors:
+    batch:
+      timeout: 5s
+      send_batch_size: 1000
+    memory_limiter:
+      limit_mib: 512
+      spike_limit_mib: 128
+  
+  exporters:
+    jaeger:
+      endpoint: jaeger-collector:14250
+      tls:
+        insecure: true
+
+部署（K8s）：
+  OTel Collector DaemonSet → 接收所有 Pod 的 OTLP
+  → 处理（采样/批量）→ 导出到 Jaeger
+```
+
+## Jaeger in Kubernetes
+
+```yaml
+# Jaeger Operator 部署
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: production
+spec:
+  strategy: production
+  collector:
+    replicas: 3
+    resources:
+      limits:
+        memory: 2Gi
+        cpu: "1"
+  storage:
+    type: elasticsearch
+    options:
+      es:
+        server-urls: http://elasticsearch:9200
+        index-prefix: jaeger
+  query:
+    replicas: 2
+    options:
+      query:
+        base-path: /jaeger
+  agent:
+    strategy: DaemonSet  # 每节点一个 Agent
+```
+
+## Jaeger vs Zipkin vs Tempo
+
+| 维度 | Jaeger | Zipkin | Tempo |
+|------|--------|--------|-------|
+| CNCF 状态 | 毕业 | 无 | 孵化 |
+| 定位 | 追踪后端 | 追踪后端 | 追踪后端 |
+| 采集协议 | OTLP/Zipkin | Zipkin | OTLP |
+| 存储 | ES/Cassandra/Kafka | ES/Cassandra/内存 | 对象存储（S3） |
+| 成本 | 中 | 低 | 最低（对象存储） |
+| 查询 | 强（依赖图） | 中 | 中（TraceQL） |
+| 日志关联 | 需配置 | 需配置 | 原生（Loki） |
+| 适用 | 云原生追踪 | 轻量追踪 | Grafana 生态 |
+
+## Jaeger Storage Backends Deep
+
+### Cassandra 存储
+
+```
+Cassandra 存储配置：
+  SPAN_STORAGE_TYPE=cassandra
+  CASSANDRA_SERVERS=cassandra:9042
+  CASSANDRA_KEYSPACE=jaeger
+  CASSANDRA一致性=LOCAL_QUORUM
+  
+  表结构：
+    traces (trace_id, span)
+    service_name_index (service_name, trace_id, span_id)
+    operation_name_index (operation_name, trace_id)
+    
+优势：
+  写入吞吐高
+  线性扩展
+  适合大规模生产
+```
+
+### Elasticsearch 存储
+
+```
+ES 存储配置：
+  SPAN_STORAGE_TYPE=elasticsearch
+  ES_SERVER_URLS=http://elasticsearch:9200
+  ES_INDEX_PREFIX=jaeger
+  ES_INDEX_SHARDS=5
+  ES_INDEX_REPLICAS=1
+  
+索引策略：
+  按天滚动索引：jaeger-span-2024-01-01
+  ILM 策略：热→温→冷→删除
+  
+查询优化：
+  按服务+操作建索引
+  按时间范围查询（跳过无关索引）
+```
+
+## Jaeger Data Model
+
+```
+Jaeger 数据模型：
+
+Trace:
+  traceId: 128-bit 唯一标识
+  spans: [Span 列表]
+  processes: [Process 信息]
+
+Span:
+  spanId: 64-bit 唯一标识
+  parentSpanId: 父 Span（可选）
+  operationName: 操作名
+  startTime: 开始时间（微秒）
+  duration: 持续时间（微秒）
+  tags: {key: value} 标签
+  logs: [{timestamp, fields}] 时间线日志
+  references: [Span 引用关系]
+
+Process:
+  serviceName: 服务名
+  tags: {host, ip, version...}
+
+存储格式：
+  JSON（ES）/ 二进制（Cassandra）
+```
+
+## Jaeger Dependency Graph
+
+```
+依赖图生成：
+
+数据源：Span 的 parentSpanID → 调用关系
+  Service A (Client) → Service B (Server)
+  → 统计调用次数、延迟、错误率
+
+生成流程：
+  1. Collector 收集所有 Span
+  2. 按 service + operation 聚合
+  3. 构建有向图（A → B 权重=调用次数）
+  4. Query API 暴露给 UI
+
+查询：
+  GET /api/dependencies?startTs=xxx&endTs=xxx
+  
+UI 展示：
+  节点 = 服务
+  边 = 调用关系（粗细=调用次数）
+  颜色 = 错误率
+```
+
+## Jaeger Rollup Metrics
+
+```
+Jaeger 指标（Prometheus）：
+
+Collector 指标：
+  jaeger_collector_spans_received_total      # 收到的 Span 数
+  jaeger_collector_spans_dropped_total       # 丢弃的 Span 数
+  jaeger_collector_spans_saved_by_service    # 按服务统计
+  jaeger_collector_batch_size                # 批量大小
+  jaeger_collector_queue_size                # 队列大小
+
+Query 指标：
+  jaeger_query_latency_seconds              # 查询延迟
+  jaeger_query_requests_total               # 查询请求数
+  jaeger_query_traces_total                 # 查询的 Trace 数
+
+存储指标：
+  jaeger_storage_operations_total           # 存储操作数
+  jaeger_storage_errors_total               # 存储错误数
+
+告警规则：
+  - jaeger_collector_spans_dropped_total > 0  → 存储过载
+  - jaeger_query_latency_seconds > 5          → 查询慢
+  - jaeger_collector_queue_size > 10000       → 队列积压
+```
+
 ## 七、与其他板块的关系
 
 - 链路追踪原理（SkyWalking）见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；
