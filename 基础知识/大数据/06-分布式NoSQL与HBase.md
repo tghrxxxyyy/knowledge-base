@@ -332,7 +332,275 @@ flowchart TD
 
 ---
 
-## 十三、与其他板块的关系
+## 十三、HBase Compaction 深入
+
+### 13.1 Minor Compaction
+
+```
+触发条件：
+  HFile 数量超过 hbase.hstore.compactionThreshold（默认 3）
+  
+过程：
+  1. 选择要合并的 HFile（按大小排序）
+  2. 读取多个 HFile → 合并写入新 HFile
+  3. 删除旧 HFile
+
+注意：
+  不清理过期数据/删除标记
+  只减少文件数量，不释放空间
+  IO 相对较小
+```
+
+### 13.2 Major Compaction
+
+```
+触发条件：
+  定时触发（hbase.hregion.majorcompaction，默认 7 天）
+  手动触发（major_compact 命令）
+  HFile 数量超过阈值
+
+过程：
+  全量合并所有 HFile → 一个 HFile
+  清理过期版本（TTL/最大版本数）
+  清理删除标记（Delete Marker）
+  释放磁盘空间
+
+注意：
+  IO 非常大（全量读写）
+  必须在低峰期调度
+  生产环境每周/每月定时触发
+```
+
+### 13.3 Compaction 调优
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `hbase.hstore.compactionThreshold` | 3 | Minor 触发阈值 |
+| `hbase.hstore.compactionMax` | 10 | 单次 Minor 最大合并数 |
+| `hbase.hregion.majorcompaction` | 604800000ms (7天) | Major 自动触发间隔 |
+| `hbase.hstore.blockingStoreFiles` | 16 | 阻塞写入的文件数阈值 |
+
+## 十四、HBase Region 热点深入
+
+### 14.1 热点产生原因
+
+```
+热点 = 某个 RegionServer 承受远超其他节点的读写压力
+
+常见原因：
+  ① RowKey 纯时间戳/递增 ID → 所有写入落末台 Region
+  ② 热点 Key（如明星用户、热门商品）
+  ③ Region 分裂不均匀
+  ④ 预分区不合理
+```
+
+### 14.2 热点检测与治理
+
+```bash
+# 检测热点 Region
+# HBase Web UI → Region Server → Request Statistics
+# 关注 StoreFile size / Request count 不均匀
+
+# 检测 Region 分布
+hbase shell
+> status 'simple'
+> balancer_switch true  # 开启自动均衡
+```
+
+| 治理手段 | 做法 |
+|----------|------|
+| 加盐 | RowKey 前缀加 hash 打散 |
+| 预分区 | 建表时预切分 Region |
+| 读写分离 | 热点数据走 Redis 缓存 |
+| 限流 | 单 Region 限流保护 |
+
+## 十五、HBase Bloom Filter 深入
+
+### 15.1 Bloom Filter 类型
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| ROW | 按 RowKey 过滤 | 点查（get） |
+| ROWCOL | 按 RowKey + Column 过滤 | 点查指定列 |
+| ROWPREFIX | 按 RowKey 前缀过滤 | 前缀扫描 |
+
+### 15.2 Bloom Filter 原理
+
+```
+Bloom Filter = 概率型数据结构，判断"元素可能存在或一定不存在"
+
+写入时：
+  对 RowKey 做 N 次哈希 → 在位数组中标记对应位置
+
+读取时：
+  对 RowKey 做 N 次哈希 → 检查位数组
+  如果所有位都为 1 → 元素可能存在（假阳性）
+  如果任一位为 0 → 元素一定不存在
+
+配置：
+  NONE：不使用（默认）
+  ROW：RowKey 级别过滤
+  ROWCOL：RowKey + Column 级别过滤
+```
+
+## 十六、HBase Bulk Loading（HFile）
+
+### 16.1 原理
+
+```
+Bulk Loading = 绕过 RegionServer 直接生成 HFile 写入 HDFS
+
+流程：
+  1. MapReduce/Spark 生成 HFile（HFileOutputFormat2）
+  2. 用 LoadIncrementalHFiles 工具加载到 HBase
+  3. RegionServer 将 HFile 分配到对应 Region
+
+优势：
+  避免 RegionServer 写入压力
+  大批量数据导入速度极快
+  不触发 Compaction
+```
+
+### 16.2 使用场景
+
+| 场景 | 说明 |
+|------|------|
+| 首次数据迁移 | 从关系库/Hive 大批量导入 |
+| 离线批量更新 | Spark 生成 HFile 批量导入 |
+| 数据恢复 | 从备份恢复数据 |
+
+## 十七、HBase Coprocessor
+
+### 17.1 类型
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| Observer | 拦截写操作（类似触发器） | 二级索引、审计 |
+| Endpoint | 类似存储过程，服务端执行 | 聚合下推 |
+| Access Controller | 权限控制 | 行级/列级权限 |
+
+### 17.2 Observer 示例
+
+```java
+// Observer：写入时自动维护二级索引
+public class IndexObserver extends BaseRegionObserver {
+  @Override
+  public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                     Put put, WALEdit edit, Durability durability) {
+    // 从原始 Put 中提取索引列
+    byte[] name = put.getValue(Bytes.toBytes("info"), Bytes.toBytes("name"));
+    if (name != null) {
+      // 构造索引 Put
+      Put indexPut = new Put(name);
+      indexPut.addColumn(Bytes.toBytes("idx"), Bytes.toBytes("rowkey"),
+                         put.getRow());
+      // 写入索引表
+      e.getEnvironment().getTable().put(indexPut);
+    }
+  }
+}
+```
+
+## 十八、HBase 在 IoT 场景
+
+### 18.1 IoT 数据特点
+
+| 特点 | 影响 |
+|------|------|
+| 写多读少 | LSM 写优化适合 |
+| 时序数据 | RowKey = deviceId + timestamp |
+| 数据量大 | HBase 水平扩展 |
+| 低延迟读取 | 按 RowKey 毫秒读写 |
+
+### 18.2 IoT RowKey 设计
+
+```
+RowKey = reverse(deviceId) + timestamp
+
+反转 deviceId：避免热点（设备 ID 可能有公共前缀）
+时间戳倒序：近期数据在前，支持范围查询
+
+示例：
+  deviceId: sensor-001 → reversed: 100-rosesn
+  timestamp: 20260824100000 → reversed: 0000001420260824
+  
+  RowKey: 100-rosesn0000001420260824
+```
+
+## 十九、HBase 监控与调优
+
+### 19.1 关键监控指标
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| Region 数量 | > 10000/集群 | ZK 压力大 |
+| Region 不均衡度 | > 20% | 需要手动均衡 |
+| StoreFile 大小 | > 10GB | 需要 Major Compaction |
+| GC 暂停时间 | > 1s | 调整内存配置 |
+| BlockCache 命中率 | < 80% | 增大 BlockCache |
+| MemStore 大小 | > 128MB | 调整 flush 阈值 |
+
+### 19.2 内存分配建议
+
+```
+读多写少：
+  BlockCache: 40%+（hfile.block.cache.size=0.45）
+  MemStore: 30%（hbase.regionserver.global.memstore.size=0.3）
+
+写多读少：
+  BlockCache: 30%
+  MemStore: 40%+（hbase.regionserver.global.memstore.size=0.45）
+```
+
+## 二十、HBase vs Cassandra 深度对比
+
+| 维度 | HBase | Cassandra |
+|------|-------|-----------|
+| 架构 | HDFS + ZK + HMaster | 纯 P2P（无单点） |
+| 一致性 | 强一致（单 master 行锁） | 最终一致（可调） |
+| 多数据中心 | 弱 | **强**（跨 DC 复制） |
+| 运维复杂度 | 重（组件多） | 轻（去中心化） |
+| 写吞吐 | 高 | **极高** |
+| 读性能 | 按 key 毫秒 | 需调一致性级别 |
+| 数据模型 | 列式宽表 | 宽表 |
+| 分区策略 | RowKey 范围分区 | Hash 分区 |
+| Compaction | Minor/Major | STCS/LCS |
+| 适用 | 单集群海量宽表 | 跨机房海量写 |
+
+```
+选型决策：
+  强一致 + 已有 Hadoop 生态 → HBase
+  多活跨机房 + 极简运维 → Cassandra
+  时序数据 + IoT → HBase（时间倒序 RowKey）
+  社交 Feed + 高写 → Cassandra
+```
+
+## 二十一、NoSQL 选型决策树
+
+```mermaid
+flowchart TD
+    A{需要什么能力?} -->|海量宽表+强一致| B[HBase]
+    A -->|海量写+跨机房| C[Cassandra]
+    A -->|内存KV+微秒| D[Redis]
+    A -->|灵活文档| E[MongoDB]
+    A -->|全文检索| F[Elasticsearch]
+    A -->|图关系| G[Neo4j]
+    A -->|时序数据| H[InfluxDB/TDengine]
+    A -->|向量检索| I[Milvus/Weaviate]
+```
+
+## 二十二、设计 Checklist
+
+- [ ] RowKey 必须防热点（加盐/哈希）+ 贴合查询（组合键）。
+- [ ] 列族不宜多（1~3 个），避免跨 CF 读放大。
+- [ ] 设合理 TTL 与最大版本数，防无限增长。
+- [ ] 配置 BlockCache 与 MemStore 比例（读多/写多不同调优）。
+- [ ] 规划预分区，避免上线后频繁分裂。
+- [ ] 定时 major compaction，监控 Region 均衡与 RS GC。
+- [ ] 大集群控制 Region 总数（避免 ZK 压力）。
+- [ ] 二级索引按需（Phoenix/ES），权衡写放大。
+
+## 二十三、与其他板块的关系
 
 - HDFS 基础见「[04-分布式存储与HDFS](04-分布式存储与HDFS.md)」；
 - 宽列存储对比见「[中间件/Cassandra与宽列存储](../中间件/Cassandra与宽列存储.md)」；

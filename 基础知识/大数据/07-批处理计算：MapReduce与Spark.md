@@ -350,7 +350,198 @@ Metastore（HMS）：存表结构、分区、列信息（大数据元数据枢�
 
 ---
 
-## 十二、与其他板块的关系
+## 十二、Spark Shuffle 深入原理
+
+### 12.1 Sort Shuffle 写入流程
+
+```
+Spark Sort Shuffle（默认）：
+  1. 每个 Task 写入内存缓冲（spark.shuffle.file.buffer，默认 32KB）
+  2. 内存满 → 排序后溢出到磁盘文件（按分区排序）
+  3. 合并（merge）多个溢出文件 → 一个分区一个文件
+  4. 写索引文件（记录每个分区在数据文件中的 offset）
+
+关键参数：
+  spark.shuffle.spill.numElementsForceSpillThreshold
+    → 内存中元素数超阈值强制溢出（防 OOM）
+```
+
+### 12.2 Tungsten Shuffle
+
+```
+Tungsten（钨丝）优化：
+  堆外内存直接写入（避免 GC）
+  二进制排序（Unsafe.sort）
+  零拷贝序列化（ مباشرة写入磁盘）
+
+配置：
+  spark.shuffle.spill.compress=true（压缩溢出文件）
+  spark.io.compression.codec=lz4/zstd
+```
+
+### 12.3 Shuffle 优化参数
+
+| 参数 | 默认值 | 建议 | 说明 |
+|------|--------|------|------|
+| `spark.sql.shuffle.partitions` | 200 | 按数据量调（2000+） | Shuffle 分区数 |
+| `spark.shuffle.file.buffer` | 32KB | 64KB~128KB | 写缓冲 |
+| `spark.reducer.maxSizeInFlight` | 48MB | 96MB | 读并发 |
+| `spark.shuffle.compress` | true | true | 压缩 |
+| `spark.shuffle.sort.bypassMergeThreshold` | 400 | 按需调 | 短路排序阈值 |
+
+## 十三、Spark 内存管理深入
+
+### 13.1 统一内存管理（Unified Memory）
+
+```
+Spark 3.x Unified Memory：
+  Storage（缓存 RDD/DataFrame）和 Execution（Shuffle/Join）动态共享
+  
+  Storage 优先级 < Execution（Execution 可以"借用" Storage）
+  Storage 借用 Execution 时会触发 eviction（驱逐缓存数据）
+  
+  spark.memory.fraction = 0.6（可用内存占堆的 60%）
+  spark.memory.storageFraction = 0.5（Storage 初始占比 50%）
+```
+
+### 13.2 堆外内存（Off-Heap）
+
+```
+堆外内存优势：
+  不受 GC 管理，减少 GC 停顿
+  内存直接由 OS 管理
+  适合大状态/大 Shuffle
+
+配置：
+  spark.memory.offHeap.enabled=true
+  spark.memory.offHeap.size=4g
+  
+注意：
+  堆外内存不计入 -Xmx
+  需额外预留内存给堆外
+  spark.kubernetes.memoryOverhead 需包含堆外
+```
+
+## 十四、Spark Speculative Execution
+
+### 14.1 原理
+
+```
+推测执行 = 对"慢节点"启动备份任务，先完成的结果生效
+
+检测条件：
+  Task 运行时间 > 1.5 × 中位数
+  且失败次数 < spark.speculative.maxFailedTasks
+
+配置：
+  spark.speculation.enabled=true
+  spark.speculation.multiplier=1.5
+  spark.speculation.quantile=0.75
+```
+
+### 14.2 适用与限制
+
+| 适用 | 不适用 |
+|------|--------|
+| 非确定性计算（网络抖动） | 有状态计算（幂等性不确定） |
+| 外部服务调用慢 | 写操作（可能双写） |
+| 纯 CPU 计算受节点性能影响 | 依赖外部锁的操作 |
+
+## 十五、Spark 数据倾斜治理
+
+### 15.1 倾斜检测
+
+```scala
+// 检测数据倾斜
+df.groupBy("key").count().orderBy(desc("count")).show(20)
+// 看是否有某些 key 数量远超其他
+```
+
+### 15.2 治理方案
+
+| 方案 | 做法 | 适用 |
+|------|------|------|
+| 两阶段聚合 | 先加盐聚合，再去盐聚合 | Group By 倾斜 |
+| 广播小表 | `broadcast(hint)` 避免 Shuffle | Join 倾斜 |
+| AQE 自动处理 | Spark 3+ 自动加盐 | 通用 |
+| 隔离热点 Key | 单独处理热点，再 Union | 热点 Key 有限 |
+| 重分区 | 按倾斜 Key 手动分区 | 预知倾斜 Key |
+
+```scala
+// 两阶段聚合
+val salted = df.withColumn("salt", (rand() * 10).cast("int"))
+val partial = salted.groupBy("key", "salt").agg(sum("amount").as("partial_sum"))
+val result = partial.groupBy("key").agg(sum("partial_sum").as("total"))
+
+// 广播 Join
+val result = df1.join(broadcast(df2), "key")
+```
+
+## 十六、Spark on YARN vs Kubernetes
+
+| 维度 | Spark on YARN | Spark on K8s |
+|------|---------------|--------------|
+| 资源管理 | YARN ResourceManager | K8s Scheduler |
+| 动态分配 | YARN Container 动态申请 | K8s Pod 动态扩缩 |
+| 状态管理 | 依赖 YARN | 状态外置对象存储 |
+| 弹性 | 弱（队列静态） | 强（HPA/KEDA） |
+| 运维 | Hadoop 运维 | K8s 运维 |
+| 存算分离 | 耦合 | 分离 |
+
+```bash
+# Spark on K8s 提交
+spark-submit \
+  --master k8s://https://k8s:6443 \
+  --deploy-mode cluster \
+  --conf spark.kubernetes.container.image=spark:3.5 \
+  --conf spark.kubernetes.namespace=spark-jobs \
+  --num-executors 10 \
+  --executor-memory 4g \
+  --executor-cores 2 \
+  local:///opt/spark/examples/jars/spark-examples.jar
+```
+
+## 十七、Spark Dynamic Allocation
+
+### 17.1 原理
+
+```
+动态分配 = 按需增减 Executor
+
+触发扩容：
+  待处理 Task 数 > 已有 Executor × spark.dynamicAllocation.executorIdleTimeout
+
+触发缩容：
+  Executor 空闲时间 > spark.dynamicAllocation.executorIdleTimeout
+
+配置：
+  spark.dynamicAllocation.enabled=true
+  spark.dynamicAllocation.minExecutors=2
+  spark.dynamicAllocation.maxExecutors=20
+  spark.dynamicAllocation.executorIdleTimeout=60s
+  spark.shuffle.service.enabled=true（外部 Shuffle 服务）
+```
+
+## 十八、Spark vs Presto/Trino 对比
+
+| 维度 | Spark | Presto/Trino |
+|------|-------|--------------|
+| 定位 | 批处理（ETL） | 交互式查询（OLAP） |
+| 延迟 | 分钟~小时 | 秒~分钟 |
+| 状态 | 有状态（Shuffle） | 无状态 |
+| 容错 | 血缘重算 | 无（查询失败重试） |
+| 数据量 | PB 级 | TB~PB |
+| SQL 完整性 | DataFrame/SQL | 纯 SQL |
+| 适用 | ETL/数据清洗/ML | 即席查询/BI |
+
+```
+选型口诀：
+  批处理 ETL → Spark
+  即席查询 BI → Presto/Trino
+  两者互补（ETL 用 Spark 产出宽表，查询用 Presto/Trino）
+```
+
+## 十九、与其他板块的关系
 
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；
 - 文件格式/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；

@@ -201,7 +201,313 @@ esMapping:
 22. **选型建议？** MySQL 实时同步到缓存/ES/数仓 → Canal；多数据源/流处理/更强一致性 → Flink CDC；纯离线 → DataX。
 
 ---
-## 十、与其他板块的关系
+## 十、Canal 架构深入（Adapter/Deployer/Admin）
+
+### 10.1 Canal Server（Deployer）
+
+```
+Canal Deployer 架构：
+  启动 → 加载 instance 配置
+  → 连接 MySQL Master（dump 协议）
+  → 解析 binlog → 投递到内存队列
+  → Client/MQ 消费
+
+核心组件：
+  CanalServer：主进程，管理多个 Instance
+  Instance：一个同步实例（对应一个 MySQL）
+  MemoryEventStore：内存事件存储
+  CanalMetrics：监控指标
+```
+
+### 10.2 Canal Adapter
+
+```
+Canal Adapter 类型：
+  ES Adapter：写 Elasticsearch
+  HBase Adapter：写 HBase
+  RDB Adapter：写关系数据库（MySQL/PG）
+  MQ Adapter：投递到消息队列
+  Custom Adapter：自定义适配器
+
+Adapter 配置：
+  dataSourceKey：数据源
+  destination：实例名
+  groupId：消费组
+  esMapping/rdbMapping：映射配置
+```
+
+### 10.3 Canal Admin
+
+```
+Canal Admin 功能：
+  实例管理：创建/删除/启停实例
+  配置管理：修改 instance 配置
+  监控查看：指标/日志/状态
+  集群管理：多 Server 管理
+  权限管理：用户/角色/权限
+
+部署方式：
+  Docker：canal-admin:latest
+  K8s：canal-operator
+```
+
+---
+
+## 十一、Canal 高可用深入（ZooKeeper）
+
+### 11.1 ZK 选主原理
+
+```
+Canal HA + ZK：
+  多 Canal Server 启动
+  → 在 ZK 创建临时节点（/ canal/cluster/ instances/ {instance}/ running）
+  → 第一个创建成功的成为 Leader
+  → 其他成为 Follower
+  → Leader 故障 → 临时节点删除 → Follower 选举
+
+选主流程：
+  1. 尝试创建 /running 节点
+  2. 成功 → Leader
+  3. 失败 → Watch 该节点
+  4. 节点删除 → 重新选举
+```
+
+### 11.2 HA 配置
+
+```properties
+# canal.properties
+canal.instance.global.spring.xml = classpath:spring/file-instance.xml
+
+# instance.properties
+canal.instance.tsdb.enable = true
+canal.instance.tsdb.url = jdbc:mysql://127.0.0.1:3306/canal_tsdb
+canal.instance.tsdb.dbUsername = canal
+canal.instance.tsdb.dbPassword = canal
+
+# ZK 配置
+canal.zkServers = zk1:2181,zk2:2181,zk3:2181
+canal.instance.tsdb.spring.xml = classpath:spring/tsdb/h2-tsdb.xml
+```
+
+---
+
+## 十二、Canal 消息格式（FlatMessage vs Protobuf）
+
+### 12.1 消息格式对比
+
+| 格式 | 说明 | 适用 |
+|------|------|------|
+| Protobuf | 二进制格式，高效 | Java 客户端 |
+| FlatMessage | JSON 格式，可读 | 多语言/调试 |
+
+### 12.2 FlatMessage 示例
+
+```json
+{
+  "database": "test",
+  "table": "user",
+  "type": "UPDATE",
+  "ts": 1678901234567,
+  "sql": "",
+  "data": [
+    {
+      "id": 1,
+      "name": "张三",
+      "age": 25
+    }
+  ],
+  "old": [
+    {
+      "name": "张三",
+      "age": 24
+    }
+  ]
+}
+```
+
+### 12.3 配置选择
+
+```properties
+# canal.properties
+canal.mq.flatMessage = true  # 使用 FlatMessage
+# false 使用 Protobuf（Java 客户端推荐）
+```
+
+---
+
+## 十三、Canal 按库/表过滤
+
+### 13.1 过滤规则
+
+```properties
+# instance.properties
+# 按库过滤
+canal.instance.filter.regex = test\\.user.*,test\\.order.*
+
+# 按表过滤
+canal.instance.filter.black.regex = test\\.user_log.*
+
+# 按字段过滤
+canal.instance.filter.field.regex = id,name
+```
+
+### 13.2 过滤最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 精确过滤 | 只监听需要的库/表 |
+| 黑名单 | 排除不需要的表 |
+| 字段过滤 | 只同步需要的字段 |
+| 正则优化 | 避免复杂正则 |
+
+---
+
+## 十四、Canal 与 RocketMQ/Kafka 集成
+
+### 14.1 Kafka 集成配置
+
+```properties
+# canal.properties
+canal.mq.servers = kafka1:9092,kafka2:9092,kafka3:9092
+canal.mq.retries = 3
+canal.mq.acks = all
+canal.mq.transaction = false
+
+# instance.properties
+canal.mq.topic = canal_sync
+canal.mq.partition = 0
+canal.mq.dynamicTopic = test\\..*
+```
+
+### 14.2 RocketMQ 集成配置
+
+```properties
+# canal.properties
+canal.mq.servers = rocketmq:9876
+canal.mq.producerGroup = canal_producer
+canal.mq.accessChannel = local
+
+# instance.properties
+canal.mq.topic = canal_sync
+canal.mq.dynamicTopic = test\\..*
+```
+
+### 14.3 MQ 集成最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| Topic 规划 | 按库/业务分 Topic |
+| 分区策略 | 按表 hash 分区 |
+| 消费组 | 不同消费者用不同组 |
+| 重试 | 配置合理重试次数 |
+| 死信队列 | 失败消息进死信 |
+
+---
+
+## 十五、Canal 在实时特征存储中的应用
+
+### 15.1 实时特征存储架构
+
+```
+实时特征存储：
+  MySQL → Canal → Kafka → Flink
+    → 特征计算（实时聚合）
+    → 特征存储（Redis/Feature Store）
+    → 模型推理（在线预测）
+
+特征存储选型：
+  Redis：低延迟特征存储
+  Feast：开源特征存储
+  Tecton：商业特征存储
+```
+
+### 15.2 特征同步配置
+
+```yaml
+# Flink SQL 特征计算
+CREATE TABLE mysql_source (
+  user_id BIGINT,
+  order_amount DECIMAL(10,2),
+  order_time TIMESTAMP(3)
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'canal_sync',
+  'properties.bootstrap.servers' = 'kafka:9092'
+);
+
+CREATE TABLE feature_sink (
+  user_id BIGINT,
+  total_amount DECIMAL(10,2),
+  order_count BIGINT,
+  PRIMARY KEY (user_id)
+) WITH (
+  'connector' = 'redis',
+  'host' = 'redis',
+  'port' = '6379'
+);
+
+INSERT INTO feature_sink
+SELECT 
+  user_id,
+  SUM(order_amount) as total_amount,
+  COUNT(*) as order_count
+FROM mysql_source
+GROUP BY user_id, TUMBLE(order_time, INTERVAL '1' HOUR);
+```
+
+---
+
+## 十六、Canal 监控指标
+
+### 16.1 关键指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| instance.status | 实例状态 | != RUNNING |
+| instance.delay | 延迟（秒） | > 10 |
+| instance.store.energy | 内存使用率 | > 80% |
+| instance.cursor.position | 消费位点 | 不增长 |
+| mq.put.time.ms | MQ 投递延迟 | > 1000ms |
+| mq.put.fail.count | MQ 投递失败 | > 0 |
+
+### 16.2 监控配置
+
+```yaml
+# Prometheus 监控
+scrape_configs:
+  - job_name: canal
+    static_configs:
+      - targets: ['canal-metrics:11112']
+    metrics_path: /metrics
+```
+
+### 16.3 告警规则
+
+```yaml
+# 告警规则
+groups:
+  - name: canal
+    rules:
+      - alert: CanalInstanceDown
+        expr: canal_instance_status != 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Canal 实例 {{ $labels.instance }} 宕机"
+      
+      - alert: CanalDelayHigh
+        expr: canal_instance_delay > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Canal 延迟 {{ $value }}s"
+```
+
+---
+
+## 十七、与其他板块的关系
 
 - 和「**基础知识/MQ**」：Canal 常投递到 Kafka / RocketMQ，再由下游消费。
 - 和「**基础知识/ES 体系**」：Canal 是把 MySQL 实时同步到 ES 的标准管道。

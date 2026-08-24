@@ -284,7 +284,325 @@ rules:
 
 ---
 
-## 十一、与其他板块的关系（扩展）
+## 十、SkyWalking OAP 集群部署
+
+### 10.1 集群架构
+
+```
+SkyWalking OAP 集群（3 节点+）：
+  ├── OAP-1 (Leader) ←→ OAP-2 (Follower) ←→ OAP-3 (Follower)
+  │       ↕                    ↕                    ↕
+  │   ES Cluster (3 节点+，Hot/Warm/Cold 分层)
+  │
+  ├── Agent → 任意 OAP 节点（负载均衡）
+  └── UI → 任意 OAP 节点
+
+集群模式：
+  Standalone：单节点（测试）
+  Cluster：多节点 + 共享存储（生产）
+  部署方式：Kubernetes Operator / Helm / Docker Compose
+```
+
+### 10.2 集群部署配置
+
+```yaml
+# docker-compose-cluster.yml
+version: '3.8'
+services:
+  oap-1:
+    image: apache/skywalking-oap-server:9.7.0
+    environment:
+      SW_CLUSTER: zk
+      SW_CLUSTER_ZK_HOST_PORT: zookeeper:2181
+      SW_STORAGE: elasticsearch
+      SW_STORAGE_ES_CLUSTER_NODES: es-1:9200,es-2:9200,es-3:9200
+      SW_STORAGE_ES_INDEX_SHARDS_NUMBER: 2
+      SW_STORAGE_ES_INDEX_REPLICAS_NUMBER: 1
+      SW_RETENTION: 30
+    ports: ["11800:11800", "12800:12800"]
+
+  zookeeper:
+    image: zookeeper:3.8
+    ports: ["2181:2181"]
+```
+
+### 10.3 BanyanDB 存储（SkyWalking 原生存储）
+
+| 特性 | BanyanDB | Elasticsearch |
+|------|----------|---------------|
+| 性能 | 写入更快（时序优化） | 通用但开销大 |
+| 资源占用 | 低（Go 实现） | 高（JVM + Lucene） |
+| 运维复杂度 | 低（单二进制） | 高（集群/分片/ILM） |
+| 适用场景 | SkyWalking 原生存储 | 通用日志/链路 |
+| 压缩率 | 高（列式存储） | 中 |
+
+```bash
+# BanyanDB 部署
+docker run -d -p 8300:8300 -p 8400:8400 -p 8500:8500 \
+  -v /data/banyandb:/data \
+  apache/skywalking-banyandb
+
+# OAP 配置 BanyanDB
+SW_STORAGE=banyandb
+SW_STORAGE_BANYANDB_HOST=banyandb
+SW_STORAGE_BANYANDB_GRPC_PORT=8300
+```
+
+---
+
+## 十一、SkyWalking 链路分析实战
+
+### 11.1 链路树分析
+
+```
+Trace 分析维度：
+  1. 耗时分析：找出最慢 Span（瓶颈服务）
+  2. 拓扑分析：服务间依赖关系
+  3. 错误分析：异常 Span 分布
+  4. JVM 分析：GC/线程/内存
+
+操作路径：
+  SkyWalking UI → 链路追踪 → 输入 traceId
+  → 查看 Span 树 → 点击慢 Span 查看详情
+  → Tag 分析（SQL/HTTP URL/参数）
+  → 日志关联（traceId 跳转）
+```
+
+### 11.2 慢链路定位 SOP
+
+| 步骤 | 操作 | 工具 |
+|------|------|------|
+| 1. 发现 | 告警触发（P99 > 阈值） | Alertmanager |
+| 2. 定位 | 按 traceId 查链路树 | SkyWalking UI |
+| 3. 分析 | 找最慢 Span + tag/log | Span 详情 |
+| 4. 关联 | traceId 查日志 | ELK/Loki |
+| 5. 优化 | 缓存/索引/扩容 | 业务代码 |
+| 6. 验证 | 对比优化前后 p99 | SkyWalking 指标 |
+
+---
+
+## 十二、SkyWalking 日志关联
+
+### 12.1 日志与链路集成
+
+```yaml
+# log4j2 配置输出 traceId
+pattern: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] [%X{tid}] %msg%n"
+# tid = SkyWalking propagation context
+
+# Logback 配置
+<encoder>
+  <pattern>%d{HH:mm:ss.SSS} [%thread] [%X{SW_CTX:-}] %msg%n</pattern>
+</encoder>
+```
+
+### 12.2 日志采集方式
+
+| 方式 | 说明 | 适用 |
+|------|------|------|
+| 文件采集 | SkyWalking Agent 读取日志文件 | 传统部署 |
+| gRPC 上报 | Agent 直接 gRPC 发送日志 | 推荐 |
+| Kafka 投递 | 日志 → Kafka → OAP | 高吞吐 |
+| ELK 集成 | 日志进 ES，链路关联 traceId | 已有 ELK |
+
+### 12.3 日志-链路-指标三合一
+
+```
+三支柱联动：
+  指标（Prometheus）：告警触发（P99 > 1s）
+    ↓ 触发
+  链路（SkyWalking）：定位慢 Span（order-service → MySQL）
+    ↓ 关联
+  日志（ELK/Loki）：traceId 查具体异常堆栈
+
+排障黄金路径：
+  告警 → 链路定位 → 日志查因 → 指标验证
+```
+
+---
+
+## 十三、SkyWalking 指标聚合
+
+### 13.1 指标类型
+
+| 指标 | 说明 | 存储周期 |
+|------|------|----------|
+| Service Metrics | 服务级指标（SLA/RT/成功率） | 天/周/月 |
+| Endpoint Metrics | 端点级指标（每个 API 的 RT） | 天/周 |
+| Instance Metrics | 实例级指标（JVM/GC/线程） | 天 |
+| Database Metrics | 数据库指标（SQL RT/慢查询） | 天 |
+
+### 13.2 聚合规则
+
+```yaml
+# 指标聚合配置
+metricAgg:
+  # 天级别聚合（原始数据 → 天级汇总）
+  day:
+    - service_resp_time
+    - service_sla
+    - service_cpm
+  # 周/月聚合（天级 → 周/月）
+  week:
+    - service_resp_time
+  month:
+    - service_resp_time
+
+# 保留策略
+retention:
+  day: 30      # 天级数据保留 30 天
+  week: 90     # 周级保留 90 天
+  month: 365   # 月级保留 1 年
+```
+
+---
+
+## 十四、SkyWalking 告警规则详解
+
+### 14.1 内置告警规则
+
+```yaml
+# alarm-rules.yml 完整示例
+rules:
+  # 服务响应时间
+  - name: service_resp_time_rule
+    metrics-name: service_resp_time
+    op: ">"
+    threshold: 1000
+    period: 10
+    count: 3
+    silence-period: 5
+    message: 服务 {name} 平均响应时间超过 1000ms
+
+  # 服务 SLA
+  - name: service_sla_rule
+    metrics-name: service_sla
+    op: "<"
+    threshold: 99
+    period: 10
+    count: 3
+    message: 服务 {name} SLA 低于 99%
+
+  # 服务成功率
+  - name: service_success_rate_rule
+    metrics-name: service_sla
+    op: "<"
+    threshold: 95
+    period: 5
+    count: 2
+    message: 服务 {name} 成功率低于 95%
+
+  # 慢端点
+  - name: endpoint_resp_time_rule
+    metrics-name: endpoint_avg
+    op: ">"
+    threshold: 2000
+    period: 10
+    count: 3
+    message: 端点 {name} 平均响应时间超过 2000ms
+
+  # JVM GC
+  - name: jvm_gc_rule
+    metrics-name: jvm_gc_time
+    op: ">"
+    threshold: 1000
+    period: 10
+    count: 3
+    message: 服务 {name} GC 时间超过 1000ms
+```
+
+### 14.2 自定义告警规则
+
+```yaml
+# 自定义业务指标告警
+rules:
+  # 订单量异常
+  - name: order_count_anomaly
+    metrics-name: custom_order_count
+    op: "<"
+    threshold: 100
+    period: 5
+    count: 3
+    message: 订单量异常偏低
+
+  # 错误率
+  - name: error_rate_rule
+    metrics-name: service_sla
+    op: "<"
+    threshold: 90
+    period: 5
+    count: 2
+    webhook: http://alert-service/webhook
+    message: 错误率超过 10%
+```
+
+### 14.3 告警通知集成
+
+| 通知方式 | 配置 | 适用 |
+|----------|------|------|
+| Webhook | HTTP POST 到自定义服务 | 集成钉钉/企微/飞书 |
+| 邮件 | SMTP 配置 | 传统通知 |
+| Slack | Slack Webhook | 国际团队 |
+| 企微机器人 | 企微 Webhook URL | 国内团队 |
+
+---
+
+## 十五、SkyWalking 在 Istio 中的集成
+
+### 15.1 Istio + SkyWalking 架构
+
+```
+Istio + SkyWalking：
+  Envoy Sidecar → 生成 Trace 数据
+  → 通过 SkyWalking OAP Collector 采集
+  → OAP 解析为 Span
+  → 存储 + UI 展示
+
+配置：
+  Istio MeshConfig：
+    defaultConfig:
+      tracing:
+        sampling: 10.0  # 10% 采样
+      zipkin:
+        address: skywalking-oap:11800
+```
+
+### 15.2 与 Jaeger 在 Istio 中的对比
+
+| 维度 | SkyWalking | Jaeger |
+|------|-----------|--------|
+| 集成方式 | OAP Collector 接收 Envoy 数据 | Jaeger Agent/Collector |
+| 功能 | APM 全家桶（拓扑/指标/告警） | 纯链路追踪 |
+| 性能 | 中等 | 轻量 |
+| 国内生态 | 强 | 一般 |
+
+---
+
+## 十六、SkyWalking Agent 性能开销
+
+### 16.1 开销分析
+
+| 开销类型 | 说明 | 典型值 |
+|----------|------|--------|
+| CPU | 字节码注入 + 数据采集 | 1~3% |
+| 内存 | Agent 运行时 + 缓冲区 | 50~200MB |
+| 网络 | Trace 数据上报 | <1% 带宽 |
+| GC | Agent 增加的 GC 压力 | 可忽略 |
+| 启动时间 | Agent 初始化 | 100~300ms |
+
+### 16.2 优化建议
+
+| 优化项 | 说明 |
+|--------|------|
+| 采样率调整 | 降低采样率减少数据量 |
+| 异步上报 | Agent 异步批量上报 |
+| 采样策略 | 头部采样 + 错误强制采样 |
+| Buffer 调优 | 调整 buffer size 平衡延迟与吞吐 |
+| 禁用不需要的插件 | 关闭未使用的框架插件 |
+
+---
+
+## 十七、与其他板块的关系（扩展）
 
 - 和「**基础知识/中间件/ELK日志体系**」：链路 + 日志双剑合璧（traceId 关联），排障黄金组合。
 - 和「**云原生/可观测性**」：可观测性三支柱中，链路由 SkyWalking/Jaeger/OTel 承载，与 Prometheus（指标）、Loki/ELK（日志）并列。
@@ -295,7 +613,300 @@ rules:
 
 ---
 
-## 十二、速查表（扩展）
+## 十三、SkyWalking OAP 架构深入
+
+### 13.1 OAP Server 组件
+
+```mermaid
+flowchart TB
+    subgraph OAP[OAP Server]
+        GRPC[gRPC Receiver] --> PARSE[解析层]
+        HTTP[HTTP Receiver] --> PARSE
+        PARSE --> AGG[聚合层: 指标/链路/拓扑]
+        AGG --> PROC[处理层: 告警/拓扑计算]
+        PROC --> STORE[存储层: 指标/链路/日志]
+    end
+    AGG --> ES[(Elasticsearch)]
+    AGG --> B2[(BanyanDB)]
+    AGG --> MYSQL[(MySQL/TiDB)]
+    PROC --> NOTIFY[告警通知]
+```
+
+| 组件 | 职责 | 说明 |
+|------|------|------|
+| gRPC Receiver | 接收 Agent 上报的 Trace/Metric/Log | 默认端口 11800 |
+| HTTP Receiver | 接收 UI/API 查询 | 默认端口 12800 |
+| Aggregation Layer | 聚合指标（分钟/小时/天级） | 指标按时间窗口聚合 |
+| Topology Discovery | 自动发现服务拓扑 | 基于 Trace 数据推导 |
+| Alarm Module | 规则匹配触发告警 | 支持 Webhook/钉钉/企微 |
+
+### 13.2 OAP 存储后端对比
+
+| 存储 | 指标 | 链路 | 适用场景 |
+|------|------|------|----------|
+| Elasticsearch | ✅ | ✅ | 生产首选（水平扩展） |
+| BanyanDB | ✅ | ✅ | SkyWalking 原生存储（轻量） |
+| MySQL/TiDB | ✅ | ✅ | 轻量部署/小规模 |
+| H2 | ✅ | ✅ | 测试/单机 |
+| PostgreSQL | ✅ | ✅ | 替代 MySQL |
+
+## 十四、SkyWalking Java Agent 深入
+
+### 14.1 Agent 插桩原理
+
+```mermaid
+flowchart LR
+    A[应用启动] --> B[Agent premain]
+    B --> C[类加载器拦截]
+    C --> D[字节码增强]
+    D --> E[拦截框架调用]
+    E --> F[创建 Span]
+    F --> G[gRPC 上报 OAP]
+```
+
+| 插桩框架 | 说明 |
+|----------|------|
+| HTTP Client | 拦截 OkHttp/Apache HttpClient/RestTemplate |
+| RPC | 拦截 gRPC/Dubbo/Spring Cloud |
+| MQ | 拦截 Kafka/RabbitMQ/RocketMQ |
+| DB | 拦截 JDBC/Redis/MongoDB |
+| Spring | 拦截 Spring MVC/Cloud Gateway |
+
+### 14.2 Agent 配置优化
+
+```properties
+# agent.config 关键配置
+agent.service_name=${SW_AGENT_NAME:payment-service}
+agent.sample_n_per_3_secs=10           # 每3秒采样10条
+agent.ignore_suffix=.jpg,.css,.js      # 忽略静态资源
+agent.tracing.ignore_path=/health,/metrics  # 忽略健康检查
+
+# 性能调优
+agent.span_limit_per_segment=300       # 单 Segment 最大 Span 数
+agent.is_open_debugging=true           # 调试模式（生产关闭）
+agent.metric.flush_interval=15         # 指标上报间隔（秒）
+
+# 采样策略
+agent.sample_n_per_3_secs=10           # 按比例采样
+agent.force_sample=true                # 强制采样（测试环境）
+```
+
+## 十五、SkyWalking Trace/Span/Segment 模型
+
+### 15.1 数据结构关系
+
+```
+Segment（段）：一个服务内的一次请求处理
+  └── Span（跨度）：Segment 内的一个操作单元
+       └── Tags：键值对标注（如 http.url、db.statement）
+       └── Logs：事件日志（如异常堆栈）
+       └── Refs：跨 Segment 引用（Trace Segment Ref）
+
+Trace = 多个 Segment 通过 Trace Segment Ref 串联
+```
+
+### 15.2 Span 类型
+
+| Span 类型 | 说明 | 示例 |
+|-----------|------|------|
+| Entry Span | 入口（被调用） | HTTP 请求入口、gRPC 服务端 |
+| Local Span | 本地调用 | 方法内部调用 |
+| Exit Span | 出口（主动调用） | HTTP 客户端、DB 查询 |
+
+```java
+// Agent 自动创建的 Span 示例
+Segment: payment-service
+  EntrySpan: POST /api/pay (320ms)
+    ExitSpan: MySQL SELECT * FROM orders (150ms)
+    LocalSpan: calculateTax (30ms)
+    ExitSpan: Kafka send to topic:payment-complete (10ms)
+```
+
+## 十六、SkyWalking 拓扑图原理
+
+### 16.1 拓扑发现
+
+```
+拓扑图基于 Trace 数据自动构建：
+  1. Agent 上报 Span 数据（含 service name、endpoint）
+  2. OAP 从 Span 中提取 service 间调用关系
+  3. 聚合生成拓扑边（source → dest，含 QPS/延迟/错误率）
+  4. UI 展示服务拓扑图（力导向布局）
+```
+
+### 16.2 拓扑图价值
+
+| 价值 | 说明 |
+|------|------|
+| 依赖梳理 | 自动发现服务间依赖，无需人工文档 |
+| 影响分析 | 服务故障时快速定位影响范围 |
+| 容量规划 | 基于 QPS 趋势规划扩容 |
+| 架构治理 | 发现循环依赖、不必要的调用链 |
+
+## 十七、SkyWalking 告警规则深入
+
+### 17.1 内置告警规则
+
+```yaml
+# 默认告警规则（alarm-settings.yml）
+rules:
+  service_resp_time_rule:
+    metrics-name: service_resp_time
+    op: ">"
+    threshold: 1000            # P99 > 1000ms
+    period: 10                 # 10分钟窗口
+    count: 3                   # 连续3次
+    silence-period: 5          # 告警静默5分钟
+    message: 服务{0}响应时间超过阈值，当前值{1}ms
+
+  service_sla_rule:
+    metrics-name: service_sla
+    op: "<"
+    threshold: 99              # SLA < 99%
+    period: 10
+    count: 3
+
+  service_p99_rule:
+    metrics-name: service_p99
+    op: ">"
+    threshold: 500             # P99 > 500ms
+    period: 5
+    count: 2
+
+  endpoint_resp_time_rule:
+    metrics-name: endpoint_avg
+    op: ">"
+    threshold: 500
+    period: 10
+    count: 3
+```
+
+### 17.2 自定义告警规则
+
+```yaml
+# 自定义：错误率告警
+rules:
+  service_error_rate_rule:
+    metrics-name: service_cpm
+    op: ">"
+    threshold: 10              # 每分钟错误数 > 10
+    period: 5
+    count: 2
+
+# Webhook 通知
+webhooks:
+  - name: dingtalk-webhook
+    url: https://oapi.dingtalk.com/robot/send?access_token=xxx
+    type: Json
+```
+
+## 十八、SkyWalking vs Jaeger vs Zipkin 深度对比
+
+| 维度 | SkyWalking | Jaeger | Zipkin |
+|------|-----------|--------|--------|
+| 采集方式 | **Java Agent 字节码注入（零侵入）** | SDK 埋点/OTel Agent | SDK 埋点 |
+| 语言支持 | Java 最强 + 多语言 Agent | 多语言（OTel） | 多语言 |
+| 附带能力 | 拓扑/指标/告警/日志关联/剖析 | 纯链路 + 服务图 | 纯链路 |
+| 存储后端 | ES/BanyanDB/MySQL/TiDB | ES/Cassandra/内存 | ES/Cassandra/内存 |
+| 采样策略 | 按比例/按秒数/强制采样 | 按概率/自适应 | 按比例 |
+| 告警 | ✅ 内置规则引擎 | ❌ 需外部集成 | ❌ 需外部集成 |
+| 性能剖析 | ✅ 火焰图/线程 Dump | ❌ | ❌ |
+| 社区活跃度 | 高（国内为主） | 高（CNCF 毕业） | 中（维护模式） |
+| 选型建议 | **国内 Java 微服务首选** | 云原生/多语言 + OTel 生态 | 老项目存量 |
+
+## 十九、SkyWalking 在 Kubernetes 中部署
+
+### 19.1 Operator 部署方式
+
+```yaml
+# SkyWalking Kubernetes Operator
+apiVersion: operator.skywalking.apache.org/v1alpha1
+kind: SkyWalkingOperator
+metadata:
+  name: skywalking-operator
+spec:
+  image:
+    oap: apache/skywalking-oap-server:10.0.0
+    ui: apache/skywalking-ui:10.0.0
+---
+apiVersion: operator.skywalking.apache.org/v1alpha1
+kind: SkyWalking
+metadata:
+  name: skywalking-cluster
+spec:
+  oap:
+    replicas: 3
+    storage:
+      selector:
+        name: elasticsearch
+  ui:
+    replicas: 2
+  satellite:
+    replicas: 3
+```
+
+### 19.2 Agent Sidecar 注入
+
+```yaml
+# 自动注入 Agent（通过 MutatingWebhook）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  annotations:
+    sidecar.istio.io/inject: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        sidecar.skywalking.apache.org/agent.service_name: "payment"
+```
+
+## 二十、SkyWalking 存储后端深入
+
+### 20.1 ES 索引规划
+
+| 索引 | 数据类型 | 保留期 | 分片策略 |
+|------|----------|--------|----------|
+| skywalking_metrics_* | 指标（分钟级） | 7天 | 按天 |
+| skywalking_topologies_* | 拓扑数据 | 7天 | 按天 |
+| skywalking_records_* | 链路记录 | 3天 | 按天 |
+| skywalking_logs_* | 日志 | 7天 | 按天 |
+
+### 20.2 ES 容量估算
+
+```
+估算公式：
+  每秒 Span 数 × 每 Span 平均大小 × 保留天数 × 副本
+
+示例：
+  1000 Span/s × 2KB × 7天 × 3副本
+  = 1000 × 2KB × 604800s × 3
+  ≈ 3.5 TB（原始数据）
+  索引开销 × 1.5 ≈ 5.25 TB 存储
+```
+
+> **口诀**：ES 存储规划 = Span 吞吐 × 大小 × 保留期 × 副本 × 1.5；索引按天创建，配合 ILM 生命周期管理。
+
+## 二十一、SkyWalking 存储后端配置
+
+```yaml
+# application.yml 存储配置
+storage:
+  selector: ${SW_STORAGE:elasticsearch}
+  elasticsearch:
+    clusterNodes: ${SW_STORAGE_ES_CLUSTER_NODES:localhost:9200}
+    protocol: ${SW_STORAGE_ES_PROTOCOL:http}
+    indexShardsNumber: ${SW_STORAGE_ES_INDEX_SHARDS_NUMBER:2}
+    indexReplicasNumber: ${SW_STORAGE_ES_INDEX_REPLICAS_NUMBER:1}
+    bulkActions: ${SW_STORAGE_ES_BULK_ACTIONS:1000}
+    flushInterval: ${SW_STORAGE_ES_FLUSH_INTERVAL:10s}
+    resultWindowMaxSize: ${SW_STORAGE_ES_RESULT_WINDOW_MAX_SIZE:10000}
+    metadataQueryMaxSize: ${SW_STORAGE_ES_METADATA_QUERY_MAX_SIZE:5000}
+    segmentFileMaxSize: ${SW_STORAGE_ES_SEGMENT_FILE_MAX_SIZE:50}
+```
+
+## 二十二、速查表（扩展）
 
 | 项 | 结论 |
 |----|------|
@@ -307,5 +918,7 @@ rules:
 | 标准 | OpenTelemetry（采集标准）+ Jaeger/SkyWalking（后端） |
 | 部署 | OAP Server + Agent + ES/MySQL 存储 |
 | 告警 | 按指标阈值触发（P99/SLA/错误率） |
+| K8s 部署 | SkyWalking Operator + Sidecar 自动注入 |
+| 存储 | ES（生产首选）/ BanyanDB（原生）/ MySQL（轻量） |
 | 许可证 | Apache 2.0（三家） |
 | 一句话 | 「微服务排障第一视角」——慢在哪一跳、坏在哪一环，一目了然 |

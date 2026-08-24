@@ -162,6 +162,207 @@ spec:
 
 ---
 
+## 补充：Traefik 深度解析
+
+### 1. EntryPoint / Router / Middleware 详解
+
+#### 1.1 EntryPoint 高级配置
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `address` | 监听地址与端口 | `:80`, `:443`, `:8443` |
+| `transport.respondingTimeouts` | 超时设置 | readTimeout / writeTimeout / idleTimeout |
+| `transport.maxRequestsPerConn` | 单连接最大请求数 | `10000` |
+| `proxyProtocol` | PROXY Protocol 支持 | v1/v2 |
+| `forwardedHeaders` | 信任 X-Forwarded-* | `trustedIPs: ["10.0.0.0/8"]` |
+
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+        writeTimeout: 60s
+        idleTimeout: 180s
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+```
+
+#### 1.2 Router 匹配规则
+
+| 匹配条件 | 语法示例 | 说明 |
+|----------|----------|------|
+| Host | `Host(\`example.com\`)` | 精确域名 |
+| HostRegexp | `HostRegexp(\`^.+\\.example\\.com\$\`)` | 通配域名 |
+| PathPrefix | `PathPrefix(\`/api\`)` | 路径前缀 |
+| Headers | `Headers(\`X-Custom\`, \`value\`)` | 请求头匹配 |
+| Method | `Method(\`GET\`, \`POST\`)` | HTTP 方法 |
+| ClientIP | `ClientIP(\`10.0.0.0/8\`)` | 客户端 IP |
+
+#### 1.3 Middleware 链式组合
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: full-pipeline
+spec:
+  chain:
+    middlewares:
+      - name: ip-whitelist
+      - name: rate-limit
+      - name: jwt-auth
+      - name: compress
+```
+
+### 2. Traefik in Kubernetes（IngressRoute CRD）
+
+| 维度 | IngressRoute (CRD) | K8s Ingress |
+|------|---------------------|-------------|
+| 功能 | 全功能（中间件、TLS、TCP/UDP） | 基础路由 |
+| 中间件 | 原生支持 | 需注解扩展 |
+| TCP/UDP | 支持 | 不支持 |
+| 验证 | CRD schema 校验 | 注解无校验 |
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: webapp
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`app.example.com`)
+      kind: Rule
+      middlewares:
+        - name: rate-limit
+      services:
+        - name: webapp-svc
+          port: 80
+  tls:
+    certResolver: letsencrypt
+```
+
+### 3. Traefik Let's Encrypt 自动 SSL
+
+| 挑战 | 说明 | 优缺点 |
+|------|------|--------|
+| HTTP Challenge | 80 端口 HTTP-01 验证 | 简单，不支持通配符 |
+| TLS Challenge | TLS-ALPN-01 验证 | 443 端口，无需 80 |
+| DNS Challenge | DNS-01 验证 | 支持通配符，需 DNS API 权限 |
+
+```yaml
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com
+      storage: /data/acme.json
+      dnsChallenge:
+        provider: cloudflare
+```
+
+### 4. Traefik Service Mesh（Traefik Mesh）
+
+| 特性 | 说明 |
+|------|------|
+| 架构 | 轻量级服务网格，无 sidecar |
+| 数据面 | Traefik 代理（与 Ingress 共用） |
+| 控制面 | Traefik Mesh Controller |
+| 负载均衡 | 加权轮询、最少连接 |
+| 熔断 | 连接数/延迟/错误率 |
+| 限流 | 全局/每服务 |
+| mTLS | 服务间加密（可选） |
+
+### 5. Traefik vs Nginx vs HAProxy 深度对比
+
+| 维度 | Traefik | Nginx | HAProxy |
+|------|---------|-------|---------|
+| 配置方式 | 声明式 CRD/YAML | 静态配置文件 | 静态配置文件 |
+| 动态更新 | 原生热更新 | reload（优雅） | reload（优雅） |
+| 自动发现 | 15+ Provider | 不支持 | 不支持 |
+| 自动 HTTPS | Let's Encrypt 原生 | cert-manager 配合 | cert-manager 配合 |
+| 中间件 | 30+ 内置 | Lua/第三方模块 | ACL/规则 |
+| 性能 | 高（Go 实现） | 极高（C 实现） | 极高（C 实现） |
+| 内存占用 | 中 | 低 | 低 |
+| TCP/UDP 代理 | 原生支持 | stream 模块 | 原生支持 |
+| 学习曲线 | 低 | 中 | 高 |
+| 适用场景 | K8s/Docker 环境 | 传统 Web 服务器 | 高性能 TCP 负载均衡 |
+
+### 6. Traefik 文件配置
+
+```yaml
+# traefik.yml（静态配置）
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com
+      storage: /data/acme.json
+      dnsChallenge:
+        provider: cloudflare
+```
+
+```yaml
+# dynamic.yml（动态配置）
+http:
+  routers:
+    webapp:
+      rule: Host(`app.example.com`)
+      service: webapp-svc
+  services:
+    webapp-svc:
+      loadBalancer:
+        servers:
+          - url: "http://10.0.1.10:8080"
+          - url: "http://10.0.1.11:8080"
+```
+
+### 7. Traefik Prometheus 监控
+
+```yaml
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+```
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `traefik_entrypoint_requests_total` | Counter | 入口请求总数 |
+| `traefik_entrypoint_request_duration_seconds` | Histogram | 入口请求延迟 |
+| `traefik_router_requests_total` | Counter | 路由请求总数 |
+| `traefik_service_requests_total` | Counter | 服务请求总数 |
+| `traefik_service_open_connections` | Gauge | 服务打开连接数 |
+
+```promql
+# QPS 按路由
+sum(rate(traefik_router_requests_total[5m])) by (router)
+# P99 延迟
+histogram_quantile(0.99, sum(rate(traefik_router_request_duration_seconds_bucket[5m])) by (le, router))
+```
+
+---
+
 ## 七、与其他板块的关系
 
 - 网关选型总览见「[API 网关](./API网关.md)」；

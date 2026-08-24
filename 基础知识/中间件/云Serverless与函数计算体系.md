@@ -307,7 +307,424 @@ DynamoDB On-Demand：
 
 ---
 
-## 十、与其他板块的关系
+## 十、AWS Step Functions 深入
+
+### 10.1 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| State Machine | 工作流定义（JSON 状态机） |
+| Task | 单个执行单元（Lambda/EC2/Activity） |
+| Choice | 条件分支（if-else） |
+| Wait | 等待指定时间/事件 |
+| Parallel | 并行执行多个分支 |
+| Map | 循环处理数组 |
+| Pass | 透传数据/注入常量 |
+| Fail/Success | 终止状态 |
+
+### 10.2 状态机定义
+
+```json
+{
+  "Comment": "订单处理工作流",
+  "StartAt": "ValidateOrder",
+  "States": {
+    "ValidateOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:validate",
+      "Next": "CheckInventory"
+    },
+    "CheckInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:inventory",
+      "Next": "IsInStock"
+    },
+    "IsInStock": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.inStock",
+          "BooleanEquals": true,
+          "Next": "ProcessPayment"
+        }
+      ],
+      "Default": "NotifyOutOfStock"
+    },
+    "ProcessPayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789/orders",
+        "MessageBody.$": "$"
+      },
+      "Next": "WaitForPayment"
+    },
+    "WaitForPayment": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "CheckPaymentStatus"
+    },
+    "CheckPaymentStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:check-payment",
+      "End": true
+    },
+    "NotifyOutOfStock": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:notify",
+      "End": true
+    }
+  }
+}
+```
+
+### 10.3 Step Functions vs Durable Functions vs Temporal
+
+| 维度 | Step Functions | Durable Functions | Temporal |
+|------|---------------|-------------------|----------|
+| 厂商 | AWS | Azure | 开源（多云） |
+| 定义 | JSON 状态机 | 代码编排 | 代码编排 |
+| 状态管理 | 平台托管 | 平台托管 | 平台托管 |
+| 调试 | X-Ray 追踪 | 本地调试 | 本地调试 |
+| 适用 | AWS 生态 | Azure 生态 | 多云/复杂编排 |
+
+---
+
+## 十一、Google Cloud Workflows
+
+### 11.1 核心概念
+
+```yaml
+# workflow.yaml
+main:
+  params: [input]
+  steps:
+    - callService:
+        call: http.post
+        args:
+          url: https://service-a.run.app/api/process
+          auth:
+            type: OIDC
+          body:
+            data: ${input.data}
+        result: serviceAResult
+    - checkResult:
+        switch:
+          - condition: ${serviceAResult.body.status == "error"}
+            raise: ${serviceAResult.body}
+    - returnResult:
+        return: ${serviceAResult.body}
+```
+
+### 11.2 Workflows vs Step Functions
+
+| 维度 | Google Cloud Workflows | AWS Step Functions |
+|------|----------------------|-------------------|
+| 语言 | YAML/伪代码 | JSON 状态机 |
+| 集成 | GCP 服务 | AWS 服务 |
+| 定价 | 按执行次数+GB-s | 按状态转换次数 |
+| 适用 | GCP 生态 | AWS 生态 |
+
+---
+
+## 十二、Serverless API Gateway 模式
+
+### 12.1 常见模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| 单函数路由 | 一个 Lambda 处理一个路径 | 简单 API |
+| 多函数路由 | API Gateway 按路径分发到不同函数 | 复杂 API |
+| 后端代理 | API Gateway 代理到 ALB/容器 | 混合架构 |
+| WebSocket | 实时通信（聊天/通知） | 实时场景 |
+| HTTP API | 轻量级 API Gateway（比 REST API 便宜） | REST API |
+
+### 12.2 配置示例
+
+```yaml
+# AWS API Gateway + Lambda
+openapi: 3.0.0
+paths:
+  /users:
+    get:
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789:function:getUsers/invocations
+    post:
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789:function:createUser/invocations
+```
+
+---
+
+## 十三、Serverless Cron Job
+
+### 13.1 实现方式
+
+| 厂商 | 服务 | 配置 |
+|------|------|------|
+| AWS | EventBridge + Lambda | cron 表达式触发 |
+| Azure | Timer Trigger | 毫秒级定时 |
+| GCP | Cloud Scheduler + Cloud Functions | cron 触发 |
+| 阿里云 | 定时触发器 + FC | cron 表达式 |
+
+### 13.2 最佳实践
+
+```
+Serverless Cron 注意事项：
+  ① 幂等：定时任务可能重复执行
+  ② 超时：设合理超时（避免长任务）
+  ③ 错误处理：失败重试 + 死信队列
+  ④ 并发控制：避免多实例同时执行
+  ⑤ 监控：执行时长/成功率告警
+```
+
+---
+
+## 十四、Serverless 图片处理
+
+### 14.1 架构设计
+
+```
+图片处理链路：
+  用户上传 → OSS/S3 → 事件触发 → Lambda/FC
+    → 缩略图生成（Sharp/Pillow）
+    → 水印添加
+    → 格式转换（WebP/AVIF）
+    → 内容审核（AI 服务）
+    → 结果写回 OSS/S3
+    → CDN 刷新
+
+技术栈：
+  Node.js + Sharp（高性能图片处理）
+  Python + Pillow（轻量处理）
+  Go + imaging（高性能）
+```
+
+### 14.2 性能优化
+
+| 优化项 | 说明 |
+|--------|------|
+| 内存配置 | 图片处理吃内存，配 1~2GB |
+| 并发控制 | 限制并发避免 OSS 压力 |
+| 缓存 | 相同参数的缩略图缓存 |
+| 异步 | 大批量处理用 SQS/队列异步 |
+| 格式 | 优先 WebP/AVIF 省带宽 |
+
+---
+
+## 十五、Serverless 成本计算器
+
+### 15.1 成本计算公式
+
+```
+Lambda 成本 = 调用次数 × $0.20/百万 + GB-秒 × $0.00001667
+
+示例：
+  每月 1000 万次调用，平均 200ms，128MB 内存
+  调用费：10 × $0.20 = $2.00
+  计算费：10M × 0.2s × 0.125GB × $0.00001667 = $4.17
+  总计：$6.17/月
+
+对比常驻 EC2：
+  t3.micro（$0.0104/h）× 730h = $7.60/月
+  Lambda 更便宜（低频场景）
+```
+
+### 15.2 成本优化策略
+
+| 策略 | 说明 | 节省 |
+|------|------|------|
+| 合理内存 | 内存↑ CPU↑ 时间↓，找最优值 | 30~50% |
+| 批处理 | 合并请求减少调用次数 | 50%+ |
+| 预置并发 | 仅核心链路开启 | 按需 |
+| Spot 实例 | Fargate Spot 省 70% | 70% |
+| 本地文件系统 | /tmp 缓存减少重复调用 | 变化大 |
+
+---
+
+## 十六、Serverless vs 容器决策矩阵
+
+| 维度 | Serverless (FaaS) | 容器 (ECS/Cloud Run) |
+|------|-------------------|----------------------|
+| 冷启动 | 有（毫秒~秒） | 无（常驻） |
+| 最大执行时间 | 15 分钟（Lambda） | 无限制 |
+| 并发模型 | 每请求一个实例 | 每实例多请求 |
+| 状态 | 无状态 | 可有状态 |
+| 成本模型 | 按调用+时长 | 按实例+时长 |
+| 运维 | 零运维 | 少量运维 |
+| 适用 | 事件驱动/短任务 | 长时运行/稳定负载 |
+| Vendor Lock-in | 高（平台绑定） | 低（容器标准） |
+
+### 决策树
+
+```
+任务执行时间 > 15 分钟？→ 是 → 容器
+需要常驻连接（WebSocket）？→ 是 → 容器
+流量波动大？→ 是 → Serverless
+已有容器镜像？→ 是 → 容器（Cloud Run/Fargate）
+事件驱动？→ 是 → Serverless
+需要 GPU？→ 是 → 容器
+预算敏感？→ 看流量模式（低频→Serverless，高频→容器）
+```
+
+---
+
+## 补充：Serverless 深度解析
+
+### 1. AWS Lambda 冷启动优化
+
+| 优化策略 | 说明 | 效果 |
+|----------|------|------|
+| Provisioned Concurrency | 预置并发消除冷启动 | 冷启动→0 |
+| SnapStart | Java 内存快照恢复 | 1-3s→~100ms |
+| 精简依赖 | 减少初始化包大小 | 30-50% 提升 |
+| 运行时选择 | Node/Python 比 Java 快 | 10x 差异 |
+| 连接池复用 | 全局作用域复用 DB 连接 | 减少初始化时间 |
+| Lambda Power Tuning | 自动测试最优内存配置 | 成本降低30% |
+
+### 2. Lambda Layers
+
+| 特性 | 说明 |
+|------|------|
+| 定义 | 共享依赖库（层），多个函数复用 |
+| 大小限制 | 最大 250MB（未压缩） |
+| 版本控制 | 层有版本，函数绑定特定版本 |
+| 使用场景 | 公共库、SDK、运行时扩展 |
+
+```yaml
+# 层结构
+python/
+  python/
+    requests/  # 共享依赖
+    utils/
+```
+
+### 3. Lambda@Edge 深度
+
+| 特性 | 说明 |
+|------|------|
+| 执行位置 | CloudFront 边缘节点（全球 200+） |
+| 触发事件 | Viewer Request/Response, Origin Request/Response |
+| 限制 | 5s 超时、128MB 内存、Node/Python |
+| 典型用法 | A/B 测试、Header 改写、认证、缓存策略 |
+
+### 4. Azure Functions Durable Functions 模式
+
+| 模式 | 说明 | 示例 |
+|------|------|------|
+| Function Chaining | 函数链式调用 | A→B→C |
+| Fan-out/Fan-in | 并行执行后汇总 | N 个子任务并行 |
+| Async HTTP APIs | 异步 HTTP 轮询 | 长任务状态查询 |
+| Monitor | 定时轮询 | 订单状态监控 |
+| Human Interaction | 人工审批 | 工作流审批 |
+
+### 5. Google Cloud Functions Gen2
+
+| 特性 | 说明 |
+|------|------|
+| 基于 | Cloud Run（统一底层） |
+| 优势 | 更长超时（60min）、更大内存（32GB）、事件arc |
+| 触发器 | HTTP/Pub/Sub/Cloud Storage/Firestore |
+| 流量分配 | 修订版流量分配（灰度发布） |
+
+### 6. Serverless 成本分析
+
+```
+Lambda vs EC2 成本模型对比：
+  Lambda: $0.20/百万调用 + $0.00001667/GB-秒
+  EC2 t3.micro: $0.0104/小时 = $7.60/月
+
+盈亏平衡点计算：
+  假设函数平均执行 200ms，128MB 内存
+  每月调用次数 X:
+    Lambda 成本 = X × ($0.20/1M + 0.2s × 0.125GB × $0.00001667/GB-s)
+               = X × ($0.0000002 + $0.000000417)
+               = X × $0.000000617
+  EC2 成本 = $7.60/月
+  X = $7.60 / $0.000000617 ≈ 1230万次/月
+
+结论：每月调用 <1230万次 → Lambda 更便宜
+```
+
+### 7. Serverless 架构模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| Fan-out/Fan-in | 并行处理后汇总 | 批量处理、数据分析 |
+| Aggregator | 聚合多个数据源 | API 聚合、报表 |
+| Asynchronous | 异步事件处理 | 后台任务、通知 |
+| Stream Processing | 流式处理 | 实时分析、日志处理 |
+| Choreography | 事件驱动编排 | 微服务解耦 |
+
+### 8. Knative on Kubernetes
+
+| 组件 | 说明 |
+|------|------|
+| Knative Serving | Serverless 部署（自动伸缩到 0） |
+| Knative Eventing | 事件驱动（Broker/Trigger） |
+| 优势 | 无 Vendor Lock-in、K8s 原生 |
+| 适用 | 混合云、多云 Serverless |
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: helloworld-go
+spec:
+  template:
+    spec:
+      containers:
+        - image: gcr.io/knative-samples/helloworld-go
+          env:
+            - name: TARGET
+              value: "World"
+```
+
+### 9. Serverless 异步集成模式
+
+| 模式 | 架构 | 适用场景 |
+|------|------|----------|
+| 事件扇出 | 事件源→多 Lambda 并行处理 | 广播通知、多系统同步 |
+| 结果聚合 | 多 Lambda→汇总 Lambda | 批量处理、报表生成 |
+| 消息队列解耦 | SQS/Service Bus→Lambda | 削峰填谷、异步处理 |
+| 流处理 | Kinesis/Event Hubs→Lambda | 实时分析、日志处理 |
+
+### 10. Serverless 可观测性
+
+| 维度 | 工具 | 说明 |
+|------|------|------|
+| 日志 | CloudWatch Logs / Azure Monitor | 函数执行日志 |
+| 指标 | CloudWatch Metrics | 调用数、错误率、延迟 |
+| 追踪 | X-Ray / Application Insights | 跨函数链路追踪 |
+| 告警 | CloudWatch Alarms | 错误率、延迟阈值告警 |
+
+### 11. Serverless 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 最小权限 IAM | 函数仅授予必要权限 |
+| 环境变量加密 | 敏感配置加密存储 |
+| VPC 隔离 | 函数部署在私有子网 |
+| 依赖审计 | 扫描第三方依赖漏洞 |
+| 输入验证 | 防止注入攻击 |
+| 调用签名 | 验证事件源签名（API Gateway） |
+| 日志脱敏 | 敏感数据不写日志 |
+| 函数隔离 | 不同环境使用不同账号/VPC |
+| 速率限制 | 防止滥用和 DDoS |
+| 定期更新运行时 | 保持运行时版本最新 |
+| 密钥管理 | 使用 KMS/Secrets Manager |
+| 网络访问控制 | 限制函数出站流量 |
+| 审计日志 | 记录所有函数调用 |
+| WAF 集成 | API Gateway 配置 WAF |
+| 代码签名 | 验证函数代码完整性 |
+
+---
+
+## 十七、与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；
 - 云上消息（事件源）见「[云上消息与集成生态](./云上消息与集成生态.md)」；

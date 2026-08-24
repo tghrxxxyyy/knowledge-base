@@ -389,9 +389,239 @@ jstat -gcutil $(pgrep -f jenkins.war) 1s
 jstack $(pgrep -f jenkins.war) > /tmp/jstack.txt
 ```
 
+## 十三、Jenkins Credentials 深度管理
+
+### 13.1 凭据类型与存储
+
+| 凭据类型 | 用途 | 存储位置 |
+|----------|------|----------|
+| Username with Password | Git/Registry 登录 | `credentials.xml` 加密 |
+| SSH Username with private key | Agent SSH 连接 | `credentials.xml` + `secrets/` |
+| Secret text | Token/API Key（环境变量） | `credentials.xml` 加密 |
+| Secret file | Kubeconfig / 证书 | `credentials.xml` + 文件加密 |
+| Certificate | TLS 客户端证书 | `credentials.xml` + PKCS12 |
+
+```groovy
+// 凭据使用（Pipeline 中）
+withCredentials([
+  usernamePassword(
+    credentialsId: 'git-cred',
+    usernameVariable: 'GIT_USER',
+    passwordVariable: 'GIT_PASS'
+  ),
+  string(
+    credentialsId: 'slack-token',
+    variable: 'SLACK_TOKEN'
+  )
+]) {
+  sh 'git clone https://$GIT_USER:$GIT_PASS@github.com/corp/repo.git'
+  sh "curl -X POST -H 'Authorization: Bearer $SLACK_TOKEN' ..."
+}
+```
+
+### 13.2 凭据安全红线
+
+| 风险 | 说明 | 对策 |
+|------|------|------|
+| 明文日志 | 密码被 echo 打进日志 | `withCredentials` 自动 mask |
+| Pipeline 硬编码 | `sh "curl -u admin:pass123"` | 绝对禁止，用凭据注入 |
+| 插件泄露 | 部分插件明文写 config.xml | 审计 config.xml、订阅安全公告 |
+| 备份泄露 | `JENKINS_HOME` 包含加密凭据 | 备份加密 + 异地存储 |
+
+> ⚠️ **红线**：`withCredentials` 是唯一合法的凭据使用方式；任何硬编码密钥的 Pipeline 都是安全漏洞。
+
+## 十四、Jenkinsfile 并行阶段实战
+
+### 14.1 并行 Stage 与矩阵
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Build Matrix') {
+            parallel {
+                stage('Linux Build') {
+                    steps {
+                        sh 'make linux'
+                    }
+                }
+                stage('macOS Build') {
+                    agent { label 'mac' }
+                    steps {
+                        sh 'make macos'
+                    }
+                }
+                stage('Windows Build') {
+                    agent { label 'windows' }
+                    steps {
+                        bat 'make windows'
+                    }
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                input message: '确认部署？'
+            }
+        }
+    }
+}
+```
+
+### 14.2 Stages 内嵌并行（嵌套）
+
+```groovy
+stage('Test') {
+    parallel {
+        stage('Unit Tests') {
+            steps { sh 'mvn test' }
+        }
+        stage('Integration Tests') {
+            steps { sh 'mvn verify -Pit' }
+        }
+        stage('Security Scan') {
+            steps { sh 'trivy fs .' }
+        }
+    }
+}
+```
+
+### 14.3 容错控制
+
+| 参数 | 作用 | 默认 |
+|------|------|------|
+| `failFast: true` | 任一并行阶段失败则取消其他 | false |
+| `failFast: false` | 所有阶段跑完再汇总结果 | true |
+
+```groovy
+stage('Parallel Tests') {
+    failFast true   // 一个红即全部停
+    parallel {
+        stage('Unit') { steps { sh 'mvn test' } }
+        stage('Lint') { steps { sh 'eslint src/' } }
+    }
+}
+```
+
+## 十五、Jenkins vs GitHub Actions vs GitLab CI 深度对比
+
+| 维度 | Jenkins | GitHub Actions | GitLab CI |
+|------|---------|----------------|-----------|
+| **部署模式** | 自托管（Controller+Agent） | SaaS + 自托管 Runner | SaaS + 自托管 Runner |
+| **配置方式** | Jenkinsfile（Groovy DSL）+ UI | `.github/workflows/*.yml` | `.gitlab-ci.yml` |
+| **插件生态** | 1800+ 插件（最丰富） | Marketplace（中等） | 内置功能（GitLab SAST/DAST等） |
+| **弹性伸缩** | K8s Cloud 插件动态 Pod | 托管 Runner 自动扩缩 | GitLab Runner 自动扩缩 |
+| **学习曲线** | 陡（Groovy + 插件配置） | 低（YAML + Actions 市场） | 中（YAML + 内置能力） |
+| **安全集成** | 插件（SonarQube/Trivy） | 内置 CodeQL/Dependabot | 内置 SAST/DAST/Secret Detection |
+| **矩阵构建** | 需 Shared Library | `strategy.matrix` 原生 | `parallel:matrix` 原生 |
+| **制品管理** | 插件（Nexus/Artifactory） | GitHub Packages | GitLab Package Registry |
+| **成本** | 运维成本高（自托管） | 免费层 + 付费 Runner | 免费层 + 付费 Runner |
+
+```mermaid
+flowchart TD
+    A[CI/CD 工具选型] --> B{团队技术栈?}
+    B -->|GitHub 为主| C[GitHub Actions]
+    B -->|GitLab 为主| D[GitLab CI]
+    B -->|自托管/混合| E{复杂度需求?}
+    E -->|极致灵活| F[Jenkins]
+    E -->|云原生简洁| G[Tekton]
+```
+
+> **选型口诀**：GitHub 项目用 Actions，GitLab 项目用 GitLab CI，已有 Jenkins 存量的逐步迁移，纯 K8s 原生可评估 Tekton。
+
+## 十六、Jenkins 性能调优
+
+### 16.1 JVM 调优
+
+```bash
+# jenkins.xml 或环境变量
+JAVA_OPTS="-Xms2g -Xmx4g -XX:+UseG1GC -XX:+ParallelRefProcEnabled"
+```
+
+| 参数 | 建议 | 说明 |
+|------|------|------|
+| `-Xmx` | 4~8GB | Controller 堆内存上限 |
+| G1GC | 推荐 | 低延迟垃圾回收器 |
+| `-XX:+UseContainerSupport` | 容器必开 | 感知 cgroup 内存限制 |
+
+### 16.2 构建历史与磁盘
+
+```groovy
+// 按构建保留策略
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '5'))
+    }
+}
+```
+
+| 治理手段 | 作用 |
+|----------|------|
+| `buildDiscarder` | 保留最近 N 次构建 |
+| `cleanWs()` | 构建后清理 workspace |
+| 制品外置 | 大制品推 Nexus/Harbor，不存 Jenkins 本地 |
+| `JENKINS_HOME` 瘦身 | 定期清理 `builds/`、`workspace/` |
+
+### 16.3 Agent 调度优化
+
+| 优化 | 做法 |
+|------|------|
+| Label 精细 | 按构建类型（maven/docker/gpu）打 label |
+| Executor 合理 | CPU 密集型 = 核数/2，IO 密集型 = 核数 |
+| K8s 动态 Agent | 高峰自动扩 Pod，闲时缩为 0 |
+| 反亲和 | 构建型与测试型 Agent 分离 |
+
+## 十七、Jenkins 备份策略
+
+### 17.1 备份范围
+
+```mermaid
+flowchart TB
+    JH[JENKINS_HOME] -->|必须备份| CFG[config.xml]
+    JH -->|必须备份| CR[credentials.xml]
+    JH -->|必须备份| SEC[secrets/]
+    JH -->|必须备份| JOBS[jobs/*/config.xml]
+    JH -->|必须备份| PL[plugins/]
+    JH -->|可选| BLD[builds/ 历史记录]
+    JH -->|不用备份| WS[workspace/]
+```
+
+### 17.2 备份方案
+
+| 方案 | 工具 | 频率 | 恢复时间 |
+|------|------|------|----------|
+| thinBackup | 插件 | 每日 | 分钟级 |
+| 脚本备份 | `tar + crontab` | 每日 | 分钟级 |
+| K8s PVC 快照 | CSI Snapshot | 每日 | 分钟级 |
+| JCasC + Git | 配置即代码 | 实时（Git） | 秒级（配置恢复） |
+
+```bash
+#!/bin/bash
+# 备份关键文件（不含 workspace）
+BACKUP_DIR="/backup/jenkins/$(date +%Y%m%d)"
+mkdir -p "$BACKUP_DIR"
+tar czf "$BACKUP_DIR/config.tar.gz" \
+  $JENKINS_HOME/config.xml \
+  $JENKINS_HOME/credentials.xml \
+  $JENKINS_HOME/secrets/ \
+  $JENKINS_HOME/users/ \
+  $JENKINS_HOME/jobs/*/config.xml \
+  $JENKINS_HOME/plugins.txt \
+  2>/dev/null
+
+# 加密备份（含凭据）
+gpg -c "$BACKUP_DIR/config.tar.gz"
+```
+
+> ⚠️ **备份红线**：`JENKINS_HOME` 包含加密凭据，备份必须加密且异地存储，禁止明文上传对象存储。
+
 ## 本篇补充 Checklist
 
 - [ ] Controller 轻量化 + Agent 弹性，K8s 动态 Agent 按需扩缩。
 - [ ] 通用逻辑入 Shared Library 并锁版本、写单测。
 - [ ] 用 `cleanWs()` / Build Discarder / 制品库外置治理磁盘与内存。
 - [ ] 队列 pending、OOM、磁盘堆积是三大高频瓶颈，配监控告警。
+- [ ] 凭据只经 `withCredentials`，禁止硬编码进 Pipeline 或日志。
+- [ ] 并行阶段用 `failFast: true` 实现快速失败，矩阵构建控制维度爆炸。
+- [ ] JCasC + plugins.txt 声明式配置，杜绝 UI 手动漂移。
+- [ ] 定期备份 `JENKINS_HOME` 关键文件，加密异地存储。

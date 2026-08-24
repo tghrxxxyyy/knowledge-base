@@ -325,7 +325,297 @@ Pulumi：编程语言（通用），多云，需要编程能力
 
 ---
 
-## 九、与其他板块的关系
+## 九、K8s Helm Chart 深入
+
+### 9.1 Helm Chart 结构
+
+```
+mychart/
+  ├── Chart.yaml          # 元数据（版本/依赖）
+  ├── values.yaml         # 默认配置值
+  ├── templates/
+  │   ├── deployment.yaml # K8s 资源模板
+  │   ├── service.yaml
+  │   ├── ingress.yaml
+  │   ├── configmap.yaml
+  │   ├── secret.yaml
+  │   ├── hpa.yaml
+  │   ├── _helpers.tpl   # 模板助手函数
+  │   └── NOTES.txt       # 安装后提示
+  └── charts/             # 依赖 chart
+```
+
+### 9.2 Helm 模板语法
+
+```yaml
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mychart.fullname" . }}
+  labels:
+    {{- include "mychart.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mychart.selectorLabels" . | nindent 6 }}
+  template:
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+```
+
+### 9.3 Helm 最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| values 分层 | values.yaml + env-specific values |
+| 模板复用 | _helpers.tpl 提取公共模板 |
+| 版本管理 | Chart.yaml 语义化版本 |
+| 依赖管理 | Chart.yaml 声明依赖 |
+| 安全 | 非 root 运行，SecurityContext |
+| 健康检查 | liveness/readiness probe |
+| 资源限制 | requests/limits 明确声明 |
+
+---
+
+## 十、K8s Custom Operator
+
+### 10.1 Operator 模式
+
+```
+Operator = CRD（自定义资源）+ Controller（控制循环）
+
+控制循环：
+  1. Watch：监听 CRD 变更
+  2. Compare：当前状态 vs 期望状态
+  3. Act：调谐（Reconcile）到期望状态
+
+实现框架：
+  Kubebuilder（Go，官方推荐）
+  Operator SDK（Go/Ansible/Helm）
+  KUDO（声明式 Operator）
+```
+
+### 10.2 CRD 定义示例
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: webapps.example.com
+spec:
+  group: example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                image:
+                  type: string
+  scope: Namespaced
+  names:
+    plural: webapps
+    singular: webapp
+    kind: WebApp
+```
+
+---
+
+## 十一、K8s Admission Controllers
+
+### 11.1 准入控制流程
+
+```
+API Server 请求流程：
+  认证 → 授权 → 准入控制 → etcd
+
+准入控制器类型：
+  MutatingAdmissionWebhook：修改请求（注入 Sidecar 等）
+  ValidatingAdmissionWebhook：验证请求（策略检查）
+```
+
+### 11.2 常见准入控制器
+
+| 控制器 | 说明 |
+|--------|------|
+| PodSecurity | Pod 安全策略 |
+| ResourceQuota | 资源配额检查 |
+| LimitRange | 资源限制默认值 |
+| NamespaceExists | 命名空间存在检查 |
+| MutatingWebhook | Istio Sidecar 注入 |
+| ValidatingWebhook | 策略验证（OPA/Kyverno） |
+
+### 11.3 OPA Gatekeeper 示例
+
+```yaml
+# 禁止 latest tag
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredtags
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredTags
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredtags
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not startswith(container.image, "registry.example.com/")
+          msg := sprintf("镜像必须来自私有仓库: %v", [container.image])
+        }
+```
+
+---
+
+## 十二、K8s API Aggregation Layer
+
+### 12.1 聚合 API 架构
+
+```
+K8s API Server 请求路由：
+  /api/v1          → 内置资源（Pod/Service）
+  /apis/apps/v1    → 内置资源（Deployment）
+  /apis/custom.example.com/v1 → 聚合 API Server
+
+聚合层作用：
+  允许注册自定义 API Server
+  扩展 K8s API 能力
+  保持 K8s API 风格
+```
+
+### 12.2 APIService 注册
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1.custom.example.com
+spec:
+  group: custom.example.com
+  version: v1
+  service:
+    name: custom-api-server
+    namespace: system
+  caBundle: <base64-ca-cert>
+```
+
+---
+
+## 十三、K8s Storage Classes
+
+### 13.1 StorageClass 定义
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp3
+  iopsPerGB: "10"
+  encrypted: "true"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+### 13.2 动态供给流程
+
+```
+PVC → StorageClass → Provisioner → 创建 PV → 绑定 PVC → Pod 挂载
+
+StorageClass 关键参数：
+  provisioner：谁来创建存储（EBS/Ceph/NFS）
+  reclaimPolicy：Delete/Retain（PV 删除时行为）
+  volumeBindingMode：Immediate/WaitForFirstConsumer
+  allowVolumeExpansion：是否允许在线扩容
+```
+
+---
+
+## 十四、K8s 多集群管理
+
+### 14.1 多集群方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| Federation v2 | K8s 原生联邦 | 多集群资源同步 |
+| Anthos | Google 多集群管理 | GCP 生态 |
+| Rancher | 开源多集群管理 | 多云 |
+| Cluster API | 声明式集群生命周期 | 自建集群 |
+
+### 14.2 多集群网络
+
+```
+多集群网络方案：
+  ① 集群内：CNI（Calico/Cilium）
+  ② 集群间：Submariner/Cluster API
+  ③ 跨云：VPN/专线
+  ④ Service Mesh：Istio 多集群
+```
+
+---
+
+## 十五、GitOps 深入：Flux 与 ArgoCD 对比
+
+| 维度 | Flux | ArgoCD |
+|------|------|--------|
+| 架构 | 轻量级，单组件 | 功能丰富，多组件 |
+| UI | 无原生 UI（需 Weave GitOps） | 强大 Web UI |
+| 多集群 | 支持 | 强（可视化） |
+| RBAC | 基于 K8s RBAC | 内置 RBAC |
+| 通知 | 丰富（Slack/Teams/Webhook） | 有限 |
+| 适用 | 轻量 GitOps | 复杂多集群 |
+
+---
+
+## 十六、DevSecOps 流水线集成
+
+### 16.1 安全扫描阶段
+
+```
+CI/CD 安全扫描：
+  代码阶段：SAST（SonarQube/Checkmarx）
+  依赖阶段：SCA（Snyk/Dependabot）
+  构建阶段：镜像扫描（Trivy/Snyk）
+  部署阶段：IaC 扫描（Checkov/tfsec）
+  运行时：运行时安全（Falco/Tetragon）
+```
+
+### 16.2 DevSecOps 工具链
+
+| 阶段 | 工具 | 说明 |
+|------|------|------|
+| 代码 | SonarQube | 静态代码分析 |
+| 依赖 | Snyk | 依赖漏洞扫描 |
+| 镜像 | Trivy | 容器镜像 CVE |
+| IaC | Checkov | Terraform/K8s 安全 |
+| 策略 | OPA/Kyverno | K8s 策略执行 |
+| 运行时 | Falco | 运行时威胁检测 |
+
+---
+
+## 十七、与其他板块的关系
 
 - K8s 原理见「[云原生/Kubernetes核心](../../云原生/Kubernetes核心.md)」；
 - CI/CD 原理见「[基础知识/CI-CD](../../基础知识/CI-CD/README.md)」；

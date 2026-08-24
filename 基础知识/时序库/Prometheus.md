@@ -332,6 +332,152 @@ relabel_configs:
 
 ## 10. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
 
+### 10.1 Prometheus TSDB Compaction 深入
+
+```
+Compaction 类型：
+  Level 1：Head → Block（每 2 小时）
+  Level 2：合并小 Block（1~4 小时块 → 更大块）
+  Level 3：合并中等 Block（多天块 → 月级块）
+  Level 4：大块合并（月级 → 季度级）
+
+Compaction 策略：
+  - 时间窗口：2 小时 head → block
+  - 合并阈值：block 数量 > N 时触发合并
+  - 压缩率：提升 2~5 倍
+  - 索引重建：合并后重建倒排索引
+```
+
+### 10.2 Prometheus Exemplars
+
+```
+Exemplars 用途：
+  关联指标与链路追踪
+  在指标中嵌入 traceId
+  从指标跳转到具体 Trace
+
+示例：
+  http_request_duration_seconds_bucket{le="0.5"} 1234 # {traceId="abc123"}
+
+配置：
+  remote_write:
+    - url: http://thanos-receive:19291/api/v1/receive
+      send_exemplars: true
+```
+
+### 10.3 Prometheus Native Histograms
+
+```
+Native Histograms：
+  原生直方图，无需预定义桶
+  自动调整桶边界
+  更精确的分位数计算
+  更小的存储空间
+
+使用：
+  在应用中使用 histogram 和 native histogram
+  Prometheus 自动识别并存储
+  PromQL 查询直方图数据
+```
+
+### 10.4 Prometheus Remote Write/Read 深入
+
+```yaml
+# remote_write 高级配置
+remote_write:
+  - url: http://victoriametrics:8480/insert/0/prometheus/api/v1/write
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      min_shards: 1
+      max_shards: 200
+      capacity: 100000
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*'
+        action: drop
+    send_timeout: 30s
+    queue_config:
+      max_samples_per_send: 10000
+```
+
+### 10.5 Thanos Store Gateway 深入
+
+```
+Thanos Store Gateway：
+  对象存储的缓存层
+  缓存热门数据到本地
+  减少对象存储访问
+
+配置：
+  storegateway:
+    - --data-dir=/data
+    --objstore.config-file=/etc/thanos/s3.yml
+    --index-cache-size=500MB
+    --chunk-pool-size=2GB
+```
+
+### 10.6 Thanos Compactor
+
+```
+Thanos Compactor：
+  对象存储数据压缩
+  降采样（5m/1h 块）
+  保留策略管理
+
+配置：
+  compactor:
+    - --data-dir=/data
+    --objstore.config-file=/etc/thanos/s3.yml
+    --retention.resolution-raw=30d
+    --retention.resolution-5m=90d
+    --retention.resolution-1h=365d
+```
+
+### 10.7 Thanos Ruler
+
+```
+Thanos Ruler：
+  分布式告警/记录规则
+  基于 Thanos Query 查询
+  高可用告警
+
+配置：
+  ruler:
+    - --data-dir=/data
+    --objstore.config-file=/etc/thanos/s3.yml
+    --query=thanos-query:10901
+    --rule-file=/etc/thanos/rules/*.yml
+```
+
+### 10.8 kube-prometheus-stack 深入
+
+```
+kube-prometheus-stack 组件：
+  Prometheus Operator：管理 Prometheus 实例
+  Grafana：可视化
+  Alertmanager：告警管理
+  Node Exporter：节点指标
+  kube-state-metrics：K8s 资源指标
+  Prometheus Adapter：自定义指标
+
+部署：
+  helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack
+
+配置：
+  Prometheus：
+    retention: 15d
+    resources: { requests: { memory: 2Gi } }
+  Grafana：
+    adminPassword: admin
+  Alertmanager：
+    config: { ... }
+```
+
+---
+
+## 11. 速查表（扩展）
+
 ### 10.1 性能基准（推导 / 公开数字）
 
 - 写入吞吐：单实例受内存/ compaction 约束，活跃 series 建议 ≤ 200~500 万。

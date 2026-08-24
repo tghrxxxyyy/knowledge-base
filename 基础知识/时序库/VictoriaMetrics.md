@@ -350,6 +350,127 @@ scrape_configs:
 
 ## 10. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
 
+### 10.1 VictoriaMetrics 架构深入（Single vs Cluster）
+
+```
+Single 模式：
+  单二进制 victoria-metrics
+  包含所有功能（写入/查询/存储）
+  适合中小规模（<1亿样本/天）
+  
+Cluster 模式：
+  vmstorage：存储层（无状态协调，一致性哈希分片）
+  vminsert：写入代理（无状态，接收 remote_write）
+  vmselect：查询代理（无状态，并行查询合并）
+  
+关键设计：
+  三者全部无状态（除 vmstorage 持有数据）
+  可独立扩缩容
+  一致性哈希分片
+```
+
+### 10.2 VictoriaMetrics 去重机制
+
+```
+去重原理：
+  多副本 Prometheus 双写同一 VM
+  → 同一 (TSID, timestamp) 有多个样本
+  → 查询时去重（取最新值）
+
+去重配置：
+  vmselect -dedup.minScrapeInterval=30s
+  → 按最小抓取间隔去重
+  
+去重最佳实践：
+  1. 对齐时间戳（多副本时钟同步）
+  2. 设置合理的 minScrapeInterval
+  3. 查询时用 dedup() 函数
+  4. 监控去重效果
+```
+
+### 10.3 VictoriaMetrics 降采样
+
+```
+降采样策略：
+  原始数据：保留 1~3 月
+  5m 聚合：保留 3~6 月
+  1h 聚合：保留 6~12 月
+  
+降采样配置：
+  vmstorage -downsampling.period=30d:5m,90d:1h
+  
+降采样优势：
+  磁盘空间节省 5~10 倍
+  查询性能提升（数据量减少）
+  长期数据可查询
+```
+
+### 10.4 VictoriaMetrics vs Prometheus/TimescaleDB/InfluxDB
+
+| 维度 | VictoriaMetrics | Prometheus | TimescaleDB | InfluxDB |
+|------|----------------|------------|-------------|----------|
+| 架构 | 分布式 | 单机 | 分布式 | 分布式 |
+| 压缩比 | 极高（3~7x） | 中 | 中 | 中 |
+| 查询 | MetricsQL（PromQL 超集） | PromQL | SQL | Flux |
+| 成本 | 低 | 中 | 高 | 中 |
+| 适用 | 大规模监控 | 中小规模 | 时序+关系 | IoT/监控 |
+
+### 10.5 VictoriaMetrics in Kubernetes（vm-operator）
+
+```
+vm-operator 部署：
+  helm install vm-operator victoriametrics-operator
+  
+CRD 资源：
+  VMAgent：替代 Prometheus 抓取
+  VMAlert：告警/记录规则
+  VMSingle：单节点部署
+  VMCluster：集群部署
+  VMAlertmanager：告警管理
+  
+优势：
+  K8s 原生管理
+  自动扩缩容
+  声明式配置
+```
+
+### 10.6 VictoriaMetrics 保留策略
+
+```bash
+# 保留策略配置
+# Single 模式
+./victoria-metrics -retentionPeriod=12
+
+# Cluster 模式（vmstorage）
+./vmstorage -retentionPeriod=12 -storageDataPath=/vm-data
+
+# 保留策略最佳实践
+热数据：1~3 月（本地 SSD）
+温数据：3~12 月（本地 HDD）
+冷数据：12 月+（对象存储归档）
+```
+
+### 10.7 VictoriaMetrics 性能基准
+
+```
+官方 TSBS 测试数据：
+  写入吞吐：单节点 ~150~200 万 metrics/s
+  压缩比：比 Prometheus 本地省 3~7x
+  查询延迟：本地盘 <100ms
+  资源占用：内存/CPU 远低于 Prometheus
+
+容量规划公式：
+  日磁盘(GB) ≈ samples/s × 86400 × 1.0B / 1024³
+  例：5000 samples/s → 每天 ~0.43 GB
+  
+  内存(GB) ≈ 活跃 series × 4KB + 块缓存
+  例：100万 series → 约 4GB + 缓存
+```
+
+---
+
+## 11. 速查表（扩展）
+
 ### 10.1 性能基准（TSBS 实测数字）
 
 - 写入吞吐：官方 TSBS 公开区间，单节点 ~150~200 万 metrics/s；cluster 线性扩展。
