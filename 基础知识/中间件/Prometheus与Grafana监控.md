@@ -168,7 +168,408 @@ kube-prometheus-stack（Helm 一键安装）
 
 ---
 
-## 九、与其他板块的关系
+## 九、Prometheus TSDB 内部机制
+
+### 9.1 TSDB 存储结构
+
+```mermaid
+graph TD
+    A[Prometheus Server] --> B[Head Block 内存中]
+    A --> C[磁盘 Block 已持久化]
+    B --> D[WAL Write-Ahead Log]
+    C --> E[Block 元数据]
+    C --> F[Chunks 数据块]
+    C --> G[Index 索引]
+
+    style B fill:#ff9,stroke:#333
+    style D fill:#f9f,stroke:#333
+```
+
+| 组件 | 说明 |
+|------|------|
+| Head Block | 内存中的最新数据块（2h 为一个 block） |
+| WAL | 预写日志，防止宕机丢数据 |
+| Block | 持久化到磁盘的数据块（压缩后） |
+| Chunks | 时序数据的实际存储（Go 的 chunks 编码） |
+| Index | 倒排索引，支持按 label 快速查找 |
+| Tombstone | 删除标记（软删除） |
+
+### 9.2 数据写入流程
+
+```
+1. 路由器：根据 metric hash 路由到对应 time series
+2. Head Block：写入内存中的当前 block
+3. WAL：同步写入 WAL（防宕机丢数据）
+4. Block Cut：当 block 达到 2h 时长 → 切分
+5. Compact：后台压缩 → 写入磁盘 Block
+6. 降采样：旧 block 自动降采样（5m/1h 粒度）
+```
+
+### 9.3 Block 压缩与清理
+
+```
+压缩周期：
+  Level 1：2h block → 合并多个 2h block → 1 个大 block
+  Level 2：合并 Level 1 block → 更大的 block
+  Level 3：继续合并（deletion + compaction）
+
+清理策略：
+  过期 block → 自动删除
+  降采样 → 5m/1h 粒度（减少查询数据量）
+  WAL 清理 → block 持久化后删除对应 WAL
+```
+
+---
+
+## 十、Prometheus Recording Rules
+
+### 10.1 Recording Rule 配置
+
+```yaml
+groups:
+  - name: http_metrics
+    interval: 30s  # 规则执行间隔
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total{job="api"}[5m])) by (job)
+        
+      - record: instance:http_request_duration_seconds:p99
+        expr: histogram_quantile(0.99, 
+          sum(rate(http_request_duration_seconds_bucket[5m])) by (le, instance))
+        
+      - record: job:http_errors:ratio
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          / sum(rate(http_requests_total[5m])) by (job)
+```
+
+### 10.2 Recording Rule 最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 复杂聚合预计算 | 避免 Dashboard 查询超时 |
+| 固定间隔执行 | 与 scrape_interval 对齐 |
+| 命名规范 | `{level}:{metric}:{agg}` |
+| 分级聚合 | 先按实例聚合，再按服务聚合 |
+| 限制规则数量 | 规则太多增加 CPU 开销 |
+
+### 10.3 Recording Rule vs 即时查询
+
+| 维度 | Recording Rule | 即时查询 |
+|------|----------------|----------|
+| 性能 | 预计算，查询快 | 实时计算，查询慢 |
+| 存储 | 占用存储空间 | 不占额外存储 |
+| 实时性 | 有延迟（= 执行间隔） | 实时 |
+| 适用场景 | Dashboard/告警 | 临时分析 |
+
+---
+
+## 十一、Prometheus Federation（联邦）
+
+### 11.1 联邦架构
+
+```mermaid
+graph TD
+    A[全局 Prometheus] --> B[区域 Prometheus A]
+    A --> C[区域 Prometheus B]
+    A --> D[区域 Prometheus C]
+    B --> E[Pod 级 Exporter]
+    C --> F[Pod 级 Exporter]
+    D --> G[Pod 级 Exporter]
+
+    style A fill:#f96,stroke:#333
+    style B fill:#ff9,stroke:#333
+```
+
+### 11.2 联邦配置
+
+```yaml
+# 全局 Prometheus 配置
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job=~".+"}'
+        - '{__name__=~"job:.*"}'
+    static_configs:
+      - targets:
+        - 'region-a-prometheus:9090'
+        - 'region-b-prometheus:9090'
+```
+
+### 11.3 联邦 vs Thanos/Mimir
+
+| 方案 | 优势 | 劣势 |
+|------|------|------|
+| Federation | 简单，原生支持 | 全局视图有限，查询性能差 |
+| Thanos | 全局视图+长期存储+降采样 | 架构复杂 |
+| Cortex/Mimir | 水平扩展+多租户 | 运维成本高 |
+
+---
+
+## 十二、Thanos / Cortex 长期存储
+
+### 12.1 Thanos 架构
+
+```
+Thanos 组件：
+  Thanos Sidecar → 挂载 Prometheus，上传 Block 到对象存储
+  Thanos Store Gateway → 读取对象存储中的 Block
+  Thanos Compactor → 压缩与降采样
+  Thanos Query → 全局查询入口（联邦查询）
+  Thanos Ruler → 全局告警规则评估
+
+数据流：
+  Prometheus → Sidecar → 对象存储（S3/GCS）
+  Query → Store Gateway → 对象存储 → 全局视图
+```
+
+### 12.2 Thanos 关键配置
+
+```yaml
+# Sidecar 配置
+thanos sidecar \
+  --tsdb.path=/prometheus \
+  --objstore.config-file=bucket.yml \
+  --prometheus.url=http://localhost:9090
+
+# bucket.yml
+type: S3
+config:
+  bucket: thanos-metrics
+  endpoint: s3.us-west-2.amazonaws.com
+  access_key: XXX
+  secret_key: XXX
+```
+
+### 12.3 VictoriaMetrics 替代方案
+
+| 维度 | VictoriaMetrics | Thanos |
+|------|-----------------|--------|
+| 部署复杂度 | 低（单二进制） | 高（多组件） |
+| 压缩比 | 高（10x+） | 中 |
+| 查询性能 | 快 | 中 |
+| 兼容性 | 兼容 Prometheus API | 完全兼容 |
+| 多租户 | 支持 | 需要额外配置 |
+
+---
+
+## 十三、Grafana Dashboard 设计模式
+
+### 13.1 Dashboard 分层设计
+
+```
+L1 - 总览 Dashboard（Overview）
+  └── 服务级别指标：可用性/延迟/流量/错误率
+
+L2 - 服务 Dashboard（Service）
+  └── 服务级别详细：各接口指标/依赖状态
+
+L3 - 实例 Dashboard（Instance）
+  └── 实例级别：CPU/内存/JVM/连接池
+
+L4 - 告警 Dashboard（Alert）
+  └── 告警列表/历史/统计
+```
+
+### 13.2 常用面板类型
+
+| 面板类型 | 用途 | PromQL 示例 |
+|----------|------|-------------|
+| Stat | 单一数值 | `sum(http_requests_total)` |
+| Time Series | 时序曲线 | `rate(http_requests_total[5m])` |
+| Bar Gauge | 条形图 | `node_filesystem_avail_bytes` |
+| Table | 表格 | 多指标对比 |
+| Heatmap | 热力图 | Histogram 分布 |
+| Pie Chart | 饼图 | 比例分布 |
+
+### 13.3 Dashboard 变量模板
+
+```json
+{
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus"
+      },
+      {
+        "name": "job",
+        "type": "query",
+        "query": "label_values(http_requests_total, job)",
+        "refresh": 2
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "query": "label_values(http_requests_total{job=\"$job\"}, instance)",
+        "refresh": 2
+      }
+    ]
+  }
+}
+```
+
+---
+
+## 十四、Prometheus 告警规则最佳实践
+
+### 14.1 告警分级体系
+
+| 级别 | 响应时间 | 通知方式 | 示例 |
+|------|----------|----------|------|
+| P0 - Critical | 5分钟 | 电话+短信+IM | 服务宕机/数据丢失 |
+| P1 - Warning | 30分钟 | 短信+IM | CPU>80%/磁盘>85% |
+| P2 - Info | 工作时间 | 邮件 | 新实例加入/证书即将过期 |
+
+### 14.2 告警规则模板
+
+```yaml
+groups:
+  - name: service_slo
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          / sum(rate(http_requests_total[5m])) by (job) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate on {{ $labels.job }}"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+          
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job)
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency on {{ $labels.job }}"
+```
+
+### 14.3 告警抑制与静默
+
+```yaml
+# Alertmanager 抑制规则
+inhibit_rules:
+  - source_match:
+      alertname: ClusterDown
+    target_match_re:
+      alertname: .*
+    equal: [cluster]
+
+# 静默规则（维护期间）
+# amtool silence add alertname=.* duration=2h comment="维护中"
+```
+
+---
+
+## 十五、Prometheus 服务发现
+
+### 15.1 服务发现方式
+
+| 方式 | 说明 | 配置 |
+|------|------|------|
+| static_configs | 静态配置 | `static_configs: [{targets: [...]}]` |
+| kubernetes_sd | K8s API 发现 | `kubernetes_sd_configs: [{role: pod}]` |
+| consul_sd | Consul 服务发现 | `consul_sd_configs: [{server: ...}]` |
+| ec2_sd | AWS EC2 发现 | `ec2_sd_configs: [{region: ...}]` |
+| dns_sd | DNS 发现 | `dns_sd_configs: [{names: [...]}]` |
+
+### 15.2 K8s 服务发现配置
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+```
+
+### 15.3 Relabel 配置
+
+| action | 说明 |
+|--------|------|
+| keep | 保留匹配的 target |
+| drop | 丢弃匹配的 target |
+| replace | 替换标签值 |
+| labelmap | 所有 meta 标签映射到新标签 |
+| hashmod | 取模分片（多 Prometheus 分片采集） |
+
+---
+
+## 十六、Prometheus 在 Kubernetes 中（kube-prometheus-stack）
+
+### 16.1 kube-prometheus-stack 组件
+
+```
+kube-prometheus-stack（Helm Chart）
+  ├── Prometheus Operator（CRD 管理）
+  │   ├── ServiceMonitor → 定义采集目标
+  │   ├── PodMonitor → Pod 级采集
+  │   ├── PrometheusRule → 告警规则
+  │   └── Prometheus → 集群配置
+  ├── Prometheus（采集+存储+告警）
+  ├── Grafana（可视化）
+  ├── Alertmanager（告警路由）
+  ├── node_exporter（节点指标）
+  ├── kube-state-metrics（K8s 对象指标）
+  └── 预置 Dashboard + 告警规则
+```
+
+### 16.2 ServiceMonitor 示例
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-service-monitor
+  labels:
+    release: prometheus  # 与 Prometheus Operator 匹配
+spec:
+  selector:
+    matchLabels:
+      app: my-service
+  endpoints:
+  - port: http-metrics
+    interval: 30s
+    path: /metrics
+  namespaceSelector:
+    matchNames:
+    - my-namespace
+```
+
+### 16.3 Prometheus Operator 架构优势
+
+| 特性 | 说明 |
+|------|------|
+| 声明式配置 | 用 K8s CRD 管理监控配置 |
+| 自动发现 | 监听 ServiceMonitor/PodMonitor 变更 |
+| 滚动更新 | 配置变更自动重启 Prometheus |
+| 多租户 | 通过 namespace 隔离 |
+| 可扩展 | 支持 Thanos/VictoriaMetrics 集成 |
+
+---
+
+## 十七、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；
 - 监控告警规则库见「[场景设计/生产问题排查实战](../../场景设计/生产问题排查实战：常见故障与处置步骤.md)」；

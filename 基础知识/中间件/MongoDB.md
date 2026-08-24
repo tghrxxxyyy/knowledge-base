@@ -316,7 +316,259 @@ changeStream.on("change", (event) => {
 
 ---
 
-## 十二、与其他板块的关系（扩展）
+## 十二、MongoDB 分片深度
+
+### 12.1 分片架构组件
+
+```mermaid
+flowchart TB
+    MONGOS[mongos 路由] --> CONFIG[Config Server 副本集]
+    MONGOS --> SHARD1[Shard1 副本集]
+    MONGOS --> SHARD2[Shard2 副本集]
+    MONGOS --> SHARD3[Shard3 副本集]
+```
+
+| 组件 | 说明 |
+|------|------|
+| mongos | 路由器，应用只连 mongos |
+| Config Server | 存储分片元数据（chunk 分布），必须是副本集 |
+| Shard | 数据节点，每个 Shard 是一个副本集 |
+| Chunk | 分片键范围的一段数据块 |
+
+### 12.2 Balancer 均衡器
+
+```text
+Balancer 工作机制：
+  - 后台进程，定期检查各 Shard 的 chunk 数量
+  - chunk 数不均衡时自动迁移
+  - 迁移过程对应用透明（先复制 chunk，再删除源）
+  - 迁移窗口可配置（避免影响业务）
+```
+
+```javascript
+// 查看 Balancer 状态
+sh.getBalancerState()
+sh.isBalancerRunning()
+
+// 配置迁移窗口（UTC 时间）
+db.settings.update(
+  { _id: "balancer" },
+  { $set: { activeWindow: { start: "02:00", stop: "06:00" } } },
+  { upsert: true }
+)
+```
+
+### 12.3 Chunk 迁移流程
+
+```mermaid
+flowchart LR
+    S1[源 Shard] -->|1. 复制 chunk| S2[目标 Shard]
+    S2 -->|2. 确认完成| CONFIG[Config Server]
+    CONFIG -->|3. 更新元数据| S1
+    S1 -->|4. 删除本地 chunk| DONE[迁移完成]
+```
+
+### 12.4 分片键选择最佳实践
+
+```
+好的分片键特征：
+  1. 高基数：取值多，分布均匀
+  2. 查询必带：绝大多数查询都带分片键
+  3. 不单调递增：避免写入热点
+  4. 相对稳定：不会频繁变更
+
+推荐策略：
+  - Hashed 分片：均匀分布，适合等值查询
+  - Range 分片：适合范围查询，但易热点
+  - 复合分片键：{user_id: "hashed", created_at: 1}
+```
+
+---
+
+## 十三、副本集选举机制
+
+### 13.1 选举流程
+
+```text
+触发条件：
+  - Primary 宕机或网络不可达
+  - heartbeat 超时（默认 10s）
+
+选举过程（基于 Raft）：
+  1. Secondary 检测到 Primary 不可达
+  2. Secondary 提升为 Candidate，发起选举
+  3. 向所有节点请求投票
+  4. 获得多数派投票（N/2+1）→ 当选新 Primary
+  5. 更新 term（任期号），同步 oplog
+```
+
+### 13.2 选举配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `electionTimeoutMillis` | 10000 | 判定 Primary 不可达的时间 |
+| `priority` | 1 | 选举优先级（0=永远不竞选） |
+| `votes` | 1 | 投票权重 |
+| `arbiterOnly` | false | 仲裁节点（不存数据，只投票） |
+
+### 13.3 选举注意事项
+
+```
+1. 奇数节点：3/5/7，偶数节点可能脑裂
+2. 优先级配置：重要节点设高 priority
+3. 隐藏节点：priority=0 + hidden=true 做只读
+4. 延迟节点：priority=0 + secondaryDelaySecs 做延迟从库
+5. 网络分区：配置 protectiveMode 防止异常写入
+```
+
+---
+
+## 十四、Change Streams 深度
+
+### 14.1 原理
+
+```text
+Change Streams 基于 oplog 实现：
+  - 类似 MySQL binlog，记录所有写操作
+  - 通过 resume token 断点续传
+  - 支持集群级/库级/集合级监听
+  - 可过滤操作类型（insert/update/delete/replace）
+```
+
+### 14.2 高级用法
+
+```javascript
+// 集群级 Change Stream
+const changeStream = db.watch([], { resumeAfter: resumeToken });
+
+// 带管道过滤
+const changeStream = ordersCollection.watch([
+  { $match: { "operationType": "insert", "fullDocument.amount": { $gte: 1000 } } }
+]);
+
+// 断点续传
+const resumeToken = changeStream.resumeToken;
+// 重启后
+const changeStream = collection.watch([], { resumeAfter: resumeToken });
+
+// 关闭监听
+changeStream.close();
+```
+
+### 14.3 Change Streams vs CDC
+
+| 维度 | Change Streams | CDC (Canal/Debezium) |
+|------|---------------|---------------------|
+| 数据源 | MongoDB oplog | MySQL binlog |
+| 延迟 | 毫秒级 | 秒级 |
+| 目标 | MongoDB 间同步 | 异构系统同步 |
+| 部署 | 内嵌 MongoDB | 独立组件 |
+| 适用 | 事件驱动/CDC | 跨数据库同步 |
+
+---
+
+## 十五、聚合管道优化
+
+### 15.1 优化原则
+
+```
+1. $match 前置：尽早过滤数据，减少后续处理量
+2. $project 精简：只传递需要的字段
+3. 使用索引：$match 和 $sort 尽量命中索引
+4. 避免 $lookup：尽量用嵌入文档替代关联查询
+5. 限制结果集：$limit 提前限制数量
+6. explain() 分析：查看执行计划确认优化效果
+```
+
+### 15.2 优化示例
+
+```javascript
+// 差：$lookup 放前面
+db.orders.aggregate([
+  { $lookup: { from: "users", localField: "user_id", foreignField: "_id", as: "user" } },
+  { $match: { status: "paid" } },
+  { $group: { _id: "$user_id", total: { $sum: "$amount" } } }
+])
+
+// 好：$match 前置 + 嵌入文档
+db.orders.aggregate([
+  { $match: { status: "paid" } },
+  { $project: { user_id: 1, amount: 1 } },
+  { $group: { _id: "$user_id", total: { $sum: "$amount" } } }
+])
+```
+
+---
+
+## 十六、WiredTiger 内部机制
+
+### 16.1 存储架构
+
+```mermaid
+flowchart TB
+    CACHE[WiredTiger Cache 内存] --> DISK[磁盘数据文件]
+    CACHE --> JOURNAL[WAL 日志]
+    CACHE --> CHECKPOINT[Checkpoint]
+```
+
+| 组件 | 说明 |
+|------|------|
+| Cache | 默认占物理内存 50%，LRU 淘汰 |
+| B-Tree | 数据索引结构，文档级并发控制 |
+| Journal | WAL 预写日志，崩溃恢复 |
+| Checkpoint | 定期刷盘，持久化 |
+| Snappy | 默认压缩算法，压缩率约 80% |
+
+### 16.2 性能调优
+
+```yaml
+# WiredTiger 缓存配置
+storage:
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 4          # 手动设置缓存大小
+      journalCompressor: snappy
+    collectionConfig:
+      blockCompressor: snappy
+    indexConfig:
+      prefixCompression: true
+```
+
+---
+
+## 十七、MongoDB Atlas 特性
+
+```text
+Atlas = MongoDB 官方全托管云服务（AWS/Azure/GPC）
+
+核心特性：
+  - 自动副本集/分片集群部署
+  - 自动备份与时间点恢复（PITR）
+  - 实时性能仪表盘
+  - 全球数据库集群（Global Clusters）
+  - 数据库搜索（Atlas Search = Lucene）
+  - Atlas Data Lake（S3 查询）
+  - 联合查询（Federated Query）
+  - 多云部署（AWS + Azure + GCP）
+```
+
+---
+
+## 十八、MongoDB vs DynamoDB vs CouchDB
+
+| 维度 | MongoDB | DynamoDB | CouchDB |
+|------|---------|----------|---------|
+| 数据模型 | 文档（BSON） | KV + 文档 | JSON 文档 |
+| 查询 | 丰富（聚合管道） | 有限（GSI/LSI） | MapReduce |
+| 事务 | 多文档 ACID | 单文档 ACID | 无 |
+| 扩展 | 分片（手动/自动） | 自动扩缩容 | 多主复制 |
+| 一致性 | 可调（最终/majority） | 强一致/最终一致 | 最终一致 |
+| 适用 | 通用文档数据库 | AWS 生态 KV/文档 | P2P 同步场景 |
+| 成本 | 自建可控 | 按量计费（可能高） | 开源免费 |
+
+---
+
+## 十九、与其他板块的关系（扩展）
 
 - 与 [MySQL](../mysql知识.md)、[Redis](../redis知识.md)：MongoDB 补「文档/半结构 + 水平扩展」，Redis 补缓存/高性能 KV，MySQL 保强事务。
 - 与 [分库分表 ShardingSphere](分库分表ShardingSphere.md)：ShardingSphere 是「关系型分库分表」方案；MongoDB 原生分片可替代部分场景，二者选型看是否要保 ACID/SQL。

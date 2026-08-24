@@ -220,7 +220,521 @@ Delete：自动删除过期数据
 
 ---
 
-## 五、与其他板块的关系
+## 五、索引生命周期管理（ILM）深入
+
+### 5.1 ILM 策略配置
+
+```json
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": { "priority": 0 },
+          "freeze": {}
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### 5.2 ILM 状态查看
+
+```bash
+# 查看索引 ILM 状态
+GET logs-*/_ilm/explain
+
+# 手动执行 ILM 操作
+POST logs-000001/_ilm/rollover
+
+# 重置 ILM 步骤
+POST logs-000001/_ilm/operation/retry
+```
+
+### 5.3 Rollover 与别名
+
+```json
+# 创建带 ILM 的初始索引
+PUT /%3Clogs-%7Bnow%2Fd%7D-000001
+{
+  "aliases": {
+    "logs-write": { "is_write_index": true },
+    "logs-read": {}
+  },
+  "settings": {
+    "index.lifecycle.name": "logs-policy",
+    "index.lifecycle.rollover_alias": "logs-write"
+  }
+}
+
+# Rollover 后自动创建新索引，别名自动切换
+```
+
+---
+
+## 六、跨集群复制（CCR）
+
+### 6.1 CCR 架构
+
+```mermaid
+graph LR
+    A[主集群 Leader] -->|异步复制| B[从集群 Follower]
+    A -->|异步复制| C[灾备集群 Follower]
+    B -->|查询/读| D[本地读请求]
+    C -->|灾备切换| E[故障时提升为主]
+```
+
+### 6.2 CCR 配置
+
+```bash
+# 主集群：创建 Leader 索引
+PUT /logs-leader
+{
+  "settings": {
+    "index.xpack.ccr.following_enabled": true
+  }
+}
+
+# 从集群：创建 Follower 索引
+PUT /logs-follower
+{
+  "remote_info": {
+    "cluster": "primary-cluster"
+  },
+  "settings": {
+    "index.xpack.ccr.leader_alias": "logs-leader"
+  }
+}
+
+# 查看复制状态
+GET /logs-follower/_ccr/stats
+```
+
+### 6.3 CCR 适用场景
+
+| 场景 | 说明 |
+|------|------|
+| 灾备 | 主集群故障，从集群提升为新主 |
+| 跨地域读 | 就近读取，降低延迟 |
+| 报表查询 | 从集群专门处理查询，不影响主集群写入 |
+| 数据合规 | 特定地域数据保留要求 |
+
+---
+
+## 七、可搜索快照（Searchable Snapshots）
+
+### 7.1 快照存储架构
+
+```
+本地存储（热数据） ←→ 对象存储（S3/GCS/Azure Blob）
+   │                      │
+   ├── 完整索引数据        ├── 冻结索引数据
+   └── 毫秒级查询          └── 按需加载到本地缓存
+
+Searchable Snapshot = 从对象存储按需加载分片到本地缓存
+  节点本地磁盘：存储热数据
+  对象存储：存储冷数据（成本低 10 倍+）
+```
+
+### 7.2 快照配置示例
+
+```json
+# 将索引迁移到快照存储
+POST _snapshot/my_s3_repository/logs-000001/_restore
+{
+  "indices": "logs-*",
+  "index_settings": {
+    "index.number_of_replicas": 0
+  }
+}
+
+# 配置分层存储
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "cold": {
+        "actions": {
+          "searchable_snapshot": {
+            "snapshot_repository": "my_s3_repository"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 7.3 快照性能优化
+
+| 配置 | 说明 |
+|------|------|
+| `index.store.snapshot.blob_cache.size` | 本地缓存大小（默认 100MB） |
+| `index.store.snapshot.partial_file.readahead_size` | 预读大小 |
+| 冷数据节点角色 | `node.roles: [data_cold]` |
+| 强制合并 | 冻结前 `forcemerge` 到 1 个 segment |
+
+---
+
+## 八、Elasticsearch 与 Kubernetes（ECK Operator）
+
+### 8.1 ECK 架构
+
+```
+Elastic Cloud on Kubernetes（ECK）
+  └── Elasticsearch Operator（自动部署/管理/扩缩容）
+
+CRD 资源：
+  Elasticsearch  → 集群定义
+  Kibana         → Kibana 定义
+  APM Server     → APM 定义
+  Elastic Agent  → Agent 定义
+
+自动操作：
+  节点发现与加入
+  证书管理（自动生成 TLS）
+  滚动升级
+  存储卷管理
+  健康检查与自愈
+```
+
+### 8.2 ECK 部署示例
+
+```yaml
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: production
+spec:
+  version: 8.12.0
+  nodeSets:
+  - name: master
+    count: 3
+    config:
+      node.roles: ["master"]
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+        storageClassName: fast-ssd
+  - name: data-hot
+    count: 3
+    config:
+      node.roles: ["data_hot", "ingest"]
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 200Gi
+        storageClassName: fast-ssd
+  - name: data-warm
+    count: 2
+    config:
+      node.roles: ["data_warm"]
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 500Gi
+        storageClassName: hdd
+```
+
+### 8.3 ECK 与 K8s 监控集成
+
+```yaml
+# 自定义 Pod 模板添加 Prometheus 注解
+spec:
+  nodeSets:
+  - name: data
+    podTemplate:
+      metadata:
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9200"
+          prometheus.io/path: "/_metrics/prometheus"
+```
+
+---
+
+## 九、查询性能优化（Doc Values / Fielddata）
+
+### 9.1 Doc Values 机制
+
+| 特性 | 说明 |
+|------|------|
+| 存储方式 | 列式存储（与行式 _source 互补） |
+| 用途 | 排序、聚合、脚本访问字段值 |
+| 默认开启 | keyword/数值/日期/boolean |
+| 关闭方式 | `"doc_values": false`（节省磁盘但不能排序/聚合） |
+
+### 9.2 Fielddata 与 Text 字段聚合
+
+```json
+// Text 字段默认不支持聚合（需开启 fielddata）
+PUT /my-index/_mapping
+{
+  "properties": {
+    "title": {
+      "type": "text",
+      "fielddata": true,
+      "fielddata_frequency_filter": {
+        "min": 0.01,
+        "min_segment_size": 1000
+      }
+    }
+  }
+}
+
+// 更佳方案：用 keyword 子字段聚合
+{
+  "properties": {
+    "title": {
+      "type": "text",
+      "fields": {
+        "keyword": { "type": "keyword" }
+      }
+    }
+  }
+}
+
+// 聚合使用 title.keyword
+GET /my-index/_search
+{
+  "aggs": {
+    "title_agg": {
+      "terms": { "field": "title.keyword" }
+    }
+  }
+}
+```
+
+### 9.3 查询性能优化速查
+
+| 优化手段 | 说明 |
+|----------|------|
+| filter 替代 query | filter 不计分且可缓存 |
+| 禁用不需要的 `_source` 字段 | 减少网络传输 |
+| 合理设置 `size: 0` | 聚合查询不返回文档 |
+| 使用 `preference` 路由查询 | 利用缓存 |
+| 开启 `search.allow_partial_results` | 部分分片失败不阻塞整体 |
+| 控制分片数 | 每个分片有查询开销 |
+
+---
+
+## 十、批量索引最佳实践
+
+### 10.1 Bulk API 使用规范
+
+```json
+POST _bulk
+{"index": {"_index": "logs", "_id": 1}}
+{"timestamp": "2024-01-01", "message": "hello"}
+{"index": {"_index": "logs", "_id": 2}}
+{"timestamp": "2024-01-01", "message": "world"}
+```
+
+### 10.2 Bulk 调优参数
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| 批量大小 | 5~15MB | 太小浪费连接，太大占用内存 |
+| 文档数 | 1000~5000 | 根据文档大小调整 |
+| 线程数 | 1~CPU 核数 | 避免过多线程竞争 |
+| refresh_interval | 30s | 写入密集时调大 |
+| translog.durability | async | 异步提升写入，有丢数据风险 |
+| 副本数 | 0→1 | 写入时禁用副本，写完恢复 |
+
+### 10.3 Bulk 写入监控
+
+```bash
+# 监控 Bulk 拒绝数
+curl -s localhost:9200/_cat/thread_pool/write?v&h=node_name,active,queue,rejected
+
+# 监控索引速率
+curl -s localhost:9200/_nodes/stats/indices/indexing
+
+# 分析慢 Bulk
+GET _cluster/stats?pretty
+```
+
+---
+
+## 十一、Elasticsearch 安全（RBAC / SAML / OIDC）
+
+### 11.1 安全架构
+
+```
+Elasticsearch Security
+  ├── 认证（Authentication）
+  │   ├── 内置用户（elastic/changeme）
+  │   ├── LDAP/Active Directory
+  │   ├── SAML（企业 SSO）
+  │   ├── OIDC（OpenID Connect）
+  │   └── API Key / Token
+  ├── 授权（Authorization）
+  │   ├── RBAC（角色控制）
+  │   ├── 基于字段/文档权限
+  │   └── 基于索引的权限
+  └── 审计（Audit Logging）
+      └── 记录所有管理操作和查询
+```
+
+### 11.2 RBAC 配置示例
+
+```json
+# 创建角色
+POST /_security/role/log_reader
+{
+  "cluster": ["monitor"],
+  "indices": [
+    {
+      "names": ["logs-*"],
+      "privileges": ["read", "view_index_metadata"]
+    }
+  ]
+}
+
+# 创建用户并分配角色
+POST /_security/user/log_analyst
+{
+  "password": "secure_password",
+  "roles": ["log_reader"],
+  "full_name": "Log Analyst"
+}
+```
+
+### 11.3 SAML 集成配置
+
+```yaml
+# elasticsearch.yml
+xpack.security.authc.realms.saml.saml1:
+  order: 3
+  idp.metadata.path: idp-metadata.xml
+  idp.entity_id: https://idp.example.com
+  sp.entity_id: https://elasticsearch.example.com
+  sp.acs: https://elasticsearch.example.com/_security/acs/saml
+  attributes.principal: nameid
+  attributes.groups: groups
+```
+
+### 11.4 API Key 管理
+
+```bash
+# 创建 API Key
+POST /_security/api_key
+{
+  "name": "monitoring-key",
+  "role_descriptors": {
+    "monitoring": {
+      "cluster": ["monitor"],
+      "index": [{ "names": ["monitoring-*"], "privileges": ["read"] }]
+    }
+  }
+}
+
+# 使用 API Key
+curl -H "Authorization: ApiKey <base64-encoded-key>" \
+  localhost:9200/_cat/indices
+```
+
+---
+
+## 十二、Elasticsearch 可观测性
+
+### 12.1 内置监控指标
+
+```
+Elasticsearch 核心指标：
+  集群健康：green/yellow/red
+  节点指标：JVM/GC/CPU/内存
+  索引指标：索引速率/查询速率/延迟
+  线程池：write/search/get/bulk 拒绝数
+  磁盘：水位线/IO 延迟
+```
+
+### 12.2 Prometheus 集成
+
+```yaml
+# elasticsearch.yml
+xpack.monitoring.collection.enabled: true
+xpack.monitoring.exporters.prometheus.type: http
+xpack.monitoring.exporters.prometheus.host: ["http://prometheus:9090"]
+
+# 或使用 elasticsearch_exporter
+# docker run --rm -p 9114:9114 \
+#   justwatch/elasticsearch_exporter \
+#   --es.uri=http://localhost:9200
+```
+
+### 12.3 慢查询日志配置
+
+```yaml
+# elasticsearch.yml
+index.search.slowlog.threshold.query.warn: 5s
+index.search.slowlog.threshold.query.info: 2s
+index.search.slowlog.threshold.fetch.warn: 1s
+index.indexing.slowlog.threshold.index.warn: 5s
+```
+
+### 12.4 健康检查命令
+
+```bash
+# 集群健康
+GET _cluster/health?pretty
+
+# 节点统计
+GET _nodes/stats?pretty
+
+# 索引统计
+GET _stats?pretty
+
+# 分片分布
+GET _cat/shards?v&h=index,shard,prirep,state,node
+
+# 未分配分片原因
+GET _cluster/allocation/explain?pretty
+```
+
+---
+
+## 十三、与其他板块的关系
 
 - ES 基础见「[ES 体系](../ES体系.md)」；
 - ES 源码见「[MySQL InnoDB 源码](../../源码系列/MySQL-InnoDB源码.md)」（参考思路）；

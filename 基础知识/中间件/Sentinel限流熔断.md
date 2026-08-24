@@ -167,7 +167,351 @@ public Order getOrder(String id) { ... }
 
 ---
 
-## 八、与其他板块的关系
+## 八、Sentinel 流控内部实现
+
+### 8.1 漏桶算法（Leaky Bucket）
+
+```mermaid
+graph TD
+    A[请求进入] --> B[队列/桶]
+    B -->|固定速率流出| C[处理请求]
+    B -->|队列满| D[直接拒绝]
+
+    style B fill:#f9f,stroke:#333
+```
+
+| 特性 | 说明 |
+|------|------|
+| 原理 | 请求进入固定大小的桶，以恒定速率流出 |
+| 优势 | 平滑流量，削峰填谷 |
+| 劣势 | 突发流量需排队等待，延迟较高 |
+| Sentinel 实现 | `controlBehavior=2`（匀速排队模式） |
+
+### 8.2 Warm Up（冷启动）
+
+```
+Warm Up = 请求以固定间隔通过，阈值从 低 → 高 线性增长
+
+原理：
+  冷启动因子（默认 3）= 阈值/3
+  预热时长内，允许通过的请求数从 count/3 线性增长到 count
+  预热时长结束 → 稳态阈值
+
+示例：
+  count=90, warmUpPeriodSec=10
+  → 初始 QPS = 90/3 = 30
+  → 10s 内线性增长到 90
+  → 10s 后稳定在 90
+```
+
+| 场景 | 说明 |
+|------|------|
+| 服务刚启动 | 线程池/连接池未初始化，容量不足 |
+| 依赖冷资源 | 缓存未预热，数据库连接未建立 |
+| 大促场景 | 流量从零突增，系统需渐进式扩容 |
+
+### 8.3 系统自适应保护（System Adaptive）
+
+| 保护维度 | 说明 | 计算方式 |
+|----------|------|----------|
+| CPU 使用率 | 系统 CPU 超阈值限流 | 实时 CPU 使用率 > 阈值 → 拒绝 |
+| 系统负载 | 系统 load 超阈值限流 | 系统 load > 阈值 → 拒绝 |
+| 入口 QPS | 入口总 QPS 超阈值限流 | 所有入口 QPS 之和 > 阈值 → 拒绝 |
+| 平均 RT | 入口平均 RT 超阈值限流 | 平均 RT > 阈值 → 拒绝 |
+
+```
+系统保护原理：
+  1. 定期（默认 1s）采集系统指标（CPU/Load/QPS/RT）
+  2. 通过滑动窗口计算当前系统负载
+  3. 负载超阈值 → 自动调整 QPS 上限
+  4. 负载恢复 → 逐步放开口径
+
+优势：无需手动设置阈值，系统自动感知负载
+劣势：依赖操作系统指标采集精度
+```
+
+### 8.4 Sentinel 流控与 QPS 计算
+
+```
+Sentinel QPS 统计实现：
+  滑动窗口（LeapArray）
+    ├── 窗口大小：默认 1s
+    ├── 粒度：默认 500ms（半秒）
+    └── 桶数：2（窗口大小/粒度）
+
+  每个桶统计：passCount / blockCount / exceptionCount / completeCount
+  QPS = passCount / 窗口时长
+
+  实时性：每 500ms 更新一次统计
+  性能：无锁 CAS + ThreadLocal 局部桶
+```
+
+---
+
+## 九、Sentinel 熔断状态机
+
+### 9.1 三态模型
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: 触发熔断条件
+    Open --> HalfOpen: 熔断时长结束
+    HalfOpen --> Closed: 探测请求成功
+    HalfOpen --> Open: 探测请求失败
+```
+
+| 状态 | 说明 | 行为 |
+|------|------|------|
+| **Closed**（关闭） | 正常状态，放行所有请求 | 统计慢调用/异常比例，达阈值 → Open |
+| **Open**（打开） | 熔断状态，拒绝所有请求 | 等待熔断时长 → HalfOpen |
+| **HalfOpen**（半开） | 探测恢复 | 放行一个请求，成功 → Closed，失败 → Open |
+
+### 9.2 熔断时序示例
+
+```
+时间线：
+  T0：慢调用比例达阈值 → 熔断（Open）
+  T1~T10：所有请求被拒绝（Fast Fail）
+  T10：熔断时长结束 → HalfOpen
+  T11：探测请求成功 → Closed（恢复正常）
+  T12：探测请求失败 → Open（继续熔断）
+```
+
+### 9.3 熔断配置最佳实践
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| minRequestAmount | 5~10 | 最小请求数（低于此不触发） |
+| statIntervalMs | 1000~10000 | 统计时间窗口 |
+| timeWindow | 10~30s | 熔断时长 |
+| slowRatioThreshold | 0.5~0.8 | 慢调用比例阈值 |
+| maxAllowedRt | 500~2000ms | 慢调用 RT 阈值 |
+
+---
+
+## 十、Sentinel 系统保护规则
+
+### 10.1 系统规则配置
+
+```json
+[
+  {
+    "resource": "系统规则",
+    "highestSystemLoad": 10,
+    "highestCpuUsage": 0.8,
+    "maxRt": 500,
+    "maxQps": 10000
+  }
+]
+```
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| highestSystemLoad | 系统最高负载 | CPU 核数 × 2 |
+| highestCpuUsage | 最高 CPU 使用率 | 0.7~0.85 |
+| maxRt | 最高平均 RT | 业务可接受的上限 |
+| maxQps | 最高入口 QPS | 系统处理能力上限 |
+
+### 10.2 系统保护 vs 资源级限流
+
+| 维度 | 系统保护 | 资源级限流 |
+|------|----------|------------|
+| 粒度 | 全局（整个应用） | 单个资源（接口） |
+| 依据 | 系统指标（CPU/Load/QPS/RT） | 资源指标（QPS/线程数） |
+| 作用 | 自动调整全局 QPS 上限 | 控制单个接口流量 |
+| 场景 | 系统整体过载保护 | 防止单接口被打爆 |
+
+---
+
+## 十一、Sentinel 与 Spring Cloud 深度集成
+
+### 11.1 自动配置原理
+
+```java
+// SentinelAutoConfiguration 自动装配流程
+1. @EnableConfigurationProperties → SentinelProperties
+2. @ConditionalOnClass → classpath 有 Sentinel 时生效
+3. 初始化 SentinelResourceAspect（AOP 拦截 @SentinelResource）
+4. 注册 Sentinel 与 Nacos/Apollo 的数据源绑定
+5. 注册 Sentinel 与 Spring Cloud Gateway 的集成
+```
+
+### 11.2 Feign 与 Sentinel 集成
+
+```yaml
+# application.yml
+spring:
+  cloud:
+    openfeign:
+      sentinel:
+        enabled: true  # 启用 Feign Sentinel 降级
+
+# Feign 接口降级
+@FeignClient(name = "user-service", fallback = UserServiceFallback.class)
+public interface UserService {
+    @GetMapping("/user/{id}")
+    User getUser(@PathVariable Long id);
+}
+
+@Component
+public class UserServiceFallback implements UserService {
+    @Override
+    public User getUser(Long id) {
+        return new User("默认用户");  // 降级返回
+    }
+}
+```
+
+### 11.3 RestTemplate 与 Sentinel 集成
+
+```java
+@Configuration
+public class RestTemplateConfig {
+    @Bean
+    @SentinelRestTemplate  // 自动注入 Sentinel 保护
+    public RestTemplate restTemplate() {
+        return new RestTemplate();
+    }
+}
+```
+
+---
+
+## 十二、Sentinel Dashboard 定制化
+
+### 12.1 Dashboard 架构
+
+```
+Sentinel Dashboard
+  ├── 实时监控（WebSocket 推送）
+  │   ├── QPS 曲线
+  │   ├── 线程数曲线
+  │   └── RT 曲线
+  ├── 规则管理（推送到配置中心）
+  │   ├── 流控规则
+  │   ├── 熔断规则
+  │   ├── 热点规则
+  │   └── 系统规则
+  ├── 机器列表（健康状态）
+  └── 集群流控（Token Server）
+```
+
+### 12.2 Dashboard 定制开发
+
+```java
+// 自定义数据源（从 MySQL 加载规则）
+@Component
+public class DataSourceRuleManager {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    public List<FlowRule> getFlowRules(String app) {
+        String sql = "SELECT * FROM sentinel_flow_rules WHERE app_name = ?";
+        return jdbcTemplate.query(sql, new Object[]{app}, (rs, rowNum) -> {
+            FlowRule rule = new FlowRule();
+            rule.setResource(rs.getString("resource"));
+            rule.setCount(rs.getDouble("count"));
+            rule.setGrade(rs.getInt("grade"));
+            return rule;
+        });
+    }
+}
+```
+
+### 12.3 Dashboard 高可用
+
+| 方案 | 说明 |
+|------|------|
+| 单实例 | 开发/测试环境 |
+| 多实例 + 共享配置中心 | 所有实例从 Nacos 读取规则 |
+| 自定义 Dashboard | 对接公司内部权限系统 |
+
+---
+
+## 十三、Sentinel vs Hystrix vs Resilience4j 深度对比
+
+### 13.1 架构对比
+
+| 维度 | Sentinel | Hystrix | Resilience4j |
+|------|----------|---------|--------------|
+| 隔离模型 | 信号量 | 线程池/信号量 | 信号量 |
+| 线程池开销 | 无 | 每资源一个线程池 | 无 |
+| 熔断状态 | 三态（Closed/Open/HalfOpen） | 三态 | 三态 |
+| 滑动窗口 | LeapArray（环形缓冲区） | RxJava 滑动窗口 | 基于环形缓冲区 |
+| 规则存储 | 多数据源（Nacos/ZK/Apollo） | 本地 | 配置文件 |
+| 控制台 | 完整（实时监控+规则下发） | 已停更 | 无（依赖 Micrometer） |
+
+### 13.2 性能对比
+
+| 指标 | Sentinel | Hystrix | Resilience4j |
+|------|----------|---------|--------------|
+| 单机 QPS（限流） | 100k+ | N/A | 50k+ |
+| 单机 QPS（熔断） | 50k+ | 10k+ | 30k+ |
+| 内存占用 | 低 | 高（线程池） | 低 |
+| GC 压力 | 低 | 高 | 低 |
+
+### 13.3 生态适配
+
+```
+Spring Cloud Alibaba 生态：
+  Nacos（注册+配置）+ Sentinel（限流熔断）+ Seata（分布式事务）
+  → 一站式解决方案
+
+Spring Cloud 原生生态：
+  Spring Cloud Gateway + Resilience4j + Spring Cloud Config
+  → 轻量级方案
+
+Dubbo 生态：
+  Sentinel + Nacos + Dubbo
+  → RPC 流量治理
+```
+
+---
+
+## 十四、Sentinel 生产最佳实践
+
+### 14.1 规则配置流程
+
+```
+1. 压测 → 确定系统 QPS/RT/线程数上限
+2. 设置系统保护规则（CPU/Load/QPS）
+3. 为每个核心接口设置限流规则（QPS × 1.2 冗余）
+4. 为下游依赖设置熔断规则（慢调用/异常比例）
+5. 为热点参数设置热点规则（商品ID/用户ID）
+6. 为黑白名单设置授权规则
+7. 规则推送到 Nacos → 持久化
+8. 观察 Dashboard → 调整阈值
+```
+
+### 14.2 降级策略设计
+
+| 降级层级 | 策略 | 示例 |
+|----------|------|------|
+| 接口级 | 返回默认值 | 返回空列表 |
+| 服务级 | 缓存降级 | 返回 Redis 缓存数据 |
+| 功能级 | 功能开关 | 关闭非核心功能 |
+| 全局级 | 页面降级 | 显示维护页面 |
+
+### 14.3 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: sentinel-alerts
+    rules:
+      - alert: SentinelBlockHigh
+        expr: sum(rate(sentinel_block_total[5m])) by (resource) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sentinel 限流告警：{{ $labels.resource }}"
+```
+
+---
+
+## 十五、与其他板块的关系
 
 - 限流原理（令牌桶/漏桶/滑动窗口）见「[场景设计/稳定性三板斧](../../场景设计/稳定性三板斧：限流-熔断-降级.md)」；
 - 分布式限流见「[Redis 实现限流](../../场景设计/redis实现限流.md)」；

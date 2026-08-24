@@ -189,7 +189,454 @@ Pod
 
 ---
 
-## 八、与其他板块的关系
+## 八、Envoy xDS 协议深度
+
+### 8.1 xDS 协议架构
+
+```mermaid
+graph TD
+    A[控制面 Istiod/Pilot] -->|gRPC Stream| B[LDS Listener Discovery]
+    A -->|gRPC Stream| C[RDS Route Discovery]
+    A -->|gRPC Stream| D[CDS Cluster Discovery]
+    A -->|gRPC Stream| E[EDS Endpoint Discovery]
+    A -->|gRPC Stream| F[SDS Secret Discovery]
+    B --> G[Envoy Proxy]
+    C --> G
+    D --> G
+    E --> G
+    F --> G
+```
+
+### 8.2 xDS 协议详解
+
+| 协议 | 全称 | 作用 |
+|------|------|------|
+| LDS | Listener Discovery Service | 发现监听器（端口+过滤器链） |
+| RDS | Route Discovery Service | 发现路由规则（匹配→转发） |
+| CDS | Cluster Discovery Service | 发现上游集群（服务列表） |
+| EDS | Endpoint Discovery Service | 发现实例端点（IP:Port） |
+| SDS | Secret Discovery Service | 发现 TLS 证书/密钥 |
+| RTDS | Runtime Discovery Service | 发现运行时配置 |
+
+### 8.3 xDS 推送流程
+
+```
+1. 控制面监听 K8s API / 服务发现源
+2. 配置变更 → 生成 xDS 配置（LDS/RDS/CDS/EDS）
+3. 通过 gRPC 长连接流式推送（增量或全量）
+4. Envoy 接收配置 → 热加载（无需重启）
+5. Envoy 确认配置生效 → ACK/NACK
+
+增量推送（Delta xDS）：
+  只推送变更部分，减少带宽和内存占用
+  支持资源添加/删除/更新
+```
+
+### 8.4 xDS 调试
+
+```bash
+# 查看 Envoy 当前配置
+curl -s localhost:15000/config_dump
+
+# 查看 xDS 订阅状态
+curl -s localhost:15000/clusters
+
+# 查看活跃连接
+curl -s localhost:15000/stats | grep "downstream_cx_active"
+
+# Istio 代理状态
+istioctl proxy-status
+istioctl proxy-config listener <pod-name>
+```
+
+---
+
+## 九、Envoy WASM 扩展
+
+### 9.1 WASM 扩展架构
+
+```
+Envoy WASM 运行时：
+  ┌─────────────────────────┐
+  │   Envoy Host Functions  │
+  │   (日志/HTTP/配置/共享)   │
+  └──────────┬──────────────┘
+             │ ABI
+  ┌──────────┴──────────────┐
+  │     WASM 沙箱执行        │
+  │   (Rust/Go/C++/AssemblyScript) │
+  └─────────────────────────┘
+
+扩展点：
+  HTTP Filter → 请求/响应处理
+  Network Filter → TCP 流处理
+  元数据生成 → 指标/日志定制
+```
+
+### 9.2 WASM 扩展示例（Rust）
+
+```rust
+// 简单的请求计数器扩展
+use proxy_wasm::traits::*;
+use proxy_wasm::types::*;
+
+struct RequestCounter;
+
+impl HttpContext for RequestCounter {
+    fn on_http_request_headers(&mut self, _: usize) -> Action {
+        // 读取请求头
+        if let Some(path) = self.get_http_request_header(":path") {
+            // 自定义逻辑
+            self.set_http_request_header("X-Custom-Header", Some("value"));
+        }
+        Action::Continue
+    }
+}
+
+impl Context for RequestCounter {}
+```
+
+### 9.3 WASM 扩展最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 语言选择 | Rust 性能最佳，Go 易上手 |
+| 内存限制 | WASM 模块有内存上限（默认 128MB） |
+| 热加载 | 配置推送即可更新 WASM 模块 |
+| 沙箱隔离 | 崩溃不影响 Envoy 主进程 |
+| 性能开销 | WASM 调用有 1~5μs 额外开销 |
+
+---
+
+## 十、Envoy 访问日志
+
+### 10.1 访问日志格式
+
+```yaml
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+    path: /var/log/envoy/access.log
+    log_format:
+      json_format:
+        protocol: "%PROTOCOL%"
+        duration: "%DURATION%"
+        response_code: "%RESPONSE_CODE%"
+        request_method: "%REQ(:METHOD)%"
+        request_path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
+        upstream_cluster: "%UPSTREAM_CLUSTER%"
+        upstream_host: "%UPSTREAM_HOST%"
+        bytes_received: "%BYTES_RECEIVED%"
+        bytes_sent: "%BYTES_SENT%"
+        user_agent: "%REQ(USER-AGENT)%"
+        request_id: "%REQ(X-REQUEST-ID)%"
+        trace_id: "%REQ(X-B3-TRACEID)%"
+```
+
+### 10.2 访问日志高级配置
+
+```yaml
+# 采样配置（只记录 10% 请求）
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    path: /var/log/envoy/access.log
+    filter:
+      runtime_filter:
+        runtime_key: access_log.sample_rate
+        percent_sampled:
+          numerator: 10
+          denominator: HUNDRED
+
+# 条件过滤（只记录错误请求）
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    path: /var/log/envoy/access.log
+    filter:
+      or_filter:
+        filters:
+        - not_health_check_filter: {}
+        - grpc_status_filter:
+            statuses:
+            - "UNAVAILABLE"
+```
+
+### 10.3 异步日志
+
+```yaml
+# 异步日志（防阻塞）
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    path: /var/log/envoy/access.log
+    flush_interval: 1s
+    flush_message_num: 100
+```
+
+---
+
+## 十一、Envoy 统计架构
+
+### 11.1 统计指标分类
+
+| 分类 | 前缀 | 说明 |
+|------|------|------|
+| 监听器 | `listener.<name>` | 连接/请求统计 |
+| HTTP | `http.<stat_prefix>` | HTTP 请求指标 |
+| 集群 | `cluster.<name>` | 上游集群指标 |
+| 服务 | `server` | Envoy 进程指标 |
+| 断路器 | `cluster.<name>.circuit_breakers` | 熔断统计 |
+
+### 11.2 关键统计指标
+
+```
+下游连接：
+  envoy_listener_downstream_cx_total          # 总连接数
+  envoy_listener_downstream_cx_active         # 活跃连接数
+  envoy_listener_downstream_cx_destroy        # 销毁连接数
+
+上游请求：
+  envoy_cluster_upstream_rq_total             # 总请求数
+  envoy_cluster_upstream_rq_active            # 活跃请求数
+  envoy_cluster_upstream_rq_time_bucket       # 请求延迟分布
+  envoy_cluster_upstream_rq_xx                # 按状态码分类
+
+健康检查：
+  envoy_cluster_health_check_healthy          # 健康实例数
+  envoy_cluster_health_check_failure          # 健康检查失败数
+
+错误：
+  envoy_cluster_upstream_cx_failure           # 连接失败数
+  envoy_cluster_upstream_rq_retry             # 重试次数
+  envoy_cluster_upstream_rq_retry_overflow    # 重试预算溢出
+```
+
+### 11.3 自定义统计
+
+```yaml
+# 在 HTTP 过滤器中添加自定义统计
+http_filters:
+- name: envoy.filters.http.stats
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.stats.v3.Stats
+    emit_machine_stats: true
+```
+
+---
+
+## 十二、Envoy 与 Istio 服务网格
+
+### 12.1 Istio 架构
+
+```
+Istio 数据面（Envoy Sidecar）：
+  ├── 拦截所有进出流量（iptables）
+  ├── mTLS 自动加密
+  ├── 负载均衡/重试/超时
+  ├── 流量路由（金丝雀/灰度）
+  ├── 故障注入
+  └── 可观测性（Metrics/Traces/Logs）
+
+Istio 控制面（Istiod）：
+  ├── Pilot：xDS 配置生成与下发
+  ├── Citadel：证书签发与 mTLS
+  ├── Galley：配置验证
+  └── Citadel：密钥管理
+```
+
+### 12.2 Istio 流量治理能力
+
+| 能力 | 说明 |
+|------|------|
+| 金丝雀发布 | 按权重/Header/URI 路由到不同版本 |
+| A/B 测试 | 按 Header 匹配路由 |
+| 故障注入 | 模拟延迟/错误测试弹性 |
+| 超时重试 | 预算重试防雪崩 |
+| 熔断 | 连接池限制 + 异常检测驱逐 |
+| 流量镜像 | 复制流量到测试环境 |
+| 限流 | 外部 Rate Limit 服务集成 |
+
+### 12.3 Istio VirtualService 示例
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: reviews
+spec:
+  hosts:
+  - reviews
+  http:
+  - match:
+    - headers:
+        end-user:
+          exact: jason
+    route:
+    - destination:
+        host: reviews
+        subset: v2
+  - route:
+    - destination:
+        host: reviews
+        subset: v1
+      weight: 90
+    - destination:
+        host: reviews
+        subset: v2
+      weight: 10
+```
+
+---
+
+## 十三、Envoy 限流
+
+### 13.1 本地限流
+
+```yaml
+http_filters:
+- name: envoy.filters.http.local_ratelimit
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+    stat_prefix: http_local_rate_limiter
+    token_bucket:
+      max_tokens: 100
+      tokens_per_fill: 10
+      fill_interval: 1s
+    filter_enabled:
+      runtime_key: local_rate_limit_enabled
+      default_value:
+        numerator: 100
+        denominator: HUNDRED
+    filter_enforced:
+      runtime_key: local_rate_limit_enforced
+      default_value:
+        numerator: 100
+        denominator: HUNDRED
+```
+
+### 13.2 全局限流（External Rate Limit）
+
+```yaml
+http_filters:
+- name: envoy.filters.http.ratelimit
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+    domain: production
+    failure_mode_deny: false
+    rate_limit_service:
+      grpc_service:
+        envoy_grpc:
+          cluster_name: rate_limit_cluster
+      transport_api_version: V3
+```
+
+---
+
+## 十四、Envoy 故障注入
+
+### 14.1 故障注入配置
+
+```yaml
+http_filters:
+- name: envoy.filters.http.fault
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+    delay:
+      percentage:
+        numerator: 10
+        denominator: HUNDRED
+      fixed_duration: 5s
+    abort:
+      percentage:
+        numerator: 5
+        denominator: HUNDRED
+      status: 500
+```
+
+### 14.2 故障注入场景
+
+| 场景 | 配置 |
+|------|------|
+| 模拟延迟 | delay + fixed_duration |
+| 模拟错误 | abort + status 500/503 |
+| 混合故障 | 同时配置 delay + abort |
+
+---
+
+## 十五、Envoy gRPC 桥接
+
+### 15.1 gRPC-JSON 转码
+
+```yaml
+http_filters:
+- name: envoy.filters.http.grpc_json_transcoder
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_json_transcoder.v3.GrpcJsonTranscoder
+    proto_descriptor: /etc/envoy/proto.pb
+    services: ["mypackage.MyService"]
+    convert_grpc_status: true
+```
+
+### 15.2 gRPC-Web 支持
+
+```yaml
+http_filters:
+- name: envoy.filters.http.grpc_web
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb
+```
+
+---
+
+## 十六、Envoy 部署模式
+
+### 16.1 部署模式对比
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| Sidecar | 每个 Pod 一个 Envoy | Service Mesh |
+| Ingress Gateway | 集群入口网关 | 边缘路由 |
+| Egress Gateway | 集群出口网关 | 外部访问控制 |
+| 中心代理 | 共享 Envoy 代理 | 轻量级服务网格 |
+| 独立部署 | 独立进程部署 | 传统架构 |
+
+### 16.2 Sidecar 注入方式
+
+```yaml
+# 自动注入（Istio）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "true"
+
+# 手动注入
+# istioctl kube-inject -f deployment.yaml | kubectl apply -f -
+```
+
+### 16.3 Envoy 资源配置
+
+```yaml
+# Envoy Sidecar 资源限制
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# Envoy 启动参数
+- --max-obj-name-len=256
+- --concurrency=2
+- --log-level=warning
+```
+
+---
+
+## 十七、与其他板块的关系
 
 - 服务网格（Istio + Envoy）见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
 - Nginx 原理见「[Nginx](./Nginx.md)」；

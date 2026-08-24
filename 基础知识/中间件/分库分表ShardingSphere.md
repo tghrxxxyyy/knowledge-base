@@ -210,9 +210,349 @@ ShardingSphere 内置多种事务模式：
 21. **Sharding-Proxy 的使用场景？** 异构语言客户端（非 Java）、不想改代码接入、统一治理入口；代价是多一跳代理与额外运维。
 
 22. **分库分表的合理阈值？** 单表超 500 万~1000 万行或单库性能瓶颈再分，不要过早分片增加复杂度。
+---
+
+## 十、ShardingSphere-JDBC vs ShardingSphere-Proxy 深度对比
+
+### 10.1 架构差异
+
+```mermaid
+flowchart TB
+    APP1[Java 应用] -->|JDBC 直连| JDBC[ShardingSphere-JDBC]
+    JDBC --> DB1[MySQL]
+    JDBC --> DB2[MySQL]
+    
+    APP2[任意语言应用] -->|协议连接| PROXY[Sharding-Proxy]
+    PROXY --> DB3[MySQL]
+    PROXY --> DB4[MySQL]
+```
+
+### 10.2 详细对比
+
+| 维度 | ShardingSphere-JDBC | ShardingSphere-Proxy |
+|------|---------------------|---------------------|
+| 部署 | JAR 嵌入应用 | 独立进程部署 |
+| 协议 | JDBC | MySQL/PG 协议 |
+| 语言 | 仅 Java | 任意语言 |
+| 性能 | 高（无网络跳转） | 较低（多一跳） |
+| 运维 | 需发版升级 | 独立升级 |
+| 连接池 | 应用管理 | Proxy 管理 |
+| 适用 | Java 微服务 | 多语言/统一管控 |
+| 集群 | 无需额外部署 | 需 HA 部署 |
+
+### 10.3 混合部署方案
+
+```
+推荐架构：
+  - Java 微服务：用 ShardingSphere-JDBC（性能优先）
+  - 非 Java 应用：用 Sharding-Proxy（兼容性优先）
+  - DBA 运维入口：统一用 Sharding-Proxy 管理
+  - 两种接入端可共享同一套配置（治理中心 ZK/Nacos）
+```
 
 ---
-## 十、与其他板块的关系
+
+## 十一、读写分离深度
+
+### 11.1 路由策略
+
+```yaml
+rules:
+  readwrite-splitting:
+    data-sources:
+      ds_master:
+        write-data-source-name: master
+        read-data-source-names: slave0,slave1
+        load-balancer-name: round_robin
+        props:
+          write-data-source-query-enabled: false  # 写后读延迟允许从库
+    load-balancers:
+      round_robin:
+        type: ROUND_ROBIN
+      random:
+        type: RANDOM
+      weight:
+        type: WEIGHT
+        props:
+          slave0: 3
+          slave1: 1
+```
+
+### 11.2 主从延迟处理
+
+```
+问题：写完立刻从从库读，可能读到旧数据。
+
+解决方案：
+1. Hint 强制主库：写完立刻读强制走主库
+   HintManager.getInstance().setWriteRouteOnly();
+
+2. 强一致读：读主库（牺牲性能）
+3. 延迟检测：检测主从延迟，超过阈值读主库
+4. 业务容忍：非核心业务接受短暂不一致
+
+配置：
+  props:
+    allow-read-data-source-write-data-source: true
+```
+
+### 11.3 读写分离 + 分片组合
+
+```mermaid
+flowchart TB
+    APP[应用] --> MONGOS[ShardingSphere]
+    MONGOS -->|写| SHARD0_MASTER[Shard0 Master]
+    MONGOS -->|读| SHARD0_SLAVE[Shard0 Slave]
+    MONGOS -->|写| SHARD1_MASTER[Shard1 Master]
+    MONGOS -->|读| SHARD1_SLAVE[Shard1 Slave]
+```
+
+---
+
+## 十二、数据脱敏与加密
+
+### 12.1 脱敏类型
+
+| 算法 | 效果 | 适用 |
+|------|------|------|
+| MD5 | 哈希不可逆 | 唯一键 |
+| MASK | 掩码 `138****0000` | 手机号/身份证 |
+| KEEP_FIRST_LAST | 保留首尾 | 姓名 |
+| PERSONAL_IDENTITY_NUMBER_MASK | 身份证脱敏 | 身份证号 |
+| TELEPHONE_RANDOM_MASK | 随机掩码 | 电话 |
+| LITERAL_REPLACE | 固定替换 | 测试数据 |
+
+### 12.2 配置示例
+
+```yaml
+rules:
+  mask:
+    tables:
+      t_user:
+        columns:
+          phone:
+            mask-algorithm: TELEPHONE_RANDOM_MASK
+          id_card:
+            mask-algorithm: PERSONAL_IDENTITY_NUMBER_MASK
+          name:
+            mask-algorithm: MASK
+            props:
+              mask-algorithm-MASK.mask-char: "*"
+              mask-algorithm-MASK.allow-partial-list: true
+```
+
+---
+
+## 十三、分布式事务深度（XA / Saga）
+
+### 13.1 XA 事务
+
+```text
+原理：
+  - 基于数据库 XA 协议的两阶段提交（2PC）
+  - 协调者：ShardingSphere
+  - 参与者：各分片数据库
+
+优点：强一致
+缺点：性能差（全局锁）、阻塞、协调者单点
+
+配置：
+  props:
+    xa-transaction-manager-name: atomikos
+```
+
+### 13.2 Saga 事务
+
+```text
+原理：
+  - 长事务拆为本地事务序列
+  - 任一步失败 → 逆序补偿（回滚）
+
+编排方式：
+  1. Choreography（事件驱动）：无中心，各服务监听事件
+  2. Orchestrator（编排器）：中心协调器指挥流程
+
+与 Seata 集成：
+  - ShardingSphere + Seata AT 模式
+  - 分布式事务由 Seata 协调
+```
+
+### 13.3 事务选型
+
+| 场景 | 推荐方案 |
+|------|----------|
+| 强一致、低并发 | XA（2PC） |
+| 高性能、最终一致 | Saga / 本地消息表 |
+| 跨数据源 | Seata AT/TCC |
+| 简单分片 | LOCAL 本地事务 |
+
+---
+
+## 十四、影子库压测
+
+### 14.1 原理
+
+```text
+影子库（Shadow DB）将线上流量路由到独立的影子库，不影响真实数据。
+
+工作流程：
+  1. 流量标记：HTTP Header / 注解标记压测流量
+  2. 路由决策：ShardingSphere 判断流量类型
+  3. 压测流量 → 影子库
+  4. 真实流量 → 真实库
+```
+
+### 14.2 配置
+
+```yaml
+rules:
+  shadow:
+    data-sources:
+      shadow_ds:
+        source-data-source-name: ds
+        shadow-data-source-name: ds_shadow
+    tables:
+      t_order:
+        data-source-mapping: t_order_shadow
+    shadow-algorithm-name: hint-algo
+    shadow-algorithms:
+      hint-algo:
+        type: VALUE_MATCH
+        props:
+          operation: all
+          value: shadow
+```
+
+---
+
+## 十五、Hint 策略
+
+### 15.1 使用场景
+
+```
+1. 强制路由到指定库/表
+   - 无分片键的查询
+   - 运维脚本指定库
+
+2. 强制走主库
+   - 写后立刻读
+   - 强一致读需求
+
+3. 数据迁移
+   - 指定源库和目标库
+   - 灰度迁移
+
+4. 分片键值注入
+   - 无法从 SQL 提取分片键
+   - 通过 HintManager 注入
+```
+
+### 15.2 代码示例
+
+```java
+// 强制走主库
+try (HintManager hintManager = HintManager.getInstance()) {
+    hintManager.setWriteRouteOnly();
+    jdbcTemplate.query("SELECT * FROM t_order WHERE id = ?", orderId);
+}
+
+// 强制指定分片
+try (HintManager hintManager = HintManager.getInstance()) {
+    hintManager.addTableShardingValue("t_order", "order_id", orderId);
+    jdbcTemplate.query("SELECT * FROM t_order", new Object[]{});
+}
+```
+
+---
+
+## 十六、SQL 改写引擎
+
+### 16.1 改写类型
+
+```text
+1. 逻辑表 → 真实表
+   SELECT * FROM t_order → SELECT * FROM ds_0.t_order_3
+
+2. 分布式 ID 替换
+   INSERT INTO t_order(id, ...) VALUES(?, ...) 
+   → INSERT INTO t_order_3(id, ...) VALUES(雪花ID生成, ...)
+
+3. 分页改写
+   LIMIT 10 OFFSET 100000 
+   → 各分片查 100010 条，在内存中归并取后 10 条
+
+4. 聚合改写
+   SELECT COUNT(*) FROM t_order 
+   → 各分片 SELECT COUNT(*)，结果归并求和
+
+5. 排序改写
+   SELECT * FROM t_order ORDER BY create_time 
+   → 各分片排序，归并排序（归并排序算法）
+```
+
+---
+
+## 十七、ShardingSphere on Kubernetes
+
+### 17.1 部署方式
+
+```text
+ShardingSphere on K8s 三种模式：
+1. ShardingSphere-JDBC：嵌入应用 Pod（最简单）
+2. ShardingSphere-Proxy：独立 Deployment + Service
+3. ShardingSphere Operator：K8s Operator 自动化管理
+```
+
+### 17.2 Proxy 部署示例
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shardingsphere-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shardingsphere-proxy
+  template:
+    metadata:
+      labels:
+        app: shardingsphere-proxy
+    spec:
+      containers:
+      - name: proxy
+        image: apache/shardingsphere-proxy:5.4.0
+        ports:
+        - containerPort: 3307
+        volumeMounts:
+        - name: config
+          mountPath: /opt/shardingsphere-proxy/conf
+      volumes:
+      - name: config
+        configMap:
+          name: shardingsphere-config
+```
+
+---
+
+## 十八、ShardingSphere vs MyCat vs Vitess
+
+| 维度 | ShardingSphere | MyCat | Vitess |
+|------|---------------|-------|--------|
+| 语言 | Java | Java | Go |
+| 架构 | JDBC + Proxy | 代理 | 代理 + VTGate |
+| 社区 | Apache 活跃 | 停滞 | CNCF 活跃 |
+| 分布式事务 | XA / Seata | 弱 | 有限 |
+| 数据加密 | ✅ | ❌ | ❌ |
+| 影子库 | ✅ | ❌ | ❌ |
+| SQL 支持 | MySQL/PG | MySQL | MySQL |
+| 适用 | Java 生态 | 老系统 | 大规模/云原生 |
+| 运维 | DistSQL 动态管理 | 较弱 | vtctld 管理 |
+
+---
+
+## 十九、与其他板块的关系
 
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。
 - 和「**基础知识/MQ**」：分片后异构同步（如订单同步 ES）用 Canal + MQ。

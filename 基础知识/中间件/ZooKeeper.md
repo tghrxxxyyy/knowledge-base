@@ -198,7 +198,414 @@ flowchart LR
 
 ---
 
-## 六、与其他板块的关系
+## 五、ZAB 协议深入
+
+### 5.1 ZAB 协议详解
+
+```
+ZAB（ZooKeeper Atomic Broadcast）协议分为两个核心阶段：
+
+1. 崩溃恢复（Leader Election + Recovery）
+   ├── Leader 选举：比较 Zxid（高 epoch + 低 counter）
+   ├── 数据同步：Leader 与 Follower 同步未提交事务
+   └── 原子提交：超过 quorum 确认后提交
+
+2. 原子广播（Atomic Broadcast）
+   ├── Leader 接收写请求 → 生成 Proposal（Zxid+1）
+   ├── 广播 Proposal 到所有 Follower
+   ├── Follower 写入本地事务日志 → 返回 ACK
+   ├── Leader 收到 quorum ACK → 发送 Commit
+   └── 各节点提交事务 → 响应客户端
+```
+
+### 5.2 Zxid 结构
+
+```
+Zxid = 64 位事务 ID
+  高 32 位：epoch（Leader 任期编号，每次选举 +1）
+  低 32 位：counter（事务计数器，每次写 +1）
+
+示例：
+  Zxid = 0x100000003
+    epoch = 1（第 2 任 Leader）
+    counter = 3（第 3 个事务）
+
+作用：
+  比较事务新旧：Zxid 越大越新
+  选举比较：Zxid 大者优先（保证新 Leader 有最新数据）
+  事务排序：全局有序，保证一致性
+```
+
+### 5.3 ZAB vs Raft 对比
+
+| 维度 | ZAB | Raft |
+|------|-----|------|
+| Leader 选举 | 比较 Zxid | 比较日志最后索引 |
+| 日志复制 | 两阶段（Proposal+Commit） | AppendEntries + Commit |
+| 脑裂处理 | quorum 保证 | quorum 保证 |
+| 日志空洞 | 恢复阶段填补 | Leader 补发缺失日志 |
+| 成员变更 | 动态配置变更 | Joint Consensus / 自动变更 |
+| 应用 | ZooKeeper | etcd/Raft/PolarDB |
+
+---
+
+## 六、Session 管理机制
+
+### 6.1 Session 生命周期
+
+```
+Session 状态机：
+  Creating → Active → Closing → Closed
+
+  Creating：客户端与服务端建立连接，分配 SessionID
+  Active：心跳正常，Session 保持存活
+  Closing：Session 超时，开始清理临时节点
+  Closed：Session 完全结束
+
+心跳机制：
+  客户端 → 服务端：Ping 心跳
+  服务端 → 客户端：响应（更新 Session 超时时间）
+  默认心跳间隔：sessionTimeout / 3
+```
+
+### 6.2 Session 超时处理
+
+| 场景 | 行为 |
+|------|------|
+| 客户端正常关闭 | 主动关闭 Session，临时节点删除 |
+| 客户端网络断开 | 等待 sessionTimeout，超时后关闭 Session |
+| 服务端重启 | 客户端重连，Session 可恢复（如果在超时内） |
+| 集群 Leader 切换 | Session 状态同步到新 Leader |
+
+### 6.3 Session 分配策略
+
+```
+Session 分配流程：
+  1. 客户端连接任意 Follower
+  2. Follower 转发 Session 创建请求到 Leader
+  3. Leader 分配全局唯一 SessionID
+  4. Leader 广播 Session 信息到所有节点
+  5. 各节点维护 Session 状态
+
+Session 存储：
+  内存中维护 Session → 对应临时节点映射
+  定期持久化 Session 信息到磁盘（Zxid + Session 列表）
+```
+
+---
+
+## 七、Watcher 机制深入
+
+### 7.1 Watcher 类型
+
+| 类型 | 说明 | 触发事件 |
+|------|------|----------|
+| Data Watch | 监听节点数据变更 | NodeDataChanged |
+| Child Watch | 监听子节点变更 | NodeChildrenChanged |
+| Exist Watch | 监听节点是否存在 | NodeCreated/NodeDeleted |
+| Persistent Watch | 持久监听（3.6+） | 所有事件（不自动失效） |
+| Recursive Watch | 递归监听（3.6+） | 子树所有变更 |
+
+### 7.2 Watcher 注册与触发流程
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant W as WatchManager
+    C->>S: getData("/path", watch=true)
+    S->>W: 注册 Watcher
+    Note over W: 存储: path → watcher列表
+    C->>C: 获取数据返回
+    
+    Note over S: 其他客户端修改 /path
+    S->>W: 触发 Watcher
+    W->>S: 发送 Watcher 事件
+    S->>C: Watcher 通知
+    C->>S: 重新注册 Watcher（一次性）
+```
+
+### 7.3 Watcher 一次性与持久监听
+
+```
+一次性 Watcher（默认）：
+  1. 客户端注册 Watcher
+  2. 事件触发后自动失效
+  3. 需要客户端重新注册
+  问题：容易遗漏事件（忘记重注册）
+
+持久 Watcher（3.6+）：
+  addWatch /path -p（持久模式）
+  事件触发后不会失效
+  适合需要持续监听的场景
+  缺点：服务端需维护更多 Watcher
+
+递归 Watcher（3.6+）：
+  addWatch /path -r（递归模式）
+  监听整个子树的所有变更
+  减少客户端 Watcher 注册数量
+```
+
+---
+
+## 八、ZooKeeper 动态重配置
+
+### 8.1 动态添加/删除节点
+
+```bash
+# 动态添加节点（无需重启）
+zkServer.sh add start
+
+# 动态删除节点
+zkServer.sh remove <server-id>
+
+# 查看当前配置
+zkServer.sh config
+```
+
+### 8.2 动态重配置流程
+
+```
+1. 管理员执行 reconfig 命令
+2. Leader 验证配置变更合法性
+3. Leader 将新配置作为特殊事务广播
+4. 所有节点更新本地配置
+5. 新节点加入后从 Leader 同步数据
+
+限制：
+  - 只能修改集群成员（不能改端口/路径等）
+  - 需要所有节点在线（或 quorum 在线）
+  - 不支持跨机房动态扩展（延迟敏感）
+```
+
+### 8.3 动态配置 vs 滚动重启
+
+| 方式 | 优势 | 劣势 |
+|------|------|------|
+| 动态重配置 | 无需停服，实时生效 | 只能改集群成员 |
+| 滚动重启 | 可修改所有配置 | 需要逐个重启，有短暂不可用 |
+
+---
+
+## 九、Curator 框架模式
+
+### 9.1 Curator 核心 API
+
+```java
+// 1. 分布式锁（可重入）
+InterProcessMutex lock = new InterProcessMutex(client, "/lock/order");
+if (lock.acquire(10, TimeUnit.SECONDS)) {
+    try {
+        // 业务逻辑
+    } finally {
+        lock.release();
+    }
+}
+
+// 2. 分布式可重入读写锁
+InterProcessReadWriteLock rwLock = new InterProcessReadWriteLock(client, "/rw-lock");
+rwLock.readLock().acquire();
+rwLock.writeLock().acquire();
+
+// 3. 分布式信号量
+InterProcessSemaphoreV2 semaphore = new InterProcessSemaphoreV2(client, "/semaphore", 5);
+Lease lease = semaphore.acquire();
+try {
+    // 最多 5 个并发
+} finally {
+    semaphore.returnLease(lease);
+}
+
+// 4. 分布式 Barrier
+InterProcessBarrier barrier = new InterProcessBarrier(client, "/barrier", 3);
+barrier.await(10, TimeUnit.SECONDS);  // 等待 3 个节点都到达
+```
+
+### 9.2 Curator 缓存模式
+
+```java
+// PathChildrenCache：监听子节点变化
+PathChildrenCache cache = new PathChildrenCache(client, "/services", true);
+cache.getListenable().addListener((framework, event) -> {
+    switch (event.getType()) {
+        case CHILD_ADDED:
+            System.out.println("节点添加: " + event.getData().getPath());
+            break;
+        case CHILD_REMOVED:
+            System.out.println("节点删除: " + event.getData().getPath());
+            break;
+        case CHILD_UPDATED:
+            System.out.println("节点更新: " + event.getData().getPath());
+            break;
+    }
+});
+cache.start();
+
+// TreeCache：监听整棵树
+TreeCache treeCache = new TreeCache(client, "/app");
+treeCache.getListenable().addListener((framework, event) -> {
+    // 处理所有节点事件
+});
+treeCache.start();
+
+// NodeCache：监听单个节点
+NodeCache nodeCache = new NodeCache(client, "/config/db.url");
+nodeCache.getListenable().addListener(() -> {
+    System.out.println("配置变更: " + nodeCache.getCurrentData().getPath());
+});
+nodeCache.start();
+```
+
+### 9.3 Curator 重试策略
+
+| 策略 | 说明 |
+|------|------|
+| ExponentialBackoffRetry | 指数退避重试（推荐） |
+| RetryNTimes | 固定次数重试 |
+| RetryForever | 无限重试 |
+| RetryUntilElapsed | 直到超时 |
+
+```java
+// 推荐配置
+CuratorFramework client = CuratorFrameworkFactory.builder()
+    .connectString("localhost:2181")
+    .sessionTimeoutMs(30000)
+    .connectionTimeoutMs(15000)
+    .retryPolicy(new ExponentialBackoffRetry(1000, 3))
+    .namespace("my-app")
+    .build();
+```
+
+---
+
+## 十、ZooKeeper vs etcd vs Consul 对比
+
+### 10.1 核心能力对比
+
+| 维度 | ZooKeeper | etcd | Consul |
+|------|-----------|------|--------|
+| 一致性协议 | ZAB | Raft | Raft |
+| 数据模型 | ZNode 树 | 扁平 KV | KV + 服务目录 |
+| 通知机制 | Watcher（一次性） | Watch 流（持续） | Blocking Queries |
+| 事务 | 无原生事务 | Txn（if-then-else） | KV 事务 |
+| 服务发现 | 临时节点 | Lease + Watch | 内置健康检查 |
+| 健康检查 | 无（需自建） | 无（需自建） | 内置（HTTP/TCP/gRPC） |
+| 多数据中心 | 不支持 | 不支持 | 原生支持 |
+| DNS 接口 | 无 | 无 | 内置 DNS |
+| ACL | 基于 path | 基于 key prefix | 基于 token + policy |
+
+### 10.2 适用场景对比
+
+| 场景 | 首选 | 原因 |
+|------|------|------|
+| K8s 元数据存储 | etcd | K8s 官方指定 |
+| Java 微服务注册 | ZooKeeper | Dubbo/Kafka 生态 |
+| 多数据中心服务发现 | Consul | 原生多 DC 支持 |
+| 轻量配置中心 | etcd | Watch 流 + MVCC |
+| 分布式锁 | 三者都可 | ZK 最成熟，etcd 更轻量 |
+| 服务网格 | Consul/etcd | 内置健康检查 + DNS |
+
+### 10.3 性能对比
+
+| 指标 | ZooKeeper | etcd | Consul |
+|------|-----------|------|--------|
+| 写 QPS | 10k~20k | 10k~15k | 10k~15k |
+| 读 QPS | 100k+（Follower） | 10k~15k（线性读） | 50k+（Stale） |
+| 写延迟 | 5~20ms | 5~20ms | 5~20ms |
+| 集群规模 | 3~7 节点 | 3~7 节点 | 3~7 节点 |
+
+---
+
+## 十一、ZooKeeper 性能调优
+
+### 11.1 关键配置参数
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| tickTime | 2000ms | 2000ms | 心跳基本单位 |
+| initLimit | 10 | 10 | Follower 初始连接超时（tickTime 倍数） |
+| syncLimit | 5 | 5 | Follower 同步超时 |
+| maxClientCnxns | 60 | 128 | 单 IP 最大连接数 |
+| snapCount | 100000 | 500000 | 触发快照的事务数 |
+|autopurge.purgeInterval | 0 | 24 | 自动清理间隔（小时） |
+
+### 11.2 JVM 调优
+
+```bash
+# JVM 参数
+export SERVER_JVMFLAGS="-Xms4g -Xmx4g \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=50 \
+  -XX:InitiatingHeapOccupancyPercent=35 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/var/log/zookeeper/heapdump.hprof"
+
+# GC 日志
+export SERVER_JVMFLAGS="$SERVER_JVMFLAGS \
+  -Xlog:gc*:file=/var/log/zookeeper/gc.log:time,uptime:filecount=10,filesize=100m"
+```
+
+### 11.3 操作系统调优
+
+```bash
+# 文件描述符限制
+ulimit -n 65536
+
+# 虚拟内存
+echo 1 > /proc/sys/vm/overcommit_memory
+
+# 网络优化
+echo 32768 > /proc/sys/net/core/somaxconn
+echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse
+```
+
+---
+
+## 十二、ZooKeeper 在 Kafka 中的角色演变
+
+### 12.1 Kafka 旧版本（依赖 ZK）
+
+```
+Kafka 0.8 ~ 2.8：ZK 作为元数据存储
+  ├── Broker 注册 → /brokers/ids/[brokerId]
+  ├── Topic 配置 → /brokers/topics/[topicName]
+  ├── Partition 分配 → /brokers/topics/[topic]/partitions/[0]
+  ├── Controller 选举 → /controller
+  └── 消费者组 → /consumers/[group]
+
+问题：
+  ZK 成为性能瓶颈（大量写操作）
+  Controller 单点（依赖 ZK 选举）
+  网络分区时 ZK 不可用影响 Kafka
+```
+
+### 12.2 KRaft 替代方案（KRaft）
+
+```
+Kafka 3.0+：KRaft 模式（去除 ZK 依赖）
+  ├── 自管理 Raft 共识
+  ├── Controller Quorum（多个 Controller 节点）
+  ├── 元数据存储在 Kafka 内部 Topic
+  └── 性能提升：Controller 选举更快，元数据同步更高效
+
+迁移路径：
+  1. K8s 部署：直接使用 KRaft 模式
+  2. 存量集群：ZK → KRaft 滚动迁移
+```
+
+### 12.3 KRaft vs ZK 模式对比
+
+| 维度 | ZK 模式 | KRaft 模式 |
+|------|---------|------------|
+| 依赖组件 | ZooKeeper | 无外部依赖 |
+| Controller 选举 | ZK 选举（慢） | Raft 选举（快） |
+| 元数据存储 | ZK（内存） | Kafka Topic |
+| 启动速度 | 慢（等 ZK） | 快 |
+| 运维复杂度 | 高（维护 ZK 集群） | 低 |
+
+---
+
+## 十三、与其他板块的关系
 
 - 和「**源码系列/zookeeper**」：本篇讲协议、场景与生产；源码篇有常见 ZK 面试题深挖。
 - 和「**基础知识/中间件/etcd**」：同是 CP 协调服务，etcd 是云原生替代者（对比见上）。

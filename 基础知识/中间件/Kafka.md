@@ -278,7 +278,343 @@ kafka-acls.sh --add --allow-principal User:alice \
 
 ---
 
-## 十、与其他板块的关系（扩展）
+## 十、Kafka 分层存储（Tiered Storage）
+
+### 10.1 背景与动机
+
+传统 Kafka 的数据全部存储在 Broker 本地磁盘，成本高且扩展受限。分层存储将冷数据卸载到廉价的对象存储（S3、HDFS、Azure Blob），热数据保留在本地磁盘。
+
+```mermaid
+flowchart LR
+    HOT[热数据 本地磁盘 SSD] -->|超过 retention| COLD[冷数据 对象存储 S3/HDFS]
+    COLD -->|按需拉取| CONSUMER[消费者]
+    HOT --> CONSUMER
+```
+
+### 10.2 核心原理
+
+| 概念 | 说明 |
+|------|------|
+| Local Storage | Broker 本地磁盘，存放热数据 |
+| Remote Storage | 对象存储/S3/HDFS，存放冷数据 |
+| Tiered Storage Policy | 配置何时将数据从本地卸载到远程 |
+| Fetch from Remote | 消费者读取冷数据时，Broker 从远程存储拉取并缓存 |
+
+### 10.3 配置示例
+
+```properties
+# server.properties
+remote.log.storage.manager.class.name=org.apache.kafka.server.log.remote.storage.RemoteLogManager
+remote.log.storage.manager.class.path=
+remote.log.metadata.manager.class.name=org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManager
+remote.log.retention.ms=604800000  # 7天后卸载到远程
+
+# Topic 级别配置
+kafka-configs.sh --alter --topic my-topic \
+  --add-config remote.storage.enable=true,local.retention.ms=259200000
+```
+
+### 10.4 适用场景与限制
+
+```
+适用：
+  - 日志/埋点保留时间长（30天+），但近期热数据比例低
+  - 磁盘成本敏感，需要降本
+  - 冷数据偶尔回溯查询
+
+限制（截至 3.6.x）：
+  - 生产者不支持直接写远程（需本地先写）
+  - 消费者读冷数据有额外延迟（拉取+缓存）
+  - 不支持 KRaft 模式完全兼容（需 ZK 模式）
+  - 兼容性需验证，生产建议充分测试
+```
+
+---
+
+## 十一、Kafka Exactly-Once 语义深度
+
+### 11.1 三层 Exactly-Once 机制
+
+```mermaid
+flowchart TB
+    L1[幂等 Producer] --> L2[事务 API]
+    L2 --> L3[消费端幂等]
+```
+
+| 层次 | 机制 | 保证范围 |
+|------|------|----------|
+| 幂等 Producer | PID + 序列号去重 | 单分区、单会话不重复 |
+| 事务 API | transactional.id + 原子提交 | 跨分区写 + 消费位移原子提交 |
+| 消费端幂等 | 业务层去重 | 端到端不重复 |
+
+### 11.2 事务 API 详解
+
+```java
+Properties props = new Properties();
+props.put("transactional.id", "order-tx-001");  // 稳定事务 ID（跨重启不变）
+props.put("enable.idempotence", "true");
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();
+
+try {
+    producer.beginTransaction();
+    
+    // 1. 从 input-topic 消费
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+    for (ConsumerRecord<String, String> record : records) {
+        // 2. 处理并写入 output-topic
+        producer.send(new ProducerRecord<>("output-topic", record.key(), transform(record.value())));
+    }
+    
+    // 3. 消费位移与产出原子提交
+    producer.sendOffsetsToTransaction(
+        currentOffsets(consumer), consumer.groupMetadata()
+    );
+    
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+}
+```
+
+### 11.3 EOS 使用模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| at-most-once | 先提交位移再处理 | 允许丢数据 |
+| at-least-once | 先处理再提交位移（默认） | 不允许丢数据，允许重复 |
+| exactly-once | 幂等+事务+消费端幂等 | 端到端零重复 |
+
+---
+
+## 十二、Kafka Streams 状态存储
+
+### 12.1 State Store 类型
+
+| 类型 | 说明 | 适用场景 |
+|------|------|----------|
+| In-Memory | HashMap 存储，重启丢失 | 临时窗口聚合 |
+| RocksDB | 嵌入式 KV 存储，持久化 | 大规模状态（推荐） |
+| Custom Store | 自定义实现 | 特殊需求 |
+
+### 12.2 原理
+
+```
+Kafka Streams 状态存储架构：
+
+1. 每个 Store 对应一个内部 changelog topic
+2. 写入 Store 时同步写 changelog（备份）
+3. 重启时从 changelog 恢复状态
+4. 默认开启 standby replicas（热备恢复更快）
+
+配置：
+  state.dir=/tmp/kafka-streams
+  num.standby.replicas=1
+  state.cleaner.enable=true
+```
+
+### 12.3 最佳实践
+
+```
+1. RocksDB 是默认且推荐，内存占用可控
+2. 合理设置 cache.max.bytes.buffering（默认 10MB），减少写放大
+3. 压缩开启：rocksdb.block.cache.size + rocksdb.compression.type=lz4
+4. 监控：state-store-age-ms、changelog-bytes-consumed-rate
+5. 恢复优化：standby replicas + 合理 repartition count
+```
+
+---
+
+## 十三、Kafka Connect 单消息转换（SMT）
+
+### 13.1 SMT 概念
+
+SMT（Single Message Transform）在 Kafka Connect 中间层对消息做轻量转换，无需自定义 Converter。
+
+### 13.2 常用 SMT
+
+| SMT | 功能 | 示例 |
+|-----|------|------|
+| ReplaceField | 重命名/删除字段 | 移除密码字段 |
+| InsertField | 插入固定字段 | 添加 source 标识 |
+| MaskField | 字段脱敏 | 手机号掩码 |
+| TimestampRouter | 按时间路由 topic | 按天分 topic |
+| RegexRouter | 正则替换 topic 名 | 加前缀/后缀 |
+| Flatten | 嵌套文档展平 | JSON 嵌套→平铺 |
+| Cast | 字段类型转换 | string→int |
+
+### 13.3 配置示例
+
+```json
+{
+  "name": "jdbc-source",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSourceConnector",
+    "transforms": "addTimestamp,maskPhone",
+    "transforms.addTimestamp.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addTimestamp.timestamp.field": "imported_at",
+    "transforms.maskPhone.type": "org.apache.kafka.connect.transforms.MaskField$Value",
+    "transforms.maskPhone.fields": "phone",
+    "transforms.maskPhone.replacement": "138****0000"
+  }
+}
+```
+
+---
+
+## 十四、Kafka 性能调优
+
+### 14.1 Producer 调优
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| `batch.size` | 16384 (16KB) | 32768~65536 | 批量大小越大吞吐越高，但延迟增加 |
+| `linger.ms` | 0 | 5~100 | 等待攒批时间，0=立即发送 |
+| `compression.type` | none | lz4/zstd | 压缩减少网络传输和磁盘占用 |
+| `buffer.memory` | 33554432 (32MB) | 64MB~128MB | 生产端缓冲池 |
+| `max.in.flight.requests.per.connection` | 5 | 5 | 并发请求数，幂等模式下可保持5 |
+| `acks` | all | all | 可靠性，all是最高保障 |
+
+### 14.2 Consumer 调优
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| `fetch.min.bytes` | 1 | 1024~10240 | 减少空轮询 |
+| `fetch.max.wait.ms` | 500 | 500~2000 | 等待足够数据再返回 |
+| `max.poll.records` | 500 | 100~500 | 单次拉取条数 |
+| `max.poll.interval.ms` | 300000 | 按业务调整 | 处理超时被踢出组 |
+| `session.timeout.ms` | 45000 | 30000~45000 | 心跳超时 |
+
+### 14.3 Broker 调优
+
+```
+# 吞吐优先
+num.io.threads=16
+num.network.threads=8
+log.flush.interval.messages=10000
+log.flush.interval.ms=1000
+
+# 可靠性优先
+num.replica.fetchers=4
+replica.fetch.wait.max.ms=500
+min.insync.replicas=2
+```
+
+---
+
+## 十五、Kafka 监控指标
+
+### 15.1 核心指标
+
+| 指标 | 含义 | 告警阈值建议 |
+|------|------|-------------|
+| `UnderReplicatedPartitions` | 未同步分区数 | > 0 |
+| `ActiveControllerCount` | 活跃 Controller 数 | ≠ 1 |
+| `OfflinePartitionsCount` | 离线分区数 | > 0 |
+| `RequestHandlerAvgIdlePercent` | 请求处理空闲率 | < 0.3 |
+| `NetworkProcessorAvgIdlePercent` | 网络线程空闲率 | < 0.3 |
+| `LogFlushRateAndLatency` | 日志刷盘延迟 | > 500ms |
+| `ConsumerLag` | 消费者延迟 | 业务告警阈值 |
+
+### 15.2 监控工具
+
+```
+1. JMX + Prometheus + Grafana：标准方案
+   - kafka_exporter 采集 JMX 指标
+   - Grafana Dashboard 4763（Kafka Overview）
+   - Grafana Dashboard 7589（Kafka Consumer Groups）
+
+2. Confluent Control Center：商业版全面监控
+3. Burrow（LinkedIn）：消费者 Lag 监控
+4. AKHQ（原 Kafdrop）：Web UI 管理界面
+```
+
+### 15.3 关键监控面板
+
+```
+集群面板：
+  - Broker 数量与存活状态
+  - 分区总数与 Leader 分布
+  - Under Replicated 分区数
+
+生产者面板：
+  - 消息发送速率（msgs/s）
+  - 请求延迟（produce request latency）
+  - 批次大小分布
+
+消费者面板：
+  - 消费 Lag（各分区）
+  - 消费速率
+  - Rebalance 频率
+```
+
+---
+
+## 十六、Kafka 安全深度配置
+
+### 16.1 SASL 配置
+
+```properties
+# server.properties
+listeners=SASL_PLAINTEXT://broker1:9092
+security.inter.broker.protocol=SASL_PLAINTEXT
+sasl.enabled.mechanisms=SCRAM-SHA-256
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-256
+
+# JAAS 配置
+kafka_server_org.apache.kafka.common.security.scram.ScramLoginModule required
+  username="admin"
+  password="admin-secret";
+```
+
+### 16.2 ACL 精细控制
+
+```bash
+# 创建用户
+kafka-configs.sh --alter --add-config 'SCRAM-SHA-256=[password=secret]' \
+  --entity-type users --entity-name alice
+
+# 授权
+kafka-acls.sh --add --allow-principal User:alice \
+  --operation Read --topic orders --group my-consumer-group
+
+# 拒绝
+kafka-acls.sh --add --deny-principal User:bob \
+  --operation Write --topic orders
+
+# 列出
+kafka-acls.sh --list --topic orders
+```
+
+### 16.3 加密传输
+
+```properties
+# SSL/TLS 配置
+listeners=SSL://broker1:9093
+ssl.keystore.location=/var/kafka/ssl/kafka.server.keystore.jks
+ssl.keystore.password=changeit
+ssl.truststore.location=/var/kafka/ssl/kafka.server.truststore.jks
+ssl.truststore.password=changeit
+ssl.client.auth=required
+ssl.enabled.protocols=TLSv1.2,TLSv1.3
+ssl.cipher.suites=TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256
+```
+
+### 16.4 安全架构全景
+
+```mermaid
+flowchart TB
+    PRODUCER[生产者] -->|SASL认证| BROKER[Broker]
+    CONSUMER[消费者] -->|SASL认证| BROKER
+    BROKER -->|SSL加密传输| BROKER2[Broker间通信]
+    BROKER -->|ACL授权| TOPIC[Topic资源]
+    ADMIN[管理员] -->|RBAC| CONFLUENT[Confluent Control Center]
+```
+
+---
+
+## 十七、与其他板块的关系（扩展）
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。
 - 和「**基础知识/MQ**」：MQ.md 收录 Kafka 的 Producer 流程、ISR/LEO/HW、清理策略等零散精华；本篇是体系化实用版。

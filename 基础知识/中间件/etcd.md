@@ -191,7 +191,392 @@ sequenceDiagram
 
 ---
 
-## 六、与其他板块的关系
+## 五、etcd Raft 实现细节
+
+### 5.1 Raft 日志复制流程
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F1 as Follower1
+    participant F2 as Follower2
+    participant F3 as Follower3
+    C->>L: Put(key, val)
+    L->>L: 追加日志条目
+    L->>F1: AppendEntries RPC
+    L->>F2: AppendEntries RPC
+    L->>F3: AppendEntries RPC
+    F1-->>L: ACK（日志匹配）
+    F2-->>L: ACK
+    Note over L: 多数派(3/5)确认后提交
+    L->>F1: CommitIndex
+    L->>F2: CommitIndex
+    L->>C: 返回成功
+```
+
+### 5.2 Raft 关键机制
+
+| 机制 | 说明 |
+|------|------|
+| Leader 完整性 | 已提交的日志一定存在于新 Leader |
+| 日志匹配 | AppendEntries 校验前一条日志的 Term 和 Index |
+| 快速恢复 | Follower 缺失的日志会回退到 Leader 匹配点 |
+| 心跳 | Leader 定期发送空 AppendEntries 保持权威 |
+| PreVote | 预选举机制，防止网络分区后 Term 暴涨 |
+
+### 5.3 etcd Raft 优化
+
+```
+etcd Raft 优化点：
+  1. 批量日志合并：多个写请求合并为一次 AppendEntries
+  2. Pipeline 模式：日志复制不等待上一轮确认
+  3. 读优化：ReadIndex / Lease Read（避免走 Raft 共识）
+  4. Leader Transfer：优雅转移 Leader（运维友好）
+  5. 只读节点：Learner 不参与投票，只同步日志
+```
+
+---
+
+## 六、etcd Watch 机制深入
+
+### 6.1 Watch 数据结构
+
+```
+Watch 结构：
+  watchID         → 唯一标识
+  key             → 监听的 key 或前缀
+  startRevision   → 起始版本号
+  progress        → 当前进度（用于断线续传）
+  chan            → 事件通知 channel
+
+事件类型：
+  PUT    → key 创建或修改
+  DELETE → key 删除
+```
+
+### 6.2 Watch 事件分发流程
+
+```
+1. 客户端发起 Watch 请求（gRPC Stream）
+2. etcd server 创建 Watcher 对象
+3. Watcher 注册到WatchableStore
+4. 后续写操作产生事件 → 分发给所有匹配的 Watcher
+5. 通过 gRPC Stream 推送给客户端
+
+性能优化：
+  事件批量发送（减少网络开销）
+  事件压缩（合并同一 key 的多次变更）
+  按 revision 过滤（只推送客户端关心的版本）
+```
+
+### 6.3 Watch 与 ZooKeeper Watcher 对比
+
+| 维度 | etcd Watch | ZK Watcher |
+|------|------------|------------|
+| 生命周期 | 持续流式推送 | 一次性触发 |
+| 断线续传 | 支持（按 revision） | 不支持 |
+| 前缀监听 | 原生支持 | 需监听父节点 |
+| 事件可靠性 | 保证不丢（WAL） | 可能丢事件 |
+| 性能 | 高（长连接） | 中（每次重注册） |
+
+---
+
+## 七、etcd Compaction 与 Defragmentation
+
+### 7.1 Compaction 压缩
+
+```bash
+# 手动压缩（保留当前 revision）
+etcdctl compact $(etcdctl endpoint status --write-out=json | jq '.header.revision')
+
+# 自动压缩配置
+# --auto-compaction-mode=periodic
+# --auto-compaction-retention=8h
+
+# K8s 默认配置
+# kube-apiserver --etcd-compaction-retention=8h
+```
+
+### 7.2 Defragmentation 碎片整理
+
+```bash
+# 手动碎片整理（释放磁盘空间）
+etcdctl defrag
+
+# 批量整理所有节点
+for host in node1 node2 node3; do
+  ETCDCTL_API=3 etcdctl --endpoints=$host:2379 defrag
+done
+
+# 注意：
+#   defrag 会阻塞写操作（拷贝数据+切换）
+#   建议在低峰期执行
+#   执行前确保磁盘空间充足
+```
+
+### 7.3 DB 空间管理最佳实践
+
+```
+磁盘空间计算：
+  理论大小 = 当前数据量 + 历史版本 + 删除标记（tombstone）
+  实际大小 = 理论大小 × 2（碎片 + 临时文件）
+
+监控指标：
+  etcd_mvcc_db_total_size_in_bytes  → DB 大小
+  etcd_mvcc_db_total_size_in_use_in_bytes → 实际使用大小
+  ratio = total_size_in_bytes / total_size_in_use_in_bytes
+  ratio > 2 → 需要 defrag
+
+清理策略：
+  1. 启用自动压缩（--auto-compaction-retention=8h）
+  2. 每周执行一次 defrag
+  3. 磁盘使用率 > 70% 时立即 defrag
+```
+
+---
+
+## 八、etcd 在 Kubernetes 中的角色
+
+### 8.1 etcd 作为 K8s 后端存储
+
+```
+Kubernetes 架构：
+  kube-apiserver → etcd（唯一读写入口）
+    ├── 所有资源对象存储
+    ├── Watch 机制驱动控制循环
+    ├── 事务操作（创建/更新/删除）
+    └── 版本控制（resourceVersion）
+
+存储内容：
+  Pod / Deployment / Service / ConfigMap / Secret
+  Namespace / Node / PV / PVC / Ingress ...
+  所有集群状态信息
+```
+
+### 8.2 etcd 与 K8s 性能关系
+
+| 场景 | 影响 |
+|------|------|
+| etcd 延迟高 | API 请求超时，控制器反应迟钝 |
+| etcd 磁盘满 | 集群完全不可用 |
+| etcd 写吞吐不足 | 大规模集群创建/更新缓慢 |
+| etcd 网络分区 | 集群脑裂/不可用 |
+
+### 8.3 K8s etcd 运维建议
+
+```bash
+# 定期备份（建议每小时）
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d%H%M).db
+
+# 监控 etcd 健康
+etcdctl endpoint health --cluster
+etcdctl endpoint status --cluster --write-out=table
+
+# 关键告警指标
+# etcd_server_has_leader == 0 → 无 Leader
+# etcd_server_leader_changes_seen_total → 频繁换主
+# etcd_disk_wal_fsync_duration_seconds > 100ms → 磁盘慢
+# etcd_mvcc_db_total_size_in_bytes > 8GB → DB 过大
+```
+
+---
+
+## 九、etcd 性能调优
+
+### 9.1 关键参数配置
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| heartbeat-interval | 100ms | 100~300ms | 心跳间隔（跨机房可调大） |
+| election-timeout | 1000ms | 1000~5000ms | 选举超时 |
+| quota-backend-bytes | 2GB | 8GB | 后端存储大小限制 |
+| auto-compaction-retention | 0 | 8h | 自动压缩周期 |
+| snapshot-count | 10000 | 10000~50000 | 触发快照的事务数 |
+| max-request-bytes | 1.5MB | 4MB | 最大请求大小 |
+
+### 9.2 磁盘优化
+
+```
+磁盘选型：
+  推荐：NVMe SSD（最低延迟）
+  可接受：SATA SSD
+  禁止：HDD（fsync 延迟高，会导致选举超时）
+
+文件系统：
+  推荐：ext4 或 xfs
+  挂载选项：noatime,nodiratime
+
+IO 调度器：
+  SSD：noop 或 deadline
+  查看：cat /sys/block/sda/queue/scheduler
+```
+
+### 9.3 网络优化
+
+```
+网络要求：
+  延迟：< 10ms（同机房）
+  带宽：1Gbps+
+  丢包率：< 0.1%
+
+跨机房部署：
+  主集群在一个机房，灾备集群跨机房
+  Raft 对延迟敏感，跨广域网不推荐
+  建议使用 Observer 节点做跨机房读
+```
+
+---
+
+## 十、etcd 备份与恢复
+
+### 10.1 备份策略
+
+```bash
+# 完整备份
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d).db
+
+# 验证备份
+etcdctl snapshot status /backup/etcd-20260821.db --write-out=table
+
+# 定时备份（cron）
+0 * * * * /usr/local/bin/etcdctl snapshot save /backup/etcd-$(date +\%Y\%m\%d\%H\%M).db
+
+# 保留策略
+# 保留最近 7 天的备份
+find /backup -name "etcd-*.db" -mtime +7 -delete
+```
+
+### 10.2 恢复流程
+
+```bash
+# 1. 停止所有 etcd 节点
+systemctl stop etcd
+
+# 2. 备份当前数据目录
+mv /var/lib/etcd /var/lib/etcd.bak
+
+# 3. 恢复快照
+etcdctl snapshot restore /backup/etcd-20260821.db \
+  --data-dir=/var/lib/etcd-restored \
+  --name=etcd-node1 \
+  --initial-cluster="etcd-node1=http://node1:2380,etcd-node2=http://node2:2380" \
+  --initial-advertise-peer-urls=http://node1:2380
+
+# 4. 启动 etcd
+systemctl start etcd
+
+# 5. 验证数据完整性
+etcdctl get / --prefix --keys-only | head -20
+```
+
+### 10.3 恢复注意事项
+
+| 场景 | 注意事项 |
+|------|----------|
+| 单节点恢复 | 直接 snapshot restore + 启动 |
+| 集群恢复 | 所有节点使用同一快照恢复 |
+| 部分数据恢复 | 先恢复到新集群，再导出部分数据 |
+| 跨版本恢复 | 小版本可恢复，大版本需验证兼容性 |
+
+---
+
+## 十一、etcd 安全（RBAC / Auth）
+
+### 11.1 认证开启
+
+```bash
+# 启用认证
+etcdctl auth enable
+
+# 禁用认证
+etcdctl auth disable
+
+# 查看认证状态
+etcdctl auth status
+```
+
+### 11.2 RBAC 角色权限
+
+```bash
+# 创建用户
+etcdctl user add root:root-password
+
+# 创建角色
+etcdctl role add read-only
+
+# 给角色授权（只读 /services 前缀）
+etcdctl role grant-permission read-only read /services/
+
+# 绑定角色到用户
+etcdctl user grant-role root root
+
+# 查看用户权限
+etcdctl user get root
+```
+
+### 11.3 权限控制最佳实践
+
+| 角色 | 权限 | 用途 |
+|------|------|------|
+| root | 读写全部 key | 管理员 |
+| k8s-apiserver | 读写 /registry/* | K8s API Server |
+| monitoring | 读全部 key | 监控系统 |
+| app-read | 读 /services/* | 应用只读 |
+
+### 11.4 传输加密（TLS）
+
+```bash
+# 生成证书
+cfssl gencert -ca=ca.pem -ca-key=ca-key.pem \
+  -config=ca-config.json -profile=server etcd-csr.json | cfssljson -bare etcd
+
+# 启动时配置 TLS
+etcd \
+  --cert-file=/etc/etcd/server.pem \
+  --key-file=/etc/etcd/server-key.pem \
+  --trusted-ca-file=/etc/etcd/ca.pem \
+  --client-cert-auth=true \
+  --peer-cert-file=/etc/etcd/peer.pem \
+  --peer-key-file=/etc/etcd/peer-key.pem \
+  --peer-trusted-ca-file=/etc/etcd/ca.pem \
+  --peer-client-cert-auth=true
+```
+
+---
+
+## 十二、etcd vs ZooKeeper 性能基准
+
+### 12.1 基准测试对比
+
+| 指标 | etcd | ZooKeeper |
+|------|------|-----------|
+| 写 QPS（3 节点） | 15,000~20,000 | 15,000~25,000 |
+| 读 QPS（线性读） | 15,000~20,000 | 100,000+（Follower） |
+| 写延迟（P99） | 10~50ms | 5~20ms |
+| 读延迟（P99） | 5~20ms | < 5ms（Follower） |
+| 内存占用 | 较低 | 较高 |
+| 磁盘 IO | WAL + snapshot | 事务日志 + snapshot |
+
+### 12.2 场景适配
+
+```
+选 etcd 的场景：
+  ✓ K8s 集群（官方指定）
+  ✓ 云原生 Go 技术栈
+  ✓ 需要 Watch 流和 MVCC
+  ✓ 轻量配置中心
+
+选 ZooKeeper 的场景：
+  ✓ 存量 Java 生态（Kafka/HBase/Dubbo）
+  ✓ 需要超高读吞吐（Follower 读）
+  ✓ 团队熟悉 ZK 运维
+  ✓ 大规模 Hadoop 集群
+```
+
+---
+
+## 十三、与其他板块的关系
 
 - 和「**基础知识/中间件/ZooKeeper**」：同为 CP 协调服务，etcd 是云原生替代者（对比见上）。
 - 和「**基础知识/中间件/注册中心与配置中心**」：etcd 可做轻量注册/配置中心，与 Nacos/Apollo 的取舍见该篇。

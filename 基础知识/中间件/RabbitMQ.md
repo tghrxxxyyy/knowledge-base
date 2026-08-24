@@ -247,7 +247,334 @@ rabbitmq-plugins enable rabbitmq_delayed_message_exchange
 
 ---
 
-## 十二、RabbitMQ Spring Boot 集成示例
+## 十二、Quorum Queues（仲裁队列）
+
+### 12.1 什么是 Quorum Queue
+
+Quorum Queue 是 RabbitMQ 3.8+ 引入的高可用队列，基于 Raft 共识协议实现数据复制，替代老版本的镜像队列（Mirror Queue）。
+
+```mermaid
+flowchart TB
+    PRODUCER[生产者] --> LEADER[Leader 节点]
+    LEADER -->|Raft 复制| F1[Follower 1]
+    LEADER -->|Raft 复制| F2[Follower 2]
+    F1 --> C1[消费者]
+    F2 --> C2[消费者]
+```
+
+### 12.2 Quorum Queue vs Mirror Queue
+
+| 维度 | Quorum Queue | Mirror Queue |
+|------|-------------|--------------|
+| 协议 | Raft | 自定义同步 |
+| 数据一致性 | 强一致 | 最终一致 |
+| 消息持久化 | 必须持久化 | 可选 |
+| 内存占用 | 较低（磁盘优先） | 较高（内存复制） |
+| 消息吞吐 | 较低（Raft 开销） | 较高 |
+| 推荐版本 | 3.8+（推荐） | 已废弃 |
+
+### 12.3 配置与使用
+
+```bash
+# 声明仲裁队列
+rabbitmqadmin declare queue name=order-queue durable=true \
+  arguments='{"x-queue-type": "quorum", "x-quorum-initial-group-size": 3}'
+
+# 监控
+rabbitmqctl list_queues name type messages consumers
+```
+
+---
+
+## 十三、Stream Queues（流队列）
+
+### 13.1 Stream 特性
+
+RabbitMQ 3.9+ 引入的流存储队列，类似 Kafka 的日志模型：消息持久化、支持多消费者组、支持消息回溯。
+
+```text
+Stream Queue 特点：
+  - 追加写入，不可变消息日志
+  - 多消费者组独立消费（类似 Kafka）
+  - 消费位移由客户端管理（支持回溯）
+  - 高吞吐（顺序写磁盘）
+  - 适合事件溯源、审计日志、CDC
+```
+
+### 13.2 Stream vs Classic vs Quorum
+
+| 维度 | Classic | Quorum | Stream |
+|------|---------|--------|--------|
+| 消息模型 | 队列（消费即删） | 队列（消费即删） | 日志（持久保留） |
+| 多消费者组 | 不支持 | 不支持 | 支持 |
+| 消息回溯 | 不支持 | 不支持 | 支持 |
+| 吞吐 | 中 | 中 | **高** |
+| 适用 | 传统业务解耦 | 高可用队列 | 事件溯源/CDC |
+
+### 13.3 使用示例
+
+```bash
+# 声明流队列
+rabbitmqadmin declare queue name=event-stream durable=true \
+  arguments='{"x-queue-type": "stream", "x-stream-max-length": 1000000}'
+
+# 流消费者（Java 客户端）
+StreamConsumer consumer = channel.consume("event-stream",
+    new DeliverCallback() {
+        public void handle(String tag, Delivery delivery) {
+            // 处理消息，消费位移由客户端追踪
+        }
+    });
+```
+
+---
+
+## 十四、RabbitMQ Federation 与 Shovel
+
+### 14.1 Federation（联邦）
+
+```text
+Federation 用途：
+  - 跨机房/跨地域消息复制
+  - 异步复制，最终一致
+  - 不同集群/不同 Vhost 间桥接
+
+配置：
+  1. 启用插件：rabbitmq-plugins enable federation
+  2. 创建 Federation Upstream（上游地址）
+  3. 配置 Exchange/Queue Federation 策略
+```
+
+```mermaid
+flowchart LR
+    DC1[机房A Exchange] -->|Federation 异步| DC2[机房B Exchange]
+    DC2 --> Q1[Queue B1]
+    DC2 --> Q2[Queue B2]
+```
+
+### 14.2 Shovel（铲子）
+
+```text
+Shovel 用途：
+  - 跨集群主动搬运消息
+  - 支持 AMQP 和 STOMP 协议
+  - 精确控制消息转发规则
+
+配置：
+  rabbitmq-plugins enable shovel
+  rabbitmqctl set_parameter shovel my-shovel \
+    '{"src-protocol": "amqp", "src-uri": "amqp://host1", "src-queue": "q1", "dest-protocol": "amqp", "dest-uri": "amqp://host2", "dest-queue": "q2"}'
+```
+
+### 14.3 Federation vs Shovel
+
+| 维度 | Federation | Shovel |
+|------|-----------|--------|
+| 粒度 | Exchange/Queue 级别 | Queue→Queue/Exchange |
+| 方向 | 自动路由 | 精确点对点 |
+| 适用 | 广播复制 | 精确搬运 |
+| 复杂度 | 较低 | 较高 |
+
+---
+
+## 十五、消息去重与优先级队列
+
+### 15.1 消息去重策略
+
+```text
+RabbitMQ 不保证 exactly-once，需要应用层去重：
+
+1. 消息 ID 去重表
+   - 生产者设唯一 message-id
+   - 消费者查去重表（Redis/DB）
+   - 已处理则跳过
+
+2. 业务唯一键
+   - 订单号/支付流水号 做幂等
+   - 数据库唯一索引兜底
+
+3. Redis SETNX
+   - SETNX message_id 1 EX 3600
+   - 成功则消费，失败则跳过
+```
+
+```java
+// Redis 去重示例
+public boolean isDuplicate(String messageId) {
+    String key = "mq:dedup:" + messageId;
+    return !redisTemplate.opsForValue().setIfAbsent(key, "1", 24, TimeUnit.HOURS);
+}
+```
+
+### 15.2 优先级队列
+
+```bash
+# 声明优先级队列
+rabbitmqadmin declare queue name=priority-queue durable=true \
+  arguments='{"x-max-priority": 10}'
+
+# 发送带优先级的消息
+rabbitmqadmin publish routing_key=priority-queue payload='high priority' \
+  properties='{"priority": 8}'
+```
+
+| 优先级 | 说明 |
+|--------|------|
+| 0-9 | 数字越大优先级越高 |
+| 消费者 | 优先消费高优先级消息 |
+| 适用 | VIP 用户优先处理、紧急任务优先 |
+
+---
+
+## 十六、死信队列深度
+
+### 16.1 死信产生原因
+
+```text
+消息变成死信的三种场景：
+1. 消费者拒绝（basic.reject / basic.nack 且 requeue=false）
+2. 消息 TTL 过期（message-ttl 或 per-message expiration）
+3. 队列达到最大长度（x-max-length），头部消息被丢弃
+```
+
+### 16.2 死信处理架构
+
+```mermaid
+flowchart LR
+    DLX[Dead Letter Exchange] --> DLQ1[DLQ 告警队列]
+    DLX --> DLQ2[DLQ 补偿队列]
+    DLX --> DLQ3[DLQ 审计队列]
+    DLQ1 --> ALERT[告警通知]
+    DLQ2 --> RETRY[重试补偿]
+    DLQ3 --> AUDIT[审计日志]
+```
+
+### 16.3 配置示例
+
+```java
+@Bean
+public Queue businessQueue() {
+    return QueueBuilder.durable("business.queue")
+        .withArgument("x-dead-letter-exchange", "dlx.exchange")
+        .withArgument("x-dead-letter-routing-key", "dlq.routing")
+        .withArgument("x-message-ttl", 60000)  // 消息 60s 未消费进死信
+        .build();
+}
+```
+
+---
+
+## 十七、RabbitMQ on Kubernetes
+
+### 17.1 RabbitMQ Operator
+
+```text
+RabbitMQ Cluster Operator（VMware 开源）：
+  - 声明式管理 RabbitMQ 集群
+  - 自动处理集群扩缩容、版本升级
+  - 集成 K8s Service/Ingress/PVC
+
+安装：
+  kubectl apply -f https://github.com/rabbitmq/cluster-operator/releases/latest/download/cluster-operator.yml
+```
+
+### 17.2 Operator 资源定义
+
+```yaml
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: rabbitmq
+spec:
+  replicas: 3
+  image: rabbitmq:3.12-management
+  persistence:
+    storageClassName: gp3
+    storage: 50Gi
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  rabbitmq:
+    additionalConfig: |
+      vm_memory_high_watermark.relative = 0.6
+      disk_free_limit.absolute = 10GB
+```
+
+---
+
+## 十八、rabbitmq.conf 生产调优
+
+### 18.1 核心参数
+
+```ini
+# 连接与通道
+channel_max = 2048
+heartbeat = 60
+
+# 内存
+vm_memory_high_watermark.relative = 0.4
+vm_memory_high_watermark_paging_ratio = 0.75
+
+# 磁盘
+disk_free_limit.absolute = 50GB
+
+# 队列
+queue_master_locator = min-masters
+default_queue_type = quorum  # 默认使用仲裁队列
+
+# 网络
+tcp_listen_options.backlog = 256
+tcp_listen_options.nodelay = true
+tcp_listen_options.sndbuf = 196608
+tcp_listen_options.recbuf = 196608
+
+# 日志
+log.file.level = info
+log.file.rotation.date = $D0
+log.file.rotation.size = 104857600
+```
+
+### 18.2 Erlang VM 调优
+
+```erlang
+%% Erlang VM 参数（advanced.config）
+[
+  {kernel, [
+    {inet_dist_listen_min, 60000},
+    {inet_dist_listen_max, 60100}
+  ]},
+  {sasl, [
+    {sasl_error_logger, false}
+  ]},
+  {os_mon, [
+    {memsup_system_memory_high_watermark, 0.8},
+    {disksup_diskspace_high_watermark, 0.85}
+  ]}
+].
+
+%% 环境变量
+ERL_FLAGS="+P 1048576 +Q 65536 +A 32 +S 2:2"
+%% +P 进程数上限  +Q 端口上限  +A 线程池  +S CPU核心绑定
+```
+
+### 18.3 调优检查清单
+
+| 检查项 | 建议值 | 说明 |
+|--------|--------|------|
+| vm_memory_high_watermark | 0.4~0.6 | 视内存和队列堆积情况 |
+| disk_free_limit | 50GB+ | 防磁盘满阻塞 |
+| channel_max | 2048 | 单连接最大通道数 |
+| heartbeat | 60 | 检测死连接 |
+| tcp listen backlog | 256 | 高并发连接队列 |
+| Erlang 进程数 | 1048576+ | 默认上限可能不够 |
+
+---
+
+## 十九、RabbitMQ Spring Boot 集成示例
 
 ### 12.1 配置类
 
