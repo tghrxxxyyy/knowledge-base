@@ -507,6 +507,160 @@ groups:
 
 ---
 
+## 补充：Canal深度解析
+
+### 1. Canal Binlog Parsing
+
+| 维度 | 说明 |
+|------|------|
+| 支持格式 | ROW/STATEMENT/MIXED |
+| 事件类型 | INSERT/UPDATE/DELETE/DDL |
+| 解析方式 | 伪装MySQL Slave |
+| 位点管理 | GTID/文件位点 |
+
+### 2. Canal Instance Configuration
+
+| 配置项 | 说明 |
+|--------|------|
+| 数据库地址 | MySQL Master地址 |
+| 账号密码 | Canal专用账号 |
+| 表过滤 | 按库/表过滤 |
+| 消息格式 | Protobuf/FlatMessage |
+
+### 3. Canal Filter Rules
+
+| 规则类型 | 说明 |
+|----------|------|
+| 库过滤 | 按数据库名过滤 |
+| 表过滤 | 按表名过滤 |
+| 字段过滤 | 按字段名过滤 |
+| 黑名单 | 排除特定表 |
+
+### 4. Canal Monitoring
+
+| 指标 | 说明 |
+|------|------|
+| 实例状态 | RUNNING/STOPPED |
+| 同步延迟 | binlog位点差 |
+| 消费堆积 | MQ消息堆积 |
+| 投递成功率 | 消息投递成功比例 |
+
+### 5. Canal in Microservices
+
+| 场景 | 说明 |
+|------|------|
+| 缓存同步 | MySQL→Redis一致性 |
+| 搜索同步 | MySQL→ES实时索引 |
+| 数据分发 | 一对多数据分发 |
+| 事件驱动 | 变更事件触发业务 |
+
+### 6. Canal with Flink
+
+| 场景 | 说明 |
+|------|------|
+| 实时数仓 | binlog→Kafka→Flink |
+| 流处理 | 变更事件实时计算 |
+| 特征计算 | 实时特征更新 |
+
+### 7. Canal with Kafka
+
+| 组件 | 说明 |
+|------|------|
+| 生产者 | Canal Server |
+| 消费者 | 业务应用 |
+| Topic | 按库/业务划分 |
+| 分区 | 按表hash分区 |
+
+### 8. Canal in Real-Time Data Warehouse
+
+| 层 | 说明 |
+|----|------|
+| 数据源 | MySQL |
+| 采集层 | Canal |
+| 缓冲层 | Kafka |
+| 计算层 | Flink |
+| 存储层 | ES/Redis/数仓 |
+
+### 9. Canal vs Debezium vs Flink CDC
+
+| 维度 | Canal | Debezium | Flink CDC |
+|------|-------|----------|-----------|
+| 数据源 | MySQL为主 | 多数据库 | 多数据库 |
+| 部署 | 独立Server | Kafka Connect | Flink集群 |
+| 精确一次 | 至少一次 | 至少一次 | 端到端精确一次 |
+| 运维成本 | 中 | 中 | 低 |
+
+### 10. Canal Data Consistency
+
+| 机制 | 说明 |
+|------|------|
+| 位点持久化 | 记录消费位点 |
+| ACK机制 | 处理完才确认 |
+| 幂等消费 | 下游保证幂等 |
+| 断点续传 | 故障恢复 |
+
+### 11. Canal Performance Tuning
+
+| 优化项 | 说明 |
+|--------|------|
+| 多实例并行 | 分库分表并行消费 |
+| Kafka解耦 | MQ缓冲削峰 |
+| 批量投递 | 批量写入下游 |
+| 内存优化 | 调整内存队列大小 |
+
+### 12. Canal Security
+
+| 维度 | 说明 |
+|------|------|
+| 账号权限 | 最小权限原则 |
+| 网络隔离 | Canal专用网络 |
+| 数据加密 | 传输加密 |
+
+### 13. Canal Checklist
+
+| 检查项 | 说明 |
+|--------|------|
+| binlog格式 | ROW模式 |
+| 账号权限 | REPLICATION SLAVE |
+| 表过滤 | 只监听需要的表 |
+| 幂等消费 | 下游保证幂等 |
+
+### 14. Canal Future Trends
+
+| 趋势 | 说明 |
+|------|------|
+| 云原生 | K8s部署 |
+| 多数据源 | 支持更多数据库 |
+| AI集成 | 智能监控告警 |
+
+### 15. Canal Selection Guide
+
+| 场景 | 推荐方案 |
+|------|----------|
+| MySQL同步 | Canal |
+| 多数据源 | Flink CDC |
+| 流处理 | Flink CDC |
+| 离线同步 | DataX |
+
+### 16. Canal Tools
+
+| 工具 | 说明 |
+|------|------|
+| Canal Admin | Web控制台 |
+| mc客户端 | 命令行工具 |
+| Adapter | 数据同步适配器 |
+
+### 17. Canal Best Practices
+
+| 实践 | 说明 |
+|------|------|
+| 最小权限 | Canal账号权限最小化 |
+| 监控告警 | 实例状态+延迟监控 |
+| 幂等消费 | 下游保证幂等 |
+| 断点续传 | 位点持久化 |
+
+---
+
 ## 十七、与其他板块的关系
 
 - 和「**基础知识/MQ**」：Canal 常投递到 Kafka / RocketMQ，再由下游消费。

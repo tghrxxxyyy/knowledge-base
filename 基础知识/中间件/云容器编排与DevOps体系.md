@@ -615,6 +615,162 @@ CI/CD 安全扫描：
 
 ---
 
+## 补充：云容器编排深度解析
+
+### 1. EKS vs AKS vs GKE 对比
+
+| 维度 | EKS | AKS | GKE |
+|------|-----|-----|-----|
+| 控制面SLA | 99.95% | 99.95% | 99.95% |
+| 控制面费用 | $0.10/hr | 免费 | $0.10/hr |
+| 节点自动扩缩 | Cluster Autoscaler/Karpenter | Cluster Autoscaler | 自动扩缩 |
+| Serverless节点 | Fargate | ACI/Virtual Nodes | Autopilot |
+| 网络 | VPC CNI | Azure CNI | VPC-native |
+| 存储 | EBS/EFS | Azure Disk/File | Persistent Disk |
+| 安全 | IAM Roles for Pods | AAD Pod Identity | Workload Identity |
+| 监控 | CloudWatch | Azure Monitor | Cloud Monitoring |
+
+### 2. Managed K8s Control Plane
+
+| 组件 | 托管说明 |
+|------|----------|
+| API Server | 云厂商管理，自动扩缩 |
+| etcd | 云厂商管理，自动备份 |
+| Controller Manager | 云厂商管理，自动升级 |
+| Scheduler | 云厂商管理，自动优化 |
+
+### 3. K8s Node Auto-Provisioning
+
+| 方案 | 说明 |
+|------|------|
+| Cluster Autoscaler | 根据Pod需求自动扩缩节点 |
+| Karpenter | AWS新一代节点自动配置 |
+| Node Pool | 预配置节点组 |
+| Spot Instances | 使用抢占式实例降低成本 |
+
+### 4. Cloud CI/CD Pipelines
+
+| 服务 | 说明 |
+|------|------|
+| AWS CodePipeline | 流水线编排 |
+| AWS CodeBuild | 托管构建服务 |
+| Azure DevOps | 完整DevOps平台 |
+| GitHub Actions | 事件驱动CI/CD |
+| Cloud Build | GCP托管构建 |
+
+### 5. Cloud Artifact Registry
+
+| 服务 | 说明 |
+|------|------|
+| ECR | AWS容器镜像仓库 |
+| ACR | Azure容器镜像仓库 |
+| Artifact Registry | GCP制品仓库 |
+| 支持格式 | Docker/Maven/npm/PyPI |
+
+### 6. Cloud Deployment Strategies
+
+| 策略 | 说明 |
+|------|------|
+| Rolling Update | 逐步替换Pod |
+| Blue/Green | 新旧版本并行 |
+| Canary | 灰度发布 |
+| A/B Testing | 流量分割测试 |
+
+### 7. GitOps with ArgoCD
+
+| 功能 | 说明 |
+|------|------|
+| 声明式部署 | Git作为唯一真相源 |
+| 自动同步 | 检测Git变更自动部署 |
+| 多集群管理 | 统一管理多集群 |
+| 回滚 | Git revert自动回滚 |
+| RBAC | 细粒度权限控制 |
+
+### 8. 云容器安全
+
+| 实践 | 说明 |
+|------|------|
+| 镜像扫描 | 构建时CVE扫描 |
+| 运行时安全 | 异常行为检测 |
+| 网络策略 | Pod间网络隔离 |
+| RBAC | K8s权限控制 |
+| Secret管理 | 外部密钥系统 |
+
+### 9. 云容器成本优化
+
+| 策略 | 说明 |
+|------|------|
+| 节点自动扩缩 | 按需扩缩节点 |
+| Spot实例 | 非关键负载使用 |
+| 资源请求 | 合理设置requests/limits |
+| Pod反亲和性 | 均衡节点负载 |
+
+### 10. 云容器监控
+
+| 工具 | 说明 |
+|------|------|
+| Prometheus | 指标采集 |
+| Grafana | 可视化 |
+| Loki | 日志聚合 |
+| Jaeger | 链路追踪 |
+
+### 11. 云容器网络
+
+| 方案 | 说明 |
+|------|------|
+| VPC CNI | AWS VPC原生网络 |
+| Azure CNI | Azure容器网络 |
+| Calico | 网络策略 |
+| Cilium | eBPF网络 |
+
+### 12. 云容器存储
+
+| 方案 | 说明 |
+|------|------|
+| EBS | AWS块存储 |
+| Azure Disk | Azure块存储 |
+| Persistent Disk | GCP块存储 |
+| EFS/Azure File | 共享文件存储 |
+
+### 13. 云容器最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 镜像优化 | 最小化基础镜像 |
+| 资源限制 | 设置requests/limits |
+| 健康检查 | liveness/readiness |
+| 日志收集 | 标准输出收集 |
+| 配置管理 | ConfigMap/Secret |
+
+### 14. 云容器团队协作
+
+| 角色 | 职责 |
+|------|------|
+| 平台工程师 | K8s集群运维 |
+| SRE | 可观测性保障 |
+| 开发工程师 | 应用容器化 |
+| 安全工程师 | 容器安全 |
+
+### 15. 云容器未来趋势
+
+| 趋势 | 说明 |
+|------|------|
+| WebAssembly | 新一代容器运行时 |
+| eBPF | 内核级网络观测 |
+| 多集群联邦 | 统一管理多集群 |
+| 混合云 | 云上云下统一调度 |
+
+### 16. 云容器选型决策
+
+| 场景 | 推荐方案 |
+|------|----------|
+| 快速上手 | 托管K8s+托管CI/CD |
+| 多云环境 | Terraform+ArgoCD |
+| 企业级 | 安全扫描+合规检查 |
+| 成本敏感 | Spot实例+自动扩缩 |
+
+---
+
 ## 十七、与其他板块的关系
 
 - K8s 原理见「[云原生/Kubernetes核心](../../云原生/Kubernetes核心.md)」；
