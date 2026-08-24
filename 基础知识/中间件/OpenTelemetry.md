@@ -354,6 +354,418 @@ Service A → 请求带 traceparent: 00-abc...-def...-01
 
 ---
 
+## 十二、OpenTelemetry Collector Pipeline 深入
+
+### 12.1 Pipeline 架构
+
+```mermaid
+flowchart LR
+    A[Receivers] --> B[Processors]
+    B --> C[Exporters]
+    
+    subgraph Receivers
+        R1[OTLP gRPC]
+        R2[OTLP HTTP]
+        R3[Prometheus]
+        R4[Filelog]
+        R5[Jaeger]
+    end
+    
+    subgraph Processors
+        P1[memory_limiter]
+        P2[batch]
+        P3[tail_sampling]
+        P4[attributes]
+        P5[redaction]
+        P6[filter]
+    end
+    
+    subgraph Exporters
+        E1[Jaeger]
+        E2[Prometheus]
+        E3[Loki]
+        E4[云厂商]
+    end
+```
+
+### 12.2 Receiver 详解
+
+| Receiver | 协议 | 用途 |
+|----------|------|------|
+| otlp | OTLP gRPC/HTTP | OTel SDK 直连 |
+| prometheus | Prometheus 拉取 | 兼容现有监控 |
+| jaeger | Jaeger 协议 | 迁移现有链路 |
+| zipkin | Zipkin 协议 | 迁移现有链路 |
+| filelog | 文件采集 | 容器日志 |
+| kafka | Kafka 消息 | 日志/链路缓冲 |
+| hostmetrics | 主机指标 | CPU/内存/磁盘 |
+
+### 12.3 Processor 详解
+
+| Processor | 用途 | 关键配置 |
+|-----------|------|---------|
+| batch | 批量发送 | timeout, send_batch_size |
+| memory_limiter | 内存保护 | limit_mib, check_interval |
+| tail_sampling | 尾部采样 | decision_wait, policies |
+| attributes | 属性修改 | actions (add/update/delete) |
+| resource | 资源信息 | attributes |
+| redaction | 脱敏 | blocked_values |
+| filter | 过滤 | traces/metrics/logs |
+| transform | 字段转换 | expressions |
+| k8sattributes | K8s 元数据 | extract_metadata |
+| resourcedetection | 资源检测 | detectors |
+
+### 12.4 Exporter 详解
+
+| Exporter | 输出 | 用途 |
+|----------|------|------|
+| otlp | OTLP 协议 | 链路后端 |
+| prometheus | Prometheus 格式 | 指标后端 |
+| loki | Loki API | 日志后端 |
+| elasticsearch | ES API | 日志检索 |
+| kafka | Kafka 消息 | 缓冲层 |
+| logging | 控制台 | 调试 |
+
+---
+
+## 十三、OTLP 协议深入
+
+### 13.1 OTLP 协议结构
+
+```
+OTLP（OpenTelemetry Protocol）：
+  基于 gRPC/HTTP 的二进制协议
+  三种信号：Traces / Metrics / Logs
+
+gRPC 模式：
+  默认端口：4317（gRPC）/ 4318（HTTP）
+  传输：Protobuf 编码
+  流式传输（gRPC streaming）
+
+HTTP 模式：
+  POST /v1/traces
+  POST /v1/metrics
+  POST /v1/logs
+  Content-Type: application/x-protobuf
+```
+
+### 13.2 OTLP vs 其他协议
+
+| 协议 | 传输 | 编码 | 多信号 | 生态 |
+|------|------|------|--------|------|
+| OTLP | gRPC/HTTP | Protobuf | 是 | OTel 原生 |
+| Jaeger | gRPC/HTTP | Protobuf | 否（仅链路） | Jaeger |
+| Zipkin | HTTP | JSON/Protobuf | 否（仅链路） | Zipkin |
+| Prometheus | HTTP | Prometheus 文本 | 否（仅指标） | Prometheus |
+
+### 13.3 OTLP 配置示例
+
+```yaml
+# OTel Collector 接收 OTLP
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 4
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+          - "*"
+
+# SDK 发送 OTLP
+exporters:
+  otlp:
+    endpoint: collector:4317
+    tls:
+      insecure: true
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+```
+
+---
+
+## 十四、OpenTelemetry SDK 自动埋点
+
+### 14.1 Java Agent 自动埋点
+
+```bash
+# 零侵入自动埋点
+java -javaagent:opentelemetry-javaagent.jar \
+     -Dotel.service.name=order-service \
+     -Dotel.traces.exporter=otlp \
+     -Dotel.metrics.exporter=otlp \
+     -Dotel.logs.exporter=otlp \
+     -Dotel.exporter.otlp.endpoint=http://collector:4317 \
+     -Dotel.resource.attributes=deployment.environment=production \
+     -jar app.jar
+```
+
+### 14.2 自动覆盖框架
+
+| 框架 | 支持 | 说明 |
+|------|------|------|
+| HTTP Servlet | 完整 | Spring MVC/JAX-RS |
+| Spring WebFlux | 完整 | 响应式框架 |
+| JDBC | 完整 | 数据库调用 |
+| Redis | 完整 | Jedis/Lettuce |
+| Kafka | 完整 | 生产者/消费者 |
+| gRPC | 完整 | 客户端/服务端 |
+| RabbitMQ | 完整 | 消息收发 |
+| Elasticsearch | 完整 | 客户端调用 |
+| Netty | 完整 | 网络框架 |
+| GraphQL | 完整 | GraphQL Java |
+
+### 14.3 Python 自动埋点
+
+```python
+# opentelemetry-instrument 自动埋点
+pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install
+
+# 启动自动埋点
+opentelemetry-instrument \
+  --service_name order-service \
+  --exporter_otlp_endpoint http://collector:4317 \
+  python app.py
+
+# 自动覆盖：
+# Flask / Django / FastAPI / requests / psycopg2 / redis / kafka
+```
+
+### 14.4 Go 自动埋点
+
+```go
+// 使用 contrib 包自动埋点
+import (
+    "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+    "go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+)
+
+// HTTP Handler 自动埋点
+handler := otelhttp.NewHandler(mux, "server")
+
+// Gin 路由自动埋点
+r := gin.New()
+r.Use(otelgin.Middleware("order-service"))
+```
+
+---
+
+## 十五、OpenTelemetry vs Jaeger vs Zipkin
+
+| 维度 | OpenTelemetry | Jaeger | Zipkin |
+|------|---------------|--------|--------|
+| 定位 | 采集标准（SDK/协议） | 链路追踪后端 | 链路追踪后端 |
+| 埋点 | 标准 API + 自动埋点 | 自家 SDK | 自家 SDK |
+| 后端存储 | 任意（导出到任后端） | ES/Cassandra/Kafka | ES/MySQL/Cassandra |
+| 协议 | OTLP（标准） | Jaeger 协议 | Zipkin 协议 |
+| 可观测性 | 三支柱（Trace/Metrics/Logs） | 仅链路 | 仅链路 |
+| 厂商锁定 | 无 | 中 | 中 |
+| 生态 | CNCF 毕业 | CNCF 毕业 | 社区 |
+| 适用 | 云原生统一采集 | Java 链路追踪 | 轻量链路追踪 |
+
+**选型决策**：
+
+```
+新项目 → OpenTelemetry（标准 + 三支柱）
+Java 已有 Jaeger → OpenTelemetry SDK 替换 Jaeger SDK
+轻量链路 → Zipkin（简单）
+统一可观测 → OTel Collector → Jaeger/Prometheus/Loki
+```
+
+---
+
+## 十六、OpenTelemetry 生产部署
+
+### 16.1 部署架构
+
+```
+生产部署模式：
+  Agent 模式：每节点/每 Pod 一个 Collector（DaemonSet）
+    → 接收本地 SDK 数据
+    → 批处理 + 转发到 Gateway
+
+  Gateway 模式：中心化 Collector 集群
+    → 接收所有 Agent 数据
+    → Tail 采样 + 脱敏
+    → 导出到多后端
+
+  推荐组合：
+    Agent（采集）→ Gateway（处理）→ 多后端（Jaeger/Prometheus/Loki）
+```
+
+### 16.2 K8s 部署
+
+```yaml
+# OTel Collector Agent (DaemonSet)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+spec:
+  template:
+    spec:
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:0.88.0
+        args:
+        - --config=/etc/otelcol/config.yaml
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otelcol
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+```
+
+### 16.3 高可用配置
+
+| 组件 | 高可用策略 |
+|------|-----------|
+| Agent | DaemonSet（每节点一个） |
+| Gateway | 多副本 + K8s Service |
+| 配置存储 | ConfigMap/CRD |
+| 后端存储 | ES 集群 / S3 多 AZ |
+
+---
+
+## 十七、OpenTelemetry 语义约定（Semantic Conventions）
+
+### 17.1 资源属性
+
+| 属性 | 说明 | 示例 |
+|------|------|------|
+| service.name | 服务名 | order-service |
+| service.version | 服务版本 | 1.2.3 |
+| deployment.environment | 部署环境 | production |
+| host.name | 主机名 | pod-abc-123 |
+| k8s.namespace.name | K8s 命名空间 | default |
+| k8s.pod.name | K8s Pod 名 | order-abc-123 |
+
+### 17.2 Span 属性
+
+| 属性 | 说明 | 示例 |
+|------|------|------|
+| http.method | HTTP 方法 | GET |
+| http.url | 请求 URL | /api/orders |
+| http.status_code | 状态码 | 200 |
+| db.system | 数据库类型 | mysql |
+| db.statement | SQL 语句 | SELECT * FROM orders |
+| messaging.system | 消息系统 | kafka |
+| messaging.destination | 目标 topic | orders |
+
+### 17.3 语义约定最佳实践
+
+```
+遵循语义约定的好处：
+  1. 工具自动识别（Grafana/Jaeger 自动展示）
+  2. 跨团队统一（相同属性名）
+  3. 采样规则可基于属性（如 http.status_code=500）
+
+自定义属性前缀：
+  业务属性：myapp.order_id
+  避免与标准属性冲突
+```
+
+---
+
+## 十八、OpenTelemetry 采样策略
+
+### 18.1 采样类型
+
+| 类型 | 位置 | 说明 | 适用 |
+|------|------|------|------|
+| Head-based | SDK 端 | 入口决定采样率 | 基础采样 |
+| Tail-based | Collector 端 | 看完整链路后决定 | 保留关键链路 |
+| Parent-based | SDK 端 | 子 Span 跟随父采样 | 默认行为 |
+
+### 18.2 Tail Sampling 策略
+
+```yaml
+# Collector tail_sampling 配置
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    policies:
+    # 保留错误请求
+    - name: error-policy
+      type: status_code
+      status_code: {status_codes: [ERROR]}
+    # 保留慢请求
+    - name: slow-policy
+      type: latency
+      latency: {threshold_ms: 1000}
+    # 保留特定服务
+    - name: service-policy
+      type: string_attribute
+      string_attribute: {key: service.name, values: [payment-service]}
+    # 概率采样
+    - name: probabilistic-policy
+      type: probabilistic
+      probabilistic: {sampling_percentage: 10}
+```
+
+### 18.3 采样率规划
+
+```
+采样率参考：
+  低流量服务（< 100 QPS）：100%
+  中流量服务（100~1000 QPS）：10~50%
+  高流量服务（> 1000 QPS）：1~10%
+  关键业务（支付/订单）：100%（强制）
+
+动态调整：
+  大促期间：临时提高采样率
+  故障排查：临时 100% 采样
+  日常运行：恢复正常采样率
+```
+
+---
+
+## 十九、OpenTelemetry 数据库观测
+
+### 19.1 数据库 Span 属性
+
+```java
+// 数据库调用自动埋点属性
+Span span = tracer.spanBuilder("SELECT orders")
+    .setAttribute("db.system", "mysql")
+    .setAttribute("db.statement", "SELECT * FROM orders WHERE id = ?")
+    .setAttribute("db.user", "app_user")
+    .setAttribute("net.peer.name", "db-host:3306")
+    .setAttribute("db.name", "order_db")
+    .startSpan();
+```
+
+### 19.2 数据库监控指标
+
+| 指标 | 说明 | 告警 |
+|------|------|------|
+| db.client.connections.usage | 连接池使用率 | > 80% |
+| db.client.connections.timeout | 连接超时数 | > 0 |
+| db.statement.duration | SQL 执行耗时 | P99 > 1s |
+| db.statement.count | SQL 执行次数 | 突增/突降 |
+| db.statement.error | SQL 错误数 | > 0 |
+
+### 19.3 慢 SQL 分析
+
+```
+慢 SQL 定位流程：
+  1. 查看 db.statement.duration 分位线
+  2. 按 db.statement 分组 → Top N 慢 SQL
+  3. 结合 db.statement 内容 → EXPLAIN 分析
+  4. 关联 span attributes → 定位具体服务/实例
+```
+
+---
+
 ## 十一、与其他板块的关系
 
 - 链路追踪见「[Jaeger 链路追踪](./Jaeger链路追踪.md)」与「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；

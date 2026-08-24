@@ -292,7 +292,351 @@ SMT = 在事件进入 Kafka 前做字段级处理（无需消费端处理）
 
 ---
 
-## 七、与其他板块的关系
+## 七、Debezium Connector 内部机制
+
+### 7.1 CDC 机制对比
+
+| 数据库 | CDC 机制 | 说明 |
+|--------|----------|------|
+| MySQL | binlog | 基于 binlog 文件读取 |
+| PostgreSQL | WAL | 基于 WAL 日志（Logical Decoding） |
+| Oracle | LogMiner/ASM | 基于 Redo Log |
+| SQL Server | LSN | 基于 Log Sequence Number |
+| MongoDB | Oplog | 基于操作日志 |
+
+### 7.2 MySQL CDC 内部流程
+
+```mermaid
+sequenceDiagram
+    participant M as MySQL Master
+    participant D as Debezium
+    participant K as Kafka
+    M->>D: binlog 事件
+    D->>D: 解析 binlog 事件
+    D->>D: 构造 Change Event
+    D->>K: 发送到 Kafka Topic
+    D->>D: 记录 offset
+```
+
+### 7.3 binlog 读取模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| Based on position | 指定 binlog 位点 | 迁移/恢复 |
+| Based on GTID | 基于 GTID | 高可用集群 |
+| Based on timestamp | 基于时间戳 | 简单场景 |
+
+### 7.4 增量快照原理
+
+```
+传统快照问题：
+  大表全量读取 → 阻塞 binlog 消费
+  快照期间数据变更 → 不一致
+
+Debezium 增量快照：
+  表按主键分块（chunk）
+  每块读取完成 → 标记水位线
+  水位线前后的 binlog 事件去重
+  快照与 binlog 并行推进
+```
+
+---
+
+## 八、Debezium 与 MongoDB
+
+### 8.1 MongoDB CDC 配置
+
+```json
+{
+  "name": "mongo-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
+    "mongodb.connection.mode": "replica_set",
+    "mongodb.connection-string": "mongodb://mongo1:27017,mongo2:27017",
+    "database.include.list": "shop",
+    "collection.include.list": "shop.orders",
+    "topic.prefix": "mongo"
+  }
+}
+```
+
+### 8.2 MongoDB 事件结构
+
+```json
+{
+  "payload": {
+    "op": "c",
+    "source": { "connector": "mongodb", "db": "shop", "collection": "orders" },
+    "after": { "_id": { "$oid": "..." }, "amount": 100, "status": "pending" }
+  }
+}
+```
+
+### 8.3 MongoDB 特殊处理
+
+| 特性 | 说明 |
+|------|------|
+| Change Stream | MongoDB 4.0+ 原生变更流 |
+| Oplog | 复制集 Oplog 作为 CDC 源 |
+| 大文档 | 变更事件可能很大（需配置 max.size） |
+| 数组操作 | 数组修改事件特殊处理 |
+| 事务 | 多文档事务的变更合并 |
+
+---
+
+## 九、Debezium 快照模式
+
+### 9.1 快照模式对比
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| `initial` | 全量快照 + 增量 | 首次启动 |
+| `never` | 跳过快照，只消费 binlog | 已有位点 |
+| `when_needed` | 需要时自动快照 | 自动恢复 |
+| `no_data` | 只记录 Schema 不读数据 | Schema 同步 |
+| `schema_only` | 只同步 Schema | 结构同步 |
+
+### 9.2 增量快照配置
+
+```json
+{
+  "snapshot.mode": "initial",
+  "incremental.snapshot.enabled": "true",
+  "incremental.snapshot.chunk.size": "4096",
+  "snapshot.fetch.size": "1000"
+}
+```
+
+### 9.3 快照调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `incremental.snapshot.chunk.size` | 每块大小 | 4096~16384 |
+| `snapshot.fetch.size` | 每次读取行数 | 1000~5000 |
+| `snapshot.select.statement.overrides` | 自定义快照 SQL | 按需过滤 |
+| `snapshot.mode` | 快照策略 | 根据场景选择 |
+
+---
+
+## 十、Debezium SMT（消息转换）
+
+### 10.1 内置 SMT 列表
+
+| SMT | 说明 | 示例 |
+|-----|------|------|
+| `InsertField` | 插入字段 | 添加时间戳字段 |
+| `RemoveField` | 移除字段 | 去掉敏感字段 |
+| `RenameField` | 重命名字段 | 统一字段名 |
+| `ReplaceField` | 替换字段 | 字段格式转换 |
+| `MaskField` | 字段脱敏 | 身份证/手机号 |
+| `TimestampConverter` | 时间戳转换 | epoch → ISO |
+| `TopicRouting` | 主题路由 | 按条件分 Topic |
+| `ExtractNewRecordState` | 只保留 after 值 | 简化事件 |
+
+### 10.2 SMT 配置示例
+
+```json
+{
+  "transforms": "route,mask",
+  "transforms.route.type": "org.apache.kafka.connect.transforms.TopicRouting",
+  "transforms.route.route.topic.regex": "(.*)",
+  "transforms.route.route.topic.replacement": "cdc.$1",
+  "transforms.mask.type": "org.apache.kafka.connect.transforms.MaskField$Value",
+  "transforms.mask.fields": "card_no,id_card",
+  "transforms.mask.replacement": "******"
+}
+```
+
+### 10.3 SMT 执行顺序
+
+```
+多个 SMT 按配置顺序执行：
+  1. 字段插入（InsertField）
+  2. 字段重命名（RenameField）
+  3. 字段脱敏（MaskField）
+  4. 主题路由（TopicRouting）
+  5. 提取值（ExtractNewRecordState）
+
+注意：
+  SMT 在 Kafka Connect Worker 执行（非消费端）
+  执行顺序影响结果
+  复杂转换建议在消费端处理
+```
+
+---
+
+## 十一、Debezium vs Canal vs Maxwell
+
+### 11.1 核心对比
+
+| 维度 | Debezium | Canal | Maxwell |
+|------|----------|-------|---------|
+| 支持数据库 | 8+（MySQL/PG/Oracle等） | 仅 MySQL | 仅 MySQL |
+| 架构 | Kafka Connect | 自研 Server | 独立进程 |
+| 输出 | Kafka（多格式） | Kafka/数据库/自定义 | JSON（Kafka） |
+| 快照能力 | 强（增量快照） | 有 | 有 |
+| Schema 变更 | 支持 | 支持 | 有限 |
+| 事件格式 | 标准（before/after/op） | 自定义 | JSON |
+| 运维成本 | 中 | 中 | 低 |
+| 生态 | Kafka Connect 生态 | 阿里生态 | 简单 |
+| 社区 | Red Hat 主导 | 阿里主导 | 社区维护 |
+
+### 11.2 选型决策树
+
+```
+数据库种类？
+  ├── 多种数据库 → Debezium（唯一选择）
+  └── 仅 MySQL
+      ├── 需要 Kafka 生态 → Debezium / Canal
+      ├── 需要简单 JSON → Maxwell
+      ├── 需要实时数仓 SQL → Flink CDC
+      └── 阿里云环境 → Canal / DTS
+```
+
+### 11.3 迁移路径
+
+| 从 | 到 | 方案 |
+|----|-----|------|
+| Canal → Debezium | 替换 Server 为 Connect |
+| Maxwell → Debezium | 配置增量快照 |
+| Debezium → Flink CDC | 内核一致，SQL 化 |
+
+---
+
+## 十二、Debezium 性能调优
+
+### 12.1 源端调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `snapshot.chunk.size` | 快照分块大小 | 4096~16384 |
+| `max.batch.size` | 单次批量大小 | 2048 |
+| `poll.interval.ms` | 轮询间隔 | 500 |
+| `snapshot.fetch.size` | 快照读取行数 | 1000 |
+
+### 12.2 Kafka Connect 调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `tasks.max` | 任务数 | 按表数量 |
+| `batch.size` | Kafka 批量大小 | 16384 |
+| `linger.ms` | 发送延迟 | 10~100 |
+| `buffer.memory` | 缓冲区大小 | 32MB |
+
+### 12.3 性能基准
+
+| 指标 | 典型值 |
+|------|--------|
+| MySQL binlog 吞吐 | 10~50 万事件/秒 |
+| Kafka 写入吞吐 | 50~100 万事件/秒 |
+| 端到端延迟 | 100ms~1s |
+| 快照速度 | 1~5 万行/秒 |
+
+### 12.4 性能监控
+
+```
+关键指标：
+  Debezium connector lag（延迟）
+  Kafka Connect task 状态
+  binlog 读取速率
+  Kafka 写入速率
+  快照进度
+```
+
+---
+
+## 十三、Debezium 错误处理策略
+
+### 13.1 常见错误类型
+
+| 错误类型 | 原因 | 处理 |
+|----------|------|------|
+| 连接失败 | 数据库不可达 | 重试 + 告警 |
+| binlog 位点丢失 | binlog 被清理 | 重新快照 |
+| Schema 变更 | 表结构变化 | 兼容处理 |
+| 数据解析失败 | 数据类型不匹配 | Dead Letter Queue |
+| 磁盘写满 | Kafka 磁盘满 | 扩容/清理 |
+
+### 13.2 错误处理配置
+
+```json
+{
+  "errors.log.enable": true,
+  "errors.log.include.messages": true,
+  "errors.tolerance": "all",
+  "errors.deadletterqueue.topic.name": "dlq-debezium",
+  "errors.deadletterqueue.topic.replication.factor": 3,
+  "errors.deadletterqueue.context.headers.enable": true
+}
+```
+
+### 13.3 重试策略
+
+```
+Debezium 重试机制：
+  连接重试：exponential backoff（指数退避）
+  Task 重试：Kafka Connect 自动重启
+  消息重试：消费端幂等 + 死信队列
+
+最佳实践：
+  配置 dead-letter queue（死信队列）
+  监控 DLQ 消息数量
+  定期人工处理 DLQ 消息
+```
+
+---
+
+## 十四、Debezium 在数据湖入湖
+
+### 14.1 典型架构
+
+```mermaid
+graph LR
+    A[MySQL/PG] -->|CDC| B[Debezium]
+    B --> C[Kafka]
+    C --> D[Flink/Spark]
+    D --> E[数据湖 Delta/Iceberg]
+    D --> F[实时数仓 ClickHouse]
+    D --> G[搜索引擎 ES]
+```
+
+### 14.2 入湖模式
+
+| 模式 | 说明 | 延迟 |
+|------|------|------|
+| 批量入湖 | 定时批量写入湖格式 | 小时级 |
+| 实时入湖 | 流式写入湖格式 | 分钟级 |
+| CDC 入湖 | 增量合并到湖表 | 秒~分钟 |
+
+### 14.3 入湖配置示例
+
+```python
+# Flink + Delta Lake 入湖
+CREATE TABLE delta_sink (
+  id BIGINT,
+  amount DECIMAL(10,2),
+  ts TIMESTAMP(3)
+) WITH (
+  'connector' = 'delta',
+  'table-path' = 's3://lake/orders'
+);
+
+INSERT INTO delta_sink SELECT * FROM cdc_source;
+```
+
+### 14.4 入湖最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 增量合并 | 定期 Merge 到 Delta/Iceberg |
+| 分区策略 | 按时间分区 |
+| Schema 演进 | 兼容性检查 |
+| 数据质量 | 入湖前校验 |
+| 元数据管理 | Glue/Hive Metastore |
+
+---
+
+## 十五、与其他板块的关系
 
 - Canal 对比见「[数据同步 CDC（Canal）](./数据同步CDC-Canal.md)」；
 - Kafka（事件落点）见「[Kafka](./Kafka.md)」；

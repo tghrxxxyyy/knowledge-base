@@ -319,6 +319,373 @@ sequenceDiagram
 - `SERIALIZABLE`：最高隔离、锁最重，仅极端一致性要求用。
 - 隔离级别越高一致性越强但并发越低；按业务读一致性需求选，别盲目用最高。
 
+## 二十三、Spring Bean 生命周期深度剖析
+
+### 23.1 Bean 生命周期完整流程
+
+```mermaid
+graph TB
+    A[BeanDefinition 加载] --> B[BeanFactoryPostProcessor]
+    B --> C[InstantiationAwareBeanPostProcessor.postProcessBeforeInstantiation]
+    C --> D[createBeanInstance 实例化]
+    D --> E[BeanPostProcessor.postProcessBeforeInitialization]
+    E --> F[@PostConstruct / InitializingBean.afterPropertiesSet]
+    F --> G[自定义 init-method]
+    G --> H[BeanPostProcessor.postProcessAfterInitialization]
+    H --> I[Bean 就绪，可使用]
+    I --> J[容器关闭]
+    J --> K[@PreDestroy / DisposableBean.destroy]
+    K --> L[自定义 destroy-method]
+```
+
+### 23.2 关键扩展点
+
+| 扩展点 | 触发时机 | 典型用途 |
+|--------|----------|----------|
+| BeanFactoryPostProcessor | Bean 定义加载后 | 修改 BeanDefinition（如占位符替换） |
+| InstantiationAwareBeanPostProcessor | 实例化前后 | 短路实例化、属性注入 |
+| BeanPostProcessor | 初始化前后 | AOP 代理、@Autowired 处理 |
+| SmartInitializingSingleton | 所有单例初始化后 | 触发依赖注入完成后的逻辑 |
+| DisposableBean | 销毁时 | 资源清理 |
+
+## 二十四、Spring AOP 代理机制（CGLIB vs JDK）
+
+### 24.1 代理方式对比
+
+| 维度 | JDK 动态代理 | CGLIB |
+|------|-------------|-------|
+| 实现方式 | 基于接口，Proxy.newProxyInstance | 基于继承，生成子类 |
+| 限制 | 目标类必须实现接口 | 不能代理 final 类/方法 |
+| 性能 | 反射调用，略慢 | 字节码生成，较快 |
+| Spring Boot 默认 | false | true |
+| 配置 | spring.aop.proxy-target-class=false | spring.aop.proxy-target-class=true |
+
+### 24.2 代理选择逻辑
+
+```mermaid
+flowchart TD
+    A[目标 Bean] --> B{实现了接口?}
+    B -->|是| C{proxyTargetClass=false?}
+    B -->|否| D[CGLIB 代理]
+    C -->|是| E[JDK 动态代理]
+    C -->|否| F[CGLIB 代理]
+```
+
+```java
+// 代理判断逻辑
+if (targetClass.getInterfaces().length > 0 && !proxyTargetClass) {
+    // JDK 动态代理
+    return Proxy.newProxyInstance(classLoader, interfaces, handler);
+} else {
+    // CGLIB 代理
+    Enhancer enhancer = new Enhancer();
+    enhancer.setSuperclass(targetClass);
+    enhancer.setCallback(handler);
+    return enhancer.create();
+}
+```
+
+### 24.3 AOP 执行顺序（多切面）
+
+```text
+@Order(1) @Aspect:
+  @Before → 执行顺序 1
+  
+@Order(2) @Aspect:
+  @Before → 执行顺序 2
+  
+目标方法执行
+  
+@Order(2) @Aspect:
+  @AfterReturning → 执行顺序 2
+  
+@Order(1) @Aspect:
+  @AfterReturning → 执行顺序 1
+
+执行顺序：@Before 升序，@After 降序
+```
+
+## 二十五、Spring 事件系统（ApplicationEvent）
+
+### 25.1 事件发布与监听
+
+```java
+// 定义事件
+public class OrderCreatedEvent extends ApplicationEvent {
+    private final Long orderId;
+    private final BigDecimal amount;
+    
+    public OrderCreatedEvent(Object source, Long orderId, BigDecimal amount) {
+        super(source);
+        this.orderId = orderId;
+        this.amount = amount;
+    }
+}
+
+// 发布事件
+@Service
+public class OrderService {
+    @Autowired ApplicationEventPublisher publisher;
+    
+    public void createOrder(Order order) {
+        // 业务逻辑...
+        publisher.publishEvent(new OrderCreatedEvent(this, order.getId(), order.getAmount()));
+    }
+}
+
+// 监听事件
+@Component
+public class OrderEventListener {
+    @EventListener
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        // 发送通知、清缓存等
+    }
+    
+    @EventListener(condition = "#event.amount > 1000")
+    public void handleLargeOrder(OrderCreatedEvent event) {
+        // 大额订单特殊处理
+    }
+    
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void afterOrderCommitted(OrderCreatedEvent event) {
+        // 事务提交后异步处理
+    }
+}
+```
+
+### 25.2 事件系统最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 事务事件 | @TransactionalEventListener(AFTER_COMMIT) 避免脏读 |
+| 异步事件 | @EventListener + @Async 不阻塞主流程 |
+| 解耦 | 事件用于跨模块通知，不放核心一致性逻辑 |
+| 失败处理 | 异步事件异常需 AsyncUncaughtExceptionHandler |
+
+## 二十六、Spring @Conditional 魔法
+
+### 26.1 条件装配注解体系
+
+```mermaid
+graph TB
+    A[@Conditional] --> B[@ConditionalOnClass]
+    A --> C[@ConditionalOnMissingBean]
+    A --> D[@ConditionalOnProperty]
+    A --> E[@ConditionalOnWebApplication]
+    A --> F[@ConditionalOnBean]
+    A --> G[@ConditionalOnResource]
+    A --> H[@ConditionalOnExpression]
+```
+
+### 26.2 条件装配实战
+
+```java
+// Starter 自动配置
+@Configuration
+@ConditionalOnClass(RedisTemplate.class)           // classpath 有 RedisTemplate
+@ConditionalOnMissingBean(CacheService.class)      // 用户没自定义 CacheService
+public class CacheAutoConfiguration {
+    
+    @Bean
+    @ConditionalOnProperty(name = "cache.type", havingValue = "redis", matchIfMissing = true)
+    public CacheService redisCacheService() {
+        return new RedisCacheService();
+    }
+    
+    @Bean
+    @ConditionalOnProperty(name = "cache.type", havingValue = "local")
+    public CacheService localCacheService() {
+        return new LocalCacheService();
+    }
+}
+
+// 用户自定义覆盖默认
+@Service
+public class MyCacheService implements CacheService {
+    // 自动覆盖默认的 RedisCacheService
+}
+```
+
+## 二十七、Spring Boot 自动配置原理
+
+### 27.1 自动配置加载流程
+
+```mermaid
+flowchart TB
+    A[@SpringBootApplication] --> B[@EnableAutoConfiguration]
+    B --> C[AutoConfigurationImportSelector]
+    C --> D[读取 META-INF/spring/AutoConfiguration.imports]
+    D --> E[过滤 @Conditional 注解]
+    E --> F[按 @Order 排序]
+    F --> G[注册为 BeanDefinition]
+```
+
+### 27.2 自动配置调试
+
+```bash
+# 启动时打印自动配置报告
+java -jar app.jar --debug
+
+# 日志中会显示：
+# Positive matches:（生效的自动配置）
+# Negative matches:（未生效的自动配置及原因）
+```
+
+```java
+// 获取条件评估报告
+@Autowired ConditionEvaluationReport report;
+Map<String, ConditionOutcome> outcomes = report.getOutcomes();
+outcomes.forEach((key, value) -> {
+    System.out.println(key + ": " + (value.isMatch() ? "匹配" : "不匹配"));
+});
+```
+
+## 二十八、Spring Profiles 环境隔离
+
+### 28.1 Profile 配置方式
+
+```java
+// 注解方式
+@Component
+@Profile("dev")
+public class DevDataSource extends DataSource { }
+
+@Configuration
+@Profile("prod")
+public class ProdDataSource extends DataSource { }
+
+// YAML 多环境配置
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+server:
+  port: 8080
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+server:
+  port: 80
+```
+
+### 28.2 Profile 激活方式
+
+| 方式 | 命令/配置 | 说明 |
+|------|-----------|------|
+| 命令行 | --spring.profiles.active=dev | 最高优先级 |
+| 环境变量 | SPRING_PROFILES_ACTIVE=prod | 容器环境 |
+| 配置文件 | spring.profiles.active: dev | application.yml |
+| 代码 | environment.setActiveProfiles("test") | 编程方式 |
+
+## 二十九、Spring Cache 抽象
+
+### 29.1 Cache 注解
+
+```java
+@Service
+public class UserService {
+    
+    @Cacheable(value = "users", key = "#id")
+    public User getUserById(Long id) {
+        // 有缓存不执行，无缓存执行后缓存
+        return userRepository.findById(id).orElse(null);
+    }
+    
+    @CachePut(value = "users", key = "#user.id")
+    public User updateUser(User user) {
+        // 总是执行，更新缓存
+        return userRepository.save(user);
+    }
+    
+    @CacheEvict(value = "users", key = "#id")
+    public void deleteUser(Long id) {
+        // 删除缓存
+        userRepository.deleteById(id);
+    }
+    
+    @Caching(
+        evict = {
+            @CacheEvict(value = "users", key = "#id"),
+            @CacheEvict(value = "userProfiles", key = "#id")
+        }
+    )
+    public void deleteUserWithProfile(Long id) {
+        // 删除多个缓存
+    }
+}
+```
+
+### 29.2 Cache 实现对比
+
+| 实现 | 特点 | 适用场景 |
+|------|------|----------|
+| ConcurrentMapCache | 内存，JVM 级 | 开发测试 |
+| RedisCache | 分布式，持久化 | 生产环境 |
+| CaffeineCache | 高性能本地缓存 | 热点数据 |
+| EhCacheCache | 支持磁盘持久化 | 大本地缓存 |
+
+## 三十、Spring vs Quarkus vs Micronaut 对比
+
+| 维度 | Spring Boot | Quarkus | Micronaut |
+|------|-------------|---------|-----------|
+| 启动时间 | 2~5s | 0.5~2s | 0.5~2s |
+| 内存占用 | 200~500MB | 100~300MB | 100~300MB |
+| 反射使用 | 大量 | 极少（AOT） | 极少（编译时） |
+| GraalVM | 支持 | 原生支持 | 原生支持 |
+| 生态成熟度 | 最丰富 | 快速增长 | 较丰富 |
+| 学习曲线 | 中等 | 中等 | 中等 |
+| 适用场景 | 通用企业应用 | Serverless/云原生 | 微服务/边缘计算 |
+
+```text
+选型建议：
+- 传统企业应用/团队熟悉 → Spring Boot
+- Serverless/低延迟/容器密度 → Quarkus
+- 微服务/编译时优化 → Micronaut
+- 三者都支持 GraalVM 原生镜像
+```
+
+## 三十一、Spring 与 GraalVM 原生镜像
+
+### 31.1 原生镜像优势与限制
+
+| 优势 | 限制 |
+|------|------|
+| 启动毫秒级 | 编译时间长（数分钟） |
+| 内存占用小 | 反射/动态代理需配置 |
+| 无 JIT 预热 | 运行时元数据处理受限 |
+| 适合 Serverless | 部分库不兼容 |
+
+### 31.2 原生镜像配置
+
+```java
+// 反射配置
+@RegisterReflectionForBinding({User.class, Order.class})
+public class NativeConfig { }
+
+// 资源配置
+@ImportResource("classpath:applicationContext.xml")
+public class NativeConfig { }
+
+// 构建时注册
+@Reflective
+public class MyService {
+    // 运行时可通过反射访问
+}
+```
+
+```bash
+# 构建原生镜像
+mvn -Pnative native:compile
+# 或
+./mvnw -DskipTests package -Pnative
+
+# 运行
+./target/myapp
+```
+
 ---
 
 # 第三轮深度优化：Spring6 循环依赖变更 / @Transactional 全失效 / 事件驱动 / 条件装配 / WebFlux选型 / Actuator监控

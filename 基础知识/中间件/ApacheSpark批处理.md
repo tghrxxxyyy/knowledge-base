@@ -173,7 +173,366 @@ Cluster Manager（资源管理）
 
 ---
 
-## 七、与其他板块的关系
+## 七、Spark Catalyst 优化器内部原理
+
+### 7.1 优化流程
+
+```mermaid
+graph TD
+    A[SQL/API] --> B[解析器 Parser]
+    B --> C[逻辑计划 Logical Plan]
+    C --> D[分析器 Analyzer]
+    D --> E[优化逻辑计划 Optimized Logical Plan]
+    E --> F[物理计划生成 Planner]
+    F --> G[物理计划 Physical Plan]
+    G --> H[代码生成 Code Generation]
+    H --> I[可执行 RDD]
+```
+
+### 7.2 四大优化阶段
+
+| 阶段 | 说明 | 示例 |
+|------|------|------|
+| 解析 | SQL → 未解析逻辑计划 | `SELECT * FROM t WHERE id=1` |
+| 分析 | 解析元数据（表/列） | 确认 `t` 表存在，`id` 列类型 |
+| 优化 | 谓词下推/列裁剪/常量折叠 | `WHERE id=1` 下推到 Scan |
+| 物理 | 选择 Join 策略/ Shuffle 方式 | Broadcast Join vs Sort Merge Join |
+
+### 7.3 核心优化规则
+
+| 优化 | 说明 |
+|------|------|
+| 谓词下推 | `WHERE` 条件推到数据源 |
+| 列裁剪 | 只读取需要的列 |
+| 常量折叠 | `1+2` 编译期计算为 `3` |
+| 消除子查询 | 子查询 → Join/Union |
+| Join 重排序 | 小表放左侧/广播 |
+
+### 7.4 Whole-Stage Code Generation
+
+```
+传统执行：
+  算子 A → 行化接口 → 算子 B → 行化接口 → 算子 C
+  每步都有虚函数调用/缓存未命中
+
+Whole-Stage Code Generation：
+  算子 A + B + C 合并为一个 Stage
+  生成单个 Java 函数（无虚调用）
+  类似手写代码性能
+
+示例：
+  Filter → Project → Aggregate
+  编译为：单个循环 + 累加器
+  性能提升 2~10x
+```
+
+---
+
+## 八、Tungsten 执行引擎
+
+### 8.1 内存管理
+
+```
+Tungsten 内存管理：
+  堆外内存（Off-Heap）：避免 GC
+  二进制格式：数据紧凑存储
+  缓存友好：数据布局优化
+
+内存布局：
+  8 字节对齐 → CPU 缓存行命中
+  紧凑编码 → 减少内存占用
+  指针跳转少 → 减少间接寻址
+```
+
+### 8.2 排序优化
+
+| 优化 | 说明 |
+|------|------|
+| Unsafe 排序 | 堆外内存直接排序 |
+| Prefix 排序 | 多列排序只比较前缀 |
+| Radix Sort | 整数排序用基数排序 |
+| Page-Based 排序 | 按页排序减少内存分配 |
+
+### 8.3 缓存感知计算
+
+```
+数据结构对齐 CPU 缓存行（64 字节）：
+  行数据紧凑存储（不像 Java 对象有对象头）
+  嵌套循环 Join 优化：内表按缓存行对齐
+  Hash 聚合：桶数对齐缓存行
+
+性能提升：
+  减少 CPU Cache Miss
+  减少 TLB Miss
+  提升内存带宽利用率
+```
+
+---
+
+## 九、Spark Shuffle 深入
+
+### 9.1 Shuffle 写入流程
+
+```mermaid
+graph TD
+    A[Task 输出] --> B[Buffer 溢写]
+    B --> C[Sort 按分区排序]
+    C --> D[Spill 到磁盘]
+    D --> E[Merge 合并文件]
+    E --> F[通知下游 Task 位置]
+```
+
+### 9.2 Shuffle 读取流程
+
+```mermaid
+graph TD
+    A[获取 Map 输出位置] --> B[远程/本地读取]
+    B --> C[反序列化]
+    C --> D[归并排序]
+    D --> E[返回给 Task]
+```
+
+### 9.3 Shuffle 优化策略
+
+| 优化 | 说明 | 配置项 |
+|------|------|--------|
+| Broadcast Join | 小表广播避免 Shuffle | `spark.sql.autoBroadcastJoinThreshold` |
+| 预分区 | 提前按 Join Key 分区 | `repartition()` |
+| Map 端聚合 | 预聚合减少 Shuffle 数据量 | `spark.sql.mapKeyDedupPolicy` |
+| Sort-Based Shuffle | 替代 Hash Shuffle | `spark.shuffle.manager=sort` |
+| 外部 Shuffle 服务 | 跨 Executor 读取 Shuffle 数据 | `spark.shuffle.service.enabled` |
+
+### 9.4 Shuffle 调优参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `spark.sql.shuffle.partitions` | 200 | Shuffle 分区数 |
+| `spark.shuffle.compress` | true | Shuffle 数据压缩 |
+| `spark.shuffle.spill.compress` | true | 溢写数据压缩 |
+| `spark.shuffle.file.buffer` | 32K | Shuffle 写缓冲 |
+| `spark.reducer.maxSizeInFlight` | 48M | Shuffle 读缓冲 |
+
+---
+
+## 十、Spark on Kubernetes
+
+### 10.1 部署架构
+
+```mermaid
+graph TD
+    A[用户提交 Spark 任务] --> B[Spark Driver Pod]
+    B --> C[申请 Executor Pod]
+    C --> D[Executor Pod 1]
+    C --> E[Executor Pod 2]
+    C --> F[Executor Pod N]
+    D --> G[本地磁盘 Shuffle]
+    E --> G
+    F --> G
+```
+
+### 10.2 配置示例
+
+```bash
+spark-submit \
+  --master k8s://https://k8s-master:6443 \
+  --deploy-mode cluster \
+  --name spark-job \
+  --class com.example.Main \
+  --conf spark.kubernetes.container.image=my-spark:latest \
+  --conf spark.kubernetes.executor.instances=4 \
+  --conf spark.kubernetes.executor.memory=8g \
+  --conf spark.kubernetes.executor.cores=4 \
+  --conf spark.kubernetes.driver.memory=4g \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+  --conf spark.kubernetes.driver.podTemplateFile=driver-pod.yaml \
+  --conf spark.kubernetes.executor.podTemplateFile=executor-pod.yaml \
+  local:///opt/spark/jars/app.jar
+```
+
+### 10.3 K8s 部署关键配置
+
+| 配置项 | 说明 |
+|--------|------|
+| `spark.kubernetes.container.image` | Docker 镜像 |
+| `spark.kubernetes.executor.instances` | Executor 数量 |
+| `spark.kubernetes.executor.deleteOnTermination` | 结束后删除 Pod |
+| `spark.kubernetes.submission.waitAppCompletion` | 等待完成 |
+| `spark.kubernetes.allocation.batch.size` | 批量申请 Pod 数 |
+
+### 10.4 动态资源分配
+
+```properties
+spark.dynamicAllocation.enabled=true
+spark.dynamicAllocation.minExecutors=2
+spark.dynamicAllocation.maxExecutors=20
+spark.dynamicAllocation.executorIdleTimeout=60s
+spark.shuffle.service.enabled=true
+```
+
+---
+
+## 十一、Spark Structured Streaming
+
+### 11.1 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| Input Table | 无限输入表（流数据视为表） |
+| Result Table | 查询结果表 |
+| Output Mode | 输出方式（Append/Complete/Update） |
+| Trigger | 触发间隔（Processing Time/Event Time） |
+| Watermark | 处理延迟数据 |
+
+### 11.2 Output Mode 对比
+
+| Mode | 说明 | 适用 |
+|------|------|------|
+| Append | 新行追加 | 无聚合/窗口聚合 |
+| Complete | 全部结果覆盖 | 聚合查询 |
+| Update | 只更新行 | 聚合查询（非全量） |
+
+### 11.3 使用示例
+
+```python
+# 读取 Kafka 流
+df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "orders") \
+    .load()
+
+# 处理
+result = df.selectExpr("CAST(value AS STRING)") \
+    .groupBy(window("timestamp", "5 minutes"), "value") \
+    .count()
+
+# 写入
+query = result.writeStream \
+    .outputMode("complete") \
+    .format("console") \
+    .start()
+```
+
+### 11.4 Structured Streaming vs Flink
+
+| 维度 | Structured Streaming | Flink |
+|------|---------------------|-------|
+| 处理模型 | 微批 | 真流 |
+| 延迟 | 秒级 | 毫秒级 |
+| API | DataFrame | DataStream/SQL |
+| 状态管理 | 有限 | RocksDB |
+| 事件时间 | 支持 | 支持 |
+| 适用 | 批流统一 | 复杂流处理 |
+
+---
+
+## 十二、Spark AQE 深入
+
+### 12.1 AQE 三大优化
+
+| 优化 | 说明 | 效果 |
+|------|------|------|
+| 动态合并分区 | 自动合并小分区 | 减少 Task 数 |
+| 动态切换 Join | 运行时发现小表切 Broadcast | 避免 Shuffle |
+| 动态倾斜处理 | 自动拆分倾斜分区 | 均衡负载 |
+
+### 12.2 配置项
+
+```properties
+# 开启 AQE
+spark.sql.adaptive.enabled=true
+spark.sql.adaptive.coalescePartitions.enabled=true
+spark.sql.adaptive.skewJoin.enabled=true
+
+# 合并分区阈值
+spark.sql.adaptive.coalescePartitions.minPartitionNum=1
+spark.sql.adaptive.coalescePartitions.targetPostShuffleInputSize=64MB
+
+# 倾斜处理
+spark.sql.adaptive.skewJoin.skewedPartitionFactor=5
+spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256MB
+```
+
+### 12.3 AQE 工作原理
+
+```
+传统查询：
+  编译期确定执行计划（静态）
+  无法感知运行时数据分布
+
+AQE：
+  编译期生成多个可切换计划
+  运行时采集统计信息
+  动态调整执行计划
+  Shuffle 后重新评估 Join 策略
+  自动处理数据倾斜
+```
+
+---
+
+## 十三、Spark 动态分区裁剪
+
+### 13.1 原理
+
+```
+传统 JOIN：
+  SELECT * FROM fact JOIN dim ON fact.id = dim.id
+  → 全量扫描 fact 表
+
+动态分区裁剪：
+  编译期：识别 JOIN 中的等值条件
+  运行时：dim 表的结果动态裁剪 fact 表分区
+  → 只扫描相关分区
+
+性能提升：
+  分区数 × 裁剪比例 = 减少的扫描量
+  通常提升 2~10x
+```
+
+### 13.2 触发条件
+
+| 条件 | 说明 |
+|------|------|
+| JOIN 键 = 分区键 | 等值 JOIN 条件 |
+| 分区表 | 目标表是分区表 |
+| AQE 开启 | `spark.sql.adaptive.enabled=true` |
+
+### 13.3 示例
+
+```sql
+-- 动态分区裁剪示例
+SELECT * FROM sales s
+JOIN products p ON s.product_id = p.product_id
+WHERE p.category = 'electronics';
+
+-- 传统：全量扫描 sales
+-- 动态裁剪：只扫描 electronics 相关分区
+```
+
+---
+
+## 十四、Spark vs Presto/Trino
+
+| 维度 | Spark | Presto/Trino |
+|------|-------|--------------|
+| 处理模型 | 批处理（内存+磁盘） | MPP（纯内存） |
+| 延迟 | 秒~分钟 | 秒 |
+| 吞吐 | 最高 | 中 |
+| SQL 标准 | Spark SQL | ANSI SQL |
+| 生态 | 最丰富（SQL/ML/Graph） | 纯 SQL |
+| 交互查询 | 不支持（需 Thrift） | 支持 |
+| 内存 | 磁盘可溢写 | 纯内存（OOM 风险） |
+| 适用 | 离线批处理/ML | 交互式 SQL 查询 |
+
+**选型决策**：
+- 交互式查询/BI 报表 → Presto/Trino
+- 离线批处理/ML → Spark
+- 大规模 ETL → Spark
+- Ad-hoc 查询 → Presto/Trino
+
+---
+
+## 十五、与其他板块的关系
 
 - Flink（流处理对比）见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；
 - 大数据全链路见「[基础知识/大数据](../大数据/README.md)」；

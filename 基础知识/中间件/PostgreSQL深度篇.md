@@ -197,7 +197,382 @@ PostgreSQL Server
 
 ---
 
-## 八、与其他板块的关系
+## 八、PostgreSQL MVCC 内部原理
+
+### 8.1 MVCC 架构
+
+```mermaid
+graph TD
+    A[事务开始] --> B[获取快照]
+    B --> C[读取数据]
+    C --> D{检查 xmin/xmax}
+    D -->|可见| E[返回数据]
+    D -->|不可见| F[查找下一版本]
+    F --> D
+```
+
+### 8.2 元组结构
+
+| 字段 | 说明 |
+|------|------|
+| xmin | 创建该版本的事务 ID |
+| xmax | 删除/更新该版本的事务 ID（0 表示未删除） |
+| ctid | 指向新版本的指针（更新链） |
+| infomask | 事务状态标志位 |
+
+### 8.3 事务快照
+
+```
+快照组成：
+  xmin：最小活跃事务 ID（小于该 ID 的事务已提交）
+  xmax：下一个分配的事务 ID
+  xip_list：活跃事务 ID 列表
+
+可见性判断：
+  1. 如果 xmin 已提交 AND xmin < snapshot.xmin → 可见
+  2. 如果 xmin 未提交 OR xmin 在 xip_list 中 → 不可见
+  3. 如果 xmax 已提交 AND xmax < snapshot.xmin → 不可见
+  4. 如果 xmax 未提交 OR xmax 在 xip_list 中 → 可见
+```
+
+### 8.4 更新链
+
+```
+更新操作：
+  旧版本：xmax 设置为当前事务 ID
+  新版本：xmin 设置为当前事务 ID
+  旧版本 ctid 指向新版本
+
+查询时：
+  沿更新链找到可见版本
+  可能需要遍历多个版本
+```
+
+### 8.5 MVCC vs 锁
+
+| 维度 | MVCC | 锁 |
+|------|------|-----|
+| 读写阻塞 | 不阻塞 | 阻塞 |
+| 空间开销 | 多版本存储 | 无额外开销 |
+| 清理机制 | VACUUM | 锁释放 |
+| 适用 | OLTP | 特殊场景 |
+
+---
+
+## 九、PostgreSQL VACUUM 与 Autovacuum
+
+### 9.1 死元组问题
+
+```
+死元组产生：
+  UPDATE：创建新版本，旧版本变成死元组
+  DELETE：标记删除，变成死元组
+
+影响：
+  空间膨胀（存储浪费）
+  查询变慢（扫描更多元组）
+  索引膨胀（索引条目增多）
+```
+
+### 9.2 VACUUM 类型
+
+| 类型 | 说明 | 效果 |
+|------|------|------|
+| VACUUM | 标记死元组空间可复用 | 不释放磁盘空间 |
+| VACUUM FULL | 重写表释放空间 | 释放磁盘空间（锁表） |
+| Autovacuum | 自动 VACUUM | 定期清理 |
+
+### 9.3 Autovacuum 配置
+
+```sql
+-- 启用 Autovacuum
+ALTER SYSTEM SET autovacuum = on;
+
+-- 配置阈值
+ALTER SYSTEM SET autovacuum_vacuum_threshold = 50;
+ALTER SYSTEM SET autovacuum_vacuum_scale_factor = 0.1;
+ALTER SYSTEM SET autovacuum_analyze_threshold = 50;
+ALTER SYSTEM SET autovacuum_analyze_scale_factor = 0.05;
+
+-- 配置资源
+ALTER SYSTEM SET autovacuum_max_workers = 3;
+ALTER SYSTEM SET autovacuum_naptime = '1min';
+```
+
+### 9.4 VACUUM 最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 开启 Autovacuum | 必须开启 |
+| 合理阈值 | 避免过于频繁/不及时 |
+| 专用磁盘 | VACUUM IO 放专用磁盘 |
+| 监控膨胀 | 定期检查表膨胀率 |
+| 避免长事务 | 长事务阻止清理 |
+
+### 9.5 XID Wraparound
+
+```
+问题：
+  事务 ID 32 位（约 40 亿）
+  达到阈值 → 数据库停机保护
+
+预防：
+  Autovacuum 定期清理
+  监控 XID 消耗
+  设置 autovacuum_freeze_max_age
+
+处理：
+  告警时手动 VACUUM FREEZE
+  极端情况 pg_resetwal
+```
+
+---
+
+## 十、PostgreSQL 分区策略
+
+### 10.1 分区类型对比
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| Range | 范围分区 | 时间/数值范围 |
+| List | 列表分区 | 离散值（地区/类型） |
+| Hash | 哈希分区 | 均匀分布 |
+
+### 10.2 分区裁剪（Partition Pruning）
+
+```
+原理：
+  查询条件与分区键匹配
+  只扫描相关分区
+  减少 IO 和查询时间
+
+示例：
+  WHERE created_at >= '2026-01-01'
+  → 只扫描 2026-01 及之后的分区
+
+配置：
+  SET enable_partition_pruning = on;
+```
+
+### 10.3 分区表最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 按时间分区 | 时序数据首选 |
+| 预创建分区 | 避免写入失败 |
+| 自动化管理 | pg_partman |
+| 分区键选择 | 高频查询条件 |
+| 分区数量控制 | 避免过多分区 |
+
+### 10.4 分区维护
+
+```sql
+-- 自动创建分区
+CREATE EXTENSION pg_partman;
+SELECT partman.create_parent('public.orders', 'created_at', 'native', 'monthly');
+
+-- 手动创建分区
+CREATE TABLE orders_2026_03 PARTITION OF orders
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+
+-- 删除旧分区
+DROP TABLE orders_2025_01;
+```
+
+---
+
+## 十一、PostgreSQL 逻辑复制
+
+### 11.1 逻辑复制原理
+
+```mermaid
+graph LR
+    A[主库 WAL] --> B[Logical Decoding]
+    B --> C[变更事件]
+    C --> D[网络传输]
+    D --> E[从库 apply]
+```
+
+### 11.2 逻辑复制 vs 流复制
+
+| 维度 | 逻辑复制 | 流复制 |
+|------|----------|--------|
+| 复制级别 | 指定表 | 整个实例 |
+| 数据同步 | 逻辑变更 | 物理 WAL |
+| 跨版本 | 支持 | 不支持 |
+| DDL | 不复制 | 复制 |
+| 用途 | 跨库同步/升级 | 高可用/灾备 |
+
+### 11.3 逻辑复制配置
+
+```sql
+-- 发布端
+ALTER SYSTEM SET wal_level = logical;
+CREATE PUBLICATION my_pub FOR TABLE orders, users;
+
+-- 订阅端
+CREATE SUBSCRIPTION my_sub
+    CONNECTION 'host=master dbname=mydb user=replicator'
+    PUBLICATION my_pub;
+
+-- 管理
+ALTER SUBSCRIPTION my_sub REFRESH PUBLICATION;
+DROP SUBSCRIPTION my_sub;
+```
+
+### 11.4 逻辑复制限制
+
+| 限制 | 说明 |
+|------|------|
+| DDL 复制 | 不支持 |
+| 序列 | 不复制 |
+| 大对象 | 不复制 |
+| 外键约束 | 不检查 |
+| 触发器 | 不触发 |
+
+---
+
+## 十二、PostgreSQL 扩展生态
+
+### 12.1 核心扩展
+
+| 扩展 | 说明 | 适用 |
+|------|------|------|
+| PostGIS | 地理空间 | LBS/地图 |
+| TimescaleDB | 时序数据 | IoT/监控 |
+| Citus | 分布式 | 大规模数据 |
+| pgvector | 向量检索 | AI/推荐 |
+| pg_partman | 分区管理 | 自动分区 |
+| pg_stat_statements | SQL 统计 | 性能分析 |
+| pg_trgm | 模糊搜索 | 搜索 |
+
+### 12.2 扩展安装
+
+```sql
+-- 安装扩展
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE EXTENSION IF NOT EXISTS citus;
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 查看已安装扩展
+SELECT * FROM pg_extension;
+```
+
+### 12.3 扩展选型
+
+| 需求 | 扩展 |
+|------|------|
+| 地理空间 | PostGIS |
+| 时序数据 | TimescaleDB |
+| 分布式 | Citus |
+| 向量检索 | pgvector |
+| 模糊搜索 | pg_trgm |
+| 中文全文 | zhparser/pg_jieba |
+
+---
+
+## 十三、PostgreSQL 云托管
+
+### 13.1 Aurora PostgreSQL
+
+| 特性 | 说明 |
+|------|------|
+| 存储计算分离 | 类似 Pulsar 架构 |
+| 自动扩展 | 存储自动扩展到 128TB |
+| 高可用 | 6 副本，3 可用区 |
+| 备份 | 连续备份到 S3 |
+| 性能 | 比标准 PG 快 5 倍 |
+
+### 13.2 Supabase
+
+| 特性 | 说明 |
+|------|------|
+| 开源 Firebase | 基于 PostgreSQL |
+| 实时订阅 | WebSocket 实时推送 |
+| 认证 | 内置用户认证 |
+| 存储 | 对象存储 |
+| Edge Functions | Serverless 函数 |
+
+### 13.3 云托管选型
+
+| 服务 | 说明 | 适用 |
+|------|------|------|
+| Aurora PostgreSQL | AWS 托管 | 企业级 |
+| Cloud SQL | Google 托管 | 中小规模 |
+| PolarDB | 阿里云托管 | 国内场景 |
+| Supabase | 开源 BaaS | 快速开发 |
+
+---
+
+## 十四、PostgreSQL 性能调优
+
+### 14.1 配置调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| shared_buffers | 数据页缓存 | 25% 内存 |
+| effective_cache_size | 优化器估算 | 75% 内存 |
+| work_mem | 排序/哈希内存 | 按并发调整 |
+| maintenance_work_mem | VACUUM 内存 | 1~2GB |
+| max_connections | 最大连接数 | 合理设置 |
+| wal_buffers | WAL 缓冲 | 64MB |
+
+### 14.2 SQL 调优
+
+| 技巧 | 说明 |
+|------|------|
+| EXPLAIN ANALYZE | 分析执行计划 |
+| 合理索引 | B-Tree/GiST/GIN |
+| 避免 SELECT * | 只查询需要的列 |
+| 批量操作 | 批量 INSERT/UPDATE |
+| 连接池 | PgBouncer |
+
+### 14.3 监控指标
+
+```
+关键指标：
+  缓存命中率（>95%）
+  连接数使用率
+  查询延迟（P99）
+  VACUUM 进度
+  复制延迟
+  磁盘使用率
+```
+
+---
+
+## 十五、PostgreSQL vs MySQL 深度对比
+
+### 15.1 核心差异
+
+| 维度 | PostgreSQL | MySQL |
+|------|------------|-------|
+| SQL 标准 | 最完整 | 部分支持 |
+| MVCC | 多版本 | 单版本 |
+| 索引 | B-Tree/GiST/GIN/BRIN | B-Tree/Hash |
+| 分区 | 声明式 | 5.7+ 支持 |
+| JSON | JSONB（二进制） | JSON（文本） |
+| 全文搜索 | 内置 | 需 ES |
+| 地理空间 | PostGIS（最强） | 基础 |
+| 扩展性 | 极强 | 弱 |
+| 复制 | 流复制+逻辑复制 | binlog 复制 |
+
+### 15.2 选型决策
+
+| 场景 | 选择 |
+|------|------|
+| 复杂查询/分析 | PostgreSQL |
+| 地理空间 | PostgreSQL + PostGIS |
+| 全文搜索 | PostgreSQL |
+| 简单 OLTP | MySQL |
+| 读多写少 | MySQL |
+| 高并发写入 | MySQL |
+| 云托管 | Aurora（两者都支持） |
+
+---
+
+## 十六、与其他板块的关系
 
 - MySQL 知识见「[基础知识/mysql知识](../mysql知识.md)」；
 - 分库分表见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」与「[分库分表板块](../../分库分表与数据迁移/)」；

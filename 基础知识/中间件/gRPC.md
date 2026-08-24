@@ -337,6 +337,451 @@ http_filters:
 
 ---
 
+## 十三、gRPC 双向流式通信
+
+### 13.1 四种流模式详解
+
+| 模式 | 方向 | Proto 定义 | 典型场景 |
+|------|------|-----------|---------|
+| Unary | C ↔ S | `rpc Get(Req) returns (Resp)` | 常规 RPC |
+| Server Streaming | C → S（单次），S → C（多次） | `rpc List(Req) returns (stream Resp)` | 推送/分页/订阅 |
+| Client Streaming | C → S（多次），S → C（单次） | `rpc Upload(stream Chunk) returns (Resp)` | 文件上传/批量提交 |
+| Bidi Streaming | C ↔ S（双向多次） | `rpc Chat(stream Msg) returns (stream Msg)` | 实时聊天/协同 |
+
+### 13.2 双向流式实现（Go）
+
+```go
+// 服务端实现
+func (s *chatServer) Chat(stream pb.Chat_ChatServer) error {
+    for {
+        msg, err := stream.Recv()
+        if err == io.EOF {
+            return nil
+        }
+        if err != nil {
+            return err
+        }
+        // 处理消息并回复
+        reply := &pb.Message{Content: "echo: " + msg.Content}
+        if err := stream.Send(reply); err != nil {
+            return err
+        }
+    }
+}
+
+// 客户端实现
+stream, _ := client.Chat(context.Background())
+go func() {
+    for {
+        msg, err := stream.Recv()
+        if err == io.EOF { break }
+        fmt.Println("Received:", msg.Content)
+    }
+}()
+for i := 0; i < 10; i++ {
+    stream.Send(&pb.Message{Content: fmt.Sprintf("msg %d", i)})
+}
+stream.CloseSend()
+```
+
+### 13.3 流式背压控制
+
+```
+背压问题：
+  发送端太快 → 接收端处理不过来 → 内存溢出
+
+gRPC 流式背压：
+  Flow Control（HTTP/2 窗口机制）
+  接收端消费慢 → 窗口满 → 发送端自动暂停
+  
+实践要点：
+  设置合理缓冲区大小
+  接收端及时消费（不阻塞）
+  监控 stream pending bytes
+```
+
+---
+
+## 十四、gRPC Deadline/Timeout
+
+### 14.1 Deadline 原理
+
+```
+gRPC Deadline = 分布式超时机制
+  客户端设置 Deadline → 通过 gRPC-Timeout Header 传播
+  每个中间服务自动扣减已用时间
+  Deadline 到达 → 自动取消请求 → 返回 DEADLINE_EXCEEDED
+```
+
+### 14.2 Deadline 配置
+
+```go
+// Go：设置 5 秒 Deadline
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+resp, err := client.GetUser(ctx, &pb.GetUserRequest{Id: 123})
+
+// Java：设置 Deadline
+ResponseObserver observer = new ResponseObserver<>();
+stub.withDeadlineAfter(5, TimeUnit.SECONDS)
+    .getUser(request, observer);
+```
+
+### 14.3 Deadline 最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 必须设置 | 默认无限等待会拖垮调用链 |
+| 入口最长 | 入口服务 Deadline = 整条链路最长时间 |
+| 逐级缩短 | 每层预留缓冲（如入口 10s，下游 5s） |
+| Context 传播 | 向下游传递 Deadline（否则超时不生效） |
+| 区分超时 | 读超时 / 写超时 / 总超时 |
+
+---
+
+## 十五、gRPC 错误处理模式
+
+### 15.1 错误码体系
+
+| 状态码 | 含义 | HTTP 等价 | 使用场景 |
+|--------|------|----------|---------|
+| OK | 成功 | 200 | 正常响应 |
+| INVALID_ARGUMENT | 参数错误 | 400 | 请求参数校验 |
+| NOT_FOUND | 不存在 | 404 | 资源未找到 |
+| ALREADY_EXISTS | 已存在 | 409 | 重复创建 |
+| PERMISSION_DENIED | 无权限 | 403 | 鉴权失败 |
+| UNAUTHENTICATED | 未认证 | 401 | Token 无效 |
+| RESOURCE_EXHAUSTED | 资源耗尽 | 429 | 限流 |
+| FAILED_PRECONDITION | 前置条件不满足 | 412 | 业务校验 |
+| ABORTED | 操作被中止 | 409 | 事务冲突 |
+| UNAVAILABLE | 不可用 | 503 | 服务不可用 |
+| DATA_LOSS | 数据丢失 | 500 | 不可恢复错误 |
+| UNIMPLEMENTED | 未实现 | 501 | 功能未实现 |
+| INTERNAL | 内部错误 | 500 | 服务端异常 |
+| DEADLINE_EXCEEDED | 超时 | 504 | 请求超时 |
+
+### 15.2 错误详情携带
+
+```protobuf
+// 使用 google.rpc.Status 携带详细错误信息
+import "google/rpc/error_details.proto";
+
+// 错误响应示例
+{
+  "code": 3,
+  "message": "invalid argument",
+  "details": [
+    {
+      "@type": "type.googleapis.com/google.rpc.BadRequest",
+      "field_violations": [
+        {"field": "email", "description": "invalid email format"}
+      ]
+    },
+    {
+      "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+      "reason": "INVALID_EMAIL",
+      "domain": "user-service"
+    }
+  ]
+}
+```
+
+### 15.3 错误处理最佳实践
+
+```
+错误处理三原则：
+  1. 区分可重试/不可重试错误
+     可重试：UNAVAILABLE / DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED
+     不可重试：INVALID_ARGUMENT / NOT_FOUND / PERMISSION_DENIED
+
+  2. 携带丰富错误详情
+     使用 google.rpc.Status + ErrorInfo
+     包含错误码/字段/原因/ domain
+
+  3. 客户端重试策略
+     幂等操作：自动重试 + 指数退避
+     非幂等操作：不重试 + 返回错误
+```
+
+---
+
+## 十六、gRPC 负载均衡深入
+
+### 16.1 客户端侧负载均衡
+
+```
+gRPC 负载均衡架构：
+  Client Channel
+    ├── Name Resolver（服务发现）
+    │   ├── DNS Resolver（DNS 轮询）
+    │   ├── Consul Resolver
+    │   └── K8s Resolver
+    ├── Balancer（负载均衡策略）
+    │   ├── pick_first（默认，选第一个）
+    │   ├── round_robin（轮询所有连接）
+    │   └── weighted_round_robin（加权轮询）
+    └── Subconnections（每个后端一个连接）
+```
+
+### 16.2 负载均衡配置
+
+```go
+// Go：round_robin 负载均衡
+conn, _ := grpc.Dial(
+    "dns:///my-service.default.svc.cluster.local:8080",
+    grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
+    grpc.WithInsecure(),
+)
+
+// Java：自定义负载均衡
+ManagedChannel channel = ManagedChannelBuilder
+    .forAddress("my-service", 8080)
+    .defaultLoadBalancingPolicy("round_robin")
+    .build();
+```
+
+### 16.3 代理模式 vs 客户端模式
+
+| 模式 | 优点 | 缺点 |
+|------|------|------|
+| 客户端侧 LB | 低延迟（直连） | 客户端复杂 |
+| 代理模式 LB（Envoy） | 简单（客户端无感知） | 多一跳延迟 |
+| 服务网格（Istio） | 统一治理 | 运维复杂 |
+
+### 16.4 gRPC 与 Envoy 集成
+
+```
+Envoy 作为 gRPC 代理：
+  HTTP/2 透传（无需协议转换）
+  自动服务发现（xDS）
+  负载均衡（轮询/一致性哈希）
+  重试/超时（可配置）
+  mTLS（自动双向认证）
+  链路追踪（自动注入 Span）
+
+典型架构：
+  Client → Envoy Sidecar → gRPC Server
+    或
+  Client → Envoy（L7 LB）→ gRPC Server 集群
+```
+
+---
+
+## 十七、gRPC in Go vs Java
+
+### 17.1 Go gRPC 特点
+
+```go
+// Go gRPC 特点：
+// 1. 原生支持（gRPC 最早语言）
+// 2. goroutine 天然适合流式
+// 3. 性能极佳
+// 4. 代码生成：protoc-gen-go-grpc
+
+// 流式处理天然优雅
+func (s *server) Stream(req *pb.Request, stream pb.Service_StreamServer) error {
+    for i := 0; i < 100; i++ {
+        stream.Send(&pb.Response{Data: fmt.Sprintf("item %d", i)})
+    }
+    return nil
+}
+```
+
+### 17.2 Java gRPC 特点
+
+```java
+// Java gRPC 特点：
+// 1. 生态丰富（与 Spring/Spring Boot 集成好）
+// 2. 阻塞式 stub 需注意线程池
+// 3. 异步 stub / 响应式支持
+// 4. 代码生成：protobuf-java + grpc-java
+
+// 异步客户端（避免线程阻塞）
+stub.getUser(request, new StreamObserver<User>() {
+    @Override
+    public void onNext(User user) { /* 处理响应 */ }
+    @Override
+    public void onError(Throwable t) { /* 错误处理 */ }
+    @Override
+    public void onCompleted() { /* 完成 */ }
+});
+```
+
+### 17.3 Go vs Java gRPC 对比
+
+| 维度 | Go gRPC | Java gRPC |
+|------|---------|-----------|
+| 性能 | 极佳 | 好 |
+| 内存占用 | 低 | 中 |
+| 并发模型 | goroutine（轻量） | 线程池（较重） |
+| 流式处理 | 天然优雅 | 需异步 stub |
+| 生态集成 | 轻量 | Spring 生态丰富 |
+| 学习曲线 | 低 | 中 |
+| 适用 | 云原生/微服务 | Java 企业应用 |
+
+---
+
+## 十八、gRPC-Web
+
+### 18.1 gRPC-Web 架构
+
+```
+浏览器（JavaScript）
+  → gRPC-Web 协议（HTTP/1.1 或 HTTP/2）
+    → Envoy 代理（协议转换）
+      → gRPC Server（HTTP/2）
+
+转换层：
+  Envoy gRPC-Web Filter
+    将 gRPC-Web 请求转换为标准 gRPC
+    将 gRPC 响应转换为 gRPC-Web
+```
+
+### 18.2 gRPC-Web 使用
+
+```javascript
+// gRPC-Web 客户端
+const {grpc} = require('grpc-web');
+const {UserServiceClient} = require('./generated/UserServiceClientPb');
+
+const client = new UserServiceClient('https://api.example.com');
+const request = new GetUserRequest();
+request.setId(123);
+
+client.getUser(request, {}, (err, response) => {
+    if (err) {
+        console.error(err);
+        return;
+    }
+    console.log(response.getUser());
+});
+```
+
+### 18.3 gRPC-Web 限制
+
+| 限制 | 说明 | 解决方案 |
+|------|------|---------|
+| 仅支持 Unary + Server Streaming | 不支持 Client/Bidi Streaming | 使用 WebSocket |
+| 需要代理层 | 浏览器不能直连 gRPC | Envoy 代理 |
+| 浏览器兼容性 | 需要 fetch/XHR 支持 | polyfill |
+
+---
+
+## 十九、gRPC 反射与健康检查
+
+### 19.1 gRPC 服务反射
+
+```go
+// 启用 Server Reflection（Go）
+import "google.golang.org/grpc/reflection"
+
+func main() {
+    s := grpc.NewServer()
+    pb.RegisterUserServiceServer(s, &server{})
+    reflection.Register(s)  // 启用反射
+    s.Serve(lis)
+}
+
+// 使用 grpcurl 调试
+grpcurl -plaintext localhost:8080 list
+grpcurl -plaintext localhost:8080 describe mypackage.UserService
+grpcurl -plaintext -d '{"id": 123}' localhost:8080 mypackage.UserService/GetUser
+```
+
+### 19.2 gRPC 健康检查
+
+```protobuf
+// gRPC Health Checking Protocol
+syntax = "proto3";
+package grpc.health.v1;
+
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    SERVICE_UNKNOWN = 3;
+  }
+  ServingStatus status = 1;
+}
+```
+
+### 19.3 K8s 健康检查集成
+
+```yaml
+# K8s Pod 健康检查配置
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: grpc-server
+    livenessProbe:
+      exec:
+        command:
+        - /grpc-health-probe
+        - -addr=:8080
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    readinessProbe:
+      exec:
+        command:
+        - /grpc-health-probe
+        - -addr=:8080
+        - -service=my-service
+      initialDelaySeconds: 5
+      periodSeconds: 5
+```
+
+---
+
+## 二十、gRPC vs REST 性能对比
+
+### 20.1 性能基准测试
+
+| 指标 | gRPC | REST/JSON |
+|------|------|-----------|
+| 序列化大小 | ~1/5 | 基准 |
+| 序列化速度 | ~10x | 基准 |
+| 传输速度 | ~2x | 基准 |
+| 连接复用 | HTTP/2 多路复用 | HTTP/1.1 串行 |
+| 延迟（P99） | 低 | 中 |
+| CPU 开销 | 低 | 中（JSON 解析） |
+
+### 20.2 适用场景对比
+
+| 场景 | gRPC | REST |
+|------|------|------|
+| 内部微服务通信 | 极佳 | 一般 |
+| 浏览器直连 | 需 gRPC-Web | 极佳 |
+| 对外开放 API | 需 grpc-gateway | 极佳 |
+| 实时流式通信 | 极佳 | SSE/WebSocket |
+| 跨语言调用 | 极佳 | 极佳 |
+| 调试便利性 | 需 grpcurl | curl 即可 |
+| 人类可读 | 不可读（二进制） | 可读（JSON） |
+
+### 20.3 性能优化建议
+
+```
+gRPC 性能优化：
+  1. 连接复用：一个 Channel 复用所有请求
+  2. 流式传输：大数据用流式替代多次 Unary
+  3. 压缩：启用 gzip/snappy（CPU 换带宽）
+  4. 消息大小：合理设置 MaxRecvMsgSize
+  5. Keepalive：设置 Ping 间隔防连接失效
+  6. 拦截器异步：鉴权/日志拦截器异步执行
+```
+
+---
+
 ## 十一、与其他板块的关系（扩展）
 
 - Dubbo 对比见「[Apache Dubbo RPC 框架](./ApacheDubboRPC框架.md)」；

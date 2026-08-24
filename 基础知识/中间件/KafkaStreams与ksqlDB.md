@@ -204,7 +204,379 @@ ksqlDB 服务端：独立进程（ksqlDB server），管理多个查询
 
 ---
 
-## 七、与其他板块的关系
+## 七、Kafka Streams State Store 内部机制
+
+### 7.1 State Store 架构
+
+```mermaid
+graph TD
+    A[KStream/KTable] --> B[State Store]
+    B --> C[RocksDB 本地存储]
+    B --> D[Changelog Topic 备份]
+    C --> E[内存缓存]
+    C --> F[磁盘持久化]
+```
+
+### 7.2 State Store 类型
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| RocksDB Store | 本地磁盘存储 | 大状态（生产首选） |
+| InMemory Store | 内存存储 | 小状态/测试 |
+| Window Store | 窗口状态 | 时间窗口聚合 |
+| Session Store | 会话状态 | 会话窗口 |
+
+### 7.3 Changelog 机制
+
+```
+写入流程：
+  1. 更新 State Store（RocksDB）
+  2. 同时写入 Changelog Topic（备份）
+  3. 返回成功
+
+恢复流程：
+  实例故障 → 新实例接管
+  → 从 Changelog Topic 恢复状态
+  → 重放变更事件
+  → 状态重建完成
+
+Changelog 配置：
+  cleanup.policy=compact（保留最新值）
+  压缩策略：同 key 只保留最新值
+```
+
+### 7.4 State Store 调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `state.dir` | 状态目录 | SSD 磁盘 |
+| `rocksdb.block.cache.size` | Block Cache 大小 | 按内存调整 |
+| `rocksdb.write.buffer.size` | 写缓冲大小 | 64MB |
+| `rocksdb.max.write.buffer.number` | 写缓冲数量 | 3 |
+| `rocksdb.compaction.style` | Compaction 策略 | LEVEL |
+
+---
+
+## 八、Kafka Streams 交互式查询
+
+### 8.1 查询架构
+
+```mermaid
+graph LR
+    A[REST API] --> B[Kafka Streams 实例]
+    B --> C[State Store]
+    C --> D[本地查询]
+    E[其他实例] --> F[远程查询]
+```
+
+### 8.2 查询方式
+
+| 方式 | 说明 | 适用 |
+|------|------|------|
+| 本地查询 | 查询当前实例的 State Store | 单实例 |
+| 远程查询 | 查询其他实例的 State Store | 分布式 |
+| 聚合查询 | 汇总所有实例的结果 | 全局统计 |
+
+### 8.3 查询示例
+
+```java
+// 获取 State Store
+ReadOnlyKeyValueStore<String, Long> store =
+    KafkaStreams.queryableStoreStores().queryableStoreTypes()
+        .keyValueStore("counts-store");
+
+// 本地查询
+Long value = store.get("key");
+
+// 远程查询（通过 REST）
+// GET /queryable-store/stores/counts-store/keys/key
+```
+
+### 8.4 查询最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 查询路由 | 服务发现 + 负载均衡 |
+| 缓存结果 | 减少 State Store 查询压力 |
+| 异步查询 | 非阻塞查询 |
+| 监控延迟 | 查询响应时间 |
+
+---
+
+## 九、ksqlDB Pull Query vs Push Query
+
+### 9.1 查询类型对比
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| Pull Query | 一次性查询当前状态 | 交互式查询 |
+| Push Query | 持续推送结果 | 实时大屏 |
+
+### 9.2 Pull Query 特点
+
+```
+特点：
+  一次查询，返回当前状态
+  类似 SQL SELECT
+  不会持续更新
+  支持 WHERE 条件
+
+使用场景：
+  实时大屏查询当前值
+  交互式数据分析
+  API 查询物化视图
+
+限制：
+  不支持聚合函数（SUM/COUNT）
+  只查询当前状态
+```
+
+### 9.3 Push Query 特点
+
+```
+特点：
+  持续推送结果（EMIT CHANGES）
+  类似数据库触发器
+  实时更新
+  支持窗口聚合
+
+使用场景：
+  实时大屏
+  监控告警
+  实时推荐
+
+配置：
+  EMIT CHANGES（持续推送）
+  EMIT FINAL（窗口关闭后推送最终结果）
+```
+
+### 9.4 查询示例
+
+```sql
+-- Pull Query（一次性查询）
+SELECT * FROM page_view_stats WHERE page_id = 'home';
+
+-- Push Query（持续推送）
+SELECT page_id, COUNT(*) FROM page_views
+GROUP BY page_id EMIT CHANGES;
+
+-- Push Query + 窗口
+SELECT page_id, COUNT(*) FROM page_views
+WINDOW TUMBLING (SIZE 5 MINUTES)
+GROUP BY page_id EMIT FINAL;
+```
+
+---
+
+## 十、ksqlDB 物化视图
+
+### 10.1 物化视图原理
+
+```mermaid
+graph LR
+    A[Stream/Source] --> B[CREATE TABLE AS SELECT]
+    B --> C[物化视图 Topic]
+    C --> D[增量更新]
+    D --> E[查询当前状态]
+```
+
+### 10.2 物化视图操作
+
+```sql
+-- 创建物化视图
+CREATE TABLE order_stats AS
+SELECT user_id, SUM(amount) AS total, COUNT(*) AS cnt
+FROM orders
+GROUP BY user_id;
+
+-- 查询物化视图
+SELECT * FROM order_stats WHERE user_id = 'u1';
+
+-- 删除物化视图
+DROP TABLE IF EXISTS order_stats;
+```
+
+### 10.3 物化视图 vs 流查询
+
+| 维度 | 物化视图 | 流查询 |
+|------|----------|--------|
+| 结果 | 持久化到 Topic | 临时结果 |
+| 查询 | 可 Pull Query | 只能 Push |
+| 状态 | 持久化 | 不持久化 |
+| 恢复 | 可恢复 | 不可恢复 |
+
+---
+
+## 十一、Kafka Streams Exactly-once 深入
+
+### 11.1 EOS 实现原理
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant P as Producer
+    participant T as Transaction Coordinator
+    participant K as Kafka
+    C->>K: 消费消息
+    C->>P: 处理并发送结果
+    C->>T: 提交 offset + 消息（同一事务）
+    T->>K: 提交事务
+    T->>K: 提交消费 offset
+```
+
+### 11.2 EOS 配置
+
+```properties
+# 启用 EOS
+processing.guarantee=exactly_once_v2
+
+# 生产者配置
+enable.idempotence=true
+transactional.id=my-streams-app
+```
+
+### 11.3 EOS 性能影响
+
+| 维度 | at-least-once | exactly_once |
+|------|---------------|--------------|
+| 吞吐 | 高 | 中（事务开销） |
+| 延迟 | 低 | 中 |
+| 重复 | 可能 | 无 |
+| 适用 | 非关键链路 | 关键链路 |
+
+### 11.4 EOS 最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 关键链路启用 | 财务/订单等场景 |
+| 非关键用幂等 | 性能优先 |
+| 监控事务 | 事务提交成功率 |
+| 合理超时 | 避免事务超时 |
+
+---
+
+## 十二、Kafka Streams vs Flink vs Spark Streaming
+
+### 12.1 核心对比
+
+| 维度 | Kafka Streams | Flink | Spark Streaming |
+|------|---------------|-------|-----------------|
+| 形态 | 库嵌入应用 | 独立集群 | 独立集群 |
+| 运维 | 零 | 重 | 重 |
+| 延迟 | 毫秒 | 毫秒 | 秒 |
+| 状态 | RocksDB + changelog | RocksDB/内存 | 有状态 |
+| 窗口 | 4种 | 丰富 | 有限 |
+| EOS | 事务 | Checkpoint | WAL+Checkpoint |
+| SQL | ksqlDB | Flink SQL | Spark SQL |
+| 复杂事件 | 有限 | 强（CEP） | 无 |
+| 适用规模 | 中小 | 大 | 大 |
+
+### 12.2 选型决策
+
+```
+场景选型：
+  应用内轻量处理 → Kafka Streams（零运维）
+  复杂流处理/CEP → Flink
+  批流一体 → Spark
+  实时数仓 SQL → Flink SQL / ksqlDB
+  实时大屏 → ksqlDB
+```
+
+---
+
+## 十三、Kafka Streams 在微服务
+
+### 13.1 架构模式
+
+```mermaid
+graph TD
+    A[Service A] -->|生产事件| B[Kafka]
+    B -->|消费事件| C[Service B]
+    C -->|处理| D[State Store]
+    D -->|查询| E[REST API]
+```
+
+### 13.2 微服务集成
+
+```java
+// Spring Boot 集成
+@Bean
+public KStream<String, Order> processOrders(StreamsBuilder builder) {
+    KStream<String, Order> orders = builder.stream("orders");
+    
+    KTable<String, Long> stats = orders
+        .groupBy((key, order) -> order.getUserId())
+        .count();
+    
+    // 交互式查询
+    ReadOnlyKeyValueStore<String, Long> store =
+        kafkaStreams.store(
+            StoreQueryParameters.fromNameAndType("counts-store", QueryableStoreTypes.keyValueStore())
+        );
+    
+    return orders;
+}
+```
+
+### 13.3 微服务最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 状态独立 | 每个服务独立 State Store |
+| 查询路由 | 服务发现 + 负载均衡 |
+| 错误处理 | Dead Letter Topic |
+| 监控 | Kafka Lag + 处理延迟 |
+
+---
+
+## 十四、ksqlDB UDF
+
+### 14.1 UDF 类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| 标量 UDF | 输入→输出 | URL 解析 |
+| 聚合 UDF | 多行→一行 | 自定义聚合 |
+| 表值函数 | 一行→多行 | JSON 展开 |
+
+### 14.2 UDF 开发
+
+```java
+// 标量 UDF
+@UdfDescription(name = "parse_url", ...)
+public class ParseUrlUdf {
+    @Udf
+    public String parseUrl(String url, String part) {
+        // 解析逻辑
+    }
+}
+
+// 聚合 UDF
+@UdfDescription(name = "string_agg", ...)
+public class StringAggUdf {
+    @Udaf(description = "字符串聚合")
+    public StringAgg create() {
+        return new StringAgg();
+    }
+}
+```
+
+### 14.3 UDF 注册与使用
+
+```sql
+-- 注册 UDF
+CREATE FUNCTION parse_url AS 'com.example.ParseUrlUdf';
+
+-- 使用 UDF
+SELECT parse_url(url, 'host') AS host FROM urls;
+
+-- 删除 UDF
+DROP FUNCTION IF EXISTS parse_url;
+```
+
+---
+
+## 十五、与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；
 - Flink 对比见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；

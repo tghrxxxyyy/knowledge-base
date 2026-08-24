@@ -399,7 +399,428 @@ NodeNotReady      ：kubelet 掉线/磁盘压力/网络分区
 
 ---
 
-## 十八、与其他板块的关系
+## 十八、Pod 生命周期深度剖析
+
+### 18.1 Pod 生命周期详解
+
+```text
+Pod 完整生命周期（含所有阶段）：
+┌─────────────────────────────────────────────────────────────────┐
+│  Pending → Running → Succeeded/Failed/Unknown                    │
+│                                                                  │
+│  Pod 内部状态机：                                                  │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐      │
+│  │ Pending  │──▶│ Running  │──▶│ Succeeded│──▶│  等待 GC  │      │
+│  │(调度中)  │   │(运行中)  │   │(正常结束)│   │          │      │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘      │
+│       │               │               │                          │
+│       ▼               ▼               ▼                          │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐                     │
+│  │  Failed  │   │ Unknown  │   │  Waiting │                     │
+│  │(异常退出)│   │(状态未知)│   │(等待启动)│                     │
+│  └──────────┘   └──────────┘   └──────────┘                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Pod 启动流程**：
+
+| 阶段 | 行为 | 关键配置 |
+|------|------|----------|
+| 调度 | Scheduler 选节点绑定 | nodeSelector/affinity/taint |
+| 拉取镜像 | kubelet 拉取容器镜像 | imagePullPolicy: Always/IfNotPresent |
+| 启动容器 | 按 restartPolicy 决定重启策略 | restartPolicy: Always/OnFailure/Never |
+| 初始化容器 | initContainers 依次执行成功 | initContainers[].command |
+| 就绪探针 | readinessProbe 成功后加入 Service | readinessProbe |
+| 存活探针 | livenessProbe 失败则重启容器 | livenessProbe |
+| 停止 | SIGTERM → preStop → SIGKILL | terminationGracePeriodSeconds |
+
+### 18.2 Init Containers 详解
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  initContainers:
+  - name: init-db
+    image: busybox:1.36
+    command: ['sh', '-c', 'until nslookup mysql-service; do echo waiting...; sleep 2; done']
+  - name: init-config
+    image: busybox:1.36
+    command: ['sh', '-c', 'wget -O /config/app.yaml http://config-server/config']
+  containers:
+  - name: app
+    image: myapp:1.0
+```
+
+**Init Container 特性**：
+
+| 特性 | 说明 |
+|------|------|
+| 顺序执行 | 严格按定义顺序，前一个成功后才启动下一个 |
+| 重启策略 | 失败会重试（受 restartPolicy 影响），直到成功 |
+| 资源隔离 | 独立于主容器，有独立的资源请求/限制 |
+| 终止态 | 退出后不再启动（除非 Pod 重启） |
+| 典型场景 | 等待依赖服务、预下载配置、初始化数据库schema、设置权限 |
+
+### 18.3 Sidecar 模式
+
+```mermaid
+graph TB
+    subgraph Pod
+        subgraph "主容器"
+            A[应用容器]
+        end
+        subgraph "Sidecar 容器"
+            B[日志收集]
+            C[服务网格代理]
+            D[配置更新]
+        end
+    end
+    B -->|共享 Volume| A
+    C -->|拦截流量| A
+    D -->|热更新配置| A
+```
+
+| Sidecar 类型 | 工具 | 用途 |
+|-------------|------|------|
+| 日志收集 | Fluent Bit/Filebeat | 采集 stdout + 文件日志 |
+| 服务网格 | Istio Envoy | mTLS、熔断、重试、灰度 |
+| 配置更新 | Consul Template | 配置变更热加载 |
+| 监控代理 | Istio Metrics | 自动注入 metrics 采集 |
+| 证书管理 | Cert-manager | 证书自动轮换 |
+
+### 18.4 Resource Requests/Limits 调优
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"      # 调度依据：确保节点有 0.5 核空闲
+    memory: "256Mi"  # OOM 判断依据
+  limits:
+    cpu: "1000m"     # CPU 限流（throttle），非硬限制
+    memory: "512Mi"  # 超出则 OOMKill
+```
+
+**调优原则**：
+
+| 策略 | 说明 | 注意事项 |
+|------|------|----------|
+| requests=limits | Guaranteed QoS，不被驱逐 | 资源浪费，适合核心服务 |
+| requests<limits | Burstable QoS，弹性伸缩 | 常见选择，平衡成本与稳定 |
+| 无 limits | Best-Effort QoS | 最先被驱逐，慎用 |
+| CPU 粒度 | 1m=0.001核 | CPU 可压缩，超限被 throttle |
+| 内存粒度 | 1Mi=1048576字节 | 内存不可压缩，超限被 OOMKill |
+
+```text
+QoS 等级与驱逐优先级：
+Best-Effort（无 requests/limits）→ Burstable（requests<limits）→ Guaranteed（requests=limits）
+低优先级先驱逐
+```
+
+### 18.5 HPA/VPA/KEDA 自动扩缩容
+
+**HPA（Horizontal Pod Autoscaler）**：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 缩容冷却5分钟
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+```
+
+**VPA（Vertical Pod Autoscaler）**：
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  updatePolicy:
+    updateMode: "Auto"  # 自动重建 Pod 应用新资源
+  resourcePolicy:
+    containerPolicies:
+    - containerName: app
+      minAllowed:
+        cpu: "100m"
+        memory: "128Mi"
+      maxAllowed:
+        cpu: "4"
+        memory: "8Gi"
+```
+
+**KEDA（Kubernetes Event-Driven Autoscaling）**：
+
+| 指标源 | 触发器 | 场景 |
+|--------|--------|------|
+| Kafka lag | kafka | 消费积压自动扩容 |
+| RabbitMQ queue | rabbitmq | 队列深度触发 |
+| Prometheus | prometheus | 自定义指标 |
+| Cron | cron | 定时扩缩 |
+| MySQL/PG | 外部指标 | DB 连接数/慢查询 |
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+spec:
+  scaleTargetRef:
+    name: myapp
+  minReplicaCount: 2
+  maxReplicaCount: 50
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka:9092
+      consumerGroup: mygroup
+      topic: orders
+      lagThreshold: "100"
+```
+
+### 18.6 NetworkPolicy 网络策略
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: database
+    ports:
+    - protocol: TCP
+      port: 5432
+```
+
+```text
+NetworkPolicy 工作原理：
+1. 默认全通：未定义策略时 Pod 间无限制
+2. 默认拒绝：定义了 ingress/egress 后只放行匹配规则
+3. 选择器：podSelector + namespaceSelector 做标签匹配
+4. CIDR：ipBlock 放行特定 IP 段
+5. 实现依赖：Calico/Cilium 支持，Flannel 不支持 NetworkPolicy
+```
+
+### 18.7 PodDisruptionBudget（PDB）
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myapp-pdb
+spec:
+  minAvailable: 2    # 至少保留 2 个 Pod
+  # 或 maxUnavailable: 1  # 最多不可用 1 个
+  selector:
+    matchLabels:
+      app: myapp
+```
+
+**PDB 使用场景**：
+
+| 场景 | 配置 | 效果 |
+|------|------|------|
+| 滚动更新 | minAvailable: 50% | 更新时至少一半可用 |
+| 节点维护 | maxUnavailable: 1 | 驱逐时逐个进行 |
+| 有状态服务 | minAvailable: 3 | 保证 quorum |
+
+### 18.8 K8s RBAC 权限模型
+
+```mermaid
+graph LR
+    SA[ServiceAccount] --> RoleBinding
+    RoleBinding --> Role
+    Role --> Rules[资源+操作]
+    SA --> ClusterRoleBinding
+    ClusterRoleBinding --> ClusterRole
+    ClusterRole --> Rules2[集群资源+操作]
+```
+
+```yaml
+# 命名空间级角色
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: production
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+---
+# 集群级角色
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-reader
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+---
+# 绑定
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: app-sa
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### 18.9 K8s 调试利器：kubectl debug 与临时容器
+
+```bash
+# 基础调试
+kubectl debug mypod -it --image=busybox:1.36 -- sh
+
+# 复用现有容器的进程命名空间
+kubectl debug mypod -it --image=busybox:1.36 --target=app
+
+# 节点级调试（进入节点的 host PID/IPC）
+kubectl debug node/worker-1 -it --image=ubuntu
+
+# 查看 Pod 的环境变量/挂载
+kubectl exec mypod -it -- env
+kubectl exec mypod -it -- ls /data
+
+# 查看事件（排障第一步）
+kubectl get events -n production --sort-by=.lastTimestamp | tail -20
+```
+
+**Ephemeral Containers（临时容器）**：
+
+```yaml
+apiVersion: v1
+kind: EphemeralContainer
+name: debugger
+image: busybox:1.36
+targetNamespace: ""
+command: ["sleep", "3600"]
+# kubectl debug mypod -it --image=busybox --target=app
+```
+
+### 18.10 Helm Chart 最佳实践
+
+```text
+Helm Chart 结构：
+mychart/
+├── Chart.yaml          # 元数据（版本、依赖）
+├── values.yaml         # 默认配置值
+├── templates/          # 模板文件
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   ├── hpa.yaml
+│   ├── pdb.yaml
+│   ├── networkpolicy.yaml
+│   ├── _helpers.tpl    # 辅助模板
+│   └── tests/          # 测试
+├── charts/             # 依赖子 chart
+└── .helmignore
+```
+
+```yaml
+# values.yaml 最佳实践
+replicaCount: 2
+image:
+  repository: myapp
+  tag: "1.0"
+  pullPolicy: IfNotPresent
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+```
+
+```bash
+# 开发阶段：模板渲染调试
+helm template myapp ./chart -f values-dev.yaml
+
+# 生产部署：dry-run 验证
+helm upgrade myapp ./chart -f values-prod.yaml --dry-run
+
+# 回滚
+helm rollback myapp 1
+
+# 查看历史
+helm history myapp
+```
+
+## 十九、与其他板块的关系
 
 ```text
 Docker/K8s ↔ 知识库：

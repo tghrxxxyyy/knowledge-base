@@ -366,6 +366,448 @@ Kong 负载均衡：
 
 ---
 
+## 十二、Kong 插件开发
+
+### 12.1 Kong 插件开发流程
+
+```
+1. 创建插件目录：kong/plugins/my-plugin/
+2. 编写 schema.lua（配置定义）
+3. 编写 handler.lua（各阶段处理函数）
+4. 在 kong.conf 中启用插件
+5. 绑定到 Route/Service/Global
+```
+
+### 12.2 Kong 插件骨架
+
+```lua
+-- kong/plugins/my-plugin/schema.lua
+local typedefs = require "kong.db.schema.typedefs"
+
+return {
+  name = "my-plugin",
+  fields = {
+    { protocols = typedefs.protocols { default = { "http", "https" } } },
+    { config = {
+        type = "record",
+        fields = {
+          { header_name = { type = "string", required = true } },
+          { header_value = { type = "string", required = true } },
+          { rate_limit = { type = "number", default = 100 } },
+        },
+    }},
+  },
+}
+
+-- kong/plugins/my-plugin/handler.lua
+return {
+  PRIORITY = 1000,
+  access = function(conf, plugin)
+    kong.service.request.set_header(conf.header_name, conf.header_value)
+  end,
+  header_filter = function(conf, plugin)
+    kong.response.set_header("X-Powered-By", "my-plugin")
+  end,
+  log = function(conf, plugin)
+    kong.log.info("request processed by my-plugin")
+  end,
+}
+```
+
+### 12.3 Kong 插件 vs APISIX 插件
+
+| 维度 | Kong 插件 | APISIX 插件 |
+|------|-----------|-------------|
+| 语言 | Lua（PDK） | Lua/Java/Go/WASM |
+| 开发复杂度 | 中等 | 低（轻量级） |
+| 热加载 | 需 reload | 支持热加载 |
+| 生态 | 成熟（60+） | 丰富（100+） |
+| 文档 | 完善 | 完善 |
+
+---
+
+## 十三、Kong in Kubernetes（Kong Ingress Controller）
+
+### 13.1 架构
+
+```
+K8s 集群：
+  Kong Ingress Controller（Pod）
+    → 监听 Ingress/KongIngress CRD
+    → 动态更新 Kong 网关配置
+    → 路由到后端 Service Pod
+
+CRD 资源：
+  KongIngress：网关专属配置
+  TCPIngress：TCP 路由
+  UDPIngress：UDP 路由
+  KongPlugin：插件配置
+  KongConsumer：消费者
+```
+
+### 13.2 KongIngress CRD 示例
+
+```yaml
+apiVersion: configuration.konghq.com/v1
+kind: KongIngress
+metadata:
+  name: api-kong
+upstream:
+  hash_on: none
+  algorithm: round-robin
+  healthchecks:
+    active:
+      http_path: /healthz
+      healthy:
+        interval: 5
+        successes: 2
+      unhealthy:
+        interval: 3
+        http_failures: 3
+service:
+  connect_timeout: 5000
+  read_timeout: 60000
+  write_timeout: 60000
+route:
+  strip_path: true
+  preserve_host: false
+  protocols:
+  - https
+```
+
+### 13.3 Kong Plugin CRD
+
+```yaml
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: rate-limit-plugin
+  namespace: default
+config:
+  minute: 100
+  policy: local
+  fault_tolerant: true
+plugin: rate-limiting
+---
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: jwt-plugin
+config:
+  uri_param_names: jwt
+  claims_to_verify:
+  - exp
+plugin: jwt
+```
+
+---
+
+## 十四、APISIX 插件架构
+
+### 14.1 插件运行机制
+
+```
+APISIX 插件执行流程：
+  1. 请求到达 → 生成插件执行链（按优先级排序）
+  2. rewrite 阶段 → 改写请求
+  3. access 阶段 → 鉴权/限流/IP 限制
+  4. before_proxy → 转发前处理
+  5. proxy → 转发到后端
+  6. header_filter → 响应头处理
+  7. body_filter → 响应体处理
+  8. log → 日志/指标上报
+
+插件优先级（数字越大越先执行）：
+  cors: 120000
+  ip-restriction: 30000
+  jwt-auth: 2500
+  limit-count: 1040
+  proxy-rewrite: 10080
+  prometheus: 910
+```
+
+### 14.2 多语言插件支持
+
+```yaml
+# APISIX 插件多语言架构
+APISIX 核心（Lua）
+  ├── Lua 插件（原生，性能最佳）
+  ├── Java 插件（通过 RPC 调用）
+  ├── Go 插件（通过 RPC 调用）
+  └── WASM 插件（WebAssembly）
+
+WASM 插件示例：
+  使用 Rust/Go 编译为 WASM
+  在 APISIX 中运行
+  安全隔离 + 跨平台
+```
+
+### 14.3 APISIX 插件热加载
+
+```bash
+# 动态启用插件
+curl http://127.0.0.1:9180/apisix/admin/routes/1 -X PUT -d '
+{
+  "uri": "/api/*",
+  "plugins": {
+    "limit-count": {
+      "count": 100,
+      "time_window": 60
+    }
+  }
+}'
+
+# 插件热更新（无需重启）
+# 修改插件代码后，APISIX 自动重新加载
+```
+
+---
+
+## 十五、APISIX vs Kong 性能对比
+
+### 15.1 基准测试数据
+
+| 指标 | APISIX | Kong |
+|------|--------|------|
+| 简单路由 QPS | ~12 万 | ~8 万 |
+| 路由匹配延迟 | ~0.3ms | ~0.5ms |
+| 内存占用（空载） | ~30MB | ~50MB |
+| 配置热更新时间 | <100ms | ~1s（reload） |
+| 路由数量（万级） | 性能稳定 | 性能下降 |
+
+### 15.2 路由匹配性能
+
+```
+APISIX：radixtree（Radix Tree）匹配
+  路由数量增加 → 匹配时间基本不变
+  万级路由：O(log n) 复杂度
+
+Kong：先查最具体匹配（缓存 + 优先表）
+  路由数量增加 → 匹配时间略有增加
+  万级路由：O(n) 退化风险
+
+实践建议：
+  路由控制在万级以内
+  合理设计 uri 前缀
+  避免过多正则路由
+```
+
+### 15.3 性能测试方法
+
+```bash
+# 使用 wrk 测试
+wrk -t12 -c400 -d30s http://127.0.0.1:9080/api/test
+
+# 使用 vegeta 测试
+echo "GET http://127.0.0.1:9080/api/test" | vegeta attack -rate=10000 -duration=30s | vegeta report
+
+# 监控指标
+# - 请求量 QPS
+# - 延迟 P50/P99
+# - 错误率
+# - CPU/内存使用率
+```
+
+---
+
+## 十六、APISIX Serverless
+
+### 16.1 Serverless 插件
+
+```json
+{
+  "plugins": {
+    "serverless-pre-function": {
+      "phase": "rewrite",
+      "functions": [
+        "return function(conf, ctx) ngx.say('hello from serverless') end"
+      ]
+    },
+    "serverless-post-function": {
+      "phase": "log",
+      "functions": [
+        "return function(conf, ctx) ngx.log(ngx.INFO, 'request processed') end"
+      ]
+    }
+  }
+}
+```
+
+### 16.2 Serverless 使用场景
+
+| 场景 | 说明 |
+|------|------|
+| 快速原型 | 无需部署服务，网关内直接运行逻辑 |
+| 边缘计算 | 在网关层执行轻量计算 |
+| 请求预处理 | 转发前修改 Header/参数 |
+| 响应后处理 | 日志记录/指标上报 |
+| 简单聚合 | 多个后端结果聚合 |
+
+---
+
+## 十七、API 网关迁移策略
+
+### 17.1 迁移路径
+
+```
+迁移三阶段：
+  Phase 1：并行运行（新旧网关同时接收流量）
+    → 灰度切换 10% 流量到新网关
+    → 监控指标对比
+
+  Phase 2：逐步切换
+    → 10% → 30% → 50% → 80% → 100%
+    → 每步观察错误率/延迟
+
+  Phase 3：下线旧网关
+    → 确认全量切换完成
+    → 保留旧网关 7 天
+    → 下线
+```
+
+### 17.2 迁移检查清单
+
+| 检查项 | 说明 |
+|--------|------|
+| 路由规则 | 所有路由已迁移且匹配正确 |
+| 鉴权插件 | JWT/OAuth2 配置一致 |
+| 限流规则 | 限流阈值已迁移 |
+| 灰度策略 | 灰度规则已迁移 |
+| 监控告警 | 指标采集已对接 |
+| 日志 | 访问日志格式一致 |
+| 性能 | 延迟/QPS 不退化 |
+| 回滚方案 | 保留旧网关可快速回滚 |
+
+### 17.3 灰度切换策略
+
+```yaml
+# Nginx 灰度切换示例
+upstream old_gateway {
+    server 10.0.0.1:80;
+}
+
+upstream new_gateway {
+    server 10.0.0.2:80;
+}
+
+split_clients "${remote_addr}" $target {
+    10% new_gateway;
+    * old_gateway;
+}
+
+server {
+    location / {
+        proxy_pass http://$target;
+    }
+}
+```
+
+---
+
+## 十八、网关安全加固
+
+### 18.1 安全配置清单
+
+| 加固项 | 说明 |
+|--------|------|
+| TLS 配置 | TLSv1.2+，禁用弱加密套件 |
+| 速率限制 | 全局+路由级限流 |
+| IP 黑白名单 | 按路由配置 ACL |
+| 请求验证 | 参数校验/SQL 注入防护 |
+| 响应头安全 | CORS/X-Frame-Options/CSP |
+| 日志审计 | 访问日志+异常日志 |
+| 证书管理 | 自动续期+轮转 |
+
+### 18.2 APISIX 安全插件组合
+
+```json
+{
+  "plugins": {
+    "cors": {
+      "allow_origins": "https://example.com",
+      "allow_methods": ["GET", "POST"],
+      "allow_headers": ["Authorization"]
+    },
+    "ip-restriction": {
+      "whitelist": ["10.0.0.0/8", "172.16.0.0/12"]
+    },
+    "uri-blocker": {
+      "block_rules": ["\\.env", "wp-admin", "phpmyadmin"]
+    },
+    "request-validation": {
+      "body_schema": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"}
+        }
+      }
+    },
+    "prometheus": {},
+    "opentelemetry": {}
+  }
+}
+```
+
+---
+
+## 十九、网关可观测性
+
+### 19.1 可观测性三支柱
+
+| 支柱 | 工具 | 指标 |
+|------|------|------|
+| 指标 | Prometheus + Grafana | QPS/延迟/错误率/连接数 |
+| 日志 | ELK/Loki | 访问日志/错误日志 |
+| 链路 | Jaeger/Zipkin | 请求追踪/Span 分析 |
+
+### 19.2 网关核心监控指标
+
+```
+网关监控黄金信号：
+  ├── 请求量（QPS/RPM）
+  ├── 错误率（4xx/5xx 比例）
+  ├── 延迟分位线（P50/P90/P99）
+  ├── 连接数（活跃/总计）
+  ├── 后端健康状态
+  ├── 插件执行耗时
+  └── 限流/熔断触发次数
+```
+
+### 19.3 告警规则示例
+
+```yaml
+# Prometheus 告警规则
+groups:
+- name: gateway-alerts
+  rules:
+  - alert: HighErrorRate
+    expr: rate(gateway_http_responses_total{status=~"5.."}[5m]) / rate(gateway_http_responses_total[5m]) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "网关 5xx 错误率 > 5%"
+
+  - alert: HighLatency
+    expr: histogram_quantile(0.99, rate(gateway_http_request_duration_seconds_bucket[5m])) > 2
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "网关 P99 延迟 > 2s"
+
+  - alert: LowActiveServers
+    expr: gateway_backend_active_servers < 2
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "后端活跃实例 < 2"
+```
+
+---
+
 ## 十一、与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；

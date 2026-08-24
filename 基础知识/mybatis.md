@@ -410,3 +410,336 @@ public class JsonTypeHandler extends BaseTypeHandler<Object> {
 
 - **代码生成器**：MP `AutoGenerator`（或 `mybatis-plus-generator`）按表结构一键出 `Entity / Mapper / Service / Controller / XML`，配 `StrategyConfig`（表前缀、字段命名驼峰）、`GlobalConfig`（输出路径）、`DataSourceConfig`。注意：生成代码仅作脚手架，**复杂查询与业务逻辑仍需手写**，生成的 `updateById` 只更非 null 字段（想置 null 用 `UpdateWrapper.set`）。
 - **选型**：简单 CRUD 多、想省样板 → MP；复杂报表/极致性能/可读 SQL → 原生 MyBatis；二者可共存（MP 管简单读写，XML 管复杂 SQL）。
+
+## 二十二、MyBatis 插件机制深度（责任链 + 动态代理）
+
+### 22.1 四大拦截点详解
+
+```text
+MyBatis 插件可拦截的四大对象：
+
+1. Executor（执行器）
+   - 拦截方法：update/query/commit/rollback
+   - 用途：分页改写、数据权限、SQL审计、缓存控制
+   - 典型实现：PageHelper
+
+2. StatementHandler（语句处理器）
+   - 拦截方法：prepare/parameterize/batch/update/query
+   - 用途：SQL改写、分表路由、读写分离
+   - 最常用拦截点
+
+3. ParameterHandler（参数处理器）
+   - 拦截方法：setParameters/getParameterObject
+   - 用途：参数加密、租户ID注入、脱敏
+
+4. ResultSetHandler（结果集处理器）
+   - 拦截方法：handleResultSets/handleOutputParameters
+   - 用途：结果解密、字段脱敏、类型转换
+```
+
+### 22.2 插件执行顺序
+
+```mermaid
+graph TB
+    A[Executor] --> B[Plugin 1]
+    B --> C[Plugin 2]
+    C --> D[Plugin 3]
+    D --> E[真实 Executor]
+    
+    F[调用链] --> G[Plugin 3 前置]
+    G --> H[Plugin 2 前置]
+    H --> I[Plugin 1 前置]
+    I --> J[真实方法]
+    J --> K[Plugin 1 后置]
+    K --> L[Plugin 2 后置]
+    L --> M[Plugin 3 后置]
+```
+
+```java
+// 插件执行顺序示例
+// mybatis-config.xml 中配置顺序决定执行顺序
+<plugins>
+  <plugin interceptor="com.example.SqlCostInterceptor"/>      <!-- 最外层 -->
+  <plugin interceptor="com.example.DataPermissionInterceptor"/> <!-- 中间层 -->
+  <plugin interceptor="com.example.TenantInterceptor"/>         <!-- 最内层 -->
+</plugins>
+```
+
+## 二十三、MyBatis TypeHandler 机制
+
+### 23.1 内置 TypeHandler 对照
+
+| Java Type | JDBC Type | TypeHandler |
+|-----------|-----------|-------------|
+| String | VARCHAR | StringTypeHandler |
+| Integer | INTEGER | IntegerTypeHandler |
+| Long | BIGINT | LongTypeHandler |
+| Double | DOUBLE | DoubleTypeHandler |
+| Boolean | BOOLEAN | BooleanTypeHandler |
+| Date | TIMESTAMP | JdbcDateHandler |
+| LocalDateTime | TIMESTAMP | LocalDateTimeTypeHandler |
+| Enum | VARCHAR/INTEGER | EnumTypeHandler |
+| byte[] | BLOB | BlobTypeHandler |
+
+### 23.2 自定义 TypeHandler 实战
+
+```java
+// JSON 字段 TypeHandler
+@MappedTypes(Map.class)
+public class JsonTypeHandler extends BaseTypeHandler<Object> {
+    private final ObjectMapper mapper = new ObjectMapper();
+    
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i, Object parameter, JdbcType jdbcType) 
+            throws SQLException {
+        ps.setString(i, mapper.writeValueAsString(parameter));
+    }
+    
+    @Override
+    public Object getNullableResult(ResultSet rs, String columnName) throws SQLException {
+        return parse(rs.getString(columnName));
+    }
+    
+    @Override
+    public Object getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+        return parse(rs.getString(columnIndex));
+    }
+    
+    @Override
+    public Object getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+        return parse(cs.getString(columnIndex));
+    }
+    
+    private Object parse(String json) {
+        if (json == null || json.isEmpty()) return null;
+        try {
+            return mapper.readValue(json, Map.class);
+        } catch (Exception e) {
+            throw new RuntimeException("JSON parse error", e);
+        }
+    }
+}
+```
+
+```xml
+<!-- 注册 TypeHandler -->
+<typeHandlers>
+  <typeHandler handler="com.example.JsonTypeHandler" 
+               javaType="com.example.dto.UserExtra"
+               jdbcType="VARCHAR"/>
+</typeHandlers>
+
+<!-- 使用 TypeHandler -->
+<resultMap id="userResultMap" type="User">
+  <id property="id" column="id"/>
+  <result property="extra" column="extra_json" 
+          typeHandler="com.example.JsonTypeHandler"/>
+</resultMap>
+```
+
+## 二十四、MyBatis 动态 SQL 引擎原理
+
+### 24.1 动态 SQL 解析流程
+
+```text
+XML SQL → XMLScriptBuilder → SqlNode 树 → DynamicContext → SqlSource → BoundSql
+
+1. XMLScriptBuilder.parseBodyNode()
+   - 解析 <if>/<where>/<set>/<foreach>/<choose>/<trim> 等节点
+   - 构建 MixedSqlNode（包含所有子节点）
+
+2. SqlNode.apply(DynamicContext)
+   - 遍历所有子节点，根据条件生成 SQL 片段
+   - <if> 用 OGNL 表达式判断条件
+   - <where> 自动去除首部 AND/OR
+   - <set> 自动去除尾部逗号
+   - <foreach> 展开集合
+
+3. DynamicContext.getSql()
+   - 获取拼接后的完整 SQL
+   - 调用 SqlSource 的 getBoundSql()
+
+4. SqlSource.getBoundSql()
+   - 替换 ${} 为实际值（字符串替换）
+   - 替换 #{} 为 ?（预编译占位符）
+   - 返回 BoundSql（包含 SQL + 参数映射）
+```
+
+### 24.2 OGNL 表达式陷阱
+
+```xml
+<!-- 陷阱1：Integer 缓存范围 -->
+<if test="status == 1">  <!-- status 为 Integer，>127 时 == 比较对象引用失败 -->
+  AND status = 1
+</if>
+<!-- 正确写法 -->
+<if test="status == 1 or status eq 1">
+  AND status = 1
+</if>
+
+<!-- 陷阱2：字符串判空 -->
+<if test="name != null and name != ''">  <!-- 必须同时判 null 和空串 -->
+  AND name = #{name}
+</if>
+
+<!-- 陷阱3：集合判空 -->
+<if test="list != null and list.size() > 0">  <!-- 不能用 list.isEmpty() -->
+  AND id IN
+  <foreach collection="list" item="id" open="(" close=")" separator=",">
+    #{id}
+  </foreach>
+</if>
+
+<!-- 陷阱4：choose 顺序 -->
+<choose>
+  <when test="type == 'A'">AND status = 1</when>  <!-- 第一个命中即停 -->
+  <when test="type == 'B'">AND status = 2</when>
+  <otherwise>AND status = 0</otherwise>
+</choose>
+```
+
+## 二十五、MyBatis 缓存层级（L1/L2）
+
+### 25.1 一级缓存（SqlSession 级）
+
+```text
+一级缓存工作原理：
+┌─────────────────────────────────────────┐
+│ SqlSession                              │
+│  └── Executor (BaseExecutor)            │
+│       └── localCache (PerpetualCache)   │
+│            └── HashMap<CacheKey, Object>│
+└─────────────────────────────────────────┘
+
+CacheKey 构成：
+- statementId（Mapper + 方法名）
+- rowBounds（分页参数）
+- params（查询参数）
+- boundSql.sql（SQL 语句）
+
+失效条件：
+- 执行 update/insert/delete
+- 执行 commit/rollback
+- 调用 clearCache()
+- SqlSession 关闭
+
+Spring 集成下的问题：
+- SqlSessionTemplate 每次方法调用新建/归还 SqlSession
+- 跨方法一级缓存基本不共享
+- 同一事务内通过 SqlSessionHolder 复用
+```
+
+### 25.2 二级缓存（Mapper/Namespace 级）
+
+```text
+二级缓存工作原理：
+┌──────────────────────────────────────────┐
+│ SqlSession 1     SqlSession 2            │
+│     │                │                   │
+│     ▼                ▼                   │
+│  CachingExecutor (装饰器)                │
+│     │                │                   │
+│     ▼                ▼                   │
+│  ┌──────────────────────────────────┐   │
+│  │ 二级缓存 (namespace 级)          │   │
+│  │  └── TransactionalCacheManager   │   │
+│  │       └── TransactionalCache     │   │
+│  │            └── HashMap 缓存       │   │
+│  └──────────────────────────────────┘   │
+└──────────────────────────────────────────┘
+
+命中顺序：二级缓存 → 一级缓存 → 数据库
+
+关键特性：
+- 事务提交后才写入二级缓存（避免脏读）
+- 多表 join 的二级缓存极易不一致
+- 生产建议用 Redis 替代 MyBatis 内置二级缓存
+```
+
+## 二十六、MyBatis-Spring 整合原理
+
+```text
+整合流程：
+1. SqlSessionFactoryBean 构建 SqlSessionFactory
+   - 读取 mybatis-config.xml
+   - 扫描 mapperLocations 的 XML 文件
+   - 注册 TypeHandler
+   - 注册 Mapper 到 knownMappers
+
+2. @MapperScan + ClassPathMapperScanner
+   - 扫描 Mapper 接口
+   - 注册为 MapperFactoryBean
+   - getObject() 返回 SqlSession.getMapper() 的代理
+
+3. 调用 Mapper 方法
+   - MapperProxy.invoke()
+   - MapperMethod.execute()
+   - SqlSessionTemplate（线程安全）
+   - Executor 执行 SQL
+
+4. 事务绑定
+   - SpringManagedTransaction
+   - 同一事务复用同一 Connection
+   - @Transactional 才生效
+```
+
+## 二十七、MyBatis 与 JPA/Hibernate 对比
+
+| 维度 | MyBatis | JPA/Hibernate |
+|------|---------|---------------|
+| SQL 控制 | 完全控制，手写 SQL | 自动生成，HQL/JPQL |
+| 学习曲线 | 低，SQL 为基础 | 高，ORM 概念多 |
+| 复杂查询 | 强，灵活编写 | 弱，复杂查询受限 |
+| 缓存 | L1/L2，可集成 Redis | L1/L2，更完善 |
+| 性能 | 优化空间大 | 需调优，N+1 问题 |
+| 适用场景 | 互联网/复杂查询/性能敏感 | 企业级/CRUD 为主/快速开发 |
+| 迁移成本 | 低，SQL 显式 | 高，ORM 耦合重 |
+
+**混用策略**：JPA 管简单 CRUD（省代码），MyBatis 管复杂报表/批量操作（控性能）。
+
+## 二十八、MyBatis 批量操作优化
+
+### 28.1 三种批量方式对比
+
+| 方式 | 原理 | 性能 | 适用场景 |
+|------|------|------|----------|
+| foreach VALUES | 单条 SQL 插入多行 | 高 | 中等批量（<1000行） |
+| ExecutorType.BATCH | JDBC addBatch + executeBatch | 最高 | 大批量（>1000行） |
+| 流式查询 | 游标逐条处理 | 中 | 大结果集读取 |
+
+### 28.2 BATCH 模式最佳实践
+
+```java
+// 批量插入示例
+public void batchInsert(List<User> users) {
+    SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH, false);
+    UserMapper mapper = sqlSession.getMapper(UserMapper.class);
+    
+    try {
+        for (int i = 0; i < users.size(); i++) {
+            mapper.insert(users.get(i));
+            // 每 500 条提交一次
+            if (i % 500 == 499) {
+                sqlSession.flushStatements();
+                sqlSession.clearCache();
+            }
+        }
+        sqlSession.flushStatements();
+        sqlSession.commit();
+    } catch (Exception e) {
+        sqlSession.rollback();
+        throw e;
+    } finally {
+        sqlSession.close();
+    }
+}
+```
+
+```xml
+<!-- 流式查询示例 -->
+<select id="selectLargeResult" resultMap="userResultMap" 
+        resultSetType="FORWARD_ONLY" fetchSize="-2147483648">
+  SELECT * FROM users WHERE status = #{status}
+</select>
+<!-- fetchSize=Integer.MIN_VALUE 启用 MySQL 流式查询 -->
+```

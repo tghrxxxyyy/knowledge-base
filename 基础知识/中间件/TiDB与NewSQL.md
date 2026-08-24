@@ -330,6 +330,406 @@ TiFlash：同步延迟/查询延迟
 
 ---
 
+## 十二、TiDB TiKV/TiFlash 架构深入
+
+### 12.1 TiKV 架构
+
+```mermaid
+flowchart TD
+    A[TiDB Server<br/>SQL 层] -->|KV 请求| B[TiKV<br/>存储层]
+    B --> C[Raft Layer<br/>复制/共识]
+    C --> D[RocksDB<br/>KV 存储引擎]
+    D --> E[磁盘<br/>WAL/MemTable/SST]
+    
+    subgraph TiKV 节点
+        C
+        D
+        E
+    end
+```
+
+| 组件 | 职责 |
+|------|------|
+| Raft Layer | 复制/选举/日志提交 |
+| RocksDB | KV 存储（LSM-Tree） |
+| Coprocessor | 计算下推（谓词/聚合/TopN） |
+| Region | 数据调度基本单位（~96MB） |
+
+### 12.2 TiFlash 架构
+
+```
+TiFlash 架构：
+  列式存储引擎（DeltaTree）
+  Raft Learner（异步同步行存数据）
+  MPP 引擎（多节点并行计算）
+
+DeltaTree 结构：
+  Delta 层：增量数据（写缓冲）
+  Stable 层：全量数据（列存压缩）
+  合并：Delta → Stable（后台合并）
+
+MPP 模式：
+  大查询 → 分发到多个 TiFlash 节点
+  → 各节点并行计算
+  → 汇总结果
+  适合：大表 JOIN / 聚合 / 扫描
+```
+
+### 12.3 TiKV vs TiFlash
+
+| 维度 | TiKV（行存） | TiFlash（列存） |
+|------|-------------|----------------|
+| 存储格式 | 行式 | 列式 |
+| 读优化 | 点查/小范围 | 大范围扫描/聚合 |
+| 写入性能 | 高 | 中（异步同步） |
+| 压缩比 | 一般 | 高（列压缩） |
+| 适用 | OLTP | OLAP |
+| 副本 | Raft（强一致） | Raft Learner（异步） |
+
+---
+
+## 十三、TiDB Placement Rules
+
+### 13.1 Placement Rules 概念
+
+```
+Placement Rules = 数据放置规则
+  控制副本数量/角色/位置
+  实现：跨机架/跨可用区/跨地域部署
+
+规则维度：
+  replicas：副本数
+  role：Leader/Follower/Learner
+  location_labels：位置标签（zone/rack/host）
+  count：副本数量
+```
+
+### 13.2 Placement Rules 配置
+
+```json
+// 将 order 表的 Leader 放在 zone=a，Follower 放在 zone=b/c
+[
+  {
+    "group_id": "order_group",
+    "id": 1,
+    "index": 1,
+    "override": true,
+    "role": "leader",
+    "count": 1,
+    "location_labels": ["zone"],
+    "isolation_level": "zone"
+  },
+  {
+    "group_id": "order_group",
+    "id": 2,
+    "index": 2,
+    "override": true,
+    "role": "follower",
+    "count": 2,
+    "location_labels": ["zone"],
+    "isolation_level": "zone"
+  }
+]
+```
+
+### 13.3 Placement Rules 使用场景
+
+| 场景 | 规则 |
+|------|------|
+| 跨可用区高可用 | Leader + 2 Follower 分布 3 个 AZ |
+| 读写分离 | Leader 在主区，Follower 在从区 |
+| 数据本地性 | 特定表的副本在指定区域 |
+| 降级容灾 | Learner 在异地（不影响写入性能） |
+
+---
+
+## 十四、TiDB HTAP 场景
+
+### 14.1 HTAP 使用模式
+
+```
+模式一：在线分析（实时报表）
+  业务写入 TiKV（OLTP）
+  分析查询自动路由到 TiFlash（OLAP）
+  → 实时报表（数据秒级可见）
+
+模式二：实时大屏
+  业务数据实时写入
+  Grafana/BI 工具直接查 TiFlash
+  → 毫秒级响应
+
+模式三：数据仓库替代
+  传统 ETL 流程：业务库 → CDC → 数仓（T+1）
+  HTAP 模式：业务库 + TiFlash（无需 ETL，实时查询）
+```
+
+### 14.2 HTAP 查询路由
+
+```sql
+-- 自动路由（TiDB 优化器决策）
+EXPLAIN SELECT * FROM orders WHERE amount > 100;
+-- 优化器根据数据量自动选择 TiKV 或 TiFlash
+
+-- 强制使用 TiFlash
+EXPLAIN SELECT /*+ read_from_storage(tiflash[orders]) */ 
+  COUNT(*) FROM orders GROUP BY status;
+
+-- 强制使用 TiKV
+EXPLAIN SELECT /*+ read_from_storage(tikv[orders]) */ 
+  * FROM orders WHERE id = 123;
+```
+
+### 14.3 HTAP 注意事项
+
+| 事项 | 说明 |
+|------|------|
+| 存储成本 | TiKV + TiFlash 双份数据 |
+| 同步延迟 | TiFlash 异步同步（秒级延迟） |
+| 写放大 | TiFlash 同步增加写入开销 |
+| 复杂分析 | 超复杂查询仍建议大数据平台 |
+| 内存消耗 | MPP 查询消耗大量内存 |
+
+---
+
+## 十五、TiDB vs CockroachDB vs YugabyteDB
+
+| 维度 | TiDB | CockroachDB | YugabyteDB |
+|------|------|-------------|------------|
+| 协议兼容 | MySQL | PostgreSQL | PostgreSQL |
+| 存储引擎 | RocksDB（TiKV） | Pebble | RocksDB |
+| 事务模型 | Percolator 2PC | 串行化（2PC） | 2PC |
+| HTAP | TiKV + TiFlash | 无（扩展版有） | 无 |
+| 一致性 | 强一致（Raft） | 强一致（Raft） | 强一致（Raft） |
+| 地理分布 | Placement Rules | 自动区域化 | 表空间 |
+| 生态工具 | 丰富（Lightning/CDC） | 一般 | 一般 |
+| 社区 | 活跃（CNCF） | 活跃 | 活跃 |
+| 学习成本 | 中（MySQL） | 中（PostgreSQL） | 中（PostgreSQL） |
+
+### 选型决策
+
+| 场景 | 首选 | 理由 |
+|------|------|------|
+| MySQL 生态 + HTAP | TiDB | MySQL 兼容 + TiFlash |
+| PostgreSQL 生态 | CockroachDB | PG 兼容 |
+| 全球分布式 | CockroachDB | 原生区域化 |
+| 阿里云生态 | OceanBase | 阿里系支持 |
+| 开源自建 | TiDB / CockroachDB | 功能丰富 |
+
+---
+
+## 十六、TiDB 性能调优
+
+### 16.1 SQL 层调优
+
+| 调优点 | 方法 |
+|--------|------|
+| 执行计划 | EXPLAIN ANALYZE 分析慢查询 |
+| 索引优化 | 合理创建索引（避免全表扫描） |
+| 查询改写 | 避免子查询/改写为 JOIN |
+| 统计信息 | ANALYZE TABLE 更新统计信息 |
+| Hint | 强制使用特定索引/存储引擎 |
+
+### 16.2 TiKV 层调优
+
+| 调优点 | 方法 |
+|--------|------|
+| 热点 Region | 随机主键/打散热点 |
+| 写入性能 | 批量写入/调整 raft log |
+| 读取性能 | Follower Read/_kv_read_only |
+| 内存 | 调整 block cache 大小 |
+| 磁盘 | SSD + 调整 RocksDB 参数 |
+
+### 16.3 慢查询分析
+
+```sql
+-- 查看慢查询
+SELECT * FROM mysql.slow_query ORDER BY query_time DESC LIMIT 10;
+
+-- 执行计划分析
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123 AND status = 'paid';
+
+-- 关注：
+-- - rows_examined（扫描行数）
+-- - execution_info（实际耗时）
+-- - task info（TiKV/TiFlash 任务分布）
+```
+
+---
+
+## 十七、TiDB 备份与恢复
+
+### 17.1 备份方案
+
+| 方案 | 工具 | 说明 |
+|------|------|------|
+| 全量备份 | BR (Backup & Restore) | 物理备份，速度快 |
+| 增量备份 | BR incremental | 基于全量的增量 |
+| 逻辑备份 | Dumpling | SQL 导出，兼容 MySQL |
+| 实时备份 | TiCDC | 实时增量同步 |
+
+### 17.2 BR 备份示例
+
+```bash
+# 全量备份
+br backup full \
+  --pd "pd1:2379,pd2:2379,pd3:2379" \
+  --storage "s3://backup/tidb/full" \
+  --send-credentials-to-tikv=true
+
+# 增量备份
+br backup incremental \
+  --pd "pd1:2379" \
+  --storage "s3://backup/tidb/full" \
+  --lastbackupid 1234567890
+
+# 恢复
+br restore full \
+  --pd "pd1:2379" \
+  --storage "s3://backup/tidb/full" \
+  --send-credentials-to-tikv=true
+```
+
+### 17.3 备份策略
+
+```
+备份策略：
+  全量备份：每天凌晨（业务低峰）
+  增量备份：每小时
+  保留周期：7 天
+  异地备份：跨 AZ/跨地域
+
+恢复时间目标（RTO）：
+  BR 物理恢复：TB 级数据 ~30 分钟
+  Dumpling 逻辑恢复：TB 级数据 ~数小时
+
+恢复点目标（RPO）：
+  全量+增量：最多丢失 1 小时数据
+  TiCDC 实时同步：秒级 RPO
+```
+
+---
+
+## 十八、TiDB 金融场景
+
+### 18.1 金融场景要求
+
+| 要求 | TiDB 方案 |
+|------|----------|
+| 强一致 | Raft 多副本 + Percolator 事务 |
+| 高可用 | 自动故障转移（秒级） |
+| 数据不丢 | RPO = 0（同步复制） |
+| 事务完整 | ACID 事务支持 |
+| 审计 | SQL 审计日志 |
+| 加密 | 传输加密（TLS）+ 存储加密 |
+
+### 18.2 金融场景最佳实践
+
+```
+部署要求：
+  3 数据中心部署（跨 AZ）
+  Raft 副本数 ≥ 3
+  同步模式（sync_log = true）
+  金融级 SSD（高 IOPS）
+
+性能要求：
+  核心交易：P99 < 10ms
+  批量处理：高吞吐
+  报表查询：HTAP 实时分析
+
+运维要求：
+  7×24 监控
+  自动备份 + 异地容灾
+  定期演练恢复
+```
+
+### 18.3 TiDB 金融案例
+
+```
+场景：银行核心交易系统
+  数据量：日增 500GB
+  QPS：峰值 50,000
+  事务：核心交易 ACID
+  报表：实时风控分析
+
+方案：
+  TiDB（MySQL 兼容，应用改造小）
+  TiFlash（实时风控分析）
+  3 AZ 部署（高可用）
+  BR + TiCDC（备份 + 实时同步）
+```
+
+---
+
+## 十九、TiDB 生态工具
+
+### 19.1 TiCDC
+
+```
+TiCDC（Change Data Capture）：
+  实时捕获 TiDB 变更
+  输出到下游系统（Kafka/MySQL/云存储）
+
+用途：
+  实时数据同步（TiDB → MySQL）
+  实时数据仓库（TiDB → ClickHouse/数仓）
+  实时搜索（TiDB → Elasticsearch）
+  实时缓存（TiDB → Redis）
+
+架构：
+  TiDB → TiKV → CDC 捕获变更 → 下游
+```
+
+### 19.2 TiDB Lightning
+
+```
+TiDB Lightning：
+  快速数据导入工具
+  全量导入（TB 级数据 ~小时级完成）
+
+工作流程：
+  1. 导出数据文件（CSV/Dumpling 格式）
+  2. Lightning 解析文件
+  3. 并行写入 TiKV（绕过 SQL 层）
+  4. 数据校验
+
+使用场景：
+  新集群初始化
+  全量数据迁移
+  大表重建
+```
+
+### 19.3 TiDB DM（Data Migration）
+
+```
+DM（Data Migration）：
+  MySQL → TiDB 实时同步
+  全量迁移 + 增量同步
+
+工作流程：
+  1. 全量迁移（dumpling 导出 + Lightning 导入）
+  2. 增量同步（binlog 持续复制）
+  3. 数据校验
+  4. 切换（停写窗口秒级）
+
+使用场景：
+  MySQL → TiDB 迁移
+  MySQL → TiDB 实时同步
+  分库分表 → TiDB 合并
+```
+
+### 19.4 生态工具对比
+
+| 工具 | 用途 | 输入 | 输出 |
+|------|------|------|------|
+| TiCDC | 实时变更捕获 | TiDB | Kafka/MySQL/ES |
+| Lightning | 快速导入 | CSV/Dumpling | TiDB |
+| DM | MySQL 同步 | MySQL binlog | TiDB |
+| BR | 备份恢复 | TiDB | S3/本地 |
+| Dumpling | 逻辑导出 | TiDB | SQL/CSV |
+| TiDB Dashboard | 运维监控 | — | Web UI |
+
+---
+
 ## 十一、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

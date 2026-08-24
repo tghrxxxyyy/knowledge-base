@@ -200,7 +200,399 @@ Cell = (RowKey, CF:Qualifier, Timestamp) → Value
 
 ---
 
-## 七、与其他板块的关系
+## 七、HBase Region 分裂策略
+
+### 7.1 分裂策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| ConstantSizeRegionSplitPolicy | 固定大小分裂 | 默认策略 |
+| IncreasingToUpperBoundRegionSplitPolicy | 上限递增分裂 | 新表/自动分裂 |
+| KeyPrefixRegionSplitPolicy | 前缀分裂 | 前缀设计的表 |
+| DisabledRegionSplitPolicy | 禁用分裂 | 预分裂表 |
+
+### 7.2 分裂流程
+
+```mermaid
+graph TD
+    A[Region 达到阈值] --> B[HMaster 触发分裂]
+    B --> C[RegionServer 执行分裂]
+    C --> D[生成两个子 Region]
+    D --> E[子 Region 注册到 Master]
+    E --> F[负载均衡分配]
+```
+
+### 7.3 分裂配置
+
+```xml
+<!-- hbase-site.xml -->
+<property>
+  <name>hbase.hregion.max.filesize</name>
+  <value>10737418240</value> <!-- 10GB -->
+</property>
+<property>
+  <name>hbase.hregion.split.algorithm</name>
+  <value>IncreasingToUpperBoundRegionSplitPolicy</value>
+</property>
+```
+
+### 7.4 预分裂（Pre-split）
+
+```bash
+# 建表时预分裂
+create 'table_name', 'cf', SPLITS => ['10', '20', '30', '40']
+
+# 按文件预分裂
+create 'table_name', 'cf', {NUMREGIONS => 15, SPLITALGO => 'HexStringSplit'}
+```
+
+### 7.5 分裂最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| RowKey 哈希打散 | 避免分裂热点 |
+| 预分裂 | 避免首次分裂延迟 |
+| 合理阈值 | 10GB 适合大多数场景 |
+| 监控 Region 数 | 避免过多 Region |
+
+---
+
+## 八、HBase Compaction 机制
+
+### 8.1 Minor Compaction
+
+```
+触发条件：
+  HFile 数量达到阈值（默认 3）
+  相邻小 HFile 合并
+
+特点：
+  速度快（合并小文件）
+  不删除数据（保留所有版本）
+  不删除标记（Delete 标记保留）
+  后台异步执行
+
+配置：
+  hbase.hstore.compactionThreshold: 3（触发阈值）
+  hbase.hstore.compaction.max: 10（单次最大合并数）
+```
+
+### 8.2 Major Compaction
+
+```
+触发条件：
+  手动触发（major_compact 命令）
+  自动触发（默认 7 天）
+
+特点：
+  合并整个列族的所有 HFile
+  删除过期版本
+  删除 Delete 标记
+  IO 开销大（生产低峰期执行）
+
+配置：
+  hbase.hstore.compaction.throughput.lower.bound: 20MB/s
+  hbase.hstore.compaction.throughput.higher.limit: 200MB/s
+```
+
+### 8.3 Compaction 调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `hbase.hstore.compactionThreshold` | 触发阈值 | 3~6 |
+| `hbase.hstore.compaction.max` | 单次最大合并数 | 10~20 |
+| `hbase.hstore.compaction.max.size` | 单文件最大大小 | 100MB |
+| `hbase.region.compacting.lowthroughput.limit` | 低吞吐限速 | 2MB/s |
+
+### 8.4 Compaction 监控
+
+```
+监控指标：
+  Compaction 队列长度（是否积压）
+  Compaction 速率（MB/s）
+  HFile 数量（是否过多）
+  IO 使用率（磁盘负载）
+
+告警：
+  队列积压 > 阈值 → 告警
+  IO 使用率 > 80% → 限速
+```
+
+---
+
+## 九、HBase Bloom Filter
+
+### 9.1 Bloom Filter 类型
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| ROW | 按 RowKey 过滤 | 随机读 |
+| ROWCOL | 按 RowKey + Column 过滤 | 精确列读 |
+
+### 9.2 Bloom Filter 原理
+
+```
+写入时：
+  RowKey → Hash 函数 → 多个位设置为 1
+  存储在 HFile 的元数据中
+
+读取时：
+  RowKey → Hash 函数 → 检查对应位
+  全部为 1 → 可能存在（需进一步检查）
+  任一为 0 → 一定不存在（直接跳过）
+
+误判率：
+  默认 1%（0.01）
+  可配置：0.001~0.1
+  越小 → 占用空间越大
+```
+
+### 9.3 Bloom Filter 配置
+
+```bash
+# 建表时启用
+create 'table_name', {NAME => 'cf', BLOOMFILTER => 'ROW'}
+
+# 查看 Bloom Filter 信息
+hbase org.apache.hadoop.hbase.io.hfile.HFileMain
+```
+
+### 9.4 Bloom Filter 效果
+
+| 场景 | 无 Bloom Filter | 有 Bloom Filter |
+|------|-----------------|-----------------|
+| 随机读 | 可能读多个 HFile | 跳过不存在的 HFile |
+| 无效读比例 | 100% | 降低到 1~5% |
+| 读放大 | 严重 | 大幅减少 |
+
+---
+
+## 十、HBase Coprocessor
+
+### 10.1 协处理器类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| Observer | 类似触发器/拦截器 | 审计/二级索引 |
+| Endpoint | 类似存储过程 | 聚合/计算 |
+
+### 10.2 Observer 协处理器
+
+```
+触发时机：
+  Before/After Get/Put/Scan/Delete
+
+使用场景：
+  二级索引维护（写入时同步更新索引）
+  审计日志（记录所有写操作）
+  权限控制（请求前检查权限）
+  数据验证（写入前校验）
+
+示例：
+  协处理器在 Put 时自动更新二级索引表
+```
+
+### 10.3 Endpoint 协处理器
+
+```
+触发时机：
+  客户端主动调用
+
+使用场景：
+  服务端聚合（减少数据传输）
+  复杂计算（服务端执行）
+  自定义 API（封装业务逻辑）
+
+示例：
+  客户端调用 endpoint → 服务端计算聚合值 → 返回结果
+  避免全表扫描
+```
+
+### 10.4 协处理器配置
+
+```bash
+# 加载协处理器
+alter 'table_name', {NAME => 'cf', coprocessor => 'com.example.IndexObserver|1001|'}
+
+# 卸载协处理器
+alter 'table_name', {NAME => 'cf', coprocessor => ''}
+```
+
+---
+
+## 十一、HBase Bulk Load
+
+### 11.1 原理
+
+```mermaid
+graph TD
+    A[外部数据] --> B[生成 HFile]
+    B --> C[上传到 HDFS]
+    C --> D[CompleteBulkLoad]
+    D --> E[HFile 导入 Region]
+```
+
+### 11.2 使用场景
+
+| 场景 | 说明 |
+|------|------|
+| 大批量导入 | 百万/亿级数据导入 |
+| 数据迁移 | 从其他系统迁移数据 |
+| 定时批量更新 | 夜间批量更新数据 |
+
+### 11.3 Bulk Load 配置
+
+```java
+// MapReduce 生成 HFile
+Job job = Job.getInstance(conf);
+job.setMapperClass(MyMapper.class);
+job.setOutputKeyClass(ImmutableBytesWritable.class);
+job.setOutputValueClass(KeyValue.class);
+job.setOutputFormatClass(HFileOutputFormat2.class);
+
+// 导入 HFile
+LoadIncrementalHFile loader = new LoadIncrementalHFile(conf);
+loader.doBulkLoad(new Path("/hfiles"), table);
+```
+
+### 11.4 vs 正常写入
+
+| 维度 | 正常写入 | Bulk Load |
+|------|----------|-----------|
+| 速度 | 慢（WAL + MemStore） | 快（直接写 HFile） |
+| 资源 | 消耗 RegionServer IO | 消耗 MapReduce 资源 |
+| 副作用 | 可能触发 Compaction | 无 |
+| 适用 | 实时写入 | 批量导入 |
+
+---
+
+## 十二、HBase vs Cassandra vs Bigtable
+
+| 维度 | HBase | Cassandra | Bigtable |
+|------|-------|-----------|----------|
+| 一致性 | 强（CP） | 最终（AP） | 强（CP） |
+| 数据模型 | 列式（Bigtable） | 宽列 | 列式（Bigtable） |
+| 架构 | HDFS + Master | P2P（无中心） | Google 内部 |
+| 写优化 | LSM-Tree | LSM-Tree | LSM-Tree |
+| 读优化 | BloomFilter + BlockCache | 布隆过滤器 | BloomFilter |
+| 生态 | Hadoop | 独立 | Google Cloud |
+| 运维 | 复杂 | 中等 | 托管 |
+| 适用 | Hadoop 生态 | 多数据中心 | Google Cloud |
+
+**选型决策**：
+- Hadoop 生态 + 强一致 → HBase
+- 多数据中心 + 高可用 → Cassandra
+- Google Cloud → Bigtable
+
+---
+
+## 十三、HBase 时序数据场景
+
+### 13.1 时序数据特点
+
+```
+写入模式：
+  高吞吐顺序写（时间戳递增）
+  近期数据写入频繁
+  历史数据很少读取
+
+存储挑战：
+  数据量大（每天 TB 级）
+  需要高效写入
+  冷热数据分离
+```
+
+### 13.2 RowKey 设计
+
+```
+时序数据 RowKey：
+  metric_hash(deviceId) + reverseTimestamp
+
+示例：
+  原始数据：温度=25, 时间=2026-08-24 10:00:00
+  RowKey：md5("temperature")_md5("device1")_9999999999999999 - 时间戳
+
+倒序时间戳：
+  Long.MAX_VALUE - timestamp
+  → 最新数据排在最前（Scan 高效）
+```
+
+### 13.3 冷热分离
+
+```bash
+# 按时间分区（不同 CF）
+# 热数据 CF：最近 7 天
+# 冷数据 CF：7 天前
+
+# TTL 自动过期
+alter 'sensor_data', {NAME => 'hot', TTL => 604800}
+alter 'sensor_data', {NAME => 'cold', TTL => 7776000}
+```
+
+---
+
+## 十四、HBase 安全
+
+### 14.1 ACL 权限控制
+
+```bash
+# 授权
+grant 'user1', 'RWXCA', 'table_name'
+
+# 权限说明
+R - 读
+W - 写
+X - 执行
+C - 创建
+A - 管理
+
+# 查看权限
+user_access 'user1'
+```
+
+### 14.2 配置认证
+
+```xml
+<!-- 启用 Kerberos -->
+<property>
+  <name>hbase.security.authentication</name>
+  <value>kerberos</value>
+</property>
+<property>
+  <name>hbase.security.authorization</name>
+  <value>true</value>
+</property>
+```
+
+### 14.3 数据加密
+
+```xml
+<!-- 传输加密 -->
+<property>
+  <name>hbase.rpc.protection</name>
+  <value>privacy</value>
+</property>
+
+<!-- 存储加密 -->
+<property>
+  <name>hbase.crypto.key.provider</name>
+  <value>org.apache.hadoop.hbase.crypto.KeyProvider</value>
+</property>
+```
+
+### 14.4 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 启用 Kerberos | 集群认证 |
+| ACL 最小权限 | 按用户/表授权 |
+| RPC 加密 | 传输层加密 |
+| 审计日志 | 记录所有操作 |
+| 网络隔离 | VPC/防火墙 |
+
+---
+
+## 十五、与其他板块的关系
 
 - 大数据存储见「[基础知识/大数据](../大数据/README.md)」；
 - NoSQL 对比见「[MongoDB](./MongoDB.md)」；

@@ -366,7 +366,374 @@ flowchart LR
 - **组合打法**：日志/文档类"既要检索又要分析"——ES 做检索与交互式下钻，原始明细/指标落 ClickHouse 做 T+1 大报表；或 ES 承接在线探索、ClickHouse 承接离线宽表。经典链路：Kafka → ES（检索）+ ClickHouse（分析），MySQL 保交易源。
 - **何时选谁**：需要"关键词/分词/任意过滤/秒级可见"→ ES；需要"亿级固定维度聚合、SQL 分析、成本敏感"→ ClickHouse；两者都要就都上。
 
-## 六、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
+## 六、索引设计深度（时间序列 vs 非时间序列）
+
+### 6.1 时间序列索引设计
+
+```mermaid
+flowchart LR
+    A[写入] --> B[Hot Index<br/>logs-000001]
+    B -->|rollover| C[logs-000002]
+    C -->|ILM warm| D[Warm Node<br/>shrink+forcemerge]
+    D -->|ILM cold| E[Cold Node<br/>frozen/searchable snapshots]
+    E -->|ILM delete| F[Delete/Archive]
+```
+
+| 设计要素 | 推荐做法 | 说明 |
+|----------|----------|------|
+| 索引名 | `logs-{yyyy.MM.dd}` | 按天滚动，ILM 自动管理 |
+| 分片数 | 单分片 10~50GB | 日志索引 1~3 分片即可 |
+| 刷新间隔 | `30s` 或更大 | 日志场景实时性要求低 |
+| 副本数 | Hot=0, Warm=1 | 导入期 0 副本，完成后恢复 |
+| 生命周期 | ILM 策略自动滚动 | rollover + shrink + forcemerge + delete |
+
+**ILM 策略 YAML 完整示例**：
+
+```yaml
+# 日志索引 ILM 策略
+policy:
+  phases:
+    hot:
+      min_age: 0ms
+      actions:
+        rollover:
+          max_size: 30gb
+          max_age: 1d
+          max_docs: 100000000
+        set_priority: { priority: 100 }
+    warm:
+      min_age: 3d
+      actions:
+        shrink: { number_of_shards: 1 }
+        forcemerge: { max_num_segments: 1 }
+        set_priority: { priority: 50 }
+    cold:
+      min_age: 30d
+      actions:
+        freeze: {}
+        set_priority: { priority: 0 }
+    delete:
+      min_age: 90d
+      actions:
+        delete: {}
+```
+
+### 6.2 非时间序列索引设计
+
+| 场景 | 设计要点 | 示例 |
+|------|----------|------|
+| 商品搜索 | keyword+text 组合、`dynamic: strict` | `products` 索引 |
+| 用户画像 | 高基数字段用 keyword、关闭不需要的 doc_values | `user_profiles` 索引 |
+| 配置中心 | 小数据量、高读低写、长生命周期 | `configurations` 索引 |
+
+### 6.3 Mapping 爆炸预防
+
+```text
+Mapping 爆炸（Mapping Explosion）：
+- dynamic: true（默认）时，新字段自动加入 mapping
+- 高基数字段（userId、requestId）自动加字段 → mapping 数万 → 内存爆炸
+
+解决方案：
+1. dynamic: strict（拒绝未知字段）
+2. dynamic: runtime（运行时字段，不落存储，按需计算）
+3. 关闭不需要聚合/排序的字段的 doc_values
+```
+
+```json
+PUT /logs
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "timestamp": { "type": "date" },
+      "level": { "type": "keyword" },
+      "message": { "type": "text" },
+      "extra": {
+        "type": "object",
+        "dynamic": true
+      }
+    }
+  }
+}
+```
+
+## 七、Elasticsearch Ingest Pipelines
+
+Ingest Pipeline 在文档索引前做预处理，类似轻量 ETL：
+
+```json
+PUT _ingest/pipeline/logs-pipeline
+{
+  "processors": [
+    {
+      "set": {
+        "field": "ingest_time",
+        "value": "{{_ingest.timestamp}}"
+      }
+    },
+    {
+      "date": {
+        "field": "timestamp",
+        "formats": ["ISO8601", "yyyy-MM-dd HH:mm:ss"]
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": ["%{IP:client_ip} %{GREEDYDATA:request_path}"]
+      }
+    },
+    {
+      "geoip": {
+        "field": "client_ip",
+        "target_field": "geo"
+      }
+    },
+    {
+      "remove": {
+        "fields": ["raw_message"]
+      }
+    }
+  ]
+}
+
+# 使用 Pipeline
+PUT /logs/_doc/1?pipeline=logs-pipeline
+{ "message": "192.168.1.1 GET /api/users", "timestamp": "2025-01-01T00:00:00Z" }
+```
+
+**常用 Processor 对照表**：
+
+| Processor | 用途 | 典型场景 |
+|-----------|------|----------|
+| set | 设置字段值 | 添加固定字段、时间戳 |
+| date | 日期解析 | 统一时间格式 |
+| grok | 正则提取 | 解析日志格式 |
+| geoip | IP 地理位置 | 添加地理信息 |
+| user-agent | UA 解析 | 提取浏览器/OS 信息 |
+| remove | 删除字段 | 清理不需要的字段 |
+| rename | 重命名字段 | 统一字段命名 |
+| script | 自定义脚本 | 复杂转换逻辑 |
+| drop | 丢弃文档 | 过滤无效日志 |
+| fail | 验证失败 | 数据校验 |
+
+## 八、Runtime Fields（运行时字段）
+
+```text
+Runtime Fields = 不落存储、查询时动态计算的字段
+优势：节省存储空间、灵活添加字段无需 reindex
+劣势：查询时实时计算，性能比原生字段差
+```
+
+```json
+PUT /logs/_mapping
+{
+  "runtime": {
+    "response_time_ms": {
+      "type": "long",
+      "script": {
+        "source": "emit(doc['duration'].value * 1000)"
+      }
+    },
+    "full_url": {
+      "type": "keyword",
+      "script": {
+        "source": "emit(params._source.scheme + '://' + params._source.host + params._source.path)"
+      }
+    }
+  }
+}
+
+# 查询时使用
+GET /logs/_search
+{
+  "runtime_mappings": {
+    "is_error": {
+      "type": "boolean",
+      "script": {
+        "source": "emit(doc['status_code'].value >= 500)"
+      }
+    }
+  },
+  "query": { "term": { "is_error": true } }
+}
+```
+
+## 九、Elasticsearch SQL
+
+```sql
+-- 基础查询
+SELECT * FROM logs WHERE level = 'ERROR' ORDER BY timestamp DESC LIMIT 100
+
+-- 聚合
+SELECT level, COUNT(*) as cnt FROM logs GROUP BY level ORDER BY cnt DESC
+
+-- 时间聚合
+SELECT DATE_FORMAT(timestamp, 'yyyy-MM-dd HH:00') as hour, COUNT(*) as cnt
+FROM logs
+WHERE timestamp > NOW() - INTERVAL 1 DAY
+GROUP BY hour ORDER BY hour
+
+-- JOIN（ES 7.10+）
+SELECT o.order_id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id
+
+-- 子查询
+SELECT * FROM (
+  SELECT level, COUNT(*) as cnt FROM logs GROUP BY level
+) WHERE cnt > 1000
+```
+
+```bash
+# 通过 API 执行
+POST /_xpack/sql?format=txt
+{ "query": "SELECT * FROM logs WHERE level = 'ERROR' LIMIT 10" }
+
+# 转换为 DSL
+POST /_xpack/sql/translate
+{ "query": "SELECT * FROM logs WHERE level = 'ERROR'" }
+# 返回对应的 Elasticsearch DSL JSON
+```
+
+## 十、跨集群搜索（Cross-Cluster Search）
+
+```mermaid
+graph TB
+    subgraph "本地集群"
+        L1[Node 1]
+        L2[Node 2]
+    end
+    subgraph "远程集群 A"
+        R1[Node A1]
+        R2[Node A2]
+    end
+    subgraph "远程集群 B"
+        R3[Node B1]
+        R4[Node B2]
+    end
+    L1 -->|跨集群搜索| R1
+    L1 -->|跨集群搜索| R3
+```
+
+```yaml
+# elasticsearch.yml 配置
+# 本地集群配置远程集群
+cluster.remote.cluster_a.seeds: ["10.0.1.1:9300", "10.0.1.2:9300"]
+cluster.remote.cluster_a.transport.ping_connect_timeout: "30s"
+cluster.remote.cluster_b.seeds: ["10.0.2.1:9300"]
+```
+
+```bash
+# 跨集群查询
+GET /cluster_a:logs-*,cluster_b:logs-*/_search
+{
+  "query": { "match_all": {} }
+}
+
+# 跨集群聚合
+GET /cluster_a:logs-*/_search
+{
+  "size": 0,
+  "aggs": {
+    "by_cluster": {
+      "terms": { "field": "_index" }
+    }
+  }
+}
+```
+
+## 十一、Elasticsearch 作为向量存储
+
+```json
+# 创建向量索引
+PUT /vector_docs
+{
+  "mappings": {
+    "properties": {
+      "text": { "type": "text" },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 768,
+        "index": true,
+        "similarity": "cosine"
+      },
+      "metadata": { "type": "object", "enabled": false }
+    }
+  }
+}
+
+# 生成向量并索引（需先用模型生成 embedding）
+POST /vector_docs/_doc/1
+{
+  "text": "Spring Boot 自动配置原理",
+  "embedding": [0.1, 0.2, ... , 0.768个维度]
+}
+
+# kNN 向量搜索
+GET /vector_docs/_search
+{
+  "knn": {
+    "field": "embedding",
+    "query_vector": [0.1, 0.2, ...],
+    "k": 10,
+    "num_candidates": 100
+  },
+  "source": ["text", "metadata"]
+}
+
+# 混合搜索（向量 + 关键词）
+GET /vector_docs/_search
+{
+  "query": {
+    "match": { "text": "Spring Boot" }
+  },
+  "knn": {
+    "field": "embedding",
+    "query_vector": [...],
+    "k": 10,
+    "num_candidates": 100,
+    "boost": 0.5
+  }
+}
+```
+
+## 十二、性能测试方法论
+
+```text
+ES 压测流程：
+1. 准备阶段
+   - 固定变量：文档大小、数量、分片数、副本数
+   - 确定基线：单节点默认配置的吞吐与延迟
+   - 准备数据：bulk 导入，等待 refresh + flush 完成
+
+2. 压测阶段
+   - 写入压测：不同并发/batch size 的写入吞吐
+   - 查询压测：match/term/range/aggregation 的 QPS 与延迟
+   - 混合压测：写入+查询同时进行的资源竞争
+
+3. 分析阶段
+   - 吞吐指标：docs/s、search QPS
+   - 延迟指标：P50/P90/P99
+   - 资源指标：CPU/内存/IO/GC
+   - 稳定性：长时间运行是否性能衰减
+```
+
+| 测试工具 | 特点 | 适用场景 |
+|----------|------|----------|
+| esrally | 官方基准测试工具 | 版本对比、参数调优 |
+|自写 bulk 脚本 | 灵活定制 | 特定业务场景 |
+| JMeter + ES 插件 | 通用压测平台 | 混合场景 |
+
+**压测报告模板**：
+
+| 指标 | 默认配置 | 优化后 | 提升 |
+|------|----------|--------|------|
+| 写入吞吐 (docs/s) | - | - | - |
+| 查询 QPS (match) | - | - | - |
+| 查询 P99 延迟 (ms) | - | - | - |
+| CPU 使用率 (%) | - | - | - |
+| JVM GC 暂停 (ms) | - | - | - |
+
+## 十三、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
 
 - **集群变红（Red）**：`GET _cluster/health` 看 `status=red`（主分片未分配）。排查：`GET _cat/indices?v&health=red` 定位红索引；`GET _cluster/allocation/explain` 看分片未分配原因（最常见：磁盘水位、节点离线、分片数超限）。红通常意味着有主分片丢失、数据可能已损，优先恢复节点而非强制分配（强制分配空分片会丢数据）。
 - **脑裂（Split-Brain）**：两主并存、元数据冲突。成因：网络分区 + `minimum_master_nodes` 配错（7.x 后由奇数节点 + `cluster.initial_master_nodes` 自动仲裁，但仍需节点数为奇数）。SOP：① 确认真正的主（看 `_cat/nodes?v&h=node,node.role,master` 中 `*` 标记）；② 隔离/重启"假主"节点让其重新加入；③ 网络恢复后 `GET _cluster/health` 回到 green；④ 长期：节点数奇数、跨可用区部署 `discovery.seed_hosts`、加 `cluster.fault_detection.*` 调优心跳。

@@ -113,7 +113,377 @@ Pulsar 一个 topic 支持多种订阅，灵活兼顾「队列」和「流」：
 
 ---
 
-## 七、与其他板块的关系
+## 七、Pulsar 分层存储（Tiered Storage）
+
+### 7.1 架构原理
+
+```mermaid
+graph LR
+    P[Producer] --> B[Broker]
+    B --> BK[BookKeeper 热数据]
+    BK -->|冷数据卸载| S3[S3/OSS/GCS]
+    C[Consumer] --> B
+    B -->|热数据读| BK
+    B -->|冷数据读| S3
+```
+
+### 7.2 分层存储配置
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `managedLedgerMaxSizeNoLedgerSwitch` | 触发 Ledger 切换的大小 | 10GB |
+| `offloadThreshold` | 触发卸载的消息积压时间 | 14400s（4h） |
+| `offloadDeletionLagMs` | 卸载后删除 BookKeeper 数据的延迟 | 14400s |
+| `tieredStorageMaxFileSize` | 单文件最大大小 | 512MB |
+
+### 7.3 分层存储工作流
+
+```
+写入流程：
+  Producer → Broker → BookKeeper（热存储）
+
+冷数据卸载（异步）：
+  Ledger 不活跃 → 达到阈值 → 异步上传到 S3
+  → BookKeeper 标记为已卸载
+
+读取流程：
+  Consumer → Broker → 检查本地/远程
+    → 热数据：直接从 BookKeeper 读
+    → 冷数据：从 S3 读取（延迟略高）
+
+延迟消息存储：
+  延迟消息暂存 BookKeeper → 时间到达后投递
+  → 长延迟（天级）可卸载到 S3 节省成本
+```
+
+### 7.4 适用场景
+
+| 场景 | 说明 |
+|------|------|
+| 长周期回溯 | 消息保留 30 天/90 天/1年 |
+| 合规审计 | 法规要求长期保留事件日志 |
+| 成本优化 | 冷数据降本 70%+ |
+| 延迟消息 | 长延迟消息卸载到 S3 |
+
+---
+
+## 八、Pulsar Functions
+
+### 8.1 架构
+
+```mermaid
+graph LR
+    A[Topic Input] --> B[Function Worker]
+    B --> C[User Function]
+    C --> D[Topic Output]
+    B --> E[本地状态存储]
+```
+
+### 8.2 Function 类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| Producer Function | 消息生成/转换 | 数据增强/格式转换 |
+| Consumer Function | 消息消费/处理 | 实时统计/过滤 |
+| Window Function | 窗口聚合 | 滑动窗口计数 |
+
+### 8.3 Function 示例
+
+```java
+// Java Function
+public class ExclamationFunction implements Function<String> {
+    @Override
+    public void process(Record<String> record) {
+        String value = record.getValue();
+        // 处理逻辑
+    }
+}
+
+// 部署命令
+pulsar-admin functions create \
+  --jar my-function.jar \
+  --classname com.example.ExclamationFunction \
+  --tenant public --namespace default \
+  --name my-function \
+  --input-topic input-topic \
+  --output-topic output-topic
+```
+
+### 8.4 vs 外部流处理
+
+| 维度 | Pulsar Functions | Flink |
+|------|------------------|-------|
+| 部署 | 无独立集群 | 独立集群 |
+| 复杂度 | 简单转换/聚合 | 复杂流处理 |
+| 状态 | 有限本地状态 | RocksDB 大状态 |
+| 延迟 | 毫秒 | 毫秒 |
+| 适用 | 轻量 ETL/过滤 | 复杂事件处理 |
+
+---
+
+## 九、Pulsar IO Connectors
+
+### 9.1 内置连接器
+
+| 连接器 | 方向 | 说明 |
+|--------|------|------|
+| Kafka Source/Sink | 双向 | Kafka 互操作 |
+| JDBC Source/Sink | 双向 | MySQL/PG 等 |
+| Elasticsearch Sink | 输出 | 实时写入 ES |
+| MongoDB Sink | 输出 | 写入 MongoDB |
+| Cassandra Sink | 输出 | 写入 Cassandra |
+| HDFS Sink | 输出 | 写入 HDFS |
+| AWS S3 Sink | 输出 | 写入 S3 |
+| Google Cloud Storage Sink | 输出 | 写入 GCS |
+| Twitter Firehose Source | 输入 | Twitter 流 |
+| Splunk Sink | 输出 | 写入 Splunk |
+
+### 9.2 连接器配置示例
+
+```properties
+# JDBC Sink 示例
+configs:
+  jdbcUrl: "jdbc:mysql://localhost:3306/db"
+  tableName: "orders"
+  userName: "root"
+  password: "secret"
+  batchSize: 100
+```
+
+### 9.3 自定义连接器开发
+
+```
+实现接口：
+  SourceConnector / SinkConnector（Kafka Connect 兼容）
+
+步骤：
+  1. 实现 Connector 接口
+  2. 实现 Task 接口
+  3. 打包为 NAR 文件
+  4. 通过 pulsar-admin 管理
+
+优势：
+  复用 Kafka Connect 生态（大量现成 Connector）
+```
+
+---
+
+## 十、Pulsar 跨地域复制（Geo-replication）
+
+### 10.1 架构
+
+```mermaid
+graph LR
+    subgraph 北京集群
+        B1[Broker] --> BK1[BookKeeper]
+    end
+    subgraph 上海集群
+        B2[Broker] --> BK2[BookKeeper]
+    end
+    B1 -->|异步复制| B2
+    B2 -->|异步复制| B1
+    C1[Producer] --> B1
+    C2[Consumer] --> B2
+```
+
+### 10.2 配置示例
+
+```bash
+# 创建集群
+pulsar-admin clusters create cluster-bj --url http://bj:8080
+pulsar-admin clusters create cluster-sh --url http://sh:8080
+
+# 创建租户并配置跨地域
+pulsar-admin tenants create my-tenant \
+  --allowed-clusters cluster-bj,cluster-sh
+
+# 配置 Namespace 复制策略
+pulsar-admin namespaces set-clusters my-tenant/my-ns \
+  --clusters cluster-bj,cluster-sh
+
+# 设置复制消息的延迟
+pulsar-admin namespaces set-retention my-tenant/my-ns \
+  --size -1 --time 168h
+```
+
+### 10.3 复制模式
+
+| 模式 | 说明 | 延迟 |
+|------|------|------|
+| 异步复制 | 默认，最终一致 | 秒级 |
+| 同步复制 | 写入多个集群后才确认 | 高（跨地域） |
+
+### 10.4 故障转移
+
+```
+区域故障处理：
+  Broker 感知目标集群不可用 → 消息暂存本地
+  目标集群恢复 → 自动重新复制
+
+客户端自动切换：
+  Pulsar Client 支持多集群配置
+  当前集群不可用 → 自动切换到健康集群
+  消费进度（Cursor）独立存储，不丢失
+```
+
+---
+
+## 十一、BookKeeper 内部机制
+
+### 11.1 数据写入流程
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    participant BK as Bookie
+    P->>B: 发送消息
+    B->>BK: 写入 Journal（WAL）
+    BK->>BK: Journal 持久化
+    B->>BK: 写入 Entry Log（数据）
+    BK->>BK: 索引更新
+    BK-->>B: Ack Quorum 确认
+    B-->>P: 返回 Ack
+```
+
+### 11.2 Ledger 管理
+
+| 概念 | 说明 |
+|------|------|
+| Ledger | append-only 日志段，单写者 |
+| Entry | Ledger 中的单条记录 |
+| Ensemble | 写入 Ledger 时使用的 Bookie 集合 |
+| Write Quorum | 写入副本数 |
+| Ack Quorum | 需要确认的 Bookie 数 |
+
+### 11.3 Journal 与 Entry Log
+
+```
+Journal（WAL）：
+  每个 Bookie 一个 Journal 目录
+  写入先持久化 Journal（保证持久性）
+  Journal 文件按时间滚动
+
+Entry Log：
+  多个 Ledger 的数据合并存储
+  单个 Entry Log 文件可能包含多个 Ledger 的数据
+  减少文件数量，提升写入吞吐
+```
+
+### 11.4 读取路径
+
+```
+读取流程：
+  Broker 收到读请求 → 查找 Ledger 所在 Bookie
+  → 读取 Entry Log + 索引 → 返回数据
+
+读取优化：
+  Ledger 缓存（Broker 侧缓存 Ledger 元数据）
+  热数据缓存（Bookie 侧缓存热点 Entry）
+```
+
+---
+
+## 十二、Pulsar Schema Registry
+
+### 12.1 Schema 类型
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| String | 纯字符串 | 简单场景 |
+| JSON | JSON 格式 | 通用 |
+| Avro | 二进制序列化 | 高性能 |
+| Protobuf | Google 协议缓冲 | 跨语言 |
+| Bytes | 原始字节 | 自定义序列化 |
+
+### 12.2 Schema 演进策略
+
+```bash
+# 创建 Topic 并指定 Schema
+pulsar-admin schemas upload my-topic \
+  --schema-file schema.avsc \
+  --type AVRO
+
+# Schema 兼容性策略
+pulsar-admin namespaces set-clusters my-tenant/my-ns \
+  --clusters cluster-bj
+
+# 兼容性类型
+BACKWARD    # 新 Schema 可读旧数据
+FORWARD     # 旧 Schema 可读新数据
+FULL        # 双向兼容
+```
+
+### 12.3 Schema 注册流程
+
+```
+生产者发送消息：
+  1. 检查 Topic 是否有 Schema
+  2. 无 Schema → 自动注册（首次）
+  3. 有 Schema → 检查兼容性
+  4. 兼容 → 写入消息
+  5. 不兼容 → 拒绝（抛异常）
+
+消费者接收消息：
+  1. 读取消息
+  2. 根据 Schema 反序列化
+  3. 类型不匹配 → 抛异常
+```
+
+---
+
+## 十三、Pulsar 多租户实践
+
+### 13.1 三级隔离模型
+
+```mermaid
+graph TB
+    T[Tenant 租户] --> NS1[Namespace 1]
+    T --> NS2[Namespace 2]
+    NS1 --> T1[Topic 1]
+    NS1 --> T2[Topic 2]
+    NS2 --> T3[Topic 3]
+    NS2 --> T4[Topic 4]
+```
+
+### 13.2 配额管理
+
+| 资源 | 配置项 | 说明 |
+|------|--------|------|
+| 带宽 | `dispatchThrottlingRateInMsg` | 消息发送/消费速率 |
+| 存储 | `maxSize` | 命名空间最大存储 |
+| Topic 数 | `maxTopicsPerNamespace` | 每个 Namespace 最大 Topic 数 |
+| 租户存储 | `storageQuotaInMB` | 租户级存储上限 |
+
+### 13.3 多租户隔离策略
+
+```bash
+# 租户级隔离
+pulsar-admin tenants create team-a \
+  --allowed-clusters cluster-bj
+
+# Namespace 级配额
+pulsar-admin namespaces set-retention team-a/orders \
+  --size 10GB --time 168h
+
+# Topic 级限流
+pulsar-admin topics set-dispatch-rate team-a/orders \
+  --msg-rate 10000 --byte-rate 10485760
+```
+
+### 13.4 多租户最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 按团队隔离 Namespace | 每个团队独立 Namespace |
+| 设置存储配额 | 防止单租户耗尽资源 |
+| 监控租户指标 | 消息速率/延迟/存储 |
+| 网络策略 | VPC/网络隔离 |
+| 认证授权 | JWT/OAuth2 多租户认证 |
+
+---
+
+## 十四、与其他板块的关系
 
 - 与 [RabbitMQ](RabbitMQ.md)、[消息队列 MQ](../MQ.md)、[MQTT](MQTT与消息broker.md)：同属消息家族。Pulsar 是「云原生统一消息流」，RabbitMQ 是「业务路由」，MQTT 是「设备协议」。
 - 与 [注册中心与配置中心](注册中心与配置中心.md)：Pulsar 自带元数据层，不依赖外部注册中心。

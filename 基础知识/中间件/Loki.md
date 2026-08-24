@@ -359,6 +359,476 @@ Loki 自身支持告警：
 
 ---
 
+## 十二、Loki 架构深入（Ingester/Distributor/Querier）
+
+### 12.1 核心组件职责
+
+```mermaid
+flowchart TD
+    A[Promtail<br/>采集器] -->|push| B[Distributor<br/>入口/校验/路由]
+    B -->|哈希路由| C[Ingester<br/>内存Chunk写入]
+    B -->|哈希路由| D[Ingester<br/>副本写入]
+    C -->|flush| E[对象存储<br/>S3/MinIO]
+    D -->|flush| E
+    F[Querier<br/>查询引擎] -->|读取| E
+    G[Compactor<br/>合并/清理] -->|优化| E
+    H[Ruler<br/>告警规则] -->|LogQL| F
+```
+
+### 12.2 Distributor 详解
+
+```
+Distributor 职责：
+  1. 接收 Promtail/Fluent Bit 推送的日志
+  2. 校验日志格式（标签合法/时间戳合理）
+  3. 按标签哈希路由到指定 Ingester
+  4. 去重（相同 Stream 的重复日志）
+  5. 限流（per_stream_rate_limit）
+
+路由策略：
+  标签哈希 → 确保相同 Stream 到同一 Ingester
+  → 保证 Chunk 的完整性
+
+副本写入：
+  3 副本写入不同 Ingester
+  → 防止单节点故障丢数据
+```
+
+### 12.3 Ingester 详解
+
+```
+Ingester 职责：
+  1. 日志追加到内存 Chunk（按 Stream 组织）
+  2. Chunk 达到阈值 → 压缩 → flush 到对象存储
+  3. 维护索引（标签 → Chunk 映射）
+  4. 处理查询（返回内存中未 flush 的数据）
+
+Chunk 生命周期：
+  新建 → 追加日志 → 达到阈值 → 压缩 → flush 到存储
+  阈值：chunk_target_size(1.5MB) / max_chunk_age(2h) / chunk_idle_period(30m)
+
+内存管理：
+  chunks_in_memory 监控
+  OOM 风险：高并发写入 + 大 Chunk → 内存打满
+  对策：限制并发流数量 / 调小 Chunk / 扩容
+```
+
+### 12.4 Querier 详解
+
+```
+Querier 职责：
+  1. 解析 LogQL 查询语句
+  2. 按标签选择器查索引 → 定位 Chunk
+  3. 从对象存储拉取 Chunk
+  4. 解压 + 内容过滤（正则/子串）
+  5. 返回结果
+
+查询优化：
+  标签定位（快）→ Chunk 缓存（中等）→ 内容过滤（慢）
+  
+  缓存策略：
+    chunk 缓存（已解压的 Chunk 缓存到内存）
+    索引缓存（标签 → Chunk 映射缓存）
+    查询结果缓存（相同查询复用）
+```
+
+---
+
+## 十三、Loki 无索引设计（Index-Free）
+
+### 13.1 设计原理
+
+```
+传统日志系统（ELK）：
+  全文索引（倒排索引）
+  每个字段都建索引
+  索引体积 ≈ 数据体积的 10~30%
+  → 索引占用大量 CPU/内存/磁盘
+
+Loki 设计：
+  只索引 标签（labels）→ Stream 的映射
+  不索引日志内容
+  索引体积 ≈ 数据体积的 1~5%
+  → 索引极小，存储成本极低
+
+查询方式：
+  标签定位（秒级，查索引）
+  → 找到 Stream 对应的 Chunk
+  → 读取 Chunk（对象存储）
+  → 内容过滤（正则/子串，逐行扫描）
+```
+
+### 13.2 优劣对比
+
+| 维度 | Loki（无索引） | ELK（全文索引） |
+|------|---------------|----------------|
+| 存储成本 | 低（对象存储） | 高（索引+副本） |
+| 索引大小 | 极小（标签映射） | 大（全文倒排） |
+| 查询灵活性 | 标签+内容过滤 | 全文检索（最强） |
+| 查询延迟 | 标签查询快，内容过滤慢 | 全文检索快 |
+| 写入性能 | 高（无索引开销） | 中（需建索引） |
+| 运维复杂度 | 低 | 高（ES 集群） |
+
+### 13.3 最佳实践
+
+```
+标签设计（低成本关键）：
+  好的标签（低基数）：
+    namespace / pod / container / service / level / env
+    → 每个标签值组合形成一个 Stream
+    → 数千~数万个 Stream
+
+  坏的标签（高基数）：
+    request_id / user_id / ip / 随机值
+    → 每个值一个 Stream → 数百万 Stream → 索引爆炸！
+
+查询优化：
+  尽量用标签缩小范围（先标签后过滤）
+  避免无标签的全文搜索（全量扫描）
+  合理设置查询时间范围（避免大范围扫描）
+```
+
+---
+
+## 十四、LogQL 深入
+
+### 14.1 高级查询语法
+
+```promql
+# 日志流选择器
+{app="order", env="prod"}              # 精确匹配
+{app=~"order|user"}                    # 正则匹配
+{app="order"} !~ "heartbeat"           # 正则排除
+
+# 管道操作（按顺序执行）
+{app="order"}
+  |= "ERROR"                           # 包含子串
+  | json                                # 解析 JSON
+  | level="error"                       # 字段过滤
+  | line_format "{{.timestamp}} {{.msg}}"  # 格式化输出
+  | label_format status="{{.code}}"     # 标签重命名
+
+# 解析器
+| logfmt                               # logfmt 格式
+| json                                 # JSON 格式
+| regexp "(?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)"  # 正则提取
+| pattern "<ip> - - [<ts>] "<method> <path> <status> <size>""  # 模式解析
+```
+
+### 14.2 聚合操作
+
+```promql
+# 错误率（每秒错误数）
+sum(rate({app="order"} |= "ERROR" [5m]))
+
+# 按服务统计错误数
+sum by (app) (count_over_time({app=~".*"} |= "ERROR" [5m]))
+
+# Top 5 错误日志最多的 Pod
+topk(5, sum by (pod) (count_over_time({app="order"} |= "ERROR" [5m])))
+
+# 日志量趋势（每分钟）
+sum(rate({app="order"} [1m])) * 60
+
+# 延迟分位数（从日志中提取数值）
+quantile_over_time(0.99,
+  {app="order"} | json | unwrap duration_ms [5m]
+) > 1000
+
+# 错误日志占比
+sum(rate({app="order"} |= "ERROR" [5m]))
+/
+sum(rate({app="order"} [5m]))
+```
+
+### 14.3 LogQL 常用函数
+
+| 函数 | 用途 | 示例 |
+|------|------|------|
+| rate | 每秒速率 | rate({app="order"} [5m]) |
+| count_over_time | 时间窗口计数 | count_over_time({app="order"} [5m]) |
+| sum by | 按标签聚合求和 | sum by (app) (rate(...)) |
+| topk | Top N | topk(5, sum by (app) (...)) |
+| unwrap | 提取数值做指标 | unwrap duration_ms |
+| quantile_over_time | 分位数 | quantile_over_time(0.99, ...) |
+| line_format | 格式化输出 | line_format "{{.msg}}" |
+| label_format | 标签名重命名 | label_format app="{{.service}}" |
+
+---
+
+## 十五、Loki in Kubernetes
+
+### 15.1 部署架构
+
+```
+K8s 集群：
+  DaemonSet: Promtail/Fluent Bit（每节点一个采集器）
+  Deployment: Loki Distributor（入口）
+  StatefulSet: Loki Ingester（写入，3 副本）
+  Deployment: Loki Querier（查询）
+  Deployment: Loki Compactor（合并清理）
+  ConfigMap: Loki 配置
+  PVC: 对象存储（S3/MinIO）
+
+  Grafana: 查询界面
+```
+
+### 15.2 Promtail DaemonSet 配置
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+spec:
+  template:
+    spec:
+      serviceAccountName: promtail
+      containers:
+      - name: promtail
+        image: grafana/promtail:2.9.0
+        args:
+        - -config.file=/etc/promtail/promtail.yaml
+        volumeMounts:
+        - name: config
+          mountPath: /etc/promtail
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: containers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: promtail-config
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: containers
+        hostPath:
+          path: /var/lib/docker/containers
+```
+
+### 15.3 K8s 日志标签自动发现
+
+```yaml
+# promtail-config.yaml
+scrape_configs:
+- job_name: kubernetes-pods
+  kubernetes_sd_configs:
+  - role: pod
+  relabel_configs:
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  - source_labels: [__meta_kubernetes_pod_name]
+    target_label: pod
+  - source_labels: [__meta_kubernetes_pod_container_name]
+    target_label: container
+  - source_labels: [__meta_kubernetes_pod_label_app]
+    target_label: app
+  - action: replace
+    source_labels: [__meta_kubernetes_pod_label_env]
+    target_label: env
+    replacement: production
+```
+
+---
+
+## 十六、Loki vs ELK 全面对比
+
+| 维度 | Loki | ELK |
+|------|------|-----|
+| 索引策略 | 只索引标签（1~5%） | 全文索引（10~30%） |
+| 存储成本 | 低（对象存储） | 高（ES 集群+副本） |
+| 查询能力 | 标签+内容过滤 | 全文检索+聚合 |
+| 写入性能 | 高（无索引开销） | 中（建索引） |
+| 运维复杂度 | 低（Grafana 一套） | 高（ES 集群运维） |
+| 生态集成 | Prometheus/Grafana 一体 | Kibana 强大 |
+| 多租户 | 原生支持 | 需额外配置 |
+| 实时性 | 秒级 | 秒级 |
+| 扩展性 | 水平扩展（对象存储） | 水平扩展（ES 集群） |
+| 学习曲线 | 低 | 中高 |
+
+**选型决策**：
+
+| 场景 | 首选 | 理由 |
+|------|------|------|
+| 成本敏感 + Grafana 生态 | Loki | 存储成本低，与 Prometheus 一体 |
+| 复杂全文检索（安全/审计） | ELK | 全文索引能力强 |
+| 云原生 K8s 日志 | Loki | 轻量，K8s 集成好 |
+| 日志做分析报表 | ClickHouse | 分析型查询强 |
+| 无运维能力 | 云日志服务 | 托管免运维 |
+
+---
+
+## 十七、Loki 存储后端
+
+### 17.1 存储选项
+
+| 存储后端 | 说明 | 适用 |
+|---------|------|------|
+| BoltDB-shipper | 本地 BoltDB + 对象存储 | 中小规模 |
+| AWS S3 | Amazon S3 | 大规模/云上 |
+| GCS | Google Cloud Storage | GCP 环境 |
+| Azure Blob | Azure Blob Storage | Azure 环境 |
+| MinIO | S3 兼容对象存储 | 自建/测试 |
+|/filesystem | 本地文件系统 | 单机/开发 |
+
+### 17.2 BoltDB-shipper 架构
+
+```
+BoltDB-shipper 架构：
+  Ingester → BoltDB（本地索引）
+    → 定期上传到对象存储
+  Querier → 从对象存储下载 BoltDB 快照
+    → 合并查询
+
+优势：
+  索引在本地（查询快）
+  对象存储存原始数据（成本低）
+  无需独立索引服务
+
+劣势：
+  查询需下载索引（冷启动慢）
+  多节点索引一致性（最终一致）
+```
+
+### 17.3 存储配置示例
+
+```yaml
+# loki.yaml
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+    shared_store: s3
+
+  aws:
+    s3: s3://access_key:secret_key@endpoint/bucket-name
+    s3forcepathstyle: true
+
+  filesystem:
+    directory: /loki/chunks
+
+chunk_store_config:
+  chunk_cache_config:
+    embedded_cache:
+      enabled: true
+      max_size_mb: 100
+
+schema_config:
+  configs:
+  - from: "2024-01-01"
+    store: boltdb-shipper
+    object_store: s3
+    schema: v11
+    index:
+      prefix: index_
+      period: 24h
+```
+
+---
+
+## 十八、Loki Ruler 告警
+
+### 18.1 告警规则配置
+
+```yaml
+# ruler.yaml
+groups:
+- name: error-alerts
+  rules:
+  - alert: HighErrorRate
+    expr: sum(rate({app="order"} |= "ERROR" [5m])) > 10
+    for: 5m
+    labels:
+      severity: critical
+      team: backend
+    annotations:
+      summary: "订单服务错误率过高"
+      description: "过去 5 分钟错误率 {{ $value }}/s"
+
+  - alert: LogVolumeSpike
+    expr: sum(rate({app="order"} [5m])) > 1000
+    for: 3m
+    labels:
+      severity: warning
+    annotations:
+      summary: "日志量突增"
+      description: "日志量 {{ $value }}/s，可能是异常"
+```
+
+### 18.2 告警通知路由
+
+```
+Loki Ruler → Alertmanager → 通知渠道
+  ├── Slack（即时通知）
+  ├── 钉钉（国内常用）
+  ├── 邮件（正式记录）
+  ├── PagerDuty（on-call）
+  └── Webhook（自定义）
+
+Alertmanager 路由：
+  severity: critical → 即时通知（Slack/电话）
+  severity: warning → 延迟通知（邮件）
+  severity: info → 仅记录
+```
+
+---
+
+## 十九、Loki 性能调优
+
+### 19.1 写入优化
+
+| 方向 | 优化 |
+|------|------|
+| 分布式部署 | Distributor/Ingester 水平扩容 |
+| 压缩 | 启用 snappy 压缩 |
+| 批量推送 | Promtail batch_size 调大 |
+| 限流 | per_stream_rate_limit 限制高基数流 |
+| 标签规范 | 避免高基数标签 |
+
+### 19.2 查询优化
+
+| 方向 | 优化 |
+|------|------|
+| 缓存 | 启用 chunk 缓存 + 索引缓存 |
+| Querier 扩容 | 水平扩展 Querier |
+| 查询范围 | 限制最大查询时间范围 |
+| 标签基数 | 降低标签基数 |
+| 并行查询 | 开启并行查询（querier.parallelise_shardable_queries） |
+
+### 19.3 容量规划
+
+```
+存储估算：
+  日增量 × 压缩比 ≈ 实际存储
+  示例：100GB/天 × 0.25 = 25GB/天
+  30 天 = 750GB
+
+内存估算：
+  Ingester：并发流数 × chunk 大小
+  Querier：查询并发数 × 结果集大小
+  Distributor：相对轻量
+
+CPU 估算：
+  写入：主要在 Ingester（压缩）
+  查询：主要在 Querier（过滤/聚合）
+```
+
+### 19.4 常见性能问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 写入延迟高 | Ingester 瓶颈 | 扩容 Ingester / 降低写入速率 |
+| 查询超时 | 大范围查询 | 缩小时间范围 / 增加标签过滤 |
+| 内存 OOM | 高基数标签 / 大查询 | 限制标签基数 / 查询超时设置 |
+| Chunk 碎片 | 小 Stream 多 | 合并小 Chunk / 调整 chunk 参数 |
+| 对象存储延迟 | 网络/存储性能 | 使用 SSD / 就近部署 |
+
+---
+
 ## 十一、与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；

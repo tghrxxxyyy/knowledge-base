@@ -184,7 +184,381 @@ TaskManager（Worker）
 
 ---
 
-## 八、与其他板块的关系
+## 八、Flink State Backend 深入
+
+### 8.1 HashMapStateBackend
+
+```
+存储位置：TaskManager JVM 堆内存
+数据结构：ConcurrentHashMap<Key, Value>
+
+优点：
+  读写最快（纯内存操作）
+  Checkpoint 直接序列化到外部存储
+
+缺点：
+  受 JVM 堆大小限制（GB 级）
+  GC 压力大（大状态时 Full GC 频繁）
+  不支持 Incremental Checkpoint
+
+适用场景：
+  状态较小（< 几 GB）
+  开发测试环境
+  低延迟要求极高
+```
+
+### 8.2 RocksDBStateBackend
+
+```
+存储位置：TaskManager 本地磁盘（嵌入式 RocksDB）
+数据结构：LSM-Tree（有序持久化存储）
+
+优点：
+  支持超大状态（TB 级）
+  支持 Incremental Checkpoint（增量快照）
+  状态大小不受 JVM 堆限制
+
+缺点：
+  读写比内存慢（涉及磁盘 IO）
+  序列化/反序列化开销
+
+适用场景：
+  生产环境首选（状态 > 几 GB）
+  需要增量 Checkpoint
+  超大状态场景
+```
+
+### 8.3 状态后端选型对比
+
+| 维度 | HashMapStateBackend | RocksDBStateBackend |
+|------|---------------------|---------------------|
+| 存储 | JVM 堆内存 | 本地磁盘（LSM-Tree） |
+| 速度 | 最快 | 慢（磁盘 IO） |
+| 状态大小 | 受堆限制（GB） | TB 级 |
+| Incremental Checkpoint | 不支持 | 支持 |
+| GC 压力 | 大（大状态） | 小（数据在堆外） |
+| 生产推荐 | 小状态/调试 | 生产首选 |
+
+### 8.4 状态后端配置
+
+```java
+// HashMapStateBackend
+env.setStateBackend(new HashMapStateBackend());
+env.getCheckpointConfig().setCheckpointStorage("hdfs:///flink/checkpoints");
+
+// RocksDBStateBackend（生产推荐）
+RocksDBStateBackend rocksDB = new RocksDBStateBackend("hdfs:///flink/checkpoints", true);
+env.setStateBackend(rocksDB);
+```
+
+---
+
+## 九、Flink Checkpoint 深入
+
+### 9.1 Checkpoint 执行流程
+
+```mermaid
+sequenceDiagram
+    participant JM as JobManager
+    participant S1 as Source
+    participant O1 as Operator
+    participant S2 as Sink
+    JM->>S1: 触发 Checkpoint (注入 Barrier)
+    S1->>S1: 本地状态快照
+    S1->>O1: Barrier 向下游传播
+    O1->>O1: 等待所有输入 Barrier 到齐
+    O1->>O1: 本地状态快照
+    O1->>S2: Barrier 向下游传播
+    S2->>S2: 本地状态快照
+    S2->>JM: Checkpoint 完成确认
+    JM->>JM: 元数据持久化
+```
+
+### 9.2 Checkpoint 关键配置
+
+| 配置项 | 默认值 | 建议值 | 说明 |
+|--------|--------|--------|------|
+| `execution.checkpointing.interval` | 无 | 60000（1分钟） | Checkpoint 间隔 |
+| `execution.checkpointing.mode` | EXACTLY_ONCE | EXACTLY_ONCE | 语义保证 |
+| `execution.checkpointing.timeout` | 600000 | 600000 | 单次 Checkpoint 超时 |
+| `execution.checkpointing.min-pause` | 500000 | 60000 | 两次 Checkpoint 最小间隔 |
+| `execution.checkpointing.max-concurrent` | 1 | 1 | 并发 Checkpoint 数 |
+| `state.backend.incremental` | false | true（RocksDB） | 增量快照 |
+| `state.backend.rocksdb.memory.managed` | true | true | RocksDB 堆外内存管理 |
+
+### 9.3 Checkpoint 失败常见原因
+
+| 失败类型 | 原因 | 解决方案 |
+|----------|------|----------|
+| 超时 | 状态过大/网络慢 | 增大 timeout / 使用增量 Checkpoint |
+| Barriers 对齐慢 | 反压/数据倾斜 | 解决反压 / 非对齐 Checkpoint |
+| 外部存储失败 | HDFS/S3 不可用 | 检查存储系统健康 |
+| Task 失败 | OOM/异常 | 调整内存 / 排查代码 |
+| Checkpoint 过旧 | 频繁失败 | 检查重启策略 |
+
+### 9.4 Unaligned Checkpoint（非对齐 Checkpoint）
+
+```
+传统对齐 Checkpoint：
+  Barrier 必须对齐（等待所有输入到齐）
+  反压时 Barrier 排队 → Checkpoint 超时
+
+非对齐 Checkpoint（Flink 1.11+）：
+  Barrier 不等待对齐，直接快照当前状态
+  反压场景下 Checkpoint 不会超时
+  代价：Checkpoint 数据量更大
+
+适用场景：
+  反压严重的复杂拓扑
+  需要快速恢复的场景
+```
+
+---
+
+## 十、Flink Window 内部机制
+
+### 10.1 Window 分配器（Window Assigner）
+
+| 分配器 | 说明 | 触发时机 |
+|--------|------|----------|
+| TumblingEventTimeWindows | 事件时间滚动窗口 | Watermark ≥ 窗口结束时间 |
+| TumblingProcessingTimeWindows | 处理时间滚动窗口 | 系统时间到达 |
+| SlidingEventTimeWindows | 事件时间滑动窗口 | 同上 |
+| EventTimeSessionWindows | 事件时间会话窗口 | 间隔超时触发 |
+| GlobalWindows | 全局窗口 | 自定义触发器 |
+
+### 10.2 Window 触发器（Trigger）
+
+| 触发器 | 说明 |
+|--------|------|
+| EventTimeTrigger | Watermark 到达触发 |
+| ProcessingTimeTrigger | 处理时间到达触发 |
+| CountTrigger | 计数达到阈值触发 |
+| PurgingTrigger | 触发后清空窗口内容 |
+| ContinuousEventTimeTrigger | 周期性事件时间触发 |
+
+### 10.3 Window Function 类型
+
+```java
+// ReduceFunction（增量聚合，窗口内只保留聚合值）
+window.reduce((a, b) -> a + b);
+
+// AggregateFunction（增量聚合，更灵活）
+window.aggregate(new AggregateFunction<Integer, Long, Long>() {
+    public Long createAccumulator() { return 0L; }
+    public Long add(Integer v, Long acc) { return acc + v; }
+    public Long getResult(Long acc) { return acc; }
+    public Long merge(Long a, Long b) { return a + b; }
+});
+
+// ProcessWindowFunction（全量处理，可访问窗口上下文）
+window.process(new ProcessWindowFunction<Integer, String, String, TimeWindow>() {
+    public void process(String key, Context ctx, Iterable<Integer> elements, Collector<String> out) {
+        // elements 包含窗口内所有元素
+    }
+});
+```
+
+---
+
+## 十一、Flink CDC Connector
+
+### 11.1 Flink CDC 架构
+
+```mermaid
+graph LR
+    A[MySQL/PG] -->|binlog/WAL| B[Flink CDC Source]
+    B --> C[Flink Processing]
+    C --> D[Sink: Kafka/ES/Hive]
+    E[Debezium Engine] -.嵌入.-> B
+```
+
+### 11.2 Flink CDC 与 Debezium 关系
+
+| 维度 | Flink CDC | Debezium |
+|------|-----------|----------|
+| 内核 | Debezium（嵌入式） | 独立 Kafka Connect |
+| 输出 | Flink DataStream/SQL | Kafka |
+| 部署 | Flink 集群 | Kafka Connect 集群 |
+| SQL 支持 | Flink SQL 原生 | 需 Flink 二次消费 |
+| 适用 | 实时数仓 SQL 管道 | Kafka 事件流 |
+
+### 11.3 Flink CDC SQL 示例
+
+```sql
+CREATE TABLE mysql_cdc (
+  id BIGINT,
+  name STRING,
+  amount DECIMAL(10,2),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'mysql-cdc',
+  'hostname' = 'localhost',
+  'port' = '3306',
+  'username' = 'root',
+  'password' = 'secret',
+  'database-name' = 'shop',
+  'table-name' = 'orders'
+);
+
+-- 实时同步到 Kafka
+INSERT INTO kafka_sink SELECT * FROM mysql_cdc;
+```
+
+---
+
+## 十二、Flink SQL 优化
+
+### 12.1 常见优化手段
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 谓词下推 | WHERE 条件下推到 Source | 减少数据读取 |
+| 列裁剪 | 只读取需要的列 | 减少 IO |
+| Mini-batch 聚合 | 延迟聚合减少状态写入 | 降低状态更新频率 |
+| 维表 JOIN 优化 | Async I/O + LRU 缓存 | 减少维表查询延迟 |
+| 窗口聚合优化 | 增量聚合 + 窗口裁剪 | 减少状态大小 |
+
+### 12.2 Mini-batch 配置
+
+```sql
+-- 开启 Mini-batch
+SET table.exec.mini-batch.enabled = true;
+SET table.exec.mini-batch.allow-latency = '5s';
+SET table.exec.mini-batch.size = '1000';
+
+-- 开启状态TTL（自动清理过期状态）
+SET table.exec.state.ttl = '24h';
+```
+
+### 12.3 Async I/O 维表 JOIN
+
+```java
+// 异步查询维表（Redis/MySQL）
+AsyncDataStream.unorderedWait(
+    stream,
+    new AsyncFunction<Event, EnrichedEvent>() {
+        public void asyncInvoke(Event event, ResultFuture<EnrichedEvent> resultFuture) {
+            // 异步查询维表
+        }
+    },
+    30, TimeUnit.SECONDS,  // 超时
+    100                     // 最大并发请求
+);
+```
+
+---
+
+## 十三、Flink Exactly-once 与 Kafka
+
+### 13.1 端到端 Exactly-once 实现
+
+```mermaid
+graph TD
+    A[Kafka Source] -->|读取 offset| B[Flink Processing]
+    B -->|写入+事务提交| C[Kafka Sink]
+    C -->|commit offset| A
+    subgraph 事务边界
+        B --> D[Kafka Producer Transaction]
+        D --> C
+    end
+```
+
+### 13.2 实现条件
+
+| 组件 | 要求 |
+|------|------|
+| Source | 可重放（Kafka offset 回退） |
+| Sink | 幂等 或 事务性（Kafka 事务） |
+| Processing | Flink Checkpoint（状态一致性） |
+
+### 13.3 Kafka 事务 Sink 配置
+
+```java
+KafkaSink<String> sink = KafkaSink.<String>builder()
+    .setBootstrapServers("localhost:9092")
+    .setRecordSerializer(...)
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-")
+    .build();
+```
+
+---
+
+## 十四、Flink vs Spark Streaming vs Kafka Streams
+
+| 维度 | Flink | Spark Streaming | Kafka Streams |
+|------|-------|-----------------|---------------|
+| 处理模型 | 真流（逐事件） | 微批 | 真流（逐事件） |
+| 延迟 | 毫秒 | 秒 | 毫秒 |
+| 状态管理 | RocksDB/内存 | 有限 | RocksDB |
+| 窗口 | 丰富（5种+） | 有限 | 4种 |
+| Exactly-once | Checkpoint | WAL+Checkpoint | 事务 |
+| 部署 | 独立集群 | 独立集群 | 库嵌入应用 |
+| 运维 | 重 | 重 | 轻（零集群） |
+| 复杂事件处理 | 强（CEP） | 无 | 无 |
+| 批流一体 | 原生 | 微批 | 不支持 |
+| SQL | Flink SQL | Spark SQL | ksqlDB |
+| 适用规模 | 大 | 大 | 中小 |
+
+**选型决策**：
+- 复杂流处理/CEP/毫秒延迟 → Flink
+- 批流一体/ML生态 → Spark
+- 应用内轻量流处理 → Kafka Streams
+
+---
+
+## 十五、Flink on Kubernetes（Flink Operator）
+
+### 15.1 部署模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| Session Mode | 共享集群，Job 动态提交 | 开发测试 |
+| Application Mode | 每个 Application 独立集群 | 生产（资源隔离） |
+| per-Job Mode | 每个 Job 独立集群 | 已废弃（推荐 Application） |
+
+### 15.2 Flink Operator CRD
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-flink-job
+spec:
+  image: flink:1.17
+  flinkVersion: v1_17
+  serviceAccount: flink
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    replicas: 4
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/examples/streaming/WindowJoin.jar
+    parallelism: 8
+    state: running
+    upgradeMode: savepoint
+```
+
+### 15.3 K8s 部署关键配置
+
+| 配置项 | 说明 |
+|--------|------|
+| `kubernetes.jobmanager.cpu` | JM CPU 请求 |
+| `kubernetes.taskmanager.cpu` | TM CPU 请求 |
+| `kubernetes.container.image.pull-policy` | 镜像拉取策略 |
+| `kubernetes.pod.template-file` | 自定义 Pod 模板 |
+| `high-availability: kubernetes` | K8s 高可用模式 |
+| `kubernetes.config.maps` | ConfigMap 挂载 |
+
+---
+
+## 十六、与其他板块的关系
 
 - Kafka（Flink 的 Source/Sink 核心）见「[Kafka](./Kafka.md)」；
 - 实时数仓/湖仓一体见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；

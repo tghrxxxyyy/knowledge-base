@@ -446,3 +446,222 @@ MQ 不保证"只投递一次"（多为至少一次），消费端必须幂等：
   - **Schema 演进**：表结构变更（DDL）需用 Schema Registry 管理兼容（backward/forward compatible），否则消费者解析失败。
   - **幂等消费**：下游写 ES/缓存按主键 upsert，天然幂等；避免"同一条变更被重放两次"致脏数据。
   - **Kafka Connect 运维**：Debezium 跑在 Kafka Connect 集群，需管 offset/topic 留存与 Connect 容错。
+
+## 十二、消息顺序保证全景（跨系统）
+
+### 12.1 各 MQ 顺序保证对比
+
+| MQ | 顺序保证 | 实现方式 | 限制 |
+|---|---|---|---|
+| Kafka | 分区内有序 | 同 key 落同 partition | 跨 partition 无序 |
+| RocketMQ | 队列内有序 | MessageListenerOrderly + 队列锁 | 全局有序需单 queue |
+| RabbitMQ | 队列内有序 | 单消费者 | 队列级有序 |
+| Pulsar | 分区有序 | Key_Shared 订阅 | 跨分区无序 |
+
+### 12.2 跨系统顺序保证模式
+
+```mermaid
+flowchart TB
+    A[事件源系统] -->|按 key 路由| B[Kafka/RocketMQ]
+    B --> C1[消费者1]
+    B --> C2[消费者2]
+    B --> C3[消费者3]
+    C1 --> D1[DB写入]
+    C2 --> D2[ES写入]
+    C3 --> D3[缓存更新]
+```
+
+**关键点**：
+- 同一聚合根（如订单ID）的事件必须路由到同一 partition
+- 下游消费者单线程消费单 partition 可保序
+- 跨 partition 顺序不可保，业务需容忍最终一致
+
+## 十三、消息去重模式
+
+### 13.1 幂等消费
+
+```java
+// 方案一：数据库唯一索引去重表
+@Component
+public class IdempotentConsumer {
+    @Autowired JdbcTemplate jdbc;
+    
+    public void consume(Message msg) {
+        try {
+            jdbc.update("INSERT INTO consume_log(message_id, status) VALUES(?, 'PROCESSING')", 
+                msg.getId());
+            // 正常业务处理
+            processMessage(msg);
+            jdbc.update("UPDATE consume_log SET status='DONE' WHERE message_id=?", msg.getId());
+        } catch (DuplicateKeyException e) {
+            // 重复消费，跳过
+            log.info("Duplicate message: {}", msg.getId());
+        }
+    }
+}
+
+// 方案二：Redis SETNX 去重
+public boolean tryAcquire(String messageId) {
+    String key = "mq:dedup:" + messageId;
+    return redis.setIfAbsent(key, "1", Duration.ofHours(24));
+}
+```
+
+### 13.2 去重表设计
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| message_id | VARCHAR(64) UK | 消息唯一标识 |
+| status | VARCHAR(20) | PROCESSING/DONE/FAILED |
+| retry_count | INT | 重试次数 |
+| create_time | DATETIME | 创建时间 |
+| update_time | DATETIME | 最后更新时间 |
+
+## 十四、请求-应答模式（Request-Reply over MQ）
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant MQ as Message Queue
+    participant S as Server
+    C->>MQ: 发送请求（correlationId）
+    MQ->>S: Server 消费请求
+    S->>MQ: 发送应答（correlationId）
+    MQ->>C: Client 匹配应答
+```
+
+```java
+// 客户端：发送请求并等待应答
+public Object sendAndReceive(Object request, Duration timeout) {
+    String correlationId = UUID.randomUUID().toString();
+    // 发送请求到 request queue
+    rabbitTemplate.convertAndSend("request-queue", request, msg -> {
+        msg.getMessageProperties().setCorrelationId(correlationId);
+        return msg;
+    });
+    // 监听 reply queue，用 correlationId 匹配
+    return rabbitTemplate.receiveAndConvert("reply-queue", timeout.toMillis());
+}
+```
+
+## 十五、消息优先级
+
+```text
+Kafka：原生不支持优先级（消息追加到 log 尾部）
+  解决：多个 topic 代表不同优先级，消费者按优先级消费
+
+RocketMQ：支持优先级队列（队列级别优先级）
+  发送时设置 msg.setPriority(level)
+  消费端按优先级调度
+
+RabbitMQ：原生支持（x-max-priority 属性）
+  声明队列时设置：arguments.put("x-max-priority", 10)
+  消息发送时设置 priority 字段
+```
+
+```json
+// RabbitMQ 优先级队列声明
+{
+  "durable": true,
+  "arguments": {
+    "x-max-priority": 10,
+    "x-queue-type": "quorum"
+  }
+}
+```
+
+## 十六、消息 TTL（Time-To-Live）
+
+```text
+消息 TTL = 消息在队列中的最大存活时间，超时则被丢弃或进入死信队列
+
+Kafka：通过 log.retention.hours/bytes 控制（topic 级别）
+  // 消息保留 7 天或 1GB
+  log.retention.hours=168
+  log.retention.bytes=1073741824
+
+RocketMQ：消息级别 TTL
+  msg.setDeliverTimeMs(System.currentTimeMillis() + 3600_000); // 延迟 1 小时投递
+
+RabbitMQ：消息 TTL 或队列 TTL
+  // 消息级别
+  AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+      .expiration("60000") // 60 秒
+      .build();
+  // 队列级别
+  arguments.put("x-message-ttl", 60000);
+```
+
+## 十七、死信队列（DLQ）模式
+
+```mermaid
+flowchart LR
+    A[正常队列] -->|消费失败 N 次| B[重试队列]
+    B -->|再次失败| C[死信队列 DLQ]
+    C --> D[人工处理/告警]
+    C --> E[定时重放]
+```
+
+**DLQ 设计要点**：
+
+| 要点 | 说明 |
+|------|------|
+| 失败计数 | 消息属性中携带失败次数 |
+| 退避策略 | 指数退避：1s → 5s → 30s → 5min |
+| 最大重试 | 超过阈值进 DLQ（RocketMQ 默认 16 次） |
+| 保留信息 | 保留原始 payload + 失败原因 |
+| 监控告警 | DLQ 堆积量 > 阈值则告警 |
+| 重放机制 | 修复后从 DLQ 重新投递到正常队列 |
+
+## 十八、MQ 在 Event Sourcing 中的应用
+
+```text
+Event Sourcing = 状态变更以事件形式持久化，而非直接修改状态
+
+写入流程：
+1. 命令（Command）到达
+2. 验证命令合法性
+3. 生成领域事件
+4. 事件持久化到 Event Store（MQ）
+5. 事件投影（Projection）更新读模型
+
+读取流程：
+1. 查询读模型（CQRS 读侧）
+2. 读模型 = 事件流的物化视图
+
+MQ 在 Event Sourcing 中的角色：
+- 事件持久化：Kafka 作为 Event Store（append-only log）
+- 事件分发：消费者订阅事件流更新读模型
+- 事件重放：Kafka 支持按 offset 重放事件
+- 事件溯源：通过事件重建聚合根状态
+```
+
+## 十九、MQ 容量规划公式
+
+```text
+容量规划核心公式：
+
+1. 吞吐需求：
+   消息生产速率 = QPS × 每条消息大小
+   消息消费速率 = QPS × 处理延迟
+
+2. 存储需求：
+   存储 = 消息速率 × 保留时间 × 副本数 × 安全系数
+   例：10000 msg/s × 1KB × 7天 × 3副本 × 1.5 = ~3TB
+
+3. 带宽需求：
+   生产带宽 = 消息速率 × 消息大小
+   消费带宽 = 消息速率 × 消息大小 × 消费者数
+
+4. 分区/队列数：
+   Kafka 分区数 ≥ max(消费者数, 目标吞吐 / 单分区吞吐)
+   RocketMQ 队列数 ≥ 消费者数（每个消费者分配至少一个队列）
+```
+
+| 指标 | Kafka 计算 | RocketMQ 计算 |
+|------|-----------|---------------|
+| 分区/队列数 | max(消费者数, 目标TPS/单分区TPS) | max(消费者数, 目标TPS/单队列TPS) |
+| Broker 数 | 分区数 × 副本数 / 每Broker分区数 | broker 数 ≥ 副本数 |
+| 磁盘 | 消息速率 × 保留时间 × 副本数 | 消息速率 × 保留时间 × 副本数 |
+| 内存 | 分区数 × segment 缓冲 | CommitLog 缓冲 + ConsumeQueue 缓存 |
+| 网络 | 生产带宽 + 消费带宽 × 消费者数 | 生产带宽 + 消费带宽 × 消费者数 |

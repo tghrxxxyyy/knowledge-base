@@ -359,6 +359,473 @@ output {
 
 ---
 
+## 十三、Elasticsearch 索引生命周期管理（ILM）深入
+
+### 13.1 ILM 策略详解
+
+```mermaid
+flowchart LR
+    A[Hot 阶段] -->|rollover| B[Warm 阶段]
+    B -->|min_age| C[Cold 阶段]
+    C -->|freeze| D[Delete 阶段]
+```
+
+| 阶段 | 存储介质 | 操作 | 典型配置 |
+|------|---------|------|---------|
+| Hot | SSD/NVMe | rollover（按大小/时间） | max_size: 50GB, max_age: 1d |
+| Warm | HDD | shrink、forcemerge、segment merge | number_of_shards: 1 |
+| Cold | 低温存储 | freeze、搜索降级 | readonly + 缓存预加载 |
+| Delete | — | 按策略删除 | min_age: 90d |
+
+### 13.2 ILM 完整配置示例
+
+```json
+PUT _ilm/policy/logs-lifecycle
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {},
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### 13.3 Rollover 与写入别名
+
+```json
+// 创建写入别名
+PUT /logs-000001
+{
+  "aliases": {
+    "logs-write": { "is_write_index": true },
+    "logs-read": {}
+  }
+}
+
+// Rollover 创建新索引
+POST /logs-write/_rollover
+{
+  "conditions": {
+    "max_age": "1d",
+    "max_primary_shard_size": "50gb"
+  }
+}
+```
+
+---
+
+## 十四、Elasticsearch Curator（索引管理自动化）
+
+### 14.1 Curator 核心功能
+
+| 功能 | 说明 |
+|------|------|
+| 索引删除 | 按 age/count/size 删除旧索引 |
+| 索引收缩 | 将多个分片合并为少量分片 |
+| 索引快照 | 定期备份到 S3/共享存储 |
+| 索引别名 | 批量切换写入别名 |
+| 索引模板 | 批量更新模板 |
+
+### 14.2 Curator 配置示例
+
+```yaml
+# curator-action.yml
+actions:
+  1:
+    action: delete_indices
+    description: "删除 30 天前的日志索引"
+    options:
+      ignore_empty_list: True
+      disable_action: False
+    filters:
+    - filtertype: pattern
+      kind: prefix
+      value: logs-
+    - filtertype: age
+      source: name
+      direction: older
+      timestring: '%Y.%m.%d'
+      unit: days
+      unit_count: 30
+
+  2:
+    action: shrink
+    description: "Warm 阶段收缩分片"
+    options:
+      shrink_index: True
+      number_of_shards: 1
+      number_of_replicas: 0
+    filters:
+    - filtertype: age
+      source: creation_date
+      direction: older
+      unit: days
+      unit_count: 7
+```
+
+### 14.3 Curator vs ILM
+
+| 维度 | ILM | Curator |
+|------|-----|---------|
+| 运行方式 | ES 内置自动执行 | 外部脚本定时执行 |
+| 精细度 | 索引级别 | 索引+集群级别 |
+| 复杂度 | 配置简单 | 需要 Python 脚本 |
+| 适用 | 日志场景标配 | 复杂运维/跨集群 |
+
+---
+
+## 十五、Kibana Dashboard 最佳实践
+
+### 15.1 Dashboard 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| 分层展示 | 概览页 → 服务详情 → 单条下钻 |
+| 黄金信号 | QPS、错误率、延迟 P50/P99、饱和度 |
+| 筛选器 | 全局时间范围 + 服务名/环境/级别筛选 |
+| 可操作性 | 每个面板可点击下钻到具体 traceId |
+
+### 15.2 常用 Dashboard 配置
+
+```
+Dashboard 黄金信号面板：
+┌─────────────────────────────────────────┐
+│  总请求量(QPS)  │  错误率(5xx)  │  延迟P99  │
+├─────────────────────────────────────────┤
+│  按服务分布      │  按时间趋势    │  Top10慢查询 │
+├─────────────────────────────────────────┤
+│  错误日志分布    │  级别分布      │  traceId下钻 │
+└─────────────────────────────────────────┘
+```
+
+### 15.3 Kibana 可视化类型
+
+| 可视化 | 用途 | 最佳场景 |
+|--------|------|---------|
+| Lens | 智能推荐图表 | 快速探索 |
+| TSVB | 时间序列 | 指标趋势 |
+| Vega | 自定义图表 | 复杂可视化 |
+| Data Table | 明细表格 | 排障下钻 |
+| Metric | 单值指标 | 告警阈值展示 |
+| Heatmap | 热力图 | 延迟分布 |
+
+---
+
+## 十六、Logstash Pipeline 优化
+
+### 16.1 性能调优参数
+
+| 参数 | 说明 | 建议值 |
+|------|------|--------|
+| pipeline.workers | 工作线程数 | CPU 核数 |
+| pipeline.batch.size | 批处理大小 | 125~1000 |
+| pipeline.batch.delay | 批等待时间 | 50ms |
+| pipeline.ordered | 是否保序 | auto |
+| queue.type | 队列类型 | persisted（持久化） |
+| queue.max_bytes | 队列最大字节 | 1GB+ |
+
+### 16.2 Logstash 性能瓶颈排查
+
+```bash
+# 监控 Logstash 指标
+GET _node/stats/jvm,process,os
+# 关注：
+# - jvm.mem.pools.old.max_in_bytes（老年代大小）
+# - process.cpu.percent（CPU 使用率）
+# - pipeline.events.out（吞吐量）
+```
+
+### 16.3 多 Pipeline 架构
+
+```yaml
+# logstash.yml
+pipeline.id: logs-app
+pipeline.workers: 8
+pipeline.batch.size: 500
+
+pipeline.id: logs-audit
+pipeline.workers: 4
+pipeline.batch.size: 250
+```
+
+---
+
+## 十七、Beats 模块生态
+
+### 17.1 Beats 家族
+
+| Beats | 用途 | 特点 |
+|-------|------|------|
+| Filebeat | 日志文件采集 | 断点续传、多行合并 |
+| Metricbeat | 指标采集 | 系统/服务指标 |
+| Packetbeat | 网络流量 | 协议解析 |
+| Heartbeat | 健康探测 | 站点存活检测 |
+| Auditbeat | 审计日志 | 系统调用 |
+| Functionbeat | Serverless 采集 | Lambda/Cloud Functions |
+
+### 17.2 Filebeat Modules 内置解析
+
+```yaml
+# 启用 nginx 模块
+filebeat.modules:
+- module: nginx
+  access:
+    enabled: true
+    var.paths: ["/var/log/nginx/access.log"]
+  error:
+    enabled: true
+    var.paths: ["/var/log/nginx/error.log"]
+
+- module: system
+  syslog:
+    enabled: true
+    var.paths: ["/var/log/syslog"]
+```
+
+### 17.3 Beats 与 Logstash 协作
+
+```
+Filebeat（轻量采集）→ Kafka（缓冲）
+    → Logstash（复杂加工：grok/mutate/enrich）
+        → Elasticsearch
+
+对比：
+  Filebeat 直连 ES：简单场景（JSON 日志无需加工）
+  Filebeat → Logstash：复杂场景（多格式/需丰富/需聚合）
+```
+
+---
+
+## 十八、Elasticsearch 热温冷架构
+
+### 18.1 节点角色规划
+
+```
+Hot 节点（2~3 台）：
+  SSD/NVMe 磁盘
+  高写入吞吐
+  足够内存（JVM 16~31GB）
+  新数据写入
+
+Warm 节点（2~4 台）：
+  HDD 磁盘
+  保留 7~30 天数据
+  forcemerge 后只读
+  减少分片数
+
+Cold 节点（1~2 台）：
+  大容量 HDD/对象存储
+  30~90 天数据
+  freeze 索引（只在查询时加载）
+
+Master 节点（3 台）：
+  不存数据
+  仅集群管理
+  最小配置（CPU+内存即可）
+```
+
+### 18.2 数据流向
+
+```mermaid
+flowchart TD
+    A[写入请求] --> B[Hot 节点<br/>SSD 索引]
+    B -->|ILM 7天| C[Warm 节点<br/>HDD 索引]
+    C -->|ILM 30天| D[Cold 节点<br/>归档索引]
+    D -->|ILM 90天| E[Delete]
+    F[查询请求] --> B
+    F --> C
+    F --> D
+```
+
+### 18.3 分片分配过滤
+
+```json
+// Hot 节点标签
+PUT _cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.require.node_type": "hot"
+  }
+}
+
+// Warm 节点标签
+PUT _cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.require.node_type": "warm"
+  }
+}
+
+// 索引模板指定分配
+PUT _index_template/logs-template
+{
+  "template": {
+    "settings": {
+      "index.routing.allocation.require.node_type": "hot"
+    }
+  }
+}
+```
+
+---
+
+## 十九、ELK in Kubernetes 部署
+
+### 19.1 部署架构
+
+```
+K8s 集群：
+  DaemonSet: Filebeat（每节点一个，采集容器日志）
+  Deployment: Logstash（可选，复杂加工）
+  StatefulSet: Elasticsearch（3 节点集群）
+  Deployment: Kibana（UI 入口）
+  ConfigMap: 配置文件
+  PVC: ES 数据持久化
+```
+
+### 19.2 Filebeat DaemonSet 示例
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat
+spec:
+  template:
+    spec:
+      containers:
+      - name: filebeat
+        image: elastic/filebeat:8.10.0
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: containers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: containers
+        hostPath:
+          path: /var/lib/docker/containers
+```
+
+### 19.3 Kubernetes 日志采集最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| DaemonSet 采集 | 每节点一个 Filebeat，采集 /var/log/pods |
+| 自动发现 | kubernetes_sd_config 自动发现 Pod |
+| 标签注入 | namespace/pod/container/service 作为标签 |
+| 多行合并 | 容器日志合并 Java 异常栈 |
+| 资源限制 | Filebeat 设置 requests/limits |
+
+---
+
+## 二十、ELK 扩展策略
+
+### 20.1 水平扩展方案
+
+| 组件 | 扩展方式 | 注意事项 |
+|------|---------|---------|
+| Elasticsearch | 加节点 + rebalance | 分片数规划、磁盘水位 |
+| Logstash | 加实例 + Kafka 消费组 | 避免重复消费 |
+| Filebeat | DaemonSet 自动扩展 | 每节点一个 |
+| Kafka | 加 Broker + 分区扩容 | 采集与消费匹配 |
+| Kibana | 多副本 + LB | 无状态 |
+
+### 20.2 大规模集群架构
+
+```
+                        ┌──────────────┐
+                        │   Kibana     │
+                        │  (多副本)    │
+                        └──────┬───────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │  Elasticsearch 集群   │
+                    │  ├─ Master ×3       │
+                    │  ├─ Hot ×3 (SSD)    │
+                    │  ├─ Warm ×4 (HDD)   │
+                    │  └─ Cold ×2 (大容量) │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │  Kafka 集群          │
+                    │  (B3+ Partitions 12) │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+        ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐
+        │ Filebeat  │   │ Filebeat  │   │ Filebeat  │
+        │ (Node 1)  │   │ (Node 2)  │   │ (Node N)  │
+        └───────────┘   └───────────┘   └───────────┘
+```
+
+### 20.3 ES 集群容量规划公式
+
+```
+存储估算：
+  日增量 × 副本数 × 保留天数 × 压缩比 ≈ 总存储
+
+示例：
+  日增量 100GB
+  副本数 1
+  保留 30 天
+  压缩比 0.3（snappy）
+  → 100 × 2 × 30 × 0.3 = 1800GB ≈ 2TB
+
+分片估算：
+  单分片建议 10~50GB
+  日索引 100GB → 3~5 个主分片
+  × 2 副本 = 6~10 个分片/天
+  30 天 = 180~300 个分片
+
+节点估算：
+  Hot 节点：总分片/单节点分片数
+  内存：分片数 × 1GB（堆内存参考）
+```
+
+---
+
 ## 十二、与其他板块的关系（扩展）
 
 - 和「**基础知识/ES体系**」「**基础知识/中间件/ClickHouse**」：ES 系检索细节见 ES 体系篇；日志分析报表可用 ClickHouse。

@@ -167,6 +167,454 @@
 
 ---
 
+## 十二、HAProxy 健康检查深入
+
+### 12.1 健康检查方法详解
+
+| 检查类型 | 方式 | 说明 |
+|---------|------|------|
+| TCP 检查 | `check` | 三次握手成功即存活 |
+| HTTP 检查 | `option httpchk` | GET 指定路径 + 期望状态码 |
+| SSL 检查 | `option ssl-hello-chk` | SSL 握手成功 |
+| Redis 检查 | `option redis-check` | PING 命令 |
+| MySQL 检查 | `option mysql-check` | MySQL 协议握手 |
+| SMTP 检查 | `option smtpchk` | SMTP EHLO |
+
+### 12.2 健康检查参数调优
+
+```ini
+backend web_servers
+    option httpchk GET /healthz
+    http-check expect status 200
+
+    server web1 10.0.0.1:8080 check inter 5s rise 3 fall 2 slowstart 60s
+    server web2 10.0.0.2:8080 check inter 5s rise 3 fall 2 slowstart 60s
+    server web3 10.0.0.3:8080 check inter 5s rise 3 fall 2 slowstart 60s backup
+
+# 参数说明：
+# inter: 检查间隔（默认 2s）
+# rise: 连续成功次数标记为 UP
+# fall: 连续失败次数标记为 DOWN
+# slowstart: 恢复后权重逐步提升时间
+# backup: 备用服务器（主服务器全 DOWN 时启用）
+```
+
+### 12.3 高级健康检查
+
+```ini
+# HTTP 多路径检查
+backend api_servers
+    option httpchk
+    http-check connect
+    http-check send meth GET uri /health ver HTTP/1.1 hdr Host api.example.com
+    http-check expect status 200
+
+    server api1 10.0.0.1:8080 check
+    server api2 10.0.0.2:8080 check
+
+# TCP 检查自定义字符串
+backend db_servers
+    option tcp-check
+    tcp-check connect
+    tcp-check send PING\r\n
+    tcp-check expect string +PONG
+
+    server db1 10.0.0.1:6379 check
+```
+
+---
+
+## 十三、HAProxy Stick Tables（会话保持）
+
+### 13.1 Stick Table 原理
+
+```
+Stick Table = 进程内共享的键值存储
+  用于：会话保持、速率限制、连接计数
+  存储位置：内存（可选复制到其他节点）
+
+键类型：
+  ip（源 IP）/ integer（自定义）/ string（自定义）
+
+值类型：
+  conn（当前连接数）
+  rate（速率）
+  sess（会话数）
+  bytes_in/out（流量）
+  gpc0/gpc1（计数器）
+  server_id（绑定服务器）
+```
+
+### 13.2 Stick Table 配置示例
+
+```ini
+# 基于源 IP 的会话保持（5 分钟超时）
+frontend http-in
+    stick-table type ip size 200k expire 30m
+    stick on src
+    default_backend servers
+
+backend servers
+    balance roundrobin
+    server s1 10.0.0.1:8080 check
+    server s2 10.0.0.2:8080 check
+
+# 基于 Cookie 的会话保持
+frontend http-in
+    cookie SRVID insert indirect nocache
+
+backend servers
+    cookie SRVID insert indirect nocache
+    server s1 10.0.0.1:8080 check cookie s1
+    server s2 10.0.0.2:8080 check cookie s2
+```
+
+### 13.3 Stick Table 速率限制
+
+```ini
+# 限速：每秒最多 50 请求
+frontend http-in
+    stick-table type ip size 100k expire 30s store http_req_rate(10s)
+    stick on src
+    http-request deny deny_status 429 if { http_req_rate(10s) gt 50 }
+
+# 连接数限制
+frontend http-in
+    stick-table type ip size 100k expire 1m store conn_cur
+    stick on src
+    http-request deny deny_status 429 if { conn_cur gt 100 }
+```
+
+### 13.4 多节点 Stick Table 复制
+
+```ini
+# 节点间同步 stick table
+peers mycluster
+    peer h1 10.0.0.1:10000
+    peer h2 10.0.0.2:10000
+
+frontend http-in
+    stick-table type ip size 200k expire 30m peers mycluster
+    stick on src
+```
+
+---
+
+## 十四、HAProxy ACL 规则
+
+### 14.1 ACL 基础语法
+
+```
+acl <名称> <条件> [<值>]
+
+条件类型：
+  path_beg /path     路径前缀
+  path_end /path     路径后缀
+  path_beg -i /path  路径前缀（忽略大小写）
+  hdr(Header)        请求头
+  src IP/mask        源 IP
+  dst IP/mask        目标 IP
+  port 端口
+  method GET/POST    HTTP 方法
+  ssl_fc             SSL 连接
+  req_ssl_sni        SNI 域名
+```
+
+### 14.2 ACL 路由示例
+
+```ini
+frontend http-in
+    bind *:80
+    bind *:443 ssl crt /etc/haproxy/certs/
+
+    # 基于路径路由
+    acl is_api path_beg /api/
+    acl is_static path_end .css .js .png .jpg
+    acl is_websocket hdr(Upgrade) -i WebSocket
+
+    # 基于域名路由
+    acl is_api_host hdr(Host) -i api.example.com
+    acl is_web_host hdr(Host) -i www.example.com
+
+    # 基于 IP 白名单
+    acl is_internal src 10.0.0.0/8
+
+    # 路由规则
+    use_backend api_servers if is_api or is_api_host
+    use_backend static_servers if is_static
+    use_backend ws_servers if is_websocket
+    use_backend admin_servers if is_internal
+    default_backend web_servers
+```
+
+### 14.3 ACL 访问控制
+
+```ini
+# IP 黑白名单
+frontend http-in
+    acl blocked_ips src -f /etc/haproxy/blocked_ips.txt
+    http-request deny if blocked_ips
+
+# 基于 User-Agent 封禁爬虫
+    acl is_bot hdr_sub(User-Agent) -i bot crawler spider
+    http-request deny if is_bot
+
+# 基于速率限制（配合 stick-table）
+    stick-table type ip size 100k expire 30s store http_req_rate(10s)
+    stick on src
+    http-request deny deny_status 429 if { http_req_rate(10s) gt 100 }
+```
+
+---
+
+## 十五、HAProxy TCP vs HTTP 模式深入
+
+### 15.1 TCP 模式（L4）
+
+```ini
+# TCP 模式：数据库负载均衡
+listen mysql-cluster
+    mode tcp
+    bind *:3306
+    option mysql-check user haproxy
+    balance roundrobin
+    server db1 10.0.0.1:3306 check
+    server db2 10.0.0.2:3306 check
+
+# TCP 模式：Redis 集群
+listen redis-cluster
+    mode tcp
+    bind *:6379
+    option tcp-check
+    tcp-check send PING\r\n
+    tcp-check expect string +PONG
+    balance leastconn
+    server redis1 10.0.0.1:6379 check
+    server redis2 10.0.0.2:6379 check
+```
+
+### 15.2 HTTP 模式（L7）
+
+```ini
+# HTTP 模式：Web 应用
+frontend web-in
+    mode http
+    bind *:80
+    bind *:443 ssl crt /etc/haproxy/certs/
+
+    # HTTP 层解析
+    option httplog
+    option forwardfor
+    option http-server-close
+
+    # 路由规则
+    acl is_ssl ssl_fc
+    http-request redirect scheme https unless is_ssl
+    default_backend web_servers
+```
+
+### 15.3 选型对比
+
+| 维度 | TCP 模式 | HTTP 模式 |
+|------|---------|----------|
+| 层级 | L4（IP:Port） | L7（URL/Host/Cookie） |
+| 性能 | 极高（不解包） | 高（需解析 HTTP） |
+| 路由能力 | 无 | URL/Header/Cookie 路由 |
+| 健康检查 | TCP 握手 | HTTP 状态码 |
+| 会话保持 | Source IP | Cookie/Header |
+| 适用场景 | 数据库/Redis/MQ | Web 应用/API 网关 |
+
+---
+
+## 十六、HAProxy in Kubernetes（haproxy-ingress）
+
+### 16.1 架构模型
+
+```
+K8s 集群：
+  Service (NodePort/LoadBalancer)
+    → HAProxy Ingress Controller（Pod）
+      → 解析 Ingress 规则
+      → 路由到后端 Service Pod
+
+HAProxy Ingress Controller：
+  监听 Ingress 资源变更
+  动态更新 HAProxy 配置
+  支持 ConfigMap 自定义
+```
+
+### 16.2 Ingress 配置示例
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+  annotations:
+    haproxy.org/ssl-redirect: "true"
+    haproxy.org/check: "true"
+    haproxy.org/check-interval: "5s"
+    haproxy.org/sticky-table: "type=ip size=200k expire=30m"
+spec:
+  ingressClassName: haproxy
+  tls:
+  - hosts:
+    - app.example.com
+    secretName: app-tls
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /api/
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 8080
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80
+```
+
+### 16.3 haproxy-ingress vs nginx-ingress
+
+| 维度 | haproxy-ingress | nginx-ingress |
+|------|-----------------|---------------|
+| L4 性能 | 极高 | 高 |
+| L7 功能 | 丰富 | 丰富 |
+| 会话保持 | Stick Table | Cookie |
+| 动态配置 | 近实时 | reload |
+| 社区活跃度 | 中 | 高 |
+| 生态 | 较少 | 丰富 |
+
+---
+
+## 十七、HAProxy vs Nginx vs Envoy 综合对比
+
+| 维度 | HAProxy | Nginx | Envoy |
+|------|---------|-------|-------|
+| 内存占用 | 低（单进程） | 低 | 中（多线程） |
+| 连接处理 | 单事件驱动 | 单事件驱动 | 多线程 |
+| 配置热更新 | reload（近秒级） | reload（秒级） | 实时（xDS） |
+| 健康检查 | 协议级（丰富） | HTTP 级 | 主动+被动 |
+| 限流 | Stick Table | limit_req | 令牌桶 |
+| 负载均衡 | 轮询/最少连接/哈希 | 轮询/哈希/最少连接 | 一致性哈希/轮询 |
+| WebSocket | 支持 | 支持 | 支持 |
+| gRPC | TCP 模式透传 | 需 HTTP/2 | 原生支持 |
+| 服务发现 | DNS | DNS | xDS（丰富） |
+| 可观测性 | Stats + Exporter | 日志 | Prometheus + 追踪 |
+| 学习曲线 | 陡峭（专业） | 中等 | 中等 |
+| 最佳场景 | L4 入口/数据库 | Web/静态/L7 | 服务网格/微服务 |
+
+---
+
+## 十八、HAProxy with Prometheus 监控
+
+### 18.1 启用 Prometheus Exporter
+
+```ini
+# haproxy.cfg
+global
+    stats socket /var/run/haproxy.sock mode 660 level admin
+
+# 或使用 haproxy_exporter
+# 启动：haproxy_exporter --haproxy.scrape-uri=http://haproxy:8404/stats
+```
+
+### 18.2 关键监控指标
+
+| 指标 | 说明 | 告警建议 |
+|------|------|---------|
+| haproxy_backend_active_servers | 活跃后端数 | < 期望值 |
+| haproxy_backend_current_sessions | 当前会话数 | > 80% maxconn |
+| haproxy_backend_http_responses_total | HTTP 响应计数 | 5xx 突增 |
+| haproxy_backend_response_time_seconds | 后端响应时间 | P99 > 1s |
+| haproxy_frontend_current_sessions | 前端会话数 | > 80% maxconn |
+| haproxy_server_bytes_in_total | 入站流量 | 突增 |
+
+### 18.3 Grafana Dashboard 配置
+
+```
+面板规划：
+┌──────────────────────────────────────┐
+│  连接数趋势  │  QPS  │  错误率  │
+├──────────────────────────────────────┤
+│  后端健康    │  响应时间 P99  │  队列长度 │
+├──────────────────────────────────────┤
+│  每秒会话率  │  拒绝连接数    │  后端状态 │
+└──────────────────────────────────────┘
+```
+
+---
+
+## 十九、HAProxy SSL 终止
+
+### 19.1 SSL 终止配置
+
+```ini
+frontend https-in
+    bind *:443 ssl crt /etc/haproxy/certs/example.pem
+    mode http
+
+    # HTTP 到 HTTPS 重定向
+    http-request redirect scheme https unless { ssl_fc }
+
+    # SSL 参数
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+    tune.ssl.default-dh-param 2048
+
+    default_backend servers
+```
+
+### 19.2 SSL 透传（Pass-through）
+
+```ini
+# SSL 透传：不解密直接转发
+frontend tcp-in
+    mode tcp
+    bind *:443
+    option tcplog
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+
+    # 基于 SNI 路由
+    use_backend api_servers if { req_ssl_sni -i api.example.com }
+    default_backend web_servers
+```
+
+### 19.3 双向 TLS（mTLS）
+
+```ini
+frontend mtls-in
+    bind *:443 ssl crt /etc/haproxy/server.pem ca-file /etc/haproxy/ca.crt verify required
+    mode http
+
+    # 将客户端证书信息传递给后端
+    http-request set-header X-Client-Cert-CN %[ssl_fc_s_dn CN]
+
+    default_backend servers
+```
+
+### 19.4 SSL Session 复用
+
+```ini
+global
+    # SSL Session 缓存（减少 TLS 握手开销）
+    tune.ssl.cachesize 20000
+    tune.ssl.lifetime 300
+
+    # SSL Session Ticket（跨节点复用）
+    ssl-default-bind-options force-tlsv12
+```
+
+---
+
 ## 七、与其他板块的关系
 
 - Envoy 对比见「[Envoy 服务代理](./Envoy服务代理.md)」；

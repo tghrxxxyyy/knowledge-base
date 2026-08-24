@@ -352,7 +352,364 @@ ceph osd df              # 容量分布
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、Ceph CRUSH 算法深入
+
+### 11.1 CRUSH 映射流程
+
+```mermaid
+graph TD
+    A[Object ID] --> B[hash → PG]
+    B --> C[CRUSH 计算]
+    C --> D[选择 OSD 组合]
+    D --> E[写入副本]
+```
+
+### 11.2 CRUSH Map 结构
+
+```
+CRUSH Map 组成：
+  OSD 列表：每个 OSD 的 ID 和权重
+  故障域层级：host → rack → datacenter → root
+  规则（rule）：副本数 + 故障域约束
+
+示例规则：
+  rule replicated_ruleset {
+    type replicated
+    min_size 1
+    max_size 10
+    step take root
+    step chooseleaf firstn 3 type host
+  }
+```
+
+### 11.3 权重计算
+
+```
+权重类型：
+  传统权重：基于容量（如 2TB = 2.0）
+  CRUSH 权重：基于容量 + 性能
+
+权重计算：
+  权重 = 容量 / 参考容量
+  参考容量通常是所有 OSD 的平均容量
+
+自动均衡：
+  Balancer（MGR 组件）自动检测不均衡
+  后台慢速迁移 PG
+```
+
+### 11.4 CRUSH 与一致性哈希对比
+
+| 维度 | CRUSH | 一致性哈希 |
+|------|-------|-----------|
+| 中心查询 | 无（客户端计算） | 无 |
+| 扩容迁移 | 只迁移受影响 PG | 只迁移受影响桶 |
+| 故障域感知 | 原生支持 | 需扩展 |
+| 权重 | 原生支持 | 需扩展 |
+| 确定性 | 同一对象结果一致 | 一致 |
+
+---
+
+## 十二、Ceph Pool 和 Placement Group
+
+### 12.1 Pool 配置
+
+```bash
+# 创建 Pool
+ceph osd pool create mypool 128 128 replicated
+
+# 设置副本数
+ceph osd pool set mypool size 3
+
+# 设置最小副本数
+ceph osd pool set mypool min_size 2
+
+# 设置配额
+ceph osd pool set-quota mypool max_bytes 100G
+```
+
+### 12.2 PG 数量规划
+
+| OSD 数量 | 建议 PG 数 | 每 OSD PG 数 |
+|----------|------------|--------------|
+| 10 | 128 | 12.8 |
+| 50 | 512 | 10.2 |
+| 100 | 1024 | 10.2 |
+| 200 | 2048 | 10.2 |
+
+### 12.3 PG 状态
+
+| 状态 | 说明 |
+|------|------|
+| active+clean | 正常状态 |
+| active+clean+scrubbing | 正在 Scrub |
+| active+degraded | 降级（部分副本丢失） |
+| active+recovering | 正在恢复 |
+| active+backfilling | 正在回填 |
+
+### 12.4 PG 调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `pg_num` | PG 数量 | OSD × 100 |
+| `pgp_num` | PGP 数量 | 等于 pg_num |
+| `pg_autoscale_mode` | 自动伸缩 | on |
+| `target_size_ratio` | 目标比例 | 按需设置 |
+
+---
+
+## 十三、Ceph RBD/CephFS/RGW
+
+### 13.1 RBD（RADOS Block Device）
+
+```
+特性：
+  块设备接口（iSCSI/RBD 协议）
+  快照（增量快照）
+  克隆（写时复制）
+  精简配置（Thin Provisioning）
+  纠删码支持
+
+使用场景：
+  虚拟机磁盘（KVM/QEMU）
+  K8s 持久化卷（CSI）
+  数据库存储
+```
+
+### 13.2 CephFS（Ceph File System）
+
+```
+特性：
+  POSIX 文件系统接口
+  多活元数据服务器（MDS）
+  快照（目录级）
+  配额（目录/用户）
+  NFS 导出
+
+使用场景：
+  共享文件存储
+  大数据计算存储
+  容器持久化卷
+```
+
+### 13.3 RGW（RADOS Gateway）
+
+```
+特性：
+  S3/Swift 兼容接口
+  对象存储（无限扩展）
+  多租户
+  生命周期管理
+  跨区域复制
+
+使用场景：
+  对象存储服务
+  备份归档
+  静态资源存储
+```
+
+### 13.4 接口对比
+
+| 接口 | 协议 | 适用场景 |
+|------|------|----------|
+| RBD | RBD/iSCSI | 虚拟机/容器存储 |
+| CephFS | FUSE/Kernel | 文件共享/大数据 |
+| RGW | S3/Swift | 对象存储 |
+
+---
+
+## 十四、Ceph 性能调优
+
+### 14.1 硬件配置
+
+| 组件 | 建议 |
+|------|------|
+| OSD 磁盘 | SSD（热数据）/ HDD（温数据） |
+| journal/WAL | NVMe（独立于数据盘） |
+| 网络 | 万兆起步，集群/公网分离 |
+| 内存 | 每 OSD 2~4GB |
+| CPU | 每 OSD 2~4 核 |
+
+### 14.2 关键参数
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `osd_max_backfills` | 恢复并发数 | 1~2 |
+| `osd_recovery_max_active` | 活跃恢复 OSD 数 | 3~5 |
+| `osd_op_threads` | 操作线程数 | 按 CPU 核数 |
+| `osd_journal_size` | Journal 大小 | 10GB+（SSD） |
+| `mon_osd_down_out_interval` | 延迟标记 out 时间 | 600s |
+
+### 14.3 性能瓶颈识别
+
+```
+监控指标：
+  客户端 IOPS/带宽（per pool）
+  OSD 延迟（commit/apply）
+  PG 恢复速率
+  网络吞吐（集群网络）
+
+常见瓶颈：
+  网络（复制流量 2~3 倍于写入）
+  小文件随机写（Ceph 弱项）
+  journal 磁盘（写路径瓶颈）
+```
+
+---
+
+## 十五、Ceph 监控（ceph-mgr）
+
+### 15.1 监控架构
+
+```mermaid
+graph LR
+    A[Ceph 集群] --> B[ceph-mgr]
+    B --> C[Prometheus 插件]
+    C --> D[Prometheus]
+    D --> E[Grafana]
+    B --> F[Dashboard 插件]
+    F --> G[Web UI]
+```
+
+### 15.2 关键监控指标
+
+| 指标 | 说明 | 阈值 |
+|------|------|------|
+| OSD 使用率 | 磁盘使用率 | <80% |
+| PG 状态 | active+clean 比例 | 100% |
+| OSD 延迟 | commit/apply 延迟 | <10ms |
+| 复制带宽 | 副本同步带宽 | 按需设置 |
+| 客户端 IOPS | 读写 IOPS | 按需设置 |
+
+### 15.3 ceph-mgr 模块
+
+| 模块 | 说明 |
+|------|------|
+| Prometheus | 指标导出 |
+| Dashboard | Web 管理界面 |
+| Balancer | 自动均衡 |
+| PG Autoscaler | PG 自动伸缩 |
+| Zabbix | Zabbix 集成 |
+
+---
+
+## 十六、Ceph 在 OpenStack
+
+### 16.1 集成架构
+
+```mermaid
+graph TD
+    A[OpenStack Nova] -->|挂载 RBD| B[Ceph RBD]
+    C[OpenStack Glance] -->|存储镜像| B
+    D[OpenStack Cinder] -->|块存储| B
+    E[OpenStack Swift] -->|对象存储| F[Ceph RGW]
+```
+
+### 16.2 集成配置
+
+```ini
+# Nova 配置
+[libvirt]
+images_rbd_pool=vms
+images_rbd_ceph_conf=/etc/ceph/ceph.conf
+images_type=rbd
+
+# Glance 配置
+[DEFAULT]
+show_image_direct_url = True
+[glance_store]
+rbd_store_pool=images
+```
+
+### 16.3 OpenStack + Ceph 最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 专用 Pool | Nova/Glance/Cinder/Swift 各自 Pool |
+| 副本数 | 生产至少 3 副本 |
+| 网络分离 | 集群网络/存储网络分离 |
+| SSD 优化 | OSD 使用 SSD |
+| 监控 | ceph-mgr + Prometheus |
+
+---
+
+## 十七、Ceph vs MinIO vs GlusterFS
+
+| 维度 | Ceph | MinIO | GlusterFS |
+|------|------|-------|-----------|
+| 类型 | 统一（对象+块+文件） | 对象 | 文件 |
+| 一致性 | 强（CRUSH 副本） | 强 | 强 |
+| 去中心化 | 强（CRUSH） | 中（需控制面） | 中 |
+| 自愈 | 强（自动重建） | 有（纠删码） | 弱 |
+| 性能 | 中 | 高（小规模） | 中 |
+| 部署复杂度 | 高 | 低 | 低 |
+| 适用 | 私有云存储底座 | 轻量对象存储 | 文件共享 |
+
+### 17.1 选型决策
+
+```
+场景选型：
+  私有云/统一存储 → Ceph
+  轻量对象存储 → MinIO
+  文件共享 → GlusterFS/NFS
+  大数据计算存储 → HDFS/CephFS
+  K8s 持久化 → Ceph RBD/CSI
+```
+
+---
+
+## 十八、Ceph 灾难恢复
+
+### 18.1 备份策略
+
+| 策略 | 说明 | 频率 |
+|------|------|------|
+| 全量备份 | 完整集群备份 | 每周 |
+| 增量备份 | 变更数据备份 | 每天 |
+| 快照 | Pool 快照 | 按需 |
+| 跨集群复制 | 异地复制 | 实时 |
+
+### 18.2 灾难恢复流程
+
+```mermaid
+graph TD
+    A[灾难发生] --> B[评估损失]
+    B --> C[恢复 MON]
+    C --> D[恢复 OSD]
+    D --> E[恢复 Pool]
+    E --> F[验证数据完整性]
+```
+
+### 18.3 恢复步骤
+
+```bash
+# 1. 恢复 MON
+ceph-mon -i <id> --mkfs --monmap /path/to/monmap
+
+# 2. 恢复 OSD
+ceph-volume lvm activate <osd-id> <fsid>
+
+# 3. 检查集群状态
+ceph health detail
+ceph -s
+
+# 4. 恢复数据（如有需要）
+ceph osd pool restore <pool-name> <backup>
+```
+
+### 18.4 灾难恢复最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 定期备份 | 全量+增量 |
+| 异地复制 | Geo-replication |
+| 演练测试 | 定期恢复演练 |
+| 监控告警 | 异常及时发现 |
+| 文档维护 | 恢复流程文档化 |
+
+---
+
+## 十九、与其他板块的关系
 
 - 对象存储对比见「[对象存储 MinIO/OSS](./对象存储MinIO-OSS.md)」；
 - 大数据存储（HDFS）见「[大数据/04-分布式存储与HDFS](../大数据/04-分布式存储与HDFS.md)」；

@@ -377,7 +377,370 @@ JWT 安全：
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、OAuth2 PKCE 流程
+
+```text
+PKCE（Proof Key for Code Exchange）= 防止授权码拦截攻击的 OAuth2 扩展
+
+传统 OAuth2 授权码流程的问题：
+1. 客户端获取授权码
+2. 客户端用授权码换取 Token
+3. 如果授权码在传输中被拦截，攻击者可直接换 Token
+
+PKCE 解决方案：
+1. 客户端生成 code_verifier（随机字符串）
+2. 客户端计算 code_challenge = SHA256(code_verifier)
+3. 发送授权请求时带上 code_challenge
+4. 换 Token 时带上 code_verifier
+5. 服务端验证 SHA256(code_verifier) == code_challenge
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AS as Auth Server
+    C->>C: 生成 code_verifier
+    C->>C: 计算 code_challenge = SHA256(verifier)
+    C->>AS: /authorize?response_type=code&code_challenge=xxx&code_challenge_method=S256
+    AS->>C: 返回 authorization_code
+    C->>AS: /token code=xxx&code_verifier=yyy
+    AS->>AS: SHA256(verifier) == challenge ?
+    AS->>C: 返回 access_token + refresh_token
+```
+
+```java
+// Spring Authorization Server PKCE 配置
+@Bean
+public RegisteredClientRepository registeredClientRepository() {
+    RegisteredClient client = RegisteredClient.withId(UUID.randomUUID().toString())
+        .clientId("my-client")
+        .clientAuthenticationMethod(ClientAuthenticationMethod.NONE) // 公共客户端
+        .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+        .redirectUri("http://localhost:8080/callback")
+        .authorizationSettings(AuthorizationSettings.builder()
+            .requireProofKey(true)  // 强制 PKCE
+            .build())
+        .build();
+    return new InMemoryRegisteredClientRepository(client);
+}
+```
+
+## 十二、CSP Headers 深度解析
+
+```text
+Content Security Policy = 限制页面可以加载的资源来源
+
+关键指令：
+default-src    : 默认策略（未指定指令的 fallback）
+script-src     : JavaScript 来源
+style-src      : CSS 来源
+img-src        : 图片来源
+font-src       : 字体来源
+connect-src    : AJAX/WebSocket/fetch 来源
+frame-src      : iframe 来源
+object-src     : Flash/Java 插件来源
+media-src      : 音视频来源
+worker-src     : Service Worker 来源
+base-uri       : <base> 标签限制
+form-action    : 表单提交目标
+frame-ancestors: 允许嵌入的来源（替代 X-Frame-Options）
+```
+
+**CSP 常用策略示例**：
+
+```text
+# 严格模式（推荐）
+default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';
+
+# 宽松模式（兼容性好）
+default-src 'self'; script-src 'self' https://cdn.example.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none';
+
+# 报告模式（先监控不阻断）
+default-src 'self'; report-uri /csp-report; report-to csp-endpoint;
+```
+
+```java
+// Spring Security CSP 配置
+http.headers(headers -> headers
+    .contentSecurityPolicy(csp -> csp
+        .policyDirectives("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
+        .reportOnly(false)  // false=强制执行, true=仅报告
+    )
+);
+```
+
+## 十三、CORS 错误配置攻击
+
+```text
+CORS 错误配置攻击场景：
+1. 服务端配置 Access-Control-Allow-Origin: *（允许所有来源）
+2. 服务端配置反射 Origin（回显请求中的 Origin）
+3. 攻击者构造恶意页面，利用受害者的 Cookie 发起跨域请求
+4. 浏览器自动带上 Cookie，服务端返回数据
+5. 攻击者通过 JavaScript 读取响应数据
+
+防御：
+1. 显式白名单（不使用 * 和反射 Origin）
+2. 配置 Access-Control-Allow-Credentials: true 时不允许 *
+3. 使用 Nginx 严格校验 Origin
+```
+
+```nginx
+# Nginx CORS 安全配置
+set $cors_origin "";
+if ($http_origin ~* "^https://(www\.)?trusted\.com$") {
+    set $cors_origin $http_origin;
+}
+add_header Access-Control-Allow-Origin $cors_origin always;
+add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE" always;
+add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+add_header Access-Control-Allow-Credentials "true" always;
+add_header Access-Control-Max-Age 3600 always;
+```
+
+## 十四、JWT 安全最佳实践
+
+| 安全要点 | 推荐做法 | 风险 |
+|----------|----------|------|
+| 签名算法 | RS256/ES256（非对称） | HS256 密钥泄露风险 |
+| 密钥管理 | 密钥轮换 + KMS 托管 | 硬编码密钥泄露 |
+| Token 过期 | Access Token 15min，Refresh Token 7d | 长期有效 Token 风险 |
+| 吊销机制 | Token 黑名单/版本号 | 登出后 Token 仍有效 |
+| Claims 校验 | 校验 iss/aud/exp/nbf | 未校验导致伪造 |
+| 存储安全 | HttpOnly Cookie 或安全存储 | localStorage XSS 泄露 |
+
+```java
+// JWT 安全配置
+String token = Jwts.builder()
+    .setIssuer("https://auth.example.com")     // 签发者
+    .setAudience("https://api.example.com")    // 受众
+    .setSubject(userId)                         // 用户标识
+    .setIssuedAt(new Date())                    // 签发时间
+    .setExpiration(new Date(System.currentTimeMillis() + 900_000)) // 15分钟
+    .setId(UUID.randomUUID().toString())        // 唯一ID（用于吊销）
+    .signWith(privateKey, SignatureAlgorithm.RS256)
+    .compact();
+
+// JWT 校验
+Claims claims = Jwts.parserBuilder()
+    .setSigningKey(publicKey)
+    .requireIssuer("https://auth.example.com")
+    .requireAudience("https://api.example.com")
+    .build()
+    .parseClaimsJws(token)
+    .getBody();
+```
+
+## 十五、SSRF 防御进阶
+
+```text
+SSRF 高级防御策略：
+
+1. URL 白名单 + DNS 重解析：
+   - 先解析域名获取 IP
+   - 校验 IP 是否在白名单内
+   - 防止 DNS 绑定攻击（第一次解析到白名单 IP，第二次解析到内网 IP）
+
+2. 协议白名单：
+   - 只允许 http/https
+   - 禁止 file/gopher/dict/ftp 等协议
+
+3. 内网 IP 段禁止：
+   - 10.0.0.0/8
+   - 172.16.0.0/12
+   - 192.168.0.0/16
+   - 127.0.0.0/8
+   - 169.254.0.0/16（云元数据）
+
+4. 网络层隔离：
+   - 应用服务器网络 ACL 限制访问内网管理端口
+   - 禁止应用服务器访问云元数据端口
+```
+
+```java
+public boolean isSafeUrl(String url) {
+    URI uri = URI.create(url);
+    // 1. 协议限制
+    String scheme = uri.getScheme();
+    if (!"http".equals(scheme) && !"https".equals(scheme)) return false;
+    
+    // 2. DNS 解析后校验 IP
+    InetAddress[] addrs = InetAddress.getAllByName(uri.getHost());
+    for (InetAddress addr : addrs) {
+        if (addr.isLoopbackAddress()) return false;
+        if (addr.isSiteLocalAddress()) return false;
+        byte[] octets = addr.getAddress();
+        // 禁止内网 IP
+        if (octets[0] == 10) return false;
+        if (octets[0] == 172 && (octets[1] & 0xFF) >= 16 && (octets[1] & 0xFF) <= 31) return false;
+        if (octets[0] == 192 && octets[1] == (byte)168) return false;
+        if (octets[0] == 169 && octets[1] == (byte)254) return false;
+    }
+    
+    // 3. 白名单校验
+    return ALLOWED_HOSTS.contains(uri.getHost());
+}
+```
+
+## 十六、文件上传安全进阶
+
+```text
+文件上传安全检查清单：
+
+1. 类型校验：
+   - 白名单扩展名：.jpg, .png, .pdf, .docx
+   - MIME 类型校验：Content-Type 必须匹配
+   - 文件头校验：检查 magic bytes（JPG=FFD8, PNG=89504E47）
+
+2. 文件重命名：
+   - 使用 UUID 重命名：a1b2c3d4.jpg
+   - 禁止用户指定文件名
+   - 防止路径穿越：../etc/passwd
+
+3. 存储隔离：
+   - 非执行目录：与 Web 应用分离
+   - 独立域名/CDN：不走应用域名
+   - 禁止脚本执行：Nginx 配置禁止解析 .php/.jsp
+
+4. 大小限制：
+   - 单文件大小限制：10MB
+   - 总上传大小限制：50MB
+   - 并发上传限制
+
+5. 杀毒扫描：
+   - ClamAV 扫描恶意代码
+   - SVG 文件特殊处理（可能含 XSS）
+```
+
+```nginx
+# Nginx 文件上传安全配置
+location /upload/ {
+    # 禁止脚本执行
+    location ~* \.(php|jsp|py|pl|cgi)$ {
+        deny all;
+    }
+    # 禁止访问隐藏文件
+    location ~ /\. {
+        deny all;
+    }
+    # 设置上传大小限制
+    client_max_body_size 10m;
+    # 设置超时
+    client_body_timeout 30s;
+}
+```
+
+## 十七、API 安全测试方法论
+
+```text
+API 安全测试流程：
+
+1. 信息收集
+   - 识别 API 类型（REST/GraphQL/gRPC）
+   - 收集端点列表（Swagger/OpenAPI）
+   - 识别认证方式（JWT/OAuth2/API Key）
+
+2. 认证测试
+   - Token 伪造/篡改
+   - Token 过期/吊销
+   - 权限提升
+
+3. 授权测试
+   - IDOR（不安全的直接对象引用）
+   - 越权访问其他用户数据
+   - 功能级别越权
+
+4. 输入验证测试
+   - SQL 注入
+   - XSS
+   - 命令注入
+   - 路径穿越
+
+5. 业务逻辑测试
+   - 速率限制绕过
+   - 批量操作滥用
+   - 竞态条件
+
+6. 配置安全测试
+   - CORS 配置
+   - 安全头缺失
+   - 错误信息泄露
+```
+
+| 测试工具 | 类型 | 用途 |
+|----------|------|------|
+| Burp Suite | 代理+扫描 | 手动渗透测试 |
+| OWASP ZAP | DAST | 自动化扫描 |
+| Postman | API 测试 | 手动测试 |
+| Nuclei | 漏洞扫描 | 模板化扫描 |
+| ffuf | 模糊测试 | 端点发现 |
+
+## 十八、OWASP Top 10 2023 解读
+
+| 排名 | 威胁 | 说明 | 防御 |
+|------|------|------|------|
+| A01 | Broken Access Control | 越权访问 | 服务端校验、RBAC |
+| A02 | Cryptographic Failures | 加密失败 | 强加密、密钥管理 |
+| A03 | Injection | 注入攻击 | 参数化查询、输入校验 |
+| A04 | Insecure Design | 不安全设计 | 威胁建模、安全设计 |
+| A05 | Security Misconfiguration | 安全配置错误 | 加固清单、最小化 |
+| A06 | Vulnerable Components | 漏洞组件 | SCA 扫描、及时升级 |
+| A07 | Auth Failures | 认证失败 | MFA、强密码策略 |
+| A08 | Data Integrity Failures | 数据完整性失败 | 签名验证、CI/CD 安全 |
+| A09 | Logging Failures | 日志记录失败 | 安全日志、监控告警 |
+| A10 | SSRF | 服务端请求伪造 | URL 白名单、协议限制 |
+
+## 十九、安全 Headers 完整清单
+
+```text
+安全 Headers 检查清单：
+
+1. 传输安全：
+   Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+
+2. 内容安全：
+   Content-Security-Policy: default-src 'self'; script-src 'self'; ...
+   X-Content-Type-Options: nosniff
+   X-Frame-Options: DENY (已被 CSP frame-ancestors 替代)
+
+3. 缓存安全：
+   Cache-Control: no-store, no-cache, must-revalidate
+   Pragma: no-cache
+
+4. CORS 安全：
+   Access-Control-Allow-Origin: https://trusted.com
+   Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+   Access-Control-Allow-Headers: Content-Type, Authorization
+
+5. 其他安全：
+   Referrer-Policy: strict-origin-when-cross-origin
+   Permissions-Policy: camera=(), microphone=(), geolocation=()
+   X-XSS-Protection: 0 (已过时，建议禁用浏览器 XSS 过滤器)
+```
+
+```java
+// Spring Security 安全 Headers 配置
+http.headers(headers -> headers
+    .httpStrictTransportSecurity(hsts -> hsts
+        .includeSubDomains(true)
+        .maxAgeInSeconds(31536000)
+        .preload(true)
+    )
+    .contentSecurityPolicy(csp -> csp
+        .policyDirectives("default-src 'self'; script-src 'self'")
+    )
+    .frameOptions(frame -> frame.deny())
+    .contentTypeOptions(Customizer.withDefaults())
+    .referrerPolicy(referrer -> referrer
+        .policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN)
+    )
+    .permissionsPolicy(permissions -> permissions
+        .policy("camera=(), microphone=(), geolocation=()")
+    )
+);
+```
+
+## 二十、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；
 - API 网关安全见「[API 网关](../中间件/API网关.md)」；

@@ -354,7 +354,262 @@ try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
 
 ---
 
-## 十、与其他板块的关联
+## 十、GC 日志分析方法论
+
+### 10.1 GC 日志格式（JDK11+ 统一日志）
+
+```bash
+# 启用 GC 日志
+-Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=10,filesize=50m
+
+# 分析 GC 日志
+# 使用 GCViewer 或 GCEasy 可视化
+# 关键指标：GC 频率、暂停时间、回收效率、晋升速率
+```
+
+**GC 日志关键字段解读**：
+
+| 字段 | 含义 | 关注点 |
+|------|------|--------|
+| GC Cause | 触发原因 | Allocation Failure/ Metadata GC Threshold/ System.gc() |
+| Pause Time | STW 暂停时间 | Young GC < 50ms, Full GC < 200ms |
+| GC Strategy | GC 策略 | G1 Evacuation Pause, G1 Concurrent Mark |
+| Heap Before/After | GC 前后堆大小 | 回收量、是否接近上限 |
+| Promotion | 晋升到老年代的量 | 过快说明 Survivor 太小 |
+| Humongous | 大对象分配 | G1 中大对象直接进老年代 |
+
+### 10.2 GC 日志分析步骤
+
+```mermaid
+flowchart TD
+    A[收集 GC 日志] --> B{Full GC 频繁?}
+    B -->|是| C[看 GC Cause]
+    B -->|否| D{Young GC 暂停长?}
+    C --> C1[Memory Leak → MAT 分析]
+    C --> C2[Metaspace → 调元空间]
+    C --> C3[System.gc → 关闭显式 GC]
+    D --> D1[调 Region Size]
+    D --> D2[调 NewSize 比例]
+    D --> E{暂停时间达标?}
+    E -->|否| F[调 MaxGCPauseMillis]
+    E -->|是| G[性能达标]
+```
+
+## 十一、JVM 内存布局深度
+
+### 11.1 对象内存布局（HotSpot）
+
+```text
+对象头（Object Header）：
+┌───────────────────────────────────────┐
+│  Mark Word (64 bits, 64位 JVM)        │
+│  ┌─────────────────────────────────┐  │
+│  │ 无锁: hashcode(31) | age(4) | 1│  │
+│  │ 偏向: threadId(54)| epoch(2)| 1 │  │
+│  │ 轻量: ptr_to_lock(62)      | 00│  │
+│  │ 重量: ptr_to_monitor(62)   | 10│  │
+│  └─────────────────────────────────┘  │
+│  Klass Pointer (32 bits, 指向类元数据)  │
+│  数组长度 (32 bits, 仅数组)            │
+├───────────────────────────────────────┤
+│  实例数据（Instance Data）             │
+│  对齐填充（Padding, 8 字节对齐）       │
+└───────────────────────────────────────┘
+
+对象大小：
+- 对象头: 12 bytes (Mark Word 8 + Klass 4)
+- 实例数据: 按字段类型
+- 对齐: 总大小必须是 8 的倍数
+```
+
+### 11.2 TLAB（Thread Local Allocation Buffer）
+
+```text
+TLAB = 每个线程独享的 Eden 区小块，无锁分配
+
+工作流程：
+1. 线程首次分配对象 → 从 Eden 区申请一块 TLAB（默认 Eden 的 1%）
+2. 在 TLAB 内分配 → CAS 无需加锁，极快
+3. TLAB 用完 → 申请新 TLAB 或直接 Eden 分配（CAS）
+4. 对象进入 Survivor → 线程切换 TLAB
+
+相关参数：
+- -XX:+UseTLAB（默认开启）
+- -XX:TLABSize=<bytes>（初始大小）
+- -XX:MinTLABSize=2KB（最小值）
+- -XX:TLABRefillWasteFraction=64（ refill 浪费比例）
+```
+
+## 十二、JIT 编译层级（C1/C2/Graal）
+
+```text
+JIT 编译层级：
+解释器 → C1 (Client Compiler) → C2 (Server Compiler) → Graal JIT
+
+┌──────────┬──────────────────────┬───────────────────────┐
+│ 层级      │ 特点                  │ 优化级别              │
+├──────────┼──────────────────────┼───────────────────────┤
+│ 解释执行  │ 逐行解释，启动快       │ 无优化                │
+│ C1       │ 编译为本地代码         │ 方法内联、逃逸分析      │
+│ C2       │ 深度优化编译           │ 循环展开、向量化        │
+│ Graal    │ Java 编写的 JIT       │ 部分场景超越 C2        │
+└──────────┴──────────────────────┴───────────────────────┘
+
+编译触发：
+- C1: 方法调用次数 > 1500 (Client 模式)
+- C2: 方法调用次数 > 10000 (Server 模式)
+- -XX:+TieredCompilation（分层编译，默认开启）
+```
+
+## 十三、JVM Crash 分析
+
+```text
+JVM Crash 常见类型：
+1. SIGSEGV (Segmentation Fault)
+   - 原因：JVM Bug、JNI 代码越界、内存损坏
+   - 文件：hs_err_pid<>.log
+   - 关键信息：siginfo、registers、stack、memory map
+
+2. OutOfMemoryError
+   - Java heap space: 堆不足
+   - Metaspace: 类加载过多
+   - Direct buffer memory: NIO 堆外内存
+
+3. StackOverflowError
+   - 线程栈溢出：递归过深或栈帧过大
+
+hs_err_pid<>.log 关键部分：
+- # A fatal error has been detected by the Java Runtime
+- siginfo: signal 11 (SIGSEGV)  → 信号类型
+- Registers: → CPU 寄存器状态
+- Stack: [0x...,0x...], sp=0x..., free space=...  → 栈空间
+- Java Threads: → 所有 Java 线程状态
+- Lockown: → 锁信息
+```
+
+```bash
+# 分析 JVM Crash
+# 1. 查看 hs_err_pid<>.log 文件
+# 2. 关注 signal、fault addr、registers
+# 3. 检查 JVM 版本已知 Bug
+# 4. 检查是否有 JNI 代码问题
+# 5. 升级 JVM 到最新补丁版本
+```
+
+## 十四、JVM 容器环境调优（MaxRAMPercentage）
+
+```text
+JVM 在容器中的内存配置：
+传统方式：-Xmx 512m（固定值，容器 limit 变化时不自适应）
+推荐方式：-XX:MaxRAMPercentage=75.0（按容器 limit 动态计算）
+
+为什么用百分比：
+- 容器 limit 可能变化（HPA 扩缩容）
+- 固定 -Xmx 会导致 OOM 或内存浪费
+- MaxRAMPercentage 自动适配容器内存 limit
+
+JVM 可用内存检测：
+- 容器 cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes
+- 容器 cgroup v2: /sys/fs/cgroup/memory.max
+- JDK 10+ 自动检测容器内存 limit
+- JDK 8u131+ 需要 -XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap
+```
+
+```bash
+# 容器环境推荐 JVM 参数
+java \
+  -XX:MaxRAMPercentage=75.0 \
+  -XX:InitialRAMPercentage=50.0 \
+  -XX:+UseContainerSupport \
+  -XX:+UseG1GC \
+  -Xlog:gc*:file=/var/log/gc.log \
+  -jar app.jar
+
+# 常见错误配置
+-XX:MaxRAMPercentage=90.0  # 太高，OS/page cache 没空间
+-XX:MaxRAMPercentage=50.0  # 太低，内存浪费
+```
+
+## 十五、ZGC/Shenandoah 高级调优
+
+### 15.1 ZGC 高级参数
+
+```bash
+# ZGC 调优参数
+-XX:+UseZGC
+-XX:+ZGenerational           # 分代 ZGC（JDK21+）
+-XX:SoftMaxHeapSize=N        # 软限制，ZGC 尽量不超过
+-XX:ZAllocationSpikeTolerance=2.0  # 分配尖峰容忍度（默认2.0）
+-XX:ZCollectionInterval=5    # 主动 GC 间隔（秒）
+-XX:ConcGCThreads=N          # 并发 GC 线程数
+
+# NUMA 感知（多路 CPU）
+-XX:+UseNUMA
+```
+
+### 15.2 Shenandoah 高级参数
+
+```bash
+# Shenandoah 调优
+-XX:+UseShenandoahGC
+-XX:ShenandoahGCHeuristics=adaptive  # 启发式策略
+-XX:ShenandoahMinFreeThreshold=10    # 最小空闲比例触发 GC
+-XX:ShenandoahGuaranteedGCInterval=300000  # 保证 GC 间隔（ms）
+-XX:ShenandoahUncommitDelay=3000     # 内存归还延迟（ms）
+```
+
+## 十六、JVM Profiling 工具（async-profiler/JFR）
+
+### 16.1 async-profiler
+
+```bash
+# CPU profiling
+./profiler.sh -d 30 -f cpu_profile.html <pid>
+
+# 内存分配 profiling
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# Wall-clock profiling
+./profiler.sh -d 30 -e wall -f wall_profile.html <pid>
+
+# 火焰图分析
+# - 纵轴：调用栈深度
+# - 横轴：采样比例（越宽 = CPU 时间越多）
+# - 找"宽"的帧 = 性能瓶颈
+```
+
+### 16.2 JFR（Java Flight Recorder）
+
+```bash
+# 持续录制（生产低开销）
+jcmd <pid> JFR.start settings=profile duration=0 filename=recording.jfr
+
+# 事件过滤
+jcmd <pid> JFR.start settings=profile filename=recording.jfr \
+  jdk.GC* \
+  jdk.JavaMonitorWait \
+  jdk.LockContended
+
+# 查看 JFR 事件
+jfr summary recording.jfr
+jfr print --events jdk.GCHeapSummary recording.jfr
+```
+
+**JFR 常用事件**：
+
+| 事件类别 | 事件 | 用途 |
+|----------|------|------|
+| GC | G1HeapSummary | 堆内存变化 |
+| GC | G1CollectionPause | GC 暂停详情 |
+| JVM | JVMInformation | JVM 版本/参数 |
+| Thread | ThreadStart/End | 线程生命周期 |
+| Method | MethodExecution | 方法执行耗时 |
+| IO | FileRead/Write | 文件 IO |
+| Socket | SocketRead/Write | 网络 IO |
+| Exception | JavaExceptionThrow | 异常统计 |
+| JFR | FlightRecorder | JFR 自身状态 |
+
+## 十七、与其他板块的关联
 
 - JVM 原理见「[Java 虚拟机](../基础知识/Java虚拟机.md)」；
 - 并发问题见「[并发编程](../基础知识/并发编程.md)」；
