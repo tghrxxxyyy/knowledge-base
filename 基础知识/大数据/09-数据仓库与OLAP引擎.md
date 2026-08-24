@@ -335,7 +335,174 @@ PARTITION BY：分区裁剪（按时间分区，查询只扫相关分区）
 
 ---
 
-## 十二、与其他板块的关系
+## 十二、OLAP 引擎对比深入
+
+### 12.1 ClickHouse 深入
+
+```
+MergeTree 家族：
+  MergeTree：基础（分区 + 稀疏索引 + 列式）
+  ReplacingMergeTree：按 ORDER BY 去重（异步合并）
+  SummingMergeTree：自动预聚合（求和）
+  AggregatingMergeTree：聚合状态（复杂聚合）
+  CollapsingMergeTree：折叠删除（sign 字段）
+
+写入：
+  INSERT INTO t VALUES (...) → 追加写入
+  ReplacingMergeTree：相同 ORDER BY 的行异步合并为最新版
+  
+查询：
+  SELECT ... FINAL → 合并后查询（性能差，慎用）
+  SELECT ... WHERE ... → 稀疏索引过滤
+```
+
+### 12.2 Doris/StarRocks 架构对比
+
+| 组件 | Doris | StarRocks |
+|------|-------|-----------|
+| FE（Frontend） | 元数据 + 查询计划 | 元数据 + 查询计划 |
+| BE（Backend） | 存储 + 计算 | 存储 + 计算 |
+| 协议 | MySQL 协议 | MySQL 协议 |
+| 向量化 | 是 | **自研极速向量化** |
+| 存算分离 | 实验 | **支持（S3/HDFS）** |
+
+### 12.3 引擎选型决策
+
+```mermaid
+flowchart TD
+    Q{主要负载?}
+    Q -->|单表聚合/日志监控| CK[ClickHouse]
+    Q -->|高并发BI/复杂JOIN| SR[StarRocks]
+    Q -->|轻量快速上线| DORIS[Doris]
+    Q -->|预计算多维Cube| KY[Kylin]
+    Q -->|时序监控大屏| DR[Druid/Pinot]
+    Q -->|传统SQL ETL| GP[Greenplum]
+    Q -->|嵌入式分析| DUCK[DuckDB]
+```
+
+## 十三、数仓 Schema 设计
+
+### 13.1 星型模型 vs 雪花模型
+
+| 维度 | 星型模型 | 雪花模型 |
+|------|----------|----------|
+| 维度表 | 扁平化（反规范化） | 规范化（维度套维度） |
+| JOIN 数 | 少（事实表 JOIN 维度表） | 多（维度表之间也 JOIN） |
+| 查询性能 | 快 | 慢（多 JOIN） |
+| 存储空间 | 大（冗余） | 小（规范化） |
+| 维护 | 简单 | 复杂 |
+| 推荐 | ✅ 生产首选 | 特殊场景 |
+
+### 13.2 星座模型（Fact Constellation）
+
+```
+星座模型 = 多个事实表共享维度表
+
+示例：
+  事实表：订单事实表、退款事实表、浏览事实表
+  维度表：用户维度、商品维度、时间维度
+  
+  订单事实表 → 用户维度
+  退款事实表 → 用户维度
+  浏览事实表 → 用户维度
+  
+  三个事实表共享用户维度 → 星座模型
+```
+
+## 十四、缓慢变化维（SCD）深入
+
+### 14.1 SCD Type 2 实战
+
+```sql
+-- SCD Type 2 拉链表
+CREATE TABLE dim_user_scd (
+  user_id BIGINT,
+  user_name STRING,
+  city STRING,
+  start_date DATE,
+  end_date DATE,
+  is_current BOOLEAN
+);
+
+-- 插入新版本（关旧开新）
+MERGE INTO dim_user_scd t
+USING (
+  SELECT user_id, user_name, city,
+         CURRENT_DATE AS start_date,
+         '9999-12-31'::DATE AS end_date,
+         TRUE AS is_current
+  FROM new_users
+) s ON t.user_id = s.user_id AND t.is_current = TRUE
+WHEN MATCHED THEN UPDATE SET
+  end_date = CURRENT_DATE - INTERVAL '1 day',
+  is_current = FALSE
+WHEN NOT MATCHED THEN INSERT VALUES (
+  s.user_id, s.user_name, s.city, s.start_date, s.end_date, s.is_current
+);
+```
+
+### 14.2 SCD 选型
+
+| 类型 | 做法 | 适用 | 缺点 |
+|------|------|------|------|
+| Type 1 | 直接覆盖 | 不关心历史 | 丢失历史 |
+| Type 2 | 加 start/end/is_current | **需历史追踪** | 存储增长 |
+| Type 3 | 加 prev_value 列 | 仅看上一版 | 只保留一版历史 |
+| Type 4 | 历史表 + 当前表 | 大量历史 | 查询复杂 |
+
+## 十五、数据仓库测试
+
+### 15.1 测试类型
+
+| 测试类型 | 说明 | 工具 |
+|----------|------|------|
+| Schema 测试 | 表结构/字段类型正确 | 自定义 SQL |
+| 数据质量测试 | 非空/唯一/值域 | Great Expectations |
+| ETL 测试 | 转换逻辑正确 | dbt tests |
+| 性能测试 | 查询延迟/吞吐 | 自定义 Benchmark |
+| 对账测试 | 新旧系统数据一致 | 自定义对账脚本 |
+
+### 15.2 数据质量规则
+
+```sql
+-- 数据质量校验 SQL
+-- 非空率
+SELECT COUNT(*) FILTER (WHERE user_id IS NULL) * 100.0 / COUNT(*) AS null_rate
+FROM dwd_orders;
+
+-- 唯一率
+SELECT (COUNT(*) - COUNT(DISTINCT order_id)) * 100.0 / COUNT(*) AS dup_rate
+FROM dwd_orders;
+
+-- 跨表一致性
+SELECT a.order_id FROM dwd_orders a
+LEFT JOIN dim_users b ON a.user_id = b.user_id
+WHERE b.user_id IS NULL;  -- 孤儿记录
+```
+
+## 十六、数据集市 vs 数据仓库
+
+| 维度 | 数据仓库（DW） | 数据集市（DM） |
+|------|----------------|----------------|
+| 范围 | 全企业 | 特定部门/业务 |
+| 数据 | 全量（ODS→DWD→DWS→ADS） | 子集（面向主题） |
+| 用户 | 数据团队 | 业务分析师 |
+| 建模 | 企业级维度模型 | 部门级特定模型 |
+| 治理 | 严格（OneData） | 相对宽松 |
+
+> **口诀**：数据仓库是"全企业数据资产"，数据集市是"部门级数据消费"——集市的数据来自仓库。
+
+## 十七、数据仓库在云上
+
+| 能力 | 云上优势 |
+|------|----------|
+| 弹性扩缩 | 按需扩缩容，无需预采购 |
+| 存算分离 | 独立扩展计算和存储 |
+| Serverless | 按查询付费，无需运维 |
+| 物化视图 | 自动刷新预计算 |
+| 跨域分析 | 多区域数据统一查询 |
+
+## 十八、与其他板块的关系
 
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
 - 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；

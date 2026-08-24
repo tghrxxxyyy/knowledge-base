@@ -325,7 +325,213 @@ spec:
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、YARN 资源模型深入
+
+### 11.1 Container 资源抽象
+
+```
+YARN Container = CPU（vcore）+ 内存（MB）
+
+调度决策：
+  节点可用资源 ≥ 申请资源 → 分配
+  资源不足 → 等待队列（Pending）
+
+内存分类：
+  container-mb：容器总内存（含堆+堆外+overhead）
+  virtual-memory：物理内存 × virtual-memory-multiplier（默认 2.1）
+  物理内存超限 → YARN Kill 容器
+```
+
+### 11.2 Queue 资源配置
+
+```xml
+<!-- Capacity Scheduler 多级队列 -->
+<property>
+  <name>yarn.scheduler.capacity.root.queues</name>
+  <value>realtime,batch</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.realtime.capacity</name>
+  <value>40</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.realtime.maximum-capacity</name>
+  <value>80</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.batch.capacity</name>
+  <value>60</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.batch.maximum-capacity</name>
+  <value>90</value>
+</property>
+```
+
+## 十二、YARN Timeline Service
+
+### 12.1 Timeline Service v2
+
+```
+Timeline Service v2 = YARN 作业历史服务
+
+架构：
+  TimelineReader：读取作业历史
+  TimelineWriter：写入作业事件（HDFS/Leveldb）
+
+功能：
+  查询已完成作业的历史信息
+  应用指标聚合（AM 汇报）
+  支持 Spark/Flink 作业历史查询
+
+配置：
+  yarn.timeline-service.enabled=true
+  yarn.timeline-service.versions=v2
+```
+
+## 十三、Kubernetes 资源模型深入
+
+### 13.1 Pod 资源模型
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: spark-executor
+    resources:
+      requests:           # 调度依据（保证分配）
+        cpu: "2"
+        memory: "4Gi"
+        ephemeral-storage: "10Gi"
+      limits:             # 运行时上限（超限 OOM/Kill）
+        cpu: "4"
+        memory: "8Gi"
+        ephemeral-storage: "20Gi"
+```
+
+### 13.2 QoS 等级
+
+| QoS 等级 | 条件 | OOM Kill 优先级 |
+|----------|------|-----------------|
+| Guaranteed | requests = limits | 最后被 Kill |
+| Burstable | requests < limits | 中间 |
+| BestEffort | 无 requests/limits | 最先被 Kill |
+
+## 十四、YARN vs K8s 深度对比
+
+| 维度 | YARN | Kubernetes |
+|------|------|------------|
+| 调度模型 | 队列 + AM + Container | Pod + 亲和性 + QoS |
+| 弹性 | 弱（队列静态） | 强（HPA/KEDA） |
+| 存算分离 | 耦合 | 分离（原生支持） |
+| 网络 | 无原生 | Service + Ingress |
+| 运维 | 重（组件多） | 统一（K8s 生态） |
+| 生态 | Hadoop 系 | 全栈（CI/CD/监控/日志） |
+| 状态管理 | AM 内存 | 状态外置对象存储 |
+| 多租户 | Queue ACL | Namespace + RBAC |
+
+```
+趋势：
+  新项目 → K8s 原生
+  存量 Hadoop → YARN 保留跑 MR/Hive
+  混合架构 → YARN on K8s（Spark/Flink on YARN 跑在 K8s Pod 里）
+```
+
+## 十五、Spark/Flink on YARN vs K8s 选型
+
+| 维度 | on YARN | on K8s |
+|------|---------|--------|
+| 部署 | Hadoop 集群 | K8s 集群 |
+| 弹性 | YARN 动态分配 | K8s HPA/KEDA |
+| 状态 | YARN 管理 | 状态外置对象存储 |
+| 运维 | Hadoop 运维 | K8s 运维 |
+| 成本 | Hadoop 集群常驻 | 弹性按需 |
+| 推荐 | 存量 Hadoop | 新架构 |
+
+## 十六、K8s Operator for 大数据
+
+### 16.1 常用 Operator
+
+| Operator | 组件 | 说明 |
+|----------|------|------|
+| Flink Kubernetes Operator | Flink | 声明式管理 Flink 作业 |
+| Spark Operator | Spark | 声明式管理 Spark 应用 |
+| Strimzi | Kafka | Kafka 集群管理 |
+| YARN Operator | YARN | YARN on K8s（实验） |
+
+### 16.2 Flink Operator 配置
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-flink-job
+spec:
+  image: flink:1.18
+  flinkVersion: v1_18
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    replicas: 3
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/job.jar
+    parallelism: 4
+    upgradeMode: savepoint
+  flinkConfiguration:
+    state.checkpoints.dir: s3://checkpoints/flink
+    state.backend: rocksdb
+```
+
+## 十七、资源配额管理
+
+### 17.1 K8s 资源配额
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark-quota
+  namespace: spark-jobs
+spec:
+  hard:
+    requests.cpu: "100"
+    requests.memory: "200Gi"
+    limits.cpu: "200"
+    limits.memory: "400Gi"
+    pods: "100"
+    persistentvolumeclaims: "20"
+```
+
+### 17.2 YARN 队列配额
+
+```
+YARN 队列配额管理：
+  容量（capacity）：队列最小保证资源
+  最大容量（maximum-capacity）：队列上限
+  弹性借用（user-limit-factor）：允许借用其他队列空闲资源
+
+最佳实践：
+  实时队列保底 40%，最大 80%
+  批处理队列保底 60%，最大 90%
+  队列间 ACL 隔离
+```
+
+## 十八、调度与编排 Checklist
+
+- [ ] 多团队用 Capacity 队列隔离，实时保底。
+- [ ] Spark/Flink Native on K8s，状态外置、Pod 无状态。
+- [ ] 作业编排用 Airflow/DS，DAG 依赖 + SLA + 告警。
+- [ ] 弹性：HPA 按资源、KEDA 按 Kafka lag 扩缩。
+- [ ] 质量不过关阻断下游（与治理联动）。
+- [ ] 监控队列资源、Pending、作业失败率、调度延迟。
+
+## 十九、与其他板块的关系
 
 - 数据采集见「[03-数据采集与同步](03-数据采集与同步.md)」；
 - 离线/实时计算见「[07-批处理计算：MapReduce与Spark](07-批处理计算：MapReduce与Spark.md)」「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；

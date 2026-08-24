@@ -345,7 +345,250 @@ FOR SYSTEM_TIME AS OF 做时态维表 join（实时打宽）
 
 ---
 
-## 十三、与其他板块的关系
+## 十三、Flink 状态管理深入
+
+### 13.1 状态类型详解
+
+| 状态类型 | 说明 | API | 适用 |
+|----------|------|-----|------|
+| ValueState | 单值状态 | `ValueState<T>` | 计数器/标志位 |
+| ListState | 列表状态 | `ListState<T>` | 累积多条数据 |
+| MapState | 映射状态 | `MapState<K,V>` | 多 key 维护 |
+| ReducingState | 归约状态 | `ReducingState<T>` | 聚合（需 Reducer） |
+| AggregatingState | 聚合状态 | `AggregatingState<I,O>` | 复杂聚合逻辑 |
+
+```java
+// ValueState 示例：累加器
+public class SumAgg extends RichFlatMapFunction<Tuple2<String, Integer>,
+    Tuple2<String, Integer>> {
+    
+    private ValueState<Integer> sumState;
+    
+    @Override
+    public void open(Configuration conf) {
+        ValueStateDescriptor<Integer> desc = new ValueStateDescriptor<>("sum", Integer.class);
+        sumState = getRuntimeContext().getState(desc);
+    }
+    
+    @Override
+    public void flatMap(Tuple2<String, Integer> in, Collector<Tuple2<String, Integer>> out) {
+        Integer current = sumState.value();
+        if (current == null) current = 0;
+        current += in.f1;
+        sumState.update(current);
+        out.collect(Tuple2.of(in.f0, current));
+    }
+}
+
+// MapState 示例：去重计数
+public class DistinctCount extends KeyedProcessFunction<String, Event, Long> {
+    private MapState<String, Boolean> seenState;
+    
+    @Override
+    public void open(Configuration conf) {
+        MapStateDescriptor<String, Boolean> desc = new MapStateDescriptor<>(
+            "seen", String.class, Boolean.class);
+        seenState = getRuntimeContext().getMapState(desc);
+    }
+}
+```
+
+### 13.2 状态 TTL
+
+```java
+// 状态 TTL 配置
+StateTtlConfig ttl = StateTtlConfig.newBuilder(Time.days(7))
+    .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter(10_000_000)
+    .build();
+
+ValueStateDescriptor<String> desc = new ValueStateDescriptor<>("myState", String.class);
+desc.enableTimeToLive(ttl);
+```
+
+## 十四、Flink Savepoint vs Checkpoint
+
+### 14.1 对比
+
+| 维度 | Checkpoint | Savepoint |
+|------|------------|-----------|
+| 触发 | 自动（周期性） | 手动触发 |
+| 格式 | 内部格式（与代码版本相关） | 标准格式（跨版本兼容） |
+| 用途 | 故障恢复 | 升级/扩缩容/迁移 |
+| 保留 | 默认取消后删除 | 永久保留 |
+| 性能 | 增量（RocksDB） | 全量 |
+
+### 14.2 Savepoint 使用场景
+
+```bash
+# 触发 Savepoint
+flink savepoint hdfs://cluster/savepoints/job-123
+
+# 从 Savepoint 恢复
+flink run -s hdfs://cluster/savepoints/savepoint-abc123 -c com.example.Job
+
+# 取消作业并保留 Checkpoint
+flink cancel -s hdfs://cluster/savepoints/ job-id
+```
+
+## 十五、Flink CEP（Complex Event Processing）
+
+### 15.1 CEP 模式定义
+
+```java
+// CEP 模式：连续3次失败
+Pattern<LoginEvent, ?> pattern = Pattern
+    .<LoginEvent>begin("start")
+    .where(new SimpleCondition<LoginEvent>() {
+        public boolean filter(LoginEvent e) {
+            return e.getStatus().equals("FAIL");
+        }
+    })
+    .times(3)                    // 连续3次
+    .within(Time.minutes(5));    // 5分钟内
+
+// 应用模式
+PatternStream<LoginEvent> patternStream = CEP.pattern(
+    stream.keyBy(LoginEvent::getUserId), pattern);
+
+patternStream.select(new PatternSelectFunction<LoginEvent, Alert>() {
+    public Alert select(Map<String, List<LoginEvent>> pattern) {
+        return new Alert("连续登录失败", pattern.get("start").get(0).getUserId());
+    }
+});
+```
+
+### 15.2 CEP 模式类型
+
+| 模式 | 说明 | 示例 |
+|------|------|------|
+| `begin().where()` | 起始条件 | 首次事件 |
+| `next()` | 严格连续（中间不能有其他事件） | A 后紧跟 B |
+| `followedBy()` | 松散连续（中间可有其他事件） | A 后某个时间出现 B |
+| `followedByAny()` | 非确定松散连续 | A 后所有可能的 B |
+| `times(n)` | 重复 n 次 | 连续 n 次 |
+| `oneOrMore()` | 至少一次 | 至少出现一次 |
+| `optional()` | 可选 | 可能出现也可能不出现 |
+
+## 十六、Flink Table API/SQL 进阶
+
+### 16.1 时态表 Join（Temporal Join）
+
+```sql
+-- 维表 Join（时态表）
+SELECT o.order_id, o.amount, d.city
+FROM orders o
+LEFT JOIN user_dim FOR SYSTEM_TIME AS OF o.proc_time d
+  ON o.user_id = d.user_id;
+
+-- 说明：FOR SYSTEM_TIME AS OF 做时态维表 join
+-- 每条 orders 数据到达时，关联当时的最新维表数据
+```
+
+### 16.2 流式聚合
+
+```sql
+-- 5分钟滚动窗口 GMV
+SELECT
+  TUMBLE_START(ts, INTERVAL '5' MINUTE) AS window_start,
+  SUM(amount) AS gmv
+FROM orders
+GROUP BY TUMBLE(ts, INTERVAL '5' MINUTE);
+
+-- 会话窗口
+SELECT
+  SESSION_START(ts, INTERVAL '30' MINUTE) AS session_start,
+  user_id,
+  COUNT(*) AS event_count
+FROM events
+GROUP BY SESSION(ts, INTERVAL '30' MINUTE), user_id;
+```
+
+## 十七、Flink Exactly-Once 与 Sink
+
+### 17.1 端到端 Exactly-Once
+
+```
+Flink 的 Exactly-Once 分两层：
+  1. 处理语义：Checkpoint barrier 对齐 → 状态一致
+  2. 输出语义：Sink 支持事务或幂等 → 输出不重
+
+Sink Exactly-Once 实现方式：
+  ① Kafka Transactions（TwoPhaseCommitSinkFunction）
+  ② Iceberg/Paimon 幂等写入（主键 upsert）
+  ③ 数据库 Sink：幂等写入（INSERT ON DUPLICATE KEY UPDATE）
+```
+
+### 17.2 Sink 事务实现
+
+```java
+// Kafka 事务 Sink（端到端 Exactly-Once）
+FlinkKafkaProducer<String> sink = new FlinkKafkaProducer<>(
+    "output-topic",
+    new SimpleStringSchema(),
+    properties,
+    FlinkKafkaProducer.Semantic.EXACTLY_ONCE  // 事务模式
+);
+```
+
+## 十八、Flink 在 Kubernetes 中部署
+
+### 18.1 部署模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| Session Mode | 共享 TM 集群 | 多作业共享 |
+| Per-Job Mode | 每个作业独立集群（已弃用） | 无 |
+| Application Mode | 每个应用独立集群（推荐） | 生产 |
+
+### 18.2 Flink Operator 部署
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-flink-job
+spec:
+  image: flink:1.18
+  flinkVersion: v1_18
+  serviceAccount: flink
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    replicas: 3
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/examples/streaming/StateMachineExample.jar
+    parallelism: 4
+    upgradeMode: savepoint
+    savepointTriggerNonce: 0
+```
+
+## 十九、Flink vs Kafka Streams 对比
+
+| 维度 | Flink | Kafka Streams |
+|------|-------|---------------|
+| 定位 | 分布式流处理框架 | 客户端库（嵌入应用） |
+| 状态存储 | RocksDB/内存 | 本地文件 |
+| Exactly-Once | Checkpoint + 事务 | Kafka 事务 |
+| 窗口支持 | 丰富（滚动/滑动/会话） | 有限 |
+| SQL | Flink SQL | 无 |
+| 部署 | 独立集群/K8s | 嵌入应用（无需集群） |
+| 适用 | 复杂流处理/大规模 | 简单流处理/Kafka 生态 |
+
+```
+选型口诀：
+  纯 Kafka 生态 + 简单流处理 → Kafka Streams
+  复杂窗口/状态/SQL/大规模 → Flink
+  需要精确一次 + 多源 → Flink
+```
+
+## 二十、与其他板块的关系
 
 - 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；
 - 批处理对比见「[07-批处理计算：MapReduce与Spark](07-批处理计算：MapReduce与Spark.md)」；
