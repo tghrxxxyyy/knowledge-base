@@ -270,7 +270,479 @@ K8s 部署：
 
 ---
 
-## 九、与其他板块的关系
+## 九、Trino 架构深入与查询优化
+
+### 9.1 Coordinator + Worker 架构详解
+
+```
+Trino 集群架构：
+
+  Coordinator（协调节点，可多实例）：
+    ├── SQL 解析器（ANTLR 语法解析）
+    ├── 查询分析器（语义分析/类型检查）
+    ├── 查询优化器（规则优化 + 成本优化）
+    ├── Stage 调度器（分解 Stage → 分发 Task）
+    ├── 结果聚合（合并 Worker 结果）
+    └── REST API（客户端通信）
+
+  Worker（工作节点，可水平扩展）：
+    ├── Task 执行器（Pipeline 执行模型）
+    ├── 页面源（PageSource → 从 Connector 读数据）
+    ├── 页面 Sink（PageSink → 写数据到 Connector）
+    ├── 内存管理器（查询级内存限制）
+    └── 任务管理器（Task 生命周期管理）
+
+  存储层（不存储数据）：
+    ├── Connector SPI（连接器接口）
+    ├── 元数据缓存（表/列/分区信息）
+    └── 数据源对接（MySQL/Hive/S3/ES...）
+
+  通信机制：
+    Coordinator ↔ Worker: REST API（HTTP/HTTPS）
+    Worker ↔ Worker: 数据 Shuffle（Exchange）
+    所有节点: 基于 HTTP/2 的高效通信
+```
+
+### 9.2 查询解析与优化
+
+```
+Trino 查询处理流程：
+
+  SQL 字符串
+  → Parser（ANTLR 语法树）
+  → Analyzer（语义分析/类型推断/权限检查）
+  → Logical Plan（逻辑计划）
+  → Optimizer（规则优化 + 成本优化）
+  → Physical Plan（物理计划）
+  → Stage 分解（Coordinator/Source/Fixed/Single）
+  → Task 生成（分布式执行单元）
+  → Task 分发到 Worker
+  → Pipeline 执行（读→处理→写）
+  → 结果返回 Coordinator → 客户端
+
+关键优化器规则：
+  1. 谓词下推（Predicate Pushdown）：WHERE 条件推到 Connector
+  2. 列裁剪（Column Pruning）：只读需要的列
+  3. 分区裁剪（Partition Pruning）：只读匹配分区
+  4. 聚合下推（Aggregation Pushdown）：源端预聚合
+  5. Join 重排序（Join Reordering）：按成本选择最优 Join 顺序
+  6. 子查询合并（Subquery Merging）：减少重复扫描
+  7. 常量折叠（Constant Folding）：编译期计算常量表达式
+```
+
+### 9.3 动态过滤（Dynamic Filtering）
+
+```
+动态过滤 = Join 时从大表提取过滤条件，应用到小表扫描
+
+示例：
+  SELECT * FROM orders o
+  JOIN users u ON o.user_id = u.id
+  WHERE o.order_date > '2024-01-01';
+
+  传统执行：
+    orders 扫描全量 → Join → 过滤
+    users 扫描全量 → Join → 过滤
+
+  动态过滤执行：
+    阶段 1：扫描 orders（过滤 order_date > 2024-01-01）
+           → 提取 user_id 集合 {101, 102, 103, ...}
+    阶段 2：将 user_id 集合推送到 users Connector
+           → users 只扫描 id IN (101, 102, 103, ...)
+           → 大幅减少 users 扫描量
+
+  配置：
+    optimizer.dynamic-filtering=true（默认开启）
+    dynamic-filtering-max-domain-combinations=1000
+    dynamic-filtering-pushdown-filter-factor=10
+```
+
+### 9.4 字典聚合（Dictionary Aggregation）
+
+```
+字典聚合 = 用字典编码优化 GROUP BY
+
+原理：
+  低基数列（如 status, region）GROUP BY 时
+  传统：逐行比较字符串 → CPU 开销大
+  字典聚合：将字符串映射为整数 → 整数 GROUP BY → 极快
+
+  适用条件：
+    列的唯一值数量有限（< 几千）
+    GROUP BY 列是低基数列
+
+  配置：
+    dictionary-aggregation=true（默认开启）
+
+  验证：
+    EXPLAIN 输出中看到 "DictionaryAggregation" 节点
+    表示字典聚合已生效
+```
+
+---
+
+## 十、Trino Connector SPI 深入
+
+### 10.1 Connector 核心接口
+
+```java
+// Connector 实现核心接口
+public interface Connector {
+    // 元数据管理
+    ConnectorMetadata getMetadata();
+
+    // Split 管理（数据分片）
+    ConnectorSplitManager getSplitManager();
+
+    // 数据读取
+    ConnectorPageSourceProvider getPageSourceProvider();
+
+    // 数据写入（可选）
+    ConnectorPageSinkProvider getPageSinkProvider();
+
+    // 事务管理（可选）
+    ConnectorTransactionHandle beginTransaction();
+}
+
+// 元数据接口（实现表/列信息查询）
+public interface ConnectorMetadata {
+    // Schema 管理
+    List<String> listSchemaNames(ConnectorSession session);
+    List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schema);
+
+    // 表元数据
+    ConnectorTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName);
+    ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle handle);
+    List<ConnectorColumnHandle> getColumns(ConnectorSession session, ConnectorTableHandle handle);
+
+    // 应用谓词下推（核心）
+    Optional<ConnectorApplyFilterResult> applyFilter(
+        ConnectorSession session,
+        ConnectorTableHandle handle,
+        TupleDomain<ColumnHandle> filter);
+
+    // 聚合下推
+    Optional<ConnectorAggregationgregationPushdownResult> applyAggregationgregationPushdown(
+        ConnectorSession session,
+        ConnectorTableHandle handle,
+        ConnectorAggregationgregationPushdownResult result);
+}
+
+// Split 管理（数据分片）
+public interface ConnectorSplitManager {
+    ConnectorSplitSource getSplits(
+        ConnectorSession session,
+        ConnectorTableHandle table,
+        DynamicFilter dynamicFilter);
+}
+```
+
+### 10.2 自定义 Connector 开发流程
+
+```
+开发自定义 Connector 步骤：
+
+  1. 实现 Connector 接口
+     实现 getMetadata/getSplitManager/getPageSourceProvider
+
+  2. 实现 ConnectorMetadata
+     实现 listSchemaNames/listTables/getTableHandle
+     实现 getColumns（返回列信息）
+     实现 applyFilter（谓词下推）
+
+  3. 实现 ConnectorSplitManager
+     getSplits：将表数据划分为 Split（分片）
+     每个 Split 对应一个数据源片段
+
+  4. 实现 ConnectorPageSourceProvider
+     createPageSource：根据 Split 读取数据
+     返回 PageSource（逐页读取数据）
+
+  5. 打包为 JAR → 放入 Trino plugin 目录
+     每个 Connector 一个目录（如 plugin/mysql/）
+
+  6. 配置 catalog
+     catalog/properties 文件指定 Connector 类
+```
+
+---
+
+## 十一、Trino 容错执行与安全
+
+### 11.1 容错执行（Fault-Tolerant Execution）
+
+```
+Trino 容错模式（实验性）：
+
+  传统执行（当前默认）：
+    查询失败 → 整体失败 → 需要重跑
+
+  容错执行（可选）：
+    任务失败 → 重新调度到其他 Worker → 继续执行
+    中间结果持久化到存储（S3/HDFS）→ 避免重复计算
+
+  配置：
+    queryFaultToleranceEnabled=true
+
+  工作原理：
+    Stage 中间结果写入临时存储（S3/HDFS）
+    Task 失败 → 重新创建 Task → 从临时存储读取中间结果
+    支持 Stage 级别重试（非查询级别）
+
+  适用场景：
+    大规模 ETL 查询（运行数小时）
+    资源不稳定集群（Spot 实例）
+    多租户环境（资源竞争频繁）
+
+  当前状态：
+    实验性功能（非生产就绪）
+    性能开销：中间结果持久化增加 10-20% 开销
+    社区持续优化中
+```
+
+### 11.2 Trino 安全机制
+
+```
+认证（Authentication）：
+  LDAP：集成 Active Directory / OpenLDAP
+  Kerberos：企业级身份认证
+  Password：内置密码认证
+  Certificate：双向 TLS 认证
+  OAuth 2.0：集成身份提供商
+
+  配置示例（LDAP）：
+    http-server.authentication.type=LDAP
+    ldap.url=ldap://ldap.example.com:389
+    ldap.user-base-dn=dc=example,dc=com
+    ldap.user-filter=(&(objectClass=person)(uid=${USER}))
+
+授权（Authorization）：
+  RBAC（基于角色的访问控制）
+    角色 → 权限 → 资源（Catalog/Schema/Table/Column）
+    系统角色：admin、user
+    自定义角色：data_analyst、data_engineer
+
+  配置：
+    access-control.name=file
+    access-control.config-file=/etc/trino/access-control.json
+
+列级掩码（Column Masking）：
+  敏感列自动脱敏（如手机号、身份证号）
+  不同角色看到不同数据
+
+  配置示例：
+    {
+      "row-filters": [],
+      "column-masks": {
+        "users.phone": {
+          "type": "partial",
+          "mask": "concat('***', substring(${USER} from 8))"
+        }
+      }
+    }
+
+行级过滤（Row Filtering）：
+  不同角色只能看到部分行（如区域数据隔离）
+```
+
+---
+
+## 十二、Trino 性能调优
+
+### 12.1 内存调优
+
+```properties
+# Worker 内存配置
+query.max-memory=50GB              # 单查询最大内存（集群级）
+query.max-memory-per-node=8GB      # 单节点单查询最大内存
+query.max-total-memory-per-node=10GB  # 单节点总内存
+query.memory-headroom=2GB          # 系统预留内存
+
+# 查询内存分配：
+#   每查询内存 = min(query.max-memory, query.max-memory-per-node × Worker 数)
+#   Join/聚合操作消耗最多内存
+#   大表 JOIN → 可能 OOM → 调小 query.max-memory
+
+# 内存溢出排查：
+#   查询日志：EXCEEDED_MEMORY_LIMIT
+#   监控：trino_queries 查询内存使用
+#   解决：调小并发/查询内存限制/优化查询
+```
+
+### 12.2 Join 策略优化
+
+```
+Trino Join 策略：
+
+  1. Broadcast Join（广播 Join）：
+     小表广播到所有 Worker → 大表分区处理
+     适用：小表 < 几百 MB
+     优势：避免 Shuffle，性能好
+     劣势：小表重复传输（网络开销）
+
+  2. Partitioned Join（分区 Join）：
+     大表按 Join Key 分区 → Shuffle → Worker 本地 Join
+     适用：大表 JOIN 大表
+     优势：内存友好
+     劣势：网络 Shuffle 开销大
+
+  3. Hash Join（哈希 Join）：
+     构建阶段：构建哈希表（小表）
+     探测阶段：大表逐行探测
+     支持：内连接/左连接/右连接/全连接
+
+  优化器自动选择：
+    优化器根据统计信息选择最优策略
+    统计信息：表行数、列基数、数据分布
+    收集统计信息：ANALYZE table_name;
+```
+
+### 12.3 性能监控与诊断
+
+```sql
+-- 查询执行信息
+SELECT
+    query_id,
+    user,
+    source,
+    state,
+    query,
+    started,
+    end_time - started AS duration,
+    queued_time_ms,
+    analyze_time_ms,
+    process_time_ms,
+    result_queue_time_ms
+FROM system.runtime.queries
+WHERE state = 'FINISHED'
+ORDER BY duration DESC
+LIMIT 20;
+
+-- 查询内存使用
+SELECT
+    query_id,
+    user,
+    memory_pool,
+    peak_memory
+FROM system.runtime.queries
+WHERE memory_pool != 'reserved'
+ORDER BY peak_memory DESC;
+
+-- Stage 执行详情
+SELECT
+    query_id,
+    stage_id,
+    stage_number,
+    state,
+    rows,
+    bytes,
+    cpu_time_ms,
+    wall_time_ms,
+    user_memory_reservation
+FROM system.runtime.stages
+WHERE query_id = 'your_query_id';
+
+-- Worker 健康
+SELECT
+    node_id,
+    http_uri,
+    node_pool,
+    active_queries,
+    memory_available,
+    cpu_available
+FROM system.runtime.nodes
+WHERE state = 'active';
+```
+
+---
+
+## 十三、Trino on Kubernetes
+
+### 13.1 K8s 部署架构
+
+```yaml
+# Trino on K8s 架构
+Coordinator Deployment:
+  replicas: 2（高可用）
+  containers:
+    - coordinator: Coordinator 服务
+  services:
+    - ClusterIP: 内部通信
+    - LoadBalancer: 客户端访问
+
+Worker StatefulSet:
+  replicas: N（弹性伸缩）
+  containers:
+    - worker: Worker 服务
+  volumeClaimTemplates:
+    - 本地缓存卷（可选）
+
+ConfigMap:
+  config.properties: Trino 配置
+  catalog/: 数据源配置
+
+Secret:
+  ldap-password: LDAP 认证密码
+  tls-cert: TLS 证书
+
+Ingress:
+  路由规则：trino.example.com → Coordinator
+```
+
+### 13.2 Helm Chart 部署
+
+```bash
+# 使用 Trino Helm Chart
+helm repo add trino https://trino.io/charts
+helm repo update
+
+# 安装 Trino
+helm install trino trino/trino \
+  --set coordinator.replicas=2 \
+  --set worker.replicas=3 \
+  --set worker.autoscaling.enabled=true \
+  --set worker.autoscaling.minReplicas=3 \
+  --set worker.autoscaling.maxReplicas=10 \
+  --set coordinator.config."query\.max-memory"="50GB"
+
+# 监控集成
+helm install trino trino/trino \
+  --set prometheus.enabled=true \
+  --set grafana.enabled=true
+```
+
+---
+
+## 十四、Trino vs PrestoDB vs Athena 对比
+
+| 维度 | Trino | PrestoDB | AWS Athena |
+|------|-------|----------|------------|
+| **维护方** | Trino 社区（Starburst 主导） | Facebook/Meta | AWS |
+| **协议** | Apache License 2.0 | Apache License 2.0 | 闭源 |
+| **功能** | 最丰富（最新特性） | 稳定（Facebook 验证） | 简化版 |
+| **Connector** | 最多（50+） | 中等 | 有限（AWS 生态） |
+| **性能** | 优秀（持续优化） | 优秀 | 良好（受限） |
+| **部署** | 自托管/云 | 自托管 | 托管服务 |
+| **成本** | 自运维成本 | 自运维成本 | 按查询付费 |
+| **社区** | 活跃（GitHub 最快增长） | 活跃（Facebook 背书） | 无开源社区 |
+| **SQL 方言** | ANSI 标准 | ANSI 标准 | AWS 扩展 |
+| **适用** | 通用联邦查询 | Facebook 生态 | AWS 数据湖 |
+
+### 选型决策
+
+```
+场景 → 选型：
+  通用联邦查询（多云）→ Trino（功能最全，社区最活跃）
+  Facebook 生态（Hive 表格式兼容）→ PrestoDB
+  AWS 数据湖（S3 + Glue）→ Athena（零运维）
+  功能需求（动态过滤/字典聚合）→ Trino（新特性最多）
+  已有 Trino 集群 → 继续用（迁移成本高）
+  新建集群 → Trino（社区方向，Starburst 支持）
+```
+
+---
+
+## 十五、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../基础知识/大数据/05-列式存储与数据湖格式.md)」；
 - 与 Spark/ClickHouse 对比见对应文档；
