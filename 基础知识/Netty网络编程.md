@@ -297,7 +297,456 @@ IdleStateHandler（空闲检测）：
 
 ---
 
-## 七、与其他板块的关系
+## 五、Netty ByteBuf 内部实现
+
+### 5.1 ByteBuf 内存布局
+
+```
+ByteBuf 内存结构：
+  ┌──────────────────────────────────────────────┐
+  │  已读区（0 ~ readerIndex）                      │
+  ├──────────────────────────────────────────────┤
+  │  可读区（readerIndex ~ writerIndex）            │
+  ├──────────────────────────────────────────────┤
+  │  可写区（writerIndex ~ capacity）               │
+  ├──────────────────────────────────────────────┤
+  │  最大容量区（capacity ~ maxCapacity）            │
+  └──────────────────────────────────────────────┘
+
+双指针设计：
+  readerIndex → 读位置
+  writerIndex → 写位置
+  无需 flip() 操作（与 Java NIO ByteBuffer 区别）
+```
+
+### 5.2 ByteBuf 类型
+
+| 类型 | 说明 | 适用场景 |
+|------|------|----------|
+| HeapByteBuf | JVM 堆内存 | 简单场景，GC 管理 |
+| DirectByteBuf | OS 直接内存 | 零拷贝，高性能 |
+| PooledByteBuf | 内存池化 | 高并发场景（默认） |
+| UnpooledByteBuf | 非池化 | 低频使用 |
+| CompositeByteBuf | 组合缓冲区 | 多 Buffer 合并（零拷贝） |
+| SlicedByteBuf | 切片缓冲区 | 共享内存（零拷贝） |
+
+### 5.3 引用计数机制
+
+```java
+// 引用计数管理
+ByteBuf buf = Unpooled.buffer();
+try {
+    // 增加引用计数
+    buf.retain();
+    
+    // 使用 ByteBuf
+    // ...
+    
+} finally {
+    // 释放引用计数
+    buf.release();
+}
+
+// 引用计数规则：
+//   创建时 count=1
+//   retain() → count++
+//   release() → count-- → count=0 时释放内存
+//   防止内存泄漏：try-finally 确保 release
+```
+
+---
+
+## 六、Netty Channel Pipeline 详解
+
+### 6.1 Pipeline 处理流程
+
+```mermaid
+graph TD
+    A[数据到达] --> B[入站 Handler 1]
+    B --> C[入站 Handler 2]
+    C --> D[入站 Handler 3]
+    D --> E[业务逻辑]
+    E --> F[出站 Handler 1]
+    F --> G[出站 Handler 2]
+    G --> H[数据发送]
+```
+
+### 6.2 Handler 类型详解
+
+| Handler 类型 | 事件 | 典型用途 |
+|--------------|------|----------|
+| ChannelInboundHandlerAdapter | channelRead | 接收数据 |
+| ChannelOutboundHandlerAdapter | write | 发送数据 |
+| ChannelDuplexHandler | 两者 | 编解码器 |
+| ChannelInboundHandler | exceptionCaught | 异常处理 |
+| IdleStateHandler | userEventTriggered | 空闲检测 |
+| LengthFieldBasedFrameDecoder | channelRead | 粘包拆包 |
+
+### 6.3 Pipeline 操作方法
+
+```java
+// 添加 Handler
+pipeline.addLast("decoder", new StringDecoder());
+pipeline.addLast("encoder", new StringEncoder());
+pipeline.addLast("business", new BusinessHandler());
+
+// 插入 Handler
+pipeline.addFirst("first", new FirstHandler());
+pipeline.addLast("last", new LastHandler());
+pipeline.addBefore("business", "auth", new AuthHandler());
+pipeline.addAfter("business", "log", new LogHandler());
+
+// 移除 Handler
+pipeline.remove("decoder");
+
+// 替换 Handler
+pipeline.replace("decoder", "newDecoder", new NewDecoder());
+```
+
+### 6.4 入站与出站事件传播
+
+```java
+// 入站事件传播（从 Head 到 Tail）
+ctx.fireChannelRead(msg);  // 传播到下一个入站 Handler
+
+// 出站事件传播（从 Tail 到 Head）
+ctx.write(msg);  // 传播到下一个出站 Handler
+
+// 终止传播
+// 不调用 fireXxx() 即可终止
+```
+
+---
+
+## 七、Netty EventLoop 事件循环模型
+
+### 7.1 EventLoop 工作流程
+
+```
+EventLoop 单线程事件循环：
+
+while (true) {
+    // 1. 阻塞等待 IO 事件
+    int readyChannels = selector.select(timeout);
+    
+    // 2. 处理就绪的 IO 事件
+    for (SelectionKey key : selector.selectedKeys()) {
+        if (key.isAcceptable()) { /* Accept 新连接 */ }
+        if (key.isReadable()) { /* 读数据 */ }
+        if (key.isWritable()) { /* 写数据 */ }
+    }
+    
+    // 3. 处理所有待执行的任务
+    runAllTasks();
+}
+```
+
+### 7.2 EventLoop 与 Channel 绑定
+
+```
+EventLoopGroup（线程池）
+  ├── EventLoop-1 → Channel-1, Channel-2, Channel-3
+  ├── EventLoop-2 → Channel-4, Channel-5, Channel-6
+  ├── EventLoop-3 → Channel-7, Channel-8, Channel-9
+  └── EventLoop-4 → Channel-10, Channel-11, Channel-12
+
+一个 Channel 始终绑定一个 EventLoop：
+  → 所有事件在同一线程中处理（无需加锁）
+  → 减少上下文切换开销
+```
+
+### 7.3 EventLoop 任务调度
+
+```java
+// 延迟任务
+eventLoop.schedule(() -> {
+    System.out.println("延迟 5 秒执行");
+}, 5, TimeUnit.SECONDS);
+
+// 定时任务
+eventLoop.scheduleAtFixedRate(() -> {
+    System.out.println("每 10 秒执行一次");
+}, 0, 10, TimeUnit.SECONDS);
+
+// 立即执行
+eventLoop.execute(() -> {
+    System.out.println("立即执行");
+});
+```
+
+---
+
+## 八、Netty 零拷贝详解
+
+### 8.1 零拷贝实现方式
+
+| 方式 | 说明 | 性能提升 |
+|------|------|----------|
+| CompositeByteBuf | 逻辑合并多个 Buffer | 避免数据拷贝 |
+| ByteBuf.slice | 切片共享内存 | 避免数据拷贝 |
+| FileRegion.transferTo | 文件传输（DMA） | 绕过用户态 |
+| WebSocket 零拷贝 | 直接转发 Frame | 避免解码再编码 |
+
+### 8.2 传统文件传输 vs 零拷贝
+
+```
+传统文件传输（4 次拷贝）：
+  1. 磁盘 → 内核缓冲区（DMA 拷贝）
+  2. 内核缓冲区 → 用户缓冲区（CPU 拷贝）
+  3. 用户缓冲区 → Socket 缓冲区（CPU 拷贝）
+  4. Socket 缓冲区 → 网卡（DMA 拷贝）
+
+Netty 零拷贝（3 次拷贝）：
+  1. 磁盘 → 内核缓冲区（DMA 拷贝）
+  2. 内核缓冲区 → 网卡（DMA 拷贝，绕过用户态）
+  3. 文件描述符传递（无数据拷贝）
+
+性能：减少 1 次 CPU 拷贝，大文件传输提升显著
+```
+
+### 8.3 FileRegion 使用示例
+
+```java
+// 零拷贝文件传输
+RandomAccessFile file = new RandomAccessFile("data.bin", "r");
+FileRegion region = new DefaultFileRegion(
+    file.getChannel(), 0, file.length());
+
+ctx.write(region, new VoidChannelPromise());
+```
+
+---
+
+## 九、Netty 编解码框架
+
+### 9.1 编解码器类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| MessageToByteEncoder | 出站编码 | Object → ByteBuf |
+| ByteToMessageDecoder | 入站解码 | ByteBuf → Object |
+| MessageToMessageEncoder | 出站转出站 | Object → Object |
+| MessageToMessageDecoder | 入站转入站 | Object → Object |
+| ByteToMessageCodec | 编解码一体 | ByteBuf ↔ Object |
+| MessageToMessageCodec | 转码一体 | Object ↔ Object |
+
+### 9.2 自定义编解码器示例
+
+```java
+// 编码器：对象 → ByteBuf
+public class MyEncoder extends MessageToByteEncoder<MyMessage> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, MyMessage msg, ByteBuf out) {
+        out.writeInt(msg.getType());
+        out.writeBytes(msg.getData());
+    }
+}
+
+// 解码器：ByteBuf → 对象
+public class MyDecoder extends ByteToMessageDecoder {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        if (in.readableBytes() < 8) return; // 等待数据足够
+        int type = in.readInt();
+        byte[] data = new byte[in.readableBytes()];
+        in.readBytes(data);
+        out.add(new MyMessage(type, data));
+    }
+}
+```
+
+### 9.3 粘包拆包解决方案
+
+| 解决方案 | 说明 | 适用场景 |
+|----------|------|----------|
+| 固定长度 | FixedLengthFrameDecoder | 消息长度固定 |
+| 分隔符 | DelimiterBasedFrameDecoder | 文本协议（换行） |
+| 长度字段 | LengthFieldBasedFrameDecoder | 二进制协议（最常用） |
+| 自定义协议 | 继承 ByteToMessageDecoder | 私有协议 |
+
+---
+
+## 十、Netty 连接池
+
+### 10.1 连接池架构
+
+```java
+// Netty 连接池实现
+GenericKeyedObjectPool<HostPort, Channel> pool = 
+    new GenericKeyedObjectPool<>(new ChannelFactory());
+
+// 借用连接
+Channel ch = pool.borrowObject(new HostPort("127.0.0.1", 8080));
+try {
+    // 使用连接发送请求
+    ch.writeAndFlush(request).sync();
+} finally {
+    // 归还连接
+    pool.returnObject(new HostPort("127.0.0.1", 8080), ch);
+}
+```
+
+### 10.2 连接池参数配置
+
+| 参数 | 说明 | 建议值 |
+|------|------|--------|
+| maxTotal | 最大连接数 | 100~1000 |
+| maxPerKey | 每个目标最大连接数 | 10~50 |
+| minIdle | 最小空闲连接数 | 5~10 |
+| maxIdle | 最大空闲连接数 | 10~20 |
+| maxWaitMillis | 获取连接最大等待时间 | 3000ms |
+| timeBetweenEvictionRunsMillis | 空闲检测间隔 | 60000ms |
+| minEvictableIdleTimeMillis | 空闲驱逐时间 | 300000ms |
+
+### 10.3 连接池健康检查
+
+```java
+// 连接健康检查
+pool.setTestOnBorrow(true);  // 借用时检查
+pool.setTestOnReturn(true);   // 归还时检查
+pool.setTestWhileIdle(true);  // 空闲时检查
+
+// 自定义健康检查
+pool.setValidator(new KeyedPoolableObjectPool<HostPort, Channel>() {
+    @Override
+    public boolean validateObject(HostPort key, Channel obj) {
+        return obj.isActive() && !obj.isClosing();
+    }
+});
+```
+
+---
+
+## 十一、Netty SSL/TLS 支持
+
+### 11.1 SSL 配置示例
+
+```java
+// SSL Context 初始化
+SslContext sslCtx = SslContextBuilder.forServer(certFile, keyFile)
+    .protocols("TLSv1.3", "TLSv1.2")
+    .ciphers(CipherSuite.THREE_DES_EDE_CBC_SHA)
+    .build();
+
+// 客户端 SSL
+SslContext clientSslCtx = SslContextBuilder.forClient()
+    .trustManager(trustCertFile)
+    .build();
+
+// Pipeline 中添加 SSL Handler
+pipeline.addLast("ssl", sslCtx.newHandler(ctx.alloc()));
+pipeline.addLast("http", new HttpServerCodec());
+```
+
+### 11.2 SSL 性能优化
+
+| 参数 | 说明 |
+|------|------|
+| SSL 会话缓存 | 启用 SSLSessionCache 减少握手 |
+| TLS 1.3 | 更快的握手（1-RTT） |
+| 会话票据 | 避免完整握手 |
+| 硬件加速 | 使用 Intel QAT/ARM CE |
+
+---
+
+## 十二、Netty 在 RPC 框架中的应用
+
+### 12.1 Dubbo 中的 Netty
+
+```
+Dubbo RPC 调用流程：
+  Consumer → NettyClient → 网络 → NettyServer → Provider
+
+Netty 在 Dubbo 中的作用：
+  ├── TCP 连接管理（连接池）
+  ├── 协议编解码（Dubbo 协议）
+  ├── 心跳检测（IdleStateHandler）
+  ├── 超时控制（Future）
+  └── 序列化（Hessian2/Protobuf）
+```
+
+### 12.2 gRPC 中的 Netty
+
+```
+gRPC Java 底层：
+  gRPC-Java → Netty → HTTP/2
+
+Netty 提供：
+  ├── HTTP/2 帧编解码器
+  ├── 多路复用（Stream 处理）
+  ├── 流控（Flow Control）
+  ├── TLS 支持（gRPC over TLS）
+  └── 压缩（Message Size）
+```
+
+### 12.3 RocketMQ 中的 Netty
+
+```
+RocketMQ 通信层：
+  Producer/Broker/Consumer → NettyRemotingServer/Client
+
+Netty 提供：
+  ├── 异步通信（Future/Promise）
+  ├── 协议编解码（RemotingCommand）
+  ├── 连接管理（心跳检测）
+  ├── 序列化（JSON/Protobuf）
+  └── 流控（信号量限流）
+```
+
+---
+
+## 十三、Netty 内存泄漏检测
+
+### 13.1 泄漏检测级别
+
+```bash
+# 启动参数设置检测级别
+-Dio.netty.leakDetection.level=PARANOID  # 最严格（生产不推荐）
+-Dio.netty.leakDetection.level=ADVANCED   # 高级检测
+-Dio.netty.leakDetection.level=SIMPLE     # 简单检测（默认）
+-Dio.netty.leakDetection.level=DISABLED   # 禁用
+```
+
+### 13.2 泄漏检测原理
+
+```
+Netty 内存泄漏检测：
+  每个 ByteBuf 分配时记录堆栈信息
+  release() 时检查引用计数
+  如果引用计数 > 0 → 输出泄漏警告
+
+警告信息包含：
+  泄漏的 ByteBuf 类型
+  分配时的堆栈信息
+  当前引用计数
+  访问的线程
+```
+
+### 13.3 常见泄漏场景与解决
+
+| 泄漏场景 | 原因 | 解决 |
+|----------|------|------|
+| 未 release | ByteBuf 未释放 | try-finally 释放 |
+| 重复 release | 多次释放导致异常 | 用 ReferenceCountUtil.releaseOnce |
+| 异步未处理 | 异步回调中未释放 | 在回调中释放 |
+| 编解码器泄漏 | 编解码器内部未释放 | 检查编解码器实现 |
+
+```java
+// 正确的释放方式
+ByteBuf buf = ctx.alloc().buffer();
+try {
+    // 使用 ByteBuf
+    buf.writeBytes(data);
+    ctx.writeAndFlush(buf);
+} finally {
+    // 注意：writeAndFlush 会自动 release，这里不需要
+    // 但如果写入失败，需要手动 release
+}
+```
+
+---
+
+## 十四、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；
 - Reactor 模式见「[并发编程](../基础知识/并发编程.md)」；

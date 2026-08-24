@@ -291,7 +291,450 @@ try (Tracer.SpanInScope ws = tracer.withSpan(span)) {
 
 ---
 
-## 八、与其他板块的关系
+## 八、Spring Cloud Gateway 深入
+
+### 8.1 Gateway 核心架构
+
+```mermaid
+graph TD
+    A[客户端请求] --> B[Netty WebServer]
+    B --> C[DispatcherHandler]
+    C --> D[RoutePredicateHandlerMapping]
+    D --> E[FilteringWebHandler]
+    E --> F[Gateway Filter Chain]
+    F --> G[代理到后端服务]
+```
+
+### 8.2 路由断言工厂
+
+| 断言工厂 | 配置示例 | 说明 |
+|----------|----------|------|
+| Path | `Path=/api/**` | 路径匹配 |
+| Header | `Header=X-Auth-Token, \d+` | Header 匹配 |
+| Method | `Method=GET,POST` | HTTP 方法匹配 |
+| Query | `Query=name, zhangsan` | 参数匹配 |
+| After | `After=2024-01-01T00:00:00+08:00` | 时间之后 |
+| Before | `Before=2024-12-31T23:59:59+08:00` | 时间之前 |
+| Between | `Between=time1,time2` | 时间区间 |
+| Host | `Host=**.example.com` | 域名匹配 |
+| RemoteAddr | `RemoteAddr=192.168.1.0/24` | IP 匹配 |
+| Weight | `Weight=group1, 8` | 权重路由 |
+
+### 8.3 Gateway 过滤器
+
+```java
+// 全局过滤器
+@Component
+public class AuthGlobalFilter implements GlobalFilter, Ordered {
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String token = exchange.getRequest().getHeaders().getFirst("Authorization");
+        if (token == null || !validate(token)) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+        // 传递用户信息
+        exchange.getRequest().mutate()
+            .header("X-User-Id", parseUserId(token));
+        return chain.filter(exchange);
+    }
+    
+    @Override
+    public int getOrder() {
+        return -1;  // 优先级（越小越优先）
+    }
+}
+
+// 局部过滤器
+@Component
+public class RequestTimeFilter implements GatewayFilter, Ordered {
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        long start = System.currentTimeMillis();
+        return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+            long duration = System.currentTimeMillis() - start;
+            exchange.getResponse().getHeaders().add("X-Response-Time", duration + "ms");
+        }));
+    }
+    
+    @Override
+    public int getOrder() {
+        return 0;
+    }
+}
+```
+
+### 8.4 Gateway 限流配置
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+      - id: order-service
+        uri: lb://order-service
+        predicates:
+        - Path=/api/order/**
+        filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100
+            redis-rate-limiter.burstCapacity: 200
+            key-resolver: "#{@userKeyResolver}"
+
+# KeyResolver 实现
+@Bean
+public KeyResolver userKeyResolver() {
+    return exchange -> Mono.just(
+        exchange.getRequest().getHeaders().getFirst("X-User-Id")
+    );
+}
+```
+
+---
+
+## 九、Spring Cloud Circuit Breaker（Resilience4j）
+
+### 9.1 核心组件
+
+| 组件 | 说明 |
+|------|------|
+| CircuitBreaker | 熔断器（Closed/Open/HalfOpen） |
+| RateLimiter | 限流器（固定窗口） |
+| Retry | 重试（指数退避） |
+| Bulkhead | 隔离器（信号量/线程池） |
+| TimeLimiter | 超时控制 |
+| Cache | 缓存（请求结果缓存） |
+
+### 9.2 集成示例
+
+```java
+// 熔断器配置
+@Bean
+public CircuitBreakerConfig circuitBreakerConfig() {
+    return CircuitBreakerConfig.custom()
+        .failureRateThreshold(50)          // 失败率阈值
+        .waitDurationInOpenState(Duration.ofSeconds(10))  // 熔断等待时间
+        .slidingWindowSize(100)            // 滑动窗口大小
+        .minimumNumberOfCalls(10)          // 最小请求数
+        .build();
+}
+
+// 使用熔断器
+@Service
+public class OrderService {
+    @CircuitBreaker(name = "orderService", fallbackMethod = "fallback")
+    public Order getOrder(Long id) {
+        return orderRepository.findById(id);
+    }
+    
+    public Order fallback(Long id, Throwable t) {
+        return new Order("默认订单");  // 降级返回
+    }
+}
+```
+
+### 9.3 Resilience4j 配置
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      orderService:
+        slidingWindowSize: 100
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 10
+  retry:
+    instances:
+      orderService:
+        maxAttempts: 3
+        waitDuration: 500ms
+        exponentialBackoffMultiplier: 2
+  bulkhead:
+    instances:
+      orderService:
+        maxConcurrentCalls: 25
+        maxWaitDuration: 0
+  timelimiter:
+    instances:
+      orderService:
+        timeoutDuration: 3s
+```
+
+---
+
+## 十、Spring Cloud Config Server 模式
+
+### 10.1 Config Server 架构
+
+```
+Git/SVN/DB → Config Server → Config Client（应用）
+
+配置流程：
+  1. Config Server 从 Git/SVN 拉取配置
+  2. 应用启动时从 Config Server 获取配置
+  3. 配置变更 → Bus 通知 → 应用刷新
+```
+
+### 10.2 配置中心对比
+
+| 维度 | Spring Cloud Config | Nacos Config | Apollo |
+|------|---------------------|--------------|--------|
+| 配置存储 | Git/SVN | 内置数据库 | 内置数据库 |
+| 配置推送 | Bus（消息总线） | 长轮询 | 长轮询 |
+| 版本管理 | Git 版本控制 | 内置版本管理 | 内置版本管理 |
+| 灰度发布 | 不支持 | 支持 | 支持 |
+| 权限管理 | Git 权限 | 内置权限 | 内置权限 |
+| 运维复杂度 | 高（需维护 Git） | 低 | 中 |
+
+### 10.3 Config Server 高可用
+
+```yaml
+# Config Server 集群 + Eureka 注册
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/company/config-repo
+    discovery:
+      enabled: true
+      service-id: config-server
+
+# 客户端配置（通过服务发现获取 Config Server）
+spring:
+  cloud:
+    config:
+      discovery:
+        enabled: true
+        service-id: config-server
+```
+
+---
+
+## 十一、Spring Cloud Sleuth/Micrometer Tracing
+
+### 11.1 链路追踪架构
+
+```
+Spring Cloud Sleuth（2020+ 改为 Micrometer Tracing）：
+  ├── 自动生成 TraceId/SpanId
+  ├── 日志关联（MDC）
+  ├── HTTP Header 传播
+  └── 与 Zipkin/Jaeger 集成
+
+Micrometer Tracing（新标准）：
+  ├── 自动埋点
+  ├── 与 Micrometer Metrics 集成
+  ├── 支持 OpenTelemetry
+  └── 多后端支持
+```
+
+### 11.2 配置示例
+
+```yaml
+# Micrometer Tracing + Zipkin
+management:
+  tracing:
+    sampling:
+      probability: 1.0  # 采样率 100%
+  zipkin:
+    tracing:
+      endpoint: http://zipkin:9411/api/v2/spans
+
+# 依赖
+# micrometer-tracing-bridge-brave
+# brave-instrumentation-http
+```
+
+### 11.3 手动传播上下文
+
+```java
+// 手动创建 Span
+@Autowired
+Tracer tracer;
+
+public void processRequest() {
+    Span span = tracer.nextSpan().name("custom-operation").start();
+    try (Tracer.SpanInScope ws = tracer.withSpan(span)) {
+        // 业务逻辑
+        span.tag("userId", userId);
+        span.annotate("processing started");
+    } finally {
+        span.end();
+    }
+}
+```
+
+---
+
+## 十二、Spring Cloud Kubernetes 集成
+
+### 12.1 集成方式
+
+| 组件 | 功能 |
+|------|------|
+| spring-cloud-kubernetes-discovery | K8s Service 发现 |
+| spring-cloud-kubernetes-config | ConfigMap/Secret 配置 |
+| spring-cloud-kubernetes-loadbalancer | K8s Service 负载均衡 |
+
+### 12.2 配置示例
+
+```yaml
+spring:
+  cloud:
+    kubernetes:
+      discovery:
+        enabled: true
+      config:
+        enabled: true
+        sources:
+        - configmap: my-config
+        - secret: my-secret
+```
+
+### 12.3 与 Nacos 共存
+
+```
+双注册模式：
+  应用同时注册到 K8s Service 和 Nacos
+  K8s 集群内：使用 K8s Service 发现
+  K8s 集群外：使用 Nacos 发现
+  适用于混合云场景
+```
+
+---
+
+## 十三、Spring Cloud Stream 消息驱动
+
+### 13.1 Stream 架构
+
+```
+Binder（绑定器）：抽象消息中间件
+  ├── Kafka Binder
+  ├── RabbitMQ Binder
+  ├── RocketMQ Binder
+  └── Redis Binder
+
+核心概念：
+  Input Channel → Consumer
+  Output Channel → Producer
+  Binding → Channel 与中间件的映射
+```
+
+### 13.2 Kafka Binder 示例
+
+```yaml
+spring:
+  cloud:
+    stream:
+      bindings:
+        order-output:
+          destination: order-topic
+          content-type: application/json
+          binder: kafka
+        order-input:
+          destination: order-topic
+          content-type: application/json
+          group: order-consumer-group
+          binder: kafka
+      kafka:
+        binder:
+          brokers: kafka:9092
+          auto-create-topics: true
+```
+
+### 13.3 消费者分组与分区
+
+```java
+// 消费者组（负载均衡）
+@StreamListener(Sink.INPUT)
+public void consume(Order order) {
+    // 同一 Group 只有一个实例消费
+}
+
+// 生产者分区（顺序保证）
+@EnableBinding(Source.class)
+public class OrderProducer {
+    @Autowired
+    private Source source;
+    
+    public void sendOrder(Order order) {
+        // 按 orderId 分区，保证同一订单顺序
+        source.output().send(MessageBuilder
+            .withPayload(order)
+            .setHeader("partitionKey", order.getOrderId())
+            .build());
+    }
+}
+```
+
+---
+
+## 十四、Spring Cloud Alibaba 组件全景
+
+### 14.1 组件对比
+
+| 组件 | 功能 | 替代 |
+|------|------|------|
+| Nacos | 注册+配置中心 | Eureka + Spring Cloud Config |
+| Sentinel | 限流熔断 | Hystrix + Resilience4j |
+| Seata | 分布式事务 | TCC + 本地消息表 |
+| RocketMQ | 消息队列 | Kafka + RabbitMQ |
+| Dubbo | RPC 框架 | OpenFeign + RestTemplate |
+| Gateway | 网关 | Zuul |
+
+### 14.2 Spring Cloud Alibaba 版本对应
+
+| Spring Cloud Alibaba | Spring Cloud | Spring Boot |
+|-----------------------|--------------|-------------|
+| 2022.0.0 | 2022.0.0 | 3.0.x |
+| 2021.0.5 | 2021.0.5 | 2.6.x |
+| 2020.0.1 | Hoxton | 2.4.x |
+| 2.2.9 | Greenwich | 2.3.x |
+
+---
+
+## 十五、Spring Cloud vs Dubbo 对比
+
+### 15.1 核心能力对比
+
+| 维度 | Spring Cloud | Dubbo |
+|------|--------------|-------|
+| 服务发现 | Nacos/Eureka/Consul | Nacos/ZK |
+| 负载均衡 | LoadBalancer/Ribbon | 内置（随机/轮询） |
+| 熔断 | Sentinel/Resilience4j | Sentinel |
+| RPC | OpenFeign（HTTP） | Dubbo 协议（二进制） |
+| 序列化 | JSON | Hessian2/Protobuf |
+| 性能 | 中 | 高 |
+| 生态 | Spring 全家桶 | 阿里全家桶 |
+
+### 15.2 选型建议
+
+```
+选 Spring Cloud：
+  ✓ 需要 Spring 生态集成（Boot/Data/Security）
+  ✓ 多语言支持（HTTP 协议）
+  ✓ 云原生/K8s 场景
+  ✓ 团队熟悉 Spring
+
+选 Dubbo：
+  ✓ 高性能 RPC（二进制协议）
+  ✓ 存量 Java 微服务
+  ✓ 需要丰富的负载均衡/路由策略
+  ✓ 阿里生态（Nacos/Sentinel/Seata）
+
+混合使用：
+  Spring Cloud Gateway + Dubbo RPC
+  → 网关层用 Spring Cloud，内部 RPC 用 Dubbo
+```
+
+---
+
+## 十六、与其他板块的关系
 
 - Spring Cloud Gateway 见「[Spring Cloud Gateway](../基础知识/中间件/SpringCloudGateway.md)」；
 - Nacos 源码见「[源码系列/Nacos](../源码系列/Nacos.md)」；
