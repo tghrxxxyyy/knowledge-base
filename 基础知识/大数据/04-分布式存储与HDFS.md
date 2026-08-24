@@ -488,11 +488,323 @@ flowchart TD
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、HDFS NameNode HA（QJM）
 
-- 文件/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
-- HBase（HDFS 之上）见「[06-分布式NoSQL与HBase](06-分布式NoSQL与HBase.md)」；
-- 存算分离调度见「[10-资源调度：YARN与Kubernetes](10-资源调度：YARN与Kubernetes.md)」；
-- 存储中间件对比见「[中间件/Ceph](../中间件/Ceph.md)」「[中间件/对象存储MinIO-OSS](../中间件/对象存储MinIO-OSS.md)」。
+### QJM 架构
+
+```
+QJM（Quorum Journal Manager）架构：
+  Active NN：处理所有客户端请求
+  Standby NN：热备，同步元数据
+  JournalNode（JN）：共享editlog，多数派写入
+  ZKFC：ZK故障检测，自动切换
+
+工作流程：
+  1. Active NN写editlog到JN（多数派写入成功才返回）
+  2. Standby NN从JN读取editlog同步
+  3. ZKFC监控NN健康状态
+  4. Active NN故障时，ZKFC触发故障转移
+  5. Standby NN提升为Active
+
+配置示例：
+  dfs.namenode.name.dir：元数据存储目录
+  dfs.namenode.shared.edits.dir：JN地址列表
+  dfs.ha.fencing.methods：隔离方法
+  dfs.ha.automatic-failover.enabled：自动故障转移
+```
+
+### QJM 配置要点
+
+| 配置项 | 说明 | 推荐值 |
+|--------|------|--------|
+| dfs.ha.journalnode.rpc-address | JN RPC地址 | 0.0.0.0:8485 |
+| dfs.ha.journalnode.http-address | JN HTTP地址 | 0.0.0.0:8480 |
+| dfs.namenode.shared.edits.dir | JN存储目录 | qjournal://jn1:8485;jn2:8485;jn3:8485/ns1 |
+| dfs.ha.fencing.methods | 隔离方法 | sshfence(hdfs:22) |
+| dfs.ha.automatic-failover.enabled | 自动故障转移 | true |
+
+### Federation + HA
+
+```
+Federation + HA架构：
+  NS1：Active NN1 + Standby NN1
+  NS2：Active NN2 + Standby NN2
+  共享DataNode存储池
+  客户端挂载表路由
+
+优势：
+  元数据横向扩展（多NS）
+  高可用（每个NS有HA）
+  多租户隔离（不同NS管理不同目录）
+```
+
+## HDFS 分层存储（HOT/WARM/COLD/ALL_SSD）
+
+### 存储策略详解
+
+| 策略 | 副本/EC | 介质 | 访问延迟 | 成本 | 适用数据 |
+|------|--------|------|----------|------|----------|
+| HOT | 3副本 | 高性能磁盘 | ms级 | 高 | 频繁访问 |
+| WARM | 1副本+EC | 标准磁盘 | 100ms | 中 | 低频访问 |
+| COLD | EC-6-3 | 低频存储 | 分钟级 | 低 | 极少访问 |
+| ALL_SSD | 3副本(SSD) | SSD | ms级 | 最高 | 实时分析 |
+| ONE_SSD | 1副本(SSD)+2磁盘 | SSD+磁盘 | ms级 | 中高 | 混合 |
+| LAZY_PERSIST | 内存→异步落盘 | 内存+磁盘 | ms级 | 中 | 临时数据 |
+
+### 自动分层策略
+
+```mermaid
+flowchart TD
+    A[数据写入] --> B{访问频率?}
+    B -->|日/小时| C[HOT: SSD/高性能]
+    B -->|周/月| D[WARM: 标准存储]
+    B -->|季度/年| E[COLD: 低频存储]
+    B -->|极少| F[ALL_SSD: 归档]
+    C -->|30天未访问| D
+    D -->|90天未访问| E
+    E -->|1年未访问| F
+    F -->|合规到期| G[删除]
+```
+
+### 配置命令
+
+```bash
+# 设置存储策略
+hdfs storagepolicies -setStoragePolicy -path /data -policy WARM
+
+# 触发数据迁移
+hdfs mover -p /data
+
+# 查看存储策略
+hdfs storagepolicies -getStoragePolicy -path /data
+
+# 自动分层脚本
+#!/bin/bash
+# HOT → WARM（30天未访问）
+find /data -type f -atime +30 -exec hdfs dfs -setStoragePolicy -path {} -policy WARM \;
+
+# WARM → COLD（90天未访问）
+find /data -type f -atime +90 -exec hdfs dfs -setStoragePolicy -path {} -policy COLD \;
+```
+
+## HDFS 纠删码（EC）开销分析
+
+### EC vs 副本对比
+
+| 指标 | 3副本 | RS-6-3 | RS-10-4 |
+|------|-------|--------|---------|
+| 存储开销 | 3× | 1.5× | 1.4× |
+| 冗余能力 | 丢2块可恢复 | 丢3块可恢复 | 丢4块可恢复 |
+| 写入开销 | 低 | 中(计算校验) | 中高 |
+| 读取开销 | 低 | 中(可能需恢复) | 中高 |
+| 恢复开销 | 低(直接复制) | 高(读多块+计算) | 高 |
+| 适用场景 | 热数据 | 温/冷数据 | 冷数据 |
+
+### EC 开销计算
+
+```
+EC写入开销：
+  数据块：6块 × 128MB = 768MB
+  校验块：3块 × 128MB = 384MB
+  总写入：1152MB（1.5×原始数据）
+  计算开销：RS编码计算（CPU密集）
+
+EC读取开销：
+  正常读：6块 × 128MB = 768MB
+  恢复读：读剩余块 + 计算恢复（网络+CPU）
+  延迟：比副本读高2-5倍
+
+EC恢复开销：
+  丢失1块：读5块 + 计算恢复（最常见）
+  丢失2块：读4块 + 计算恢复
+  丢失3块：读3块 + 计算恢复（极限）
+  恢复时间：取决于网络带宽和CPU
+```
+
+### EC 最佳实践
+
+```
+EC适用场景：
+  冷数据目录（归档/日志）
+  WORM数据（Write Once Read Many）
+  存储成本敏感场景
+  数据量大但访问少
+
+EC不适用场景：
+  频繁写入（CPU开销大）
+  低延迟读取（恢复慢）
+  小文件（EC块对齐问题）
+  高IOPS场景（网络开销）
+
+配置建议：
+  策略选择：RS-6-3（平衡性能和冗余）
+  块大小：1024KB（默认）
+  目录规划：冷数据单独目录
+  监控：EC块健康状态、恢复进度
+```
+
+## 云对象存储作为 HDFS 替代（S3A）
+
+### S3A 客户端配置
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>fs.s3a.impl</name>
+  <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+</property>
+<property>
+  <name>fs.s3a.endpoint</name>
+  <value>s3.amazonaws.com</value>
+</property>
+<property>
+  <name>fs.s3a.access.key</name>
+  <value>YOUR_ACCESS_KEY</value>
+</property>
+<property>
+  <name>fs.s3a.secret.key</name>
+  <value>YOUR_SECRET_KEY</value>
+</property>
+<property>
+  <name>fs.s3a.path.style.access</name>
+  <value>false</value>
+</property>
+<property>
+  <name>fs.s3a.connection.maximum</name>
+  <value>200</value>
+</property>
+<property>
+  <name>fs.s3a.fast.upload</name>
+  <value>true</value>
+</property>
+```
+
+### HDFS vs S3A 性能对比
+
+| 维度 | HDFS | S3A |
+|------|------|-----|
+| 顺序读 | 高(本地磁盘) | 中(网络IO) |
+| 顺序写 | 高(本地磁盘) | 中(网络IO) |
+| 随机读 | 低(不支持) | 低(不支持) |
+| 小文件 | 差(NN瓶颈) | 好(无NN) |
+| 并发 | 中(NN瓶颈) | 高(REST API) |
+| 成本 | 高(自管硬件) | 低(按量付费) |
+
+```
+性能优化：
+  1. 大文件顺序读（避免小对象）
+  2. 列式存储（Parquet/ORC）下推
+  3. 本地缓存（Alluxio/SSD cache）
+  4. 向量化读（Arrow格式）
+  5. 多线程并发读
+```
+
+## 数据湖文件格式对比
+
+### Parquet/ORC/Avro 对比
+
+| 维度 | Parquet | ORC | Avro |
+|------|---------|-----|------|
+| 存储方式 | 列式 | 列式 | 行式 |
+| 压缩率 | 高 | 最高 | 中 |
+| Schema演进 | Footer嵌入 | Stripe元数据 | Schema嵌入 |
+| 查询性能 | 高 | 最高 | 低 |
+| 写入性能 | 中 | 中 | 高 |
+| 生态支持 | 最广 | Hive为主 | Kafka/Hive |
+| 适用场景 | OLAP分析 | Hive/Trino | 消息传输 |
+
+### 格式选择决策
+
+```
+选择建议：
+  OLAP分析 → Parquet（Spark/Trino全支持）
+  Hive查询 → ORC（压缩率最高）
+  消息传输 → Avro（Schema演进友好）
+  数据湖底座 → Parquet（通用性最强）
+
+组合使用：
+  Kafka消息 → Avro（Schema演进）
+  数据湖存储 → Parquet（列式压缩）
+  Hive查询 → ORC（Hive原生支持）
+```
+
+## 数据湖 Compaction 策略
+
+### 小文件问题
+
+```
+小文件成因：
+  1. 流式写入（每条记录一个文件）
+  2. 分区过细（按小时/分钟分区）
+  3. 频繁更新（每次更新生成新文件）
+  4. 并发写入（多个writer同时写入）
+
+影响：
+  1. NameNode/S3元数据膨胀
+  2. 查询性能下降（读取大量小文件）
+  3. 存储效率低（文件头尾浪费）
+  4. Compaction成本高
+```
+
+### Compaction 策略
+
+| 策略 | 说明 | 适用 | 工具 |
+|------|------|------|------|
+| 大文件合并 | 合并小文件为大文件 | 冷数据 | Spark/Flink |
+| 增量合并 | 只合并新增小文件 | 实时写入 | Iceberg/Hudi |
+| 时间窗口合并 | 按时间窗口合并 | 定时任务 | Airflow/DolphinScheduler |
+| 访问热度合并 | 热数据优先合并 | 混合负载 | 自定义脚本 |
+
+### Iceberg Compaction
+
+```sql
+-- Iceberg compaction
+-- 手动触发
+CALL catalog.system.rewrite_data_files(
+  table => 'db.orders',
+  strategy => 'sort',
+  sort_order => 'ts DESC',
+  options => map('target-file-size-bytes', '134217728')
+);
+
+-- 自动compaction配置
+-- spark.sql/catalog/iceberg.properties
+spark.sql.catalog.prod.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+spark.sql.catalog.prod.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+```
+
+## 数据湖治理
+
+### 治理维度
+
+| 维度 | 说明 | 工具 |
+|------|------|------|
+| 表管理 | 表生命周期、权限 | Catalog |
+| Schema管理 | 版本演进、兼容性 | Schema Registry |
+| 数据质量 | 质量规则、监控 | Great Expectations |
+| 安全治理 | 加密、脱敏、审计 | Ranger |
+| 成本治理 | 存储分层、清理 | Lifecycle Policy |
+
+### 治理最佳实践
+
+```
+表治理：
+  1. 表Owner负责制
+  2. 表生命周期管理（热→温→冷→归档→删除）
+  3. 僵尸表清理（无查询+无引用→标记删除）
+  4. 数据血缘（表级+字段级）
+
+Schema治理：
+  1. Schema版本管理
+  2. 兼容性检查（BACKWARD/FORWARD）
+  3. 破坏性变更审批
+  4. 代码生成（多语言绑定）
+
+数据质量：
+  1. 质量规则定义（非空、范围、一致性）
+  2. 质量监控（实时+离线）
+  3. 质量告警（P0/P1/P2分级）
+  4. 质量修复（自动+人工）
+```
 
 > 一句话：**HDFS = 分块（128MB）+ 多副本（机架感知）+ 中心元数据（NN+QJM HA）——理解"小文件是杀手、随机写是弱项、EC 是冷数据降本神器"；新平台转对象存储 + 开放表格式实现存算分离**。
