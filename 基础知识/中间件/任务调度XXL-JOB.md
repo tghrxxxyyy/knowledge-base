@@ -1174,6 +1174,255 @@ public class XxlJobAdminClient {
 }
 ```
 
+## XXL-JOB 与数据仓库编排
+
+### 15.1 数据仓库调度场景
+
+```
+XXL-JOB 数据仓库编排场景：
+  ├── ETL 调度：定时抽取、转换、加载
+  ├── 数据质量检查：数据完整性、一致性校验
+  ├── 报表生成：日报、周报、月报定时生成
+  ├── 数据同步：跨系统数据定时同步
+  ├── 数据清理：历史数据归档、清理
+  └── 指标计算：实时/离线指标定时计算
+
+  调度模式：
+    1. 顺序调度：按依赖顺序依次执行
+    2. 并行调度：无依赖的任务并行执行
+    3. 条件调度：根据上一步结果决定下一步
+    4. 重试调度：失败自动重试（最多 3 次）
+```
+
+### 15.2 ETL 任务编排
+
+```java
+// ETL 调度任务
+@XxlJob("etl_daily")
+public void etlDaily() {
+    // 1. 抽取（Extract）
+    extractData();
+    // 2. 转换（Transform）
+    transformData();
+    // 3. 加载（Load）
+    loadData();
+    // 4. 数据质量检查
+    qualityCheck();
+}
+
+// 依赖任务：数据质量检查（依赖 ETL 完成）
+@XxlJob("quality_check")
+public void qualityCheck() {
+    checkDataIntegrity();
+    checkDataConsistency();
+    checkDataTimeliness();
+}
+```
+
+---
+
+## XXL-JOB CI/CD API 集成
+
+### 16.1 CI/CD 触发任务
+
+```bash
+# Jenkins Pipeline 触发 XXL-JOB 任务
+curl -X POST http://xxl-job-admin/api/trigger \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": 123,
+    "executorParam": "{\"env\":\"prod\",\"version\":\"1.0.0\"}",
+    "addressList": ["10.0.0.1:9999","10.0.0.2:9999"]
+  }'
+
+# GitHub Actions 触发
+- name: Trigger XXL-JOB
+  run: |
+    curl -X POST http://xxl-job-admin/api/trigger \
+      -H "Content-Type: application/json" \
+      -d "{\"jobId\":${{ secrets.JOB_ID }},\"executorParam\":\"{}\"}"
+```
+
+---
+
+## XXL-JOB 任务依赖可视化
+
+### 17.1 依赖关系管理
+
+```
+XXL-JOB 任务依赖可视化：
+  1. 任务依赖配置：
+     - 父任务完成后触发子任务
+     - 子任务失败触发补偿任务
+
+  2. 依赖图谱：
+     数据抽取 → 数据转换 → 数据加载 → 报表生成
+        ↓           ↓          ↓
+     质量检查    质量检查    质量检查
+
+  3. 可视化工具：
+     - XXL-JOB 内置任务日志（时间线视图）
+     - 外部工具：Apache DolphinScheduler（DAG 可视化）
+     - 自定义：导入 XXL-JOB 数据，生成可视化图谱
+```
+
+---
+
+## XXL-JOB 自定义执行器插件
+
+### 18.1 自定义执行器
+
+```java
+// 自定义执行器（处理特殊任务）
+@Component
+public class CustomExecutor extends ExecutorBiz {
+    @Override
+    public ReturnT<String> execute(TriggerRequest request) {
+        String jobParam = request.getExecutorParam();
+        Map<String, String> params = parseParams(jobParam);
+
+        switch (params.get("type")) {
+            case "data_sync":
+                return executeDataSync(params);
+            case "file_transfer":
+                return executeFileTransfer(params);
+            case "notification":
+                return executeNotification(params);
+            default:
+                return new ReturnT<>(ReturnT.FAIL_CODE, "未知任务类型");
+        }
+    }
+}
+
+// 注册自定义执行器
+@Configuration
+public class ExecutorConfig {
+    @Bean
+    public ExecutorBiz customExecutor() {
+        return new CustomExecutor();
+    }
+
+    @Bean
+    public XxlJobSpringExecutor xxlJobExecutor() {
+        XxlJobSpringExecutor executor = new XxlJobSpringExecutor();
+        executor.setAdminAddresses("http://xxl-job-admin:8080");
+        executor.setAppname("custom-executor");
+        executor.setPort(9999);
+        executor.setAccessToken("your_access_token");
+        return executor;
+    }
+}
+```
+
+---
+
+## XXL-JOB 万级任务性能优化
+
+### 19.1 性能瓶颈分析
+
+```
+XXL-JOB 性能瓶颈：
+  1. 调度中心瓶颈：
+     - 调度线程池大小（默认 200）
+     - 数据库连接池（默认 30）
+     - 调度算法（默认死板）
+
+  2. 执行器瓶颈：
+     - 执行线程池（默认 200）
+     - 网络延迟（调度中心 → 执行器）
+     - 任务执行时间（长任务阻塞）
+
+  3. 数据库瓶颈：
+     - 任务表数据量（超过 100 万行变慢）
+     - 日志表数据量（超过 1000 万行变慢）
+     - 锁竞争（高并发调度）
+```
+
+### 19.2 性能优化方案
+
+```sql
+-- 1. 任务表分区（按月）
+ALTER TABLE xxl_job_info PARTITION BY RANGE (UNIX_TIMESTAMP(create_time)) (
+    PARTITION p202401 VALUES LESS THAN (UNIX_TIMESTAMP('2024-02-01')),
+    PARTITION p202402 VALUES LESS THAN (UNIX_TIMESTAMP('2024-03-01'))
+);
+
+-- 2. 日志表清理（保留 30 天）
+DELETE FROM xxl_job_log WHERE trigger_time < DATE_SUB(NOW(), INTERVAL 30 DAY);
+
+-- 3. 索引优化
+CREATE INDEX idx_job_id_trigger_time ON xxl_job_log (job_id, trigger_time);
+```
+
+### 19.3 集群扩容
+
+```
+XXL-JOB 集群扩容：
+  调度中心：3 节点（最少），部署在独立服务器
+  执行器：按任务类型分组，每组独立扩缩容
+
+  扩容策略：
+    1. 增加调度中心节点（水平扩展）
+    2. 增加执行器节点（按需扩容）
+    3. 任务分片（大任务拆分为小任务）
+    4. 负载均衡（轮询/随机/一致性哈希）
+
+  监控指标：
+    调度延迟（< 100ms）
+    执行成功率（> 99%）
+    任务积压数（< 100）
+    执行器负载（CPU/内存/线程）
+```
+
+---
+
+## XXL-JOB 与 Apache Airflow DAG 集成
+
+### 20.1 Airflow DAG 定义
+
+```python
+# Airflow DAG 定义
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'airflow',
+    'start_date': datetime(2024, 1, 1),
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG('etl_pipeline', default_args=default_args, schedule_interval='0 2 * * *')
+
+def extract(): pass
+def transform(): pass
+def load(): pass
+def quality_check(): pass
+
+extract_task = PythonOperator(task_id='extract', python_callable=extract, dag=dag)
+transform_task = PythonOperator(task_id='transform', python_callable=transform, dag=dag)
+load_task = PythonOperator(task_id='load', python_callable=load, dag=dag)
+check_task = PythonOperator(task_id='quality_check', python_callable=quality_check, dag=dag)
+
+extract_task >> transform_task >> load_task >> check_task
+```
+
+### 20.2 XXL-JOB 与 Airflow 对比
+
+| 维度 | XXL-JOB | Airflow |
+|------|---------|---------|
+| 语言 | Java | Python |
+| 调度方式 | 时间触发 + API 触发 | 时间触发 + 事件触发 |
+| 任务定义 | Java 注解 | Python 脚本 |
+| 依赖管理 | 简单（父子任务） | 强大（DAG） |
+| 监控 | 内置 UI | 内置 UI |
+| 生态 | 国内广泛 | 国际广泛 |
+| 适用场景 | Java 微服务 | 数据工程 |
+| 部署 | 简单 | 复杂（K8s） |
+
+---
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

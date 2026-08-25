@@ -582,6 +582,374 @@ remote_write:
   - url: http://vminsert:8480/insert/0/prometheus/api/v1/write
 ```
 
+## 九、Prometheus 联邦与远程存储
+
+### 联邦集群架构
+
+```
+Prometheus 联邦架构：
+  层级设计：
+    ├── 全局 Prometheus（Federation）
+    │   ├── 抓取各区域 Prometheus
+    │   ├── 全局视图
+    │   └── 跨区域聚合
+    ├── 区域 Prometheus
+    │   ├── 抓取区域指标
+    │   └── 本地存储
+    └── 应用实例
+        └── 暴露 metrics
+
+  联邦查询：
+    /federate?match[]={job="app"}
+
+  优点：
+    ├── 水平扩展：每区域独立 Prometheus
+    ├── 降低单点压力
+    └── 故障隔离
+
+  缺点：
+    ├── 数据延迟：联邦间隔影响
+    ├── 存储重复：区域和全局都存储
+    └── 管理复杂：需要维护多实例
+```
+
+### 远程存储方案
+
+```
+Prometheus 远程存储：
+  1. Thanos
+     ├── 对象存储：S3/GCS/OSS
+     ├── 全局查询：Thanos Query
+     ├── 降采样：Thanos Compactor
+     └── 数据完整性校验
+
+  2. Cortex
+     ├── 对象存储后端
+     ├── 多租户支持
+     ├── 水平扩展
+     └── 与 Grafana 深度集成
+
+  3. VictoriaMetrics
+     ├── 高性能写入
+     ├── 压缩存储
+     ├── 兼容 Prometheus API
+     └── 单机/集群模式
+
+  4. Mimir（Grafana）
+     ├── 基于 Cortex 改进
+     ├── 无限基数支持
+     ├── 原生 Grafana 集成
+     └── 生产级稳定性
+
+配置示例（Thanos Sidecar）：
+  prometheus:
+    --storage.tsdb.path=/prometheus
+    --storage.tsdb.min-block-duration=2h
+    --storage.tsdb.max-block-duration=2h
+
+  thanos sidecar:
+    --tsdb.path=/prometheus
+    --objstore.config-file=bucket.yml
+    --prometheus.url=http://localhost:9090
+```
+
+## 十、Prometheus 高可用部署
+
+### 高可用架构
+
+```
+Prometheus 高可用方案：
+  方案 1：主备复制
+    ├── 主 Prometheus 抓取指标
+    ├── 备 Prometheus 复制主数据
+    ├── 故障时切换到备
+    └── 适用：小规模部署
+
+  方案 2：联邦集群
+    ├── 多个 Prometheus 实例
+    ├── 联邦 Prometheus 聚合
+    ├── 负载均衡
+    └── 适用：中等规模
+
+  方案 3：Thanos/Cortex
+    ├── 多 Prometheus 写入对象存储
+    ├── 全局查询层
+    ├── 无限扩展
+    └── 适用：大规模生产
+
+部署配置：
+  # Prometheus 配置
+  global:
+    scrape_interval: 15s
+    evaluation_interval: 15s
+
+  # 服务发现
+  scrape_configs:
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+        - role: pod
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+```
+
+### Prometheus 性能调优
+
+```
+Prometheus 性能调优：
+  1. 抓取优化
+     ├── scrape_interval：15s（默认）→ 根据需求调整
+     ├── scrape_timeout：10s（默认）→ 根据目标调整
+     ├── sample_limit：5000（默认）→ 控制单目标样本数
+     └── metric_relabel_configs：预过滤不需要的指标
+
+  2. 存储优化
+     ├── retention：90d（默认）→ 根据存储容量调整
+     ├── storage.tsdb.min-block-duration：2h
+     ├── storage.tsdb.max-block-duration：2h
+     └── storage.tsdb.wal-compression：启用 WAL 压缩
+
+  3. 查询优化
+     ├── recording rules：预计算常用查询
+     ├── query timeout：2m（默认）
+     ├── query max samples：50000000
+     └── 避免高基数标签
+
+  4. 资源限制
+     ├── CPU：2-4 核（生产环境）
+     ├── 内存：4-16 GB（根据时间序列数）
+     ├── 磁盘：SSD，IOPS > 10000
+     └── 网络：1 Gbps+
+
+  5. 监控 Prometheus 自身
+     ├── prometheus 目标：抓取 Prometheus 自身
+     ├── 指标：prometheus_tsdb_*、prometheus_rule_group_*
+     └── 告警：高内存、高 CPU、抓取失败
+```
+
+## 十一、Prometheus 与 Kubernetes 集成
+
+### Kubernetes 服务发现
+
+```
+Prometheus Kubernetes 服务发现：
+  1. Pod 发现
+     role: pod
+     元数据：
+       __meta_kubernetes_pod_name
+       __meta_kubernetes_pod_label_xxx
+       __meta_kubernetes_namespace
+       __meta_kubernetes_pod_annotation_prometheus_io_scrape
+
+  2. Service 发现
+     role: service
+     元数据：
+       __meta_kubernetes_service_name
+       __meta_kubernetes_service_label_xxx
+       __meta_kubernetes_namespace
+
+  3. Endpoints 发现
+     role: endpoints
+     元数据：
+       __meta_kubernetes_endpoint_port_name
+       __meta_kubernetes_endpoint_port_protocol
+
+  4. Node 发现
+     role: node
+     元数据：
+       __meta_kubernetes_node_name
+       __meta_kubernetes_node_label_xxx
+
+配置示例：
+  scrape_configs:
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+        - role: pod
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          target_label: __address__
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+```
+
+### Prometheus Operator
+
+```
+Prometheus Operator 架构：
+  组件：
+    ├── Prometheus Operator：管理 Prometheus 资源
+    ├── Prometheus：Prometheus 实例
+    ├── Alertmanager：告警管理器
+    ├── Grafana：可视化
+    └── ServiceMonitor：定义抓取目标
+
+  CRD 资源：
+    ├── Prometheus：Prometheus 实例配置
+    ├── ServiceMonitor：定义抓取目标
+    ├── PrometheusRule：定义告警规则
+    └── Alertmanager：Alertmanager 实例配置
+
+  配置示例：
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: my-app
+    spec:
+      selector:
+        matchLabels:
+          app: my-app
+      endpoints:
+        - port: http
+          path: /metrics
+          interval: 15s
+
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: my-app-rules
+    spec:
+      groups:
+        - name: my-app
+          rules:
+            - alert: HighErrorRate
+              expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+              for: 5m
+              labels:
+                severity: critical
+              annotations:
+                summary: "高错误率告警"
+```
+
+## 十二、Prometheus 告警最佳实践
+
+### 告警规则设计
+
+```yaml
+# 告警规则模板
+groups:
+  - name: infrastructure
+    rules:
+      # 实例宕机
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "实例宕机"
+          description: "实例 {{ $labels.instance }} 已宕机超过 1 分钟"
+
+      # CPU 使用率过高
+      - alert: HighCpuUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率过高"
+          description: "实例 {{ $labels.instance }} CPU 使用率超过 80%"
+
+      # 内存使用率过高
+      - alert: HighMemoryUsage
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "实例 {{ $labels.instance }} 内存使用率超过 85%"
+
+      # 磁盘使用率过高
+      - alert: HighDiskUsage
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|fuse.lxcfs"} / node_filesystem_size_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "磁盘使用率过高"
+          description: "实例 {{ $labels.instance }} 磁盘使用率超过 85%"
+
+  - name: application
+    rules:
+      # HTTP 错误率过高
+      - alert: HighHttpErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP 错误率过高"
+          description: "HTTP 5xx 错误率超过 5%"
+
+      # 响应时间过长
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "响应时间过长"
+          description: "P95 响应时间超过 1 秒"
+```
+
+### 告警路由与通知
+
+```yaml
+# Alertmanager 配置
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager@example.com'
+  smtp_auth_password: 'password'
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      receiver: 'critical'
+      group_wait: 10s
+    - match:
+        severity: warning
+      receiver: 'warning'
+
+receivers:
+  - name: 'default'
+    email_configs:
+      - to: 'team@example.com'
+
+  - name: 'critical'
+    webhook_configs:
+      - url: 'http://alert-handler:8080/critical'
+        send_resolved: true
+
+  - name: 'warning'
+    email_configs:
+      - to: 'team@example.com'
+        send_resolved: true
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+```
+
 ### 10.6 生产排障 SOP
 
 **Cardinality 治理**

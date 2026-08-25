@@ -837,6 +837,433 @@ spec:
 
 ---
 
+## 十二、ELK 高级特性与生产实践
+
+### 12.1 Elasticsearch Index Templates
+
+```json
+// 索引模板配置（ES 8.x）
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "priority": 100,
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "5s",
+      "index.lifecycle.name": "logs-ilm-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text", "analyzer": "standard" },
+        "service": { "type": "keyword" },
+        "level": { "type": "keyword" },
+        "trace_id": { "type": "keyword" },
+        "user_id": { "type": "keyword" },
+        "request_duration": { "type": "float" },
+        "tags": { "type": "keyword" }
+      }
+    },
+    "aliases": {
+      "logs-read": {}
+    }
+  },
+  "composed_of": ["logs-mappings", "logs-settings"],
+  "allow_auto_create": true
+}
+
+// 组合模板
+PUT _index_template/logs-mappings
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keywords": {
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword" }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+### 12.2 Ingest Pipeline Processors
+
+```json
+// 完整的 Ingest Pipeline 配置
+PUT _ingest/pipeline/enrich-logs
+{
+  "description": "Enrich and parse log messages",
+  "processors": [
+    {
+      "set": {
+        "field": "ingest_time",
+        "value": "{{_ingest.timestamp}}"
+      }
+    },
+    {
+      "grok": {
+        "field": "message",
+        "patterns": [
+          "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:log_message}",
+          "%{IP:client_ip} - - \\[%{HTTPDATE:access_time}\\] \"%{WORD:method} %{URIPATHPARAM:request}\" %{NUMBER:status} %{NUMBER:bytes}"
+        ]
+      }
+    },
+    {
+      "date": {
+        "field": "timestamp",
+        "formats": ["ISO8601", "yyyy-MM-dd HH:mm:ss", "dd/MMM/yyyy:HH:mm:ss Z"]
+      }
+    },
+    {
+      "user_agent": {
+        "field": "user_agent",
+        "target_field": "ua"
+      }
+    },
+    {
+      "geoip": {
+        "field": "client_ip",
+        "target_field": "geo"
+      }
+    },
+    {
+      "script": {
+        "source": "ctx.level = ctx.level.toUpperCase()"
+      }
+    },
+    {
+      "remove": {
+        "fields": ["_ingest", "raw_message"]
+      }
+    }
+  ],
+  "on_failure": [
+    {
+      "set": {
+        "field": "_tags",
+        "value": ["_pipeline_failure"]
+      }
+    }
+  ]
+}
+```
+
+### 12.3 Logstash Filter Chain 模式
+
+```ruby
+# Logstash 复杂过滤管道
+input {
+  kafka {
+    bootstrap_servers => "kafka:9092"
+    topics => ["app-logs"]
+    codec => json
+  }
+}
+
+filter {
+  # 1. 解析 JSON 字段
+  json {
+    source => "message"
+    target => "parsed"
+  }
+
+  # 2. 时间戳解析
+  date {
+    match => ["parsed.timestamp", "ISO8601", "yyyy-MM-dd HH:mm:ss"]
+    target => "@timestamp"
+  }
+
+  # 3. 用户代理解析
+  useragent {
+    source => "parsed.user_agent"
+    target => "ua"
+  }
+
+  # 4. IP 地理位置
+  geoip {
+    source => "parsed.client_ip"
+    target => "geo"
+  }
+
+  # 5. 字段标准化
+  mutate {
+    uppercase => ["parsed.level"]
+    rename => {
+      "parsed.level" => "level"
+      "parsed.message" => "message"
+      "parsed.service" => "service"
+    }
+    remove_field => ["parsed", "raw"]
+  }
+
+  # 6. 敏感信息脱敏
+  mutate {
+    gsub => [
+      "message", "\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b", "****-****-****-****",
+      "message", "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "***@***.com"
+    ]
+  }
+
+  # 7. 异常堆栈合并
+  multiline {
+    pattern => "^%{TIMESTAMP_ISO8601}"
+    negate => true
+    what => "previous"
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "logs-%{+YYYY.MM.dd}"
+    user => "elastic"
+    password => "${ES_PASSWORD}"
+  }
+}
+```
+
+### 12.4 Kibana Lens 与 Vega 可视化
+
+```json
+// Vega 可视化示例：请求延迟热力图
+{
+  "$schema": "https://vega.github.io/schema/vega/v5.json",
+  "width": 800,
+  "height": 400,
+  "padding": 5,
+  "data": [
+    {
+      "name": "table",
+      "source": "logs-*",
+      "transform": [
+        {
+          "type": "aggregate",
+          "fields": ["request_duration"],
+          "groupby": ["service"],
+          "ops": ["avg", "max", "min"]
+        }
+      ]
+    }
+  ],
+  "scales": [
+    {
+      "name": "x",
+      "type": "band",
+      "domain": { "data": "table", "field": "service" },
+      "range": "width"
+    },
+    {
+      "name": "y",
+      "type": "linear",
+      "domain": { "data": "table", "field": "avg" },
+      "range": "height"
+    }
+  ],
+  "marks": [
+    {
+      "type": "rect",
+      "from": { "data": "table" },
+      "encode": {
+        "enter": {
+          "x": { "scale": "x", "field": "service" },
+          "width": { "scale": "x", "band": 0.8 },
+          "y": { "scale": "y", "field": "avg" },
+          "height": { "signal": "height - scale('y', datum.max) + scale('y', datum.avg)" }
+        },
+        "update": {
+          "fill": { "value": "steelblue" }
+        }
+      }
+    }
+  ]
+}
+```
+
+### 12.5 Filebeat Modules
+
+```yaml
+# Filebeat 系统模块配置
+# filebeat.yml
+filebeat.modules:
+- module: system
+  syslog:
+    enabled: true
+    var.paths: ["/var/log/syslog"]
+  auth:
+    enabled: true
+    var.paths: ["/var/log/auth.log"]
+
+- module: nginx
+  access:
+    enabled: true
+    var.paths: ["/var/log/nginx/access.log*"]
+  error:
+    enabled: true
+    var.paths: ["/var/log/nginx/error.log*"]
+
+- module: apache2
+  access:
+    enabled: true
+    var.paths: ["/var/log/apache2/access.log*"]
+  error:
+    enabled: true
+    var.paths: ["/var/log/apache2/error.log*"]
+
+# Kubernetes 元数据
+filebeat.inputs:
+- type: container
+  paths:
+  - '/var/log/containers/*.log'
+  processors:
+  - add_kubernetes_metadata:
+      host: ${NODE_NAME}
+      matchers:
+      - logs_path:
+          logs_path: "/var/log/containers/"
+
+# 输出到 Kafka 缓冲
+output.kafka:
+  hosts: ["kafka:9092"]
+  topic: "filebeat-%{[agent.version]}"
+  partition.round_robin:
+    reachable_only: true
+```
+
+### 12.6 ELK for Security（SIEM）
+
+```json
+// Elastic Security 检测规则示例
+{
+  "name": "暴力破解检测",
+  "type": "query",
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "event.dataset": "system.auth" } },
+        { "match": { "event.action": "failed" } }
+      ],
+      "filter": [
+        { "range": { "@timestamp": { "gte": "now-5m" } } }
+      ]
+    }
+  },
+  "threshold": {
+    "field": "source.ip",
+    "value": 10
+  },
+  "risk_score": 75,
+  "severity": "high",
+  "tags": ["brute_force", "auth"],
+  "output_index": ".siem-signals",
+  "action": {
+    "agents": ["agent-id-1"],
+    "action_type": "endpoint",
+    "name": "isolate-host"
+  }
+}
+```
+
+### 12.7 ELK for APM
+
+```yaml
+# APM Agent 配置（Java）
+# elasticapm.properties
+service_name=my-service
+server_urls=http://apm-server:8200
+environment=production
+sample_rate=1.0
+transaction_sample_rate=0.1
+span_sample_rate=0.1
+enable_stack_trace_filtering=true
+sanitize_field_names=password,secret,credit_card
+```
+
+```java
+// APM 自动埋点
+@RestController
+public class OrderController {
+
+    @GetMapping("/orders/{id}")
+    public Order getOrder(@PathVariable Long id) {
+        // APM Agent 自动捕获：
+        // - 事务（Transaction）
+        // - 跨 Span（外部 HTTP 调用、数据库查询等）
+        // - 异常
+        return orderService.findById(id);
+    }
+}
+
+// 手动创建 Span
+@Span(name = "process-payment")
+public void processPayment(PaymentRequest request) {
+    // 自定义业务逻辑追踪
+    paymentGateway.charge(request);
+}
+```
+
+### 12.8 ELK 成本优化
+
+```text
+ELK 成本优化策略：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 策略                  │ 实现方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 索引生命周期管理      │ ILM: hot→warm→cold→delete                  │
+│ 数据分层存储          │ SSD(hot) → HDD(warm) → 对象存储(cold)      │
+│ 日志降采样            │ 详细日志保留 7 天，聚合日志保留 90 天        │
+│ 压缩优化              │ 启用 best_compression                       │
+│ 分片优化              │ 单分片 10-50GB，避免过多小分片              │
+│ 查询优化              │ 使用 filter 替代 query（可缓存）            │
+│ 硬件选型              │ 写密集：SSD；查询：大内存                  │
+│ 多集群架构            │ 生产/测试/日志 分离集群                    │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```bash
+# ILM 策略配置
+PUT _ilm/policy/logs-ilm-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": { "max_size": "50gb", "max_age": "1d" }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {}
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
 ## 十三、速查表（扩展）
 
 | 项 | 结论 |

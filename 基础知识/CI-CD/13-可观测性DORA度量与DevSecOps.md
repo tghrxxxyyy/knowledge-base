@@ -375,7 +375,375 @@ flowchart TB
 - **AI 原生**：诊断/选择/生成内建到流水线，但门禁与人工 review 不可省。
 - **合规内建**：SBOM、SLSA、签名验签成为采购与等保的硬性要求。
 
-## 九、与其他模块的关联
+## 九、SLI/SLO/SLA 体系
+
+### SLI/SLO/SLA 定义
+
+```text
+SLI（Service Level Indicator）服务等级指标：
+  可量化的服务质量度量
+  示例：
+    ├── 可用性：成功请求数 / 总请求数
+    ├── 延迟：P95 响应时间
+    ├── 吞吐：每秒请求数（QPS）
+    └── 错误率：错误请求数 / 总请求数
+
+SLO（Service Level Objective）服务等级目标：
+  SLI 的目标值
+  示例：
+    ├── 可用性 SLO：99.9%（每月宕机 ≤ 43.8 分钟）
+    ├── 延迟 SLO：P95 < 200ms
+    ├── 吞吐 SLO：QPS > 1000
+    └── 错误率 SLO：< 0.1%
+
+SLA（Service Level Agreement）服务等级协议：
+  对客户的正式承诺
+  包含 SLO + 补偿条款
+  示例：
+    ├── 可用性 SLA：99.9%
+    ├── 未达标补偿：按比例退款
+    └── 报告周期：每月提供 SLA 报告
+
+Error Budget：
+  允许的故障预算 = 1 - SLO
+  99.9% SLO → Error Budget = 0.1%
+  每月允许宕机：720 分钟 × 0.1% = 43.8 分钟
+
+Error Budget 策略：
+  ├── 预算充足：可以发布新功能、进行实验
+  ├── 预算紧张：减少发布、加强测试
+  └── 预算耗尽：停止发布、专注稳定性
+```
+
+### SLI 定义模板
+
+```yaml
+# SLI 定义模板
+sli:
+  name: "http_availability"
+  description: "HTTP 请求可用性"
+  metric: "success_rate"
+  query: |
+    sum(rate(http_requests_total{status!~"5.."}[5m])) 
+    / 
+    sum(rate(http_requests_total[5m]))
+  sli_spec:
+    target: 0.999
+    window: 30d
+  error_budget:
+    target: 0.001
+    window: 30d
+  alerting:
+    warning: 0.9995
+    critical: 0.999
+    window: 5m
+
+# 多维度 SLI 定义
+slis:
+  - name: "availability"
+    query: |
+      sum(rate(http_requests_total{status!~"5.."}[5m])) 
+      / sum(rate(http_requests_total[5m]))
+    target: 0.999
+  - name: "latency_p95"
+    query: |
+      histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+    target: 0.2
+  - name: "error_rate"
+    query: |
+      sum(rate(http_requests_total{status=~"5.."}[5m])) 
+      / sum(rate(http_requests_total[5m]))
+    target: 0.001
+```
+
+## 十、DORA 指标深入
+
+### DORA 指标计算方法
+
+```
+DORA 指标计算方法：
+  1. 部署频率（Deployment Frequency）
+     计算：生产环境部署次数 / 时间窗口
+     数据来源：CI/CD 流水线、Git Tag
+     示例：每天 10 次 → 部署频率 = 10 次/天
+
+  2. 变更前置时间（Lead Time for Changes）
+     计算：代码提交到生产部署的时间
+     数据来源：Git commit 时间到部署时间
+     示例：平均 2 小时 → 变更前置时间 = 2h
+
+  3. 变更失败率（Change Failure Rate）
+     计算：导致故障的变更比例
+     数据来源：故障报告、回滚记录
+     示例：每月 100 次部署，5 次故障 → 失败率 = 5%
+
+  4. 恢复时间（Time to Restore Service）
+     计算：故障到恢复的时间
+     数据来源：故障报告、监控系统
+     示例：平均 30 分钟 → 恢复时间 = 30m
+
+  分类标准：
+    精英：部署频率 > 1次/天，前置时间 < 1h，失败率 < 5%，恢复时间 < 1h
+    高效：部署频率 1次/天-1次/周，前置时间 1天-1周，失败率 5-10%，恢复时间 < 1天
+    中等：部署频率 1次/月-1次/周，前置时间 1周-1月，失败率 10-15%，恢复时间 1天-1周
+    低效：部署频率 < 1次/月，前置时间 > 1月，失败率 > 15%，恢复时间 > 1周
+```
+
+### DORA 指标收集
+
+```yaml
+# DORA 指标收集配置
+dora_metrics:
+  deployment_frequency:
+    data_source: gitlab_api
+    query: |
+      SELECT COUNT(*) 
+      FROM deployments 
+      WHERE created_at > NOW() - INTERVAL '1 day'
+    target: 10
+    unit: "deployments/day"
+
+  lead_time_for_changes:
+    data_source: gitlab_api
+    query: |
+      SELECT AVG(deployed_at - committed_at)
+      FROM commits
+      WHERE deployed_at IS NOT NULL
+      AND committed_at > NOW() - INTERVAL '30 days'
+    target: 120
+    unit: "minutes"
+
+  change_failure_rate:
+    data_source: incident_api
+    query: |
+      SELECT COUNT(*) FILTER (WHERE severity = 'critical') * 100.0 / COUNT(*)
+      FROM deployments
+      WHERE created_at > NOW() - INTERVAL '30 days'
+    target: 5
+    unit: "percent"
+
+  time_to_restore:
+    data_source: incident_api
+    query: |
+      AVG(resolved_at - detected_at)
+      FROM incidents
+      WHERE severity = 'critical'
+      AND detected_at > NOW() - INTERVAL '30 days'
+    target: 30
+    unit: "minutes"
+```
+
+## 十一、DevSecOps 安全左移
+
+### 安全左移实施
+
+```text
+安全左移（Shift-Left Security）：
+  在软件开发生命周期早期集成安全
+  传统：开发 → 测试 → 安全审计（右移，成本高）
+  左移：安全需求 → 设计 → 开发 → 测试（全程集成）
+
+安全左移实施步骤：
+  1. 安全需求阶段
+     ├── 威胁建模（STRIDE）
+     ├── 安全需求文档
+     └── 安全设计评审
+
+  2. 开发阶段
+     ├── IDE 安全插件（SonarLint、ESLint Security）
+     ├── 代码审查（安全检查清单）
+     ├── 依赖扫描（Snyk、Dependabot）
+     └── 密钥管理（HashiCorp Vault）
+
+  3. 构建阶段
+     ├── SAST（静态应用安全测试）
+     ├── SCA（软件组成分析）
+     ├── 密钥扫描（GitLeaks、TruffleHog）
+     └── 容器镜像扫描（Trivy、Clair）
+
+  4. 测试阶段
+     ├── DAST（动态应用安全测试）
+     ├── IAST（交互式应用安全测试）
+     ├── 渗透测试
+     └── 安全回归测试
+
+  5. 部署阶段
+     ├── 基础设施即代码安全（Terraform 代码扫描）
+     ├── 容器安全（运行时保护）
+     ├── 网络安全（网络策略）
+     └── 密钥管理（Kubernetes Secrets）
+
+  6. 运行阶段
+     ├── RASP（运行时应用自我保护）
+     ├── WAF（Web 应用防火墙）
+     ├── 入侵检测
+     └── 安全日志审计
+```
+
+### 安全扫描工具链
+
+```yaml
+# 安全扫描工具链配置
+security_scanning:
+  sast:
+    tool: "SonarQube"
+    languages: ["java", "python", "javascript"]
+    rules: "OWASP Top 10"
+    gate: "quality"
+
+  sca:
+    tool: "Snyk"
+    severity: ["critical", "high"]
+    auto_fix: true
+    pr_creation: true
+
+  secret_scan:
+    tool: "GitLeaks"
+    rules: ["aws_key", "gcp_key", "private_key"]
+    blocking: true
+
+  container_scan:
+    tool: "Trivy"
+    severity: ["critical", "high"]
+    ignore_unfixed: false
+    format: "sarif"
+
+  dast:
+    tool: "OWASP ZAP"
+    target: "https://staging.example.com"
+    rules: "OWASP Top 10"
+    timeout: "30m"
+
+  iac_scan:
+    tool: "Checkov"
+    frameworks: ["terraform", "kubernetes"]
+    severity: ["critical", "high"]
+    soft_fail: false
+
+# CI/CD 集成
+pipeline:
+  stages:
+    - security_scan
+    - build
+    - test
+    - deploy
+
+  security_scan:
+    sast: "sonar-scanner"
+    sca: "snyk test"
+    secret_scan: "gitleaks detect"
+    container_scan: "trivy image"
+```
+
+## 十二、SRE 错误预算管理
+
+### 错误预算策略
+
+```text
+错误预算（Error Budget）策略：
+  1. 定义错误预算
+     ├── SLO: 99.9% 可用性
+     ├── 错误预算: 0.1%（每月 43.8 分钟）
+     └── 滚动窗口: 30 天
+
+  2. 错误预算消耗
+     ├── 事件 1: 5 分钟故障 → 消耗 11.4%
+     ├── 事件 2: 10 分钟故障 → 消耗 22.8%
+     └── 总消耗: 34.2%（剩余 65.8%）
+
+  3. 错误预算策略
+     ├── 预算 > 50%: 正常发布，可以实验
+     ├── 预算 25-50%: 减少发布，加强测试
+     ├── 预算 < 25%: 停止新功能，专注稳定性
+     └── 预算耗尽: 冻结发布，紧急修复
+
+  4. 错误预算恢复
+     ├── 故障修复 → 恢复可用性
+     ├── 错误预算自动恢复
+     └── 滚动窗口: 旧事件自动过期
+
+错误预算仪表盘：
+  ├── 当前剩余预算
+  ├── 历史消耗趋势
+  ├── 各服务预算分配
+  └── 告警阈值设置
+```
+
+### SRE 实践模板
+
+```yaml
+# SRE 实践模板
+sre_practices:
+  error_budget:
+    slo: 99.9%
+    window: 30d
+    alert_threshold: 25%
+    policy: |
+      if error_budget_remaining < 25%:
+        freeze_deployments()
+        notify_team("错误预算不足，冻结发布")
+      elif error_budget_remaining < 50%:
+        reduce_deployments()
+        enhance_testing()
+      else:
+        normal_operations()
+
+  incident_management:
+    severity_levels:
+      P0: "完全不可用，影响所有用户"
+      P1: "主要功能不可用，影响大部分用户"
+      P2: "次要功能不可用，影响部分用户"
+      P3: "功能降级，影响少量用户"
+
+    response_times:
+      P0: "15 分钟响应，1 小时恢复"
+      P1: "30 分钟响应，4 小时恢复"
+      P2: "2 小时响应，24 小时恢复"
+      P3: "8 小时响应，1 周恢复"
+
+    on_call:
+      primary: "主值班（24/7）"
+      secondary: "副值班（备份）"
+      escalation: "升级路径"
+
+  postmortem:
+    template: |
+      # 故障复盘报告
+
+      ## 概述
+      - 故障时间：
+      - 影响范围：
+      - 持续时间：
+      - 严重程度：
+
+      ## 时间线
+      - 发现时间：
+      - 响应时间：
+      - 恢复时间：
+      - 根本原因：
+
+      ## 影响
+      - 用户影响：
+      - 业务影响：
+      - 数据影响：
+
+      ## 根本原因
+      - 技术原因：
+      - 流程原因：
+      - 人员原因：
+
+      ## 改进措施
+      - 短期修复：
+      - 长期改进：
+      - 预防措施：
+
+      ## 经验教训
+      - 做得好的：
+      - 需要改进的：
+      - 行动项：
+```
+
+## 与其他模块的关联
 
 - [01-概述与核心概念](../CI-CD/01-概述与核心概念.md)：CI/CD 全景与流水线基本形态。
 - [03-构建与制品管理](../CI-CD/03-构建与制品管理.md)：制品、digest、SBOM 的生成与留存。

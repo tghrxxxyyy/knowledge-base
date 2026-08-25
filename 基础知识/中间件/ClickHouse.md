@@ -707,7 +707,427 @@ WHERE engine = 'Kafka';
 
 ---
 
-## 十四、与其他板块的关系
+## 十四、ClickHouse Async Insert
+
+### 14.1 Async Insert 原理
+
+```
+Async Insert = 异步批量插入（缓解小批量写入问题）
+
+  原理：
+    1. 客户端发送 INSERT（不等待落盘）
+    2. ClickHouse 将数据缓存在内存 buffer
+    3. 达到阈值后批量 flush 到磁盘
+    4. 返回成功
+
+  配置：
+    async_insert: 1                      # 开启异步插入
+    wait_for_async_insert: 1             # 等待异步插入完成
+    async_insert_max_data_size: 10485760 # buffer 大小 10MB
+    async_insert_busy_timeout_ms: 200    # buffer 满时超时
+    async_insert_use_adaptive_timeout: 1 # 自适应超时
+
+  优势：
+    ├── 减少小 part 产生
+    ├── 提升写入吞吐（批量合并）
+    └── 降低合并压力
+```
+
+### 14.2 Async Insert vs Buffer Engine
+
+| 维度 | Async Insert | Buffer Engine |
+|------|--------------|---------------|
+| 实现方式 | 内存 buffer | 内存表 + flush |
+| 数据安全 | 可能丢数据 | 重启丢数据 |
+| 配置复杂度 | 低（参数级） | 中（建表级） |
+| 适用场景 | 高频小批量写入 | 高频写入 + 低延迟 |
+| 推荐 | 新项目首选 | 已有架构兼容 |
+
+---
+
+## 十五、ClickHouse Replication Protocol
+
+### 15.1 ReplicatedMergeTree 复制流程
+
+```
+ClickHouse 复制流程（基于 ZooKeeper/Keeper）：
+
+  写入流程：
+    1. Client 写入 Replica A
+    2. Replica A 将操作写入 ZooKeeper（Znode）
+    3. 其他 Replica 监听 ZK 变更
+    4. 其他 Replica 拉取操作日志并重放
+    5. 数据最终一致
+
+  ZooKeeper 存储：
+    /clickhouse/tables/{cluster}/{table}/replicas/{replica_id}/
+    ├── is_active        # Replica 是否活跃
+    ├── parts            # 数据 part 信息
+    ├── mutations        # 变更操作日志
+    └── quorum           # 写入确认信息
+
+  异步复制特点：
+    ├── 写入不等待所有副本确认（性能高）
+    ├── 副本间有短暂延迟（秒级）
+    ├── 网络分区时可短暂不一致
+    └── 自动恢复（故障副本重新同步）
+```
+
+### 15.2 副本配置
+
+```sql
+-- 创建复制表
+CREATE TABLE events ON CLUSTER cluster (
+    event_time DateTime,
+    user_id UInt64,
+    event_type LowCardinality(String)
+) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{cluster}/events', '{replica}')
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (user_id, event_time);
+
+-- {cluster} 和 {replica} 自动替换
+-- /clickhouse/tables/production/events
+-- /clickhouse/tables/production/events/replica_1
+```
+
+---
+
+## 十六、ClickHouse Keeper（ZooKeeper 替代）
+
+### 16.1 ClickHouse Keeper 架构
+
+```
+ClickHouse Keeper：
+  ├── 基于 Raft 协议（非 ZAB）
+  ├── 与 ZooKeeper API 兼容
+  ├── 轻量级（资源消耗低）
+  ├── C++ 实现（无 JVM 开销）
+  └── 内置监控指标
+
+  优势：
+    ├── 部署简单（无需独立 ZK 集群）
+    ├── 资源消耗低（1-2GB 内存）
+    ├── 性能相当（Raft vs ZAB）
+    └── 与 ClickHouse 深度集成
+```
+
+### 16.2 Keeper 部署配置
+
+```xml
+<!-- clickhouse 配置 -->
+<keeper_server>
+    <tcp_port>9181</tcp_port>
+    <server_id>1</server_id>
+    <raft_configuration>
+        <server>
+            <id>1</id>
+            <hostname>node1</hostname>
+            <port>9234</port>
+        </server>
+        <server>
+            <id>2</id>
+            <hostname>node2</hostname>
+            <port>9234</port>
+        </server>
+        <server>
+            <id>3</id>
+            <hostname>node3</hostname>
+            <port>9234</port>
+        </server>
+    </raft_configuration>
+</keeper_server>
+```
+
+### 16.3 Keeper vs ZooKeeper
+
+| 维度 | ClickHouse Keeper | ZooKeeper |
+|------|-------------------|-----------|
+| 协议 | Raft | ZAB |
+| 语言 | C++ | Java |
+| 资源消耗 | 低（1-2GB） | 高（2-4GB） |
+| 部署复杂度 | 低（内置） | 高（独立集群） |
+| 兼容性 | ZK API 兼容 | 原生 |
+| 监控 | 内置 Prometheus | JMX |
+| 推荐 | ClickHouse 集群 | 通用场景 |
+
+---
+
+## 十七、ClickHouse Dictionary 函数
+
+### 17.1 字典函数详解
+
+```sql
+-- dictGet：获取字典值
+SELECT dictGet('region_dict', 'region_name', region_id) AS region
+FROM user_events;
+
+-- dictGetOrDefault：获取字典值（默认值）
+SELECT dictGetOrDefault('region_dict', 'region_name', region_id, '未知') AS region
+FROM user_events;
+
+-- dictHas：检查字典是否存在该键
+SELECT dictHas('region_dict', region_id) AS exists
+FROM user_events;
+
+-- dictGetAllKeys：获取所有键
+SELECT dictGetAllKeys('region_dict');
+
+-- 字典在 JOIN 中使用（替代 JOIN）
+SELECT
+    e.user_id,
+    dictGet('user_dict', 'name', e.user_id) AS user_name,
+    dictGet('user_dict', 'age', e.user_id) AS user_age,
+    count() AS cnt
+FROM events e
+GROUP BY e.user_id;
+```
+
+### 17.2 字典性能优化
+
+```
+字典性能优化：
+  1. 选择合适的布局（LAYOUT）：
+     FLAT：最多 10000 行，数组存储，O(1) 查找
+     HASHED：哈希表，任意行数，O(1) 查找
+     COMPLEX_KEY_HASHED：复合键
+     RANGE_HASHED：范围查找
+
+  2. 设置合理的刷新间隔：
+     LIFETIME(MIN 60 MAX 3600)  # 1-60 分钟刷新
+
+  3. 预加载字典：
+    预热常用字典到内存
+
+  4. 监控字典命中率：
+     SYSTEM RELOAD DICTIONARY dict_name  # 手动刷新
+```
+
+---
+
+## 十八、ClickHouse SQL 优化技巧
+
+### 18.1 查询优化
+
+```sql
+-- 1. 使用 FINAL 去重（ReplacingMergeTree）
+SELECT * FROM user_dim FINAL WHERE user_id = 123;
+
+-- 2. 使用 PREWHERE 替代 WHERE（自动优化）
+SELECT * FROM events WHERE user_id > 1000;  -- ClickHouse 自动用 PREWHERE
+
+-- 3. 使用 SAMPLE 采样（加速大数据量查询）
+SELECT count() * 10 AS estimated
+FROM events SAMPLE 0.1
+WHERE event_type = 'click';
+
+-- 4. 使用 dictGet 替代 JOIN
+SELECT
+    e.user_id,
+    dictGet('user_dict', 'name', e.user_id) AS name
+FROM events e;
+
+-- 5. 避免 SELECT *（列存只读需要的列）
+SELECT user_id, event_type, count() FROM events GROUP BY user_id, event_type;
+
+-- 6. 使用 LowCardinality（低基数字段编码）
+CREATE TABLE logs (
+    service LowCardinality(String),  -- 字典编码，查询快 2-5x
+    level LowCardinality(String),
+    message String
+);
+```
+
+### 18.2 EXPLAIN 分析
+
+```sql
+-- 查看查询计划
+EXPLAIN SELECT count() FROM events WHERE user_id > 1000;
+
+-- 查看详细执行计划
+EXPLAIN actions SELECT count() FROM events WHERE user_id > 1000;
+
+-- 关注：
+--   ReadFromStorage：是否命中索引
+--   FilterStep：过滤条件
+--   AggregationStep：聚合方式
+```
+
+---
+
+## 十九、ClickHouse 物化视图模式
+
+### 19.1 物化视图模式
+
+```sql
+-- 模式一：SummingMergeTree 物化视图（预聚合计数/求和）
+CREATE MATERIALIZED VIEW mv_daily_stats
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (service, day)
+AS SELECT
+    service,
+    toStartOfDay(event_time) AS day,
+    count() AS request_count,
+    sum(response_time_ms) AS total_latency
+FROM access_log
+GROUP BY service, day;
+
+-- 查询（自动合并）
+SELECT service, day, sum(request_count) AS total
+FROM mv_daily_stats
+GROUP BY service, day;
+
+-- 模式二：ReplacingMergeTree 物化视图（去重）
+CREATE MATERIALIZED VIEW mv_user_profile
+ENGINE = ReplacingMergeTree(update_time)
+ORDER BY user_id
+AS SELECT
+    user_id,
+    argMax(name, update_time) AS name,
+    max(update_time) AS update_time
+FROM user_events
+GROUP BY user_id;
+
+-- 模式三：AggregatingMergeTree 物化视图（复杂聚合）
+CREATE MATERIALIZED VIEW mv_service_metrics
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(window_start)
+ORDER BY (service, window_start)
+AS SELECT
+    service,
+    toStartOfMinute(event_time) AS window_start,
+    countState() AS request_count,
+    avgState(response_time_ms) AS avg_latency,
+    uniqState(status_code) AS status_codes
+FROM access_log
+GROUP BY service, window_start;
+```
+
+### 19.2 物化视图最佳实践
+
+| 场景 | 引擎选择 | 说明 |
+|------|----------|------|
+| 计数/求和 | SummingMergeTree | 简单聚合 |
+| 去重/维度表 | ReplacingMergeTree | 最新版本 |
+| 复杂聚合 | AggregatingMergeTree | avg/uniq/quantile |
+| 实时指标 | AggregatingMergeTree + -State/-Merge | 生产首选 |
+
+---
+
+## 二十、ClickHouse 多租户
+
+### 20.1 多租户隔离方案
+
+```
+ClickHouse 多租户隔离：
+
+  方案一：数据库级隔离
+    每个租户一个数据库
+    CREATE DATABASE tenant_001
+    优点：完全隔离
+    缺点：管理复杂
+
+  方案二：表级隔离
+    所有租户共享数据库
+    每个租户一个表（带 tenant_id 字段）
+    优点：管理简单
+    缺点：需查询时过滤
+
+  方案三：Row-Level Security
+    使用 Row Policy 限制行级访问
+    CREATE ROW POLICY tenant_policy ON events
+    FOR SELECT USING tenant_id = current_user()
+
+  方案四：配额控制
+    使用 Quota 限制资源使用
+    CREATE QUOTA tenant_quota
+    FOR INTERVAL 1 HOUR MAX queries = 1000
+```
+
+### 20.2 资源隔离
+
+```sql
+-- 创建角色（多租户角色隔离）
+CREATE ROLE tenant_001_role;
+GRANT SELECT ON DATABASE tenant_001 TO tenant_001_role;
+
+-- 创建用户（绑定角色）
+CREATE USER tenant_001 IDENTIFIED BY 'password';
+GRANT tenant_001_role TO tenant_001;
+
+-- 配额限制
+CREATE QUOTA tenant_001_quota
+FOR INTERVAL 1 HOUR MAX
+    queries = 1000,
+    result_rows = 10000000,
+    read_rows = 100000000
+TO tenant_001;
+```
+
+---
+
+## 二十一、ClickHouse 在实时分析中的应用
+
+### 21.1 实时分析架构
+
+```
+ClickHouse 实时分析架构：
+
+  数据源
+    ├── Kafka（实时流）
+    ├── MySQL（业务数据）
+    └── 日志文件
+
+  数据处理
+    ├── Kafka Engine（直接消费 Kafka）
+    ├── Materialized View（实时预聚合）
+    └── Buffer Engine（批量写入）
+
+  数据存储
+    ├── MergeTree（主表）
+    ├── ReplacingMergeTree（维度表）
+    └── AggregatingMergeTree（聚合表）
+
+  数据查询
+    ├── BI 工具（Grafana/Superset）
+    ├── API 查询（REST）
+    └── 交互式分析（ClickHouse Client）
+```
+
+### 21.2 实时大屏实现
+
+```sql
+-- 实时大屏数据源（每分钟刷新）
+CREATE MATERIALIZED VIEW mv_realtime_dashboard
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(window_start)
+ORDER BY (service, window_start)
+AS SELECT
+    service,
+    toStartOfMinute(event_time) AS window_start,
+    countState() AS qps,
+    avgState(response_time_ms) AS avg_latency,
+    uniqState(user_id) AS uv
+FROM access_log
+WHERE event_time > now() - INTERVAL 1 DAY
+GROUP BY service, window_start;
+
+-- 查询（实时大屏数据）
+SELECT
+    service,
+    window_start,
+    countMerge(qps) AS qps,
+    avgMerge(avg_latency) AS avg_latency,
+    uniqMerge(uv) AS uv
+FROM mv_realtime_dashboard
+WHERE window_start > now() - INTERVAL 5 MINUTE
+GROUP BY service, window_start
+ORDER BY window_start;
+```
+
+---
+
+## 与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。
 - 与 [ES 体系](../ES体系.md)：ES 偏「搜索 + 明细检索 + 日志全文」，ClickHouse 偏「结构化聚合分析」。日志场景常 ClickHouse 做聚合 + ES 做检索，或 ClickHouse 取代部分 ES 聚合。

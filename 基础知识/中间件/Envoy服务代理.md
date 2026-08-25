@@ -808,7 +808,370 @@ access_log:
 
 ---
 
-## 十四、与其他板块的关系（扩展）
+## 十四、Envoy 高级特性与生产实践
+
+### 14.1 HTTP Connection Manager
+
+```text
+HTTP Connection Manager（HCM）是 Envoy 处理 HTTP 请求的核心 Filter。
+
+HCM 核心功能：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 功能                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 路由匹配              │ 基于 path/header/method 等路由到后端        │
+│ 请求/响应头操作        │ 添加/修改/删除 Header                      │
+│ 访问日志              │ 自定义访问日志格式                           │
+│ 追踪                  │ 分布式追踪集成（Jaeger/Zipkin）             │
+│ 统计                  │ 请求计数/延迟/错误率统计                     │
+│ 超时控制              │ 请求超时/空闲超时                           │
+│ 重试策略              │ 自动重试/可重试状态码                        │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```yaml
+# HTTP Connection Manager 配置示例
+static_resources:
+- name: listener_0
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 8080
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.http_connection_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+        stat_prefix: ingress_http
+        codec_type: AUTO
+        route_config:
+          name: local_route
+          virtual_hosts:
+          - name: backend
+            domains: ["*"]
+            routes:
+            - match:
+                prefix: "/api"
+              route:
+                cluster: api_service
+                timeout: 15s
+                retry_policy:
+                  retry_on: "5xx"
+                  num_retries: 3
+                  per_try_timeout: 5s
+            - match:
+                prefix: "/static"
+              route:
+                cluster: static_service
+          request_headers_to_add:
+          - header:
+              key: x-request-id
+              value: "%REQ(x-request-id)%"
+        http_filters:
+        - name: envoy.filters.http.router
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+```
+
+### 14.2 Network Filter vs HTTP Filter
+
+```text
+Network Filter（L4）vs HTTP Filter（L7）：
+┌──────────────────┬──────────────────────────────────────────────┐
+│                  │ Network Filter           │ HTTP Filter        │
+├──────────────────┼──────────────────────────────────────────────┤
+│ 工作层           │ TCP 层（L4）              │ HTTP 层（L7）       │
+│ 处理单位         │ 原始 TCP 连接              │ HTTP 请求/响应      │
+│ 典型用途         │ TCP 代理/TLS 终止/限流    │ 路由/鉴权/修改     │
+│ 可见信息         │ IP/端口/字节流            │ Header/Path/Method │
+│ 配置位置         │ filter_chains.filters    │ http_filters       │
+└──────────────────┴──────────────────────────────────────────────┘
+
+常用 Network Filter：
+- envoy.filters.network.tcp_proxy：TCP 代理
+- envoy.filters.network.ratelimit：L4 限流
+- envoy.filters.network.redis_proxy：Redis 代理
+- envoy.filters.network.mongo_proxy：MongoDB 代理
+```
+
+```yaml
+# Network Filter 示例：Redis 代理
+- name: envoy.filters.network.redis_proxy
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.network.redis_proxy.v3.RedisProxy
+    stat_prefix: redis
+    settings:
+      op_timeout: 5s
+    prefix_routes:
+      catch_all_route:
+        cluster: redis_cluster
+    downstream_auth_password:
+      inline_string: "password123"
+```
+
+### 14.3 ext_authz Filter（外部鉴权）
+
+```text
+ext_authz Filter 将鉴权请求委托给外部服务：
+
+流程：
+1. 客户端发送请求到 Envoy
+2. Envoy 拦截请求，提取鉴权信息
+3. Envoy 向外部鉴权服务发送 Check 请求
+4. 鉴权服务返回 Allow/Deny
+5. Envoy 根据结果继续处理或拒绝请求
+
+支持的传输方式：
+- HTTP gRPC 鉴权服务
+- HTTP REST 鉴权服务
+- 本地 Bash 脚本
+```
+
+```yaml
+# ext_authz 配置示例
+http_filters:
+- name: envoy.filters.http.ext_authz
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+    grpc_service:
+      envoy_grpc:
+        cluster_name: auth_service
+        timeout: 1s
+    failure_mode_allow: false  # 鉴权服务失败时拒绝请求
+    with_request_body:
+      max_request_bytes: 10240
+      allow_partial_message: false
+    status_on_error:
+      code: 503
+```
+
+```go
+// 外部鉴权服务示例（Go + gRPC）
+type AuthServer struct{}
+
+func (s *AuthServer) Check(ctx context.Context, req *auth.CheckRequest) (*auth.CheckResponse, error) {
+    // 提取请求信息
+    attrs := req.GetAttributes()
+    path := attrs.GetRequest().GetHttp().GetPath()
+    method := attrs.GetRequest().GetHttp().GetMethod()
+    headers := attrs.GetRequest().GetHttp().GetHeaders()
+
+    // 鉴权逻辑
+    token := headers["authorization"]
+    if token == "" {
+        return &auth.CheckResponse{
+            Status: &rpc.Status{Code: int32(rpc.UNAUTHENTICATED)},
+        }, nil
+    }
+
+    // 验证 token
+    userID, err := validateToken(token)
+    if err != nil {
+        return &auth.CheckResponse{
+            Status: &rpc.Status{Code: int32(rpc.UNAUTHENTICATED)},
+        }, nil
+    }
+
+    // 鉴权通过，返回用户信息
+    return &auth.CheckResponse{
+        OkHttpResponse: &auth.OkHttpResponse{
+            Headers: []*core.HeaderValue{
+                {Key: "x-user-id", Value: userID},
+            },
+        },
+    }, nil
+}
+```
+
+### 14.4 Rate Limit Service（限流服务）
+
+```text
+Envoy 限流模式：
+┌──────────────────┬────────────────────────────────────────────┐
+│ 模式              │ 说明                                        │
+├──────────────────┼────────────────────────────────────────────┤
+│ 本地限流          │ 单实例限流（无状态，不精确）                 │
+│ 全局限流          │ 集中式限流服务（精确，有状态）               │
+│ 分层限流          │ 本地 + 全局组合（推荐）                     │
+└──────────────────┴────────────────────────────────────────────┘
+```
+
+```yaml
+# 本地限流配置
+http_filters:
+- name: envoy.filters.http.local_ratelimit
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+    stat_prefix: http_local_rate_limiter
+    token_bucket:
+      max_tokens: 100
+      tokens_per_fill: 10
+      fill_interval: 1s
+    filter_enabled:
+      runtime_key: local_rate_limit_enabled
+      default_value:
+        numerator: 100
+        denominator: HUNDRED
+    filter_enforced:
+      runtime_key: local_rate_limit_enforced
+      default_value:
+        numerator: 100
+        denominator: HUNDRED
+    response_headers_to_add:
+    - append: false
+      header:
+        key: x-local-rate-limit
+        value: 'true'
+```
+
+```yaml
+# 全局限流配置
+http_filters:
+- name: envoy.filters.http.ratelimit
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+    domain: production
+    failure_mode_deny: false
+    rate_limit_service:
+      grpc_service:
+        envoy_grpc:
+          cluster_name: rate_limit_cluster
+      transport_api_version: V3
+```
+
+### 14.5 CORS Filter（跨域资源共享）
+
+```yaml
+# CORS 配置
+http_filters:
+- name: envoy.filters.http.cors
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+
+# 路由级 CORS 配置
+route_config:
+  virtual_hosts:
+  - name: backend
+    domains: ["*"]
+    cors:
+      allow_origin_string_match:
+      - safe_regex:
+          regex: "https://.*\\.example\\.com"
+      allow_methods: "GET, POST, PUT, DELETE, OPTIONS"
+      allow_headers: "Authorization, Content-Type, X-Request-ID"
+      expose_headers: "X-Request-ID"
+      max_age: "3600"
+      allow_credentials: true
+```
+
+### 14.6 gRPC-JSON Transcoding
+
+```text
+gRPC-JSON Transcoding 将 gRPC 请求转为 REST JSON 格式：
+
+场景：
+- 为 gRPC 服务提供 REST API
+- 兼容不支持 gRPC 的客户端
+- API Gateway 统一接入
+```
+
+```yaml
+# gRPC-JSON Transcoding 配置
+http_filters:
+- name: envoy.filters.http.grpc_json_transcoder
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_json_transcoder.v3.GrpcJsonTranscoder
+    proto_descriptor_bin: <base64 编码的 proto 描述符>
+    services: ["my.api.v1.UserService"]
+    convert_grpc_status: true
+    print_options:
+      add_whitespace: true
+      always_print_enums_as_ints: false
+      always_print_primitive_fields: true
+```
+
+```bash
+# 生成 proto 描述符
+protoc --include_imports --descriptor_set_out=proto.pb my_service.proto
+
+# base64 编码
+base64 -w 0 proto.pb > proto.pb.base64
+```
+
+### 14.7 多集群 Service Mesh
+
+```text
+Envoy 在多集群 Service Mesh 中的角色：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     Cluster A                                   │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐                     │
+│  │   Pod   │←──→│  Envoy  │←──→│ Istiod  │                     │
+│  │ (sidecar)│   │         │    │         │                     │
+│  └─────────┘    └────┬────┘    └─────────┘                     │
+│                      │                                          │
+└──────────────────────┼──────────────────────────────────────────┘
+                       │
+                       │ mTLS
+                       │
+┌──────────────────────┼──────────────────────────────────────────┐
+│                      │                                          │
+│  ┌─────────┐    ┌────┴────┐    ┌─────────┐                     │
+│  │   Pod   │←──→│  Envoy  │←──→│ Istiod  │                     │
+│  │ (sidecar)│   │         │    │         │                     │
+│  └─────────┘    └─────────┘    └─────────┘                     │
+│                     Cluster B                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 14.8 Ztunnel（零信任隧道）
+
+```text
+Ztunnel 是 Istio Ambient Mesh 的核心组件：
+
+传统 Sidecar 模式：
+  Pod → Sidecar Envoy → Sidecar Envoy → Pod
+
+Ambient Mesh（Ztunnel）：
+  Pod → Ztunnel（节点级）→ Ztunnel（节点级）→ Pod
+
+优势：
+- 无 sidecar 开销（共享 Ztunnel）
+- 更低的资源消耗
+- 更简单的部署
+- 支持非 Kubernetes 工作负载
+```
+
+```yaml
+# Ztunnel DaemonSet 配置
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ztunnel
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      app: ztunnel
+  template:
+    metadata:
+      labels:
+        app: ztunnel
+    spec:
+      hostNetwork: true
+      containers:
+      - name: ztunnel
+        image: gcr.io/istio-testing/ztunnel:latest
+        args:
+        - proxy
+        - --config
+        - /etc/ztunnel/config.yaml
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN", "NET_RAW"]
+```
+
+## 十五、与其他板块的关系（扩展）
 
 - 服务网格（Istio + Envoy）见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
 - Nginx 原理见「[Nginx](./Nginx.md)」；

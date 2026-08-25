@@ -576,7 +576,333 @@ DROP FUNCTION IF EXISTS parse_url;
 
 ---
 
-## 十五、与其他板块的关系
+## 十五、Exactly-once vs At-least-once 权衡深入
+
+### 15.1 语义对比
+
+| 维度 | At-least-once | Exactly-once (EOS) |
+|------|---------------|---------------------|
+| 消息可能重复 | 是（消费者重平衡时） | 否（事务原子提交） |
+| 吞吐量 | 高（无事务开销） | 中（事务协调开销 10-20%） |
+| 端到端延迟 | 低 | 中（等待事务完成） |
+| 实现复杂度 | 低 | 中（需事务协调器） |
+| 适用场景 | 日志采集、非关键链路 | 财务、订单、计费 |
+
+### 15.2 EOS 实现的三阶段
+
+```
+Kafka Streams EOS 三阶段：
+  1. 生产阶段：幂等生产者 + 事务 ID（enable.idempotence=true）
+  2. 消费阶段：从 input topic 消费，状态写入 RocksDB + changelog
+  3. 提交阶段：offset 与输出消息在同一事务提交
+
+  失败重放路径：
+    事务未提交 → TC 回滚 → 消费者重平衡 → 重新消费未提交的 offset
+    由于 output 也未提交 → 无重复输出
+
+  性能开销来源：
+    ├── 事务协调器通信（~2-5ms/事务）
+    ├── 事务日志写入（磁盘 IO）
+    ├── 状态快照（checkpoint）
+    └── 生产者批量发送（减少开销的关键）
+```
+
+### 15.3 选型决策矩阵
+
+| 场景 | 推荐语义 | 配置 |
+|------|----------|------|
+| 实时大屏统计 | At-least-once + 幂等 | `processing.guarantee=at_least_once` |
+| 电商订单处理 | Exactly-once | `processing.guarantee=exactly_once_v2` |
+| 日志聚合分析 | At-least-once | 默认配置 |
+| 金融交易对账 | Exactly-once | `exactly_once_v2` + 幂等消费者 |
+| 用户行为埋点 | At-least-once | 丢少量可接受 |
+
+---
+
+## 十六、ksqlDB UDF 高级开发
+
+### 16.1 UDF 类型与注册
+
+```java
+// 标量 UDF：输入一行 → 输出一行
+@UdfDescription(name = "parse_json_field", ...)
+public class ParseJsonFieldUdf {
+    @Udf
+    public String parseJsonField(
+        @UdfDescription(name = "json_str", type = "VARCHAR") String jsonStr,
+        @UdfDescription(name = "field_path", type = "VARCHAR") String fieldPath
+    ) {
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode node = mapper.readTree(jsonStr);
+        String[] parts = fieldPath.split("\\.");
+        for (String part : parts) {
+            node = node.get(part);
+            if (node == null) return null;
+        }
+        return node.asText();
+    }
+}
+
+// 聚合 UDF：多行 → 一行
+@UdfDescription(name = "percentile_approx", ...)
+public class PercentileApproxUdf {
+    @Udaf(description = "近似百分位数")
+    public PercentileApproxState create() {
+        return new PercentileApproxState();
+    }
+}
+
+@UdafDescription(name = "percentile_approx", ...)
+public static class PercentileApproxState {
+    private final List<Double> values = new ArrayList<>();
+
+    @UdafAggregator(description = "聚合值")
+    public void aggregate(Double value, PercentileApproxState state) {
+        if (value != null) state.values.add(value);
+    }
+
+    @UdafFixup(description = "合并状态")
+    public void fixup(PercentileApproxState other, PercentileApproxState state) {
+        state.values.addAll(other.values);
+    }
+
+    @UdafTerminator(description = "输出结果")
+    public Double terminate(PercentileApproxState state) {
+        Collections.sort(state.values);
+        int idx = (int) Math.ceil(0.99 * state.values.size()) - 1;
+        return state.values.get(Math.max(0, idx));
+    }
+}
+```
+
+### 16.2 UDF 部署与测试
+
+```sql
+-- 注册 UDF（JAR 方式）
+CREATE FUNCTION parse_json_field AS 'com.example.udf.ParseJsonFieldUdf'
+  WITH (jar='s3://ksql-udfs/parse-json-1.0.jar');
+
+-- 使用 UDF
+SELECT parse_json_field(event_data, 'user.id') AS user_id
+FROM raw_events
+EMIT CHANGES;
+
+-- 单元测试（JUnit）
+@Test
+public void testParseJsonField() {
+    ParseJsonFieldUdf udf = new ParseJsonFieldUdf();
+    String result = udf.parseJsonField(
+        "{\"user\":{\"id\":\"12345\"}}", "user.id");
+    assertEquals("12345", result);
+}
+```
+
+---
+
+## 十七、ksqlDB 窗口聚合高级模式
+
+### 17.1 四种窗口对比
+
+```sql
+-- 1. Tumbling Window（固定不重叠）
+SELECT user_id, COUNT(*) AS cnt
+FROM page_views
+WINDOW TUMBLING (SIZE 5 MINUTES)
+GROUP BY user_id EMIT CHANGES;
+
+-- 2. Hopping Window（固定可滑动）
+SELECT user_id, COUNT(*) AS cnt
+FROM page_views
+WINDOW HOPPING (SIZE 10 MINUTES, ADVANCE BY 5 MINUTES)
+GROUP BY user_id EMIT CHANGES;
+
+-- 3. Sliding Window（按事件时间区间）
+SELECT user_id, COUNT(*) AS cnt
+FROM page_views
+WINDOW SLIDING (SIZE 5 MINUTES)
+GROUP BY user_id EMIT CHANGES;
+
+-- 4. Session Window（按活跃间隔）
+SELECT user_id, COUNT(*) AS cnt
+FROM page_views
+WINDOW SESSION (30 MINUTES)
+GROUP BY user_id EMIT CHANGES;
+```
+
+### 17.2 窗口聚合最佳实践
+
+| 窗口类型 | 适用场景 | 注意事项 |
+|----------|----------|----------|
+| Tumbling | 固定周期统计（每分钟UV） | 窗口边界对齐 |
+| Hopping | 滑动平均（最近10分钟均值） | ADVANCE 不宜过小 |
+| Sliding | 用户行为间隔（两事件间隔） | 仅在 Join 时常用 |
+| Session | 用户会话分析 | INACTIVITY GAP 需按业务调 |
+
+---
+
+## 十八、Kafka Streams State Store 清理策略
+
+### 18.1 Changelog 清理
+
+```
+Changelog 清理策略：
+  1. compact + delete：保留最新值，超过 retention 自动删除
+  2. cleanup.policy=compact：仅压缩（默认）
+  3. cleanup.policy=delete：仅删除
+  4. cleanup.policy=compact,delete：压缩+删除
+
+  配置建议：
+    高频更新场景：cleanup.policy=compact
+    有时效数据：cleanup.policy=compact,delete + retention.ms
+    大状态：配合 min.cleanable.dirty.ratio 调整合并频率
+```
+
+### 18.2 State Store 生命周期
+
+```
+State Store 生命周期：
+  创建 → 初始化 → 正常读写 → 故障恢复 → 关闭
+  
+  清理触发条件：
+    ├── 应用关闭：store.close() 释放 RocksDB 资源
+    ├── 分区重分配：旧实例释放，新实例重建
+    ├── 拓扑变更：state store 版本不匹配需重建
+    └── 手动清理：rm -rf {state.dir}/{application.id}
+
+  生产建议：
+    state.dir 使用独立磁盘（避免与日志竞争 IO）
+    定期监控 RocksDB 磁盘使用量
+    清理前确认无活跃消费者
+```
+
+---
+
+## 十九、Kafka Streams 线程模型
+
+### 19.1 StreamThread 架构
+
+```
+Kafka Streams 线程模型：
+  ├── StreamThread（默认 = 1，可配置 num.stream.threads）
+  │   ├── StreamTask（每个 partition 一个 task）
+  │   │   ├── Source Processor → 消费 input topic
+  │   │   ├── 处理节点（filter/map/aggregate/join）
+  │   │   └── Sink Processor → 写入 output topic
+  │   └── State Store（每个 task 独立的 RocksDB）
+  ├── GlobalStreamThread（GlobalKTable 专用，1个）
+  └── ScheduledExecutor（后台定时任务）
+
+  并行度计算：
+    实例数 × StreamThread 数 = 分区数（最优）
+    例：3 实例 × 2 线程 = 6 线程 → input topic 需 6 分区
+```
+
+### 19.2 线程调优
+
+| 参数 | 默认值 | 建议 |
+|------|--------|------|
+| `num.stream.threads` | 1 | 按 CPU 核数调整 |
+| `state.dir` | /tmp/kafka-streams | SSD 独立磁盘 |
+| `commit.interval.ms` | 30000 | 关键路径调小（5000） |
+| `cache.max.bytes.buffering` | 10MB | 大状态调大 |
+| `num.records.for递交` | 10000 | 批量提交 |
+
+---
+
+## 二十、ksqlDB Pull Query 优化
+
+### 20.1 Pull Query 限制与优化
+
+```
+Pull Query 限制：
+  1. 只查询物化视图的当前状态（非历史）
+  2. 不支持聚合函数（SUM/COUNT）
+  3. 只支持 WHERE 条件（主键或全表扫描）
+
+  优化策略：
+    ├── 为 Pull Query 建专用物化视图
+    ├── 使用 WHERE 条件命中主键（避免全表扫描）
+    ├── 监控 Pull Query 延迟（< 10ms 为健康）
+    └── 高频查询结果缓存（应用层 Redis）
+```
+
+### 20.2 Pull vs Push 选型
+
+| 维度 | Pull Query | Push Query |
+|------|------------|------------|
+| 结果形式 | 一次性返回 | 持续推送 |
+| 延迟 | 毫秒级 | 秒级 |
+| 适用场景 | API 查询/实时大屏 | 监控告警/实时推荐 |
+| 资源消耗 | 低（按需查询） | 高（持续物化） |
+| 并发能力 | 高 | 中（结果集大） |
+
+---
+
+## 二十一、Kafka Streams vs Flink SQL 深度对比
+
+| 维度 | Kafka Streams + ksqlDB | Flink SQL |
+|------|------------------------|-----------|
+| 部署 | 库嵌入应用（零集群） | 独立集群（需部署） |
+| SQL 引擎 | ksqlDB（有限） | Flink SQL（完备） |
+| 窗口 | 4种 | 丰富（含 Cumulative/Sliding） |
+| 水位线 | 基于时间戳（简单） | 自定义水位线策略（灵活） |
+| 复杂事件 | 有限 | 强（CEP 库） |
+| 批流一体 | 不支持 | 原生支持 |
+| 状态存储 | RocksDB + changelog | 多后端（RocksDB/堆内存/外部） |
+| 背压 | 依赖 Kafka | 反压机制（流量控制） |
+| 生态 | Kafka 生态内 | 独立生态（Hive/Iceberg/…） |
+| 适用规模 | 中小（应用内处理） | 大（独立平台） |
+
+```
+选型决策：
+  应用内轻量处理 → Kafka Streams
+  复杂流处理/CEP → Flink SQL
+  批流一体 → Flink SQL
+  实时数仓 → Flink SQL
+  实时大屏 → ksqlDB
+  已有 Kafka 生态 → Kafka Streams + ksqlDB
+```
+
+---
+
+## 二十二、生产部署模式
+
+### 22.1 部署拓扑
+
+```
+生产部署模式：
+  模式一：嵌入应用（推荐）
+    微服务 A（Kafka Streams 库）
+    微服务 B（Kafka Streams 库）
+    → 无独立集群，复用 Kafka
+
+  模式二：独立流处理集群
+    Kafka Streams 集群（多个实例）
+    → 适合需要独立扩缩容的场景
+
+  模式三：ksqlDB 集群
+    ksqlDB Server 1
+    ksqlDB Server 2
+    → SQL 化流处理，适合非 Java 团队
+```
+
+### 22.2 生产 Checklist
+
+| 检查项 | 说明 |
+|--------|------|
+| 并行度 | 实例数 × 线程数 = 分区数 |
+| 状态目录 | SSD 独立磁盘 |
+| 精确一次 | 关键链路 `exactly_once_v2` |
+| 监控 | Kafka Lag + Streams Metrics |
+| 容错 | 消费者组自动故障转移 |
+| 拓扑变更 | 停机迁移 + 状态 store 版本管理 |
+| 错误处理 | dead-letter topic + 重试策略 |
+| 窗口配置 | 正确设置 grace period |
+| 交互查询 | 查询服务与流处理分开部署 |
+
+---
+
+## 与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；
 - Flink 对比见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；

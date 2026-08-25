@@ -808,7 +808,359 @@ groups:
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、网关高级特性与生产实践
+
+### 11.1 Kong Service Mesh（Kong Mesh/Kuma）
+
+```text
+Kong Mesh 是基于 Envoy 的 Service Mesh 解决方案：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     Kong Mesh 架构                               │
+├─────────────────────────────────────────────────────────────────┤
+│  控制面：Kuma（开源，CNCF 毕业项目）                             │
+│  数据面：Envoy（sidecar）                                       │
+│  管理面：Kong Manager / Kuma GUI                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Kuma 特性：
+- 多区域支持（Zone + Global）
+- 多租户（Mesh 隔离）
+- 多运行时（Kubernetes + VM）
+- 自动 mTLS
+- 流量策略（L4/L7）
+- 可观测性（Metrics/Logs/Traces）
+```
+
+```yaml
+# Kuma Mesh 配置
+apiVersion: kuma.io/v1alpha1
+kind: Mesh
+metadata:
+  name: production
+spec:
+  metrics:
+    prometheus:
+      path: /prometheus
+      port: 9090
+  tracing:
+    defaultBackend: jaeger
+    backends:
+    - name: jaeger
+      type: zipkin
+      sampling: 100.0
+      config:
+        url: http://jaeger-collector:9411/api/v2/spans
+  mtls:
+    backends:
+    - name: ca-1
+      type: builtin
+  policies:
+  - type: TrafficRoute
+    sources:
+    - match:
+        kuma.io/service: backend
+    destinations:
+    - match:
+        kuma.io/service: "*"
+    conf:
+      loadBalancer:
+        roundRobin: {}
+```
+
+### 11.2 APISIX 自定义插件开发
+
+```lua
+-- APISIX Lua 插件示例：请求签名校验
+local core = require("apisix.core")
+local plugin_name = "request-signature"
+local ngx = ngx
+local hmac = require("resty.hmac")
+local to_hex = require("resty.string").to_hex
+
+local _M = {
+    version = 1.0,
+    type = 'auth',
+    name = plugin_name,
+    schema = core.schema.type = {
+        type = "object",
+        properties = {
+            header_name = { type = "string", default = "X-Signature" },
+            secret = { type = "string" },
+            algorithm = { type = "string", default = "hmac-sha256", enum = {"hmac-sha256", "hmac-sha512"} },
+            clock_skew = { type = "number", default = 300 }
+        },
+        required = {"secret"}
+    }
+}
+
+function _M.check_schema(conf)
+    return true
+end
+
+function _M.rewrite(conf, ctx)
+    local req_uri = ctx.var.uri
+    local req_method = ctx.var.request_method
+    local timestamp = ngx.req.get_headers()["X-Timestamp"] or ""
+    local sign = ngx.req.get_headers()[conf.header_name]
+
+    if not sign or not timestamp then
+        return 401, {message = "Missing signature or timestamp"}
+    end
+
+    -- 时间戳校验
+    local now = ngx.time()
+    if math.abs(now - tonumber(timestamp)) > conf.clock_skew then
+        return 401, {message = "Request expired"}
+    end
+
+    -- 签名校验
+    local payload = req_method .. "\n" .. req_uri .. "\n" .. timestamp
+    local hmac_obj = hmac:new(conf.secret, hmac.ALGOS[conf.algorithm])
+    hmac_obj:update(payload)
+    local expected_sign = to_hex(hmac_obj:final())
+
+    if sign ~= expected_sign then
+        return 401, {message = "Invalid signature"}
+    end
+end
+
+return _M
+```
+
+### 11.3 APISIX 全局规则
+
+```yaml
+# 全局规则：所有路由生效
+# 全局插件配置
+apisix:
+  plugins: api-breaker, authz-keycloak, basic-auth, batch-requests,
+    consumer-restriction, cors, echo, fault-injection,
+    grpc-transcode, hmac-auth, http-logger, ip-restriction,
+    jwt-auth, kafka-logger, key-auth, limit-conn, limit-count,
+    limit-req, node-status, prometheus, proxy-cache,
+    proxy-mirror, proxy-rewrite, redirect, referer-restriction,
+    request-id, request-validation, response-rewrite,
+    serverless-pre-function, serverless-post-function,
+    sls-logger, syslog, tcp-logger, udp-logger, uri-blocker,
+    wolf-rbac, zipkin, real-ip, gzip, grpc-web
+
+# 全局限流
+curl -X PUT http://localhost:9180/apisix/admin/global_rules/1 \
+  -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+  -d '{
+    "plugins": {
+      "limit-count": {
+        "count": 1000,
+        "time_window": 1,
+        "rejected_code": 429,
+        "key_type": "var",
+        "key": "remote_addr"
+      },
+      "prometheus": {
+        "prefer_name": true
+      }
+    }
+  }'
+```
+
+### 11.4 APISIX 服务发现
+
+```yaml
+# Nacos 服务发现
+apisix:
+  plugins:
+    - discovery.nacos
+
+discovery:
+  nacos:
+    host:
+      - "http://nacos:8848"
+    prefix: "/nacos/v1/ns"
+    username: nacos
+    password: nacos
+    weight: 100
+    groups:
+      - DEFAULT_GROUP
+
+# Eureka 服务发现
+discovery:
+  eureka:
+    host:
+      - "http://eureka:8761/eureka"
+    fetch_interval: 30
+    prefix: "/eureka/apps"
+
+# DNS 服务发现
+discovery_type: dns
+dns:
+  resolvers:
+    - "127.0.0.53"
+  lookup_timeout: 3
+```
+
+```bash
+# 使用 Nacos 服务发现创建路由
+curl -X PUT http://localhost:9180/apisix/admin/routes/1 \
+  -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+  -d '{
+    "uri": "/api/users/*",
+    "upstream": {
+      "type": "roundrobin",
+      "discovery_type": "nacos",
+      "service_name": "user-service",
+      "discovery_args": {
+        "namespace_id": "dev"
+      }
+    }
+  }'
+```
+
+### 11.5 网关限流算法
+
+```text
+常见限流算法对比：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 算法                  │ 特点                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 固定窗口              │ 简单，但有边界突发问题                       │
+│ 滑动窗口              │ 精确，但内存消耗大                          │
+│ 令牌桶                │ 允许突发，平滑限流                          │
+│ 漏桶                  │ 严格平滑，不允许突发                        │
+│ 分布式限流            │ Redis + Lua 实现全局限流                    │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```lua
+-- 令牌桶算法实现（Redis + Lua）
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])       -- 令牌生成速率（个/秒）
+local capacity = tonumber(ARGV[2])   -- 桶容量
+local now = tonumber(ARGV[3])        -- 当前时间戳（毫秒）
+local requested = tonumber(ARGV[4])  -- 请求令牌数
+
+local last_tokens = tonumber(redis.call("get", key .. ":tokens") or capacity)
+local last_time = tonumber(redis.call("get", key .. ":last_time") or now)
+
+-- 计算新增令牌
+local elapsed = (now - last_time) / 1000
+local new_tokens = math.min(capacity, last_tokens + elapsed * rate)
+
+local allowed = 0
+if new_tokens >= requested then
+    new_tokens = new_tokens - requested
+    allowed = 1
+end
+
+-- 更新状态
+redis.call("set", key .. ":tokens", new_tokens)
+redis.call("set", key .. ":last_time", now)
+redis.call("expire", key .. ":tokens", math.ceil(capacity / rate) * 2)
+redis.call("expire", key .. ":last_time", math.ceil(capacity / rate) * 2)
+
+return { allowed, new_tokens }
+```
+
+### 11.6 网关请求/响应转换
+
+```json
+// APISIX 请求转换示例
+{
+  "plugins": {
+    "proxy-rewrite": {
+      "uri": "/api/v2/users",
+      "headers": {
+        "add": {
+          "X-Request-Source": "gateway"
+        },
+        "set": {
+          "Host": "backend-service"
+        },
+        "remove": [
+          "X-Real-IP"
+        ]
+      },
+      "args": {
+        "add": {
+          "version": "v2"
+        },
+        "remove": ["old_param"]
+      }
+    },
+    "response-rewrite": {
+      "headers": {
+        "add": {
+          "X-Response-Time": "$upstream_response_time"
+        }
+      },
+      "body": "{\"code\": 0, \"data\": ${upstream_response_body}}"
+    }
+  }
+}
+```
+
+### 11.7 网关响应缓存
+
+```yaml
+# APISIX 缓存配置
+plugins:
+  proxy-cache:
+    cache_key: "$uri$is_args$args"
+    cache_zone: "disk_cache_one"
+    cache_bypass: ["$http_x_cache_bypass"]
+    cache_ttl: 300  # 5分钟
+
+# 缓存存储配置
+proxy_cache_path /tmp/cache levels=1:2
+    keys_zone=disk_cache_one:10m
+    max_size=1g
+    inactive=10m
+    use_temp_path=off
+```
+
+### 11.8 网关在微服务架构中的角色
+
+```text
+网关在微服务架构中的定位：
+┌─────────────────────────────────────────────────────────────────┐
+│                        客户端                                    │
+│                    (Web/Mobile/小程序)                           │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       API 网关                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │ 鉴权      │  │ 限流      │  │ 路由      │  │ 灰度      │        │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        │                       │                       │
+        ▼                       ▼                       ▼
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│ 用户服务      │      │ 订单服务      │      │ 支付服务      │
+└──────────────┘      └──────────────┘      └──────────────┘
+        │                       │                       │
+        └───────────────────────┼───────────────────────┘
+                                │
+                                ▼
+                    ┌──────────────────────┐
+                    │   Service Mesh        │
+                    │  (Envoy/Istio)       │
+                    └──────────────────────┘
+
+网关职责：
+- 路由：根据路径/Header 路由到后端服务
+- 鉴权：JWT/OAuth2/API Key 验证
+- 限流：保护后端服务
+- 灰度：流量按比例/用户/区域分流
+- 协议转换：HTTP ↔ gRPC
+- 缓存：热点数据缓存
+- 日志：访问日志、审计日志
+```
+
+## 十二、与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；
 - Spring 生态网关见「[Spring Cloud Gateway](./SpringCloudGateway.md)」；

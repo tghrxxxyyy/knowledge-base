@@ -1320,6 +1320,335 @@ groups:
           └── 否 → 最大努力通知
 ```
 
+## Seata 与微服务架构集成模式
+
+### 16.1 Spring Cloud Alibaba 集成
+
+```yaml
+# application.yml 集成配置
+spring:
+  cloud:
+    alibaba:
+      seata:
+        enabled: true
+        application-id: ${spring.application.name}
+        tx-service-group: my_tx_group
+        registry:
+          type: nacos
+          nacos:
+            server-addr: ${spring.cloud.nacos.discovery.server-addr}
+            namespace: ${spring.cloud.nacos.discovery.namespace}
+        config:
+          type: nacos
+          nacos:
+            server-addr: ${spring.cloud.nacos.config.server-addr}
+            namespace: ${spring.cloud.nacos.config.namespace}
+
+# Seata 分组配置（file.conf）
+service {
+  vgroupMapping.my_tx_group = "default"
+  default.grouplist = "10.0.0.1:8091,10.0.0.2:8091"
+  enableDegrade = false
+  disableGlobalTransaction = false
+}
+```
+
+### 16.2 微服务事务传播
+
+```java
+// 事务传播：在微服务间自动传播 XID
+@FeignClient(name = "order-service")
+public interface OrderClient {
+    @PostMapping("/order/create")
+    Result createOrder(@RequestBody OrderDTO dto);
+}
+
+// 调用方：自动传递 XID
+@GlobalTransactional
+public void handleOrder(OrderDTO dto) {
+    // 1. 库存服务（自动传播 XID）
+    inventoryClient.deduct(dto.getItems());
+    // 2. 订单服务（自动传播 XID）
+    orderClient.createOrder(dto);
+    // 3. 任何一个失败，全局回滚
+}
+
+// 服务端：接收 XID 并加入全局事务
+@Service
+public class OrderServiceImpl {
+    @GlobalTransactional
+    public void createOrder(OrderDTO dto) {
+        // XID 自动通过 Feign 传递，无需手动处理
+        orderMapper.insert(dto);
+    }
+}
+```
+
+---
+
+## Seata TCC 框架复杂业务实现
+
+### 17.1 TCC 高级模式
+
+```java
+// 复杂 TCC：库存预扣 + 订单 + 积分 + 优惠券
+@LocalTCC
+public interface InventoryTccService {
+    @TwoPhaseBusinessAction(name = "deduct", commitMethod = "commit", rollbackMethod = "rollback")
+    boolean prepare(@BusinessActionContext参与者上下文 BusinessActionContext context,
+                    @BusinessActionContext参数化 long userId,
+                    @BusinessActionContext参数化 long itemId,
+                    @BusinessActionContext参数化 int quantity);
+
+    boolean commit(BusinessActionContext context);
+    boolean rollback(BusinessActionContext context);
+}
+
+// TCC 实现
+@Service
+public class InventoryTccServiceImpl implements InventoryTccService {
+    @Override
+    @Transactional
+    public boolean prepare(BusinessActionContext context, long userId, long itemId, int quantity) {
+        // Try 阶段：冻结库存
+        int affected = inventoryMapper.freezeStock(itemId, quantity);
+        if (affected == 0) {
+            throw new RuntimeException("库存不足");
+        }
+        // 记录冻结日志（用于幂等）
+        inventoryMapper.insertFreezeLog(context.getXid(), itemId, quantity);
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean commit(BusinessActionContext context) {
+        // Commit 阶段：扣减冻结库存
+        inventoryMapper.confirmDeduct(context.getXid(), itemId);
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public boolean rollback(BusinessActionContext context) {
+        // Rollback 阶段：释放冻结库存
+        inventoryMapper.releaseFreeze(context.getXid(), itemId);
+        return true;
+    }
+}
+```
+
+### 17.2 TCC 异常处理
+
+```
+TCC 异常处理策略：
+  1. 幂等控制：TCC 日志表（xid + branch_id 唯一键）
+  2. 空回滚：Try 未执行，Rollback 直接返回成功
+  3. 悬挂：Try 超时，Rollback 先到，Try 后到需拒绝
+  4. 重试：Commit/Rollback 自动重试（最多 5 次）
+  5. 人工介入：多次重试失败，记录日志人工处理
+
+  幂等实现：
+    BranchTable {
+      xid, branch_id, branch_status, application_data
+    }
+    -- Commit 时检查 branch_status
+    -- 已提交则跳过
+```
+
+---
+
+## Seata SAGA 状态机 DSL
+
+### 18.1 SAGA 状态机定义
+
+```json
+{
+  "Name": "order_saga",
+  "Version": "1.0.0",
+  "States": [
+    {
+      "Type": "ServiceTask",
+      "ServiceName": "inventory",
+      "ServiceMethod": "deduct",
+      "CompensateState": "cancelInventory",
+      "IsForward": true
+    },
+    {
+      "Type": "ServiceTask",
+      "ServiceName": "order",
+      "ServiceMethod": "create",
+      "CompensateState": "cancelOrder",
+      "IsForForward": true
+    },
+    {
+      "Type": "ServiceTask",
+      "ServiceName": "payment",
+      "ServiceMethod": "pay",
+      "CompensateState": "refundPayment",
+      "IsForForward": true
+    }
+  ],
+  "Transitions": [
+    {"From": "createInventory", "To": "createOrder", "Type": "Succeed"},
+    {"From": "createInventory", "To": "cancelInventory", "Type": "Fail"},
+    {"From": "createOrder", "To": "createPayment", "Type": "Succeed"},
+    {"From": "createOrder", "To": "cancelOrder", "Type": "Fail"},
+    {"From": "createPayment", "To": "End", "Type": "Succeed"},
+    {"From": "createPayment", "To": "refundPayment", "Type": "Fail"}
+  ],
+  "CompensationTrigger": "Fail"
+}
+```
+
+### 18.2 SAGA 执行流程
+
+```
+SAGA 执行流程：
+  createInventory → createOrder → createPayment → End
+  
+  如果 createPayment 失败：
+    createPayment(Fail) → refundPayment → cancelOrder → cancelInventory
+  
+  状态机状态：
+    START → RUNNING → SUSPENDED → COMPLETED / ROLLBACKED
+  
+  日志表（seata_state_machine）：
+    id, gmt_created, gmt_modified, business_type, state_machine_id,
+    state_id, state_name, service_name, service_method, is_forward,
+    input_params, output_params, status, start_time, end_time, excep
+```
+
+---
+
+## Seata 高并发性能优化
+
+### 19.1 AT 模式性能瓶颈
+
+```
+AT 模式性能瓶颈：
+  1. 全局锁：全局锁竞争（单机瓶颈）
+  2. undo_log：额外写 undo_log（增加 IO）
+  3. SQL 解析：解析 SQL 开销（CPU）
+  4. TC 通信：与 TC 通信延迟（网络）
+
+  优化策略：
+    ├── 读写分离：读操作跳过全局锁
+    ├── 本地缓存：缓存 undo_log（减少 IO）
+    ├── 异步提交：异步清理 undo_log
+    ├── 批量操作：批量提交（减少网络开销）
+    └── 独立 TC 集群：TC 节点独立部署（避免资源竞争）
+```
+
+### 19.2 性能对比
+
+| 模式 | TPS（单机） | TPS（集群） | 延迟 | 适用场景 |
+|------|------------|------------|------|----------|
+| AT | 1000-3000 | 3000-8000 | 50-200ms | 简单 CRUD |
+| TCC | 3000-10000 | 8000-30000 | 10-50ms | 复杂业务 |
+| SAGA | 500-1000 | 1000-3000 | 100-500ms | 长事务 |
+| XA | 500-1500 | 1500-5000 | 100-300ms | 强一致 |
+
+---
+
+## Seata + Prometheus 监控
+
+### 20.1 Seata 监控指标
+
+```yaml
+# Prometheus 采集配置
+scrape_configs:
+  - job_name: 'seata_tc'
+    static_configs:
+      - targets: ['seata-tc:9090']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+# Seata TC 指标
+seata_tc_transaction_total              # 事务总数
+seata_tc_transaction_committed_total    # 提交事务数
+seata_tc_transaction_rollbacked_total   # 回滚事务数
+seata_tc_transaction_active             # 活跃事务数
+seata_tc_transaction_avg_duration       # 事务平均耗时
+seata_tc_branch_total                   # 分支事务总数
+seata_tc_branch_active                  # 活跃分支数
+seata_tc_lock_waiting_count             # 锁等待数
+```
+
+### 20.2 Grafana 大屏配置
+
+```json
+{
+  "title": "Seata 分布式事务监控",
+  "panels": [
+    {
+      "title": "事务成功率",
+      "targets": [
+        {"expr": "seata_tc_transaction_committed_total / seata_tc_transaction_total * 100"}
+      ]
+    },
+    {
+      "title": "回滚率",
+      "targets": [
+        {"expr": "seata_tc_transaction_rollbacked_total / seata_tc_transaction_total * 100"}
+      ]
+    },
+    {
+      "title": "锁等待数",
+      "targets": [
+        {"expr": "seata_tc_lock_waiting_count"}
+      ]
+    },
+    {
+      "title": "事务平均耗时",
+      "targets": [
+        {"expr": "seata_tc_transaction_avg_duration"}
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## Seata 千级 TPS 生产模式
+
+### 21.1 高可用部署
+
+```
+Seata 高可用部署：
+  TC 集群：3 节点（最少），部署在独立服务器
+  注册中心：Nacos 集群（3 节点）
+  配置中心：Nacos 集群（3 节点）
+
+  部署拓扑：
+    Client → Nacos（注册） → TC 集群
+    Client → TC 集群（事务协调）
+    TC → Database（undo_log / lock）
+
+  性能优化：
+    1. TC 独立部署（避免与业务服务竞争资源）
+    2. 数据库连接池优化（Druid/HikariCP）
+    3. undo_log 异步清理（定时任务）
+    4. 全局锁超时（避免长时间阻塞）
+    5. 事务超时设置（避免长时间占用资源）
+```
+
+### 21.2 容量规划
+
+```sql
+-- 容量规划 SQL
+-- 根据 TPS 估算 TC 节点数
+-- 单个 TC 节点：1000-3000 TPS
+-- 建议：TPS / 2000 = TC 节点数
+
+-- 数据库容量规划
+-- undo_log 表：每天约 100 万行（按 1000 TPS 估算）
+-- 需要定期清理：DELETE FROM undo_log WHERE gmt_create < NOW() - INTERVAL 7 DAY
+```
+
+---
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

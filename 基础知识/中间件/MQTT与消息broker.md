@@ -1056,6 +1056,335 @@ client.publish(
 )
 ```
 
+## MQTT v5.0 共享订阅深入
+
+### 共享订阅与 QoS 协商
+
+```
+共享订阅消息分发策略：
+  Round Robin（默认）：
+    订阅者1 → 消息1, 消息3, 消息5
+    订阅者2 → 消息2, 消息4, 消息6
+    均衡分配，适用于无状态消费
+
+  Random：
+    随机分发给任意订阅者
+    适用于均匀负载
+
+  Hash：
+    根据 Topic 或属性哈希分发
+    相关消息分发给同一订阅者（有状态消费）
+
+  Sticky：
+    黏性分发，同一消息始终发给同一订阅者
+    适用于需要会话保持的场景
+
+QoS 协商规则：
+  发布者 QoS 0 + 订阅者 QoS 0 → 投递 QoS 0
+  发布者 QoS 0 + 订阅者 QoS 1 → 投递 QoS 0（不能提升）
+  发布者 QoS 1 + 订阅者 QoS 0 → 投递 QoS 0（降级）
+  发布者 QoS 1 + 订阅者 QoS 1 → 投递 QoS 1
+  发布者 QoS 2 + 订阅者 QoS 2 → 投递 QoS 2
+  原则：取发布者和订阅者中较低的 QoS 级别
+```
+
+### 共享订阅负载均衡实现
+
+```python
+# MQTT 共享订阅消费者示例
+import paho.mqtt.client as mqtt
+
+# 共享订阅格式：$share/<group>/<topic>
+SHARED_TOPIC = "$share/worker-group/sensor/+/temperature"
+
+client = mqtt.Client(client_id="worker-1")
+
+def on_connect(client, userdata, flags, rc):
+    # 订阅共享 Topic
+    client.subscribe(SHARED_TOPIC, qos=1)
+
+def on_message(client, userdata, msg):
+    # Broker 自动在 worker-group 内轮询分发
+    topic = msg.topic
+    payload = msg.payload.decode()
+    print(f"Worker-1 收到: {topic} = {payload}")
+
+    # 处理消息
+    process_sensor_data(topic, payload)
+
+client.on_connect = on_connect
+client.on_message = on_message
+client.connect("broker.example.com", 1883, 60)
+client.loop_forever()
+```
+
+## MQTT Topic 设计模式
+
+### Topic 层次设计规范
+
+```
+Topic 设计原则：
+  1. 层次清晰：使用 / 分隔，从大到小
+  2. 避免通配符滥用：+ 和 # 影响路由性能
+  3. 预留扩展：为未来新设备类型预留空间
+  4. 控制长度：Topic 长度 ≤ 65535 字节（建议 ≤ 256）
+
+推荐 Topic 结构：
+  <项目>/<环境>/<设备类型>/<设备ID>/<数据类型>
+
+示例：
+  iot/prod/sensor/001/temperature    → 传感器温度
+  iot/prod/sensor/001/humidity       → 传感器湿度
+  iot/prod/gateway/001/status        → 网关状态
+  iot/prod/actuator/001/command      → 执行器控制
+  iot/prod/alert/high-temp           → 高温告警
+
+避免的 Topic 设计：
+  ❌ data/001/temperature  → 无项目和环境前缀
+  ❌ iot/sensor/001/data   → 数据类型不明确
+  ❌ iot/prod/sensor/001/temperature/status/extra → 层次太深
+```
+
+### Topic 与 QoS 匹配
+
+| 数据类型 | Topic 示例 | QoS | Retain | 说明 |
+|----------|------------|-----|--------|------|
+| 遥测数据 | sensor/+/temperature | 0 | 否 | 允许丢失 |
+| 设备状态 | device/+/status | 1 | 是 | 至少一次，保留最新 |
+| 控制命令 | command/+/action | 1 | 否 | 至少一次，不保留 |
+| 配置下发 | device/+/config | 2 | 是 | 恰好一次，保留 |
+| 告警信息 | alert/# | 1 | 否 | 至少一次 |
+| OTA 升级 | device/+/ota | 2 | 否 | 恰好一次 |
+
+## MQTT QoS 协商机制
+
+### QoS 协商流程
+
+```
+QoS 协商规则（MQTT 5.0）：
+  1. 客户端在 SUBSCRIBE 中指定期望的 QoS
+  2. 服务端根据发布者 QoS 和订阅者 QoS 取较低值
+  3. 服务端在 SUBACK 中返回实际授予的 QoS
+
+示例：
+  发布者 PUBLISH QoS 2
+  订阅者 SUBSCRIBE QoS 2
+  服务端授予 QoS 2
+
+  发布者 PUBLISH QoS 0
+  订阅者 SUBSCRIBE QoS 1
+  服务端授予 QoS 0（不能提升 QoS）
+
+QoS 选择建议：
+  ├── 传感器遥测数据：QoS 0（允许丢失，高频）
+  ├── 设备状态上报：QoS 1（至少一次，保留最新）
+  ├── 控制命令下发：QoS 1（至少一次，不保留）
+  ├── 金融交易数据：QoS 2（恰好一次，不可丢失/重复）
+  └── 日志采集：QoS 0（允许丢失，高频）
+```
+
+## MQTT 桥接实现混合云架构
+
+### 混合云 MQTT 架构
+
+```mermaid
+graph TD
+    subgraph 边缘节点
+        E1[边缘 Broker 1] -->|本地处理| D1[设备1]
+        E1 -->|本地处理| D2[设备2]
+        E2[边缘 Broker 2] -->|本地处理| D3[设备3]
+        E2 -->|本地处理| D4[设备4]
+    end
+    
+    subgraph 云端
+        CB[中心 Broker] -->|规则引擎| DB[(数据库)]
+        CB -->|规则引擎| Kafka[Kafka]
+        CB --> APP[应用服务]
+    end
+    
+    E1 <-->|MQTT Bridge| CB
+    E2 <-->|MQTT Bridge| CB
+```
+
+### 桥接配置示例
+
+```xml
+<!-- EMQX 桥接到云端 MQTT Broker -->
+<bridge_bridge0>
+    <enable>true</enable>
+    <bridge_type>mqtt</bridge_type>
+    <address>mqtt.cloud.example.com:1883</address>
+    <clientid>edge-bridge-001</clientid>
+    <username>bridge-user</username>
+    <password>bridge-pass</password>
+    <clean_start>true</clean_start>
+    <keepalive>60s</keepalive>
+    <Protocol_version>v5</Protocol_version>
+    
+    <!-- 订阅规则：边缘 → 云端 -->
+    <forwards>
+        <forward>
+            <topic>sensor/#</topic>
+            <qos>1</qos>
+        </forward>
+    </forwards>
+    
+    <!-- 发布规则：云端 → 边缘 -->
+    <subscribed_topics>
+        <subscribed_topic>
+            <topic>command/#</topic>
+            <qos>1</qos>
+        </subscribed_topic>
+    </subscribed_topics>
+    
+    <!-- 桥接消息 Topic 前缀 -->
+    <topic_prefix>edge/001/</topic_prefix>
+</bridge_bridge0>
+```
+
+## MQTT 在车联网中的 MQTT 5.0 特性应用
+
+### 车联网 MQTT 5.0 特性
+
+```
+MQTT 5.0 在车联网中的应用：
+  1. 共享订阅：多云端服务共享车辆遥测数据
+     Topic: $share/cloud-group/v2x/vehicle/+/bsm
+     → 交通管理服务 + 保险服务 + 导航服务 共同消费
+
+  2. 消息过期：设置消息 TTL，过期自动丢弃
+     Properties: Message-Expiry-Interval = 30（30 秒）
+     → BSM 消息 30 秒后自动丢弃（过时的位置信息无意义）
+
+  3. 内容类型：标识消息格式
+     Properties: Content-Type = "application/json"
+     → 消费者可按格式解析
+
+  4. 响应主题：请求/响应模式
+     Request Topic: v2x/vehicle/001/config/request
+     Response Topic: v2x/vehicle/001/config/response
+     Correlation Data: req-123
+     → 车辆配置查询/响应
+
+  5. 用户属性：携带元数据
+     User Properties:
+       x-vehicle-type: "sedan"
+       x-firmware-version: "2.1.0"
+       x-region: "shanghai"
+     → 车辆元数据，便于路由和过滤
+```
+
+### 车联网 MQTT 部署方案
+
+```
+车联网 MQTT 部署架构：
+  车载终端：
+    ├── MQTT 客户端（支持 v5.0）
+    ├── TLS 1.3 + 证书认证
+    ├── 心跳：30s（检测在线状态）
+    ├── 遗嘱消息：车辆离线通知
+    └── 发布 QoS：BSM QoS 0，控制 QoS 1
+
+  边缘 Broker（路侧单元 RSU）：
+    ├── 本地处理紧急告警（< 10ms）
+    ├── 缓存未送达消息
+    ├── 桥接到云端 Broker
+    └── 本地规则引擎
+
+  云端 Broker：
+    ├── 高可用集群
+    ├── 海量连接管理
+    ├── 规则引擎 → Kafka/数据库
+    └── 多租户隔离
+```
+
+## MQTT Broker 基准测试方法论
+
+### 测试方法与工具
+
+```
+MQTT Broker 基准测试方法论：
+  1. 连接测试：建立大量并发连接
+     工具：emqtt-bench、mqtt-stresser
+     指标：连接建立时间、最大连接数
+
+  2. 发布测试：高频发布消息
+     工具：mqttx bench pub、emqtt-bench
+     指标：发布 TPS、延迟 P50/P95/P99
+
+  3. 订阅测试：大量订阅者接收消息
+     工具：mqttx bench sub、emqtt-bench
+     指标：订阅 TPS、消息投递延迟
+
+  4. 混合负载测试：发布 + 订阅同时进行
+     模拟真实场景
+     指标：整体吞吐、延迟分布
+
+  5. 持续压力测试：长时间高负载
+     测试稳定性
+     指标：内存增长、GC 频率、错误率
+
+测试配置建议：
+  ├── 消息大小：256B（典型传感器数据）
+  ├── QoS 级别：0 和 1 分别测试
+  ├── Topic 层次：模拟真实设备 Topic
+  └── 持续时间：至少 30 分钟（观察稳态）
+```
+
+### 性能基准数据
+
+| 测试场景 | EMQX 5.0 | Mosquitto | HiveMQ |
+|----------|-----------|-----------|--------|
+| 10 万并发连接 | 3s 建立 | 30s 建立 | 10s 建立 |
+| QoS 0 发布 TPS | 80 万/s | 5 万/s | 20 万/s |
+| QoS 1 发布 TPS | 40 万/s | 2 万/s | 10 万/s |
+| QoS 2 发布 TPS | 15 万/s | 0.5 万/s | 3 万/s |
+| 延迟 P99（QoS 0） | < 1ms | < 5ms | < 2ms |
+| 内存占用（10 万连接） | 2GB | 8GB | 4GB |
+
+## MQTT 安全加固清单
+
+### 安全加固检查项
+
+```
+MQTT 安全加固清单：
+  1. 传输层安全
+     ├── [ ] 启用 TLS 1.2+（端口 8883）
+     ├── [ ] 使用 CA 签发的服务器证书
+     ├── [ ] 可选：双向 TLS（客户端证书认证）
+     └── [ ] 禁用 TLS 1.0/1.1
+
+  2. 认证安全
+     ├── [ ] 禁止匿名连接（allow_anonymous false）
+     ├── [ ] 使用强密码或证书认证
+     ├── [ ] 密码定期轮转
+     └── [ ] 限制单 IP 连接数
+
+  3. 授权控制
+     ├── [ ] 配置 ACL（基于 clientid/username）
+     ├── [ ] 设备只能发布/订阅自己的 Topic
+     ├── [ ] 应用只能订阅需要的 Topic
+     └── [ ] 禁止通配符订阅 $SYS/#（系统 Topic）
+
+  4. 会话安全
+     ├── [ ] 设置合理的会话过期时间
+     ├── [ ] 限制最大会话数
+     ├── [ ] 启用会话过期清理
+     └── [ ] 限制未确认消息队列长度
+
+  5. 网络安全
+     ├── [ ] Broker 不暴露公网
+     ├── [ ] 使用负载均衡 + WAF
+     ├── [ ] 启用连接速率限制
+     └── [ ] 监控异常连接
+
+  6. 监控告警
+     ├── [ ] 监控连接数、消息量、延迟
+     ├── [ ] 告警异常断连、认证失败
+     ├── [ ] 审计日志记录所有连接
+     └── [ ] 定期安全扫描
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

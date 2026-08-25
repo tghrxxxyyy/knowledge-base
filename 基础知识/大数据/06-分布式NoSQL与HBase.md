@@ -600,6 +600,164 @@ flowchart TD
 - [ ] 大集群控制 Region 总数（避免 ZK 压力）。
 - [ ] 二级索引按需（Phoenix/ES），权衡写放大。
 
+## 二十二、HBase 深度补充
+
+### 22.1 Region 热点定位与治理
+
+```
+热点检测：
+  HBase Web UI → Region Server → Request Latency
+  检查各 Region 的 StoreFile 大小差异
+  检查 Compaction 队列长度（积压 = 热点）
+
+热点治理：
+  1. 预分区（Pre-Splitting）：
+     create 'table', {NAME => 'cf', SPLITS => ['1000','2000','3000']}
+  
+  2. RowKey 设计：
+     加盐（Salt）：user_id 前加随机前缀 → hash(user_id) % N
+     哈希：MD5(user_id) 前 8 位
+     反转：手机号反转 → 13912345678 → 87654321931
+  
+  3. 负载均衡：
+     hbase shell> balancer_switch true
+     hbase shell> balancer
+
+  4. Region 分裂：
+     手动分裂：split 'table', 'split_key'
+     自动分裂：hbase.regionserver.region.split.policy
+```
+
+### 22.2 Coprocessor 详解
+
+```
+Coprocessor = HBase 的服务端扩展机制
+
+两种类型：
+  Endpoint：RPC 调用（类似存储过程）
+  Observer：拦截事件（类似触发器）
+
+Observer 使用场景：
+  RegionObserver：Get/Put/Delete/Scan 前后拦截
+  MasterObserver：DDL 操作拦截
+  WALObserver：WAL 写入拦截
+
+Endpoint 使用场景：
+  聚合查询（求和/计数/去重）
+  自定义路由逻辑
+  二级索引维护
+
+配置方式：
+  1. 表级：ALTER 'table', {NAME => 'cf', coprocessor => '...'}
+  2. 系统级：hbase-coprocessor.xml
+```
+
+```java
+// RegionObserver 示例：自动添加时间戳
+public class TimestampObserver extends BaseRegionObserver {
+    @Override
+    public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                       Put put, WALEdit edit, Durability durability) {
+        // 所有 Put 操作自动添加当前时间戳
+        for (Cell cell : put.getFamilyMap().get(Bytes.toBytes("cf"))) {
+            put.addColumn(Bytes.toBytes("cf"), CellUtil.cloneQualifier(cell),
+                EnvironmentEdgeManager.currentTime(), CellUtil.cloneValue(cell));
+        }
+    }
+}
+```
+
+### 22.3 Phoenix 二级索引
+
+```sql
+-- Phoenix 二级索引类型
+-- 1. 全局索引（Global Index）
+CREATE INDEX idx_user ON t_user (user_id) INCLUDE (name, email);
+-- 查询只走索引，不回表
+
+-- 2. 本地索引（Local Index）
+CREATE LOCAL INDEX idx_time ON t_event (event_time);
+-- 索引数据存储在同一个 Region
+
+-- 3. 覆盖索引（Covered Index）
+CREATE INDEX idx_cover ON t_order (order_id) INCLUDE (amount, status);
+-- SELECT amount, status FROM t_order WHERE order_id = ?  → 全索引扫描
+
+-- 4. 函数索引（Function-Based Index）
+CREATE INDEX idx_upper ON t_user (UPPER(name));
+-- SELECT * FROM t_user WHERE UPPER(name) = 'ZHANGSAN';
+
+-- 索引维护成本：
+--   写入放大：每条写入同步更新索引表
+--   存储开销：索引表 = 原表数据的 20%~50%
+--   适用：读多写少场景
+```
+
+### 22.4 HBase 在特征存储（Feature Store）中的应用
+
+```
+特征存储架构：
+  实时特征计算 → HBase（低延迟读写）
+  离线特征计算 → HDFS/Hive → HBase（批量导入）
+  在线推理服务 → HBase（毫秒级特征获取）
+
+HBase 优势：
+  - 列族灵活（不同特征不同列族）
+  - 低延迟（1~10ms）
+  - 高吞吐（百万级 QPS）
+  - 适合稀疏特征矩阵
+
+表设计：
+  RowKey = user_id
+  Column Family = features
+  Column Qualifier = feature_name
+  Value = feature_value
+  Timestamp = feature_timestamp
+```
+
+### 22.5 HBase 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| RegionServer 请求延迟 | P99 > 100ms | 告警 |
+| BlockCache 命中率 | < 90% | 调优 |
+| MemStore 大小 | > 128MB | 触发 flush |
+| Compaction 队列 | > 10 | 检查 IO |
+| Region 数量 | > 300/Server | 分裂/迁移 |
+| GC 暂停时间 | > 1s | 调优 JVM |
+| 写入延迟 | P99 > 50ms | 检查 WAL/磁盘 |
+
+### 22.6 HBase 容量规划
+
+```
+容量估算：
+  存储量 = 行数 × 列数 × 平均列值大小 × 副本数（默认3）
+  RegionServer 数量 = 总存储量 / 单节点容量（建议 ≤ 500GB/节点）
+
+  Region 数量：
+    每个 Region 建议 10GB~20GB
+    每个 RegionServer 建议 100~200 个 Region
+    总 Region 数 = 行数 × 列数 / (单 Region 行数)
+
+  读写 QPS：
+    单节点读 QPS：1000~5000
+    单节点写 QPS：5000~20000
+    需要 10000 读 QPS → 2~5 节点
+    需要 50000 写 QPS → 3~10 节点
+```
+
+### 22.7 HBase vs Bigtable 对比
+
+| 维度 | HBase | Bigtable |
+|------|-------|----------|
+| 部署 | 自建（HDFS） | GCP 托管 |
+| 存储 | HDFS（3副本） | Colossus（自动扩缩） |
+| 计算 | RegionServer（自运维） | 托管（自动扩缩） |
+| 一致性 | 强一致 | 强一致 |
+| 跨区域 | 需手动（Replication） | 原生多区域 |
+| 价格 | 自运维成本 | 按使用量付费 |
+| 适用 | 国内自建/混合云 | GCP 原生/全球部署 |
+
 ## 二十三、与其他板块的关系
 
 - HDFS 基础见「[04-分布式存储与HDFS](04-分布式存储与HDFS.md)」；

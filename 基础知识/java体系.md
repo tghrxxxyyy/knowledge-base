@@ -1087,6 +1087,232 @@ try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
   5. **bench 方法太长**：混合了多个操作，无法定位瓶颈。
 - **解读**：看 Score ± 误差（置信区间），误差大说明被调度/GC 干扰，单次数值别盲信。
 
+## 十、Java 17/21 新特性与现代 Java 实践
+
+### 10.1 Java 17 LTS 关键特性
+
+```java
+// 1. Pattern Matching for instanceof（16 预览，17 正式）
+if (obj instanceof String s) {
+    System.out.println(s.length());  // 无需强转
+}
+
+// 2. Switch 表达式（14 正式）
+String result = switch (day) {
+    case MONDAY, FRIDAY -> "工作日";
+    case SATURDAY, SUNDAY -> "周末";
+    default -> "其他";
+};
+
+// 3. Text Blocks（15 正式）
+String json = """
+        {
+            "name": "张三",
+            "age": 25
+        }
+        """;
+
+// 4. Sealed Classes（17 正式）
+public sealed interface Shape
+    permits Circle, Rectangle, Triangle {}
+public record Circle(double r) implements Shape {}
+public record Rectangle(double w, double h) implements Shape {}
+
+// 5. Records（14 正式）
+public record User(String name, int age) {}
+
+// 6. Helpful NullPointerExceptions（14）
+// NPE 精确到具体变量：Cannot invoke "String.length()" because "s" is null
+```
+
+### 10.2 Java 21 LTS 关键特性
+
+```java
+// 1. Virtual Threads（Loom，21 正式）
+Thread.startVirtualThread(() -> {
+    // 虚拟线程：轻量级，百万级并发
+    var conn = dataSource.getConnection();
+    // ...
+});
+
+// 结构化并发（预览）
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Future<User> user = scope.fork(() -> findUser(id));
+    Future<Order> order = scope.fork(() -> fetchOrder(id));
+    scope.join();
+    return new Response(user.resultNow(), order.resultNow());
+}
+
+// 2. Pattern Matching for switch（21 正式）
+String describe(Object obj) {
+    return switch (obj) {
+        case Integer i when i > 0 -> "正整数: " + i;
+        case Integer i -> "非正整数: " + i;
+        case String s -> "字符串: " + s;
+        case null -> "null";
+        default -> "其他: " + obj;
+    };
+}
+
+// 3. Sequenced Collections（21）
+List<String> list = List.of("a", "b", "c");
+String first = list.getFirst();
+String last = list.getLast();
+list.addFirst("z");
+list.addLast("d");
+
+// 4. String Templates（预览）
+String name = "张三";
+String msg = STR."你好，\{name}！";
+```
+
+### 10.3 Virtual Threads vs Platform Threads
+
+| 维度 | Platform Thread | Virtual Thread |
+|------|----------------|----------------|
+| 底层 | OS 线程（1:1） | JVM 线程（M:N） |
+| 内存 | ~1MB 栈空间 | ~几KB |
+| 并发数 | 数千 | 数百万 |
+| 阻塞 | 阻塞 OS 线程 | 阻塞载体线程（自动让出） |
+| 适用 | CPU 密集 | IO 密集（DB/HTTP/文件） |
+| 创建方式 | new Thread() | Thread.ofVirtual() |
+| 池化 | 需要线程池 | 不需要（按需创建） |
+
+```java
+// 虚拟线程最佳实践
+// 1. 不要池化虚拟线程（每次创建新的）
+// 2. 避免在虚拟线程中做 CPU 密集计算
+// 3. 使用 synchronized 替代 ReentrantLock（虚拟线程兼容）
+// 4. 使用 Structured Concurrency 管理生命周期
+
+// 反模式：虚拟线程中使用 ThreadLocal（百万级会 OOM）
+// 改用 ScopedValue（21 预览）
+private static final ScopedValue<User> CURRENT_USER = ScopedValue.newInstance();
+ScopedValue.where(CURRENT_USER, user).run(() -> {
+    // 所有子线程都能访问 CURRENT_USER
+    handleRequest();
+});
+```
+
+### 10.4 Spring WebFlux 响应式编程
+
+```java
+// WebFlux 响应式 API 示例
+@RestController
+public class UserController {
+    @GetMapping("/users/{id}")
+    public Mono<User> getUser(@PathVariable String id) {
+        return userRepository.findById(id)
+            .switchIfEmpty(Mono.error(new NotFoundException(id)));
+    }
+
+    @GetMapping("/users")
+    public Flux<User> listUsers() {
+        return userRepository.findAll()
+            .take(100)
+            .flatMap(this::enrichUser);
+    }
+}
+
+// 响应式核心概念
+// Mono<T>：0 or 1 个元素的异步序列
+// Flux<T>：0 to N 个元素的异步序列
+// 背压（Backpressure）：消费者控制生产速率
+
+// 响应式 vs 阻塞
+// 阻塞：一个请求一个线程，线程池耗尽 → 请求排队
+// 响应式：一个线程处理多个请求，IO 时不阻塞线程
+```
+
+### 10.5 微服务架构模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| API Gateway | 统一入口，路由/鉴权/限流 | 所有微服务 |
+| Service Mesh | sidecar 代理，服务间通信 | K8s 环境 |
+| Circuit Breaker | 熔断器，防止级联故障 | 服务间调用 |
+| Saga | 分布式事务补偿 | 跨服务事务 |
+| CQRS | 读写分离模型 | 读写差异大 |
+| Event Sourcing | 事件溯源 | 审计/回溯 |
+| Sidecar | 辅助功能外挂 | 日志/监控/安全 |
+| Strangler Fig | 渐进式替换遗留系统 | 旧系统迁移 |
+
+### 10.6 测试体系（JUnit5 + Mockito + TestContainers）
+
+```java
+// JUnit5 核心
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+class UserServiceTest {
+    @MockitoBean UserRepository userRepo;
+    @Autowired MockMvc mockMvc;
+
+    @Test
+    void shouldCreateUser() {
+        when(userRepo.save(any())).thenReturn(new User("1", "张三"));
+        User result = service.createUser("张三");
+        assertEquals("张三", result.name());
+        verify(userRepo).save(any());
+    }
+
+    // 参数化测试
+    @ParameterizedTest
+    @CsvSource({"1,一", "2,二", "3,三"})
+    void testNumberWords(int input, String expected) {
+        assertEquals(expected, converter.convert(input));
+    }
+}
+
+// TestContainers：集成测试真实依赖
+@Testcontainers
+class UserRepositoryTest {
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15")
+        .withDatabaseName("test");
+
+    @Test
+    void shouldSaveUser() {
+        // 真实 PostgreSQL，非 H2
+        repository.save(new User("test"));
+        assertThat(repository.findAll()).hasSize(1);
+    }
+}
+```
+
+### 10.7 构建工具对比（Maven vs Gradle）
+
+| 维度 | Maven | Gradle |
+|------|-------|--------|
+| 配置语言 | XML | Groovy/Kotlin DSL |
+| 构建速度 | 慢（每次全量） | 快（增量+缓存） |
+| 灵活性 | 约定优于配置 | 完全可编程 |
+| 依赖管理 | 标准 | 支持动态版本 |
+| IDE 支持 | 所有 IDE | 所有 IDE |
+| 适用 | 传统项目 | 新项目/多模块 |
+
+### 10.8 日志框架对比
+
+| 框架 | 优势 | 劣势 | 推荐 |
+|------|------|------|------|
+| Log4j2 | 异步高性能、RollingFile | 配置复杂 | 高性能场景 |
+| Logback | SLF4J 原生、简单 | 性能略低于 Log4j2 | 一般项目 |
+| SLF4J | 门面模式、统一 API | 本身无实现 | 始终使用 |
+| Logstash Encoder | JSON 格式化 | ELK 绑定 | 日志平台 |
+
+```
+最佳实践：
+  1. 代码中只用 SLF4J API
+  2. 实现用 Log4j2（异步 AsyncLogger）
+  3. 输出 JSON 格式（Logstash Encoder）
+  4. 日志级别：ERROR（告警）> WARN（关注）> INFO（跟踪）> DEBUG（调试）
+  5. 敏感信息脱敏（手机号/身份证/密码）
+```
+
+## 十一、与其他板块的关系
+
+- Redis 知识见「[基础知识/redis知识](redis知识.md)」；
+- 大数据链路见「[大数据/08-流处理计算：Flink](大数据/08-流处理计算：Flink.md)」；
+- 架构设计见「[基础知识/一些概念](一些概念.md)」。
+
 ### 9.5 GraalVM 原生镜像（Spring Native / Quarkus）适配清单
 
 - **收益**：AOT 编译成原生可执行，启动毫秒级、内存降数倍，Serverless / FaaS 利器。

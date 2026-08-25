@@ -754,7 +754,414 @@ LRU vs LFU：
 
 ---
 
-## 十六、与其他板块的关系
+## 十六、Redis Cluster 自动化 Rebalancing
+
+### 16.1 自动重平衡流程
+
+```
+Redis Cluster Rebalancing 自动化：
+  1. 添加新节点：redis-cli --cluster add-node <new>:6379 <existing>:6379
+  2. 检查集群状态：redis-cli --cluster check <any>:6379
+  3. 自动重平衡：redis-cli --cluster rebalance <any>:6379 --auto-weights
+  4. 迁移 Slot：自动将部分 Slot 从旧节点迁移到新节点
+
+  自动 Rebalance 参数：
+    --cluster权重：每个节点的权重（决定迁移多少 Slot）
+    --cluster-use-empty-masters：空 Master 也参与分配
+    --cluster-check-empty：迁移前检查是否有空 Slot
+
+  迁移过程中 Slot 状态：
+    MIGRATING：源节点正在迁出
+    IMPORTING：目标节点正在迁入
+    客户端需处理 ASK/MOVED 重定向
+```
+
+### 16.2 在线扩缩容实践
+
+```bash
+# 1. 扩容：添加 2 个新节点
+redis-cli --cluster add-node 10.0.0.4:6379 10.0.0.1:6379
+redis-cli --cluster add-node 10.0.0.5:6379 10.0.0.1:6379
+
+# 2. 自动 Rebalance（均匀分配）
+redis-cli --cluster rebalance 10.0.0.1:6379 \
+  --cluster-weight 10.0.0.1=1 10.0.0.2=1 10.0.0.3=1 10.0.0.4=1 10.0.0.5=1
+
+# 3. 缩容：先迁移 Slot，再删除节点
+redis-cli --cluster reshard 10.0.0.1:6379 \
+  --cluster-from <node-id> --cluster-to <target-id> --cluster-slots <num> --cluster-yes
+redis-cli --cluster del-node 10.0.0.1:6379 <node-id>
+
+# 4. 监控迁移进度
+redis-cli --cluster info 10.0.0.1:6379
+```
+
+---
+
+## 十七、Redis Pipeline vs Cluster Pipeline
+
+### 17.1 Pipeline 对比
+
+| 维度 | 单节点 Pipeline | Cluster Pipeline |
+|------|-----------------|------------------|
+| 命令路由 | 单节点直连 | 需按 Slot 分组 |
+| 批量发送 | 所有命令一次发送 | 按节点分组发送 |
+| 响应解析 | 顺序解析 | 按节点解析 |
+| 性能 | 极高（减少 RTT） | 高（但需分组开销） |
+| 适用 | 单节点/主从 | Cluster 集群 |
+
+### 17.2 Cluster Pipeline 实现
+
+```python
+# Python: Cluster Pipeline 示例
+from redis.cluster import RedisCluster
+
+rc = RedisCluster(host='10.0.0.1', port=6379)
+
+pipe = rc.pipeline(transaction=False)  # Cluster 不支持 MULTI/EXEC
+pipe.set('key1', 'val1')
+pipe.set('key2', 'val2')
+pipe.get('key1')
+results = pipe.execute()  # 自动按 Slot 分组发送
+
+# 按节点分组发送示例：
+# Node A (slot 0-5460): SET key1 val1
+# Node B (slot 5461-10922): SET key2 val2
+# Node A: GET key1
+# 合并响应返回
+```
+
+---
+
+## 十八、Redis Lua 脚本高级模式
+
+### 18.1 复杂 Lua 脚本示例
+
+```lua
+-- 分布式限流：滑动窗口计数器
+-- KEYS[1] = 限流 key
+-- ARGV[1] = 窗口大小（秒）
+-- ARGV[2] = 最大请求数
+-- ARGV[3] = 当前时间戳（毫秒）
+local key = KEYS[1]
+local window = tonumber(ARGV[1]) * 1000
+local max_requests = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+-- 移除窗口外的记录
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+
+-- 当前窗口内的请求数
+local current = redis.call('ZCARD', key)
+
+if current < max_requests then
+    redis.call('ZADD', key, now, now .. math.random())
+    redis.call('EXPIRE', key, math.ceil(window / 1000))
+    return 1  -- 允许
+else
+    return 0  -- 拒绝
+end
+```
+
+### 18.2 Lua 脚本调试与性能
+
+```
+Lua 脚本调试：
+  redis-cli EVAL "脚本" 0 --eval <script-file>
+  
+  调试模式：
+    redis-cli --ldb --eval /path/to/script.lua
+    step (s): 单步执行
+    continue (c): 继续执行
+    print var: 打印变量
+
+  性能优化：
+    1. 脚本尽量短（避免阻塞其他命令）
+    2. 使用 KEYS 而非 ARGV 传递 key（编译期校验）
+    3. 避免循环中的 redis.call
+    4. 复杂逻辑拆分为多个 Lua 脚本
+    5. 监控脚本执行时间：SLOWLOG GET
+
+  Redis 6.0+ 脚本超时：
+    lua-time-limit 5000  # 脚本执行超时 5 秒
+    超时后其他客户端可发送 SCRIPT KILL
+```
+
+---
+
+## 十九、Redis Module 生态
+
+### 19.1 模块加载与管理
+
+```bash
+# 加载模块
+redis-cli MODULE LOAD /path/to/module.so
+
+# 查看已加载模块
+redis-cli MODULE LIST
+
+# 卸载模块
+redis-cli MODULE UNLOAD module_name
+
+# 启动时加载
+# redis.conf
+loadmodule /path/to/module.so
+```
+
+### 19.2 RedisJSON
+
+```bash
+# 存储 JSON
+redis-cli JSON.SET user:1 '.' '{"name":"张三","age":30,"scores":[90,85,95]}'
+
+# 读取嵌套字段
+redis-cli JSON.GET user:1 '.name'
+
+# 数组操作
+redis-cli JSON.ARRAPPEND user:1 '.scores' 88
+
+# 嵌套更新
+redis-cli JSON.SET user:1 '.address.city' '"北京"'
+
+# JSON 索引（RediSearch 集成）
+redis-cli FT.CREATE idx ON JSON PREFIX 1 user: SCHEMA $.name AS name TEXT $.age AS age NUMERIC
+redis-cli FT.SEARCH idx '@name:张三'
+```
+
+### 19.3 RediSearch
+
+```bash
+# 创建全文索引
+redis-cli FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA title TEXT body TEXT category TAG
+
+# 添加文档
+redis-cli HSET doc:1 title "Redis入门" body "Redis是内存数据库" category "技术"
+redis-cli HSET doc:2 title "Java编程" body "Java面向对象" category "技术"
+
+# 全文搜索
+redis-cli FT.SEARCH idx "Redis" LIMIT 0 10
+
+# 带过滤的搜索
+redis-cli FT.SEARCH idx "@category:{技术} @title:Redis"
+
+# 聚合查询
+redis-cli FT.AGGREGATE idx "*" GROUPBY 0 REDUCE COUNT 0 AS total
+```
+
+### 19.4 RedisGraph（图数据库）
+
+```bash
+# 创建图
+redis-cli GRAPH.QUERY social "CREATE (:Person {name:'张三',age:30})"
+
+# 添加关系
+redis-cli GRAPH.QUERY social "MATCH (a:Person {name:'张三'}), (b:Person {name:'李四'}) CREATE (a)-[:FRIEND]->(b)"
+
+# 图查询（Cypher）
+redis-cli GRAPH.QUERY social "MATCH (a:Person)-[:FRIEND]->(b:Person) RETURN a.name, b.name"
+```
+
+---
+
+## 二十、Redis 时间序列
+
+### 20.1 RedisTimeSeries 模块
+
+```bash
+# 创建时间序列
+redis-cli TS.CREATE temperature:station1 RETENTION 86400000 LABELS station "北京"
+
+# 写入数据点
+redis-cli TS.ADD temperature:station1 1700000000000 25.5
+
+# 范围查询
+redis-cli TS.RANGE temperature:station1 1700000000000 1700003600000 AGGREGATION avg 3600000
+
+# 聚合：每小时平均温度
+redis-cli TS.RANGE temperature:station1 - + AGGREGATION avg 3600000
+
+# 写入批量数据
+redis-cli TS.MADD temperature:station1 1700000001000 25.6 temperature:station1 1700000002000 25.7
+```
+
+### 20.2 监控指标存储
+
+```bash
+# 存储系统指标
+redis-cli TS.CREATE cpu:usage LABELS host "server1" metric "cpu"
+redis-cli TS.CREATE memory:usage LABELS host "server1" metric "memory"
+
+# 每 10 秒采集一次
+while true; do
+  usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
+  redis-cli TS.ADD cpu:usage $(date +%s000) $usage
+  sleep 10
+done
+
+# 查询最近 1 小时的 CPU 使用率
+redis-cli TS.RANGE cpu:usage $(date -d '1 hour ago' +%s000) $(date +%s000) AGGREGATION avg 60000
+```
+
+---
+
+## 二十一、Redis 布隆过滤器
+
+### 21.1 RedisBloom 模块
+
+```bash
+# 创建布隆过滤器
+redis-cli BF.RESERVE user_filter 0.001 1000000
+# 误判率 0.1%，容量 100 万
+
+# 添加元素
+redis-cli BF.ADD user_filter "user:1001"
+redis-cli BF.MADD user_filter "user:1002" "user:1003"
+
+# 检查是否存在
+redis-cli BF.EXISTS user_filter "user:1001"  # 1 = 存在
+redis-cli BF.EXISTS user_filter "user:9999"  # 0 = 不存在
+
+# 布隆过滤器统计
+redis-cli BF.INFO user_filter
+```
+
+### 21.2 布隆过滤器防缓存穿透
+
+```java
+// 布隆过滤器防缓存穿透
+@Service
+public class UserService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    public User getUser(String userId) {
+        // 1. 布隆过滤器快速判断
+        Boolean exists = redisTemplate.opsForValue()
+            .getBit("user:bloom", Long.parseLong(userId));
+        if (exists == null || !exists) {
+            return null;  // 一定不存在，直接返回
+        }
+
+        // 2. 查缓存
+        User user = getFromCache(userId);
+        if (user != null) return user;
+
+        // 3. 查数据库
+        user = userMapper.selectById(userId);
+        if (user != null) {
+            setCache(userId, user);
+        }
+        return user;
+    }
+}
+```
+
+---
+
+## 二十二、Redis GEO 地理空间
+
+### 22.1 GEO 操作
+
+```bash
+# 添加地理位置
+redis-cli GEOADD locations 116.397128 39.916527 "天安门"
+redis-cli GEOADD locations 116.405285 39.904989 "故宫"
+redis-cli GEOADD locations 116.427231 39.991246 "鸟巢"
+
+# 附近的人（半径搜索）
+redis-cli GEORADIUS locations 116.397128 39.916527 5 km WITHDIST ASC COUNT 10
+
+# 计算两点距离
+redis-cli GEODIST locations "天安门" "故宫" km
+
+# 获取位置坐标
+redis-cli GEOPOS locations "天安门"
+
+# GeoHash 编码
+redis-cli GEOHASH locations "天安门"
+```
+
+### 22.2 GEO + 命令模式
+
+```java
+// 附近门店查询
+public List<Store> findNearbyStores(double lng, double lat, double radiusKm) {
+    GeoResults<GeoLocation<String>> results = redisTemplate.opsForGeo()
+        .radius("stores", new Circle(new Point(lng, lat), new Distance(radiusKm, RedisTemplate.DistanceUnit.KILOMETERS)),
+            RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs()
+                .includeDistance()
+                .sortAscending()
+                .limit(20));
+
+    return results.getContent().stream()
+        .map(r -> {
+            Store store = new Store();
+            store.setName(r.getContent().getName());
+            store.setDistance(r.getDistance().getValue());
+            return store;
+        })
+        .collect(Collectors.toList());
+}
+```
+
+---
+
+## 二十三、Redis Streams 消费者组深入
+
+### 23.1 消费者组高级配置
+
+```bash
+# 创建消费者组（从头消费）
+redis-cli XGROUP CREATE mystream mygroup 0
+
+# 创建消费者组（从最新消费）
+redis-cli XGROUP CREATE mystream mygroup $
+
+# 消费者组配置
+redis-cli XGROUP SETID mystream mygroup 0  # 重置偏移量
+
+# 消费消息（阻塞）
+redis-cli XREADGROUP GROUP mygroup consumer1 COUNT 10 BLOCK 5000 STREAMS mystream >
+
+# 确认消息
+redis-cli XACK mystream mygroup 1700000000000-0
+
+# 查看待确认消息
+redis-cli XPENDING mystream mygroup
+
+# 转移待确认消息（消费者超时）
+redis-cli XCLAIM mystream mygroup consumer2 3600000 1700000000000-0
+
+# 自动转移（PEL 自动清理）
+redis-cli XAUTOCLAIM mystream mygroup consumer2 3600000 0 COUNT 10
+```
+
+### 23.2 Streams 消费模式对比
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| 独立消费 | 每个消费者收到全量消息 | 通知/广播 |
+| 消费者组 | 消息在组内分配 | 负载均衡 |
+| 多消费者组 | 每个组独立消费全量 | 不同业务消费 |
+| 死信队列 | 消费失败转入 DLQ | 可靠消费 |
+
+```
+消费者组状态管理：
+  PEL（Pending Entries List）：已消费未确认的消息
+  XPENDING：查看 PEL 状态
+  XCLAIM：手动转移超时消息
+  XAUTOCLAIM：自动转移超时消息（Redis 6.2+）
+  
+  生产建议：
+    设置合理的 BLOCK 超时（避免空轮询）
+    监控 PEL 大小（过大说明消费积压）
+    定期 XAUTOCLAIM 清理超时消息
+    使用 XINFO 查看消费者组状态
+```
+
+---
+
+## 与其他板块的关系
 
 - Redis 基础知识见「[基础知识/redis知识](../redis知识.md)」；
 - 缓存设计模式见「[场景设计/缓存经典三问](../../场景设计/缓存经典三问与一致性.md)」；

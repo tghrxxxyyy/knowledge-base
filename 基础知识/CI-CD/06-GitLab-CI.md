@@ -645,6 +645,375 @@ deploy_aws:
 4. 密钥误打日志：Runner 默认会**部分遮蔽**变量，但拼进 URL/命令的参数仍可能泄露；禁止 `echo $SECRET`，必要时 `set +x`。
 5. 巨型单文件 pipeline（几百行、几十 job）难维护 → 用 `include` 拆子文件 / 父子流水线。
 
+## GitLab CI 高级缓存策略
+
+### 11.1 缓存策略详解
+
+```yaml
+# 策略一：分支隔离缓存
+cache:
+  key:
+    files:
+      - pom.xml
+      - build.gradle
+  paths:
+    - .m2/repository/
+    - node_modules/
+  policy: pull-push
+
+# 策略二：共享缓存（多分支共享）
+cache:
+  key: shared-cache
+  paths:
+    - vendor/bundle
+  policy: pull-push
+
+# 策略三：锁缓存（避免并发写冲突）
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - dist/
+  policy: pull
+  when: on_success
+
+# 策略四：按阶段缓存
+build:
+  cache:
+    - key: build-cache
+      paths: [target/]
+      policy: pull-push
+test:
+  cache:
+    - key: build-cache
+      paths: [target/]
+      policy: pull
+```
+
+### 11.2 缓存 vs artifacts
+
+| 维度 | cache | artifacts |
+|------|-------|-----------|
+| 目的 | 加速构建 | 传递产物 |
+| 存储位置 | 共享缓存目录 | 临时存储 |
+| 有效期 | 可配置 | 30天（默认） |
+| 下载方式 | 自动 | 通过 dependencies |
+| 适用场景 | 依赖包/构建缓存 | 编译产物/测试报告 |
+
+---
+
+## GitLab CI 单仓库（Monorepo）支持
+
+### 12.1 Monorepo 流水线
+
+```yaml
+# 基于路径触发
+frontend:
+  rules:
+    - changes:
+        - frontend/**/*
+  script:
+    - cd frontend && npm install && npm run build
+
+backend:
+  rules:
+    - changes:
+        - backend/**/*
+  script:
+    - cd backend && mvn clean package
+
+# 全局规则
+build:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - ./build-all.sh
+```
+
+### 12.2 Monorepo 优化
+
+```yaml
+# 使用 only/except 控制触发
+frontend:
+  only:
+    changes:
+      - "frontend/**/*"
+      - "shared/**/*"  # 共享代码变更也触发
+
+# 使用 needs 精确依赖
+build_frontend:
+  stage: build
+  script: cd frontend && npm run build
+
+build_backend:
+  stage: build
+  script: cd backend && mvn package
+
+test_frontend:
+  stage: test
+  needs: [build_frontend]
+  script: cd frontend && npm test
+
+test_backend:
+  stage: test
+  needs: [build_backend]
+  script: cd backend && mvn test
+```
+
+---
+
+## GitLab CI 安全扫描集成
+
+### 13.1 DevSecOps 扫描
+
+```yaml
+# 安全扫描模板
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+  - template: Security/DAST.gitlab-ci.yml
+
+# 自定义安全扫描
+secret_detection:
+  stage: test
+  script:
+    - trufflehog git file://. --json > secrets.json
+  artifacts:
+    reports:
+      secret_detection: secrets.json
+
+sast:
+  stage: test
+  variables:
+    SAST_EXCLUDED_PATHS: "vendor/,node_modules/"
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+
+dependency_scanning:
+  stage: test
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+```
+
+### 13.2 安全扫描配置
+
+| 扫描类型 | 说明 | 工具 |
+|----------|------|------|
+| SAST | 静态代码分析 | Semgrep/SonarQube |
+| DAST | 劐态应用扫描 | OWASP ZAP |
+| Dependency | 依赖漏洞扫描 | Trivy/Snyk |
+| Container | 容器镜像扫描 | Trivy/Grype |
+| Secret | 密钥检测 | TruffleHog/GitLeaks |
+
+---
+
+## GitLab CI 自动部署
+
+### 14.1 自动部署配置
+
+```yaml
+# 自动部署到 Staging
+deploy_staging:
+  stage: deploy
+  script:
+    - kubectl set image deploy/app app=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  environment:
+    name: staging
+    url: https://staging.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# 手动部署到 Production
+deploy_production:
+  stage: deploy
+  script:
+    - kubectl set image deploy/app app=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  environment:
+    name: production
+    url: https://www.example.com
+  when: manual
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+```
+
+### 14.2 部署策略
+
+```yaml
+# 蓝绿部署
+deploy_blue:
+  stage: deploy
+  script:
+    - kubectl apply -f deployment-blue.yaml
+    - kubectl rollout status deploy/app-blue
+  environment:
+    name: production
+
+# 金丝雀部署
+deploy_canary:
+  stage: deploy
+  script:
+    - kubectl apply -f deployment-canary.yaml
+    - sleep 60
+    - kubectl rollout undo deploy/app-canary
+  environment:
+    name: canary
+
+# 滚动更新
+deploy_rolling:
+  stage: deploy
+  script:
+    - kubectl set image deploy/app app=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - kubectl rollout status deploy/app
+  environment:
+    name: production
+```
+
+---
+
+## GitLab CI 与 Kubernetes 集成
+
+### 15.1 K8s 部署配置
+
+```yaml
+# Kubernetes 部署
+deploy_k8s:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  script:
+    - kubectl config use-context $KUBE_CONTEXT
+    - kubectl apply -f k8s/
+    - kubectl rollout status deploy/$APP_NAME
+  environment:
+    name: production
+    kubernetes:
+      namespace: production
+  variables:
+    KUBE_CONTEXT: my-cluster:production
+```
+
+### 15.2 K8s 动态环境
+
+```yaml
+# 动态 Review 环境
+review:
+  stage: deploy
+  script:
+    - kubectl create namespace $CI_ENVIRONMENT_SLUG || true
+    - kubectl -n $CI_ENVIRONMENT_SLUG apply -f k8s/
+    - kubectl -n $CI_ENVIRONMENT_SLUG rollout status deploy/$APP_NAME
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: https://$CI_COMMIT_REF_SLUG.review.example.com
+    on_stop: stop_review
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+
+stop_review:
+  stage: deploy
+  script:
+    - kubectl delete namespace $CI_ENVIRONMENT_SLUG --ignore-not-found
+  when: manual
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+```
+
+---
+
+## GitLab CI Variables 与 Secrets 管理
+
+### 16.1 Variables 管理
+
+```yaml
+# Variables 优先级（从低到高）
+# 1. Group Variables
+# 2. Project Variables
+# 3. Pipeline Variables
+# 4. Job Variables
+
+# 使用 Variables
+build:
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  script:
+    - mvn clean package
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+
+# 使用 CI/CD Variables
+deploy:
+  script:
+    - echo $DEPLOY_TOKEN | docker login -u $DEPLOY_USER --password-stdin
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+```
+
+### 16.2 Secrets 保护
+
+| 保护措施 | 说明 |
+|----------|------|
+| Protected Variables | 仅在 protected 分支/标签可用 |
+| Masked Variables | 日志中自动遮蔽 |
+| File 类型 | 以文件形式挂载 |
+| 环境级 Variables | 绑定到特定环境 |
+| 审计日志 | 记录 Variables 访问 |
+
+---
+
+## GitLab CI 性能优化
+
+### 17.1 性能优化策略
+
+```yaml
+# 1. 并行测试
+test:
+  stage: test
+  parallel: 4
+  script:
+    - pytest --splitting-algorithm=least_duration
+  artifacts:
+    reports:
+      junit: report.xml
+
+# 2. 使用 needs 加速
+build_frontend:
+  stage: build
+  script: npm run build
+
+build_backend:
+  stage: build
+  script: mvn package
+
+test_frontend:
+  stage: test
+  needs: [build_frontend]
+  script: npm test
+
+# 3. Docker 层缓存
+docker_build:
+  stage: build
+  script:
+    - docker build --cache-from=$CI_REGISTRY_IMAGE:latest -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+```
+
+### 17.2 优化效果
+
+| 优化措施 | 效果 | 适用场景 |
+|----------|------|----------|
+| 并行测试 | 测试时间减少 50-70% | 大型测试套件 |
+| needs DAG | 构建时间减少 30-50% | 复杂流水线 |
+| Docker 缓存 | 构建时间减少 40-60% | Docker 构建 |
+| 缓存优化 | 构建时间减少 20-40% | 依赖安装 |
+| 浅克隆 | 拉取时间减少 50-80% | 大型仓库 |
+
+---
+
 ## 十、与其他模块的关联
 
 - 流水线总纲与本库术语，见 [01-概述与核心概念](01-概述与核心概念.md)。

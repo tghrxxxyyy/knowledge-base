@@ -1377,6 +1377,628 @@ Session Management：
       └── 简单 JWT 验证即可（无需完整 IdP）
 ```
 
+## JWT 在微服务网关与服务端的验证分工
+
+### 网关统一验证 vs 服务端独立验证
+
+```
+架构模式 1：API 网关统一验证（推荐）
+  客户端 → API 网关（验证 JWT 签名 + 过期 + aud）
+              ↓ 提取用户信息，注入 Header
+           微服务 A → 微服务 B → 微服务 C
+           （内部服务信任网关注入的 Header，不再验证 JWT）
+
+架构模式 2：每个服务独立验证
+  客户端 → 微服务 A（验证 JWT）→ 微服务 B（验证 JWT）→ 微服务 C
+  问题：每个服务都要持有公钥，轮转复杂；JWT 验证开销×N
+
+架构模式 3：混合模式（网关 + 关键服务双重验证）
+  客户端 → 网关（验证 JWT）→ 支付服务（再次验证 JWT + 检查 scope）
+  适用：金融级场景，关键操作需二次确认
+```
+
+| 模式 | 优点 | 缺点 | 适用场景 |
+|------|------|------|----------|
+| 网关统一验证 | 简单、低延迟、集中管理 | 网关成为信任根，需高可用 | 大部分微服务架构 |
+| 服务独立验证 | 去中心化、无单点 | 密钥管理复杂、性能开销 | 零信任架构 |
+| 混合模式 | 安全性高、关键操作二次确认 | 实现复杂 | 金融支付场景 |
+
+### 网关注入 Header 规范
+
+```yaml
+# 网关验证 JWT 后注入的标准 Header
+X-User-Id: "user-001"
+X-User-Email: "zhangsan@example.com"
+X-User-Roles: "admin,editor"
+X-User-Scope: "read,write"
+X-Request-Id: "req-abc-123"
+X-Forwarded-For: "192.168.1.100"
+
+# 下游服务从 Header 读取用户信息（不再验证 JWT）
+# 注意：下游必须信任网关，不暴露公网直接访问
+```
+
+### 网关验证实现代码
+
+```python
+# API 网关 JWT 验证中间件
+import jwt
+from fastapi import FastAPI, Request, HTTPException
+
+app = FastAPI()
+
+async def verify_jwt_middleware(request: Request, call_next):
+    # 白名单路径跳过验证
+    if request.url.path in ["/health", "/auth/login", "/auth/register"]:
+        return await call_next(request)
+
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    try:
+        payload = jwt.decode(token, public_key, algorithms=["RS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    # 注入用户信息到请求头，下游服务直接读取
+    request.state.user_id = payload["sub"]
+    request.state.roles = payload.get("roles", [])
+    request.state.scope = payload.get("scope", "")
+
+    response = await call_next(request)
+    response.headers["X-User-Id"] = payload["sub"]
+    return response
+```
+
+## OAuth2 BFF（Backend for Frontend）模式
+
+### BFF 架构设计
+
+```mermaid
+graph TD
+    SPA[SPA 单页应用] --> BFF[BFF 层]
+    Mobile[移动端 App] --> BFF
+    TV[智能电视] --> BFF
+    
+    BFF -->|内部 gRPC| UserSvc[用户服务]
+    BFF -->|内部 gRPC| OrderSvc[订单服务]
+    BFF -->|内部 gRPC| ProductSvc[商品服务]
+    
+    BFF --> AuthServer[OAuth2 认证服务]
+    BFF --> Redis[(Token 缓存)]
+```
+
+### BFF 的 OAuth2 处理
+
+```
+BFF 模式的 OAuth2 流程：
+  1. 前端重定向到 OAuth2 授权页
+  2. 用户授权后回调到 BFF（不是前端）
+  3. BFF 用 code + client_secret 换取 token
+  4. BFF 存储 token（HttpOnly Cookie 或服务端 Session）
+  5. BFF 代理前端请求，附加 token 访问下游服务
+  6. 下游服务只需验证 BFF 传来的内部 token
+
+优势：
+  ├── 前端不接触 access_token（XSS 防护）
+  ├── BFF 可聚合多个下游服务（减少前端请求）
+  ├── 不同前端（Web/APP/TV）各自 BFF，定制逻辑
+  └── client_secret 安全存储在 BFF（不在前端）
+```
+
+### BFF 实现代码
+
+```javascript
+// Node.js BFF 层 OAuth2 处理
+const express = require('express');
+const axios = require('axios');
+const jwt = require('jsonwebtoken');
+
+const app = express();
+
+// 1. 登录：重定向到 OAuth2 授权页
+app.get('/auth/login', (req, res) => {
+  const authUrl = `https://auth.example.com/authorize?
+    response_type=code&
+    client_id=${CLIENT_ID}&
+    redirect_uri=${encodeURIComponent('https://bff.example.com/auth/callback')}&
+    scope=read write&
+    state=${generateState()}`;
+  res.redirect(authUrl);
+});
+
+// 2. 回调：用 code 换 token，存入 HttpOnly Cookie
+app.get('/auth/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!verifyState(state)) return res.status(403).send('CSRF detected');
+
+  const tokenResponse = await axios.post('https://auth.example.com/token', {
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: 'https://bff.example.com/auth/callback',
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET  // 安全存储在 BFF
+  });
+
+  // token 存入 HttpOnly Cookie，前端不可读
+  res.cookie('access_token', tokenResponse.data.access_token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    maxAge: 900000  // 15 分钟
+  });
+  res.cookie('refresh_token', tokenResponse.data.refresh_token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    maxAge: 2592000000  // 30 天
+  });
+  res.redirect('/dashboard');
+});
+
+// 3. 代理 API 请求
+app.get('/api/user', async (req, res) => {
+  const token = req.cookies.access_token;
+  const response = await axios.get('https://user-service/api/me', {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  res.json(response.data);
+});
+```
+
+## OAuth2 SPA + Refresh Token 轮转
+
+### SPA 安全 Token 管理
+
+```
+SPA Token 安全存储方案对比：
+  ├── 内存变量（推荐）
+  │   ├── 优点：XSS 无法直接读取
+  │   ├── 缺点：刷新页面丢失，需重新认证
+  │   └── 适用：安全性要求高的 SPA
+  ├── HttpOnly Cookie（推荐）
+  │   ├── 优点：JS 不可读，浏览器自动携带
+  │   ├── 缺点：需要 CSRF 防护
+  │   └── 适用：Web 应用
+  ├── Service Worker
+  │   ├── 优点：独立于页面上下文
+  │   ├── 缺点：实现复杂
+  │   └── 适用：PWA 应用
+  └── localStorage（不推荐）
+      ├── 优点：简单
+      ├── 缺点：XSS 可直接读取
+      └── 适用：原型/内部工具
+```
+
+### SPA + Refresh Token 轮转实现
+
+```javascript
+// SPA 安全 Token 管理器
+class SecureTokenManager {
+  #accessToken = null;
+  #refreshEndpoint = '/auth/refresh';
+  #isRefreshing = false;
+  #failedQueue = [];
+
+  // 拦截 401 自动刷新
+  setupInterceptors(axiosInstance) {
+    axiosInstance.interceptors.response.use(
+      response => response,
+      async error => {
+        const originalRequest = error.config;
+        if (error.response?.status === 401 && !originalRequest._retry) {
+          if (this.#isRefreshing) {
+            return new Promise((resolve, reject) => {
+              this.#failedQueue.push({ resolve, reject });
+            }).then(token => {
+              originalRequest.headers.Authorization = `Bearer ${token}`;
+              return axiosInstance(originalRequest);
+            });
+          }
+
+          originalRequest._retry = true;
+          this.#isRefreshing = true;
+
+          try {
+            const newToken = await this.#refreshToken();
+            this.#failedQueue.forEach(p => p.resolve(newToken));
+            originalRequest.headers.Authorization = `Bearer ${newToken}`;
+            return axiosInstance(originalRequest);
+          } catch (e) {
+            this.#failedQueue.forEach(p => p.reject(e));
+            this.#clearTokens();
+            window.location.href = '/login';
+          } finally {
+            this.#isRefreshing = false;
+            this.#failedQueue = [];
+          }
+        }
+        return Promise.reject(error);
+      }
+    );
+  }
+
+  async #refreshToken() {
+    const response = await fetch(this.#refreshEndpoint, {
+      method: 'POST',
+      credentials: 'include'  // 携带 HttpOnly refresh_token cookie
+    });
+    const { access_token } = await response.json();
+    this.#accessToken = access_token;  // 存内存
+    return access_token;
+  }
+}
+```
+
+## OIDC Claims 深入解析
+
+### 标准 Claims 详解
+
+| Claim | 类型 | 必须 | 说明 | 使用场景 |
+|-------|------|------|------|----------|
+| `sub` | string | 是 | 用户唯一标识（不可变） | 跨服务用户关联 |
+| `iss` | string | 是 | 签发者 URL | 防混淆代理攻击 |
+| `aud` | string/array | 是 | 目标受众（client_id） | 防 token 滥用 |
+| `exp` | number | 是 | 过期时间（Unix 时间戳） | token 过期检查 |
+| `iat` | number | 是 | 签发时间 | token 新旧判断 |
+| `nbf` | number | 否 | 生效时间 | 延迟生效 token |
+| `jti` | string | 否 | token 唯一 ID | 防重放攻击 |
+| `nonce` | string | 否 | 防重放随机串 | ID Token 校验 |
+| `at_hash` | string | 否 | access_token 哈希 | 隐式模式防泄露 |
+| `auth_time` | number | 否 | 最近认证时间 | 强制重新认证 |
+
+### 自定义 Claims 设计
+
+```json
+{
+  "sub": "user-001",
+  "iss": "https://auth.example.com",
+  "aud": "api.example.com",
+  "exp": 1700000000,
+  "iat": 1699996400,
+  "jti": "token-abc-123",
+  "nonce": "n-0S6_WzA2Mj",
+  "auth_time": 1699996400,
+  "email": "zhangsan@example.com",
+  "email_verified": true,
+  "name": "张三",
+  "org_id": "org-42",
+  "roles": ["admin", "editor"],
+  "permissions": ["user:read", "order:write"],
+  "tenant_id": "tenant-001",
+  "amr": ["pwd", "mfa"],
+  "azp": "client-app-123"
+}
+
+# Claims 使用规范：
+# sub：用户唯一标识，不可变（用于跨服务关联）
+# org_id / tenant_id：多租户标识（不要用 user_id 做多租户）
+# roles / permissions：RBAC/ABAC 权限声明
+# amr：认证方法引用（pwd=密码，mfa=多因素）
+# azp：授权客户端（哪个 app 持有此 token）
+```
+
+### Claims 验证最佳实践
+
+```python
+# 服务端 Claims 验证
+def validate_claims(payload, expected_audience, expected_issuer):
+    # 1. 验证必须存在的 claims
+    required = ['sub', 'iss', 'aud', 'exp', 'iat']
+    for claim in required:
+        if claim not in payload:
+            raise InvalidTokenError(f"Missing claim: {claim}")
+
+    # 2. 验证 issuer
+    if payload['iss'] != expected_issuer:
+        raise InvalidTokenError("Invalid issuer")
+
+    # 3. 验证 audience（支持字符串或数组）
+    aud = payload['aud']
+    if isinstance(aud, str):
+        aud = [aud]
+    if expected_audience not in aud:
+        raise InvalidTokenError("Invalid audience")
+
+    # 4. 验证时间相关 claims
+    now = time.time()
+    if payload.get('nbf') and now < payload['nbf']:
+        raise InvalidTokenError("Token not yet valid")
+    if payload.get('exp') and now > payload['exp']:
+        raise InvalidTokenError("Token expired")
+    if payload.get('iat') and now < payload['iat']:
+        raise InvalidTokenError("Token issued in future")
+
+    # 5. 验证 auth_time（如果要求近期认证）
+    max_age = 3600  # 1 小时内必须认证过
+    if 'auth_time' in payload:
+        if now - payload['auth_time'] > max_age:
+            raise InvalidTokenError("Re-authentication required")
+
+    return True
+```
+
+## Token 吊销策略深入
+
+### 吊销策略对比
+
+| 策略 | 实现 | 实时性 | 性能影响 | 适用场景 |
+|------|------|--------|----------|----------|
+| 黑名单（Redis） | 吊销时写入 Redis，验证时查 Redis | 秒级 | 每次验证多一次 Redis 查询 | 高安全要求场景 |
+| Token 版本号 | 用户下线时递增版本号，JWT 携带版本 | 秒级 | 无额外查询（版本在 JWT 中） | 通用场景（推荐） |
+| 密钥轮转 | 轮转签名密钥，旧 token 自然失效 | 分钟~小时 | 无额外查询 | 定期安全轮转 |
+| 短有效期 + 无刷新 | token 5 分钟有效，无 refresh token | 5 分钟 | 无 | 临时授权场景 |
+| Introspection | 每次验证调用 AS 的 introspect 端点 | 实时 | 每次验证一次网络调用 | opaque token 场景 |
+
+### Token 版本号实现
+
+```python
+# 基于版本号的 Token 吊销
+class TokenRevocationService:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+
+    def get_user_token_version(self, user_id):
+        """获取用户当前 token 版本"""
+        version = self.redis.get(f"token_version:{user_id}")
+        return int(version) if version else 0
+
+    def revoke_all_tokens(self, user_id):
+        """吊销用户所有 token（递增版本号）"""
+        self.redis.incr(f"token_version:{user_id}")
+        # 设置过期时间（与 token 最大有效期一致）
+        self.redis.expire(f"token_version:{user_id}", 86400 * 30)
+
+    def create_token_with_version(self, user_id, scope):
+        """创建带版本号的 token"""
+        version = self.get_user_token_version(user_id)
+        payload = {
+            "sub": user_id,
+            "scope": scope,
+            "token_version": version,  # 嵌入版本号
+            "exp": datetime.utcnow() + timedelta(minutes=15),
+            "iat": datetime.utcnow(),
+            "jti": str(uuid.uuid4())
+        }
+        return jwt.encode(payload, private_key, algorithm="RS256")
+
+    def verify_token_version(self, token):
+        """验证 token 版本是否有效"""
+        payload = jwt.decode(token, public_key, algorithms=["RS256"])
+        current_version = self.get_user_token_version(payload["sub"])
+        if payload.get("token_version", 0) < current_version:
+            raise TokenRevoked("Token has been revoked")
+        return payload
+```
+
+### 密钥轮转与吊销联动
+
+```
+密钥轮转 + Token 吊销联合策略：
+  1. 密钥轮转周期：90 天
+  2. 旧密钥保留期：与最长 token 有效期一致（24h）
+  3. 安全事件触发：立即轮转 + 递增所有用户 token 版本号
+
+密钥轮转 SOP：
+  1. 生成新密钥对（kid: key-N+1）
+  2. 将新公钥发布到 JWKS 端点
+  3. 签名切换到新密钥（新 token 用 key-N+1）
+  4. 保留旧密钥验证旧 token（24h 内）
+  5. 24h 后从 JWKS 移除旧密钥
+  6. 安全事件：额外递增所有用户的 token 版本号
+```
+
+## JWT 在 GraphQL 中的应用
+
+### GraphQL + JWT 架构
+
+```mermaid
+graph TD
+    Client[GraphQL 客户端] -->|JWT| Gateway[API Gateway]
+    Gateway -->|验证 JWT| AuthSvc[认证服务]
+    Gateway -->|注入用户信息| GraphQL[GraphQL Server]
+    GraphQL -->|@auth 指令| Directive[权限指令]
+    GraphQL --> UserSvc[用户服务]
+    GraphQL --> OrderSvc[订单服务]
+```
+
+### GraphQL 授权指令
+
+```graphql
+# 定义 @auth 指令
+directive @auth(requires: Role = USER) on FIELD_DEFINITION
+
+enum Role {
+  ADMIN
+  EDITOR
+  USER
+}
+
+type Query {
+  # 仅管理员可访问
+  allUsers: [User!]! @auth(requires: ADMIN)
+  
+  # 已认证用户可访问
+  me: User @auth(requires: USER)
+  
+  # 公开接口
+  publicInfo: String
+}
+
+type Mutation {
+  # 编辑者或管理员可操作
+  createPost(title: String!, content: String!): Post! @auth(requires: EDITOR)
+  
+  # 仅管理员可操作
+  deleteUser(id: ID!): Boolean! @auth(requires: ADMIN)
+}
+```
+
+### GraphQL JWT 实现
+
+```javascript
+// GraphQL Server JWT 中间件
+const { ApolloServer } = require('@apollo/server');
+const jwt = require('jsonwebtoken');
+
+const server = new ApolloServer({
+  typeDefs,
+  resolvers,
+  context: ({ req }) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let user = null;
+
+    if (token) {
+      try {
+        user = jwt.verify(token, public_key, { algorithms: ['RS256'] });
+      } catch (e) {
+        // token 无效，user 保持 null
+      }
+    }
+
+    return { user };
+  },
+});
+
+// @auth 指令实现
+const authDirectiveTransformer = (schema) => {
+  return mapSchema(schema, {
+    [MapperKind.OBJECT_FIELD]: (fieldConfig) => {
+      const auth = fieldConfig.astNode?.directives?.find(d => d.name.value === 'auth');
+      if (auth) {
+        const requiredRole = auth.arguments?.find(a => a.name.value === 'requires')?.value.value;
+        const originalResolve = fieldConfig.resolve;
+        fieldConfig.resolve = (parent, args, context, info) => {
+          if (!context.user) throw new AuthenticationError('Not authenticated');
+          if (requiredRole && !context.user.roles?.includes(requiredRole)) {
+            throw new ForbiddenError('Insufficient permissions');
+          }
+          return originalResolve(parent, args, context, info);
+        };
+      }
+      return fieldConfig;
+    },
+  });
+};
+```
+
+## OAuth2 Device Authorization Grant 详解
+
+### Device Flow 完整规范
+
+```
+RFC 8628 Device Authorization Grant 完整流程：
+
+设备端（如智能音箱、CLI 工具）：
+  1. POST /oauth/device/code
+     ├── client_id: 设备应用 ID
+     ├── scope: 请求的权限范围
+     └── response_type: device_code
+
+  2. 服务端返回：
+     ├── device_code: 设备码（设备轮询用）
+     ├── user_code: 用户码（用户输入用，如 WDJB-MJHT）
+     ├── verification_uri: 用户输入码的 URL
+     ├── verification_uri_complete: 带预填码的 URL（可选）
+     ├── expires_in: 设备码有效期（如 600 秒）
+     └── interval: 轮询间隔（如 5 秒）
+
+  3. 设备显示用户码，用户在其他设备上访问 verification_uri
+
+  4. 设备轮询 POST /token
+     ├── grant_type: urn:ietf:params:oauth:grant-type:device_code
+     ├── device_code: 设备码
+     └── client_id: 设备应用 ID
+
+  5. 响应状态：
+     ├── 200 → token（用户已授权）
+     ├── 428 → Authorization Pending（继续轮询）
+     ├── 400 → expired_token（设备码过期）
+     ├── 401 → access_denied（用户拒绝）
+     └── 403 → invalid_client（client_id 无效）
+```
+
+### Device Flow 安全考量
+
+| 风险 | 描述 | 防御措施 |
+|------|------|----------|
+| 用户码猜测 | 攻击者尝试猜解用户码 | 用户码长度 ≥ 8 位，包含字母数字 |
+| 设备码泄露 | 设备码被第三方截获 | 绑定 client_id + IP，HTTPS 传输 |
+| 拒绝服务 | 攻击者大量请求 device_code | 限流 + 设备码有效期短 |
+| 重放攻击 | 旧设备码被重用 | 一次性使用，用后即废 |
+| 社会工程 | 用户被诱导输入码到恶意设备 | 显示设备信息，用户确认后授权 |
+
+## PKCE 实现细节深入
+
+### PKCE 安全原理
+
+```
+PKCE 安全证明：
+
+没有 PKCE：
+  攻击者截获 authorization_code → 直接用 code 换 token
+  → token 被盗
+
+有 PKCE：
+  客户端生成 code_verifier（随机串）
+  客户端计算 code_challenge = SHA256(code_verifier)
+  授权请求携带 code_challenge
+  token 交换时携带 code_verifier
+  服务端验证 SHA256(code_verifier) == code_challenge
+  
+  攻击者截获 code，但没有 code_verifier → 无法换 token
+  攻击者截获 code_challenge，但无法反推 code_verifier（SHA256 单向）
+```
+
+### PKCE 高级用法
+
+```javascript
+// PKCE + JWT 客户端认证
+async function exchangeTokenWithPKCE(code, codeVerifier, clientAssertion) {
+  const response = await fetch('https://auth.example.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: 'https://myapp.com/callback',
+      code_verifier: codeVerifier,
+      client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+      client_assertion: clientAssertion  // JWT 客户端认证
+    })
+  });
+  return response.json();
+}
+
+// 生成 JWT 客户端断言
+function createClientAssertion(clientId, tokenEndpoint) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: clientId,
+    sub: clientId,
+    aud: tokenEndpoint,
+    jti: crypto.randomUUID(),
+    exp: now + 300,
+    iat: now
+  };
+  return jwt.sign(payload, privateKey, { algorithm: 'RS256' });
+}
+```
+
+### PKCE vs Client Secret 对比
+
+| 维度 | PKCE | Client Secret |
+|------|------|---------------|
+| 安全模型 | 动态密钥（每次请求不同） | 静态密钥（长期有效） |
+| 存储位置 | 客户端内存（不落盘） | 服务端安全存储 |
+| 泄露影响 | 单次请求泄露 | 长期可被滥用 |
+| 适用客户端 | SPA/移动端/CLI | 后端服务/机密客户端 |
+| 是否需要 TLS | 强烈建议 | 必须 |
+| 规范要求 | OAuth 2.1 强制公开客户端使用 | 机密客户端可选 |
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

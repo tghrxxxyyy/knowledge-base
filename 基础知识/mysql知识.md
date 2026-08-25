@@ -2085,6 +2085,383 @@ sequenceDiagram
 - **合并写**：计数类（点赞/库存）先在 `Redis` 累加，定时批量 `UPDATE`；或 `INSERT ... ON DUPLICATE KEY UPDATE` 合并同一行的多次变更。
 - **限流保护**：DB 前置entinel/网关限流，避免瞬间洪峰冲垮连接池。
 
+## 十、MySQL InnoDB Buffer Pool 内部机制
+
+### 10.1 Buffer Pool 架构
+
+```
+Buffer Pool = InnoDB 核心内存缓存层
+
+结构：
+  ├── 数据页（Data Page）：16KB，缓存热数据
+  ├── 索引页（Index Page）：B+Tree 节点
+  ├── 自适应哈希索引（AHI）：自动构建，加速等值查询
+  ├── Change Buffer：缓存非唯一索引的 DML 操作
+  └── 锁信息/事务信息
+
+LRU 算法改进（Midpoint Insertion）：
+  ┌─────────────────────────────────────┐
+  │  Young Sublist（热端 5/8）          │  ← 新页插入这里
+  │  ┌───────┬───────┬───────────────┐  │
+  │  │ 新页  │  →   │  热数据页     │  │
+  │  └───────┴───────┴───────────────┘  │
+  │  Old Sublist（冷端 3/8）            │  ← 预读页插入这里
+  │  ┌───────┬───────┬───────────────┐  │
+  │  │ 冷数据│  →   │  即将淘汰     │  │
+  │  └───────┴───────┴───────────────┘  │
+  └─────────────────────────────────────┘
+
+  问题：全表扫描会污染热数据（把热页挤到冷端）
+  解决：innodb_old_blocks_time=1000（冷端停留 >1s 才移到热端）
+```
+
+### 10.2 Buffer Pool 配置
+
+| 参数 | 默认值 | 建议 | 说明 |
+|------|--------|------|------|
+| innodb_buffer_pool_size | 128MB | 系统内存 60%~75% | 核心参数 |
+| innodb_buffer_pool_instances | 8 | CPU 核数/8 | 多实例减少锁竞争 |
+| innodb_old_blocks_pct | 37 | 保持默认 | 冷端占比 |
+| innodb_old_blocks_time | 1000 | 1000~3000 | 冷端停留时间 |
+| innodb_read_ahead_threshold | 56 | 保持默认 | 预读触发阈值 |
+| innodb_page_size | 16KB | 保持默认 | 页大小 |
+
+### 10.3 Buffer Pool 监控
+
+```sql
+-- Buffer Pool 命中率
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- 命中率 = 1 - (Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)
+-- 目标：> 99%
+
+-- Buffer Pool 状态
+SHOW ENGINE INNODB STATUS\G
+-- 看 BUFFER POOL AND MEMORY 部分
+
+-- 各页状态
+SELECT * FROM sys.innodb_buffer_stats_by_table ORDER BY pages DESC LIMIT 10;
+
+-- 自适应哈希索引状态
+SHOW STATUS LIKE 'Innodb_adaptive_hash%';
+```
+
+### 10.4 Change Buffer 机制
+
+```
+Change Buffer = 缓存非唯一索引的 INSERT/UPDATE/DELETE
+
+流程：
+  1. DML 到达 → 修改 Buffer Pool 中的页
+  2. 如果目标页不在 Buffer Pool → 写入 Change Buffer
+  3. 后台线程定期合并（Merge）Change Buffer 到实际页
+  4. 读取时强制合并（Read Merge）
+
+优势：
+  减少随机 IO（多次 DML 合并为一次写入）
+  特别适合写密集 + 低并发场景
+
+配置：
+  innodb_change_buffer_max_size=25（最大占 Buffer Pool 的 25%）
+  innodb_change_buffering=all（缓存所有 DML）
+```
+
+## 十一、MySQL 复制深度（异步/半同步/组复制）
+
+### 11.1 复制模式对比
+
+| 模式 | 延迟 | 数据安全 | 性能 | 适用 |
+|------|------|----------|------|------|
+| 异步复制 | 低 | 可能丢数据 | 最高 | 读写分离 |
+| 半同步复制 | 中 | 至少 1 从确认 | 中 | 金融级 |
+| 组复制（MGR） | 中 | 多数派确认 | 中 | 高可用 |
+| 延迟复制 | 可控 | 可回溯 | 低 | 灾备 |
+
+### 11.2 半同步复制原理
+
+```
+半同步复制流程：
+  1. Master 写 binlog
+  2. Master 等待至少 1 个 Slave 确认收到 relay log
+  3. Slave 写 relay log 后发送 ACK
+  4. Master 收到 ACK 后提交事务
+
+超时处理：
+  rpl_semi_sync_master_timeout=10000（10s）
+  超时后降级为异步复制
+  恢复后自动升级为半同步
+
+配置：
+  rpl_semi_sync_master_enabled=1
+  rpl_semi_sync_master_wait_for_slave_count=1
+  rpl_semi_sync_master_timeout=10000
+```
+
+### 11.3 MySQL Group Replication（MGR）
+
+```
+MGR 基于 Paxos 协议，实现多主/单主高可用：
+
+单主模式（推荐）：
+  1 个主 + N 从，主故障自动选新主
+  写走主，读走从
+
+多主模式：
+  所有节点可写
+  写冲突通过 certification 机制解决
+  业务需规避写冲突（按主键分片）
+
+关键参数：
+  group_replication_single_primary_mode=ON（单主）
+  group_replication_consistency=BEFORE_ON_PRIMARY_FAILOVER
+  group_replication_group_seeds="node1:33061,node2:33061"
+```
+
+### 11.4 GTID 复制
+
+```
+GTID = 全局事务标识符 = server_uuid:transaction_id
+
+优势：
+  自动定位复制位点（无需手动指定 binlog 文件+位置）
+  故障切换简单（新主自动从最完整的从库同步）
+  复制拓扑管理方便
+
+配置：
+  gtid_mode=ON
+  enforce_gtid_consistency=ON
+
+查看：
+  SELECT @@global.gtid_executed;
+  SHOW MASTER STATUS\G
+```
+
+## 十二、MySQL Performance Schema 与 Information Schema
+
+### 12.1 Performance Schema 重点表
+
+```sql
+-- 最耗时 SQL（Top 10）
+SELECT digest_text, count_star, avg_timer_wait/1000000000 AS avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY sum_timer_wait DESC LIMIT 10;
+
+-- 等待事件分析
+SELECT event_name, count_star, sum_timer_wait/1000000000 AS total_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE count_star > 0 ORDER BY total_ms DESC LIMIT 20;
+
+-- 锁分析
+SELECT * FROM performance_schema.data_locks;
+SELECT * FROM performance_schema.data_lock_waits;
+
+-- 内存使用
+SELECT event_name, current_count_used, current_number_of_bytes_used
+FROM performance_schema.memory_summary_global_by_event_name
+ORDER BY current_number_of_bytes_used DESC LIMIT 10;
+
+-- 文件 IO
+SELECT file_name, count_read, count_write, count_misc
+FROM performance_schema.file_summary_by_instance
+ORDER BY count_write DESC LIMIT 10;
+```
+
+### 12.2 Information Schema 常用查询
+
+```sql
+-- 表空间大小
+SELECT table_schema, table_name,
+  ROUND(data_length/1024/1024, 2) AS data_mb,
+  ROUND(index_length/1024/1024, 2) AS index_mb,
+  ROUND(data_free/1024/1024, 2) AS free_mb
+FROM information_schema.tables
+WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+ORDER BY data_length DESC;
+
+-- 索引使用情况
+SELECT * FROM sys.schema_unused_indexes;
+SELECT * FROM sys.schema_redundant_indexes;
+
+-- 长事务
+SELECT * FROM information_schema.innodb_trx
+WHERE TIMESTAMPDIFF(SECOND, trx_started, NOW()) > 10;
+
+-- 连接信息
+SELECT * FROM information_schema.processlist WHERE command != 'Sleep';
+```
+
+## 十三、MySQL 8.0 窗口函数与 CTE 深度
+
+### 13.1 窗口函数大全
+
+```sql
+-- 排名函数
+ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn  -- 无并列
+RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn        -- 有并列跳号
+DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn  -- 有并列不跳号
+
+-- 聚合窗口函数
+SUM(amount) OVER (PARTITION BY user_id ORDER BY created_at
+  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative  -- 累计
+AVG(amount) OVER (PARTITION BY user_id ORDER BY created_at
+  ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg  -- 移动平均
+
+-- 分布函数
+PERCENT_RANK() OVER (ORDER BY salary) AS pct  -- 百分比排名
+CUME_DIST() OVER (ORDER BY salary) AS cd       -- 累积分布
+
+-- 偏移函数
+LAG(amount, 1, 0) OVER (ORDER BY created_at) AS prev_amount  -- 前一行
+LEAD(amount, 1, 0) OVER (ORDER BY created_at) AS next_amount -- 后一行
+FIRST_VALUE(amount) OVER (PARTITION BY user_id ORDER BY created_at) AS first_amt
+LAST_VALUE(amount) OVER (PARTITION BY user_id ORDER BY created_at
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amt
+
+-- NTILE 分桶
+NTILE(4) OVER (ORDER BY salary) AS quartile  -- 四分位
+```
+
+### 13.2 CTE（Common Table Expression）
+
+```sql
+-- 递归 CTE：查询组织架构树
+WITH RECURSIVE org_tree AS (
+  SELECT id, name, manager_id, 1 AS level
+  FROM employees WHERE manager_id IS NULL
+  UNION ALL
+  SELECT e.id, e.name, e.manager_id, t.level + 1
+  FROM employees e JOIN org_tree t ON e.manager_id = t.id
+)
+SELECT * FROM org_tree ORDER BY level, name;
+
+-- 非递归 CTE：简化复杂查询
+WITH daily_stats AS (
+  SELECT DATE(created_at) AS dt, user_id, SUM(amount) AS total
+  FROM orders GROUP BY DATE(created_at), user_id
+),
+ranked AS (
+  SELECT *, RANK() OVER (PARTITION BY dt ORDER BY total DESC) AS rn
+  FROM daily_stats
+)
+SELECT * FROM ranked WHERE rn <= 10;
+```
+
+## 十四、MySQL JSON 功能深度
+
+```sql
+-- JSON 列
+CREATE TABLE events (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  data JSON NOT NULL
+);
+
+-- 插入
+INSERT INTO events (data) VALUES ('{"type":"click","page":"/home","ts":123456}');
+
+-- 提取字段
+SELECT data->>'$.type' AS event_type,
+       data->>'$.page' AS page
+FROM events;
+
+-- JSON 数组操作
+SELECT JSON_LENGTH(data->'$.tags') AS tag_count
+FROM events;
+
+-- JSON 索引（虚拟列 + 索引）
+ALTER TABLE events ADD COLUMN event_type VARCHAR(50)
+  GENERATED ALWAYS AS (data->>'$.type') VIRTUAL;
+CREATE INDEX idx_event_type ON events(event_type);
+
+-- JSON 聚合
+SELECT data->>'$.type' AS event_type, COUNT(*) AS cnt
+FROM events GROUP BY event_type;
+
+-- JSON_TABLE（8.0.17+）：JSON 转行
+SELECT jt.*
+FROM events,
+  JSON_TABLE(data, '$.tags[*]' COLUMNS (
+    tag VARCHAR(50) PATH '$'
+  )) AS jt;
+```
+
+### 14.1 MySQL on Kubernetes（Operator）
+
+```
+MySQL on K8s 方案：
+
+  1. MySQL Operator（Oracle 官方）：
+     - 基于 InnoDB Cluster（MGR + MySQL Shell + MySQL Router）
+     - 自动化部署/备份/恢复/扩缩容
+     - 声明式管理（CRD）
+
+  2. Percona XtraDB Cluster Operator：
+     - 基于 PXC（Galera 复制）
+     - 多主写入、同步复制
+     - 自动备份到 S3
+
+  3. Vitess：
+     - YouTube 开源，K8s 原生分库分表
+     - MySQL 兼容的分布式数据库
+     - 自动分片/路由/负载均衡
+
+选型：
+  单机高可用 → MySQL Operator
+  多主写入 → PXC Operator
+  分库分表 → Vitess
+  云托管 → Aurora/RDS（免运维）
+```
+
+### 14.2 MySQL vs PostgreSQL 深度对比
+
+| 维度 | MySQL | PostgreSQL |
+|------|-------|------------|
+| MVCC | Undo Log + ReadView | 元组版本（xmin/xmax） |
+| 连接模型 | 线程池（per connection） | 进程（per connection） |
+| 索引 | B+Tree/Hash/R-Tree | B-Tree/GiST/GIN/BRIN/SP-GiST |
+| 分区 | RANGE/LIST/HASH（5.7+） | RANGE/LIST/HASH + 声明式 |
+| JSON | JSON（文本） | JSONB（二进制 + GIN 索引） |
+| 全文搜索 | 内置（有限） | 内置（完整） + tsvector |
+| 地理空间 | 基础 | PostGIS（事实标准） |
+| CTE/窗口 | 8.0+ 支持 | 完整支持 |
+| 扩展性 | 弱（插件有限） | 极强（自定义类型/函数/索引） |
+| 复制 | binlog 复制 | 流复制 + 逻辑复制 |
+| 高可用 | MGR/InnoDB Cluster | Patroni + etcd |
+| 适用 | 简单 OLTP/读多写少 | 复杂查询/分析/地理/全文 |
+
+```sql
+-- PostgreSQL JSONB 索引优势（MySQL 做不到）
+CREATE INDEX idx_data_gin ON events USING GIN (data);
+SELECT * FROM events WHERE data @> '{"type":"click"}';  -- 高效查询
+
+-- PostgreSQL 数组查询
+SELECT * FROM products WHERE tags @> ARRAY['sale'];  -- 包含查询
+
+-- PostgreSQL 全文搜索
+SELECT * FROM articles
+WHERE to_tsvector('english', content) @@ to_tsquery('english', 'database & performance');
+```
+
+### 15、MySQL 速查表
+
+| 项 | 结论 |
+|----|------|
+| 存储引擎 | InnoDB（事务/外键/行锁） |
+| MVCC | Undo Log + ReadView（RC/RR） |
+| 索引 | B+Tree（聚簇+二级） |
+| 复制 | binlog → relay log → SQL 回放 |
+| 高可用 | MGR/InnoDB Cluster/Orchestrator |
+| 缓冲池 | Buffer Pool（LRU 改进 + Change Buffer） |
+| 调优 | EXPLAIN + 慢日志 + Performance Schema |
+| 8.0 新特性 | 窗口函数/CTE/JSON/不可见索引/克隆 |
+| vs PostgreSQL | 简单 OLTP → MySQL，复杂分析/扩展 → PG |
+
+---
+
+## 十六、与其他板块的关系
+
+- PostgreSQL 深度见「[中间件/PostgreSQL深度篇](中间件/PostgreSQL深度篇.md)」；
+- Redis 知识见「[基础知识/redis知识](redis知识.md)」；
+- 分库分表见「[分库分表 ShardingSphere](中间件/分库分表ShardingSphere.md)」。
+
 ### 9.7 MySQL 8.0 / 9.0 新特性（生产可用清单）
 
 - **窗口函数**（8.0）：`ROW_NUMBER()/RANK()/DENSE_RANK()/SUM() OVER (PARTITION BY ... ORDER BY ...)` 做排名、累计、同比环比，替代又慢又难维护的自连接。

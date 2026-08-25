@@ -541,6 +541,199 @@ spark-submit \
   两者互补（ETL 用 Spark 产出宽表，查询用 Presto/Trino）
 ```
 
+## 十八、Spark 性能调优深度补充
+
+### 18.1 Catalyst 优化器原理
+
+```
+Catalyst 优化流程：
+  SQL / DataFrame API → 逻辑计划 → 优化逻辑计划 → 物理计划 → 代码生成 → RDD
+
+四个阶段：
+  1. Analysis（分析）：
+     解析 SQL，绑定元数据（表/列/类型）
+     输出：未解析的逻辑计划 → 解析后的逻辑计划
+
+  2. Optimization（优化）：
+     谓词下推（Predicate Pushdown）
+     列裁剪（Column Pruning）
+     常量折叠（Constant Folding）
+     等值传播（Equality Propagation）
+     输出：优化后的逻辑计划
+
+  3. Physical Planning（物理计划）：
+     生成多个物理计划（Hash Join / Sort Merge Join / Broadcast Join）
+     基于成本模型（CBO）选择最优
+     输出：最优物理计划
+
+  4. Code Generation（代码生成）：
+     Tungsten 引擎：生成 JVM 字节码
+     全stage代码生成：Whole-Stage Code Generation
+     减少虚函数调用，提高 CPU 缓存命中率
+```
+
+### 18.2 Tungsten 内存管理
+
+```
+Tungsten = Spark 底层执行引擎优化
+
+核心优化：
+  1. 二进制行格式（Binary Row Format）：
+     - 对象 → 二进制（off-heap）
+     - 减少 GC 压力
+     - 减少序列化开销
+
+  2. 全 Stage 代码生成（Whole-Stage Code Generation）：
+     - 多个操作合并为一个代码段
+     - 消除虚函数调用
+     - 利用 CPU SIMD 指令
+
+  3. 向量化执行（Vectorized Execution）：
+     - 批量处理（1024 行/批）
+     - 列式存储访问
+     - 利用 CPU 缓存行
+
+内存结构：
+  Task Memory = Execution Memory + Storage Memory
+  Execution Memory：Shuffle/Join/Sort/Agg
+  Storage Memory：缓存/Persist
+  两者可互相借用（Execution 优先）
+```
+
+### 18.3 Shuffle Spill 调优
+
+```
+Shuffle Spill = 当内存不足时，将数据溢写到磁盘
+
+触发条件：
+  execution memory > 可用内存
+  默认：spark.sql.shuffle.partitions=200
+
+调优策略：
+  1. 增加分区数：
+     spark.sql.shuffle.partitions=1000（小文件增多，但减少 spill）
+
+  2. 调整内存比例：
+     spark.memory.fraction=0.8（执行+存储占堆内存 80%）
+     spark.memory.storageFraction=0.5（存储占执行+存储的 50%）
+
+  3. 压缩 Spill 文件：
+     spark.shuffle.spill.compress=true
+     spark.io.compression.codec=lz4
+
+  4. 外部排序器：
+     spark.shuffle.sort.bypassMergeThreshold=400
+     小数据量不排序直接合并
+
+监控指标：
+  Shuffle Read/Write：spark.eventLog → Stage 详情
+  Spill Size：看是否有大量 spill（越大性能越差）
+  Sort Time：排序耗时
+```
+
+### 18.4 数据倾斜解决方案
+
+```
+数据倾斜 = 某个/些 Key 的数据量远超其他 Key
+
+检测方法：
+  1. Spark UI → Stage → Task Duration 分布（是否极不均匀）
+  2. Spark UI → Stage → Shuffle Read/Write 分布
+  3. explain(true) 查看执行计划
+
+解决方案：
+  1. 两阶段聚合（推荐）：
+     先按 Key + 随机前缀分组聚合
+     再去掉前缀，二次聚合
+
+  2. Broadcast Join（小表广播）：
+     spark.sql.autoBroadcastJoinThreshold=10MB
+     小表广播避免 Shuffle
+
+  3. 调整分区数：
+     增加 shuffle.partitions → 更多分区 → 更均匀
+
+  4. 自定义 Partitioner：
+     对倾斜 Key 重新分区（加盐/拆分）
+
+  5. AQE（Adaptive Query Execution，Spark 3.0+）：
+     spark.sql.adaptive.enabled=true
+     自动合并小分区
+     自动调整 Shuffle 分区数
+     自动切换 Join 策略
+```
+
+### 18.5 Spark on Kubernetes
+
+```
+部署模式：
+  Client Mode：Driver 在客户端，Executor 在 K8s
+  Cluster Mode：Driver 和 Executor 都在 K8s（推荐生产）
+
+配置：
+  spark.master=k8s://https://k8s-master:6443
+  spark.kubernetes.container.image=spark:3.5
+  spark.kubernetes.namespace=spark
+  spark.dynamicAllocation.enabled=true
+  spark.dynamicAllocation.shuffleTracking.enabled=true
+
+优势：
+  资源隔离（不同 Spark 应用不同 namespace）
+  弹性扩缩（K8s HPA + Spark Dynamic Allocation）
+  混合部署（Spark + Flink + 其他应用共享集群）
+  云原生（与云服务集成）
+
+注意事项：
+  需要持久卷（PV/PVC）用于 Shuffle/Checkpoint
+  镜像需要包含 Spark + 依赖
+  K8s RBAC 权限配置
+```
+
+### 18.6 Spark Dynamic Allocation
+
+```
+动态资源分配 = 根据工作负载自动调整 Executor 数量
+
+配置：
+  spark.dynamicAllocation.enabled=true
+  spark.dynamicAllocation.minExecutors=2
+  spark.dynamicAllocation.maxExecutors=100
+  spark.dynamicAllocation.initialExecutors=10
+  spark.dynamicAllocation.executorIdleTimeout=60s
+  spark.dynamicAllocation.schedulerBacklogTimeout=1s
+
+触发扩缩条件：
+  扩容：有 pending task（待执行任务）且空闲 Executor 不足
+  缩容：Executor 空闲超过 60s
+
+Shuffle Tracking（Spark 3.0+）：
+  通过 Shuffle 数据跟踪 Executor 是否可回收
+  避免回收后 Shuffle 数据丢失导致全量重算
+  spark.dynamicAllocation.shuffleTracking.enabled=true
+```
+
+### 18.7 Spark vs Presto/Trino 对比
+
+| 维度 | Spark SQL | Presto/Trino |
+|------|-----------|--------------|
+| 模型 | 批处理（写结果到存储） | MPP（内存计算返回结果） |
+| 延迟 | 秒~分钟 | 毫秒~秒 |
+| 数据量 | TB~PB 级 | GB~TB 级 |
+| 容错 | 高（Stage 级重试） | 低（Task 失败重试） |
+| 状态 | 有状态（Shuffle） | 无状态 |
+| 连接器 | 丰富（JDBC/HDFS/Hive） | 丰富（JDBC/Hive/Kafka） |
+| 适用 | ETL/复杂查询/ML | 即席查询/BI/交互分析 |
+| 资源 | 重（需要 YARN/K8s） | 轻（独立部署） |
+
+```
+选型建议：
+  ETL 批处理 → Spark
+  即席查询 BI → Presto/Trino
+  实时查询 → Presto/Trino
+  ML Pipeline → Spark
+  两者互补：Spark 产出宽表，Presto 查询
+```
+
 ## 十九、与其他板块的关系
 
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；

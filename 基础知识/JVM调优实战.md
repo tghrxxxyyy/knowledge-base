@@ -609,6 +609,345 @@ jfr print --events jdk.GCHeapSummary recording.jfr
 | Exception | JavaExceptionThrow | 异常统计 |
 | JFR | FlightRecorder | JFR 自身状态 |
 
+## 十六、JVM 高级诊断与深度分析
+
+### 16.1 GC Root 分析
+
+```text
+GC Root 是垃圾回收的起点，从 GC Root 出发可达的对象不会被回收。
+
+GC Root 类型：
+┌──────────────────────────┬──────────────────────────────────────────┐
+│ 类型                      │ 示例                                     │
+├──────────────────────────┼──────────────────────────────────────────┤
+│ 虚拟机栈引用              │ 局部变量、方法参数                        │
+│ 方法区静态变量             │ static Object ref                        │
+│ 方法区常量                 │ static final Object ref                 │
+│ JNI 引用                  │ Native 方法持有的引用                    │
+│ Monitor（同步锁）          │ 持有 synchronized 锁的对象               │
+│ JVM 内部引用              │ ClassLoader、异常对象、系统类             │
+│ 活跃线程                  │ Thread 对象及其栈帧中的引用               │
+└──────────────────────────┴──────────────────────────────────────────┘
+```
+
+```bash
+# jmap 查看 GC Roots
+jmap -dump:live,format=b,file=heap.hprof <pid>
+
+# jhat 分析堆转储（JDK8，JDK9+ 已移除）
+jhat -J-Xmx4g heap.hprof
+# 访问 http://localhost:7000 查看 GC Root 到泄漏对象的路径
+
+# Eclipse MAT 分析
+# 1. 打开 heap.hprof
+# 2. Leak Suspects Report → 自动分析泄漏嫌疑
+# 3. Dominator Tree → 查看占用内存最大的对象
+# 4. Path to GC Roots → 查看到 GC Root 的引用链
+```
+
+```bash
+# 使用 jcmd 获取 GC Root 信息
+jcmd <pid> GC.class_stats | head -20
+jcmd <pid> VM.flags | grep -i heap
+jcmd <pid> GC.heap_info
+```
+
+### 16.2 Heap Dump 分析（MAT 详解）
+
+```text
+MAT（Memory Analyzer Tool）核心功能：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 功能                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ Leak Suspects        │ 自动分析内存泄漏嫌疑                         │
+│ Dominator Tree       │ 按对象保留内存排序                           │
+│ Histogram            │ 按类统计对象数量和内存占用                    │
+│ Path to GC Roots     │ 查看到 GC Root 的引用链（排除弱/软引用）     │
+│ OQL                  │ 类 SQL 查询堆中的对象                        │
+│ Thread Overview      │ 查看所有线程的栈帧和局部变量                  │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```bash
+# OQL 查询示例
+# 查找所有 String 对象且长度 > 1000
+SELECT s.toString() FROM java.lang.String s WHERE s.count > 1000
+
+# 查找所有自定义类实例
+SELECT * FROM com.example.MyService
+
+# 查找所有被 HTTP 请求持有的 Session 对象
+SELECT s.id FROM javax.servlet.http.HttpSession s
+```
+
+```text
+常见内存泄漏模式与 MAT 分析：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 泄漏模式              │ MAT 特征                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 静态集合持有对象       │ GC Root → Static Field → Collection → Object │
+│ 未关闭资源            │ GC Root → Thread → Socket/Connection       │
+│ ThreadLocal 泄漏      │ GC Root → Thread → ThreadLocalMap → Value  │
+│ ClassLoader 泄漏      │ GC Root → ClassLoader → Class → Object    │
+│ 缓存无限增长          │ GC Root → Static Field → HashMap → Entry  │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+### 16.3 Thread Dump 分析
+
+```text
+Thread Dump 分析要点：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 状态                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ RUNNABLE             │ 正在运行或等待 CPU                           │
+│ BLOCKED              │ 等待监视器锁（死锁嫌疑）                     │
+│ WAITING              │ 无限期等待（wait/join/park）                 │
+│ TIMED_WAITING        │ 有限期等待（sleep/wait(超时)）               │
+│ TERMINATED           │ 已终止                                      │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```bash
+# 获取 Thread Dump
+jstack <pid> > thread_dump.txt
+jcmd <pid> Thread.print > thread_dump.txt
+
+# 查找死锁
+jstack <pid> | grep -A 20 "Found one Java-level deadlock"
+
+# 使用 jcmd 分析线程
+jcmd <pid> Thread.print -l  # -l 显示锁信息
+```
+
+```text
+线程 Dump 分析模板：
+1. 死锁检查
+   - 搜索 "Found one Java-level deadlock"
+   - 查看涉及的线程和锁
+
+2. 高 CPU 线程定位
+   # 找到 CPU 使用最高的 Java 线程
+   top -Hp <pid>       # 找到 CPU 最高的本地线程 ID
+   printf "%x\n" <tid>  # 转换为十六进制
+   jstack <pid> | grep -A 30 "<hex-tid>"  # 在 Thread Dump 中查找
+
+3. 线程阻塞分析
+   - 搜索 BLOCKED 状态线程
+   - 查看 waiting to lock 的锁对象
+   - 反向查找持有该锁的线程
+```
+
+### 16.4 类加载机制
+
+```text
+JVM 类加载器层次：
+┌──────────────────────────┬──────────────────────────────────────────┐
+│ 加载器                    │ 职责                                     │
+├──────────────────────────┼──────────────────────────────────────────┤
+│ Bootstrap ClassLoader     │ 加载 rt.jar（核心类库）                   │
+│ Extension ClassLoader     │ 加载 ext 目录的类                        │
+│ Application ClassLoader   │ 加载 classpath 的类                      │
+│ 自定义 ClassLoader        │ 特殊加载需求（热部署/隔离）                │
+└──────────────────────────┴──────────────────────────────────────────┘
+
+双亲委派模型：
+  1. 先委托父加载器加载
+  2. 父加载器无法加载时才自己加载
+  3. 避免重复加载核心类库
+
+打破双亲委派的场景：
+- SPI（Service Provider Interface）：JDBC 驱动
+- OSGi 模块化：每个模块有自己的类加载器
+- 热部署：Web 容器（Tomcat）每个应用独立的 ClassLoader
+- Agent 增强：Arthas、SkyWalking 的 Java Agent
+```
+
+```java
+// 自定义 ClassLoader 示例
+public class HotSwapClassLoader extends ClassLoader {
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        byte[] bytes = loadClassBytes(name); // 从磁盘/网络加载字节码
+        if (bytes == null) {
+            throw new ClassNotFoundException(name);
+        }
+        return defineClass(name, bytes, 0, bytes.length);
+    }
+}
+
+// 查看类加载器层次
+ClassLoader cl = MyClass.class.getClassLoader();
+while (cl != null) {
+    System.out.println(cl);
+    cl = cl.getParent();
+}
+```
+
+### 16.5 JIT 编译深入
+
+```text
+JIT（Just-In-Time）编译优化过程：
+
+解释执行 → C1 编译（Client）→ C2 编译（Server）→ 优化执行
+
+C1 编译器优化（-client）：
+- 方法内联
+- 去虚拟化
+- 冗余消除
+- 基本的逃逸分析
+
+C2 编译器优化（-server）：
+- 循环展开
+- 标量替换
+- 栈上分配
+- 内存屏障消除
+- 向量化（SIMD）
+
+JIT 编译阈值：
+- CompileThreshold：方法调用次数达到阈值后触发编译（默认 10000 次）
+- OnStackReplacePercentage：OSR（栈上替换）阈值
+```
+
+```bash
+# 查看 JIT 编译日志
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -jar app.jar
+
+# 查看内联决策
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining -jar app.jar
+
+# 查看生成的汇编代码
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly -jar app.jar
+
+# 使用 JITWatch 可视化
+# 下载 JITWatch，加载 compilation.log
+```
+
+```text
+JITWatch 可视化分析：
+- 方法调用图：显示哪些方法被 JIT 编译
+- 内联树：显示方法内联关系
+- 汇编代码：查看生成的机器码
+- 编译时间：监控 JIT 编译耗时
+```
+
+### 16.6 JVM Ergonomics（自动调优）
+
+```text
+JVM 自动调优机制：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 参数                  │ 自动调优逻辑                               │
+├──────────────────────┼────────────────────────────────────────────┤
+│ Heap Size            │ 物理内存的 1/4（最大 1GB）                 │
+│ GC 选择              │ 服务器类机器 → G1GC（JDK9+）               │
+│ 并行度               │ CPU 核数                                   │
+│ JIT 编译器           │ 服务器类 → C2（-server）                    │
+│ Thread Stack Size    │ 平台相关（通常 512KB-1MB）                  │
+│ 堆区域比例           │ G1：Eden 5%, Survivor 10%, Old 自动         │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```bash
+# 查看 JVM 默认值
+java -XX:+PrintFlagsFinal -version | grep -E "HeapSize|ParallelGCThreads|UseG1GC"
+
+# 识别服务器类机器（JVM 自动判断）
+# 服务器类：CPU >= 2核，内存 >= 2GB
+# 客户端类：其他
+java -server -jar app.jar  # 强制使用服务器类模式
+
+# 查看当前 JVM 配置
+jcmd <pid> VM.flags
+jcmd <pid> GC.heap_info
+```
+
+### 16.7 JVM 性能计数器
+
+```text
+JVM 内置性能计数器（jcmd/jstat）：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 计数器                │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ gc.heap_size         │ 堆内存大小                                  │
+│ gc.eden_size         │ Eden 区大小                                 │
+│ gc.survivor_size     │ Survivor 区大小                            │
+│ gc.old_size          │ Old 区大小                                  │
+│ gc.young_gc_count    │ Young GC 次数                              │
+│ gc.full_gc_count     │ Full GC 次数                               │
+│ gc.young_gc_time     │ Young GC 耗时（毫秒）                       │
+│ gc.full_gc_time      │ Full GC 耗时（毫秒）                        │
+│ jvm.state            │ JVM 状态（running/terminating）             │
+│ threads.count        │ 线程数量                                    │
+│ threads.daemon       │ 守护线程数量                                │
+│ classes.loaded       │ 已加载类数量                                │
+│ classes.total        │ 总加载类数量（含已卸载）                     │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```bash
+# jstat 实时监控
+jstat -gcutil <pid> 1000 10  # 每秒打印一次，共10次
+jstat -gc <pid> 1000         # 每秒打印 GC 详细信息
+
+# jcmd 获取详细信息
+jcmd <pid> GC.heap_info      # 堆内存详情
+jcmd <pid> VM.flags           # JVM 参数
+jcmd <pid> Thread.print       # 线程 Dump
+jcmd <pid> GC.class_histogram # 类直方图
+
+# JMX 远程监控
+java -Dcom.sun.management.jmxremote \
+     -Dcom.sun.management.jmxremote.port=9999 \
+     -Dcom.sun.management.jmxremote.authenticate=false \
+     -jar app.jar
+```
+
+### 16.8 GraalVM Native Image
+
+```text
+GraalVM Native Image 将 Java 应用编译为原生可执行文件。
+
+vs 传统 JVM：
+┌──────────────────────┬────────────────────────────────────────────┐
+│                      │ JVM                   │ Native Image       │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 启动时间              │ 秒级                  │ 毫秒级              │
+│ 内存占用              │ 百 MB 级              │ 十 MB 级            │
+│ 峰值性能              │ 更高（JIT 优化）       │ 略低（AOT 限制）    │
+│ 适用场景              │ 长期运行服务           │ CLI/Serverless/微服务│
+│ 反射                  │ 完整支持              │ 需配置（反射配置）   │
+│ 动态代理              │ 完整支持              │ 需配置               │
+│ GC                    │ 完整支持              │ SubstrateVM（精简GC）│
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```bash
+# 构建 Native Image
+native-image -jar myapp.jar \
+  --no-fallback \
+  --enable-http \
+  --enable-https \
+  -H:Name=myapp \
+  -H:Class=com.example.Main
+
+# Spring Boot Native Image（Spring Boot 3.x 原生支持）
+./mvnw -Pnative native:compile
+
+# 常见问题解决
+# 反射配置：META-INF/native-image/reflect-config.json
+# 资源配置：META-INF/native-image/resource-config.json
+# 代理配置：META-INF/native-image/proxy-config.json
+```
+
+```text
+GraalVM Native Image 最佳实践：
+1. 减少反射使用（改用接口/泛型）
+2. 使用 GraalVM Reachability Metadata
+3. 预编译依赖库（-agentlib 等）
+4. 使用 GraalVM Dashboard 分析镜像大小
+5. 测试时注意 AOT 编译限制
+```
+
 ## 十七、与其他板块的关联
 
 - JVM 原理见「[Java 虚拟机](../基础知识/Java虚拟机.md)」；

@@ -773,9 +773,185 @@ spark.sql.catalog.prod.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
 spark.sql.catalog.prod.io-impl=org.apache.iceberg.aws.s3.S3FileIO
 ```
 
+## 数据湖文件格式深度对比
+
+### Parquet vs ORC vs Avro
+
+| 维度 | Parquet | ORC | Avro |
+|------|---------|-----|------|
+| 列式存储 | 是 | 是 | 否（行式） |
+| 压缩比 | 高 | 最高 | 中 |
+| 读取性能 | 高 | 高 | 中 |
+| Schema 演进 | 有限 | 有限 | 好 |
+| 生态支持 | 最广（Spark/Hive/Presto） | Hive 优先 | Kafka/Hadoop |
+| 适用 | OLAP/数据湖 | Hive 数仓 | 流式/CDC |
+
+### 数据湖 Compaction 策略
+
+```
+Compaction = 合并小文件 + 清理删除标记
+
+触发条件：
+  1. 小文件数量 > 100/分区
+  2. 文件大小 < 128MB
+  3. 删除标记占比 > 10%
+
+策略选择：
+  Snapshot Compaction：合并同一快照的文件
+  Incremental Compaction：只合并新增文件
+  Full Compaction：全量合并（最彻底）
+
+Spark 配置：
+  spark.sql.files.maxRecordsPerFile=1000000
+  spark.sql.shuffle.partitions=200
+  spark.sql.compaction.actor.enabled=true
+```
+
+### 数据湖治理 Checklist
+
+| 治理项 | 做法 | 频率 |
+|--------|------|------|
+| 存储成本 | 监控存储量/增长率 | 每周 |
+| 数据质量 | Schema 检查/空值率/一致性 | 每日 |
+| 生命周期 | 冷热分层/过期数据清理 | 每月 |
+| 权限管理 | RBAC/ABAC 权限审计 | 每月 |
+| 元数据 | 表/列/血缘信息维护 | 持续 |
+| 合规审计 | 数据访问日志/脱敏 | 每月 |
+| 版本管理 | Iceberg/Delta 快照保留策略 | 每周 |
+| Compaction | 小文件合并/孤儿文件清理 | 每日 |
+
+### HDFS 分层存储策略
+
+```
+存储分层 = 不同数据用不同存储介质
+
+热数据（最近 7 天）：
+  SSD 存储（高性能）
+  副本数 3
+  适用：实时查询/OLAP
+
+温数据（7 天 ~ 3 个月）：
+  普通磁盘（HDD）
+  副本数 3
+  适用：近线分析
+
+冷数据（3 个月 ~ 1 年）：
+  低频存储（Infrequent Access）
+  副本数 2 或 EC 编码
+  适用：归档/合规
+
+归档数据（1 年以上）：
+  归档存储（Glacier/OSS Archive）
+  EC 编码（最小冗余）
+  适用：合规保留/极少访问
+
+HDFS 策略配置：
+  存储策略：HOT/COLD/WARM/ALL_SSD/ONE_SSD/ Lazy_Persist
+  设置：hdfs storagepolicies -setStoragePolicy -path /data -policy COLD
+  迁移：hdfs mover -p /data
+```
+
+### HDFS NameNode 调优
+
+```
+NameNode 内存估算：
+  每个文件/目录/块 ≈ 150 字节（元数据）
+  1 亿文件 ≈ 15GB 内存
+  建议：NameNode 内存 = 文件数 × 150B × 1.5（预留）
+
+NameNode 调优参数：
+  dfs.namenode.handler.count=200（RPC 处理线程数）
+  dfs.namenode.service.handler.count=100（服务 RPC 线程数）
+  dfs.namenode.max伴随对象=200000（最大伴随对象数）
+  dfs.namenode.fs-limits.min-block-size=1048576（最小块大小）
+
+NameNode HA 配置：
+  dfs.ha.namenodes.myns=nn1,nn2
+  dfs.namenode.rpc-address.myns.nn1=host1:8020
+  dfs.namenode.rpc-address.myns.nn2=host2:8020
+  dfs.namenode.shared.edits.dir=qjournal://host1:8485;host2:8485;host3:8485/myns
+  
+JournalNode 部署：
+  至少 3 个（奇数个，多数派写入成功）
+  独立部署（不与 NameNode/DataNode 同机）
+```
+
+### 云对象存储作为 HDFS 替代
+
+```
+S3A / GCS / OSS vs HDFS 对比：
+
+  成本：
+    HDFS：自建硬件 + 运维（3 副本 = 3 倍存储成本）
+    对象存储：按使用量付费（无运维成本）
+
+  扩展性：
+    HDFS：需手动扩容（加 DataNode）
+    对象存储：自动无限扩展
+
+  性能：
+    HDFS：低延迟（本地磁盘）
+    对象存储：高吞吐（并行读取）
+
+  一致性：
+    HDFS：强一致
+    对象存储：最终一致（S3 严格一致）
+
+  适用：
+    HDFS：实时计算（Spark/Flink 本地读取）
+    对象存储：数据湖/归档/备份/跨区域
+
+迁移方案：
+  1. DistCp：hadoop distcp hdfs://path s3a://path
+  2. S3A Connector：Hadoop 原生支持 S3
+  3. Alluxio：统一命名空间（HDFS + S3）
+```
+
 ## 数据湖治理
 
 ### 治理维度
+
+### HDFS 运维速查
+
+| 检查项 | 命令 | 说明 |
+|--------|------|------|
+| 块报告 | `hdfs fsck / -files -blocks` | 查看块分布 |
+| 平衡器 | `hdfs balancer -threshold 10` | 块均衡 |
+| 安全模式 | `hdfs dfsadmin -safemode get` | 检查安全模式 |
+| 配额管理 | `hdfs dfs -setquota N /path` | 目录配额 |
+| 快照 | `hdfs dfsadmin -allowSnapshot /path` | 数据快照 |
+| KMS 加密 | `hdfs crypto -createZone -keyName key1 -path /zone` | 透明加密 |
+
+### HDFS 故障排查清单
+
+| 故障现象 | 可能原因 | 排查方法 |
+|----------|----------|----------|
+| 写入失败 | 节点满/副本不足 | `hdfs dfsadmin -report` |
+| 读取超时 | 网络/磁盘慢 | `iostat` + `ping` |
+| NameNode OOM | 小文件过多 | `hdfs dfs -count` 统计 |
+| DataNode 掉线 | 磁盘故障 | `dmesg` + `smartctl` |
+| 块丢失 | 磁盘损坏 | `hdfs fsck / -list-corruptfileblocks` |
+| 租约超时 | 客户端异常退出 | 检查客户端进程 |
+
+### 数据湖治理 Checklist
+
+| 治理项 | 做法 | 频率 |
+|--------|------|------|
+| 存储成本 | 监控存储量/增长率 | 每周 |
+| 数据质量 | Schema 检查/空值率/一致性 | 每日 |
+| 生命周期 | 冷热分层/过期数据清理 | 每月 |
+| 权限管理 | RBAC/ABAC 权限审计 | 每月 |
+| 元数据 | 表/列/血缘信息维护 | 持续 |
+| 合规审计 | 数据访问日志/脱敏 | 每月 |
+| 版本管理 | Iceberg/Delta 快照保留策略 | 每周 |
+| Compaction | 小文件合并/孤儿文件清理 | 每日 |
+
+## 与其他板块的关系
+
+- 对象存储见「[云对象存储](../../云原生/云对象存储.md)」；
+- 调度系统见「[10-资源调度：YARN与Kubernetes](10-资源调度：YARN与Kubernetes.md)」；
+- 数据湖格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
+- 流处理写入 HDFS 见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」。
 
 | 维度 | 说明 | 工具 |
 |------|------|------|

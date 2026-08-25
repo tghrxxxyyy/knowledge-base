@@ -952,6 +952,292 @@ RESP3（Redis 6+）支持更多类型（map、set、push 等），并在 RESP2 �
 
 - Pipeline 只减 RTT，不保证原子；需要原子用 `MULTI/EXEC`（或 Lua）。超大批量用 Pipeline 分批，防单次包过大阻塞。
 
+## 十四、Redis Cluster 迁移自动化
+
+### 14.1 槽迁移流程
+
+```
+Redis Cluster 扩容/缩容 = 槽（slot）重新分配
+
+扩容流程：
+  1. 添加新节点（redis-cli --cluster add-node）
+  2. 分配槽位（redis-cli --cluster reshard）
+  3. 迁移数据（逐 key MIGRATE）
+
+缩容流程：
+  1. 迁移槽到其他节点（reshard）
+  2. 删除空节点（redis-cli --cluster del-node）
+
+槽迁移状态：
+  MIGRATING：源节点，key 正在迁出
+  IMPORTING：目标节点，key 正在迁入
+  客户端处理：ASK 重定向（临时）/ MOVED 重定向（永久）
+```
+
+### 14.2 自动化迁移脚本
+
+```bash
+#!/bin/bash
+# 自动扩容脚本
+NEW_NODE=$1
+CLUSTER_NODE=$2
+
+# 添加新节点
+redis-cli --cluster add-node $NEW_NODE $CLUSTER_NODE
+
+# 获取新节点 ID
+NEW_NODE_ID=$(redis-cli -h ${NEW_NODE%:*} -p ${NEW_NODE#*:} cluster myid)
+
+# 分配 4096 个槽（从每个老节点均分）
+redis-cli --cluster reshard $CLUSTER_NODE \
+  --cluster-from all \
+  --cluster-to $NEW_NODE_ID \
+  --cluster-slots 4096 \
+  --cluster-yes
+
+# 验证
+redis-cli --cluster check $CLUSTER_NODE
+```
+
+### 14.3 迁移监控
+
+```bash
+# 监控迁移进度
+redis-cli -h node1 cluster slots | grep -c " migrating\| importing"
+
+# 监控迁移延迟
+redis-cli --cluster info node1:6379
+
+# 监控槽位分布
+redis-cli -h node1 cluster slots
+```
+
+## 十五、Redis Sentinel 故障转移深度
+
+### 15.1 Sentinel 故障检测
+
+```
+主观下线（SDOWN）：
+  单个 Sentinel 判断节点不可达
+  超时：down-after-milliseconds（默认 30s）
+
+客观下线（ODOWN）：
+  多个 Sentinel 达成共识（quorum 票数）
+  quorum = sentinels/2 + 1（如 3 个 Sentinel 需 2 票）
+
+故障转移流程：
+  1. Sentinel 发现主节点 SDOWN
+  2. 询问其他 Sentinel 是否 ODOWN
+  3. 达到 quorum → 标记 ODOWN
+  4. 选举 Leader Sentinel（Raft 协议）
+  5. Leader 选择新主（优先级 → offset → runID）
+  6. 通知从节点指向新主
+  7. 通知客户端新主地址
+```
+
+### 15.2 Sentinel 配置
+
+```
+# sentinel.conf
+sentinel monitor mymaster 127.0.0.1 6379 2
+sentinel down-after-milliseconds mymaster 30000
+sentinel failover-timeout mymaster 180000
+sentinel parallel-syncs mymaster 1
+
+# 多数据中心部署
+sentinel monitor dc1-master 10.0.0.1 6379 2
+sentinel monitor dc2-master 10.0.1.1 6379 2
+```
+
+### 15.3 Sentinel 选举原理
+
+```
+Leader 选举（Raft 变种）：
+  1. 每个 Sentinel 向其他 Sentinel 发送 is-master-down-by-addr
+  2. 每个 Sentinel 只投一票（先到先得）
+  3. 得票 >= quorum + 1 → 成为 Leader
+  4. Leader 执行故障转移
+
+选主优先级：
+  1. slave-priority 最小的从节点
+  2. 复制偏移量（offset）最大的从节点
+  3. runID 最小的从节点
+```
+
+## 十六、Redis 复制协议深度
+
+### 16.1 复制流程
+
+```
+全量复制（首次/断线过久）：
+  1. Slave 发送 PSYNC ? -1
+  2. Master 执行 BGSAVE 生成 RDB
+  3. Master 发送 RDB 给 Slave
+  4. Master 发送缓冲区的写命令
+  5. Slave 加载 RDB + 执行写命令
+
+增量复制（Redis 2.8+）：
+  1. Slave 发送 PSYNC replid offset
+  2. Master 检查 replid 是否一致
+  3. 一致 → 发送 offset 之后的写命令
+  4. 不一致 → 触发全量复制
+```
+
+### 16.2 复制积压缓冲区
+
+```
+repl_backlog_size = 1MB（默认，需调大）
+
+作用：
+  断线重连时，Slave 从缓冲区读取缺失的写命令
+  避免全量复制
+
+调优：
+  1MB → 256MB（大并发场景）
+  repl-backlog-size 256mb
+
+监控：
+  INFO replication → repl_backlog_active
+  repl_backlog_size
+  repl_backlog_first_byte_offset
+  repl_backlog_histlen
+```
+
+## 十七、Redis Module API
+
+### 17.1 Module 架构
+
+```
+Redis Module = Redis 扩展机制（Redis 4.0+）
+
+加载：redis-server --loadmodule /path/to/module.so
+
+常用 Module：
+  RediSearch：全文检索 + 二级索引 + 聚合
+  RedisJSON：原生 JSON 操作
+  RedisTimeSeries：时序数据
+  RedisGraph：图数据库
+  RedisBloom：布隆过滤器/Count-Min Sketch/Cuckoo Filter
+  RedisCell：限流（漏桶）
+  RedisRaft：Raft 共识（强一致）
+```
+
+### 17.2 Module 开发示例
+
+```c
+// Redis Module 最小示例
+#include "redismodule.h"
+
+int HelloCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    RedisModule_ReplyWithSimpleString(ctx, "Hello from Module!");
+    return REDISMODULE_OK;
+}
+
+int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (RedisModule_Init(ctx, "hello", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    RedisModule_CreateCommand(ctx, "hello.hello", HelloCommand, "", 0, 0, 0);
+    return REDISMODULE_OK;
+}
+```
+
+## 十八、Redis 实时分析
+
+### 18.1 实时统计模式
+
+```
+UV 统计：HyperLogLog（PFADD/PFCOUNT）
+  12KB 内存统计 2^64 个不同元素
+  误差 0.81%
+
+实时排行榜：Sorted Set（ZADD/ZREVRANGE）
+  ZADD rank 100 user:1
+  ZREVRANGE rank 0 9 WITHSCORES
+
+滑动窗口计数：Redis 时间序列或 Sorted Set
+  ZADD window:{key} {timestamp} {event_id}
+  ZREMRANGEBYSCORE window:{key} 0 {now - window}
+  ZCARD window:{key}
+```
+
+### 18.2 Redis 作为消息队列（Streams）
+
+```
+Redis Streams（5.0+）= 持久化消息队列
+
+写入：XADD mystream * field1 value1
+读取：XREAD COUNT 10 BLOCK 5000 STREAMS mystream 0
+消费组：XGROUP CREATE mystream mygroup 0
+确认：XACK mystream mygroup {message-id}
+
+优势：
+  消息持久化（AOF/RDB）
+  消费组（类似 Kafka consumer group）
+  消息回溯（按 ID 重读）
+  消费者负载均衡
+
+适用：
+  轻量级消息队列（替代 Kafka 的简单场景）
+  事件驱动架构
+  任务队列
+```
+
+## 十九、Redis 最佳实践 Checklist
+
+| 检查项 | 做法 | 说明 |
+|--------|------|------|
+| 内存规划 | maxmemory + 淘汰策略 | allkeys-lru 或 volatile-lru |
+| 持久化 | 混合持久化（RDB+AOF） | 4.0+ 支持 |
+| 高可用 | Sentinel 或 Cluster | 至少 3 主 3 从 |
+| 大 key | 定期扫描 + 拆分 | UNLINK 异步删除 |
+| 热 key | 本地缓存 + 读分摊 | 二级缓存 |
+| 连接池 | 客户端连接池 | maxTotal=20*CPU核数 |
+| 序列化 | Protobuf/Kryo | 比 JSON 小 3~5 倍 |
+| 监控 | INFO +慢日志+ key 统计 | 持续监控 |
+
+## 二十、Redis 容量规划
+
+```
+容量估算：
+  数据量 = key 数 × (key 大小 + value 大小 + 对象头)
+  对象头 ≈ 56 字节（redisObject）
+
+  内存 = 数据量 × (1 + 内存碎片系数 1.3~1.5)
+
+示例：
+  1000 万 key，平均 value 1KB
+  数据量 = 10M × (50 + 1024) ≈ 10GB
+  实际内存 = 10GB × 1.4 ≈ 14GB
+
+  建议：预留 30% 余量 → 20GB 内存
+
+  QPS 估算：
+    单节点 10 万+ QPS（GET/SET）
+    读多写少 → 从节点扩容
+    写多 → Cluster 分片
+```
+
+## 二十一、Redis 最佳实践 Checklist
+
+| 检查项 | 做法 | 说明 |
+|--------|------|------|
+| 内存规划 | maxmemory + 淘汰策略 | allkeys-lru 或 volatile-lru |
+| 持久化 | 混合持久化（RDB+AOF） | 4.0+ 支持 |
+| 高可用 | Sentinel 或 Cluster | 至少 3 主 3 从 |
+| 大 key | 定期扫描 + 拆分 | UNLINK 异步删除 |
+| 热 key | 本地缓存 + 读分摊 | 二级缓存 |
+| 连接池 | 客户端连接池 | maxTotal=20*CPU核数 |
+| 序列化 | Protobuf/Kryo | 比 JSON 小 3~5 倍 |
+| 监控 | INFO +慢日志+ key 统计 | 持续监控 |
+
+## 二十二、与其他板块的关系
+
+- MySQL 知识见「[基础知识/mysql知识](mysql知识.md)」；
+- PostgreSQL 深度见「[中间件/PostgreSQL深度篇](中间件/PostgreSQL深度篇.md)」；
+- 大数据链路见「[大数据/08-流处理计算：Flink](大数据/08-流处理计算：Flink.md)」。
+
+---
+
 ## 十五、bigkey/hotkey 治理与高阶实战（第三轮深度补充）
 
 ### 15.1 bigkey / hotkey 线上定位与治理全流程

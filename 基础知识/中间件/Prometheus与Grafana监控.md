@@ -720,4 +720,334 @@ amtool silence add alertname=InstanceDown instance=node1 --duration=2h --comment
 
 ---
 
+## 十三、Prometheus 高级主题
+
+### 13.1 存储容量估算
+
+```text
+Prometheus 存储容量估算公式：
+
+原始数据点 = series × samples_per_second × retention_seconds
+  - series：时间序列数量
+  - samples_per_second：每秒采样数（通常 1）
+  - retention_seconds：数据保留秒数
+
+示例：100,000 series × 1 sample/s × 30天 × 86400s ≈ 259,200,000,000 points
+
+压缩后存储 ≈ 原始数据点 × 1.2 bytes/point（压缩比约 1/5）
+
+生产建议：
+  100K series × 15天保留 ≈ 30-50GB 磁盘
+  1M series × 15天保留 ≈ 300-500GB 磁盘
+```
+
+```bash
+# 查看当前存储大小
+du -sh /prometheus/data
+
+# 查看时间序列数量
+curl -s http://localhost:9090/api/v1/label/__name__/values | wc -l
+
+# 使用 Prometheus 内置指标监控自身
+curl -s http://localhost:9090/api/v1/query?query=prometheus_tsdb_head_series
+curl -s http://localhost:9090/api/v1/query?query=prometheus_tsdb_storage_blocks_bytes
+```
+
+### 13.2 高可用方案（Thanos / Cortex）
+
+```text
+Prometheus 高可用架构对比：
+┌──────────────┬────────────────────────────────────────────────┐
+│ 方案          │ 特点                                           │
+├──────────────┼────────────────────────────────────────────────┤
+│ Thanos       │ 去中心化，对象存储，全局视图，长期存储            │
+│ Cortex       │ 微服务架构，对象存储，多租户，水平扩展           │
+│ Mimir        │ Grafana 出品，Cortex 改进版，高写入性能          │
+└──────────────┴────────────────────────────────────────────────┘
+```
+
+```yaml
+# Thanos Sidecar 配置（挂载到 Prometheus）
+apiVersion: v1
+kind: Pod
+metadata:
+  name: prometheus-thanos
+spec:
+  containers:
+  - name: prometheus
+    image: prom/prometheus:v2.45.0
+    args:
+    - --config.file=/etc/prometheus/prometheus.yml
+    - --storage.tsdb.path=/prometheus
+    - --storage.tsdb.retention.time=15d
+    volumeMounts:
+    - name: data
+      mountPath: /prometheus
+  - name: thanos-sidecar
+    image: thanosio/thanos:v0.32.0
+    args:
+    - sidecar
+    - --tsdb.path=/prometheus
+    - --prometheus.url=http://localhost:9090
+    - --objstore.config-file=/etc/thanos/bucket.yml
+    volumeMounts:
+    - name: data
+      mountPath: /prometheus
+      readOnly: true
+    - name: thanos-config
+      mountPath: /etc/thanos
+  volumes:
+  - name: data
+    emptyDir: {}
+  - name: thanos-config
+    configMap:
+      name: thanos-bucket-config
+```
+
+```yaml
+# Thanos Store Gateway（查询对象存储中的历史数据）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thanos-store-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: thanos-store-gateway
+  template:
+    spec:
+      containers:
+      - name: store
+        image: thanosio/thanos:v0.32.0
+        args:
+        - store
+        - --data-dir=/data
+        - --objstore.config-file=/etc/thanos/bucket.yml
+        - --index-cache-size=500MB
+```
+
+### 13.3 Grafana Dashboard JSON 模式
+
+```text
+Dashboard JSON 结构：
+{
+  "dashboard": {
+    "title": "My Dashboard",
+    "uid": "unique-id",
+    "tags": ["production", "k8s"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "type": "graph",
+        "title": "CPU Usage",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "rate(node_cpu_seconds_total{mode=\"idle\"}[5m])",
+            "legendFormat": "{{instance}}"
+          }
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "type": "query",
+          "query": "label_values(node_uname_info, nodename)"
+        }
+      ]
+    }
+  }
+}
+```
+
+```yaml
+# Grafana Provisioning（配置即代码）
+# provisioning/dashboards/dashboard.yml
+apiVersion: 1
+providers:
+- name: 'default'
+  orgId: 1
+  folder: 'Production'
+  type: file
+  disableDeletion: false
+  editable: true
+  options:
+    path: /var/lib/grafana/dashboards
+    foldersFromFilesStructure: true
+
+# provisioning/datasources/datasource.yml
+apiVersion: 1
+datasources:
+- name: Prometheus
+  type: prometheus
+  access: proxy
+  url: http://prometheus:9090
+  isDefault: true
+  jsonData:
+    timeInterval: '15s'
+```
+
+### 13.4 Alertmanager 路由详解
+
+```yaml
+# Alertmanager 完整路由配置
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager@example.com'
+  smtp_auth_password: 'password'
+
+# 告警模板
+templates:
+- '/etc/alertmanager/templates/*.tmpl'
+
+# 路由树
+route:
+  receiver: 'default-receiver'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s          # 首次等待分组
+  group_interval: 5m       # 分组间隔
+  repeat_interval: 4h      # 重复通知间隔
+  routes:
+  # 高优先级：立即通知
+  - match:
+      severity: critical
+    receiver: 'critical-receiver'
+    group_wait: 10s
+    repeat_interval: 1h
+  # 中优先级：工作时间通知
+  - match:
+      severity: warning
+    receiver: 'warning-receiver'
+    active_time_intervals:
+    - workhours
+  # 低优先级：仅邮件
+  - match:
+      severity: info
+    receiver: 'info-receiver'
+  # 默认路由
+  - receiver: 'default-receiver'
+
+# 接收器配置
+receivers:
+- name: 'critical-receiver'
+  email_configs:
+  - to: 'oncall@example.com'
+  pagerduty_configs:
+  - service_key: '<pagerduty-key>'
+  slack_configs:
+  - api_url: 'https://hooks.slack.com/services/xxx'
+    channel: '#alerts-critical'
+
+- name: 'warning-receiver'
+  email_configs:
+  - to: 'team@example.com'
+
+# 分组规则
+inhibit_rules:
+# Critical 告警抑制同服务的 Warning 告警
+- source_match:
+    severity: 'critical'
+  target_match:
+    severity: 'warning'
+  equal: ['alertname', 'cluster', 'service']
+
+# 集群宕机抑制单实例告警
+- source_match:
+    alertname: 'ClusterDown'
+  target_match_re:
+    alertname: 'InstanceDown|HighCPU'
+  equal: ['cluster']
+
+# 静默规则
+# amtool silence add alertname=HighCPU instance=node1 --duration=2h --comment="维护中"
+```
+
+### 13.5 指标类型深入对比
+
+```text
+Counter vs Gauge vs Histogram vs Summary：
+┌──────────────┬──────────────┬──────────────┬───────────────────┐
+│ 类型          │ 特点          │ 典型用例      │ 聚合方式           │
+├──────────────┼──────────────┼──────────────┼───────────────────┤
+│ Counter      │ 只增不减      │ 请求总数      │ rate()            │
+│ Gauge        │ 可增可减      │ 当前连接数    │ 直接读取           │
+│ Histogram    │ 客户端分桶    │ 请求延迟      │ histogram_quantile│
+│ Summary      │ 服务端分位    │ 请求延迟      │ 直接读取           │
+└──────────────┴──────────────┴──────────────┴───────────────────┘
+
+Histogram vs Summary：
+- Histogram：服务端可聚合（跨实例），桶边界固定，丢精度
+- Summary：客户端计算分位数，精确，跨实例无法聚合
+- 推荐：优先使用 Histogram（更灵活）
+```
+
+```promql
+# Counter 示例：QPS 计算
+rate(http_requests_total[5m])
+
+# Gauge 示例：当前连接数
+active_connections
+
+# Histogram 示例：P99 延迟
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# Summary 示例：P99 延迟（直接读取）
+http_request_duration_seconds{quantile="0.99"}
+
+# Histogram 桶边界设置
+# 在应用中配置：
+# duration_seconds_bucket: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+```
+
+### 13.6 Grafana Provisioning 自动化
+
+```text
+Grafana Provisioning 目录结构：
+/etc/grafana/provisioning/
+├── dashboards/
+│   ├── dashboard.yml      # Dashboard 提供者配置
+│   └── dashboards/        # JSON 文件目录
+│       ├── node-exporter.json
+│       └── kubernetes.json
+├── datasources/
+│   └── datasource.yml     # 数据源配置
+├── notifiers/
+│   └── notifier.yml       # 通知渠道配置
+└── plugins/
+    └── plugin.yml         # 插件配置
+```
+
+```yaml
+# 插件自动安装
+# provisioning/plugins/plugin.yml
+apiVersion: 1
+apps:
+- type: grafana-piechart-panel
+  org_id: 1
+  disabled: false
+- type: grafana-clock-panel
+  org_id: 1
+  disabled: false
+```
+
+```bash
+# Docker Compose 部署带 Provisioning 的 Grafana
+version: '3.8'
+services:
+  grafana:
+    image: grafana/grafana:10.0.0
+    environment:
+    - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+    - ./provisioning:/etc/grafana/provisioning
+    - ./dashboards:/var/lib/grafana/dashboards
+    ports:
+    - "3000:3000"
+```
+
 > 一句话：**Prometheus + Grafana = Pull + 多维时序 + PromQL + 服务发现 + Alertmanager（分组/抑制/路由）；选型先看「环境（K8s/传统/云）」，再定「规模（本地 TSDB/Thanos 长期存储）」，最后配「Exporter 生态」**。

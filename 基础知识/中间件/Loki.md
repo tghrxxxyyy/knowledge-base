@@ -829,7 +829,334 @@ CPU 估算：
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、Loki 高级特性与生产实践
+
+### 11.1 Chunk Format（块格式）
+
+```text
+Loki 存储结构：
+┌─────────────────────────────────────────────────────────────────┐
+│                        对象存储                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                      Chunks                               │   │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐        │   │
+│  │  │ Chunk 1 │ │ Chunk 2 │ │ Chunk 3 │ │ Chunk N │        │   │
+│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                     Index (TSDB)                         │   │
+│  │  Stream → Chunk 映射（标签 → 时间范围 → Chunk ID）        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+
+Chunk 格式：
+┌─────────────────────────────────────────────────────────────────┐
+│  Magic Number (4B) │ Version (2B) │ Encoding (2B) │ Length (4B) │
+├─────────────────────────────────────────────────────────────────┤
+│  Block 1 (compressed) │ Block 2 │ ... │ Block N                 │
+└─────────────────────────────────────────────────────────────────┘
+
+编码方式：
+- None：原始文本
+- Snappy：LZ4 + Snappy（默认）
+- Gzip：高压缩比
+- Zstd：快速压缩（推荐）
+```
+
+```go
+// Loki Chunk 结构（简化）
+type Chunk struct {
+    MagicNumber uint32    // 0x4C4F4B49 ("LOKI")
+    Version     uint16    // Chunk 版本
+    Encoding    Encoding  // 编码方式
+    Length      uint32    // 数据长度
+    Blocks      []Block   // 压缩块
+}
+
+type Block struct {
+    From       time.Time  // 起始时间
+    To         time.Time  // 结束时间
+    Entries    []Entry    // 日志条目
+}
+
+type Entry struct {
+    Line       string     // 日志内容
+    Timestamp  time.Time  // 时间戳
+    StructuredMetadata []LabelPair  // 结构化元数据
+}
+```
+
+### 11.2 查询优化
+
+```logql
+# 优化1：使用标签选择器减少扫描范围
+# 差：全量扫描
+{job="nginx"}
+
+# 好：精确匹配
+{job="nginx", env="production", region="us-west-2"}
+
+# 优化2：使用 pipeline 操作符
+# 差：全量过滤
+{job="nginx"} |= "error"
+
+# 好：先解析再过滤
+{job="nginx"} | json | status >= 500
+
+# 优化3：使用 line_format 只输出必要信息
+{job="nginx"} | json | line_format "{{.timestamp}} {{.level}} {{.message}}"
+
+# 优化4：使用 json_format 结构化输出
+{job="nginx"} | json | json_format
+
+# 优化5：使用 unwrap 提取数值进行聚合
+{job="nginx"} | json | unwrap duration | rate()
+
+# 优化6：避免使用正则表达式（性能差）
+# 差：正则匹配
+{job="nginx"} |~ "error.*timeout"
+
+# 好：字符串匹配
+{job="nginx"} | logfmt | level="error" | message |= "timeout"
+```
+
+```logql
+# 高性能查询模板
+# 1. 使用 label_replace 优化标签
+{job="nginx"}
+| label_replace("service", "(.*)", "job", "$1", ".*")
+| json
+| level == "error"
+| line_format "{{.timestamp}} [{{.service}}] {{.message}}"
+
+# 2. 使用 topk 找出最慢的请求
+topk(10,
+  sum by (path) (
+    rate({job="nginx"} | json | unwrap duration [5m])
+  )
+)
+
+# 3. 使用 count_over_time 统计错误率
+sum(count_over_time({job="nginx"} | json | level="error" [5m]))
+/
+sum(count_over_time({job="nginx"} [5m]))
+```
+
+### 11.3 Recording Rules（录制规则）
+
+```yaml
+# Loki Ruler 配置
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  alertmanager_url: http://alertmanager:9093
+  ring:
+    kvstore:
+      store: inmemory
+  enable_api: true
+
+# 录写规则定义
+groups:
+  - name: nginx_metrics
+    interval: 1m
+    rules:
+      # 计算每秒请求速率
+      - record: nginx:requests:rate1m
+        expr: |
+          sum(rate({job="nginx"}[1m])) by (status)
+
+      # 计算错误率
+      - record: nginx:error_rate:ratio
+        expr: |
+          sum(rate({job="nginx"} | json | level="error" [5m]))
+          /
+          sum(rate({job="nginx"} [5m]))
+
+      # 计算 P99 延迟
+      - record: nginx:latency:p99
+        expr: |
+          quantile_over_time(0.99, {job="nginx"} | json | unwrap duration [5m])
+
+  - name: application_metrics
+    interval: 5m
+    rules:
+      # 业务指标
+      - record: app:orders:total
+        expr: |
+          sum(count_over_time({job="order-service"} | json | event="order_created" [5m]))
+
+      - record: app:revenue:total
+        expr: |
+          sum(sum_over_time({job="order-service"} | json | unwrap amount [5m]))
+```
+
+### 11.4 Loki + Grafana Dashboard 模式
+
+```json
+// Grafana Dashboard JSON 模板
+{
+  "panels": [
+    {
+      "title": "请求速率",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate({job=\"nginx\"}[5m])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "title": "错误日志",
+      "type": "logs",
+      "targets": [
+        {
+          "expr": "{job=\"nginx\"} | json | level=\"error\"",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Top 10 慢路径",
+      "type": "table",
+      "targets": [
+        {
+          "expr": "topk(10, sum by (path) (rate({job=\"nginx\"} | json | unwrap duration [5m])))",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 11.5 基于日志的告警
+
+```yaml
+# Loki Alertmanager 告警规则
+groups:
+  - name: log_alerts
+    rules:
+      # 错误率告警
+      - alert: HighErrorRate
+        expr: |
+          sum(rate({job="nginx"} | json | level="error" [5m]))
+          /
+          sum(rate({job="nginx"} [5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "错误率超过 5%"
+
+      # OOM 告警
+      - alert: OOMDetected
+        expr: |
+          count_over_time({job=~".*"} |~ "OutOfMemoryError" [5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "检测到 OOM 错误"
+
+      # 安全告警
+      - alert: BruteForceAttack
+        expr: |
+          sum(count_over_time({job="nginx"} | json | status=401 [10m])) by (remote_addr) > 100
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "疑似暴力破解攻击"
+```
+
+### 11.6 多租户
+
+```text
+Loki 多租户方案：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 隔离级别              │ 实现方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 租户隔离              │ X-Scope-OrgID Header                      │
+│ 存储隔离              │ 独立的存储前缀                             │
+│ 限流隔离              │ 租户级别速率限制                           │
+│ 查询隔离              │ 租户级别查询超时和并发                     │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```yaml
+# 多租户配置
+auth_enabled: true
+
+limits_config:
+  max_entries_limit_per_query: 5000
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  per_stream_rate_limit: 5MB
+  per_stream_rate_limit_burst: 15MB
+
+# 租户限流
+limits_per_tenant:
+  tenant-1:
+    ingestion_rate_mb: 8
+    max_entries_limit_per_query: 1000
+  tenant-2:
+    ingestion_rate_mb: 32
+    max_entries_limit_per_query: 10000
+```
+
+### 11.7 微服务可观测性
+
+```yaml
+# 微服务日志 + 指标 + 链路关联
+# Promtail 配置
+scrape_configs:
+- job_name: microservices
+  kubernetes_sd_configs:
+  - role: pod
+  relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_label_app]
+    target_label: service
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  pipeline_stages:
+  - json:
+      expressions:
+        trace_id: trace_id
+        span_id: span_id
+        level: level
+  - labels:
+      level:
+      trace_id:
+      span_id:
+  - timestamp:
+      source: timestamp
+      format: RFC3339Nano
+```
+
+### 11.8 Loki vs CloudWatch Logs
+
+```text
+Loki vs CloudWatch Logs：
+┌──────────────────────┬────────────────────────────────────────────┐
+│                      │ Loki                  │ CloudWatch Logs    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 成本                  │ 低（对象存储）         │ 高（按量计费）     │
+│ 查询语言              │ LogQL                 │ CloudWatch Insights│
+│ 索引                  │ 标签索引              │ 全文索引           │
+│ 压缩                  │ 高（Gzip/Zstd）       │ 低                 │
+│ 保留策略              │ 自定义                │ 有限制             │
+│ 集成                  │ Grafana               │ AWS 生态           │
+│ 多租户                │ 原生支持              │ 需要额外配置       │
+│ 自托管                │ 支持                  │ 不支持             │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+## 十二、与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；
 - 采集传输见「[日志采集与传输](./日志采集与传输.md)」；

@@ -782,7 +782,425 @@ gRPC 性能优化：
 
 ---
 
-## 十一、与其他板块的关系（扩展）
+## 十一、gRPC 高级特性与生产实践
+
+### 11.1 Server Streaming 模式
+
+```protobuf
+// Proto 定义
+service MarketDataService {
+  rpc SubscribePrices (PriceRequest) returns (stream PriceUpdate);
+  rpc GetHistoricalData (HistoryRequest) returns (stream HistoricalRecord);
+}
+
+message PriceRequest {
+  repeated string symbols = 1;
+}
+
+message PriceUpdate {
+  string symbol = 1;
+  double price = 2;
+  int64 timestamp = 3;
+}
+```
+
+```java
+// 服务端实现
+@Override
+public void subscribePrices(PriceRequest request, StreamObserver<PriceUpdate> responseObserver) {
+    // 后台线程推送价格更新
+    ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
+    executor.scheduleAtFixedRate(() -> {
+        for (String symbol : request.getSymbolsList()) {
+            PriceUpdate update = PriceUpdate.newBuilder()
+                .setSymbol(symbol)
+                .setPrice(getCurrentPrice(symbol))
+                .setTimestamp(System.currentTimeMillis())
+                .build();
+            responseObserver.onNext(update);
+        }
+    }, 0, 1, TimeUnit.SECONDS);
+
+    // 客户端取消时清理资源
+    responseObserver.setOnCancelHandler(() -> {
+        executor.shutdownNow();
+    });
+}
+
+// 客户端调用
+stub.subscribePrices(request, new StreamObserver<PriceUpdate>() {
+    @Override
+    public void onNext(PriceUpdate update) {
+        System.out.println(update.getSymbol() + ": " + update.getPrice());
+    }
+
+    @Override
+    public void onError(Throwable t) {
+        System.err.println("Error: " + t.getMessage());
+    }
+
+    @Override
+    public void onCompleted() {
+        System.out.println("Stream completed");
+    }
+});
+```
+
+### 11.2 客户端负载均衡
+
+```java
+// Round-Robin 负载均衡
+ManagedChannel channel = ManagedChannelBuilder.forAddress("dns:///my-service", 8080)
+    .defaultLoadBalancingPolicy("round_robin")
+    .usePlaintext()
+    .build();
+
+// Pick-First 负载均衡（默认）
+ManagedChannel channel = ManagedChannelBuilder.forAddress("dns:///my-service", 8080)
+    .defaultLoadBalancingPolicy("pick_first")
+    .usePlaintext()
+    .build();
+
+// 自定义负载均衡
+public class CustomLoadBalancer extends LoadBalancer {
+    private final List<Subchannel> subchannels = new CopyOnWriteArrayList<>();
+
+    @Override
+    protected void handleResolvedAddresses(ResolvedAddresses resolvedAddresses) {
+        subchannels.clear();
+        for (Object address : resolvedAddresses.getAddresses()) {
+            Subchannel subchannel = createSubchannel(SubchannelArgs.newBuilder()
+                .setAddresses((EquivalentAddressGroup) address)
+                .build());
+            subchannels.add(subchannel);
+            subchannel.start();
+        }
+    }
+
+    @Override
+    protected void handleNameResolutionError(Status error) {
+        // 处理名称解析错误
+    }
+
+    @Override
+    public void requestConnection() {
+        // 主动建立连接
+    }
+
+    private int index = 0;
+    @Override
+    public Subchannel pick(PickSubchannelArgs args) {
+        // Round-Robin 选择
+        Subchannel subchannel = subchannels.get(index % subchannels.size());
+        index++;
+        return subchannel;
+    }
+}
+```
+
+### 11.3 Deadline 传播
+
+```java
+// 设置 Deadline
+UserProto.User request = UserProto.User.newBuilder()
+    .setId(123)
+    .build();
+
+// 3 秒超时
+UserProto.User response = userStub.getUser(request,
+    CallOptions.DEFAULT.withDeadlineAfter(3, TimeUnit.SECONDS));
+
+// Deadline 传播到下游服务
+@Override
+public void getUser(UserRequest request, StreamObserver<User> responseObserver) {
+    // 获取当前 Deadline
+    Deadline currentDeadline = Context.current().getDeadline();
+    if (currentDeadline != null) {
+        // 计算剩余时间
+        long remainingMs = currentDeadline.timeRemaining(TimeUnit.MILLISECONDS);
+        // 传递给下游服务
+        OrderProto.OrderResponse orderResponse = orderStub.getOrder(
+            OrderRequest.newBuilder().setUserId(request.getId()).build(),
+            CallOptions.DEFAULT.withDeadlineAfter(remainingMs, TimeUnit.MILLISECONDS));
+    }
+}
+```
+
+### 11.4 状态码最佳实践
+
+```text
+gRPC 状态码使用场景：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 状态码                │ 使用场景                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ OK                   │ 成功                                        │
+│ CANCEL               │ 客户端取消                                  │
+│ UNKNOWN              │ 未知错误（未处理的异常）                    │
+│ INVALID_ARGUMENT     │ 参数校验失败                                │
+│ DEADLINE_EXCEEDED    │ 超时                                        │
+│ NOT_FOUND            │ 资源不存在                                  │
+│ ALREADY_EXISTS       │ 资源已存在                                  │
+│ PERMISSION_DENIED    │ 权限不足                                    │
+│ RESOURCE_EXHAUSTED   │ 资源耗尽（限流）                            │
+│ FAILED_PRECONDITION  │ 前置条件不满足                              │
+│ ABORTED              │ 操作被中止（事务冲突）                      │
+│ OUT_OF_RANGE         │ 参数超出范围                                │
+│ UNIMPLEMENTED        │ 未实现                                      │
+│ INTERNAL             │ 内部错误                                    │
+│ UNAVAILABLE          │ 服务不可用                                  │
+│ DATA_LOSS            │ 数据丢失                                    │
+│ UNAUTHENTICATED      │ 未认证                                      │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 状态码抛出示例
+public void getUser(UserRequest request, StreamObserver<User> responseObserver) {
+    if (request.getId() <= 0) {
+        responseObserver.onError(Status.INVALID_ARGUMENT
+            .withDescription("ID must be positive")
+            .asRuntimeException());
+        return;
+    }
+
+    User user = userRepository.findById(request.getId());
+    if (user == null) {
+        responseObserver.onError(Status.NOT_FOUND
+            .withDescription("User not found: " + request.getId())
+            .augmentDescription("Please check the user ID")
+            .asRuntimeException());
+        return;
+    }
+
+    responseObserver.onNext(user);
+    responseObserver.onCompleted();
+}
+```
+
+### 11.5 重试策略
+
+```java
+// 客户端重试配置
+ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8080)
+    .defaultServiceConfig(ServiceConfig.newBuilder()
+        .loadBalancingPolicyConfig(RoundRobinConfig.getInstance())
+        .setMethodConfig(MethodConfig.newBuilder()
+            .addMethods(MethodConfig.newBuilder()
+                .setName(MethodDescriptor.newBuilder()
+                    .setService("my.service.UserService")
+                    .setMethod("GetUser")
+                    .build())
+                .build())
+            .setRetryPolicy(RetryPolicy.newBuilder()
+                .setMaxAttempts(3)
+                .setInitialBackoff("0.1s")
+                .setMaxBackoff("5s")
+                .setBackoffMultiplier(2)
+                .setRetryableStatusCodes("UNAVAILABLE", "DEADLINE_EXCEEDED")
+                .build())
+            .build())
+        .build())
+    .usePlaintext()
+    .build();
+
+// 配置文件方式（推荐）
+// grpc-retry-policy.json
+{
+  "methodConfig": [{
+    "name": [{"service": "my.service.UserService"}],
+    "retryPolicy": {
+      "maxAttempts": 3,
+      "initialBackoff": "0.1s",
+      "maxBackoff": "5s",
+      "backoffMultiplier": 2,
+      "retryableStatusCodes": ["UNAVAILABLE"]
+    }
+  }]
+}
+```
+
+### 11.6 Health Checking Protocol
+
+```protobuf
+// gRPC Health Checking 定义
+service Health {
+  rpc Check (HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch (HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}
+```
+
+```java
+// 服务端健康检查实现
+public class HealthServiceImpl extends HealthGrpc.HealthImplBase {
+    private final Map<String, ServingStatus> serviceStatus = new ConcurrentHashMap<>();
+
+    @Override
+    public void check(HealthCheckRequest request, StreamObserver<HealthCheckResponse> responseObserver) {
+        ServingStatus status = serviceStatus.getOrDefault(request.getService(), ServingStatus.UNKNOWN);
+        responseObserver.onNext(HealthCheckResponse.newBuilder()
+            .setStatus(status)
+            .build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void watch(HealthCheckRequest request, StreamObserver<HealthCheckResponse> responseObserver) {
+        // 初始状态
+        ServingStatus status = serviceStatus.getOrDefault(request.getService(), ServingStatus.UNKNOWN);
+        responseObserver.onNext(HealthCheckResponse.newBuilder()
+            .setStatus(status)
+            .build());
+
+        // 监听状态变化
+        serviceStatus.addListener(() -> {
+            ServingStatus newStatus = serviceStatus.get(request.getService());
+            responseObserver.onNext(HealthCheckResponse.newBuilder()
+                .setStatus(newStatus)
+                .build());
+        });
+    }
+
+    public void setStatus(String service, ServingStatus status) {
+        serviceStatus.put(service, status);
+    }
+}
+```
+
+### 11.7 微服务拦截器（认证/日志）
+
+```java
+// 服务端认证拦截器
+public class AuthServerInterceptor implements ServerInterceptor {
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+
+        // 提取 Token
+        String token = headers.get(AUTHORIZATION_KEY);
+        if (token == null || !token.startsWith("Bearer ")) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Missing token"), headers);
+            return new ServerCall.Listener<>() {};
+        }
+
+        // 验证 Token
+        try {
+            Claims claims = JwtUtil.validateToken(token.substring(7));
+            Context context = Context.current()
+                .withValue(USER_ID_KEY, claims.getSubject())
+                .withValue(ROLES_KEY, claims.get("roles"));
+            return Contexts.interceptCall(context, call, headers, next);
+        } catch (Exception e) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Invalid token"), headers);
+            return new ServerCall.Listener<>() {};
+        }
+    }
+}
+
+// 日志拦截器
+public class LoggingServerInterceptor implements ServerInterceptor {
+    private static final Logger logger = LoggerFactory.getLogger(LoggingServerInterceptor.class);
+
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+
+        long start = System.currentTimeMillis();
+        String method = call.getMethodDescriptor().getFullMethodName();
+
+        logger.info("gRPC call started: {}", method);
+
+        return new ServerCall.Listener<>() {
+            @Override
+            public void onMessage(ReqT message) {
+                logger.info("gRPC message received: {}", message);
+            }
+
+            @Override
+            public void onHalfClose() {
+                try {
+                    next.startCall(call, headers);
+                } finally {
+                    long duration = System.currentTimeMillis() - start;
+                    logger.info("gRPC call completed: {} in {}ms", method, duration);
+                }
+            }
+        };
+    }
+}
+```
+
+### 11.8 性能调优
+
+```text
+gRPC 性能调优清单：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 调优项                │ 配置方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 连接复用              │ 使用 ManagedChannel 长连接                  │
+│ 流式传输              │ 大数据用 Server/Client Streaming            │
+│ 压缩                  │ 使用 gzip/snappy                           │
+│ 消息大小              │ 合理设置 MaxSendMsgSize/MaxRecvMsgSize     │
+│ Keepalive             │ 设置 Ping 间隔防连接失效                    │
+│ 拦截器异步            │ 鉴权/日志拦截器异步执行                     │
+│ 线程池                │ 使用异步 Stub + 业务线程池                  │
+│ HTTP/2                │ 启用 HTTP/2 多路复用                       │
+│ Protobuf 优化          │ 使用 proto3 + optional 字段               │
+│ 流控                  │ 设置窗口大小                               │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 性能调优配置
+ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8080)
+    .maxInboundMessageSize(1024 * 1024 * 10)  // 10MB
+    .maxInboundMetadataSize(1024 * 1024)       // 1MB
+    .enableRetry()
+    .keepAliveTime(30, TimeUnit.SECONDS)
+    .keepAliveTimeout(5, TimeUnit.SECONDS)
+    .usePlaintext()
+    .build();
+
+// 启用压缩
+stub.withCompression("gzip").getUser(request);
+
+// 异步 Stub
+AsyncUserStub asyncStub = UserGrpc.newAsyncStub(channel);
+asyncStub.getUser(request, new StreamObserver<User>() {
+    @Override
+    public void onNext(User user) {
+        // 异步处理
+    }
+
+    @Override
+    public void onError(Throwable t) {
+        // 错误处理
+    }
+
+    @Override
+    public void onCompleted() {
+        // 完成处理
+    }
+});
+```
+
+## 十二、与其他板块的关系（扩展）
 
 - Dubbo 对比见「[Apache Dubbo RPC 框架](./ApacheDubboRPC框架.md)」；
 - Envoy（gRPC 原生代理/网关转换）见「[Envoy 服务代理](./Envoy服务代理.md)」；

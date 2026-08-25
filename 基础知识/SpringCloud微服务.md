@@ -734,7 +734,411 @@ public class OrderProducer {
 
 ---
 
-## 十六、与其他板块的关系
+## 十六、Spring Cloud 高级主题与生产实践
+
+### 16.1 Spring Cloud LoadBalancer vs Ribbon
+
+```text
+Spring Cloud LoadBalancer vs Netflix Ribbon：
+┌──────────────────────┬────────────────────────────────────────────┐
+│                      │ LoadBalancer            │ Ribbon             │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 状态                  │ 活跃（Spring 官方）     │ 维护模式            │
+│ 性能                  │ 非阻塞（基于 Reactor）  │ 阻塞（每个请求线程）│
+│ 缓存                  │ 默认开启（30s 刷新）    │ 默认开启            │
+│ 负载均衡算法           │ RoundRobin/Random      │ 多种内置           │
+│ 自定义                │ ReactorLoadBalancer    │ IRule/IPing        │
+│ 与 Spring Boot        │ 3.x 默认               │ 2.x 默认           │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 自定义 LoadBalancer 配置
+@Configuration
+public class LoadBalancerConfig {
+
+    @Bean
+    public ReactorLoadBalancer<ServiceInstance> randomLoadBalancer(
+            Environment environment,
+            LoadBalancerClientFactory clientFactory) {
+        String name = environment.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
+        return new RandomLoadBalancer(
+            clientFactory.getLazyProvider(name, ServiceInstanceListSupplier.class),
+            name);
+    }
+}
+
+// 使用自定义负载均衡
+@LoadBalancerClient(name = "user-service", configuration = LoadBalancerConfig.class)
+public interface UserServiceClient {
+    @GetMapping("/users/{id}")
+    User getUser(@PathVariable Long id);
+}
+```
+
+### 16.2 Circuit Breaker 模式
+
+```text
+Spring Cloud Circuit Breaker 选项：
+┌──────────────────────┬────────────────────────────────────────────┐
+│                      │ Resilience4j           │ Hystrix（已废弃）  │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 隔离策略              │ 信号量（默认）          │ 线程池/信号量      │
+│ 熔断器状态            │ CLOSED/OPEN/HALF_OPEN  │ 同                 │
+│ 滑动窗口              │ 基于计数/时间           │ 基于时间           │
+│ 降级逻辑              │ fallbackMethod         │ fallback method   │
+│ 限流                  │ 内置 RateLimiter       │ 不支持             │
+│ 重试                  │ 内置 Retry             │ 不支持             │
+│ 超时控制              │ CircuitBreakerTimeout  │ 线程池超时         │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// Resilience4j 熔断器配置
+@Service
+public class UserService {
+
+    @CircuitBreaker(name = "userService", fallbackMethod = "getUserFallback")
+    @Retry(name = "userService")
+    @TimeLimiter(name = "userService")
+    public CompletableFuture<User> getUser(Long id) {
+        return CompletableFuture.supplyAsync(() -> {
+            // 调用远程服务
+            return restTemplate.getForObject("http://user-service/users/" + id, User.class);
+        });
+    }
+
+    public CompletableFuture<User> getUserFallback(Long id, Throwable t) {
+        // 降级逻辑
+        return CompletableFuture.completedFuture(new User(id, "默认用户"));
+    }
+}
+```
+
+```yaml
+# Resilience4j 配置
+resilience4j:
+  circuitbreaker:
+    instances:
+      userService:
+        slidingWindowSize: 100
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 10
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+  retry:
+    instances:
+      userService:
+        maxAttempts: 3
+        waitDuration: 500ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+  timelimiter:
+    instances:
+      userService:
+        timeoutDuration: 3s
+        cancelRunningFuture: true
+```
+
+### 16.3 Spring Cloud Task（短时任务）
+
+```java
+// Spring Cloud Task 示例
+@SpringBootApplication
+public class BatchJobApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(BatchJobApplication.class, args);
+    }
+
+    @Bean
+    public TaskExecutionListener taskExecutionListener() {
+        return new TaskExecutionListener() {
+            @Override
+            public void onTaskStartup(TaskExecution taskExecution) {
+                System.out.println("Task Started: " + taskExecution.getTaskName());
+            }
+
+            @Override
+            public void onTaskEnd(TaskExecution taskExecution) {
+                System.out.println("Task Ended: " + taskExecution.getTaskName() 
+                    + " Status: " + taskExecution.getExitCode());
+            }
+        };
+    }
+
+    @Bean
+    public CommandLineRunner runner(TaskRepository taskRepository) {
+        return args -> {
+            // 执行任务逻辑
+            System.out.println("Executing batch job...");
+            // 任务完成后会自动记录到数据库
+        };
+    }
+}
+```
+
+```yaml
+# application.yml
+spring:
+  task:
+    initialize-schema: always  # 自动创建任务记录表
+  datasource:
+    url: jdbc:mysql://localhost:3306/task_db
+    username: root
+    password: password
+```
+
+### 16.4 Spring Cloud Config（Git 后端）
+
+```yaml
+# Config Server 配置
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/example/config-repo
+          default-label: main
+          search-paths: '{application}'
+          clone-on-start: true
+          force-pull: true
+        encrypt:
+          enabled: true  # 启用加密
+```
+
+```java
+// Config Client 使用
+@RefreshScope  // 支持动态刷新
+@RestController
+public class ConfigController {
+
+    @Value("${app.feature.enabled:false}")
+    private boolean featureEnabled;
+
+    @GetMapping("/feature")
+    public Map<String, Object> getFeature() {
+        return Map.of(
+            "featureEnabled", featureEnabled,
+            "timestamp", System.currentTimeMillis()
+        );
+    }
+}
+
+// 手动触发刷新
+@PostConstruct
+public void init() {
+    // 监听配置变更事件
+    ContextRefresher refresher = new ContextRefresher(applicationContext, ConfigurationProperties.class);
+}
+```
+
+### 16.5 Spring Cloud Stream Binder 深入
+
+```java
+// Spring Cloud Stream 绑定器配置
+@EnableBinding(Source.class, Sink.class)
+public class StreamConfig {
+
+    // 自定义 Binder
+    @Bean
+    public MessageConverter customMessageConverter() {
+        return new JsonMessageConverter();
+    }
+}
+
+// 消息生产者
+@Service
+@RequiredArgsConstructor
+public class OrderEventPublisher {
+    private final Source source;
+
+    public void publishOrderCreated(Order order) {
+        source.output().send(MessageBuilder
+            .withPayload(order)
+            .setHeader("eventType", "ORDER_CREATED")
+            .setHeader("timestamp", System.currentTimeMillis())
+            .build());
+    }
+}
+
+// 消息消费者
+@Service
+@StreamListener(Sink.INPUT)
+public class OrderEventHandler {
+
+    @SendTo(Source.OUTPUT)  // 消息转换
+    public Order handleOrderCreated(Order order) {
+        // 处理订单
+        order.setStatus("PROCESSED");
+        return order;
+    }
+
+    @StreamListener(
+        target = Sink.INPUT,
+        condition = "headers['eventType']=='ORDER_CANCELLED'"
+    )
+    public void handleOrderCancelled(Order order) {
+        // 处理取消订单
+    }
+}
+```
+
+```yaml
+# Stream 配置
+spring:
+  cloud:
+    stream:
+      bindings:
+        input:
+          destination: order-events
+          group: order-service
+          content-type: application/json
+        output:
+          destination: order-events
+          content-type: application/json
+      rabbit:
+        binder:
+          admin-addresses: localhost:5672
+      kafka:
+        binder:
+          brokers: localhost:9092
+          auto-create-topics: true
+```
+
+### 16.6 Spring Cloud Function
+
+```java
+// Spring Cloud Function 函数定义
+@Configuration
+public class FunctionConfig {
+
+    // 消费函数
+    @Bean
+    public Consumer<String> logMessage() {
+        return message -> {
+            System.out.println("Received: " + message);
+        };
+    }
+
+    // 供应商函数
+    @Bean
+    public Supplier<String> generateEvent() {
+        return () -> {
+            return "Event-" + System.currentTimeMillis();
+        };
+    }
+
+    // 函数管道
+    @Bean
+    public Function<String, String> uppercase() {
+        return value -> value.toUpperCase();
+    }
+
+    @Bean
+    public Function<String, String> exclaim() {
+        return value -> value + "!";
+    }
+
+    // 组合函数
+    @Bean
+    public Function<String, String> shout() {
+        return uppercase().andThen(exclaim());
+    }
+}
+
+// 使用函数
+@RestController
+@RequiredArgsConstructor
+public class FunctionController {
+    private final Function<String, String> shout;
+
+    @GetMapping("/shout/{message}")
+    public String shout(@PathVariable String message) {
+        return shout.apply(message);
+    }
+}
+```
+
+### 16.7 Spring Cloud Kubernetes 原生集成
+
+```yaml
+# Spring Cloud Kubernetes 配置
+spring:
+  cloud:
+    kubernetes:
+      enabled: true
+      discovery:
+        enabled: true
+        all-namespaces: true
+      config:
+        enabled: true
+        sources:
+        - namespace: production
+          name: my-config
+      secrets:
+        enabled: true
+        sources:
+        - namespace: production
+          name: my-secret
+```
+
+```java
+// 自动发现 Kubernetes 中的服务
+@FeignClient(name = "user-service")  // 自动从 Kubernetes Service 发现
+public interface UserServiceClient {
+
+    @GetMapping("/users/{id}")
+    User getUser(@PathVariable Long id);
+}
+
+// 使用 Kubernetes ConfigMap 和 Secret
+@RefreshScope
+@RestController
+public class KubernetesConfigController {
+
+    @Value("${config.from.configmap:default}")
+    private String configValue;
+
+    @Value("${secret.from.secret:default}")
+    private String secretValue;
+
+    @GetMapping("/config")
+    public Map<String, String> getConfig() {
+        return Map.of(
+            "config", configValue,
+            "secret", secretValue
+        );
+    }
+}
+```
+
+```yaml
+# Kubernetes ConfigMap 和 Secret
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+  namespace: production
+data:
+  application.yml: |
+    app:
+      feature:
+        enabled: true
+      name: my-service
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-secret
+  namespace: production
+type: Opaque
+data:
+  database-password: cGFzc3dvcmQxMjM=
+  api-key: c2VjcmV0LWFwaS1rZXk=
+```
+
+## 十七、与其他板块的关系
 
 - Spring Cloud Gateway 见「[Spring Cloud Gateway](../基础知识/中间件/SpringCloudGateway.md)」；
 - Nacos 源码见「[源码系列/Nacos](../源码系列/Nacos.md)」；

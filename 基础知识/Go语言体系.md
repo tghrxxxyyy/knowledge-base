@@ -552,7 +552,658 @@ myproject/
 
 ---
 
-## 十二、与其他板块的关系
+## 十二、Go channel 内部实现
+
+### channel 数据结构
+
+```go
+// runtime/chan.go 中的 hchan 结构
+type hchan struct {
+    qcount   uint           // 队列中的元素数量
+    dataqsiz uint           // 环形队列的大小（缓冲区容量）
+    buf      unsafe.Pointer // 指向环形队列的指针
+    elemsize uint16         // 元素大小
+    closed   uint32         // 是否关闭
+    elemtype *_type         // 元素类型
+    sendx    uint           // 发送索引（环形队列）
+    recvx    uint           // 接收索引（环形队列）
+    recvq    waitq          // 等待接收的 goroutine 队列
+    sendq    waitq          // 等待发送的 goroutine 队列
+    lock     mutex          // 互斥锁
+}
+
+type waitq struct {
+    first *sudog
+    last  *sudog
+}
+```
+
+### channel 发送/接收流程
+
+```
+channel 发送流程：
+  1. 加锁（hchan.lock）
+  2. 检查 channel 是否关闭
+  3. 如果有等待接收的 goroutine：
+     ├── 直接将数据发送给接收者
+     ├── 唤醒接收者 goroutine
+     └── 返回
+  4. 如果缓冲区有空间：
+     ├── 将数据复制到缓冲区
+     ├── 更新 sendx 和 qcount
+     └── 返回
+  5. 如果缓冲区满：
+     ├── 当前 goroutine 挂起（park）
+     ├── 加入 sendq 等待队列
+     └── 等待被唤醒
+
+channel 接收流程：
+  1. 加锁
+  2. 检查 channel 是否关闭且缓冲区为空
+     ├── 如果关闭且为空：返回零值
+  3. 如果有等待发送的 goroutine：
+     ├── 如果是无缓冲 channel：直接获取数据
+     ├── 如果是有缓冲 channel：从缓冲区取数据，唤醒发送者
+     └── 返回
+  4. 如果缓冲区有数据：
+     ├── 从缓冲区取数据
+     ├── 更新 recvx 和 qcount
+     └── 返回
+  5. 如果缓冲区空：
+     ├── 当前 goroutine 挂起
+     ├── 加入 recvq 等待队列
+     └── 等待被唤醒
+```
+
+### channel 性能优化
+
+```
+channel 性能特点：
+  无缓冲 channel：
+    ├── 发送和接收必须同步
+    ├── 每次操作都涉及 goroutine 切换
+    └── 适合同步协调
+
+  有缓冲 channel：
+    ├── 缓冲区满之前发送不阻塞
+    ├── 缓冲区空之前接收不阻塞
+    └── 适合生产者-消费者模式
+
+性能优化建议：
+  1. 预分配缓冲区：make(chan T, size)
+  2. 避免频繁创建/销毁：复用 channel
+  3. 使用 select 多路复用：减少阻塞
+  4. 考虑 sync.Pool：高频小对象
+  5. 避免在热路径使用 channel：用 atomic/锁替代
+```
+
+## 十三、Go 调度器（GMP 模型）深入
+
+### GMP 模型详解
+
+```go
+// GMP 模型核心概念
+G（Goroutine）：
+  ├── 用户态协程，初始栈 2KB（可动态增长到 GB）
+  ├── 包含：栈、PC（程序计数器）、状态、sched
+  └── 调度器管理 G 的生命周期
+
+M（Machine）：
+  ├── OS 线程（真正执行的线程）
+  ├── 由 runtime 管理，可创建 10000+
+  └── 一个 M 同一时刻只能执行一个 G
+
+P（Processor）：
+  ├── 逻辑处理器（持有本地 goroutine 队列）
+  ├── 默认数量 = CPU 核数（GOMAXPROCS）
+  └── P 是 G 和 M 之间的桥梁
+
+调度流程：
+  P 从本地队列取 G → 绑定 M 执行
+  本地队列空 → 从全局队列偷取（work stealing）
+  M 阻塞（syscall）→ P 与 M 解绑 → P 找新 M 继续执行
+  全局队列空 → 从其他 P 偷取（work stealing）
+
+关键点：
+  一个 P 同一时刻只能绑定一个 M
+  G 的初始栈 2KB，按需增长（2x 增长，最大 1GB）
+  M 的数量可以远大于 P（M 可以有 10000+）
+```
+
+### 调度器源码分析
+
+```go
+// runtime/proc.go 核心调度逻辑
+func schedule() {
+    // 1. 从本地队列获取 G
+    pp := getg().m.p.ptr()
+    if pp.runnext != nil {
+        // 快速路径：获取下一个运行的 G
+        gp := pp.runnext
+        pp.runnext = nil
+        return gp
+    }
+
+    // 2. 从本地队列获取
+    if len(pp.runqhead) > 0 {
+        gp := pp.runqhead[0]
+        pp.runqhead = pp.runqhead[1:]
+        return gp
+    }
+
+    // 3. 从全局队列获取（每 61 次调度检查一次）
+    if sched.runqsize > 0 {
+        lock(&sched.lock)
+        gp := sched.runqhead[0]
+        sched.runqhead = sched.runqhead[1:]
+        sched.runqsize--
+        unlock(&sched.lock)
+        return gp
+    }
+
+    // 4. Work stealing：从其他 P 偷取
+    gp := stealWork()
+    if gp != nil {
+        return gp
+    }
+
+    // 5. 无可运行的 G，进入空闲状态
+    gcactly()
+    stopm()
+    goto top
+}
+```
+
+## 十四、Go 内存模型（happens-before）
+
+### Go 内存模型规则
+
+```go
+// Go 内存模型定义的 happens-before 关系
+
+// 1. 初始化
+// 如果 package p 导入 package q，q 的 init happens-before p 的 init
+
+// 2. goroutine 创建
+// go 语句 happens-before goroutine 的执行开始
+go func() {
+    // 这里的操作 happens-before 之后
+}()
+
+// 3. goroutine 销毁
+// goroutine 的退出不保证 happens-before 任何事件
+
+// 4. channel 发送
+// 对 channel 的发送 happens-before 对应的接收完成
+ch <- v    // 发送 happens-before
+<-ch       // 接收完成
+
+// 5. channel 关闭
+// 关闭 channel happens-before 因关闭而返回零值的接收
+close(ch)
+v := <-ch  // v 是零值
+
+// 6. Mutex
+// 第 n 次 unlock happens-before 第 n+1 次 lock
+mu.Lock()
+// 临界区
+mu.Unlock()  // unlock happens-before
+mu.Lock()    // 下一次 lock
+
+// 7. sync.Once
+// once.Do(f) 中 f() happens-before 任何 once.Do 调用返回
+once.Do(func() {
+    // f() happens-before
+})
+```
+
+### happens-before 与可见性
+
+```go
+// 可见性问题示例
+var data int
+var ready bool
+
+// 错误：没有 happens-before 关系
+go func() {
+    data = 42      // 写 data
+    ready = true   // 写 ready
+}()
+
+for !ready {       // 读 ready
+    runtime.Gosched()
+}
+fmt.Println(data)  // 可能读到 0（不保证看到 42）
+
+// 正确：用 channel 建立 happens-before
+var data int
+done := make(chan bool)
+
+go func() {
+    data = 42
+    done <- true   // 发送 happens-before
+}()
+
+<-done             // 接收 happens-before
+fmt.Println(data)  // 保证看到 42
+
+// 正确：用 Mutex 建立 happens-before
+var mu sync.Mutex
+var data int
+
+mu.Lock()
+go func() {
+    mu.Lock()      // lock happens-before
+    fmt.Println(data)  // 保证看到 0（初始值）
+    mu.Unlock()
+}()
+mu.Unlock()
+```
+
+## 十五、Go GC 调优（GOGC）
+
+### GOGC 参数详解
+
+```bash
+# GOGC：触发 GC 的堆增长比例（默认 100）
+# 值越小 → GC 越频繁 → 内存占用越低 → CPU 开销越高
+# 值越大 → GC 越少 → 内存占用越高 → CPU 开销越低
+
+GOGC=100  # 默认：堆增长 100% 触发 GC
+GOGC=200  # 堆增长 200% 才触发 GC（减少频率，增加内存）
+GOGC=50   # 堆增长 50% 就触发 GC（更频繁，更少内存）
+GOGC=off  # 关闭 GC（危险，仅用于特殊场景）
+
+# GOMEMLIMIT：软内存限制（Go 1.19+）
+# 当堆接近限制时，GC 更积极地回收
+GOMEMLIMIT=4GiB  # 限制最大内存 4GB
+
+# 容器环境推荐
+GOGC=100
+GOMEMLIMIT=容器内存限制 × 0.8
+# 例如：容器 8GB 内存
+# GOMEMLIMIT=6GiB
+
+# 物理机推荐
+GOGC=100
+GOMEMLIMIT=物理内存 × 0.7
+# 例如：32GB 物理内存
+# GOMEMLIMIT=22GiB
+```
+
+### GC 日志分析
+
+```bash
+# 开启 GC 日志
+GODEBUG=gctrace=1 ./myapp
+
+# 输出示例：
+# gc 1 @0.012s 2%: 0.026+1.2+0.018 ms clock, 0.10+0.52/2.1/0.072+0.072 ms cpu,
+#   4->4->3 MB, 5 MB goal, 8 P
+
+# 含义：
+# gc 1: 第 1 次 GC
+# @0.012s: 启动时间
+# 2%: GC 占总 CPU 比例
+# 0.026+1.2+0.018 ms: STW1 + 并发标记 + STW2
+# 0.10+0.52/2.1/0.072+0.072 ms cpu: 用户时间/系统时间
+# 4->4->3 MB: GC 前堆大小 → GC 后堆大小 → 实际存活大小
+# 5 MB goal: 下次 GC 触发的堆目标
+# 8 P: 使用的处理器数
+
+# 分析要点：
+# 1. STW 时间：< 1ms 正常，> 10ms 需优化
+# 2. GC 频率：每秒 1-2 次正常
+# 3. 堆增长：4->4->3 说明存活对象稳定
+# 4. CPU 占比：< 5% 正常，> 10% 需优化
+```
+
+### GC 调优实战
+
+```go
+// 1. 减少堆分配
+// 使用 sync.Pool 复用对象
+var bufPool = sync.Pool{
+    New: func() interface{} { return new(bytes.Buffer) },
+}
+
+func process(data []byte) {
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset()
+    defer bufPool.Put(buf)
+
+    buf.Write(data)
+    // ...
+}
+
+// 2. 避免逃逸分析
+// 使用 -gcflags="-m" 查看逃逸分析
+// go build -gcflags="-m" ./...
+
+// 3. 减少 GC 压力
+// 大对象使用 mmap 或 cgo 分配
+// 高频分配对象使用对象池
+
+// 4. 监控 GC
+import "runtime/metrics"
+
+func monitorGC() {
+    samples := []metrics.Sample{
+        {Name: "/gc/cycles/total:gc-cycles"},
+        {Name: "/memory/classes/heap/objects:bytes"},
+    }
+    metrics.Read(samples)
+    fmt.Printf("GC cycles: %d\n", samples[0].Value.Uint64())
+    fmt.Printf("Heap objects: %d bytes\n", samples[1].Value.Uint64())
+}
+```
+
+## 十六、Go context 模式
+
+### context 使用模式
+
+```go
+// 模式 1：传递取消信号
+func worker(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            fmt.Println("收到取消信号:", ctx.Err())
+            return
+        default:
+            doWork()
+        }
+    }
+}
+
+ctx, cancel := context.WithCancel(context.Background())
+go worker(ctx)
+// 需要取消时
+cancel()
+
+// 模式 2：传递超时
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+result, err := doSlowWork(ctx)
+if err != nil {
+    if errors.Is(err, context.DeadlineExceeded) {
+        fmt.Println("操作超时")
+    }
+}
+
+// 模式 3：传递截止时间
+deadline := time.Now().Add(10 * time.Second)
+ctx, cancel := context.WithDeadline(context.Background(), deadline)
+defer cancel()
+
+// 模式 4：传递值
+type contextKey string
+const userIDKey contextKey = "user_id"
+
+ctx = context.WithValue(ctx, userIDKey, "user-123")
+userID := ctx.Value(userIDKey).(string)
+
+// 模式 5：HTTP 请求 context
+func handler(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context() // 自动关联请求生命周期
+    result, err := doWork(ctx)
+    // ...
+}
+
+// 模式 6：数据库查询 context
+func queryUser(ctx context.Context, id string) (*User, error) {
+    ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
+
+    var user User
+    err := db.QueryRowContext(ctx, "SELECT * FROM users WHERE id = ?", id).Scan(&user)
+    return &user, err
+}
+```
+
+### context 最佳实践
+
+```
+context 使用规范：
+  1. 始终传递 context，不存储在结构体中
+  2. 函数第一个参数是 context
+  3. 不要把 context 存储在 struct 中
+  4. context 只传递取消信号和值，不要传递业务数据
+  5. 使用 WithValue 传递请求级元数据（traceId, userId）
+  6. 用 WithTimeout/WithDeadline 控制超时
+  7. 始终调用 cancel 函数（defer cancel()）
+  8. context.Value 只用于请求级元数据，不要滥用
+```
+
+## 十七、Go 接口设计模式
+
+### 接口设计原则
+
+```go
+// 原则 1：小接口（io.Reader/Writer 只有一个方法）
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+
+type Writer interface {
+    Write(p []byte) (n int, err error)
+}
+
+// 原则 2：接口组合
+type ReadWriter interface {
+    Reader
+    Writer
+}
+
+// 原则 3：隐式实现（duck typing）
+type MyReader struct{}
+func (r *MyReader) Read(p []byte) (n int, err error) { ... }
+// MyReader 自动实现 io.Reader，无需显式声明
+
+// 原则 4：接口返回具体类型
+func NewReader(r io.Reader) *Reader {
+    return &Reader{r: r}
+}
+
+// 原则 5：避免在包内定义接口
+// 接口应该由使用方定义，而不是提供方
+```
+
+### 接口模式示例
+
+```go
+// 模式 1：策略模式
+type Sorter interface {
+    Sort(data []int)
+}
+
+type BubbleSort struct{}
+func (s *BubbleSort) Sort(data []int) { /* 冒泡排序 */ }
+
+type QuickSort struct{}
+func (s *QuickSort) Sort(data []int) { /* 快速排序 */ }
+
+func sortData(sorter Sorter, data []int) {
+    sorter.Sort(data)
+}
+
+// 模式 2：适配器模式
+type LegacyLogger struct{}
+func (l *LegacyLogger) Log(message string) { /* 旧日志接口 */ }
+
+// 适配新接口
+type LogAdapter struct {
+    legacy *LegacyLogger
+}
+
+func (a *LogAdapter) Write(p []byte) (n int, err error) {
+    a.legacy.Log(string(p))
+    return len(p), nil
+}
+
+// 模式 3：装饰器模式
+type Logger interface {
+    Log(message string)
+}
+
+type LoggerDecorator struct {
+    logger Logger
+    prefix string
+}
+
+func (d *LoggerDecorator) Log(message string) {
+    d.logger.Log(fmt.Sprintf("[%s] %s", d.prefix, message))
+}
+
+// 模式 4：依赖注入
+type UserService struct {
+    repo UserRepository
+    logger Logger
+}
+
+func NewUserService(repo UserRepository, logger Logger) *UserService {
+    return &UserService{repo: repo, logger: logger}
+}
+```
+
+## 十八、Go 错误处理模式
+
+### 错误处理最佳实践
+
+```go
+// 模式 1：错误包装（保留错误链）
+func processOrder(id string) error {
+    order, err := getOrder(id)
+    if err != nil {
+        return fmt.Errorf("processOrder: %w", err)  // %w 包装错误
+    }
+    // ...
+}
+
+// 模式 2：错误检查（errors.Is/As）
+if errors.Is(err, sql.ErrNoRows) {
+    // 精确匹配
+}
+
+var target *os.PathError
+if errors.As(err, &target) {
+    // 类型匹配
+    fmt.Println("路径错误:", target.Path)
+}
+
+// 模式 3：Sentinel Error
+var (
+    ErrNotFound     = errors.New("not found")
+    ErrUnauthorized = errors.New("unauthorized")
+    ErrForbidden    = errors.New("forbidden")
+)
+
+// 模式 4：自定义错误类型
+type ValidationError struct {
+    Field   string
+    Message string
+}
+
+func (e *ValidationError) Error() string {
+    return fmt.Sprintf("validation failed: %s - %s", e.Field, e.Message)
+}
+
+// 模式 5：错误合并（Go 1.20+）
+err := errors.Join(err1, err2, err3)
+
+// 模式 6：错误处理函数
+func must[T any](v T, err error) T {
+    if err != nil {
+        panic(err)
+    }
+    return v
+}
+
+// 用于初始化等不可恢复场景
+var db = must(sql.Open("mysql", dsn))
+```
+
+## 十九、Go 性能优化
+
+### 性能优化技巧
+
+```go
+// 1. 减少内存分配
+// 使用 sync.Pool 复用对象
+var pool = sync.Pool{
+    New: func() interface{} { return new(bytes.Buffer) },
+}
+
+// 2. 避免 string ↔ []byte 转换
+// 使用 unsafe 零拷贝转换
+func unsafeBytes(s string) []byte {
+    return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+// 3. 使用 strings.Builder
+var builder strings.Builder
+for i := 0; i < 1000; i++ {
+    builder.WriteString("hello")
+}
+
+// 4. 预分配切片
+make([]int, 0, 1000)  // 预分配容量
+
+// 5. 使用结构体而非 map
+type User struct {
+    Name string
+    Age  int
+}
+// 比 map[string]interface{} 更快
+
+// 6. 避免 goroutine 泄漏
+func worker(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case data := <-ch:
+            process(data)
+        }
+    }
+}
+
+// 7. 使用 atomic 替代锁
+var counter int64
+atomic.AddInt64(&counter, 1)
+
+// 8. 减少 defer 开销
+// 在循环中避免 defer，提取到函数
+func process(items []int) {
+    for _, item := range items {
+        processItem(item)  // 内部有 defer
+    }
+}
+```
+
+### pprof 性能分析实战
+
+```bash
+# CPU 分析（30 秒）
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+
+# 内存分析
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# Goroutine 分析（goroutine 泄漏）
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+
+# 阻塞分析
+go tool pprof http://localhost:6060/debug/pprof/block
+
+# 交互式分析
+(pprof) top 20       # 最耗资源的 20 个函数
+(pprof) web          # 生成调用图
+(pprof) list funcName # 查看具体函数的逐行耗时
+```
+
+## 与其他板块的关系
 
 - etcd 源码见「[etcd 源码](../源码系列/etcd源码.md)」；
 - Kubernetes 见「[Kubernetes 核心](../云原生/Kubernetes核心.md)」；

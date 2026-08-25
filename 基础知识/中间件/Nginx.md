@@ -697,7 +697,381 @@ curl http://localhost/nginx_status
 
 ---
 
-## 十三、与其他板块的关系
+## 十三、Nginx Upstream Keepalive 深入
+
+### 13.1 Keepalive 配置
+
+```nginx
+upstream backend {
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+
+    keepalive 32;               # 每 Worker 维持 32 个空闲长连接
+    keepalive_requests 1000;     # 单连接最大复用次数
+    keepalive_timeout 60s;       # 空闲连接超时
+}
+
+server {
+    location /api/ {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;              # 必须设为 1.1
+        proxy_set_header Connection "";       # 清除 Connection: close
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+### 13.2 Keepalive 效果对比
+
+| 维度 | 无 Keepalive | 有 Keepalive |
+|------|-------------|-------------|
+| TCP 握手 | 每次 3 次握手 | 首次握手，后续复用 |
+| SSL 握手 | 每次 TLS 握手 | 首次握手，后续复用 |
+| 延迟 | 200ms+（含握手） | 50-100ms（复用） |
+| 吞吐 | 低 | 高 30-50% |
+| 后端压力 | 高（频繁连接） | 低（连接复用） |
+
+---
+
+## 十四、Nginx Lua 脚本模式
+
+### 14.1 OpenResty Lua 执行阶段
+
+```nginx
+# Lua 执行阶段：
+#   init_by_lua: 启动时（加载配置/路由表）
+#   init_worker_by_lua: 每 Worker 启动（定时器/健康检查）
+#   set_by_lua: 变量设置阶段
+#   rewrite_by_lua: 重写阶段（鉴权/限流/路由）
+#   access_by_lua: 访问阶段（权限检查）
+#   content_by_lua: 内容生成（业务逻辑）
+#   log_by_lua: 日志阶段（审计/上报）
+
+# 示例：限流 + JWT 鉴权 + 动态路由
+location /api/ {
+    rewrite_by_lua_block {
+        local limit = require "resty限流"
+        local jwt = require "jwt验证"
+
+        -- 限流检查
+        local lim, err = limit.new("rate_limit", 100, 1)
+        if not lim then ngx.exit(500) end
+        local delay, err = lim:incoming(ngx.var.binary_remote_addr, true)
+        if not delay then ngx.exit(429) end
+
+        -- JWT 验证
+        local token = ngx.var.http_authorization
+        local payload, err = jwt.verify(token)
+        if not payload then ngx.exit(401) end
+
+        -- 动态路由
+        ngx.var.upstream = payload.service or "default"
+    }
+    proxy_pass http://$upstream;
+}
+```
+
+### 14.2 Lua 共享字典
+
+```nginx
+lua_shared_dict rate_limit 10m;      # 限流计数器
+lua_shared_dict healthcheck 1m;      # 健康检查状态
+lua_shared_dict config_cache 5m;     # 配置缓存
+
+init_worker_by_lua_block {
+    -- 定时器：健康检查
+    local function check_health()
+        -- 检查后端健康状态
+    end
+    ngx.timer.every(5, check_health)
+}
+```
+
+---
+
+## 十五、Nginx auth_request
+
+### 15.1 auth_request 原理
+
+```nginx
+# auth_request：将子请求转发到认证服务
+location /api/ {
+    auth_request /auth;
+    auth_request_set $auth_user $upstream_http_x_auth_user;
+    auth_request_set $auth_role $upstream_http_x_auth_role;
+
+    proxy_pass http://backend;
+    proxy_set_header X-Auth-User $auth_user;
+    proxy_set_header X-Auth-Role $auth_role;
+}
+
+# 认证服务（内部子请求）
+location = /auth {
+    internal;
+    proxy_pass http://auth-service:8080/auth;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URI $request_uri;
+}
+```
+
+### 15.2 auth_request 应用场景
+
+| 场景 | 说明 |
+|------|------|
+| JWT 验证 | 验证 Token 有效性 |
+| OAuth2 认证 | 验证 Access Token |
+| RBAC 授权 | 验证用户角色权限 |
+| IP 白名单 | 验证请求 IP |
+| API Key 验证 | 验证 API 密钥 |
+
+---
+
+## 十六、Nginx sub_filter 内容替换
+
+### 16.1 sub_filter 配置
+
+```nginx
+# 替换响应内容中的文本
+location / {
+    sub_filter '</body>' '<script src="/tracker.js"></script></body>';
+    sub_filter_once on;            # 只替换第一个匹配
+    sub_filter_types text/html;    # 只替换 HTML
+}
+
+# 替换多个文本
+location / {
+    sub_filter 'http://' 'https://';
+    sub_filter 'old.example.com' 'new.example.com';
+    proxy_pass http://backend;
+}
+
+# 条件替换
+location / {
+    sub_filter '</head>' '<link rel="stylesheet" href="/custom.css"></head>';
+    sub_filter_once on;
+    sub_filter_types text/html;
+}
+```
+
+### 16.2 sub_filter 与 Lua 替换
+
+```nginx
+# Lua 更灵活的内容替换
+location / {
+    content_by_lua_block {
+        local res = ngx.location.capture("/backend" .. ngx.var.request_uri)
+        -- 正则替换
+        local body = string.gsub(res.body, 'old%-text', 'new-text')
+        ngx.say(body)
+    }
+}
+```
+
+---
+
+## 十七、Nginx 条件日志
+
+### 17.1 条件日志配置
+
+```nginx
+# 条件日志：只记录慢请求
+map $request_time $log_slow {
+    default 0;
+    ~^[3-9]  1;    # > 3s 的请求
+    ~^[0-9]{2,} 1;  # > 10s 的请求
+}
+
+# 条件日志：不记录健康检查
+map $http_user_agent $log_agent {
+    default 1;
+    ~*kube-probe 0;
+    ~*ELB-HealthChecker 0;
+}
+
+access_log /var/log/nginx/access.log main if=$log_slow;
+access_log /var/log/nginx/health.log main if=$log_agent;
+
+log_format main '$remote_addr - $remote_user [$time_local] '
+                '"$request" $status $body_bytes_sent '
+                '"$http_referer" "$http_user_agent" '
+                '$request_time $upstream_response_time';
+```
+
+### 17.2 日志切割
+
+```bash
+# logrotate 配置
+/var/log/nginx/*.log {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+}
+```
+
+---
+
+## 十八、Nginx Worker CPU 亲和性
+
+### 18.1 Worker CPU 绑定
+
+```nginx
+# worker_cpu_affinity：将 Worker 绑定到指定 CPU 核
+worker_processes auto;                      # 自动检测 CPU 核数
+worker_cpu_affinity auto;                    # 自动分配（推荐）
+
+# 手动绑定（4 核 CPU）
+worker_cpu_affinity 0001 0010 0100 1000;
+
+# Worker 与 CPU 核绑定效果：
+#   避免 CPU 缓存失效（L1/L2 cache miss 减少）
+#   减少上下文切换
+#   提升性能 5-15%
+
+# 验证绑定
+taskset -p $(pgrep -f "nginx: worker")
+```
+
+### 18.2 性能调优参数
+
+```nginx
+worker_processes auto;
+worker_cpu_affinity auto;
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections 65535;
+    use epoll;
+    multi_accept on;                    # 一次 accept 多个连接
+    accept_mutex off;                   # 高并发关闭互斥锁
+}
+
+# Linux 系统调优
+# sysctl -w net.core.somaxconn=65535
+# sysctl -w net.ipv4.tcp_tw_reuse=1
+# sysctl -w net.ipv4.tcp_fin_timeout=15
+```
+
+---
+
+## 十九、Nginx 会话保持（ip_hash/sticky）
+
+### 19.1 会话保持方式
+
+```nginx
+# 方式一：ip_hash（按客户端 IP 哈希）
+upstream backend {
+    ip_hash;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+}
+
+# 方式二：sticky cookie（Nginx Plus 商业版）
+upstream backend {
+    sticky cookie srv_id expires=1h domain=.example.com path=/;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+}
+
+# 方式三：hash（一致性哈希）
+upstream backend {
+    hash $request_uri consistent;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+}
+
+# 方式四：Lua 实现 sticky
+set $target "";
+rewrite_by_lua_block {
+    local cookie = ngx.var.cookie_session
+    if cookie then
+        local backend = ngx.shared.backends:get(cookie)
+        if backend then
+            ngx.var.target = backend
+            return
+        end
+    end
+    -- 轮询选择后端
+    ngx.var.target = backends[ngx.var.connection_count % #backends]
+}
+```
+
+### 19.2 会话保持对比
+
+| 方式 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| ip_hash | 按 IP 哈希 | 简单 | 负载不均 |
+| sticky cookie | Cookie 亲和 | 精确 | 依赖 Cookie |
+| hash $uri | URI 哈希 | 缓存亲和 | 无负载感知 |
+| hash $request | 请求哈希 | 分布均匀 | 无负载感知 |
+
+---
+
+## 二十、Nginx 反向代理 gRPC
+
+### 20.1 gRPC 代理配置
+
+```nginx
+# gRPC 反向代理
+upstream grpc_backend {
+    server 10.0.0.1:50051;
+    server 10.0.0.2:50051;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+
+    location /grpc.service.Whatever/ {
+        grpc_pass grpc://grpc_backend;
+        grpc_read_timeout 30s;
+        grpc_send_timeout 30s;
+
+        # 错误处理
+        grpc_connect_timeout 5s;
+        error_page 502 = /grpc_error;
+    }
+
+    location = /grpc_error {
+        internal;
+        default_type application/grpc;
+        add_header grpc-status 14;
+        add_header grpc-message "unavailable";
+        return 204;
+    }
+}
+```
+
+### 20.2 gRPC 负载均衡
+
+```nginx
+# gRPC 负载均衡策略
+upstream grpc_backend {
+    # 一致性哈希（按请求方法）
+    hash $request_uri consistent;
+    
+    # 或轮询（默认）
+    # least_conn;
+    
+    server 10.0.0.1:50051;
+    server 10.0.0.2:50051;
+    server 10.0.0.3:50051;
+
+    keepalive 64;  # gRPC 长连接复用
+}
+```
+
+---
+
+## 与其他板块的关系
 
 - 和「**基础知识/中间件/API网关**」：Nginx 是「入口层（南北向）」，网关（Spring Cloud Gateway/APISIX）做「应用层路由治理」，常串联使用。
 - 和「**基础知识/网络**」「**网络协议深挖**」：Nginx 是 TCP/HTTP、keepalive、TLS、零拷贝原理的最佳实践观察点。

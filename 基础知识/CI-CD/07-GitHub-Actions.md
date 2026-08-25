@@ -482,6 +482,396 @@ jobs:
 4. **OIDC 忘了开 `permissions: id-token: write`** → token 拿不到，部署失败。
 5. **`concurrency` group 设错** → 把不相关分支锁一起，或生产并发部署互相覆盖。
 
+## GitHub Actions 可复用工作流
+
+### 14.1 Reusable Workflow
+
+```yaml
+# 可复用工作流（.github/workflows/reusable-build.yml）
+name: Reusable Build
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        required: false
+        type: string
+        default: '17'
+      node-version:
+        required: false
+        type: string
+        default: '20'
+    secrets:
+      registry-token:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+      - name: Build
+        run: mvn clean package
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: target/*.jar
+
+# 调用可复用工作流
+# .github/workflows/main.yml
+name: Main Pipeline
+on: [push]
+jobs:
+  build:
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      java-version: '21'
+    secrets:
+      registry-token: ${{ secrets.REGISTRY_TOKEN }}
+```
+
+### 14.2 Composite Action
+
+```yaml
+# Composite Action（.github/actions/setup-project/action.yml）
+name: Setup Project
+description: Setup Java + Node.js + cache
+inputs:
+  java-version:
+    required: false
+    default: '17'
+  node-version:
+    required: false
+    default: '20'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v4
+      with:
+        java-version: ${{ inputs.java-version }}
+        distribution: temurin
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.m2/repository
+          node_modules
+        key: ${{ runner.os }}-deps-${{ hashFiles('**/pom.xml', '**/package-lock.json') }}
+
+# 使用 Composite Action
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-project
+        with:
+          java-version: '21'
+```
+
+---
+
+## GitHub Actions Matrix 策略
+
+### 15.1 Matrix 高级用法
+
+```yaml
+# 基础 Matrix
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        java: [11, 17, 21]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+      - run: mvn test
+
+# Matrix 排除
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        java: [11, 17, 21]
+        exclude:
+          - os: windows-latest
+            java: 11
+      fail-fast: false
+
+# Matrix 包含
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        java: [11, 17, 21]
+        include:
+          - os: windows-latest
+            java: 17
+            experimental: true
+```
+
+### 15.2 Matrix 最佳实践
+
+| 策略 | 说明 |
+|------|------|
+| fail-fast: false | 失败不取消其他任务 |
+| exclude | 排除不需要的组合 |
+| include | 添加额外组合 |
+| max-parallel | 控制最大并行数 |
+
+---
+
+## GitHub Actions Monorepo 支持
+
+### 16.1 Monorepo 路径过滤
+
+```yaml
+# 基于路径触发
+name: Monorepo CI
+on:
+  push:
+    paths:
+      - 'packages/frontend/**'
+      - 'packages/shared/**'
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  frontend:
+    if: contains(github.event.head_commit.modified, 'packages/frontend/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd packages/frontend && npm install && npm run build
+
+  backend:
+    if: contains(github.event.head_commit.modified, 'packages/backend/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd packages/backend && mvn clean package
+```
+
+### 16.2 Monorepo 依赖管理
+
+```yaml
+# 使用 changes 语法
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check frontend changes
+        id: check
+        run: |
+          if git diff --name-only HEAD~1 | grep -q "^packages/frontend/"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Build frontend
+        if: steps.check.outputs.changed == 'true'
+        run: cd packages/frontend && npm install && npm run build
+```
+
+---
+
+## GitHub Actions Self-Hosted Runner 安全
+
+### 17.1 Runner 安全配置
+
+```yaml
+# Self-Hosted Runner 安全
+jobs:
+  secure-job:
+    runs-on: [self-hosted, linux, secure]
+    container:
+      options: --user 1001
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Running in isolated environment"
+
+# Runner 安全措施
+# 1. 使用 Docker 容器隔离
+# 2. 限制可信仓库
+# 3. 定期清理工作区
+# 4. 监控 Runner 状态
+```
+
+### 17.2 Runner 安全对比
+
+| 安全措施 | GitHub Hosted | Self-Hosted |
+|----------|---------------|-------------|
+| 环境隔离 | 完全隔离 | 需手动配置 |
+| 网络访问 | 受限 | 完全访问 |
+| 存储安全 | 自动清理 | 需手动清理 |
+| 镜像安全 | 官方维护 | 需自己维护 |
+| 成本 | 按分钟计费 | 固定成本 |
+
+---
+
+## GitHub Actions 安全最佳实践
+
+### 18.1 安全配置
+
+```yaml
+# 1. Pin action 版本
+- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+
+# 2. 使用 OIDC 免密钥
+permissions:
+  id-token: write
+  contents: read
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/github-actions
+      aws-region: ap-northeast-1
+
+# 3. 限制 workflow 权限
+permissions:
+  contents: read
+  packages: write
+
+# 4. 使用 Secrets
+steps:
+  - run: echo "Deploying..."
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+```
+
+### 18.2 安全检查清单
+
+| 检查项 | 说明 |
+|--------|------|
+| Action 版本 | Pin SHA 而非 tag |
+| Secrets 管理 | 使用 GitHub Secrets |
+| 权限控制 | 最小权限原则 |
+| OIDC | 云部署使用 OIDC |
+| Runner 安全 | Self-Hosted Runner 隔离 |
+| 审计日志 | 启用审计日志 |
+
+---
+
+## GitHub Actions Terraform IaC
+
+### 19.1 Terraform 工作流
+
+```yaml
+# Terraform 工作流
+name: Terraform
+on:
+  push:
+    branches: [main]
+    paths: ['terraform/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+      - run: terraform init
+      - run: terraform plan
+      - run: terraform apply
+        if: github.ref == 'refs/heads/main'
+```
+
+### 19.2 Terraform 安全
+
+```yaml
+# Terraform 安全配置
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init
+      - run: terraform plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+```
+
+---
+
+## GitHub Actions 成本优化
+
+### 20.1 成本分析
+
+```
+GitHub Actions 成本构成：
+  1. 执行时间：
+     - 免费额度：2000 分钟/月（公共仓库无限）
+     - 付费价格：$0.008/分钟（Linux）
+  
+  2. 存储成本：
+     - artifact 存储：$0.005/GB/天
+  
+  3. 网络成本：
+     - 传出流量：$0.50/GB
+
+  成本优化策略：
+    1. 缓存优化：减少依赖下载时间
+    2. 并行执行：减少总执行时间
+    3. Matrix 策略：减少重复配置
+    4. Self-Hosted：降低执行成本
+    5. 定时任务：非高峰期执行
+```
+
+### 20.2 成本优化配置
+
+```yaml
+# 缓存优化
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+# 并行优化
+jobs:
+  test:
+    strategy:
+      parallel: 4
+    steps:
+      - run: pytest --splitting-algorithm=least_duration
+
+# 定时优化
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天凌晨 2 点
+```
+
+---
+
 ## 十三、与其他模块的关联
 
 - 流水线总纲与 DORA 指标，见 [01-概述与核心概念](01-概述与核心概念.md)。

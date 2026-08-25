@@ -746,7 +746,429 @@ try {
 
 ---
 
-## 十四、与其他板块的关系
+## 十四、Netty 高级特性与生产实践
+
+### 14.1 协议解码（LengthFieldBasedFrameDecoder）
+
+```text
+LengthFieldBasedFrameDecoder 是处理 TCP 粘包/拆包的核心解码器。
+
+参数说明：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 参数                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ maxFrameLength       │ 最大帧长度（超过则报错）                     │
+│ lengthFieldOffset    │ 长度字段在帧中的偏移量                       │
+│ lengthFieldLength    │ 长度字段占用的字节数                         │
+│ lengthAdjustment     │ 长度字段的调整值                             │
+│ initialBytesToStrip  │ 跳过的字节数（解码后不传递）                 │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 常见协议解码配置
+// 协议格式：[4字节长度][消息体]
+new LengthFieldBasedFrameDecoder(
+    1024 * 1024,  // maxFrameLength: 1MB
+    0,            // lengthFieldOffset: 长度字段从第0字节开始
+    4,            // lengthFieldLength: 长度字段占4字节
+    0,            // lengthAdjustment: 无调整
+    4             // initialBytesToStrip: 跳过4字节长度字段
+);
+
+// 协议格式：[2字节类型][4字节长度][消息体]
+new LengthFieldBasedFrameDecoder(
+    1024 * 1024,  // maxFrameLength
+    2,            // lengthFieldOffset: 跳过2字节类型字段
+    4,            // lengthFieldLength
+    0,            // lengthAdjustment
+    6             // initialBytesToStrip: 跳过类型+长度共6字节
+);
+
+// 协议格式：[4字节长度][2字节类型][消息体]
+new LengthFieldBasedFrameDecoder(
+    1024 * 1024,  // maxFrameLength
+    0,            // lengthFieldOffset
+    4,            // lengthFieldLength
+    -2,           // lengthAdjustment: 长度字段包含类型字段（-2调整）
+    0             // initialBytesToStrip: 不跳过
+);
+```
+
+```java
+// 自定义协议解码器示例
+public class MyProtocolDecoder extends ByteToMessageDecoder {
+    private static final int HEADER_LENGTH = 8; // 4字节长度 + 4字节魔数
+
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        // 1. 检查可读字节数
+        if (in.readableBytes() < HEADER_LENGTH) {
+            return;
+        }
+
+        // 2. 标记读位置（用于回退）
+        in.markReaderIndex();
+
+        // 3. 读取长度和魔数
+        int length = in.readInt();
+        int magic = in.readInt();
+
+        // 4. 验证魔数
+        if (magic != 0x12345678) {
+            ctx.close();
+            return;
+        }
+
+        // 5. 检查消息体是否完整
+        if (in.readableBytes() < length) {
+            in.resetReaderIndex();
+            return;
+        }
+
+        // 6. 读取消息体
+        ByteBuf body = in.readRetainedSlice(length);
+        out.add(new MyMessage(magic, body));
+    }
+}
+```
+
+### 14.2 背压处理（Back Pressure）
+
+```text
+Netty 背压处理策略：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 策略                  │ 实现方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 水位线控制            │ ChannelOutboundBuffer 高/低水位线          │
+│ 通道不可写            │ Channel.isWritable() 检查                 │
+│ 自适应控制            │ 根据写入速度动态调整                       │
+│ 消费者拉取            │ PollingSource（响应式）                    │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 水位线配置
+ServerBootstrap b = new ServerBootstrap();
+b.option(ChannelOption.SO_BACKLOG, 1024);
+b.option(ChannelOption.WRITE_BUFFER_WATER_MARK, 
+    new WriteBufferWaterMark(32 * 1024, 64 * 1024)); // 低水位32KB，高水位64KB
+
+// 检查通道是否可写
+if (channel.isWritable()) {
+    channel.writeAndFlush(message);
+} else {
+    // 暂存消息，等待水位线下降
+    pendingMessages.add(message);
+}
+
+// 监听可写状态变化
+channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+        Channel ch = ctx.channel();
+        if (ch.isWritable()) {
+            // 水位线下降，继续写入
+            flushPendingMessages(ch);
+        }
+    }
+});
+```
+
+```java
+// 自适应写入控制
+public class AdaptiveWriteHandler extends ChannelOutboundHandlerAdapter {
+    private final Queue<Runnable> pendingWrites = new ConcurrentLinkedQueue<>();
+    private volatile boolean writable = true;
+
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        if (writable) {
+            ctx.write(msg, promise);
+        } else {
+            pendingWrites.offer(() -> ctx.write(msg, promise));
+        }
+    }
+
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+        writable = ctx.channel().isWritable();
+        if (writable) {
+            drainPendingWrites(ctx);
+        }
+    }
+
+    private void drainPendingWrites(ChannelHandlerContext ctx) {
+        Runnable task;
+        while ((task = pendingWrites.poll()) != null) {
+            task.run();
+        }
+    }
+}
+```
+
+### 14.3 资源释放（ReferenceCountUtil）
+
+```text
+Netty 引用计数管理：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 方法                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ retain()             │ 引用计数 +1                                 │
+│ release()            │ 引用计数 -1（归零时释放）                   │
+│ refCnt()             │ 当前引用计数                                │
+│ ReferenceCountUtil.release(msg) │ 安全释放消息                     │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 正确的资源释放模式
+@Override
+protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
+    // 方式1：使用 try-finally
+    try {
+        // 处理消息
+        processMessage(msg);
+    } finally {
+        ReferenceCountUtil.release(msg);
+    }
+}
+
+// 方式2：传递给下一个 Handler（由下一个负责释放）
+@Override
+public void channelRead(ChannelHandlerContext ctx, Object msg) {
+    try {
+        // 不要在这里释放，传递给下一个
+        ctx.fireChannelRead(msg);
+    } catch (Exception e) {
+        // 异常时释放
+        ReferenceCountUtil.release(msg);
+        throw e;
+    }
+}
+
+// 方式3：使用 SimpleChannelInboundHandler（自动释放）
+public class MyHandler extends SimpleChannelInboundHandler<ByteBuf> {
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
+        // 不需要手动释放，框架自动处理
+        processMessage(msg);
+    }
+}
+```
+
+```java
+// 常见泄漏场景
+// 1. 异步回调中未释放
+channel.writeAndFlush(msg).addListener(future -> {
+    if (!future.isSuccess()) {
+        // 必须释放！
+        ReferenceCountUtil.release(msg);
+    }
+});
+
+// 2. 编解码器中未释放
+@Override
+protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+    if (in.readableBytes() < 4) {
+        return; // 不够，等待
+    }
+    ByteBuf decoded = in.readRetainedSlice(4); // retain 了
+    out.add(decoded); // 传递给下一个 Handler
+    // 不要在这里 release
+}
+```
+
+### 14.4 空闲状态检测（IdleStateHandler）
+
+```text
+IdleStateHandler 用于检测连接的读/写/全空闲超时：
+
+三种事件：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 事件                  │ 触发条件                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ READER_IDLE          │ 读空闲（指定时间内没有收到数据）            │
+│ WRITER_IDLE          │ 写空闲（指定时间内没有发送数据）            │
+│ ALL_IDLE             │ 读写空闲（指定时间内没有读写操作）          │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```java
+// 心跳检测配置
+pipeline.addLast("idleStateHandler", new IdleStateHandler(
+    60,  // readerIdleTime：60秒无读取触发
+    30,  // writerIdleTime：30秒无写入触发
+    0,   // allIdleTime：不检测全空闲
+    TimeUnit.SECONDS
+));
+
+pipeline.addLast("heartbeatHandler", new ChannelInboundHandlerAdapter() {
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+        if (evt instanceof IdleStateEvent) {
+            IdleStateEvent event = (IdleStateEvent) evt;
+            switch (event.state()) {
+                case READER_IDLE:
+                    // 读空闲，可能对端断开
+                    ctx.close();
+                    break;
+                case WRITER_IDLE:
+                    // 写空闲，发送心跳
+                    ctx.writeAndFlush(heartbeatMessage());
+                    break;
+                case ALL_IDLE:
+                    // 全空闲
+                    break;
+            }
+        }
+        ctx.fireUserEventTriggered(evt);
+    }
+});
+```
+
+```java
+// 服务端心跳配置
+pipeline.addLast("serverIdleHandler", new IdleStateHandler(
+    0,     // 不检测读空闲（由客户端主动发心跳）
+    0,     // 不检测写空闲
+    300,   // 5分钟全空闲
+    TimeUnit.SECONDS
+));
+```
+
+### 14.5 HTTP 编解码
+
+```java
+// HTTP 服务端配置
+pipeline.addLast("httpServerCodec", new HttpServerCodec());
+pipeline.addLast("httpObjectAggregator", new HttpObjectAggregator(65536));
+pipeline.addLast("httpHandler", new SimpleChannelInboundHandler<FullHttpRequest>() {
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
+        // 处理 HTTP 请求
+        String uri = request.uri();
+        HttpMethod method = request.method();
+        ByteBuf content = request.content();
+
+        // 构建响应
+        FullHttpResponse response = new DefaultFullHttpResponse(
+            HttpVersion.HTTP_1_1,
+            HttpResponseStatus.OK,
+            Unpooled.copiedBuffer("Hello", CharsetUtil.UTF_8)
+        );
+        response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain");
+        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
+
+        ctx.writeAndFlush(response);
+    }
+});
+
+// HTTP 客户端配置
+pipeline.addLast("httpClientCodec", new HttpClientCodec());
+pipeline.addLast("httpObjectAggregator", new HttpObjectAggregator(65536));
+```
+
+### 14.6 WebSocket 支持
+
+```java
+// WebSocket 服务端配置
+pipeline.addLast("httpServerCodec", new HttpServerCodec());
+pipeline.addLast("httpObjectAggregator", new HttpObjectAggregator(65536));
+pipeline.addLast("websocketServerProtocol", 
+    new WebSocketServerProtocolHandler("/ws", null, true));
+pipeline.addLast("websocketHandler", new SimpleChannelInboundHandler<WebSocketFrame>() {
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
+        if (frame instanceof TextWebSocketFrame) {
+            String text = ((TextWebSocketFrame) frame).text();
+            // 处理文本消息
+            ctx.writeAndFlush(new TextWebSocketFrame("Echo: " + text));
+        } else if (frame instanceof BinaryWebSocketFrame) {
+            ByteBuf data = ((BinaryWebSocketFrame) frame).content();
+            // 处理二进制消息
+            ctx.writeAndFlush(new BinaryWebSocketFrame(data.retain()));
+        } else if (frame instanceof CloseWebSocketFrame) {
+            // 处理关闭帧
+            ctx.close();
+        } else if (frame instanceof PingWebSocketFrame) {
+            // 处理 Ping，自动回复 Pong
+            ctx.writeAndFlush(new PongWebSocketFrame(frame.content().retain()));
+        }
+    }
+});
+```
+
+### 14.7 实时通信（IM 系统）
+
+```java
+// IM 系统核心架构
+public class IMMessageDecoder extends ByteToMessageDecoder {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        // 协议：[4字节长度][1字节类型][消息体]
+        if (in.readableBytes() < 5) return;
+
+        int length = in.readInt();
+        byte type = in.readByte();
+
+        if (in.readableBytes() < length) {
+            in.resetReaderIndex();
+            return;
+        }
+
+        ByteBuf body = in.readRetainedSlice(length);
+        IMMessage msg = new IMMessage(type, body);
+        out.add(msg);
+    }
+}
+
+// 消息路由
+public class IMMessageRouter extends SimpleChannelInboundHandler<IMMessage> {
+    private final Map<Long, Channel> userChannels = new ConcurrentHashMap<>();
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, IMMessage msg) {
+        switch (msg.getType()) {
+            case MSG_TYPE_LOGIN:
+                long userId = msg.getUserId();
+                userChannels.put(userId, ctx.channel());
+                break;
+            case MSG_TYPE_CHAT:
+                long targetId = msg.getTargetId();
+                Channel targetChannel = userChannels.get(targetId);
+                if (targetChannel != null && targetChannel.isActive()) {
+                    targetChannel.writeAndFlush(msg);
+                } else {
+                    // 离线消息存储
+                    storeOfflineMessage(targetId, msg);
+                }
+                break;
+            case MSG_TYPE_GROUP:
+                broadcastToGroup(msg.getGroupId(), msg);
+                break;
+        }
+    }
+}
+```
+
+```text
+IM 系统关键设计：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 功能                  │ 实现方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 连接管理              │ ChannelGroup + 用户映射                    │
+│ 消息可靠              │ ACK 机制 + 消息重试 + 本地存储              │
+│ 消息顺序              │ 单聊序列号 / 群聊时间戳                    │
+│ 离线消息              │ Redis/DB 存储，上线拉取                    │
+│ 已读回执              │ 消息状态 + 批量更新                        │
+│ 群消息扩散            │ 写扩散 / 读扩散                            │
+│ 心跳保活              │ IdleStateHandler + Ping/Pong               │
+│ 粘包处理              │ LengthFieldBasedFrameDecoder                │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+## 十五、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；
 - Reactor 模式见「[并发编程](../基础知识/并发编程.md)」；

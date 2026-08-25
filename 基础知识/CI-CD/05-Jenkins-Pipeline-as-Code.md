@@ -654,6 +654,301 @@ agent any                                            // 应 label 'docker'
 // 解决：保留 Script Approval，别为省事放开
 ```
 
+## 十五、Jenkins Shared Library 开发
+
+### 15.1 Shared Library 结构
+
+```
+Shared Library 目录结构：
+  vars/
+    ├── buildAndPush.groovy      # 全局函数
+    ├── notifySlack.groovy        # 通知函数
+    ├── dockerBuild.groovy        # Docker 构建
+    └── deployK8s.groovy          # K8s 部署
+  src/
+    └── com/
+        └── company/
+            └── utils/
+                ├── GitUtils.groovy    # Git 工具类
+                └── DockerUtils.groovy # Docker 工具类
+  resources/
+    └── templates/
+        └── Dockerfile.template   # 模板文件
+```
+
+### 15.2 Shared Library 实现
+
+```groovy
+// vars/buildAndPush.groovy
+def call(Map config = [:]) {
+    def image = config.image ?: error("image is required")
+    def tag = config.tag ?: env.BUILD_NUMBER
+    def registry = config.registry ?: "registry.example.com"
+
+    pipeline {
+        agent any
+        stages {
+            stage('Build') {
+                steps {
+                    script {
+                        sh "docker build -t ${registry}/${image}:${tag} ."
+                    }
+                }
+            }
+            stage('Push') {
+                steps {
+                    withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                        sh "echo $PASS | docker login $registry -u $USER --password-stdin"
+                        sh "docker push ${registry}/${image}:${tag}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 使用 Shared Library
+@Library('corp-lib@v2') _
+buildAndPush(image: 'my-app', tag: '1.0.0')
+```
+
+---
+
+## 十六、Jenkins 流水线测试
+
+### 16.1 流水线测试框架
+
+```groovy
+// JenkinsfileUnit 测试
+pipeline {
+    agent any
+    stages {
+        stage('Test') {
+            steps {
+                script {
+                    // 使用 Jenkins Pipeline Unit 框架
+                    def pipeline = load 'Jenkinsfile'
+                    pipeline.call()
+                    // 验证 stage 是否正确执行
+                }
+            }
+        }
+    }
+}
+
+// 测试用例
+// JenkinsfileTest.groovy
+def testPipeline() {
+    def pipeline = load 'Jenkinsfile'
+    // Mock 环境变量
+    env.BRANCH_NAME = 'main'
+    env.BUILD_NUMBER = '123'
+    
+    // 执行流水线
+    pipeline.call()
+    
+    // 验证结果
+    assert binding.variables['STAGE_NAME'] == 'Build'
+}
+```
+
+### 16.2 测试策略
+
+| 测试类型 | 工具 | 说明 |
+|----------|------|------|
+| 单元测试 | Jenkins Pipeline Unit | 测试 Groovy 逻辑 |
+| 集成测试 | Jenkins Test Framework | 测试完整流水线 |
+| 端到端测试 | Selenium + Jenkins | 测试 Web UI |
+| 性能测试 | JMeter + Jenkins | 测试构建性能 |
+
+---
+
+## 十七、Jenkins 流水线优化
+
+### 17.1 构建加速
+
+```groovy
+// 1. 并行构建
+stage('Build') {
+    parallel {
+        stage('Backend') {
+            steps { sh 'mvn clean package -pl backend' }
+        }
+        stage('Frontend') {
+            steps { sh 'npm run build' }
+        }
+    }
+}
+
+// 2. 缓存优化
+stage('Build') {
+    steps {
+        script {
+            // Docker 层缓存
+            sh 'docker build --cache-from=registry/app:latest -t app:latest .'
+            // Maven 缓存
+            sh 'mvn clean package -Dmaven.repo.local=$HOME/.m2/repository'
+        }
+    }
+}
+
+// 3. 增量构建
+stage('Build') {
+    steps {
+        script {
+            // 只构建变更的模块
+            def changed = sh(script: 'git diff --name-only HEAD~1', returnStdout: true)
+            if (changed.contains('backend/')) {
+                sh 'mvn clean package -pl backend'
+            }
+        }
+    }
+}
+```
+
+### 17.2 优化效果
+
+| 优化措施 | 效果 | 适用场景 |
+|----------|------|----------|
+| 并行构建 | 构建时间减少 40-60% | 多模块项目 |
+| Docker 缓存 | 构建时间减少 30-50% | Docker 构建 |
+| Maven 缓存 | 构建时间减少 20-40% | Java 项目 |
+| 增量构建 | 构建时间减少 50-70% | 大型项目 |
+| 浅克隆 | 拉取时间减少 50-80% | 大型仓库 |
+
+---
+
+## 十八、Jenkins Docker Pipeline
+
+### 18.1 Docker Pipeline 配置
+
+```groovy
+// Docker Pipeline 插件
+pipeline {
+    agent {
+        docker {
+            image 'maven:3.9-eclipse-temurin-17'
+            args '-v $HOME/.m2:/root/.m2'
+            label 'docker'
+        }
+    }
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn clean package'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'mvn test'
+            }
+        }
+        stage('Docker Build') {
+            steps {
+                script {
+                    docker.build('my-app:latest', '-f Dockerfile .')
+                }
+            }
+        }
+        stage('Docker Push') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                        sh "echo $PASS | docker login -u $USER --password-stdin"
+                        docker.image('my-app:latest').push()
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### 18.2 Docker 多阶段构建
+
+```groovy
+// 多阶段 Docker 构建
+stage('Multi-Stage Build') {
+    steps {
+        script {
+            // 构建阶段
+            docker.build('my-app:build', '--target builder -f Dockerfile .')
+            // 运行阶段
+            docker.build('my-app:latest', '--target runtime -f Dockerfile .')
+        }
+    }
+}
+```
+
+---
+
+## 十九、Jenkins Blue Ocean 高级功能
+
+### 19.1 Blue Ocean 特性
+
+```
+Blue Ocean 高级功能：
+  1. 可视化编辑器：拖拽式创建流水线
+  2. 实时日志：流式查看构建日志
+  3. Git 集成：PR/分支可视化
+  4. 回放功能：回放历史构建
+  5. 并行阶段可视化：并行 stage 可视化
+
+  启用 Blue Ocean：
+    安装 Blue Ocean 插件
+    访问 http://jenkins:8080/blue
+```
+
+### 19.2 Blue Ocean vs Classic UI
+
+| 功能 | Blue Ocean | Classic UI |
+|------|------------|------------|
+| 界面 | 现代化 | 传统 |
+| 流程可视化 | 强 | 弱 |
+| Git 集成 | 深度集成 | 基础 |
+| 移动端 | 支持 | 不支持 |
+| 插件 | 部分插件 | 全部插件 |
+
+---
+
+## 二十、Jenkins 凭证管理
+
+### 20.1 凭证管理最佳实践
+
+```groovy
+// 1. 使用 Jenkins 凭据存储
+withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+    sh 'mysql -u$USER -p$PASS -e "SELECT 1"'
+}
+
+// 2. 使用 SSH 凭据
+withCredentials([sshUserPrivateKey(credentialsId: 'ssh-key', keyFileVariable: 'KEY', usernameVariable: 'USER')]) {
+    sh 'ssh -i $KEY $USER@server "ls"'
+}
+
+// 3. 使用 Secret 文件
+withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+    sh 'kubectl --kubeconfig=$KUBECONFIG get pods'
+}
+
+// 4. 使用 Secret 文本
+withCredentials([string(credentialsId: 'api-key', variable: 'API_KEY')]) {
+    sh 'curl -H "Authorization: Bearer $API_KEY" https://api.example.com'
+}
+```
+
+### 20.2 凭证安全
+
+| 安全措施 | 说明 |
+|----------|------|
+| 最小权限 | 只授予必要权限 |
+| 定期轮换 | 定期更换凭证 |
+| 审计日志 | 记录凭证使用 |
+| 加密存储 | Jenkins 内置加密 |
+| 访问控制 | 控制凭证访问权限 |
+
+---
+
 ## 本篇补充 Checklist
 
 - [ ] 新项目 Declarative，`script{}` 只做局部动态兜底。

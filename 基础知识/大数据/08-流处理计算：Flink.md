@@ -588,6 +588,259 @@ spec:
   需要精确一次 + 多源 → Flink
 ```
 
+## 十九、Flink 深度补充
+
+### 19.1 State Backend 对比
+
+```
+Flink 状态存储后端：
+
+  1. HashMapStateBackend（默认）：
+     - 状态存在 JVM 堆内存
+     - 适合大状态（堆内存充足时）
+     - Checkpoint → filesystem/S3
+     - 恢复：从 Checkpoint 加载到内存
+
+  2. EmbeddedRocksDBStateBackend：
+     - 状态存在本地 RocksDB（磁盘）
+     - 支持增量 Checkpoint（只传增量部分）
+     - 适合超大状态（> 堆内存）
+     - 写入：序列化 → RocksDB（慢于内存）
+     - 读取：反序列化（慢于内存）
+
+选择依据：
+  状态 < 堆内存 → HashMapStateBackend
+  状态 > 堆内存 → RocksDBStateBackend
+  增量 Checkpoint → RocksDB（必选）
+```
+
+| 状态后端 | 存储位置 | Checkpoint | 大状态支持 | 性能 |
+|----------|----------|------------|------------|------|
+| HashMap | JVM 堆 | 全量 | 差（受堆限制） | 高 |
+| RocksDB | 本地磁盘 | 增量/全量 | 好 | 中 |
+| 增量 RocksDB | 本地磁盘 | 增量（推荐） | 好 | 中 |
+
+### 19.2 Savepoint 深度
+
+```
+Savepoint = 全量一致性快照（手动触发，用于运维）
+
+与 Checkpoint 的区别：
+  Checkpoint：自动触发，增量（RocksDB），用于故障恢复
+  Savepoint：手动触发，全量，用于版本升级/迁移/扩缩容
+
+Savepoint 操作：
+  # 触发 Savepoint
+  flink savepoint <jobId> [targetDirectory]
+  
+  # 从 Savepoint 恢复
+  flink run -s <savepointPath> -c <mainClass> <jar>
+  
+  # 取消作业并触发 Savepoint
+  flink cancel -s <targetDirectory> <jobId>
+
+Savepoint 兼容性：
+  - 状态结构变更（新增/删除 State）→ 需要 State Processor API 迁移
+  - 算子变更（重命名/删除）→ 通过 UID 匹配
+  - 序列化变更 → 不兼容（需重新初始化）
+
+最佳实践：
+  1. 所有算子设置固定 UID（uid="myOperator"）
+  2. 升级前触发 Savepoint，升级后从 Savepoint 恢复
+  3. 定期触发 Savepoint（作为备份）
+  4. Savepoint 保留策略：保留最近 N 个
+```
+
+### 19.3 Watermark 策略对比
+
+```
+Watermark 策略：
+
+  1. 固定延迟（Fixed Out-of-Orderness）：
+     Watermark = 当前最大时间戳 - 固定延迟
+     适用：数据延迟可预测（如网络延迟 5s）
+     配置：WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5))
+
+  2. 单调递增（Monotonous Timestamps）：
+     Watermark = 当前最大时间戳
+     适用：数据严格有序（如自增 ID）
+     配置：WatermarkStrategy.forMonotonousTimestamps()
+
+  3. 自定义 Watermark（周期性/标点）：
+     周期性：每 N 秒生成一次 Watermark
+     标点：遇到特殊标记时生成 Watermark
+     适用：复杂业务逻辑
+
+  4. 多流 Watermark 对齐：
+     窗口 = 所有输入流 Watermark 的最小值
+     一条流慢 → 所有流等待（背压）
+     解决：设置合理的最大延迟（最大允许等待时间）
+
+最佳实践：
+  1. Watermark 延迟 = 业务可接受的最大延迟
+  2. 不要设太短（丢数据）/太长（延迟高）
+  3. 配合 Allowed Lateness（允许迟到数据）
+  4. 配合 Side Output（侧输出迟到数据）
+```
+
+### 19.4 Side Output（侧输出）
+
+```java
+// 侧输出 = 将不满足主输出的数据路由到其他输出流
+
+OutputTag<String> lateTag = new OutputTag<String>("late-data") {};
+
+SingleOutputStreamOperator<Event> result = stream
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(1))
+    .sideOutputLateData(lateTag)
+    .process(new ProcessWindowFunction<Event, String, String, TimeWindow>() {
+        @Override
+        public void process(String key, Context ctx, Iterable<Event> elements, Collector<String> out) {
+            // 正常输出
+            out.collect(computeResult(elements));
+        }
+    });
+
+// 获取侧输出
+DataStream<String> lateStream = result.getSideOutput(lateTag);
+// 写入 Kafka/告警/重试
+```
+
+### 19.5 Flink Async I/O
+
+```
+异步 IO = 并发请求外部系统（避免同步等待）
+
+适用场景：
+  查询外部数据库（Redis/MySQL/ES）
+  调用外部 API（风控/特征/画像）
+  并发度高、延迟敏感
+
+实现方式：
+  1. AsyncDataStream.unorderedWait()（无序，推荐）：
+     - 请求完成即输出（不等顺序）
+     - 吞吐量高
+     - 延迟低
+
+  2. AsyncDataStream.orderedWait()（有序）：
+     - 保持输入顺序
+     - 吞吐量低
+     - 适用：严格顺序场景
+
+  3. 自定义 AsyncFunction：
+     - 实现 asyncInvoke()（异步请求）
+     - 实现 timeout()（超时处理）
+     - 实现 result()（结果处理）
+
+配置：
+  async.io.timeout=30s（超时时间）
+  async.io.capacity=100（并发请求数）
+  async.io.retry-times=3（重试次数）
+```
+
+### 19.6 Flink SQL 窗口大全
+
+```sql
+-- 滚动窗口（Tumbling）
+SELECT
+  TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS window_start,
+  COUNT(*) AS cnt
+FROM events
+GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE);
+
+-- 滑动窗口（Sliding）
+SELECT
+  HOP_START(event_time, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) AS window_start,
+  COUNT(*) AS cnt
+FROM events
+GROUP BY HOP(event_time, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE);
+
+-- 会话窗口（Session）
+SELECT
+  SESSION_START(event_time, INTERVAL '30' MINUTE) AS session_start,
+  user_id,
+  COUNT(*) AS cnt
+FROM events
+GROUP BY user_id, SESSION(event_time, INTERVAL '30' MINUTE);
+
+-- 累积窗口（Cumulative）
+SELECT
+  CUMULATE_START(event_time, INTERVAL '1' HOUR, INTERVAL '1' DAY) AS window_start,
+  SUM(amount) AS total
+FROM orders
+GROUP BY CUMULATE(event_time, INTERVAL '1' HOUR, INTERVAL '1' DAY);
+
+-- Over 窗口（非分组）
+SELECT *,
+  COUNT(*) OVER (
+    PARTITION BY user_id
+    ORDER BY event_time
+    ROWS BETWEEN 100 PRECEDING AND CURRENT ROW
+  ) AS running_count
+FROM events;
+```
+
+### 19.7 Flink Exactly-Once 写入 Sink
+
+| Sink | Exactly-Once | 说明 |
+|------|--------------|------|
+| Kafka | 支持 | 事务性写入（Kafka 事务） |
+| Filesystem | 支持 | TwoPhaseCommitSinkFunction |
+| JDBC | 支持 | 两阶段提交（需数据库支持） |
+| HBase | 不支持 | 仅 At-Least-Once |
+| ES | 不支持 | 仅 At-Least-Once（需幂等） |
+
+```
+实现 Exactly-Once 的模式：
+  1. 事务性 Sink（内置支持）：
+     Kafka Transactions / JDBC 两阶段提交
+  
+  2. 幂等写入（Idempotent）：
+     写入天然幂等（如 UPSERT）
+     配合去重（如 Redis Bloom Filter）
+  
+  3. Checkpoint + 重放：
+     从 Checkpoint 重放（At-Least-Once）
+     需要 Source 支持重放（如 Kafka Offset 回滚）
+
+最佳实践：
+  优先用支持 Exactly-Once 的 Sink
+  不支持的 Sink → 幂等 + Checkpoint
+  Kafka Sink → 最推荐（事务+精确一次）
+```
+
+### 19.8 Flink on Kubernetes 部署
+
+```
+Flink on K8s 两种模式：
+
+  1. Session Mode（会话模式）：
+     - 预先部署 Flink 集群
+     - 多个作业共享集群
+     - 适合：大量小作业
+     - 缺点：资源隔离差
+
+  2. Application Mode（应用模式，推荐）：
+     - 每个作业一个 Flink 集群
+     - 作业结束后集群释放
+     - 适合：生产作业
+     - 资源隔离好
+
+配置（Application Mode）：
+  kubernetes.jobmanager.cpu=2
+  kubernetes.taskmanager.cpu=4
+  kubernetes.taskmanager.memory=8192m
+  kubernetes.taskmanager replicas=4
+  kubernetes.operator.enabled=true（Flink K8s Operator）
+
+Flink K8s Operator：
+  声明式管理 Flink 作业（CRD）
+  自动扩缩容/故障恢复/Savepoint
+  适合 GitOps 流程
+```
+
 ## 二十、与其他板块的关系
 
 - 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；

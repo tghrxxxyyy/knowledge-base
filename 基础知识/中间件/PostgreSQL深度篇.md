@@ -572,7 +572,221 @@ SELECT * FROM pg_extension;
 
 ---
 
-## 十六、与其他板块的关系
+## 十六、PostgreSQL 连接池与云托管深度
+
+### 16.1 PgBouncer 连接池
+
+```
+PgBouncer 定位：
+  轻量级连接池代理，降低 PostgreSQL 连接开销
+  每个连接 = 一个 Backend 进程（fork 模型），连接池复用避免频繁 fork
+
+三种池化模式：
+  session：连接释放时归还池（最安全，兼容性最好）
+  transaction：事务结束归还（推荐，减少连接占用）
+  statement：语句结束归还（最激进，不支持多语句事务）
+
+配置示例（pgbouncer.ini）：
+  [databases]
+  mydb = host=127.0.0.1 port=5432 dbname=mydb
+
+  [pgbouncer]
+  pool_mode = transaction
+  max_client_conn = 1000
+  default_pool_size = 20
+  min_pool_size = 5
+  reserve_pool_size = 5
+  reserve_pool_timeout = 3
+  server_lifetime = 3600
+  server_idle_timeout = 600
+  log_connections = 1
+  log_disconnections = 1
+```
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| pool_mode | 池化模式 | transaction（推荐） |
+| max_client_conn | 最大客户端连接 | 按业务峰值设 |
+| default_pool_size | 每用户每库连接数 | 20~50 |
+| reserve_pool_size | 预留连接 | 5~10 |
+| server_lifetime | 服务端连接存活时间 | 3600s |
+
+### 16.2 Pgpool-II vs PgBouncer
+
+| 维度 | PgBouncer | Pgpool-II |
+|------|-----------|-----------|
+| 定位 | 纯连接池 | 连接池 + 读写分离 + 负载均衡 + 复制 |
+| 复杂度 | 低（单进程） | 高（多进程） |
+| 读写分离 | 不支持 | 原生支持 |
+| 故障转移 | 不支持 | 支持（检测 + 切换） |
+| 查询缓存 | 不支持 | 支持（但意义不大） |
+| 适用 | 高并发连接池 | 需要读写分离/HA 的场景 |
+
+### 16.3 连接池最佳实践
+
+```
+选型建议：
+  简单连接池 → PgBouncer（轻量、高效）
+  需要读写分离 → Pgpool-II 或应用层路由
+  云托管 → 云厂商内置连接池（Aurora/RDS Proxy）
+
+生产配置：
+  1. pool_mode=transaction（避免长事务占连接）
+  2. max_client_conn 按峰值 QPS × 平均事务时间估算
+  3. default_pool_size 按后端连接数 × 节点数估算
+  4. 启用 log_connections/log_disconnections 审计
+  5. 配合 PostgreSQL 的 max_connections 一起调
+```
+
+### 16.4 云托管 PostgreSQL 选型
+
+| 服务 | 特性 | 适用 |
+|------|------|------|
+| Aurora PostgreSQL | 存算分离、自动扩展、6 副本 | 企业级、高可用 |
+| Cloud SQL | Google 托管、简单易用 | 中小规模 |
+| PolarDB | 阿里云托管、共享存储 | 国内场景 |
+| Supabase | 开源 BaaS、实时订阅 | 快速开发 |
+| Neon | Serverless PostgreSQL、分支 | 开发测试 |
+| Amazon RDS Proxy | 托管连接池 | Aurora/RDS 配套 |
+
+```
+Aurora PostgreSQL 深度：
+  存储层：6 副本跨 3 AZ，写 4/6 确认即返回
+  计算层：最多 15 只读副本，自动负载均衡
+  扩展：存储自动扩展到 128TB，无需预配
+  备份：连续备份到 S3，秒级 RPO
+  性能：比标准 PG 快 5 倍（写）/ 3 倍（读）
+  Serverless：按需自动扩缩，适合开发/测试/突发
+```
+
+### 16.5 PostgreSQL 扩展生态补充
+
+| 扩展 | 说明 | 适用 |
+|------|------|------|
+| PostGIS | 地理空间查询（事实标准） | LBS/地图 |
+| pgvector | 向量检索（AI 嵌入） | RAG/推荐 |
+| TimescaleDB | 时序数据（自动分区+压缩） | IoT/监控 |
+| Citus | 分布式 PG（分片） | 大规模数据 |
+| pg_partman | 自动分区管理 | 时序/归档 |
+| pg_stat_statements | SQL 性能统计 | 慢查询分析 |
+| pg_trgm | 三元组模糊搜索 | 模糊匹配 |
+| zhparser/pg_jieba | 中文全文搜索 | 中文检索 |
+| pg_cron | 定时任务 | 数据维护 |
+| pgAudit | 审计日志 | 合规 |
+
+### 16.6 PostgreSQL 逻辑复制高级用法
+
+```sql
+-- 逻辑复制 + 过滤
+CREATE PUBLICATION my_pub FOR TABLE orders, users
+  WITH (publish = 'insert,update');
+
+-- 选择性复制（只复制特定列）
+CREATE PUBLICATION my_pub FOR TABLE orders
+  (order_id, user_id, amount);
+
+-- 跨版本迁移（PG 14 → PG 16）
+-- 1. 目标库安装新版本 PG
+-- 2. pg_dumpall --binary-upgrade 旧库
+-- 3. 逻辑复制同步增量数据
+-- 4. 切流到新库
+
+-- 逻辑复制监控
+SELECT * FROM pg_stat_replication;
+SELECT * FROM pg_stat_subscription;
+SELECT pg_size_bytes(pg_wal_lsn_diff(
+  pg_current_wal_lsn(), replay_lsn
+)) AS replication_lag;
+```
+
+### 16.7 PostgreSQL 监控查询大全
+
+```sql
+-- 连接数监控
+SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+SELECT pid, usename, application_name, state, query_start, query
+  FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start;
+
+-- 慢查询（pg_stat_statements）
+SELECT query, calls, total_exec_time, mean_exec_time, rows
+  FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;
+
+-- 缓存命中率
+SELECT sum(blks_hit) / (sum(blks_hit) + sum(blks_read)) AS hit_ratio
+  FROM pg_stat_database;
+
+-- 表膨胀检测
+SELECT schemaname, relname, n_dead_tup, n_live_tup,
+  round(n_dead_tup::numeric / (n_live_tup + 1) * 100, 2) AS dead_ratio
+  FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;
+
+-- 复制延迟
+SELECT client_addr, state, sync_state,
+  pg_size_bytes(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS lag
+  FROM pg_stat_replication;
+
+-- 锁等待
+SELECT blocked.pid AS blocked_pid, blocked.query AS blocked_query,
+  blocking.pid AS blocking_pid, blocking.query AS blocking_query
+  FROM pg_stat_activity blocked
+  JOIN pg_locks bl ON blocked.pid = bl.pid AND NOT bl.granted
+  JOIN pg_locks gl ON bl.locktype = gl.locktype
+    AND bl.database IS NOT DISTINCT FROM gl.database
+    AND bl.relation IS NOT DISTINCT FROM gl.relation
+    AND bl.page IS NOT DISTINCT FROM gl.page
+    AND bl.tuple IS NOT DISTINCT FROM gl.tuple
+    AND bl.transactionid IS NOT DISTINCT FROM gl.transactionid
+    AND bl.pid != gl.pid AND gl.granted
+  JOIN pg_stat_activity blocking ON gl.pid = blocking.pid;
+```
+
+### 16.8 PostgreSQL Partitioning 深度
+
+```sql
+-- 哈希分区（均匀分布）
+CREATE TABLE orders (
+  id BIGSERIAL,
+  user_id BIGINT,
+  amount DECIMAL(10,2)
+) PARTITION BY HASH (user_id);
+
+CREATE TABLE orders_p0 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE orders_p1 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE orders_p2 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE orders_p3 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+-- 默认分区（兜底）
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+
+-- 分区维护自动化
+CREATE EXTENSION pg_partman;
+SELECT partman.create_parent('public.orders', 'created_at', 'native', 'monthly',
+  p_template_table := 'public.orders_template');
+
+-- 分区数据迁移（冷热分离）
+ALTER TABLE orders DETACH PARTITION orders_2025_01 CONCURRENTLY;
+-- 导出到冷存储
+COPY orders_2025_01 TO '/cold_storage/orders_2025_01.csv';
+-- 删除旧分区
+DROP TABLE orders_2025_01;
+```
+
+### 16.9 PostgreSQL 性能调优清单
+
+| 调优项 | 做法 | 效果 |
+|--------|------|------|
+| shared_buffers | 25% 系统内存 | 减少磁盘读 |
+| effective_cache_size | 75% 系统内存 | 优化器估算更准 |
+| work_mem | 256MB~1GB（按并发调） | 排序/哈希加速 |
+| maintenance_work_mem | 2~4GB | VACUUM/索引加速 |
+| wal_buffers | 64MB | 写入加速 |
+| max_parallel_workers_per_gather | CPU 核数/2 | 并行查询 |
+| random_page_cost | SSD 设为 1.1 | 优化器更倾向索引 |
+| effective_io_concurrency | SSD 设为 200 | 并行 IO |
+
+---
+
+## 十七、与其他板块的关系
 
 - MySQL 知识见「[基础知识/mysql知识](../mysql知识.md)」；
 - 分库分表见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」与「[分库分表板块](../../分库分表与数据迁移/)」；

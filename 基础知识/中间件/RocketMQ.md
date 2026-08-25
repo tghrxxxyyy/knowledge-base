@@ -959,6 +959,531 @@ pullBatchSize=1
   └── 死信队列有消息 → 立即告警
 ```
 
+## RocketMQ 电商订单全流程实战
+
+### 订单创建到完成的消息流
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant GW as API 网关
+    participant OS as 订单服务
+    participant IS as 库存服务
+    participant PS as 支付服务
+    participant NS as 通知服务
+    participant MQ as RocketMQ
+
+    C->>GW: 1. 创建订单
+    GW->>OS: 2. 创建订单请求
+    OS->>MQ: 3. 发送 Half Message（order-created）
+    OS->>OS: 4. 执行本地事务（创建订单+扣减库存）
+    alt 本地事务成功
+        OS->>MQ: 5a. Commit 消息
+        MQ->>IS: 6. 消费 order-created → 扣减库存
+        MQ->>PS: 7. 消费 order-created → 创建支付单
+        MQ->>NS: 8. 消费 order-created → 发送下单通知
+    else 本地事务失败
+        OS->>MQ: 5b. Rollback 消息
+    end
+    
+    Note over MQ: 定时消息：30 分钟未支付自动关闭
+    MQ->>OS: 9. 消费 order-timeout → 关闭订单
+    MQ->>IS: 10. 消费 order-timeout → 释放库存
+```
+
+### 订单状态机消息设计
+
+```
+订单状态流转与消息映射：
+  CREATED ──→ PAID ──→ SHIPPED ──→ DELIVERED ──→ COMPLETED
+     │          │          │            │            │
+     ▼          ▼          ▼            ▼            ▼
+  order-created  order-paid  order-shipped  order-delivered  order-completed
+     │          │          │            │            │
+     ▼          ▼          ▼            ▼            ▼
+  库存扣减    支付完成    物流通知    签收确认    积分发放
+  支付单创建  积分冻结    状态更新    好评提醒    评价邀请
+  
+取消流程：
+  CREATED ──→ CANCELLED（未支付取消）
+  PAID ──→ REFUNDING ──→ REFUNDED（支付后退款）
+```
+
+### 完整订单消息代码
+
+```java
+// 订单服务：事务消息创建订单
+@Service
+public class OrderService {
+
+    @Autowired
+    private TransactionMQProducer orderProducer;
+
+    public Order createOrder(CreateOrderRequest request) {
+        Message msg = new Message("order-topic", "order-created",
+            JSON.toJSONBytes(buildOrderMessage(request)));
+        msg.setKeys(request.getOrderId());
+
+        SendResult result = orderProducer.sendMessageInTransaction(msg, request);
+        if (result.getSendStatus() != SendStatus.SEND_OK) {
+            throw new BusinessException("订单创建失败");
+        }
+
+        return orderRepository.findById(request.getOrderId());
+    }
+}
+
+// 事务监听器
+@Component
+public class OrderTransactionListener implements TransactionListener {
+
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        CreateOrderRequest request = (CreateOrderRequest) arg;
+        try {
+            // 创建订单
+            Order order = orderService.createLocal(request);
+            // 扣减库存（同步调用或本地事务消息）
+            inventoryService.deduct(request.getItems());
+            return LocalTransactionState.COMMIT_MESSAGE;
+        } catch (Exception e) {
+            log.error("订单创建失败", e);
+            return LocalTransactionState.ROLLBACK_MESSAGE;
+        }
+    }
+
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        String orderId = msg.getKeys();
+        boolean exists = orderService.exists(orderId);
+        return exists ? LocalTransactionState.COMMIT_MESSAGE
+                     : LocalTransactionState.ROLLBACK_MESSAGE;
+    }
+}
+
+// 库存服务消费者
+@Component
+@RocketMQMessageListener(topic = "order-topic", consumerGroup = "inventory-consumer")
+public class InventoryConsumer implements RocketMQListener<MessageExt> {
+
+    @Override
+    public void onMessage(MessageExt msg) {
+        if (!"order-created".equals(msg.getTags())) return;
+
+        OrderMessage orderMsg = JSON.parseObject(msg.getBody(), OrderMessage.class);
+        // 幂等检查
+        if (inventoryService.isDeducted(orderMsg.getOrderId())) return;
+
+        inventoryService.deduct(orderMsg.getItems());
+        inventoryService.markDeducted(orderMsg.getOrderId());
+    }
+}
+```
+
+## RocketMQ 消息过滤 SQL 语法深入
+
+### SQL92 过滤完整语法
+
+```sql
+-- 比较运算符
+amount > 1000
+amount >= 500 AND amount <= 1000
+amount != 0
+amount <> 0  -- 等价于 !=
+
+-- 字符串匹配
+region = 'SH'
+region IN ('SH', 'BJ', 'GZ')
+region LIKE 'east%'      -- 前缀匹配
+region LIKE '%center'    -- 后缀匹配
+region LIKE '%east%'     -- 包含匹配
+
+-- 逻辑运算
+amount > 1000 AND region = 'SH'
+amount > 1000 OR priority = 'HIGH'
+NOT (region = 'TEST')
+(amount > 1000 OR amount < 100) AND region = 'SH'
+
+-- NULL 判断
+region IS NOT NULL
+region IS NULL
+priority IS NOT NULL AND priority != ''
+
+-- 数学运算
+amount > 100 * 10
+(amount - 100) * 2 > 500
+amount / 10 > 100
+amount % 2 = 0  -- 取模（部分版本支持）
+
+-- BETWEEN 范围
+amount BETWEEN 500 AND 1000
+create_time BETWEEN '2024-01-01' AND '2024-12-31'
+
+-- 支持的属性类型
+  INT, LONG, FLOAT, DOUBLE, STRING, BOOLEAN, DATETIME
+
+-- 注意事项：
+-- 1. 属性必须是消息的 User Properties 或系统属性
+-- 2. SQL 过滤在 Broker 端执行，有性能开销
+-- 3. 复杂表达式会增加 Broker CPU 负载
+-- 4. 建议高吞吐场景优先使用 Tag 过滤
+```
+
+### SQL 过滤性能优化
+
+```
+SQL 过滤性能优化策略：
+  1. 简单条件优先：region = 'SH' 比 (region = 'SH' AND amount > 1000) 快
+  2. 等值匹配优先：a = 'X' 比 a LIKE 'X%' 快
+  3. 减少属性数量：只传递需要过滤的属性
+  4. 避免复杂表达式：减少计算开销
+  5. 监控过滤率：过滤后消息量 / 总消息量
+     过滤率低（<10%）→ 考虑拆分 Topic
+     过滤率高（>90%）→ SQL 过滤合适
+
+性能基准（3 台 Broker，16 核 32G）：
+  Tag 过滤：100 万 msg/s
+  简单 SQL：50 万 msg/s
+  复杂 SQL：20 万 msg/s
+```
+
+## RocketMQ Connect 框架详解
+
+### Connect 架构深入
+
+```mermaid
+graph TD
+    subgraph Source Connectors
+        MySQL[MySQL Source] -->|CDC| T1[Topic: mysql-changes]
+        Kafka[Kafka Source] -->|MirrorMaker| T2[Topic: kafka-mirror]
+        File[File Source] -->|Tail| T3[Topic: file-logs]
+    end
+    
+    subgraph RocketMQ Cluster
+        T1 --> B1[Broker 1]
+        T2 --> B2[Broker 2]
+        T3 --> B3[Broker 3]
+    end
+    
+    subgraph Sink Connectors
+        B1 --> ES[Elasticsearch Sink]
+        B2 --> HBase[HBase Sink]
+        B3 --> S3[S3 Sink]
+    end
+    
+    CC[Connect Cluster] -->|管理| MySQL
+    CC -->|管理| ES
+    CC -->|REST API| Admin[管理界面]
+```
+
+### 自定义 Connector 开发
+
+```java
+// 自定义 Source Connector 示例
+public class CustomSourceConnector extends SourceConnector {
+
+    private Map<String, String> config;
+
+    @Override
+    public void start(Map<String, String> props) {
+        this.config = props;
+    }
+
+    @Override
+    public Class<? extends Task> taskClass() {
+        return CustomSourceTask.class;
+    }
+
+    @Override
+    public List<Map<String, String>> taskConfigs(int maxTasks) {
+        // 分配任务给多个 Task
+        List<Map<String, String>> configs = new ArrayList<>();
+        for (int i = 0; i < maxTasks; i++) {
+            Map<String, String> taskConfig = new HashMap<>(config);
+            taskConfig.put("task.id", String.valueOf(i));
+            configs.add(taskConfig);
+        }
+        return configs;
+    }
+
+    @Override
+    public ConfigDef configDef() {
+        ConfigDef def = new ConfigDef();
+        def.define("source.url", ConfigDef.Type.STRING, ConfigDef.Importance.HIGH);
+        def.define("topic", ConfigDef.Type.STRING, ConfigDef.Importance.HIGH);
+        return def;
+    }
+}
+
+// Source Task 实现
+public class CustomSourceTask extends SourceTask {
+
+    @Override
+    public List<SourceRecord> poll() {
+        // 从数据源拉取数据
+        List<SourceRecord> records = new ArrayList<>();
+        List<Event> events = dataSource.fetchEvents();
+
+        for (Event event : events) {
+            Map<String, String> sourcePartition = Map.of("id", event.getId());
+            Map<String, Long> sourceOffset = Map.of("offset", event.getOffset());
+
+            SourceRecord record = new SourceRecord(
+                sourcePartition, sourceOffset,
+                topic, null,  // partition null = auto
+                KeySchema, event.getKey(),
+                ValueSchema, event.getValue(),
+                event.getTimestamp()
+            );
+            records.add(record);
+        }
+        return records;
+    }
+}
+```
+
+## RocketMQ 事务日志存储机制
+
+### Half Message 存储原理
+
+```
+Half Message 存储流程：
+  1. Producer 发送 Half Message 到 Broker
+  2. Broker 将消息写入 HALF_TOPIC（内部 Topic）
+  3. Broker 不投递该消息（不进入 ConsumeQueue）
+  4. 返回发送成功 ACK 给 Producer
+
+Half Message 数据结构：
+  ├── 原始 Topic + QueueId（备份，用于后续还原）
+  ├── 消息 Body
+  ├── 消息 Properties
+  └── TRAN_MSG = true（标记为半消息）
+
+存储位置：
+  COMMITLOG → HALF_TOPIC 对应的 ConsumeQueue
+  （与普通消息共用 CommitLog，通过 Topic 区分）
+
+事务日志存储：
+  ├── HALF_TOPIC ConsumeQueue：半消息索引
+  ├── CHANGE_TOPIC ConsumeQueue：已确认消息索引
+  └── 原始 Topic ConsumeQueue：提交后的消息索引
+```
+
+### 事务回查存储
+
+```
+事务回查日志：
+  Broker 维护事务状态表：
+  ├── Key: Half Message 的 offset
+  ├── Value: 事务状态（UNKNOWN/COMMIT/ROLLBACK）
+  ├── Timestamp: 创建时间
+  └── RetryCount: 回查次数
+
+回查存储流程：
+  1. Half Message 超时未确认
+  2. Broker 从 HALF_TOPIC 扫描未确认消息
+  3. 发送回查请求到 Producer
+  4. Producer 返回状态
+  5. Broker 更新事务状态表
+  6. 根据状态决定提交/回滚/继续等待
+```
+
+## RocketMQ 顺序消息在分布式系统中的保证
+
+### 分布式顺序消息架构
+
+```
+分布式顺序消息挑战：
+  问题：单 Queue 有序但吞吐低，多 Queue 并行但无序
+  解决：MessageGroup + Queue 分配策略
+
+MessageGroup 分配策略：
+  1. 哈希取模：orderId.hashCode() % queueNum
+     优点：均匀分布
+     缺点：Queue 数变化时消息可能乱序
+
+  2. 固定映射：维护 orderId → queueId 映射表
+     优点：Queue 变化不影响顺序
+     缺点：需要额外存储
+
+  3. 一致性哈希：环形映射
+     优点：Queue 增减只影响部分消息
+     缺点：实现复杂
+
+最佳实践：
+  ├── 同一业务实体（订单/用户）的消息进同一 Queue
+  ├── 不同业务实体的消息可并行消费
+  ├── Queue 数量 = 消费者数量 × N（N 为倍数）
+  └── 消费者数量 = Queue 数量（一一对应最简单）
+```
+
+### 分布式顺序消费代码
+
+```java
+// 生产者：确保同一订单消息进同一 Queue
+public class OrderedProducer {
+    public SendResult sendOrderMessage(Message msg, String orderId) {
+        // 使用 MessageQueueSelector 选择 Queue
+        return producer.send(msg, (mqs, msg1, arg) -> {
+            String key = (String) arg;
+            // 一致性哈希选择 Queue
+            int index = Math.abs(key.hashCode()) % mqs.size();
+            return mqs.get(index);
+        }, orderId);
+    }
+}
+
+// 消费者：顺序消费
+@Component
+@RocketMQMessageListener(topic = "order-topic", consumerGroup = "order-consumer")
+public class OrderedConsumer implements RocketMQListenerOrderly<MessageExt> {
+
+    @Override
+    public void onMessage(MessageExt msg) {
+        String orderId = msg.getKeys();
+        String tags = msg.getTags();
+
+        switch (tags) {
+            case "order-created":
+                handleOrderCreated(orderId);
+                break;
+            case "order-paid":
+                handleOrderPaid(orderId);
+                break;
+            case "order-shipped":
+                handleOrderShipped(orderId);
+                break;
+        }
+    }
+}
+```
+
+## RocketMQ Dashboard 监控实战
+
+### 监控指标与告警
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: rocketmq-alerts
+    rules:
+      # 消费延迟告警
+      - alert: RocketMQ_ConsumerLagHigh
+        expr: rocketmq_consumer_lag > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "消费延迟过高: {{ $labels.group }}"
+          description: "{{ $labels.group }} 延迟 {{ $value }} 条消息"
+
+      # Broker 离线告警
+      - alert: RocketMQ_BrokerDown
+        expr: rocketmq_broker_online == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Broker 离线: {{ $labels.broker }}"
+
+      # 消费失败率告警
+      - alert: RocketMQ_ConsumeFailRate
+        expr: rate(rocketmq_consumer_fail_total[5m]) / rate(rocketmq_consumer_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "消费失败率 > 1%: {{ $labels.group }}"
+
+      # 死信队列告警
+      - alert: RocketMQ_DeadLetterQueue
+        expr: rocketmq_dead_letter_queue_size > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "死信队列有消息: {{ $labels.group }}"
+
+      # 消息堆积告警
+      - alert: RocketMQ_MessageBacklog
+        expr: rocketmq_message_backlog > 1000000
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "消息堆积 > 100万: {{ $labels.topic }}"
+```
+
+### Grafana Dashboard 关键 Panel
+
+```
+RocketMQ Grafana Dashboard 核心 Panel：
+  1. Broker 写入 TPS / 读取 TPS
+  2. Consumer Group 消费延迟（commitLogOffset - consumerOffset）
+  3. 消息堆积量（按 Topic/ConsumerGroup）
+  4. Broker 内存使用 / GC 频率
+  5. 网络吞吐量（发送/接收字节数）
+  6. 消费者在线数 / 消费者延迟
+  7. 事务消息回查次数
+  8. 定时消息投递延迟
+  9. 死信队列消息数
+  10. Topic 数量 / Queue 数量
+```
+
+## RocketMQ 大规模性能调优
+
+### 性能调优参数
+
+```properties
+# Broker 端调优
+# 写入优化
+sendMessageThreadPoolNums=16          # 发送线程数
+putMessageLockType=commitlog          # 锁类型
+transientStorePoolEnable=true         # 临时存储池
+
+# 消费优化
+consumeThreadMin=20                   # 最小消费线程
+consumeThreadMax=64                   # 最大消费线程
+consumeMessageBatchMaxSize=32         # 批量消费大小
+
+# 存储优化
+flushDiskType=ASYNC_FLUSH            # 异步刷盘（性能优先）
+brokerRole=ASYNC_MASTER              # 异步复制（性能优先）
+fileReservedTime=72                   # 文件保留时间（小时）
+
+# 网络优化
+serverSocketTimeout=3000              # 服务端超时
+transferThreadPoolNums=8              # 传输线程数
+```
+
+### 性能基准数据
+
+```
+测试环境：3 台机器，64核128G，SSD，消息体 1KB
+
+不同配置下的性能对比：
+  配置 1：同步刷盘 + 同步复制
+    写入 TPS：8 万
+    消费 TPS：5 万
+    延迟 P99：5ms
+
+  配置 2：异步刷盘 + 同步复制
+    写入 TPS：12 万
+    消费 TPS：8 万
+    延迟 P99：2ms
+
+  配置 3：异步刷盘 + 异步复制
+    写入 TPS：20 万
+    消费 TPS：12 万
+    延迟 P99：1ms
+
+调优建议：
+  ├── 金融场景：配置 1（数据不丢）
+  ├── 电商场景：配置 2（平衡性能和可靠）
+  ├── 日志场景：配置 3（性能优先）
+  └── 监控先行：部署 Prometheus + Grafana 监控
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

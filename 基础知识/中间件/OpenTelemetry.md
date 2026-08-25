@@ -766,7 +766,366 @@ Span span = tracer.spanBuilder("SELECT orders")
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、OpenTelemetry 高级特性与生产实践
+
+### 11.1 Collector 部署模式
+
+```text
+OTel Collector 两种部署模式：
+┌──────────────────────┬────────────────────────────────────────────┐
+│                      │ Agent 模式              │ Gateway 模式      │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 部署位置              │ 与应用同节点/Pod        │ 独立部署           │
+│ 资源消耗              │ 共享节点资源            │ 独立资源           │
+│ 网络                  │ 本地通信               │ 远程通信           │
+│ 扩展性                │ 水平扩展差             │ 水平扩展好         │
+│ 可用性                │ 单点故障               │ 高可用             │
+│ 适用场景              │ 小规模/开发环境        │ 生产环境           │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```yaml
+# Agent 模式部署（DaemonSet）
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector-agent
+  template:
+    metadata:
+      labels:
+        app: otel-collector-agent
+    spec:
+      containers:
+      - name: collector
+        image: otel/opentelemetry-collector-contrib:0.85.0
+        args: ["--config=/etc/otelcol/config.yaml"]
+        ports:
+        - containerPort: 4317  # OTLP gRPC
+        - containerPort: 4318  # OTLP HTTP
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otelcol
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+```
+
+```yaml
+# Gateway 模式部署（Deployment + HPA）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: otel-collector-gateway
+  template:
+    metadata:
+      labels:
+        app: otel-collector-gateway
+    spec:
+      containers:
+      - name: collector
+        image: otel/opentelemetry-collector-contrib:0.85.0
+        args: ["--config=/etc/otelcol/config.yaml"]
+        ports:
+        - containerPort: 4317
+        - containerPort: 4318
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+          requests:
+            cpu: "1"
+            memory: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-collector-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: otel-collector-gateway
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+### 11.2 Resource 语义约定
+
+```yaml
+# OTel Resource 语义约定
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  resource:
+    attributes:
+    - key: service.name
+      value: "my-service"
+      action: upsert
+    - key: service.namespace
+      value: "production"
+      action: upsert
+    - key: service.version
+      value: "1.2.3"
+      action: upsert
+    - key: deployment.environment
+      value: "production"
+      action: upsert
+    - key: host.name
+      value: "${HOSTNAME}"
+      action: insert
+    - key: os.type
+      value: "linux"
+      action: insert
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger-collector:4317
+    tls:
+      insecure: false
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [resource]
+      exporters: [prometheus]
+```
+
+### 11.3 Context Propagation（W3C TraceContext）
+
+```text
+W3C TraceContext 传播格式：
+┌─────────────────────────────────────────────────────────────────┐
+│  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 │
+│                   ├────┤ ├──────────────┤ ├──────────────┤ ├────┤  │
+│                   版本  │  Trace ID      │  Span ID      │ 采样  │
+└─────────────────────────────────────────────────────────────────┘
+
+传播 Header：
+- traceparent：Trace ID + Span ID + 采样标志
+- tracestate：厂商自定义数据（可选）
+- baggage：跨服务传播业务数据
+```
+
+```java
+// Java OTel SDK 配置
+OpenTelemetry otel = OpenTelemetrySdk.builder()
+    .setPropagators(ContextPropagators.create(
+        TextMapPropagator.composite(
+            W3CTraceContextPropagator.getInstance(),
+            W3CBaggagePropagator.getInstance()
+        )
+    ))
+    .setTracerProvider(SdkTracerProvider.builder()
+        .addSpanProcessor(BatchSpanProcessor.builder(
+            OtlpGrpcSpanExporter.builder()
+                .setEndpoint("otel-collector:4317")
+                .build())
+            .build())
+        .setResource(Resource.getDefault().merge(
+            Resource.builder()
+                .put(ResourceAttributes.SERVICE_NAME, "my-service")
+                .put(ResourceAttributes.SERVICE_VERSION, "1.0.0")
+                .build()))
+        .build())
+    .build();
+
+// HTTP 客户端传播
+OkHttpClient client = new OkHttpClient.Builder()
+    .addInterceptor(new TracingInterceptor(otel))
+    .build();
+
+// WebFlux 传播
+@Bean
+public WebFilter otelWebFilter() {
+    return (exchange, chain) -> {
+        Span span = tracer.spanBuilder("webfilter").startSpan();
+        try (Scope scope = span.makeCurrent()) {
+            return chain.filter(exchange);
+        } finally {
+            span.end();
+        }
+    };
+}
+```
+
+### 11.4 Metrics API（Observable vs Counter）
+
+```java
+// OTel Metrics API 示例
+Meter meter = otel.getMeter("my-service");
+
+// Counter：只增不减的计数器
+LongCounter requestCounter = meter.counterBuilder("http.requests.total")
+    .setDescription("Total HTTP requests")
+    .setUnit("1")
+    .build();
+
+// ObservableCounter：可观察的计数器
+ObservableLongCounter observableCounter = meter.counterBuilder("http.requests.active")
+    .setDescription("Active HTTP requests")
+    .buildWithCallback(obs -> {
+        obs.observe(activeRequestCount.get());
+    });
+
+// Histogram：直方图
+DoubleHistogram histogram = meter.histogramBuilder("http.request.duration")
+    .setDescription("HTTP request duration")
+    .setUnit("ms")
+    .build();
+
+// 使用示例
+public void handleRequest() {
+    long startTime = System.currentTimeMillis();
+    try {
+        requestCounter.add(1);
+        activeRequestCount.incrementAndGet();
+        // 处理请求
+        processRequest();
+    } finally {
+        long duration = System.currentTimeMillis() - startTime;
+        histogram.record(duration, Attributes.of(
+            AttributeKey.stringKey("method"), "GET",
+            AttributeKey.stringKey("status"), "200"
+        ));
+        activeRequestCount.decrementAndGet();
+    }
+}
+```
+
+### 11.5 OTel Profiling
+
+```text
+OTel Profiling 是 OTel 的性能分析扩展：
+
+采集内容：
+- CPU Profile：CPU 使用热点
+- Memory Profile：内存分配热点
+- Wall Clock Profile：代码执行时间
+- Contention Profile：锁竞争热点
+
+导出格式：
+- pprof（Go 生态常用）
+- JFR（Java 生态）
+- Chrome Trace Format（可视化）
+```
+
+```yaml
+# OTel Profiling Collector 配置
+receivers:
+  otlp/profiles:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+exporters:
+  otlp/profiler:
+    endpoint: "profiler:4317"
+
+service:
+  pipelines:
+    profiles:
+      receivers: [otlp/profiles]
+      processors: [batch]
+      exporters: [otlp/profiler]
+```
+
+### 11.6 前端追踪（Browser）
+
+```javascript
+// OTel Browser SDK
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-web';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
+import { XMLHttpRequestInstrumentation } from '@opentelemetry/instrumentation-xml-http-request';
+
+const exporter = new OTLPTraceExporter({
+  url: 'http://otel-collector:4318/v1/traces'
+});
+
+const provider = new WebTracerProvider({
+  instrumentations: [
+    new FetchInstrumentation(),
+    new XMLHttpRequestInstrumentation()
+  ]
+});
+
+provider.addSpanProcessor(new BatchSpanProcessor(exporter, {
+  maxQueueSize: 100,
+  maxExportBatchSize: 10,
+  scheduledDelayMillis: 5000
+}));
+
+provider.register();
+
+// 自动追踪页面加载
+import { DocumentLoadInstrumentation } from '@opentelemetry/instrumentation-document-load';
+provider.register({
+  instrumentations: [new DocumentLoadInstrumentation()]
+});
+
+// 自定义 Span
+const tracer = provider.getTracer('browser-app');
+
+function handleUserAction() {
+  const span = tracer.startSpan('user.action');
+  try {
+    // 业务逻辑
+    span.setAttribute('action.type', 'click');
+    span.setAttribute('element.id', 'submit-button');
+  } finally {
+    span.end();
+  }
+}
+```
+
+## 十二、与其他板块的关系
 
 - 链路追踪见「[Jaeger 链路追踪](./Jaeger链路追踪.md)」与「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；
 - 监控指标见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；

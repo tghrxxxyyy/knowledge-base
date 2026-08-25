@@ -820,6 +820,509 @@ helm rollback myapp 1
 helm history myapp
 ```
 
+## 十八、Kubernetes 高级模式与生产实践
+
+### 18.1 Admission Webhooks（准入控制）
+
+```text
+Admission Webhooks 是 K8s API Server 的扩展机制，用于在资源创建/更新/删除时进行拦截和校验。
+
+两种类型：
+┌──────────────────┬────────────────────────────────────────────────┐
+│ 类型              │ 作用                                            │
+├──────────────────┼────────────────────────────────────────────────┤
+│ ValidatingWebhook │ 校验请求是否合法（拒绝非法请求）                  │
+│ MutatingWebhook   │ 修改请求内容（注入默认值/边车等）                 │
+└──────────────────┴────────────────────────────────────────────────┘
+
+执行顺序：认证 → 授权 → MutatingWebhook → 对象schema校验 → ValidatingWebhook
+```
+
+```yaml
+# ValidatingWebhook 示例：校验 Pod 必须有 app 标签
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: pod-label-validator
+webhooks:
+- name: validate-pod-labels.example.com
+  clientConfig:
+    service:
+      name: webhook-server
+      namespace: webhook-system
+      path: /validate
+    caBundle: <base64-ca-cert>
+  rules:
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+  failurePolicy: Fail
+  sideEffects: None
+  admissionReviewVersions: ["v1"]
+```
+
+```yaml
+# MutatingWebhook 示例：自动注入 sidecar
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+- name: inject-sidecar.example.com
+  clientConfig:
+    service:
+      name: webhook-server
+      namespace: webhook-system
+      path: /mutate
+  rules:
+  - operations: ["CREATE"]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+  objectSelector:
+    matchLabels:
+      sidecar-inject: "enabled"
+  admissionReviewVersions: ["v1"]
+```
+
+### 18.2 API Aggregation Layer（API 聚合层）
+
+```text
+API Aggregation Layer 允许将第三方 API 扩展为 K8s API 的一部分。
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     K8s API Server                              │
+├─────────────────────────────────────────────────────────────────┤
+│  /api/v1          (核心 API，内置)                               │
+│  /apis/apps/v1    (扩展 API，内置)                               │
+│  /apis/custom.example.com/v1  (聚合 API，第三方提供)             │
+└─────────────────────────────────────────────────────────────────┘
+
+vs CRD：
+- CRD：声明式资源定义，简单，适合大多数场景
+- Aggregation：完整 API 实现，适合复杂逻辑/已有 REST API 对接
+```
+
+```yaml
+# APIService 注册示例
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.custom.example.com
+spec:
+  group: custom.example.com
+  version: v1beta1
+  service:
+    name: custom-api-server
+    namespace: custom-system
+  caBundle: <base64-ca-cert>
+  groupPriorityMinimum: 1000
+  versionPriority: 100
+```
+
+### 18.3 CronJob 与 Job 模式
+
+```text
+Job 模式：
+┌─────────────────┬───────────────────────────────────────────────┐
+│ 类型              │ 特点                                           │
+├─────────────────┼───────────────────────────────────────────────┤
+│ Non-parallel     │ 单个 Pod 完成即结束                             │
+│ Parallel (fixed) │ 固定并行度，N 个 Pod 完成即结束                  │
+│ Work Queue       │ 队列模式，Pod 自行获取任务                      │
+│ Indexed          │ 每个 Pod 获得唯一 index（0 ~ completions-1）    │
+└─────────────────┴───────────────────────────────────────────────┘
+```
+
+```yaml
+# CronJob：每日凌晨 2 点执行数据库备份
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid        # 禁止并发
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  startingDeadlineSeconds: 600     # 错过调度窗口 10 分钟内补执行
+  jobTemplate:
+    spec:
+      backoffLimit: 2              # 最多重试 2 次
+      activeDeadlineSeconds: 3600  # 1 小时超时
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: mysql:8.0
+            command:
+            - /bin/sh
+            - -c
+            - |
+              mysqldump -h $DB_HOST -u $DB_USER -p$DB_PASS \
+                --all-databases | gzip > /backup/db-$(date +%Y%m%d).sql.gz
+            env:
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: db-config
+                  key: host
+```
+
+```yaml
+# Job 并行模式：批量图片处理
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: image-processor
+spec:
+  completions: 100      # 总共完成 100 个任务
+  parallelism: 10       # 10 个 Pod 并行
+  completionMode: Indexed  # 每个 Pod 获得唯一 index
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: processor
+        image: processor:latest
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+```
+
+### 18.4 StatefulSet 深入
+
+```text
+StatefulSet 核心特性：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 特性                  │ 实现方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 稳定网络标识          │ pod-0, pod-1, ...（不变）                   │
+│ 稳定存储              │ volumeClaimTemplates（PVC 随 Pod 重建）     │
+│ 有序部署/删除         │ 按索引顺序创建/反序删除                      │
+│ 有序滚动更新          │ 从最大索引到最小（与 Deployment 相反）       │
+│ Headless Service      │ 通过 DNS 直接访问特定 Pod                   │
+│ Ordinal Index         │ metadata.labels['statefulset.kubernetes.io/pod-name'] │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```yaml
+# 3 节点 MySQL 主从集群
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: root-password
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 50Gi
+```
+
+### 18.5 DaemonSet 使用场景
+
+```text
+DaemonSet 保证每个（或指定）节点运行一个 Pod 实例。
+
+典型使用场景：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 场景                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ 日志采集              │ Fluentd/Filebeat 采集节点日志               │
+│ 节点监控              │ node_exporter 采集节点指标                  │
+│ 网络插件              │ Calico/Cilium 网络代理                      │
+│ 存储代理              │ Ceph Rook 代理                             │
+│ 安全代理              │ Falco 运行时安全监控                        │
+│ Ingress               │ NodePort 模式的 Ingress                    │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+```yaml
+# 节点级日志采集 DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-logging
+spec:
+  selector:
+    matchLabels:
+      name: fluentd
+  template:
+    metadata:
+      labels:
+        name: fluentd
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node.kubernetes.io/not-ready
+        effect: NoExecute
+        operator: Exists
+      containers:
+      - name: fluentd
+        image: fluentd:v1.16
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: container-logs
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: container-logs
+        hostPath:
+          path: /var/lib/docker/containers
+```
+
+### 18.6 多租户模式
+
+```text
+K8s 多租户方案：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 隔离级别              │ 实现方式                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ Namespace            │ 资源配额 + RBAC + NetworkPolicy             │
+│ Virtual Cluster      │ vCluster（独立控制面）                       │
+│ Node Pool            │ 节点池级别隔离                              │
+│ Cluster              │ 独立集群（最隔离，成本最高）                 │
+└──────────────────────┴────────────────────────────────────────────┘
+
+Namespace + ResourceQuota + LimitRange 组合：
+- ResourceQuota：限制命名空间总资源
+- LimitRange：限制单个 Pod/容器资源
+- NetworkPolicy：网络隔离
+- RBAC：权限隔离
+```
+
+```yaml
+# 多租户命名空间配置
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+  labels:
+    tenant: a
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-a-quota
+  namespace: tenant-a
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "50"
+    services: "20"
+    persistentvolumeclaims: "10"
+    configmaps: "50"
+    secrets: "50"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-a-limits
+  namespace: tenant-a
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: "1"
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "4"
+      memory: 4Gi
+    min:
+      cpu: 50m
+      memory: 64Mi
+```
+
+### 18.7 ResourceQuota 与 LimitRange
+
+```text
+ResourceQuota vs LimitRange：
+┌─────────────────────┬──────────────────────────────────────────────┐
+│                     │ ResourceQuota           │ LimitRange         │
+├─────────────────────┼──────────────────────────────────────────────┤
+│ 作用范围             │ 命名空间整体             │ 单个 Pod/Container  │
+│ 限制内容             │ CPU/Memory/Pod/VC/PVC  │ CPU/Memory          │
+│ 默认值设置           │ 不支持                  │ 支持 default/defaultRequest │
+│ 配额策略             │ BestEffort/NotBestEffort/NotTerminating     │
+└─────────────────────┴──────────────────────────────────────────────┘
+```
+
+```yaml
+# ResourceQuota：按优先级配额
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: critical-pods-quota
+  namespace: production
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: "10"
+    requests.memory: 20Gi
+  scopeSelector:
+    matchExpressions:
+    - scopeName: PriorityClass
+      operator: In
+      values: ["system-cluster-critical"]
+```
+
+### 18.8 Karpenter（集群自动扩缩容）
+
+```text
+Karpenter vs Cluster Autoscaler：
+┌─────────────────────┬──────────────────────────────────────────────┐
+│                     │ Cluster Autoscaler      │ Karpenter          │
+├─────────────────────┼──────────────────────────────────────────────┤
+│ 扩缩容逻辑           │ 基于 Pod 调度状态        │ 基于实际资源需求    │
+│ 节点选择             │ 单一 Node Group          │ 跨实例类型/区域     │
+│ 响应速度             │ 分钟级                  │ 秒级               │
+│ 碎片整理             │ 不支持                  │ 支持               │
+│ 云厂商               │ AWS/GCP/Azure           │ AWS（原生）         │
+│ 配置复杂度           │ 中等                    │ 简单               │
+└─────────────────────┴──────────────────────────────────────────────┘
+```
+
+```yaml
+# Karpenter NodePool 配置
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values: ["on-demand", "spot"]
+      - key: node.kubernetes.io/instance-type
+        operator: In
+        values: ["m5.large", "m5.xlarge", "m5.2xlarge", "c5.large", "c5.xlarge"]
+      - key: topology.kubernetes.io/zone
+        operator: In
+        values: ["us-west-2a", "us-west-2b", "us-west-2c"]
+      nodeClassRef:
+        name: default
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    expireAfter: 720h  # 30 天后自动回收
+  limits:
+    cpu: "100"
+    memory: 200Gi
+---
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiFamily: AL2
+  subnetSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: my-cluster
+  securityGroupSelectorTerms:
+  - tags:
+      karpenter.sh/discovery: my-cluster
+  blockDeviceMappings:
+  - deviceName: /dev/xvda
+    ebs:
+      volumeSize: 100Gi
+      volumeType: gp3
+      encrypted: true
+      deleteOnTermination: true
+```
+
+### 18.9 生产环境 Checklist
+
+```text
+□ Pod 配置
+  □ requests/limits 合理（CPU: requests=limits，Memory: limits ≥ requests）
+  □ Liveness/Readiness/Startup 探针
+  □ 资源请求（requests）不为空
+  □ securityContext 非 root 运行
+
+□ 工作负载
+  □ Deployment 设置 replicas ≥ 2
+  □ PodDisruptionBudget（PDB）配置
+  □ 滚动更新策略（maxSurge/maxUnavailable）
+  □ 优雅停机（preStop + terminationGracePeriodSeconds）
+
+□ 网络
+  □ NetworkPolicy 默认拒绝
+  □ Service 类型正确（ClusterIP/NodePort/LoadBalancer）
+  □ Ingress 配置 TLS
+  □ DNS 解析正常
+
+□ 存储
+  □ PVC 使用 StorageClass
+  □ 有状态应用使用 volumeClaimTemplates
+  □ 备份策略（Velero）
+
+□ 安全
+  □ RBAC 最小权限
+  □ Secret 加密（KMS）
+  □ 镜像签名验证
+  □ 准入控制（OPA/Gatekeeper）
+
+□ 可观测
+  □ Prometheus 指标采集
+  □ 日志采集（Fluentd/Loki）
+  □ 链路追踪
+  □ 告警规则配置
+```
+
 ## 十九、与其他板块的关系
 
 ```text

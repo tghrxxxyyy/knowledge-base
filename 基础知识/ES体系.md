@@ -733,6 +733,370 @@ ES 压测流程：
 | CPU 使用率 (%) | - | - | - |
 | JVM GC 暂停 (ms) | - | - | - |
 
+## 十二、ES 高级特性与生产实践
+
+### 12.1 Data Stream（时间序列数据）
+
+```text
+Data Stream 是 ES 7.9+ 引入的专为时间序列数据设计的 API。
+
+核心概念：
+┌──────────────────┬────────────────────────────────────────────────┐
+│ 概念              │ 说明                                            │
+├──────────────────┼────────────────────────────────────────────────┤
+│ Data Stream      │ 由多个 backing index 组成的逻辑容器              │
+│ Backing Index    │ 实际存储数据的索引（由 ILM 管理 rollover）      │
+│ Index Template   │ 定义 Data Stream 的 mapping 和 settings          │
+│ ILM Policy       │ 管理索引生命周期（hot/warm/cold/delete）         │
+└──────────────────┴────────────────────────────────────────────────┘
+```
+
+```json
+// 创建 Index Template
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "data_stream": {},
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-ilm-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" },
+        "service": { "type": "keyword" },
+        "level": { "type": "keyword" },
+        "trace_id": { "type": "keyword" }
+      }
+    }
+  }
+}
+```
+
+```bash
+# 写入数据（自动生成 backing index）
+POST logs-_write
+{
+  "@timestamp": "2026-08-25T10:00:00Z",
+  "message": "User login success",
+  "service": "auth-service",
+  "level": "INFO",
+  "trace_id": "abc-123"
+}
+
+# 查询 Data Stream
+GET logs-*/
+
+# Rollover（ILM 自动或手动触发）
+POST logs-_rollover
+```
+
+### 12.2 Enrich Processor（数据富化）
+
+```text
+Enrich Processor 在索引前将文档与已有数据进行关联匹配。
+
+流程：
+1. 创建 Enrich Policy（定义源索引和匹配字段）
+2. 执行 Enrich Policy（加载数据到内存）
+3. 在 Ingest Pipeline 中使用 enrich processor
+```
+
+```json
+// 1. 创建 Enrich Policy
+PUT _enrich/policy/user-enrich-policy
+{
+  "match": {
+    "indices": "users",
+    "match_field": "user_id",
+    "enrich_fields": ["username", "email", "department"]
+  }
+}
+
+// 2. 执行 Enrich Policy
+POST _enrich/policy/user-enrich-policy/_execute
+
+// 3. 在 Ingest Pipeline 中使用
+PUT _ingest/pipeline/enrich-log
+{
+  "processors": [
+    {
+      "enrich": {
+        "policy_name": "user-enrich-policy",
+        "field": "user_id",
+        "target_field": "user_info",
+        "max_matches": 1
+      }
+    }
+  ]
+}
+
+// 4. 使用 Pipeline 索引数据
+POST app-logs/_doc?pipeline=enrich-log
+{
+  "user_id": "12345",
+  "action": "purchase",
+  "amount": 99.99
+}
+// 索引结果会自动包含 user_info.username, user_info.email 等字段
+```
+
+### 12.3 Runtime Fields（运行时字段）
+
+```text
+Runtime Fields 不修改原始 mapping，在查询时动态计算字段值。
+
+优点：
+- 无需 reindex 即可添加新字段
+- 节省存储空间（不持久化计算结果）
+- 快速原型开发
+
+缺点：
+- 查询性能低于映射字段（每次查询都需计算）
+- 不支持聚合的精确排序
+- 建议生产环境最终迁移到正式 mapping
+```
+
+```json
+// 添加 Runtime Field
+PUT logs-*/_mapping
+{
+  "runtime": {
+    "response_time_ms": {
+      "type": "long",
+      "script": {
+        "source": "emit(doc['response_time'].value * 1000)"
+      }
+    },
+    "client_ip_geo": {
+      "type": "keyword",
+      "script": {
+        "source": """
+          def ip = doc['client_ip'].value;
+          if (ip.startsWith('10.')) {
+            emit('internal');
+          } else if (ip.startsWith('192.168.')) {
+            emit('private');
+          } else {
+            emit('public');
+          }
+        """
+      }
+    }
+  }
+}
+
+// 查询时使用 Runtime Field
+GET logs-*/_search
+{
+  "query": {
+    "range": {
+      "response_time_ms": {
+        "gte": 1000
+      }
+    }
+  },
+  "runtime_mappings": {
+    "slow_request": {
+      "type": "boolean",
+      "script": {
+        "source": "emit(doc['response_time'].value > 500)"
+      }
+    }
+  }
+}
+```
+
+### 12.4 Cross-Cluster Search（跨集群搜索）
+
+```text
+CCS 允许从一个集群搜索另一个集群的数据，无需复制。
+
+场景：
+- 跨数据中心搜索
+- 多集群日志聚合
+- 数据驻留合规（数据不动，查询跨集群）
+```
+
+```yaml
+# 集群 A 配置（搜索端）
+# elasticsearch.yml
+cluster.remote.cluster_b.seeds: ["cluster-b-node1:9300", "cluster-b-node2:9300"]
+cluster.remote.cluster_b.transport.ping_schedule: 30s
+```
+
+```json
+// 跨集群搜索
+GET cluster_b:logs-*/_search
+{
+  "query": {
+    "match": { "service": "payment" }
+  }
+}
+
+// 多集群搜索
+GET logs-*,cluster_b:logs-*,cluster_c:logs-*/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "level": "ERROR" } }
+      ],
+      "filter": [
+        { "range": { "@timestamp": { "gte": "now-1h" } } }
+      ]
+    }
+  }
+}
+```
+
+### 12.5 Frozen Tier（冻结层）
+
+```text
+ES 7.14+ 引入的冷数据存储层级，使用 searchable snapshots 实现极低成本存储。
+
+存储层级：
+┌──────────┬────────────────────────────────────────────────────────┐
+│ 层级      │ 特点                                                  │
+├──────────┼────────────────────────────────────────────────────────┤
+│ Hot      │ SSD，高写入性能，最新数据                                │
+│ Warm     │ SSD/HDD，读优化，近期数据                               │
+│ Cold     │ HDD，压缩存储，较旧数据                                 │
+│ Frozen   │ 对象存储（S3），极低成本，极旧数据                        │
+└──────────┴────────────────────────────────────────────────────────┘
+```
+
+```json
+// ILM Policy 配置 Frozen Tier
+PUT _ilm/policy/logs-ilm-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "frozen": {
+        "min_age": "90d",
+        "actions": {
+          "searchable_snapshot": {
+            "snapshot_repository": "my-s3-repo",
+            "force_merge_index": true
+          }
+        }
+      },
+      "delete": {
+        "min_age": "365d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### 12.6 节点角色详解
+
+```text
+ES 节点角色（8.x 细化）：
+┌──────────────────┬────────────────────────────────────────────────┐
+│ 角色              │ 职责                                           │
+├──────────────────┼────────────────────────────────────────────────┤
+│ master           │ 集群管理、索引创建删除、分片分配                  │
+│ data             │ 数据存储和搜索                                  │
+│ data_hot         │ 热数据节点（SSD）                               │
+│ data_warm        │ 温数据节点（SSD/HDD）                           │
+│ data_cold        │ 冷数据节点（HDD）                               │
+│ data_frozen      │ 冻结数据节点（对象存储）                         │
+│ ingest           │ 数据预处理管道                                  │
+│ coordinating     │ 查询协调、结果聚合                              │
+│ ml               │ 机器学习任务                                    │
+│ transform        │ 数据转换任务                                    │
+│ voting_only      │ 仅投票节点（减少 master 选举开销）               │
+│ remote_cluster_client │ 跨集群搜索客户端                         │
+└──────────────────┴────────────────────────────────────────────────┘
+```
+
+```yaml
+# 节点角色分离配置示例
+# master 节点
+node.roles: [master]
+
+# data_hot 节点
+node.roles: [data_hot, ingest]
+
+# data_warm 节点
+node.roles: [data_warm]
+
+# coordinating 节点
+node.roles: []
+```
+
+### 12.7 容量规划
+
+```text
+ES 容量规划公式：
+
+存储容量：
+  原始数据量 × 副本数 × (1 + 1/分片数) × 开销系数(1.1~1.3) ≈ 实际存储
+  示例：100GB 数据 × 1 副本 × 1.1 × 1.2 ≈ 132GB
+
+分片数量：
+  单分片建议 10-50GB（写入密集取小，查询密集取大）
+  总分片数 = 数据量 / 单分片大小
+  分片数 = 索引数 × 每索引分片数 × (1 + 副本数)
+
+主节点内存：
+  集群状态管理：每 1000 个分片约消耗 1GB 堆内存
+  建议：master 节点堆内存 ≥ 8GB
+
+协调节点内存：
+  查询结果聚合：每 1000 QPS 约需 4-8GB 堆内存
+  建议：coordinating 节点堆内存 ≥ 16GB
+
+写入性能：
+  单节点写入上限约 10,000-20,000 docs/s（取决于文档大小）
+  Bulk 批量大小建议 5,000-15,000 docs 或 5-15MB
+```
+
+```text
+生产集群配置参考（中等规模）：
+┌──────────────┬────────────────────────────────────────────────┐
+│ 角色          │ 配置                                           │
+├──────────────┼────────────────────────────────────────────────┤
+│ Master       │ 3 节点，8GB 堆，16GB 内存，SSD                   │
+│ Data Hot     │ 3-5 节点，31GB 堆，64GB 内存，NVMe SSD           │
+│ Data Warm    │ 3 节点，16GB 堆，32GB 内存，SSD                  │
+│ Coordinating │ 2 节点，16GB 堆，32GB 内存                       │
+│ Ingest       │ 2 节点，8GB 堆，16GB 内存                        │
+└──────────────┴────────────────────────────────────────────────┘
+```
+
 ## 十三、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
 
 - **集群变红（Red）**：`GET _cluster/health` 看 `status=red`（主分片未分配）。排查：`GET _cat/indices?v&health=red` 定位红索引；`GET _cluster/allocation/explain` 看分片未分配原因（最常见：磁盘水位、节点离线、分片数超限）。红通常意味着有主分片丢失、数据可能已损，优先恢复节点而非强制分配（强制分配空分片会丢数据）。
