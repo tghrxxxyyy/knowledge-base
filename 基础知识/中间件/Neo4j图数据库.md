@@ -435,6 +435,181 @@ GDS = Graph Data Science 库（图算法）
   知识图谱推理（路径查询）
 ```
 
+## 七-2、GDS 图算法库分类
+
+| 类别 | 代表算法 | 应用场景 |
+|------|----------|----------|
+| 中心性 | PageRank、Betweenness、Degree | 识别关键节点（KOL/欺诈核心） |
+| 社区发现 | Louvain、LPA、WCC | 社群划分/团伙识别 |
+| 路径 | Shortest Path、A*、AllPairs | 最短路径/导航/物流 |
+| 相似度 | Node Similarity、Jaccard | 推荐系统/相似用户 |
+
+```cypher
+-- 中心性算法
+CALL gds.pageRank.stream('myGraph')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).name AS name, score
+ORDER BY score DESC LIMIT 10
+
+-- 社区发现
+CALL gds.louvain.stream('myGraph')
+YIELD nodeId, communityId
+RETURN communityId, count(*) AS size
+ORDER BY size DESC
+
+-- 最短路径
+CALL gds.allShortestPaths.stream('myGraph', {
+  sourceNode: gds.util.asNode(0)
+})
+YIELD sourceNode, targetNode, distance
+WHERE distance > 0 AND distance <= 3
+RETURN sourceNode, targetNode, distance
+```
+
+## 七-3、Neo4j 事务隔离级别与并发控制
+
+```
+Neo4j 事务特性：
+  默认隔离级别：READ COMMITTED
+  支持 ACID 事务
+  写操作串行化（同一时刻只有一个写事务修改同一节点）
+
+并发控制：
+  1. 写锁：写操作加排他锁
+  2. 读锁：读操作加共享锁（不阻塞其他读）
+  3. 乐观锁：基于版本号检测冲突（应用层实现）
+
+事务限制：
+  单事务超时：默认 60s（可配置）
+  最大事务大小：JVM 堆限制
+  长事务：会阻塞其他写操作（避免长事务）
+
+配置：
+  dbms.transaction.timeout=60s
+  dbms.lock.acquisition.timeout=30s
+```
+
+## 七-4、APOC 过程调用示例
+
+```cypher
+-- APOC = Awesome Procedures On Cypher（扩展函数库）
+
+-- 1. 路径查询：spanningTree（生成树）
+CALL apoc.path.spanningTree(
+  startNode,          -- 起始节点
+  {},                 -- 关系配置
+  {},                 -- 节点配置
+  "FRIEND",           -- 关系类型
+  {maxLevel: 5}       -- 最大深度
+)
+YIELD path
+RETURN path
+
+-- 2. 并行批处理
+CALL apoc.periodic.iterate(
+  "MATCH (p:Person) RETURN p",
+  "SET p.processed = true",
+  {batchSize: 1000, parallel: true}
+)
+YIELD batches, total, errorMessages
+RETURN batches, total, errorMessages
+
+-- 3. Dijkstra 最短路径
+CALL apoc.algo.dijkstra(
+  startNode, endNode, "CONNECTED", "distance"
+)
+YIELD path, weight
+RETURN path, weight
+
+-- 4. 数据导出
+CALL apoc.export.csv.all("/data/export.csv")
+```
+
+## 七-5、Neo4j 分布式架构（Fabric 分片查询）
+
+```
+Fabric = Neo4j 企业版的分布式查询
+
+原理：
+  跨多个 Neo4j 实例的联合查询
+  每个实例存储一部分数据（按 Label 分片）
+  Fabric 路由查询到对应实例
+
+配置：
+  fabric.database.name: "users"
+  fabric.graph.databases: ["users", "orders"]
+
+使用：
+  USE users
+  MATCH (p:Person) RETURN p.name
+  
+  USE orders
+  MATCH (o:Order) RETURN o.id
+
+场景：
+  数据按域拆分（users/orders/products）
+  跨域关联查询（Fabric 路由）
+
+限制：
+  企业版功能
+  跨实例查询有网络开销
+  需要合理设计数据分布
+```
+
+## 七-6、Cypher 性能分析（EXPLAIN/PROFILE）
+
+```cypher
+-- EXPLAIN：查看执行计划（不执行查询）
+EXPLAIN MATCH (p:Person {name: '张三'})-[:FRIEND]->(f:Person)
+RETURN f.name
+
+-- 执行计划关键指标：
+--   DbHits：数据库访问次数（越少越好）
+--   Rows：返回行数
+--   EstimatedRows：估计行数（CBO）
+--   页面缓存命中：CACHES HITS（越多越好）
+
+-- PROFILE：执行查询并统计实际执行计划
+PROFILE MATCH (p:Person {name: '张三'})-[:FRIEND*1..3]->(f:Person)
+RETURN f.name
+
+-- Profile 结果解读：
+--   DbHits = 实际访问的节点/关系数
+--   Rows = 实际返回行数
+--   优化方向：减少 DbHits（建索引/限制深度）
+
+-- 常见优化：
+--   1. 建标签+属性索引：CREATE INDEX FOR (p:Person) ON (p.name)
+--   2. 限制遍历深度：*1..3 而非 *1..
+--   3. WHERE 前置过滤
+--   4. 减少 RETURN 字段
+```
+
+## 七-7、Neo4j 内存配置调优公式
+
+```
+内存配置公式：
+
+Page Cache（页缓存，最重要）：
+  目标 = 热点图数据全量 × 1.2（20% 余量）
+  计算：节点数 × 15B + 边数 × 34B × 1.2
+  如 1000万节点 + 5000万边 ≈ 2.2GB → 配置 3GB
+
+JVM Heap：
+  目标 = 事务状态 + 遍历状态 + 索引缓存
+  建议 = 物理内存的 50%（不超过 32GB）
+  如 16GB 服务器 → Heap=8G, PageCache=8G
+
+配置示例：
+  dbms.memory.heap.initial_size=8G
+  dbms.memory.heap.max_size=8G
+  dbms.memory.pagecache.size=8G
+
+监控：
+  CALL dbms.queryJmx("org.neo4j:instance=kernel#0,name=Page cache")
+  → 检查页缓存命中率（>99%）
+```
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。

@@ -707,6 +707,141 @@ SELECT add_continuous_aggregate_policy('readings_1h',
 
 ### 11.6 生产排障 SOP
 
+## Hypertable chunk 自动分区策略调优
+
+```
+chunk interval 调优方法：
+
+  目标：单 chunk 压缩前 25MB ~ 数 GB
+  
+  推导公式：
+    chunk_interval ≈ 目标chunk大小 ÷ 写入速率
+    
+  示例：
+    写入速率 = 10000 设备 × 1 点/10s × 200B/行 ≈ 20MB/min
+    目标 2GB → 2GB ÷ 20MB/min ≈ 100min → 取 1~2 小时
+    低频场景（分钟级上报）：写入 0.5MB/min → 取 7 天更合理
+
+  调整命令：
+    SELECT set_chunk_time_interval('sensor_readings', INTERVAL '1 day');
+    
+  运行期调整只影响新 chunk，已有 chunk 不变
+```
+
+| 症状 | 诊断 | 处置 |
+|------|------|------|
+| 查询计划列出上千 chunk | interval 过小 | 调大 + reorder |
+| 单 chunk 压缩耗时 >10min | interval 过大 | 调小增量执行 |
+| 写入延迟周期性抖动 | 新 chunk 创建风暴 | 预建 chunk + 错开空间分区 |
+
+## 连续聚合（Continuous Aggregate）刷新策略与性能
+
+```sql
+-- 分层聚合：明细 -> 1m -> 1h -> 1d 逐级物化
+-- 1m 从明细刷 → 1h 从 1m 刷 → 1d 从 1h 刷
+-- 上层查询命中下层聚合，重算成本指数级下降
+
+-- materialized_only=false：物化区+实时区自动拼接
+-- 新数据未刷新时直接查明细实时计算，看板无缺口
+ALTER MATERIALIZED VIEW cond_5m SET (
+    timescaledb.materialized_only = false
+);
+```
+
+| 模式 | 行为 | 适用 |
+|------|------|------|
+| materialized_only=true | 只返回已物化数据 | 历史报表 |
+| materialized_only=false | 物化区+实时明细 UNION | **监控看板推荐** |
+
+## 压缩策略（segmentby/orderby）调优实例
+
+```sql
+ALTER TABLE conditions SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',  -- 高基数分组列
+    timescaledb.compress_orderby = 'time DESC'     -- 组内时间排序
+);
+```
+
+```text
+参数选择原理：
+  segmentby 决定「分组边界」——同设备数据连续存放
+  orderby 决定「组内排列」——时序按时间排 delta-of-delta 最优
+
+实测参考（单表 5000 万行）：
+  无压缩                    ：12.8 GB
+  segmentby=device_id only  ：2.9 GB（4.4:1）
+  + orderby=time DESC       ：1.1 GB（11.6:1）
+  orderby 缺失（随机顺序）  ：4.7 GB（仅 2.7:1）
+```
+
+## 多节点分布式 hypertable 部署
+
+```sql
+-- 架构：Access Node(协调) + N 个 Data Node
+SELECT add_data_node('dn1', host => '10.0.1.11');
+SELECT add_data_node('dn2', host => '10.0.1.12');
+
+-- 分布式超表：时间+空间两维路由到 data node
+SELECT create_distributed_hypertable('conditions', 'time', 'device_id',
+       chunk_time_interval => INTERVAL '1 day',
+       replication_factor  => 2);
+```
+
+```text
+运维要点：
+  ① AN 是唯一 SQL 入口：做好高可用
+  ② replication_factor ≥2 才能扛单 DN 故障
+  ③ 带 device_id 过滤可只命中相关 DN
+  ④ 社区版 multinode 支持在收缩，生产以云版为准
+```
+
+## TimescaleDB 与 Grafana 集成最佳实践
+
+```
+集成方式：
+  Grafana → PostgreSQL 数据源 → TimescaleDB
+  
+  直连超表查询，自动命中连续聚合
+  
+  推荐配置：
+    数据源：PostgreSQL（非 MySQL）
+    连接池：PgBouncer（高并发）
+    查询优化：带时间下界，命中连续聚合
+
+  Grafana Dashboard 设计：
+    实时面板：查询连续聚合表（materialized_only=false）
+    历史面板：查询压缩后 chunk
+    告警：对连续聚合表设阈值告警
+```
+
+## TimescaleDB 在 IoT 数据平台中的应用案例
+
+```
+IoT 场景：
+
+  数据特征：
+    千万设备 × 秒级上报
+    设备元数据在关系表
+    时序指标在超表
+
+  架构：
+    设备档案：PostgreSQL 关系表
+    时序指标：TimescaleDB 超表
+    二者直接 JOIN（同库零成本）
+
+  优势：
+    时序+关系混合查询
+    设备元数据与指标关联分析
+    事务保证（设备注册+指标写入原子性）
+    PG 生态（PostGIS 地理时序、pgvector 向量）
+    
+  降本：
+    连续聚合：明细→1m→1h→1d，长期只查聚合
+    压缩：冷 chunk 自动列压
+    保留策略：超期 chunk 自动删除
+```
+
 **Cardinality / 写入慢**
 - [ ] 活跃 chunk 膨胀用 `VACUUM`/`pg_repack`；索引不宜过多。
 - [ ] `segmentby`/`orderby` 设对（高基数列 segmentby，time orderby）。

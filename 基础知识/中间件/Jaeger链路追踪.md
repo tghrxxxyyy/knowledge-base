@@ -518,6 +518,187 @@ Query 指标：
   - jaeger_collector_queue_size > 10000       → 队列积压
 ```
 
+## 六-2、Jaeger Remote Sampling 配置实例
+
+```json
+{
+  "service_1": {
+    "default_strategy": {
+      "type": "probabilistic",
+      "param": 0.01
+    },
+    "operation_get": {
+      "type": "probabilistic",
+      "param": 1.0
+    }
+  },
+  "service_2": {
+    "default_strategy": {
+      "type": "rateLimiting",
+      "param": 50
+    }
+  }
+}
+```
+
+```
+远程采样流程：
+  1. Collector 暴露 /sampling 端点
+  2. Agent 定时拉取采样策略（refresh_interval=60s）
+  3. Agent 应用策略到本地 SDK
+  4. SDK 按策略决定是否采样
+
+优势：
+  动态调整采样率（无需重启应用）
+  按服务/操作配置不同采样率
+  集中管理采样策略
+```
+
+## 六-3、Span 树可视化分析方法
+
+```
+Span 树分析方法：
+
+1. 时间线视图（Timeline）
+   - 纵轴：服务/操作
+   - 横轴：时间
+   - 每个 Span 是一个条形
+   - 宽度 = 持续时间
+   - 关键：找最宽的 Span（瓶颈）
+
+2. 依赖图（Dependency Graph）
+   - 节点 = 服务
+   - 边 = 调用关系
+   - 颜色 = 错误率
+   - 粗细 = 调用量
+   - 关键：找红色/粗边（高错误/高流量）
+
+3. 对比视图（Comparison）
+   - 两个 Trace 并排对比
+   - 找差异点（哪个 Span 慢/错）
+   - 关键：排查回归问题
+
+4. 瀑布图（Waterfall）
+   - 展示父子 Span 关系
+   - 嵌套深度 = 调用链深度
+   - 关键：找深层嵌套（不合理调用）
+```
+
+## 六-4、Jaeger Query API 查询参数详解
+
+```
+GET /api/traces/{traceID}          # 按 traceID 查询
+GET /api/traces?service=xxx        # 按服务查询
+GET /api/traces?operation=xxx      # 按操作查询
+GET /api/traces?tags=xxx           # 按标签过滤
+GET /api/traces?start=xxx&end=xxx  # 按时间范围查询
+GET /api/traces?limit=100          # 限制返回数
+
+查询示例：
+  # 查找 service=user-service 的慢请求（>1s）
+  GET /api/traces?service=user-service&minDuration=1000000&limit=50
+
+  # 查找包含错误的 Trace
+  GET /api/traces?service=user-service&tags={"error":"true"}
+
+  # 查找特定时间范围
+  GET /api/traces?service=user-service&start=1700000000000000&end=1700001000000000
+
+性能优化：
+  索引：按服务+操作+时间建索引
+  限制：默认 limit=20，避免大查询
+  缓存：热点 Trace 缓存到 Query 层
+```
+
+## 六-5、Jaeger 与 Prometheus 指标关联（Span Metrics）
+
+```
+Span Metrics = 从 Trace 数据提取指标
+
+指标类型：
+  request_count：请求总数（按服务/操作）
+  error_count：错误数
+  latency_p50/p90/p99：延迟分位数
+
+关联方式：
+  1. Collector 提取 Span 指标 → 写入 Prometheus
+  2. Grafana 可视化（Trace 与 Metric 联动）
+  3. 告警规则：基于 Span 指标触发
+
+Prometheus 配置：
+  scrape_configs:
+    - job_name: 'jaeger-collector'
+      static_configs:
+        - targets: ['jaeger-collector:14269']
+
+告警规则示例：
+  - alert: HighErrorRate
+    expr: rate(jaeger_collector_spans_error_total[5m]) > 0.05
+    for: 5m
+    annotations:
+      summary: "High error rate in {{ $labels.service }}"
+```
+
+## 六-6、大 trace 采样策略（尾采样）
+
+```
+Tail-based Sampling（尾部采样）：
+
+原理：
+  先全量采集所有 Span
+  Trace 完成后分析（是否有错误/慢请求）
+  满足条件才保留 Trace
+
+条件：
+  1. 任何 Span 有错误 → 保留
+  2. 总延迟 > 阈值（如 1s）→ 保留
+  3. 特定服务/操作 → 保留
+
+优势：
+  能捕获慢请求和错误请求
+  Head-based 采样可能漏掉
+
+劣势：
+  需要全量采集（存储成本高）
+  实现复杂（需要 Collector 协调）
+
+Jaeger 实现：
+  1. SDK 全量发送到 Collector
+  2. Collector 缓存 Trace 所有 Span
+  3. Trace 完成后判断是否保留
+  4. 不保留则丢弃
+```
+
+## 六-7、Jaeger 横向扩展架构（Kafka 缓冲层）
+
+```
+Jaeger 横向扩展架构：
+
+架构：
+  App → OTel SDK → Collector → Kafka（缓冲）→ Consumer → Storage
+
+为什么用 Kafka 缓冲：
+  1. 削峰：高吞吐写入时 Collector 不过载
+  2. 解耦：Collector 和 Storage 独立扩缩
+  3. 可靠性：Kafka 持久化防丢
+  4. 异步：写入不阻塞 Collector
+
+配置：
+  Collector:
+    kafka.producer.brokers: kafka1:9092,kafka2:9092
+    kafka.producer.topic: jaeger-spans
+  
+  Consumer:
+    kafka.consumer.brokers: kafka1:9092,kafka2:9092
+    kafka.consumer.topic: jaeger-spans
+
+扩展：
+  Collector：水平扩展（无状态）
+  Kafka：增加 Partition 提升吞吐
+  Consumer：按 Partition 消费，水平扩展
+  Storage：ES/Cassandra 水平扩展
+```
+
 ## 七、与其他板块的关系
 
 - 链路追踪原理（SkyWalking）见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；

@@ -679,6 +679,154 @@ CREATE DATABASE iot KEEP 365 DAYS 10 BLOCKS 6 VGROUPS 32 REPLICA 3;
 
 ### 11.6 生产排障 SOP
 
+## TDengine 超级表（STable）与子表设计最佳实践
+
+```
+设计决策树：
+
+  ① 设备类型不同、采集列不同？
+    → 按设备类型分多张 STABLE
+    （meters / cars / env_sensors 各自独立）
+
+  ② 同类设备有子型号差异列？
+    → 稀疏列容忍度内合并一张
+    否则拆「主表 + 扩展属性宽表」
+
+  ③ 一台设备多传感器点位？
+    → 一点位一子表，点位编号进 tbname
+
+  ④ 需要跨类型统一查询？
+    → 用视图 UNION 或上层聚合表
+
+命名规范：
+  STABLE：{域}_{设备类型}      如 iot_meter
+  子表 ：t_{设备ID}           如 t_d1001
+  tag  ：{维度}_{语义}        如 tag_region
+```
+
+| 设计项 | 推荐值 | 原因 |
+|--------|--------|------|
+| 单库子表数 | ≤ 千万级 | 元数据内存开销可控 |
+| 单 STABLE 列数 | ≤ 200 | 列多影响元数据与压缩 |
+| tag 数量 | < 10~16 | 标签索引体积 |
+| 首列 | TIMESTAMP ts | 强制约定 |
+
+## 标签（TAG）机制在多维度查询中的应用
+
+```
+TAG 本质：
+  存储在超级表维度的「静态列」
+  每个子表只存一份 tag 值（不随数据点重复存储）
+  → 这是压缩比高的关键之一
+
+多维度查询：
+  按 tag 过滤：WHERE location = '北京'
+  按 tag 分组：GROUP BY group_id
+  按 tag 排序：ORDER BY location
+  
+  → 先按 tag 过滤定位子表，再扫时间范围
+  → 避免全 STABLE 扫描
+
+tag 变更：
+  ALTER TABLE d1001 SET TAG location='上海'
+  → 只改标签文件，不动数据块（零成本元数据操作）
+```
+
+## TDengine 3.0 存算分离架构详解
+
+```
+3.0 架构变化：
+
+  2.x：存算耦合 vnode
+    计算与存储在每个 dnode 内
+    扩容必须搬数据
+
+  3.0：存算分离
+    taosd 拆分为：
+      计算层：查询协调+无状态计算（可弹性扩缩）
+      存储层：vnode 只管数据落盘，可挂对象存储
+    新增 taosKeeper（监控）+ taosAdapter 强化
+    支持云原生部署（TDengine Cloud / K8s Operator）
+
+  升级注意：
+    3.0 与 2.x 数据格式不兼容
+    需通过 taosX/导出导入迁移
+    依赖 2.x 私有参数的运维脚本要重审
+```
+
+## SQL 聚合函数（avg/max/min/count）与窗口函数（session/timer/interval）
+
+```sql
+-- 时间窗口：INTERVAL + FILL 组合（降采样核心语法）
+SELECT _WSTART, _WEND, AVG(current), MAX(voltage)
+FROM meters WHERE tbname = 'd1001' AND ts >= NOW - 6h
+INTERVAL(5m) FILL(LINEAR);
+
+-- 状态窗口：状态持续期聚合
+SELECT _WSTART, _WEND, SUM(current) FROM meters
+WHERE tbname='d1001' STATE_WINDOW(status);
+
+-- 会话窗口：空闲超 10 分钟切窗
+SELECT _WSTART, COUNT(*) FROM meters
+WHERE ts >= NOW - 1d SESSION(ts, 10m);
+
+-- 滑动窗口：滑动步长 < 窗口长度
+SELECT _WSTART, AVG(voltage) FROM meters
+WHERE ts >= NOW - 1h INTERVAL(10m) SLIDING(5m);
+
+-- 跨子表按 tag 分组 + TOPN
+SELECT tbname, AVG(current) AS avg_c FROM meters
+PARTITION BY group_id
+WHERE ts >= NOW - 10m
+INTERVAL(1m)
+ORDER BY avg_c DESC LIMIT 5;
+```
+
+## 数据订阅（TMQ）与流式计算
+
+```
+TMQ = TDengine 内置数据订阅（类似 Kafka Consumer Group）
+
+Topic 三种类型：
+  超级表：整表变更流
+  列：指定列变更流
+  SQL 查询：持续查询结果流
+
+消费组：
+  组内分区均衡（类似 Kafka consumer group）
+  组间广播
+  offset 持久化，重启续读
+
+流式计算集成：
+  TMQ → Flink：实时计算+聚合+告警
+  TMQ → Kafka：写入 Kafka 供下游消费
+  简单实时管道可替代 Kafka 中转一跳
+```
+
+## TDengine 与 Prometheus 集成方案
+
+```
+集成方式：
+
+  方式一：Remote Write（推荐）
+    Prometheus → TDengine（Remote Write 接口）
+    TDengine 兼容 Prometheus Remote Write 协议
+    替代 Thanos 长存储
+
+  方式二：taosAdapter
+    Prometheus → taosAdapter → TDengine
+    兼容 Prometheus 查询接口
+
+  方式三：Grafana 插件
+    Grafana → TDengine 数据源插件
+    直接展示 TDengine 数据
+
+优势：
+  超大规模设备指标存储
+  替代 Prometheus + Thanos 复杂架构
+  利用 TDengine 压缩比降低存储成本
+```
+
 **Cardinality 治理（标签索引爆炸）**
 - [ ] 严禁 `TAGS(device_id)` 千万取值；device_id 作子表名。
 - [ ] 按设备类型分多张 STABLE，避免列稀疏。

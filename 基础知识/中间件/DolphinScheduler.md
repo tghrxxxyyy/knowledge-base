@@ -643,6 +643,151 @@ Worker 调优：
 
 ---
 
+## 十三-2、Master 任务分配算法
+
+### Round-Robin 轮询
+
+```
+原理：按 Worker 注册顺序轮流分配
+优点：简单，负载均匀
+缺点：不考虑 Worker 资源差异
+
+配置：
+  master.resourcePool.worker-group.weight=1  # 权重=1
+```
+
+### 资源感知分配
+
+```
+原理：根据 Worker 的 CPU/内存权重 + 当前负载分配
+优点：资源利用率高
+缺点：需要实时采集 Worker 指标
+
+流程：
+  1. Worker 心跳上报 CPU/内存/任务数
+  2. Master 计算各 Worker 可用资源
+  3. 按权重 + 可用资源排序
+  4. 选择资源最充足的 Worker
+
+配置：
+  master.resourcePool.worker-group.strategy=WEIGHTED_ROUND_ROBIN
+```
+
+## 十三-3、Worker 分组与任务隔离
+
+```
+Worker 分组 = 按业务或资源特性隔离执行环境
+
+分组策略：
+  1. 按任务类型：长任务组（Spark/Flink）+ 短任务组（Shell/SQL）
+  2. 按业务线：订单组 + 用户组 + 数据组
+  3. 按资源：CPU 密集组 + IO 密集组
+
+隔离效果：
+  - 长任务不挤占短任务资源
+  - 高优先级任务组抢占低优先级
+  - 故障隔离：一组 Worker 故障不影响其他组
+
+配置：
+  worker.group=long-tasks
+  worker.weight=2  # 该组 Worker 权重
+```
+
+## 十三-4、告警插件开发（自定义告警器）
+
+```
+告警插件开发步骤：
+
+1. 实现 AlertPlugin 接口
+   public class CustomAlertPlugin implements AlertPlugin {
+     @Override
+     public void sendAlert(AlertMessage message) {
+       // 自定义发送逻辑（如飞书/钉钉/Webhook）
+       String webhook = message.getWebhook();
+       String content = formatMessage(message);
+       HttpUtils.post(webhook, content);
+     }
+   }
+
+2. 编译打包为 JAR
+
+3. 放入告警插件目录
+   $DOLPHIN_HOME/lib/alert-plugin/
+
+4. 配置告警渠道
+   告警组 → 选择自定义插件
+   配置 Webhook URL / Token
+
+5. 告警模板
+   支持变量替换：${workflowName}, ${taskName}, ${alertTime}
+```
+
+## 十三-5、项目权限模型（租户/项目/工作流三级）
+
+```
+三级权限模型：
+
+租户（Tenant）
+  ├── 管理员：创建项目/用户/资源
+  └── 普通成员：只能访问所属项目
+
+项目（Project）
+  ├── 管理员：创建/修改/删除工作流
+  ├── 开发者：创建/修改/运行工作流
+  └── 只读：查看/运行工作流
+
+工作流（Workflow）
+  ├── 所有者：完全控制
+  └── 协作者：编辑/运行
+
+权限继承：
+  租户管理员 → 项目管理员 → 工作流所有者
+
+数据隔离：
+  不同租户的项目/工作流/任务完全隔离
+  不同项目的工作流互相不可见（除非显式授权）
+```
+
+## 十三-6、任务实例日志实时查看实现
+
+```
+实时日志查看架构：
+
+1. Worker 执行任务时 → 实时写日志到本地文件
+2. Master 日志采集线程 → 定期读取 Worker 日志文件
+3. WebSocket 推送 → UI 实时展示日志流
+
+实现细节：
+  - 日志文件滚动：按大小/时间滚动
+  - 日志格式：时间戳 + 级别 + 内容
+  - 推送机制：WebSocket 长连接
+  - 日志缓存：内存缓冲 + 异步写入
+
+配置：
+  worker.log.max-size=100MB
+  worker.log.retention-days=7
+  log.server.port=1234  # 日志服务端口
+```
+
+## 十三-7、与 Airflow 调度能力对比总结
+
+| 维度 | DolphinScheduler | Airflow |
+|------|------------------|---------|
+| 编排 | 可视化拖拽（零代码） | Python 代码（DAG） |
+| 调度 | 时间触发 + 依赖触发 | 时间触发 + Sensor |
+| 任务类型 | 30+ 内置 | Operator（Python 编写） |
+| 多租户 | 强（OS 级隔离） | 弱（命名空间） |
+| 补数 | 原生（批量日期补跑） | 需扩展 |
+| 数据质量 | 内置规则引擎 | Great Expectations |
+| 部署 | 中（ZK + DB） | 重（DB + Redis + K8s） |
+| 社区 | Apache（中英文） | 全球（最活跃） |
+| 适用 | 数据平台/数仓编排 | 数据工程/MLOps |
+
+选型建议：
+  可视化 + 任务类型丰富 → DolphinScheduler
+  代码即编排 + 灵活最强 → Airflow
+  混合场景 → DS 编排数据管道，Airflow 做 ML Pipeline
+
 ## 十四、与其他板块的关系
 
 - 定时任务对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；

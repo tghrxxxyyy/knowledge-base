@@ -483,6 +483,134 @@ pulsar-admin topics set-dispatch-rate team-a/orders \
 
 ---
 
+## 十三-2、BookKeeper Write Quorum / Read Quorum 原理
+
+```
+BookKeeper Quorum 写入流程：
+
+1. Broker 选择 Ensemble（参与写入的 Bookie 集合，如 3 个）
+2. 数据并发写入 Write Quorum 个 Bookie（如 W=2）
+3. 等待 Ack Quorum 个 Bookie 确认（如 A=2）
+4. 返回 Producer 写入成功
+
+参数关系：
+  Ensemble (E) ≥ Write Quorum (W) ≥ Ack Quorum (A)
+  容错 = W - A + 1（即 A 个确认后才返回）
+  常见配置：E=3, W=3, A=2 → 容忍 1 个 Bookie 故障
+
+示例：
+  E=3, W=3, A=2 → 3 个 Bookie 都写入，2 个确认即返回
+  容错：1 个 Bookie 故障不影响写入
+```
+
+## 十三-3、Pulsar Tiered Storage 热温冷分层配置
+
+```bash
+# 配置分层存储策略
+pulsar-admin namespaces set-clipping-threshold my-tenant/my-ns \
+  --size-threshold 10GB
+
+# 启用 Offload 策略
+pulsar-admin namespaces set-offload-threshold my-tenant/my-ns \
+  --size-threshold 1GB
+
+# 按消息时间卸载
+pulsar-admin namespaces set-offload-deletion-lag my-tenant/my-ns \
+  --deletion-lag 24h
+
+# 热温冷数据流向：
+# 热：BookKeeper（近 24h）
+# 温：BookKeeper（24h~7d）→ S3 过渡
+# 冷：S3/OSS（>7d）→ 降本 70%+
+```
+
+## 十三-4、Pulsar Functions 无状态处理模型
+
+```
+Pulsar Functions = 轻量 Serverless 消息处理
+
+处理模型：
+  Input Topic → Function 实例 → Output Topic
+  每个 Function 实例无状态（或通过 State 存储简单 KV）
+
+State 存储：
+  本地状态：内存/文件（简单场景）
+  外部状态：RocksDB（持久化）
+  限制：不能做复杂事务
+
+与 Flink 对比：
+  Pulsar Functions：简单 ETL/过滤/聚合，无需独立集群
+  Flink：复杂流处理，有状态管理，需要独立集群
+
+部署命令：
+  pulsar-admin functions create \
+    --jar my-function.jar \
+    --classname com.example.MyFunction \
+    --input-topic orders --output-topic orders-processed
+```
+
+## 十三-5、Geo-replication 复制策略（sync/async）
+
+| 策略 | 说明 | 延迟 | 一致性 |
+|------|------|------|--------|
+| 异步复制 | 默认，写入本地集群即返回 | 秒级 | 最终一致 |
+| 同步复制 | 写入多个集群后才返回 | 高（跨地域） | 强一致 |
+| 半同步 | 写入本地 + 一个远程集群 | 中等 | 准强一致 |
+
+```
+异步复制流程：
+  Producer → 本地 Broker → BookKeeper
+  → 后台异步复制到远程集群
+  → 远程 Broker 接收并存储
+
+同步复制流程：
+  Producer → 本地 Broker → BookKeeper（本地）
+  → 同步写远程 Broker → 远程 BookKeeper
+  → 所有集群确认后返回
+
+选择建议：
+  金融级零丢失 → 同步复制（延迟高）
+  一般业务 → 异步复制（延迟低）
+  跨地域多活 → 异步复制 + 客户端故障转移
+```
+
+## 十三-6、Pulsar 消息去重机制
+
+```
+去重方式：
+  1. Producer 端：设置 ProducerName + SequenceId
+     → Broker 校验：同 Producer + 同 SequenceId 不重复投递
+
+  2. Broker 端：开启去重配置
+     brokerDeduplicationEnabled=true
+     brokerDeduplicationSnapshotInterval=10000
+
+  3. Consumer 端：幂等消费（业务层去重）
+
+去重原理：
+  Broker 维护已投递消息的 (ProducerName, SequenceId) 映射
+  新消息到达时检查是否已存在
+  → 存在则丢弃，不存在则写入
+```
+
+## 十三-7、Pulsar vs Kafka 吞吐/延迟基准对比
+
+| 指标 | Pulsar | Kafka |
+|------|--------|-------|
+| 单机写入吞吐 | 10~30万 msg/s | 20~50万 msg/s |
+| 端到端延迟（P99） | 5~20ms | 2~10ms |
+| 消费延迟（P99） | 5~15ms | 1~5ms |
+| 消息积压恢复 | 快（加 Bookie 即扩） | 中（需 rebalance） |
+| 多租户隔离 | 原生强 | 弱 |
+
+```
+选择建议：
+  极致吞吐/延迟 → Kafka（存算一体，本地盘快）
+  云原生弹性/多租户 → Pulsar（存算分离，弹性好）
+  跨地域复制 → Pulsar（原生支持）
+  已有 Kafka 生态 → 留 Kafka
+```
+
 ## 十四、与其他板块的关系
 
 - 与 [RabbitMQ](RabbitMQ.md)、[消息队列 MQ](../MQ.md)、[MQTT](MQTT与消息broker.md)：同属消息家族。Pulsar 是「云原生统一消息流」，RabbitMQ 是「业务路由」，MQTT 是「设备协议」。

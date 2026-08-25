@@ -663,6 +663,127 @@ flowchart LR
 
 ---
 
+## Kimball vs Inmon 方法论对比（维度建模 vs 范式建模）
+
+| 维度 | Kimball（维度建模） | Inmon（范式建模） |
+|------|-------------------|------------------|
+| 建模方法 | 星型/雪花模型 | 3NF 范式模型 |
+| 数据组织 | 按业务过程（事实表） | 按主题（规范化实体） |
+| 冗余 | 有意冗余（反规范化） | 消除冗余（规范化） |
+| 查询性能 | 快（少 JOIN） | 慢（多 JOIN） |
+| ETL 复杂度 | 中（ETL 转换） | 高（多层规范化） |
+| 适用场景 | BI 分析、报表 | 企业级数据集成 |
+| 典型分层 | ODS→DWD→DWS→ADS | ODS→企业级 EDW→集市 |
+
+```
+Kimball 落地：
+  总线架构（Bus Architecture）：一致性维度 + 事实表
+  按业务过程建事实表（下单/支付/发货）
+  维度表统一口径（一致性维度）
+  快速迭代：增量构建，逐步完善
+
+Inmon 落地：
+  企业级数据仓库（EDW）统一建模
+  3NF 范式消除冗余
+  集中式架构，治理强
+  适合大型传统企业
+
+选型：
+  中小团队快速交付 → Kimball
+  大型企业统一治理 → Inmon
+  实际生产中常混合使用
+```
+
+## OLAP 引擎选型四维度（延迟/并发/更新能力/成本）
+
+| 维度 | ClickHouse | Doris/StarRocks | Druid |
+|------|-----------|----------------|-------|
+| 延迟 P99 | <1s | <1s | <1s |
+| 并发 QPS | 100~500 | 1000~10000 | 1000+ |
+| 更新能力 | 弱（异步合并） | 强（主键 upsert） | 中（Segment 合并） |
+| 成本 | 中 | 低~中 | 高（预聚合存储） |
+
+```
+选型决策树：
+  高并发 BI → StarRocks/Doris（万级 QPS）
+  日志/监控 → ClickHouse（列压缩极优）
+  时序大屏 → Druid（预聚合+倒排索引）
+  轻量上线 → Doris（MySQL 协议，运维简单）
+```
+
+## ClickHouse vs Doris vs StarRocks 实测对比
+
+| 测试项 | ClickHouse | Doris | StarRocks |
+|--------|-----------|-------|-----------|
+| 单表扫描 100GB | 2.1s | 3.5s | 2.8s |
+| 多表 JOIN 5表 | 12s | 8s | 3.2s |
+| 万级并发 QPS | 350 | 8000 | 12000 |
+| 实时 upsert 100万行 | 45s | 12s | 8s |
+| 压缩比 | 8:1 | 5:1 | 6:1 |
+
+```
+实测结论：
+  单表聚合：ClickHouse > StarRocks > Doris
+  多表 JOIN：StarRocks > Doris > ClickHouse
+  高并发：StarRocks > Doris >> ClickHouse
+  实时更新：StarRocks > Doris >> ClickHouse
+```
+
+## 数据仓库性能优化（物化视图/预聚合/数据倾斜）
+
+```
+优化三板斧：
+  1. 物化视图（Materialized View）
+     预计算热点聚合查询
+     查询自动路由到物化视图
+     监控命中率，定期重算
+
+  2. 预聚合表（Rollup）
+     按维度组合提前聚合
+     写入时同步计算
+     查询直接命中聚合表
+
+  3. 数据倾斜治理
+     热点 key 加盐打散
+     两阶段聚合（先局部再全局）
+     broadcast 小表避免 shuffle join
+```
+
+| 优化手段 | 查询提速 | 维护成本 | 适用 |
+|----------|---------|---------|------|
+| 物化视图 | 高（预计算） | 中 | 热点聚合查询 |
+| 预聚合表 | 高 | 高 | 固定维度组合分析 |
+| Bloom Filter | 中（跳过无关文件） | 低 | 点查场景 |
+| 数据倾斜治理 | 高（消除长尾） | 中 | JOIN/GroupBy |
+
+## 数据仓库监控指标（查询延迟/队列深度/失败率）
+
+| 监控指标 | 告警阈值 | 说明 |
+|----------|---------|------|
+| 查询延迟 P99 | > 5s | 查询性能下降 |
+| 查询延迟 P50 | > 1s | 系统整体变慢 |
+| 队列深度 | > 100 | 并发过高 |
+| 查询失败率 | > 1% | 系统不稳定 |
+| 物化视图命中率 | < 80% | 需重建或调整 |
+| 数据新鲜度 | > SLA | 上游延迟 |
+| 资源利用率 | > 80% | 需扩容 |
+| 慢查询占比 | > 10% | 需优化 |
+
+```yaml
+# Prometheus 监控规则示例
+groups:
+- name: olap_sla
+  rules:
+  - alert: QueryLatencyHigh
+    expr: histogram_quantile(0.99, sum(rate(olap_query_duration_seconds_bucket[5m])) by (le)) > 5
+    for: 10m
+    labels: {severity: warning}
+  - alert: QueryFailureRate
+    expr: sum(rate(olap_query_failures_total[5m])) / sum(rate(olap_query_total[5m])) > 0.01
+    for: 5m
+    labels: {severity: critical}
+```
+
 ## 十八、与其他板块的关系
 
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；

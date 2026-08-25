@@ -643,6 +643,220 @@ Airflow Secrets Backend：
   Azure Key Vault
 ```
 
+## Airflow 2.x Sensor vs Deferrable Operator 区别与迁移
+
+| 维度 | Sensor | Deferrable Operator |
+|------|--------|-------------------|
+| 原理 | 阻塞轮询（sleep 循环） | 异步等待（Triggerer 回调） |
+| 资源占用 | 占 Worker slot（一直持有） | 释放 slot（异步等待） |
+| 并发能力 | 低（slot 被阻塞） | 高（slot 可释放） |
+| 适用场景 | 简单文件/时间等待 | 复杂外部系统等待（K8s Job/HTTP） |
+| 推荐度 | 2.x 逐步弃用 | **强烈推荐（2.2+ 默认）** |
+
+```python
+# 旧方式：Sensor（阻塞 Worker slot）
+from airflow.sensors.http_sensor import HttpSensor
+
+sensor = HttpSensor(
+    task_id="wait_for_api",
+    http_conn_id="my_api",
+    endpoint="/status",
+    poke_interval=30,   # 每 30s 轮询一次
+    timeout=600,
+)
+
+# 新方式：Deferrable Operator（释放 slot，异步等待）
+from airflow.providers.http.sensors.http import HttpSensor
+
+sensor = HttpSensor(
+    task_id="wait_for_api",
+    http_conn_id="my_api",
+    endpoint="/status",
+    deferrable=True,  # 关键开关：切换为异步模式
+)
+```
+
+```
+迁移要点：
+  1. 所有 Sensor 加 deferrable=True 即可迁移
+  2. 必须启用 Triggerer 进程（独立部署）
+  3. Triggerer 数量 = 并发等待任务数
+  4. 资源收益：100 个等待任务从占 100 slot → 占 0 slot
+```
+
+## Airflow Variable 加密存储与访问
+
+```
+Airflow Variable 存储敏感信息（API Key/密码）的安全实践：
+
+方式一：Fernet 加密（内置）
+  配置 fernet_key（airflow.cfg 或环境变量）
+  Variable.set("api_key", "secret_value")
+  → 存储为加密字符串，读取时自动解密
+
+方式二：Secret Backend（生产推荐）
+  敏感信息存外部系统（Vault/AWS Secrets Manager）
+  Variable.get("api_key") → 自动从 Vault 拉取
+
+配置方式：
+  [secrets]
+  backend = airflow.providers.hashicorp.secrets.vault.VaultBackend
+  backend_kwargs = {"connections_path": "airflow/connections",
+                    "variables_path": "airflow/variables",
+                    "url": "http://vault:8200"}
+```
+
+| 安全等级 | 存储方式 | 适用 |
+|----------|----------|------|
+| 低（开发） | 明文 Variable | 开发环境 |
+| 中 | Fernet 加密 Variable | 小规模生产 |
+| 高 | Secret Backend（Vault） | 企业生产 |
+| 最高 | Vault + KMS 密钥轮换 | 合规要求高 |
+
+## Airflow Pool/Slot 资源管理
+
+```
+Pool = 并发资源池，控制同时运行的任务数
+
+场景：
+  防止 100 个 DAG 同时跑打爆数据库连接
+  隔离不同团队的资源（数据团队 pool=10，BI 团队 pool=5）
+
+配置：
+  Airflow UI → Admin → Pools
+  或 Variable: "pool_name": {"slots": 10}
+
+代码：
+  BashOperator(pool="data_team_pool", ...)
+
+  # 动态设置池容量
+  from airflow.models import Pool
+  pool = Pool(pool="data_team_pool", slots=20)
+  session.add(pool)
+```
+
+| 资源控制 | 配置 | 作用 |
+|----------|------|------|
+| Pool | 并发槽位数 | 控制同时运行的任务数 |
+| Priority | 权重 | 同 Pool 内任务优先级 |
+| max_active_runs_per_dag | DAG 级 | 单 DAG 最大并行运行数 |
+| parallelism | 全局级 | 全局最大并行任务数 |
+
+## Airflow DAG 依赖管理（Trigger Rule / depends_on_past）
+
+```python
+from airflow.utils.trigger_rule import TriggerRule
+
+with DAG("dependency_demo", ...) as dag:
+    task_a = BashOperator(task_id="a", bash_command="echo a")
+    task_b = BashOperator(task_id="b", bash_command="echo b")
+    task_c = BashOperator(task_id="c", bash_command="echo c")
+    task_d = BashOperator(task_id="d", bash_command="echo d",
+                          trigger_rule=TriggerRule.NONE_FAILED)
+    task_e = BashOperator(task_id="e", bash_command="echo e",
+                          depends_on_past=True)  # 依赖上一次运行结果
+```
+
+| Trigger Rule | 说明 | 适用场景 |
+|-------------|------|----------|
+| ALL_SUCCESS | 全部成功（默认） | 常规依赖 |
+| ALL_FAILED | 全部失败 | 错误处理分支 |
+| ONE_SUCCESS | 至少一个成功 | 并行任务任一完成即可 |
+| ONE_FAILED | 至少一个失败 | 错误检测 |
+| NONE_FAILED | 无失败（允许部分成功） | 条件分支 |
+| NONE_FAILED_MIN_ONE | 至少一个成功且无失败 | 跳过空分区场景 |
+| ALL_DONE | 全部完成（成功失败均可） | 清理任务 |
+
+```
+depends_on_past=True：
+  当前任务依赖上一次运行的结果
+  上次成功 → 本次正常执行
+  上次失败 → 本次被 skip
+  适用：增量 ETL、幂等重跑
+```
+
+## Airflow 与 dbt 集成模式
+
+```
+dbt（Data Build Tool）= SQL 转换框架
+Airflow = 调度编排框架
+
+集成方式：
+  方式一：BashOperator 调 dbt CLI
+    BashOperator(bash_command="dbt run --models orders")
+  
+  方式二：dbt-airflow-providers 包
+    从 dbt manifest.json 自动生成 Airflow DAG
+  
+  方式三：dbt Cloud Operator
+    调用 dbt Cloud API 触发运行
+```
+
+```python
+# 方式一：BashOperator 调 dbt
+BashOperator(
+    task_id="dbt_run",
+    bash_command="cd /dbt_project && dbt run --select orders+ --target prod",
+    env={"DBT_PROFILES_DIR": "/dbt_project"},
+)
+
+# 方式二：自动生成 DAG（从 manifest.json）
+from dbt_airflow.operators import DbtRunOperator
+
+with DAG("dbt_pipeline", ...) as dag:
+    DbtRunOperator(
+        task_id="dbt_run_orders",
+        models="orders",
+        select="+orders",  # dbt 选择语法
+    )
+```
+
+## Airflow in K8s（Helm Chart 部署架构）
+
+```mermaid
+flowchart TB
+    subgraph Airflow-on-K8s
+    WEB[Webserver] --> LB[LoadBalancer]
+    SCHED[Scheduler] --> DB[(Metadata DB)]
+    SCHED --> EXEC[K8sExecutor]
+    EXEC --> POD1[Worker Pod 1]
+    EXEC --> POD2[Worker Pod 2]
+    EXEC --> POD3[Worker Pod N]
+    TRIG[Triggerer] --> KAFKA[(Kafka/Redis)]
+    end
+    LB --> USER[用户]
+    POD1 --> HDFS[(HDFS/S3)]
+    POD2 --> HDFS
+    POD3 --> HDFS
+```
+
+```
+Helm 部署要点：
+  helm repo add apache-airflow https://airflow.apache.org/helm
+  helm install airflow apache-airflow/airflow -f values.yaml
+
+关键配置：
+  executor: KubernetesExecutor
+  scheduler.replicas: 2（高可用）
+  webserver.replicas: 2（高可用）
+  triggerer.replicas: 1（异步触发）
+  workers.resources: requests/limits（Pod 资源）
+  worker.kubernetes.pod_template_file: 模板文件
+
+Pod 模板（per-task 资源覆盖）：
+  nodeSelector: node-role: data-worker
+  tolerations: data=true:NoSchedule
+  affinity: 反亲和性（Pod 分散到不同节点）
+```
+
+| 组件 | 副本数 | 说明 |
+|------|--------|------|
+| Webserver | 2+ | UI 高可用 |
+| Scheduler | 2+ | 调度高可用（数据库锁协调） |
+| Triggerer | 1+ | 异步触发（deferrable operator） |
+| Worker | 0~N（弹性） | K8sExecutor 按需创建 Pod |
+| Metadata DB | 1（RDS） | PostgreSQL 高可用托管 |
+
 ## 七、与其他板块的关系
 
 - DolphinScheduler 对比见「[DolphinScheduler](./DolphinScheduler.md)」；

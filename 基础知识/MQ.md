@@ -665,3 +665,155 @@ MQ 在 Event Sourcing 中的角色：
 | 磁盘 | 消息速率 × 保留时间 × 副本数 | 消息速率 × 保留时间 × 副本数 |
 | 内存 | 分区数 × segment 缓冲 | CommitLog 缓冲 + ConsumeQueue 缓存 |
 | 网络 | 生产带宽 + 消费带宽 × 消费者数 | 生产带宽 + 消费带宽 × 消费者数 |
+
+---
+
+## 二十二、幂等消费模式
+
+### 22.1 幂等方案对比
+
+| 方案 | 实现 | 优点 | 缺点 |
+|------|------|------|------|
+| 唯一ID+去重表 | 消息带ID，DB去重 | 简单可靠 | 增加DB压力 |
+| Redis SET | `SET msg_id 1 NX EX` | 高性能 | 需维护过期 |
+| 业务天然幂等 | 更新操作（set not add） | 无额外成本 | 只适用部分场景 |
+| 状态机 | 订单状态流转 | 精确控制 | 实现复杂 |
+
+```sql
+-- 去重表实现
+CREATE TABLE msg_dedup (
+  msg_id VARCHAR(64) PRIMARY KEY,
+  consumer_group VARCHAR(64),
+  consumed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_expire (consumed_at)
+);
+
+-- 消费时检查
+INSERT INTO msg_dedup (msg_id, consumer_group) VALUES ('msg_123', 'order-group');
+-- 若插入成功 → 处理消息；若重复 → 跳过
+```
+
+## 二十三、延迟消息与定时任务
+
+| 场景 | 方案 | 延迟精度 |
+|------|------|----------|
+| 订单超时关闭 | RocketMQ 延迟消息 | 秒级 |
+| 定时报告生成 | quartz + DB 调度 | 分钟级 |
+| 优惠券到期 | Kafka + 延迟 topic | 分钟级 |
+| 复杂 DAG 调度 | Elastic-Job/XXL-JOB | 秒级 |
+
+## 二十四、correlationId 分布式追踪
+
+```java
+// 生产端设置 correlationId
+String correlationId = UUID.randomUUID().toString();
+Message msg = MessageBuilder.withPayload(payload)
+    .setHeader("correlationId", correlationId)
+    .setHeader("timestamp", System.currentTimeMillis())
+    .build();
+kafkaTemplate.send("order-topic", msg);
+
+// 消费端提取
+@KafkaListener(topics = "order-topic")
+public void consume(ConsumerRecord<String, String> record) {
+    String correlationId = record.headers().lastHeader("correlationId").value();
+    MDC.put("correlationId", correlationId);
+    // 处理消息...
+    log.info("Message processed", correlationId);
+}
+```
+
+## 二十五、消费积压应急扩容
+
+```mermaid
+flowchart TD
+    DETECT[检测积压] --> ASSESS[评估积压量]
+    ASSESS --> QUICK[快速扩容消费者]
+    QUICK --> CHECK{积压是否缓解?}
+    CHECK -->|是| MONITOR[持续监控]
+    CHECK -->|否| SCALE_UP[增加分区数]
+    SCALE_UP --> REBALANCE[消费者Rebalance]
+    REBALANCE --> MONITOR
+    DETECT --> FLUSH[紧急处理]
+    FLUSH --> DLQ[死信队列处理]
+    FLUSH --> REPLAY[消息重放]
+```
+
+| 等级 | 积压量 | 处理方式 |
+|------|--------|----------|
+| 轻微 | <1万条 | 自动扩容消费者 |
+| 中等 | 1~10万条 | 手动扩容+提升消费线程 |
+| 严重 | 10~100万条 | 增加分区+消费者 |
+| 紧急 | >100万条 | 停止生产+紧急扩容+消息重放 |
+
+## 二十六、批量消费性能优化
+
+```java
+// 批量消费配置
+@KafkaListener(topics = "batch-topic", containerFactory = "batchFactory")
+public void batchConsume(List<ConsumerRecord<String, String>> records) {
+    // 批量处理：减少网络往返
+    List<Entity> entities = records.stream()
+        .map(this::parse)
+        .collect(Collectors.toList());
+    batchInsert(entities);  // 批量写入DB
+}
+
+// 批量配置
+@Bean
+public ConcurrentKafkaListenerContainerFactory<String, String> batchFactory() {
+    ConcurrentKafkaListenerContainerFactory<String, String> factory =
+        new ConcurrentKafkaListenerContainerFactory<>();
+    factory.setBatchListener(true);
+    factory.getConsumerProperties().setMaxPollRecords(500);
+    return factory;
+}
+```
+
+## 二十七、容量规划公式汇总
+
+| 指标 | 计算公式 |
+|------|----------|
+| Broker 数 | `ceil(目标TPS / 单Broker TPS) × 副本因子` |
+| 分区数 | `max(消费者数, 目标TPS / 单分区TPS)` |
+| 磁盘容量 | `消息速率 × 消息大小 × 保留时间 × 副本数 × 1.5` |
+| 内存 | `分区数 × segment大小 + 消费缓冲` |
+| 带宽 | `(生产TPS + 消费TPS × 消费者数) × 消息大小` |
+| 消费者数 | `min(分区数, 目标TPS / 单消费者TPS)` |
+
+## 二十八、消息队列监控告警
+
+### 28.1 核心监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 消费延迟(Lag) | 消费者积压量 | >10000条 |
+| 消息丢失率 | 生产/消费丢失 | >0.01% |
+| Broker负载 | CPU/内存/磁盘 | >80% |
+| 分区分布 | 分区是否均衡 | 不均衡度>20% |
+
+### 28.2 监控工具
+
+```text
+Kafka 监控：
+  - Kafka Manager (Yahoo)
+  - Confluent Control Center
+  - Prometheus + JMX Exporter
+  - Grafana Dashboard
+
+RocketMQ 监控：
+  - RocketMQ Dashboard
+  - Prometheus + RocketMQ Exporter
+  - Grafana Dashboard
+```
+
+## 二十九、消息队列最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 消息幂等 | 消费端做去重 |
+| 消息顺序 | 分区内保证顺序 |
+| 消息回溯 | 保留足够时间窗口 |
+| 死信队列 | 失败消息单独处理 |
+| 消息压缩 | 大消息压缩传输 |
+| 批量消费 | 提高消费效率 |

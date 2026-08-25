@@ -701,4 +701,129 @@ CREATE INDEX idx_population ON us_population (population DESC);
 
 ---
 
+## 十六、BloomFilter 类型与选型
+
+### 16.1 BloomFilter 类型对比
+
+| 类型 | 误判率 | 空间占用 | 适用场景 |
+|------|--------|----------|----------|
+| ROW | 低 | 中 | 行级查询 |
+| ROWCOL | 最低 | 高 | 行+列级查询 |
+| ROWPREFIX | 中 | 低 | 前缀扫描 |
+| ROWCOLPREFIX | 低 | 中 | 行+列前缀 |
+
+```bash
+# 创建带 BloomFilter 的表
+create 't1', {NAME => 'cf', BLOOMFILTER => 'ROWCOL'}
+
+# 查看 BloomFilter 状态
+hbase org.apache.hadoop.hbase.io.hfile.HFile
+```
+
+## 十七、Compaction 调度器
+
+### 17.1 Compaction 类型
+
+```text
+Minor Compaction：
+  - 合并小 HFile 为大 HFile
+  - 不删除数据
+  - 触发条件：hbase.hstore.compactionThreshold（默认3）
+
+Major Compaction：
+  - 合并所有 HFile 为一个
+  - 删除过期/删除标记数据
+  - 触发条件：hbase.hstore.compaction.max.large（默认10GB）
+  - 建议：低峰期执行
+```
+
+### 17.2 Compaction 调优
+
+```xml
+<!-- hbase-site.xml -->
+<property>
+  <name>hbase.hstore.compactionThreshold</name>
+  <value>3</value>
+</property>
+<property>
+  <name>hbase.hstore.compaction.max</name>
+  <value>10</value>
+</property>
+<property>
+  <name>hbase.regionserver.thread.compaction.large</name>
+  <value>2</value>
+</property>
+<property>
+  <name>hbase.regionserver.thread.compaction.small</name>
+  <value>3</value>
+</property>
+```
+
+## 十八、Coprocessor 协处理器
+
+### 18.1 协处理器类型
+
+| 类型 | 作用 | 执行位置 |
+|------|------|----------|
+| Endpoint | 自定义RPC | RegionServer |
+| Observer | 监听表事件 | RegionServer |
+| Aggregate | 聚合计算 | RegionServer |
+
+### 18.2 使用示例
+
+```java
+// Observer：自动添加时间戳
+public class IncreasingAgeObserver extends BaseRegionObserver {
+    @Override
+    public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                       Put put, WALEdit edit, Durability durability) {
+        byte[] row = put.getRow();
+        byte[] value = put.get(Bytes.toBytes("cf"), Bytes.toBytes("age"));
+        if (value != null) {
+            long age = Bytes.toLong(value) + 1;
+            put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("age"), Bytes.toBytes(age));
+        }
+    }
+}
+```
+
+## 十九、BulkLoad 批量导入
+
+```bash
+# 使用 Spark 生成 HFile
+spark-submit --class org.apache.hadoop.hbase.spark.HBaseBulkLoad \
+  --master yarn \
+  hbase-bulkload.jar \
+  -t table_name \
+  -f /tmp/hfiles
+
+# 导入 HFile 到 HBase
+hbase org.apache.hadoop.hbase.tool.LoadIncrementalHFile \
+  /tmp/hfiles table_name
+```
+
+## 二十、Phoenix 二级索引
+
+### 20.1 索引类型
+
+| 类型 | 语法 | 适用 |
+|------|------|------|
+| 全局索引 | `CREATE INDEX idx ON t(col)` | 读多写少 |
+| 本地索引 | `CREATE LOCAL INDEX idx ON t(col)` | 写多读少 |
+| 覆盖索引 | `INCLUDE(col2)` | 避免回表 |
+| 函数索引 | `CREATE INDEX idx ON t(UPPER(col))` | 函数查询 |
+
+```sql
+-- 全局索引
+CREATE INDEX idx_name ON users (name DESC) INCLUDE (email, phone);
+
+-- 本地索引
+CREATE LOCAL INDEX idx_status ON orders (status);
+
+-- 查询自动使用索引
+SELECT name, email FROM users WHERE name = 'John';
+```
+
+---
+
 > 一句话：**HBase = HDFS 上的 Bigtable + LSM 树写优化 + 列族存储 + 强一致；选型先看「生态（Hadoop→HBase，独立→Cassandra）」，再定「RowKey 设计（散列/有序/短）」，最后调「内存/Compaction/BloomFilter」**。

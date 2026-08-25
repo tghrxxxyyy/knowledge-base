@@ -576,6 +576,185 @@ etcd \
 
 ---
 
+## 十二-2、etcd MVCC 原理（revision + tree index）
+
+```
+etcd MVCC 实现：
+
+每次写操作分配全局递增 revision：
+  revision = 全局版本号（每次 Put/Delete +1）
+
+数据结构：
+  tree index：内存索引，key → revision 列表
+  boltdb：持久化存储，revision → value
+
+读取流程：
+  1. 客户端 Get(key)
+  2. tree index 查找 key 对应的最新 revision
+  3. boltdb 按 revision 读取 value
+  4. 返回结果
+
+历史版本读取：
+  Get(key, WithRevision(rev)) → 读指定版本
+  支持范围查询：Get(prefix, WithLastRev())
+
+优势：
+  - 读不阻塞写（MVCC）
+  - 支持历史版本（审计/回滚）
+  - Watch 基于 revision（断点续传）
+```
+
+## 十二-3、compact/defrag 周期性维护操作
+
+```bash
+# Compact：压缩历史版本（保留当前 revision）
+etcdctl compact $(etcdctl endpoint status --write-out=json | jq '.header.revision')
+
+# Defrag：碎片整理（释放磁盘空间）
+etcdctl defrag --endpoints=http://localhost:2379
+
+# 自动压缩配置
+# --auto-compaction-mode=periodic
+# --auto-compaction-retention=8h
+
+# 定期维护脚本（cron）
+#!/bin/bash
+REV=$(etcdctl endpoint status --write-out=json | jq '.header.revision')
+etcdctl compact $REV
+etcdctl defrag --endpoints=http://localhost:2379
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d).db
+
+# 监控指标
+# etcd_mvcc_db_total_size_in_bytes → DB 大小
+# ratio > 2 → 需要 defrag
+```
+
+## 十二-4、etcd lease 租约续期与自动回收
+
+```
+Lease 租约机制：
+
+1. 创建租约
+   lease, _ := client.Grant(ctx, 10)  -- 10 秒 TTL
+
+2. 绑定 Key
+   client.Put(ctx, "key", "value", clientv3.WithLease(lease.ID))
+
+3. 续期（KeepAlive）
+   ch, _ := client.KeepAlive(ctx, lease.ID)
+   for resp := range ch {
+       // 自动续期（每次 TTL/3）
+   }
+
+4. 自动回收
+   租约过期 → 绑定的 Key 自动删除
+   客户端宕机 → KeepAlive 停止 → 租约过期 → Key 删除
+
+与 ZK 对比：
+  etcd Lease：时间戳比较，灵活（可调整 TTL）
+  ZK Session：会话超时，固定（不易调整）
+
+应用：
+  分布式锁：持有者宕机 → 租约过期 → 锁自动释放
+  服务注册：服务下线 → 租约过期 → 注册信息自动清理
+  临时元数据：按需设置 TTL → 过期自动清理
+```
+
+## 十二-5、K8s etcd 故障恢复（backup/restore）
+
+```bash
+# 备份（每小时）
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d%H%M).db
+
+# 验证备份
+etcdctl snapshot status /backup/etcd-20260821.db --write-out=table
+
+# 恢复流程
+Step 1: 停止所有 etcd 节点
+  systemctl stop etcd
+
+Step 2: 备份当前数据目录
+  mv /var/lib/etcd /var/lib/etcd.bak
+
+Step 3: 恢复快照
+  etcdctl snapshot restore /backup/etcd-20260821.db \
+    --data-dir=/var/lib/etcd-restored \
+    --name=etcd-node1 \
+    --initial-cluster="etcd-node1=http://node1:2380,etcd-node2=http://node2:2380" \
+    --initial-advertise-peer-urls=http://node1:2380
+
+Step 4: 启动 etcd
+  systemctl start etcd
+
+Step 5: 验证数据完整性
+  etcdctl get / --prefix --keys-only | head -20
+
+注意：
+  - 所有节点使用同一快照恢复
+  - 恢复后需要重启 etcd
+  - 定期测试恢复流程（完整性校验）
+```
+
+## 十二-6、etcd 网络分区与 leader election 行为
+
+```
+网络分区行为：
+
+场景：3 节点集群（A, B, C），A 被隔离
+
+正常状态：
+  A(Leader) ──── B(Follower)
+       │
+       └─── C(Follower)
+
+分区后：
+  A(Leader) ──── X (隔离)
+  B ──── C (仍连通)
+
+行为：
+  1. B/C 检测到 Leader 不可达
+  2. 触发选举（随机超时后）
+  3. B 或 C 当选新 Leader
+  4. A 被隔离后无法获得 quorum → 写被拒绝
+  5. A 的读可能返回旧数据
+
+恢复后：
+  A 重新加入集群
+  → 发现自己的 Term 较低
+  → 自动降级为 Follower
+  → 从新 Leader 同步数据
+
+这就是 CP 特性的代价：
+  网络分区时少数派不可用（写被拒绝）
+  保证一致性（不会出现双主）
+```
+
+## 十二-7、etcd v2 vs v3 API 本质差异
+
+| 维度 | etcd v2 | etcd v3 |
+|------|---------|---------|
+| 协议 | HTTP REST | gRPC |
+| 数据模型 | 扁平 KV（目录树） | 扁平 KV（前缀组织） |
+| Watch | HTTP 长轮询（一次性） | gRPC Stream（持续流） |
+| 事务 | 无原生事务 | Txn（if-then-else） |
+| MVCC | ❌ | ✅（带 revision） |
+| 租约 | TTL（HTTP） | Lease（gRPC） |
+| 性能 | 低（HTTP 开销） | 高（gRPC + 批量） |
+| 适用 | 已废弃 | K8s 官方指定 |
+
+```
+v3 优势：
+  1. gRPC 性能更高（二进制协议）
+  2. Watch 是持续流（不丢事件）
+  3. MVCC 支持历史版本
+  4. Txn 事务（CAS/乐观锁）
+  5. Lease 租约（灵活 TTL）
+  6. 批量操作（Put/Get 支持批量）
+
+K8s 已完全移除 v2 支持
+新项目必须使用 v3
+```
+
 ## 十三、与其他板块的关系
 
 - 和「**基础知识/中间件/ZooKeeper**」：同为 CP 协调服务，etcd 是云原生替代者（对比见上）。

@@ -709,7 +709,170 @@ ceph osd pool restore <pool-name> <backup>
 
 ---
 
-## 十九、与其他板块的关系
+## 二十、CRUSH 规则自定义
+
+### 20.1 CRUSH 规则创建
+
+```bash
+# 创建自定义 CRUSH 规则（三副本，跨机架）
+ceph osd crush rule create-replicated rule-3copy default host rack
+
+# 查看 CRUSH 规则
+ceph osd crush rule dump rule-3copy
+```
+
+### 20.2 CRUSH 故障域层级
+
+| 故障域层级 | 作用 | 适用 |
+|-----------|------|------|
+| host | 节点级故障 | 基本容灾 |
+| rack | 机架级故障 | 机房级容灾 |
+| row | 机房行级 | 大规模集群 |
+| datacenter | 数据中心级 | 异地容灾 |
+| region | 区域级 | 跨地域容灾 |
+
+```text
+CRUSH Rule 设计原则：
+  1. 副本数 × 故障域数 ≥ 可用域数
+  2. 三机架部署：每机架放1副本
+  3. 避免 all-in-one-host：副本不放同一节点
+  4. 故障域越大，容灾能力越强，但性能下降
+```
+
+## 二十一、PG 数量计算
+
+### 21.1 计算公式
+
+```text
+PG 数量 = (OSD 数 × 100) / 副本数
+
+推荐值：
+  - 每个 OSD 上的 PG 数控制在 100 左右
+  - 最小 PG 数：128
+  - 最大 PG 数：每个 Pool 32768
+
+示例：
+  - 20 OSD，3副本 → PG = (20 × 100) / 3 = 667 → 向上取 1024
+  - 100 OSD，3副本 → PG = (100 × 100) / 3 = 3333 → 向上取 4096
+```
+
+### 21.2 PG 调优命令
+
+```bash
+# 设置 Pool PG 数
+ceph osd pool set <pool-name> pg_num <pg-count>
+ceph osd pool set <pool-name> pgp_num <pg-count>
+
+# 查看 PG 分布
+ceph osd pool stats
+ceph pg stat
+```
+
+## 二十二、Thin Provisioning（精简配置）
+
+```text
+Thin Provisioning 原理：
+  - OSD 按需分配容量，不预先占满磁盘
+  - 允许超配（overcommit），提高利用率
+  - 需监控实际使用量，避免超限
+
+配置方式：
+  ceph osd pool set <pool> target_size_ratio 0.8
+  ceph osd pool set <pool> target_size_bytes 100G
+```
+
+| 策略 | 优点 | 风险 |
+|------|------|------|
+| 精简配置 | 提高利用率 | 可能超配导致不可用 |
+| 厚配置 | 容量保证 | 利用率低 |
+| 混合 | 关键Pool厚配置 | 需管理 |
+
+## 二十三、BlueStore 调优
+
+### 23.1 核心参数
+
+```ini
+# ceph.conf BlueStore 调优
+[osd]
+# WAL/DB 设备（SSD/NVMe）
+bluestore_block_db_path = /dev/nvme0n1p1
+bluestore_block_wal_path = /dev/nvme0n1p2
+
+# 缓存
+bluestore_cache_size_ssd = 3GB
+bluestore_cache_size_hdd = 1GB
+
+# Compaction
+bluestore_compression_mode = aggressive
+bluestore_compression_algorithm = snappy
+
+# 日志
+bluestore_log_op_age = 3600
+bluestore_log_trim_age = 3600
+```
+
+### 23.2 SSD vs HDD 配置对比
+
+| 参数 | SSD/NVMe | HDD |
+|------|----------|-----|
+| bluestore_cache_size | 2~4GB | 512MB~1GB |
+| bluestore_compression | aggressive | none/Passive |
+| bluestore_min_alloc_size | 4K | 16K |
+| bluestore_prefer_deferred_size | 0 | 32K |
+
+## 二十四、Ceph 与 OpenStack 集成
+
+```text
+OpenStack 组件 → Ceph 对接：
+  Cinder（块存储）→ RBD（Ceph RBD）
+  Glance（镜像服务）→ RBD（存储 VM 镜像）
+  Nova（虚拟机）→ RBD（临时/持久化磁盘）
+
+对接配置：
+  1. 创建 OpenStack 专用 Pool
+  2. 创建 Ceph 认证用户
+  3. 配置 OpenStack 各组件的 ceph.conf
+  4. 导入 keyring 文件
+```
+
+```bash
+# 创建 OpenStack 专用 Pool
+ceph osd pool create volumes 128
+ceph osd pool create images 64
+ceph osd pool create vms 128
+
+# 创建认证用户
+ceph auth get-or-create client.glance mon 'allow r' osd 'allow class-read,allow rwx pool=images'
+ceph auth get-or-create client.cinder mon 'allow r' osd 'allow class-read,allow rwx pool=volumes,allow rwx pool=vms,allow rwx pool=images'
+```
+
+## 二十五、Ceph 性能基线与调优
+
+### 25.1 性能基线
+
+```bash
+# 性能测试
+rados bench -p <pool> 30 write      # 写入测试
+rados bench -p <pool> 30 seq        # 顺序读测试
+rados bench -p <pool> 30 rand       # 随机读测试
+
+# 4K随机读写 IOPS 参考
+# HDD: ~200 IOPS/OSD
+# SSD: ~5000 IOPS/OSD
+# NVMe: ~50000 IOPS/OSD
+```
+
+### 25.2 调优清单
+
+| 调优点 | 方法 | 效果 |
+|--------|------|------|
+| 网络分离 | public/cluster 网络分开 | 减少干扰 |
+| SSD WAL/DB | BlueStore 元数据放 SSD | 降低延迟 |
+| 多 OSD | 每盘一个 OSD | 并行提升 |
+| CRUSH 优化 | 均衡 PG 分布 | 避免热点 |
+| 后台任务 | scrub/compact 限速 | 减少 IO 干扰 |
+
+## 与其他板块的关系
 
 - 对象存储对比见「[对象存储 MinIO/OSS](./对象存储MinIO-OSS.md)」；
 - 大数据存储（HDFS）见「[大数据/04-分布式存储与HDFS](../大数据/04-分布式存储与HDFS.md)」；

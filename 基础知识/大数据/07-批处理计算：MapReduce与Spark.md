@@ -734,6 +734,124 @@ Shuffle Tracking（Spark 3.0+）：
   两者互补：Spark 产出宽表，Presto 查询
 ```
 
+## Spark Shuffle 内存管理（ExternalSorter/ShuffleExternalSorter）
+
+```
+Shuffle 写入内存管理：
+
+  ExternalSorter：
+    接收 map 端输出的 (key, value) 对
+    在内存中排序（可选 combine 预聚合）
+    内存满 → 溢写到磁盘（spill）
+    最终合并（merge）为排序后的分区文件
+
+  ShuffleExternalSorter：
+    Tungsten 优化版本
+    堆外内存直接写入（避免 GC）
+    二进制排序（Unsafe.sort）
+    零拷贝序列化
+
+  内存管理流程：
+    1. 申请内存（execution memory pool）
+    2. 写入内存缓冲（spark.shuffle.file.buffer）
+    3. 内存满 → 排序 → 溢写到磁盘
+    4. 溢写文件合并 → 一个分区一个文件
+    5. 写索引文件（记录分区 offset）
+```
+
+## 数据倾斜解决方案大全（salting/broadcast/adaptive skew join）
+
+```
+方案一：两阶段聚合（推荐）
+  先按 Key + 随机前缀分组聚合
+  再去掉前缀，二次聚合
+
+方案二：Broadcast Join（小表广播）
+  spark.sql.autoBroadcastJoinThreshold=10MB
+  小表广播避免 Shuffle
+
+方案三：AQE 自适应（Spark 3.0+）
+  spark.sql.adaptive.enabled=true
+  自动合并小分区+倾斜自动处理
+
+方案四：隔离热点 Key
+  单独处理热点，再 Union
+
+方案五：自定义 Partitioner
+  对倾斜 Key 重新分区（加盐/拆分）
+
+检测方法：
+  Spark UI → Stage → Task Duration 分布（极不均匀 = 倾斜）
+  df.groupBy("key").count().orderBy(desc("count")).show(20)
+```
+
+## Spark speculative execution 配置与调优
+
+```
+推测执行 = 对慢节点启动备份任务，先完成的结果生效
+
+检测条件：
+  Task 运行时间 > 1.5 × 中位数
+  且失败次数 < spark.speculative.maxFailedTasks
+
+配置：
+  spark.speculation.enabled=true
+  spark.speculation.multiplier=1.5      # 慢任务判定倍数
+  spark.speculation.quantile=0.75       # 分位数
+  spark.speculation.maxFailedTasks=3    # 最大失败次数
+
+适用：非确定性计算（网络抖动/外部服务慢）
+不适用：有状态计算/写操作（可能双写）
+```
+
+## Spark on K8s 资源分配最佳实践（executor-core/memory 计算公式）
+
+```
+资源分配公式：
+
+  executor-cores：
+    推荐 2~5 核/executor
+    过多 → GC 压力大
+    过少 → 线程切换开销
+
+  executor-memory：
+    = spark.executor.memory + spark.executor.memoryOverhead
+    overhead = max(executor-memory × 0.1, 384MB)
+    
+  executor 数量：
+    = min(集群总核数 / executor-cores, maxExecutors)
+    
+  分区数（shuffle.partitions）：
+    = 输入数据量 / 128MB（推荐）
+    ≥ 2 × executor 总核数
+
+示例（100 核集群）：
+  executor-cores=4, executor-memory=8g
+  executor 数 = 100 / 4 = 25
+  shuffle.partitions = 2000
+```
+
+## Spark 动态资源分配（shuffle tracking）
+
+```
+动态资源分配 = 根据工作负载自动调整 Executor 数量
+
+配置：
+  spark.dynamicAllocation.enabled=true
+  spark.dynamicAllocation.minExecutors=2
+  spark.dynamicAllocation.maxExecutors=100
+  spark.dynamicAllocation.executorIdleTimeout=60s
+
+Shuffle Tracking（Spark 3.0+）：
+  通过 Shuffle 数据跟踪 Executor 是否可回收
+  避免回收后 Shuffle 数据丢失导致全量重算
+  spark.dynamicAllocation.shuffleTracking.enabled=true
+
+触发条件：
+  扩容：有 pending task 且空闲 Executor 不足
+  缩容：Executor 空闲超过 60s
+```
+
 ## 十九、与其他板块的关系
 
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；

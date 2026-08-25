@@ -744,3 +744,120 @@ IOx 下直接把 Parquet 落对象存储（S3/OSS），热数据用 SSD、冷数
 - [ ] 确认查询带 `time >=` 下界；缩小时间窗与 tag 过滤。
 - [ ] 调整 shard duration（避免 1 年数据用 1h shard）。
 - [ ] 大查询走聚合 RP，避免对 `rp_hot` 做跨月明细扫。
+
+---
+
+## 二十三、InfluxDB 3.0 架构演进
+
+### 23.1 架构变化
+
+| 维度 | InfluxDB 1.x | InfluxDB 2.x | InfluxDB 3.0 |
+|------|--------------|--------------|--------------|
+| 存储引擎 | TSI + WAL | TSI + WAL | Apache Arrow + DataFusion |
+| 查询语言 | InfluxQL | Flux | SQL + InfluxQL |
+| 存储格式 | TSM | TSM | Parquet（对象存储） |
+| 扩展性 | 单节点 | 单节点 | 分布式（IOx） |
+| 部署模式 | 单节点 | 单节点 | 云原生（SaaS） |
+
+### 23.2 InfluxDB 3.0 核心特性
+
+```text
+InfluxDB 3.0（IOx）：
+  - 基于 Apache Arrow 内存格式
+  - 使用 DataFusion 查询引擎
+  - Parquet 格式存储到对象存储（S3/GCS）
+  - 支持 SQL 查询
+  - 列式存储，压缩比高
+  - 流式写入，实时查询
+```
+
+## 二十四、Flux vs InfluxQL 对比
+
+| 特性 | InfluxQL | Flux |
+|------|----------|------|
+| 语法风格 | SQL-like | 函数式 |
+| 聚合函数 | 基础聚合 | 丰富聚合+转换 |
+| 跨数据源 | 不支持 | 支持（多数据源联合查询） |
+| 脚本能力 | 无 | 支持脚本 |
+| 学习曲线 | 低 | 高 |
+| 性能 | 高（优化好） | 中（需优化） |
+
+```flux
+// Flux 查询示例
+from(bucket: "mydb")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> filter(fn: (r) => r._field == "usage_idle")
+  |> aggregateWindow(every: 5m, fn: mean)
+  |> yield(name: "mean")
+```
+
+## 二十五、Continuous Query 与降采样
+
+### 25.1 降采样策略
+
+| 时间粒度 | 保留策略 | 适用 |
+|----------|----------|------|
+| 原始数据 | rp_hot（7天） | 实时查询 |
+| 5分钟聚合 | rp_warm（30天） | 近期分析 |
+| 1小时聚合 | rp_cold（1年） | 历史趋势 |
+| 1天聚合 | rp_archive（永久） | 长期归档 |
+
+### 25.2 降采样配置
+
+```sql
+-- 创建降采样任务
+CREATE CONTINUOUS QUERY "cq_cpu_5m" ON "mydb"
+BEGIN
+  SELECT mean("usage_idle") AS "usage_idle_mean"
+  INTO "rp_warm"."cpu_5m"
+  FROM "cpu"
+  GROUP BY time(5m), "host"
+END
+
+-- 创建降采样任务（1小时）
+CREATE CONTINUOUS QUERY "cq_cpu_1h" ON "mydb"
+BEGIN
+  SELECT mean("usage_idle_mean") AS "usage_idle_mean"
+  INTO "rp_cold"."cpu_1h"
+  FROM "rp_warm"."cpu_5m"
+  GROUP BY time(1h), "host"
+END
+```
+
+## 二十六、InfluxDB 集群方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| InfluxDB Enterprise | 官方集群版 | 大规模生产 |
+| InfluxDB Cloud | SaaS托管 | 云原生 |
+| InfluxDB 3.0 IOx | 新架构分布式 | 未来方向 |
+| 单节点+外部扩展 | Thanos/VictoriaMetrics | 替代方案 |
+
+## 二十七、时序库选型决策树
+
+```mermaid
+flowchart TD
+    Q1{数据量?} -->|<100GB| SINGLE[单节点InfluxDB]
+    Q1 -->|100GB~10TB| CLUSTER[集群方案]
+    Q1 -->|>10TB| CLOUD[云服务/分布式]
+    SINGLE --> Q2{查询需求?}
+    Q2 -->|简单聚合| INFLUX[InfluxDB]
+    Q2 -->|复杂分析| CLICKHOUSE[ClickHouse]
+    CLUSTER --> Q3{协议兼容?}
+    Q3 -->|需InfluxDB兼容| ENTERPRISE[InfluxDB Enterprise]
+    Q3 -->|需Prometheus兼容| VICTORIA[VictoriaMetrics]
+    CLOUD --> Q4{预算?}
+    Q4 -->|充足| DATADOG[Datadog]
+    Q4 -->|有限| MORPHEUS[Morpheus]
+```
+
+## 二十八、性能调优清单
+
+| 调优点 | 方法 | 效果 |
+|--------|------|------|
+| Shard Duration | 按查询时间范围调整 | 减少扫描数据 |
+| 压缩算法 | 使用Zstandard | 提高压缩比 |
+| 缓存大小 | 增加TSM缓存 | 提高读性能 |
+| 并行查询 | 启用并行执行 | 加速复杂查询 |
+| 索引优化 | 使用时间索引 | 加速时间范围查询 |

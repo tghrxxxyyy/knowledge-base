@@ -532,7 +532,142 @@ WHERE p.category = 'electronics';
 
 ---
 
-## 十五、与其他板块的关系
+## 十四-2、AQE 自适应查询执行三阶段
+
+### Stage 1：Shuffle 后动态合并分区
+
+```
+传统：编译期固定 200 个 Shuffle 分区
+AQE：运行时根据数据量合并小分区
+
+触发条件：
+  spark.sql.adaptive.coalescePartitions.enabled=true
+  targetPostShuffleInputSize=64MB（每个分区目标大小）
+
+效果：小分区合并后减少 Task 数，避免资源浪费
+```
+
+### Stage 2：动态切换 Join 策略
+
+```
+运行时发现某表实际很小 → 自动切 Broadcast Join
+无需预估表大小，避免手动调参
+
+触发条件：
+  spark.sql.adaptive.localShuffleReader.enabled=true
+```
+
+### Stage 3：动态倾斜处理（Skew Join）
+
+```
+检测到某分区数据量远大于其他 → 自动拆分倾斜分区
+
+原理：
+  1. 统计各分区数据量
+  2. 识别倾斜分区（数据量 > 中位数 × skewFactor）
+  3. 将倾斜分区拆分为多个子分区
+  4. 子分区独立处理，避免单 Task 过载
+
+配置：
+  spark.sql.adaptive.skewJoin.enabled=true
+  spark.sql.adaptive.skewJoin.skewedPartitionFactor=5
+  spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256MB
+```
+
+## 十四-3、Shuffle 外部排序器内存管理
+
+```
+UnsafeExternalSorter = Spark 的 Shuffle 写入排序器
+
+内存管理：
+  1. 首次使用堆内内存（On-Heap）
+  2. 内存不足 → Spill 到磁盘（溢写）
+  3. 多次溢写 → Merge 合并文件
+
+排序优化：
+  Prefix Sort：多列排序只比较前缀（减少比较次数）
+  Radix Sort：整数排序用基数排序（O(n) 复杂度）
+  Page-Based：按页排序减少内存分配
+
+监控指标：
+  shuffle_spill_count：溢写次数（突增=内存不足）
+  shuffle_spill_disk_size：溢写磁盘大小
+```
+
+## 十四-4、Broadcast Join 触发阈值与副作用
+
+```
+触发条件：
+  表大小 < spark.sql.autoBroadcastJoinThreshold（默认 10MB）
+  AQE 开启时可动态切换
+
+副作用：
+  1. Driver 收集全表数据 → Driver 内存压力大
+  2. 全量广播到所有 Executor → 网络开销
+  3. 大表 Join 小表时如果阈值设错 → 全量广播 OOM
+
+最佳实践：
+  小表 < 10MB → Broadcast Join（最优）
+  小表 10~100MB → 按内存评估是否广播
+  小表 > 100MB → Sort-Merge Join
+
+代码控制：
+  spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "50m")
+  // 或 SQL 强制广播
+  SELECT /*+ BROADCAST(dim) */ * FROM fact JOIN dim ON ...
+```
+
+## 十五、Spark on K8s Driver/Executor Pod 资源分配公式
+
+```
+资源分配公式：
+
+Executor Pod：
+  CPU = spark.executor.cores（如 4）
+  Memory = spark.executor.memory（如 8G）
+  JVM 堆 = memory × 0.75（约 6G）
+  Off-Heap = memory × 0.25（约 2G）
+  Pod Request = CPU + Memory
+
+Driver Pod：
+  CPU = spark.driver.cores（如 2）
+  Memory = spark.driver.memory（如 4G）
+  Driver 通常比 Executor 小
+
+总资源 = Driver 内存 + Executor 数 × Executor 内存
+  如 1 Driver(4G) + 4 Executor(8G) = 36G
+
+K8s 资源请求/限制：
+  resources.requests：调度依据（保证最低资源）
+  resources.limits：硬限制（超限 OOM Kill）
+  建议 requests ≈ limits（避免资源竞争）
+```
+
+## 十五-2、Spark 历史服务器排查
+
+```
+排查流程：
+  1. 启动 History Server
+     spark-history-server.sh start
+
+  2. 访问 Web UI
+     http://history-server:18080
+
+  3. 查看关键信息：
+     Job 执行时间（哪个 Stage 慢）
+     Shuffle 读写量（数据倾斜）
+     Task 处理记录数（是否分布不均）
+     GC 时间（GC 停顿频繁）
+     失败 Task（异常原因）
+
+  4. 常见排查点：
+     某 Stage 耗时远超其他 → 数据倾斜
+     Task 处理时间差异大 → 分区不均
+     Shuffle 写量突增 → 数据膨胀
+     GC 占比 > 10% → 调整内存/GC
+```
+
+## 十六、与其他板块的关系
 
 - Flink（流处理对比）见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；
 - 大数据全链路见「[基础知识/大数据](../大数据/README.md)」；

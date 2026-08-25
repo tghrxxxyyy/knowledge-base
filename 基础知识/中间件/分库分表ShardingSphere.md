@@ -552,6 +552,191 @@ spec:
 
 ---
 
+## 十八-2、ShardingSphere 改写引擎原理（SQL 重写规则）
+
+```
+SQL 改写 = 将逻辑表名替换为真实表名
+
+改写规则：
+  1. 逻辑表 → 真实表
+     SELECT * FROM t_order → SELECT * FROM ds_0.t_order_3
+
+  2. 分布式 ID 替换
+     INSERT INTO t_order(id, ...) VALUES(?, ...)
+     → INSERT INTO t_order_3(id, ...) VALUES(雪花ID, ...)
+
+  3. 分页改写
+     LIMIT 10 OFFSET 100000
+     → 各分片查 100010 条，在内存中归并取后 10 条
+
+  4. 聚合改写
+     SELECT COUNT(*) FROM t_order
+     → 各分片 SELECT COUNT(*)，结果归并求和
+
+  5. 排序改写
+     SELECT * FROM t_order ORDER BY create_time
+     → 各分片排序，归并排序（归并排序算法）
+
+改写引擎流程：
+  解析 SQL → 生成逻辑执行计划 → 改写为真实 SQL → 多节点执行 → 结果归并
+```
+
+## 十八-3、分片算法 SPI 自定义扩展步骤
+
+```
+SPI 扩展步骤：
+
+1. 实现分片算法接口
+   public class MyShardingAlgorithm implements StandardShardingAlgorithm<String> {
+     @Override
+     public String doSharding(Collection<String> availableTargetNames, 
+                               PreciseShardingValue<String> shardingValue) {
+       String value = shardingValue.getValue();
+       // 自定义路由逻辑
+       int index = Math.abs(value.hashCode()) % availableTargetNames.size();
+       return Lists.newArrayList(availableTargetNames).get(index);
+     }
+   }
+
+2. SPI 注册
+   META-INF/services/org.apache.shardingsphere.sharding.spi.ShardingAlgorithm
+   → 写入：com.example.MyShardingAlgorithm
+
+3. 配置使用
+   sharding-algorithms:
+     my-algorithm:
+       type: CUSTOM
+       props:
+         strategy: STANDARD
+         algorithm-class-name: com.example.MyShardingAlgorithm
+
+4. 打包部署
+   编译为 JAR → 放入 ShardingSphere classpath
+```
+
+## 十八-4、数据脱敏内置算法（AES/MD5/随机替换）
+
+| 算法 | 效果 | 可逆 | 适用 |
+|------|------|------|------|
+| AES | 密文存储 | ✅ 可逆 | 需要解密的场景 |
+| MD5 | 哈希不可逆 | ❌ | 唯一键/密码 |
+| MASK | 掩码 `138****0000` | ❌ | 手机号/身份证 |
+| KEEP_FIRST_LAST | 保留首尾 | ❌ | 姓名 |
+| TELEPHONE_RANDOM_MASK | 随机掩码 | ❌ | 电话 |
+| LITERAL_REPLACE | 固定替换 | ❌ | 测试数据 |
+
+```yaml
+# 配置示例
+rules:
+  encrypt:
+    tables:
+      t_user:
+        columns:
+          phone:
+            cipher:
+              type: AES
+              props:
+                aes.key: 1234567890abcdef
+            plain:
+              type: PLAIN
+          name:
+            cipher:
+              type: MD5
+```
+
+## 十八-5、影子库压测流程与流量录制
+
+```
+影子库压测流程：
+
+1. 流量标记
+   HTTP Header / 注解标记压测流量
+   如 X-Shadow-Flag: true
+
+2. 路由决策
+   ShardingSphere 判断流量类型
+   压测流量 → 影子库
+   真实流量 → 真实库
+
+3. 流量录制
+   线上流量复制到影子库
+   不影响真实数据
+
+4. 压测执行
+   影子库承载压测流量
+   监控性能指标（QPS/RT/错误率）
+
+5. 结果分析
+   对比真实库与影子库性能
+   识别瓶颈点
+
+配置：
+  shadow:
+    data-sources:
+      shadow_ds:
+        source-data-source-name: ds
+        shadow-data-source-name: ds_shadow
+    tables:
+      t_order:
+        data-source-mapping: t_order_shadow
+    shadow-algorithm-name: hint-algo
+```
+
+## 十八-6、Hint 强制路由（读写分离/分片）
+
+```java
+// 强制走主库
+try (HintManager hintManager = HintManager.getInstance()) {
+    hintManager.setWriteRouteOnly();
+    jdbcTemplate.query("SELECT * FROM t_order WHERE id = ?", orderId);
+}
+
+// 强制指定分片
+try (HintManager hintManager = HintManager.getInstance()) {
+    hintManager.addTableShardingValue("t_order", "order_id", orderId);
+    jdbcTemplate.query("SELECT * FROM t_order", new Object[]{});
+}
+
+// 使用场景：
+// 1. 无分片键查询 → 强制指定分片
+// 2. 写后立刻读 → 强制走主库
+// 3. 运维脚本 → 指定库/表
+// 4. 数据迁移 → 指定源库和目标库
+```
+
+## 十八-7、ShardingSphere 在 K8s Operator 部署模式
+
+```yaml
+# ShardingSphere-Operator 部署
+apiVersion: shardingsphere.apache.org/v1alpha1
+kind: ShardingSphereProxy
+metadata:
+  name: shardingsphere-proxy
+spec:
+  replicas: 2
+  image:
+    repository: apache/shardingsphere-proxy
+    tag: "5.4.0"
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "1"
+  config:
+    rules:
+      - !DBDISCOVERY
+        dataSources:
+          ds_0:
+            openGaussDataSource:
+              url: jdbc:opengauss://...
+  scaling:  # 在线扩容
+    enable: true
+
+# 三种部署模式：
+# 1. ShardingSphere-JDBC：嵌入应用 Pod（最简单）
+# 2. ShardingSphere-Proxy：独立 Deployment + Service
+# 3. ShardingSphere Operator：K8s Operator 自动化管理
+```
+
 ## 十九、与其他板块的关系
 
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。

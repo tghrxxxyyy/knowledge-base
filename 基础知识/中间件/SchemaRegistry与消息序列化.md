@@ -754,6 +754,158 @@ claim-check:
 
 ---
 
+## Schema Registry 的 Schema Key 生成算法
+
+```
+Schema Key = Schema 内容的唯一标识
+
+算法流程：
+  1. 对 Schema JSON 做规范化（去空格/排序字段）
+  2. 计算哈希值（MD5 或 SHA-256）
+  3. 分配递增的整数 schemaId
+
+关键点：
+  - 同一 Schema 内容 → 同一 schemaId（去重）
+  - Schema 变更 → 新 schemaId
+  - schemaId 是 4 字节整数，嵌入消息头
+
+消息格式：
+  [0x00 | schemaId(4B) | payload]
+  → 客户端只传 ID，Schema 在注册中心缓存
+  → 消息体最小化，反序列化时按 ID 拉取 Schema
+```
+
+## schema 兼容性测试工具
+
+```bash
+# kafka-avro-console-consumer：测试 Schema 兼容性
+
+# 1. 注册 Schema
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"},{\"name\":\"amount\",\"type\":\"double\"}]}"}' \
+  http://schema-registry:8081/subjects/orders-value/versions
+
+# 2. 检查兼容性
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"schema": "...新 Schema..."}' \
+  http://schema-registry:8081/compatibility/subjects/orders-value/versions/latest
+
+# 3. 消费 Avro 消息（自动反序列化）
+kafka-avro-console-consumer \
+  --bootstrap-server kafkabroker:9092 \
+  --topic orders \
+  --from-beginning \
+  --property schema.registry.url=http://schema-registry:8081
+
+# 4. 查看版本历史
+curl http://schema-registry:8081/subjects/orders-value/versions
+```
+
+## Protobuf 与 Avro 混合使用场景
+
+```
+混合使用策略：
+  场景：微服务 RPC 用 Protobuf，Kafka 消息用 Avro
+
+  优势：
+    Protobuf：跨语言生态强、RPC 性能最优
+    Avro：Schema 演进最完善、Kafka 生态原生
+  
+  混合架构：
+    服务间通信 → Protobuf（gRPC/Dubbo Triple）
+    消息队列 → Avro（Kafka + Schema Registry）
+    数据湖 → Parquet（列式存储）
+    
+  转换层：
+    Avro Schema ↔ Protobuf .proto 自动生成
+    Flink/Spark 作为桥接，消费 Avro 后转 Protobuf 发下游
+```
+
+## schema 注册表在流处理中的角色
+
+```
+流处理中的 Schema Registry：
+
+  Producer：
+    定义 Schema → 注册到 Registry → 获得 schemaId
+    消息 = [schemaId | payload]
+    自动注册可关闭（CI 审批制）
+
+  Flink/Spark 消费：
+    反序列化时按 schemaId 拉取 Schema
+    客户端缓存 Schema（减少 Registry 调用）
+    Schema 不兼容 → 消费失败告警
+
+  Schema 变更影响：
+    加字段（带默认值）→ 无感知
+    删字段 → 下游需升级 Schema
+    改类型 → 破坏性变更，需新 Topic 过渡
+
+  监控：
+    Schema 注册失败率、解析错误率、拉取延迟
+```
+
+## schema 版本回滚策略
+
+```
+回滚场景：
+  v3 Schema 发布后发现 bug，需回滚到 v2
+
+回滚策略：
+  1. 注册回滚（推荐）
+     向 Registry 注册 v2 Schema（新版本号）
+     Producer 切回 v2 Schema 发送
+     Consumer 已缓存 v2，无需变更
+  
+  2. Topic 切换（大版本升级）
+     新建 orders_v2 Topic
+     双写过渡期（v2+v3 并行）
+     消费者切新 Topic
+     老 Topic 保留期后清理
+  
+  3. Schema 废弃
+     标记 v3 为 deprecated
+     Consumer 降级到 v2 Schema
+     监控确认后删除 v3
+
+回滚纪律：
+  回滚后必须修复 bug → 重新发布 v4（不复用 v3）
+  回滚操作走审批（防止误操作）
+```
+
+## Schema Registry API 常用操作速查
+
+| 操作 | API | 说明 |
+|------|-----|------|
+| 注册 Schema | `POST /subjects/{subject}/versions` | 注册新版本 |
+| 获取 Schema | `GET /schemas/ids/{id}` | 按 ID 获取 |
+| 检查兼容性 | `POST /compatibility/subjects/{subject}/versions/{version}` | 兼容性校验 |
+| 查看版本列表 | `GET /subjects/{subject}/versions` | 所有版本 |
+| 获取最新版本 | `GET /subjects/{subject}/versions/latest` | 最新 Schema |
+| 删除 Subject | `DELETE /subjects/{subject}` | 软删除（可恢复） |
+| 硬删除 | `DELETE /subjects/{subject}?permanent=true` | 永久删除 |
+| 获取模式 | `GET /config` | 全局兼容性配置 |
+| 设置兼容性 | `PUT /config/{subject}` | 按 Subject 设置 |
+
+```bash
+# 常用操作示例
+# 1. 获取最新 Schema
+curl http://schema-registry:8081/subjects/orders-value/versions/latest
+
+# 2. 按 ID 获取
+curl http://schema-registry:8081/schemas/ids/1
+
+# 3. 检查兼容性
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"schema": "..."}' \
+  http://schema-registry:8081/compatibility/subjects/orders-value/versions/latest
+
+# 4. 设置兼容性级别
+curl -X PUT -H "Content-Type: application/json" \
+  --data '{"compatibility": "BACKWARD"}' \
+  http://schema-registry:8081/config/orders-value
+```
+
 ## 九、与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；

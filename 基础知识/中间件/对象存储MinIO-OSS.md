@@ -602,6 +602,186 @@ MinIO 分层配置：
 
 ---
 
+## 十四-2、MinIO erasure coding 算法详解（Reed-Solomon）
+
+```
+Reed-Solomon 纠删码原理：
+
+原始对象 → 分片（N 数据块 + M 校验块）
+  ├── 数据块：data_1, data_2, ..., data_N
+  ├── 校验块：parity_1, parity_2, ..., parity_M
+  └── 分散到不同节点/磁盘
+
+编码过程：
+  原始数据（10块）→ Reed-Solomon 编码 → 4 校验块
+  → 14 块分布到 4 个节点
+
+恢复过程：
+  任意 ≤ M 个节点故障 → 从剩余块恢复
+  如 10+4 模式 → 容忍 4 盘故障
+
+存储效率：
+  三副本：33%（1/3）
+  纠删码 10+4：71%（10/14）
+  纠删码 8+4：67%（8/12）
+
+MinIO 默认配置：
+  单节点：无纠删码（单盘保护）
+  多节点：自动启用纠删码
+  最少 4 节点/4 磁盘
+  自动选择最优 EC 集（奇偶校验块数量）
+```
+
+## 十四-3、MinIO lifecycle transition 热温冷分层策略
+
+```bash
+# 配置生命周期规则（热→温→冷）
+mc ilm add local/my-bucket \
+  --transition-days 30 \
+  --storage-class GLACIER \
+  --expire-days 365
+
+# 配置示例
+# 热数据（0-30天）：NVMe/SSD
+# 温数据（30-180天）：HDD
+# 冷数据（180-365天）：S3/Glacier
+# 归档（>365天）：删除或 Deep Archive
+
+# MinIO 分层配置
+# lifecycle.xml
+<LifecycleConfiguration>
+  <Rule>
+    <ID>transition-to-warm</ID>
+    <Filter><Prefix>data/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Transition><Days>30</Days><StorageClass>WARM</StorageClass></Transition>
+    <Transition><Days>180</Days><StorageClass>COLD</StorageClass></Transition>
+    <Expiration><Days>365</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>
+```
+
+## 十四-4、MinIO replication 多站点复制拓扑
+
+| 拓扑类型 | 说明 | 适用 |
+|----------|------|------|
+| 主动-主动 | 双向复制 | 多活架构 |
+| 主动-被动 | 单向复制 | 灾备 |
+| 跨区域复制 | 跨地理区域 | 异地容灾 |
+| 链式复制 | A→B→C | 多级容灾 |
+
+```
+多站点复制流程：
+
+主动-主动（多活）：
+  Site A ←→ Site B（双向复制）
+  写入 Site A → 异步复制到 Site B
+  写入 Site B → 异步复制到 Site A
+  冲突处理：Last-Write-Wins
+
+主动-被动（灾备）：
+  Site A（主）→ Site B（备）
+  正常：Site A 服务，Site B 待命
+  故障：切换到 Site B 服务
+
+配置：
+  mc replicate add local/my-bucket \
+    --remote-bucket remote/my-bucket \
+    --endpoint http://remote-minio:9000 \
+    --access-key ACCESS_KEY \
+    --secret-key SECRET_KEY
+```
+
+## 十四-5、MinIO 在 AI 训练数据管线中的角色（替代 HDFS）
+
+```
+AI 训练数据管线：
+
+传统方案：
+  HDFS（存储）→ Spark（预处理）→ PyTorch（训练）
+
+MinIO 方案：
+  MinIO/S3（存储）→ Spark/Flink（预处理）→ PyTorch/TF（训练）
+
+MinIO 优势：
+  1. 高吞吐：大文件顺序读写（1~3GB/s/节点）
+  2. S3 兼容：ML 框架原生支持
+  3. 低成本：纠删码省存储（比 HDFS 3 副本省 60%+）
+  4. 可扩展：无限容量
+  5. 云原生：K8s 原生部署
+
+ML 框架集成：
+  PyTorch：s3fs/fsspec
+  TensorFlow：s3:// 协议
+  Hugging Face：S3 dataset
+  Ray：S3 storage
+  Kubeflow：MinIO S3
+
+效果：
+  训练数据加载速度提升 2~5x
+  存储成本降低 60%+
+  运维复杂度降低
+```
+
+## 十四-6、MinIO vs S3 兼容性测试矩阵
+
+| API | MinIO | AWS S3 | 说明 |
+|-----|-------|--------|------|
+| PUT/GET/DELETE | ✅ | ✅ | 基本操作 |
+| Multipart Upload | ✅ | ✅ | 分片上传 |
+| Pre-signed URLs | ✅ | ✅ | 临时授权 |
+| Bucket Policy | ✅ | ✅ | 桶策略 |
+| Versioning | ✅ | ✅ | 版本控制 |
+| Lifecycle | ✅ | ✅ | 生命周期 |
+| Encryption | ✅ | ✅ | 加密 |
+| Replication | ✅ | ✅ | 复制 |
+| S3 Select | ✅ | ✅ | SQL 查询 |
+| Object Lock | ✅ | ✅ | WORM |
+| IAM | ✅ | ✅ | 权限管理 |
+
+```
+兼容性结论：
+  MinIO 几乎完整兼容 S3 V2/V4 API
+  可无缝迁移到 AWS S3 或反之
+  是测试最广泛的 S3 替代
+
+迁移示例：
+  mc mirror local/ aws-s3/my-bucket
+  → 双向同步（RPO 秒级）
+```
+
+## 十四-7、MinIO 网关模式替代 HDFS 方案
+
+```
+MinIO Gateway = S3 协议代理（不存储数据）
+
+架构：
+  App → MinIO Gateway → 后端存储（S3/HDFS/Azure Blob）
+
+替代 HDFS 方案：
+  1. MinIO Gateway → HDFS
+     S3 协议 → HDFS 存储
+     兼容 S3 API 的应用无需改代码
+
+  2. MinIO Gateway → Azure Blob
+     统一 S3 接口
+     多云存储抽象
+
+优势：
+  - 统一 S3 接口（应用无感）
+  - 不改变现有存储架构
+  - 逐步迁移（先切 Gateway，再切存储）
+
+劣势：
+  - 多一跳代理（延迟增加）
+  - Gateway 需要高可用
+  - 不支持 HDFS 特有功能（如 Kerberos）
+
+配置：
+  minio server gateway hdfs
+  --endpoint http://namenode:8020
+```
+
 ## 十五、与其他板块的关系
 
 - 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。

@@ -644,6 +644,226 @@ NATS 安全机制：
    跨 Account 通信需显式导出/导入
 ```
 
+## 六-2、JetStream Stream 配置（retention/purge/max-bytes）
+
+```
+Stream 配置详解：
+
+retention（保留策略）：
+  Limits：按 MaxAge/MaxBytes 保留（超限丢弃）
+  Interest：所有消费者消费完才删除（队列语义）
+  WorkQueue：单消费者消费后删除（任务队列）
+
+max_age：消息最大保留时间
+  如 max_age: 24h → 超过 24h 的消息自动删除
+
+max_bytes：消息最大保留大小
+  如 max_bytes: 1GB → 超过 1GB 的消息自动删除
+
+max_msgs：消息最大保留数量
+  如 max_msgs: 1000000 → 超过 100 万条自动删除
+
+purge（清理策略）：
+  purge 时删除所有消息（不可恢复）
+  可按 subject 清理：js.Stream.Purge("ORDERS", nats.PurgeSubject("orders.eu"))
+
+配置示例：
+  js.AddStream(&nats.StreamConfig{
+      Name:     "ORDERS",
+      Subjects: []string{"orders.>"},
+      Retention: nats.LimitsPolicy,
+      MaxAge:   24 * time.Hour,
+      MaxBytes: 1 << 30,  // 1GB
+      MaxMsgs:  1000000,
+      Storage:  nats.FileStorage,
+      Replicas: 3,
+  })
+```
+
+## 六-3、消费者 AckPolicy（explicit/all/none）选择
+
+| AckPolicy | 语义 | 适用场景 |
+|-----------|------|----------|
+| Explicit | 每条消息单独确认 | 精确控制（Exactly-once 基础） |
+| All | 一批消息批量确认 | 高吞吐批量消费 |
+| None | 不确认（消息不重发） | 幂等日志采集 |
+
+```
+Explicit Ack 流程：
+  1. 消费者接收消息
+  2. 处理消息
+  3. 调用 msg.Ack() 确认
+  4. Stream 删除已确认消息
+
+All Ack 流程：
+  1. 消费者批量拉取消息
+  2. 处理所有消息
+  3. 调用 sub.AckAll() 批量确认
+  4. Stream 删除已确认消息
+
+选择建议：
+  关键业务 → Explicit（精确控制，防重复）
+  批量处理 → All（高吞吐）
+  日志采集 → None（允许丢失）
+```
+
+## 六-4、Request-Reply 超时与重试模式
+
+```
+Request-Reply 超时模式：
+
+请求方：
+  msg, err := nc.Request("orders.get", payload, 5*time.Second)
+  if err != nil {
+      // 超时处理
+      if err == nats.ErrTimeout {
+          // 重试或降级
+      }
+  }
+
+重试模式：
+  方式 1：指数退避重试
+    for attempt := 0; attempt < 3; attempt++ {
+        msg, err := nc.Request(subject, payload, timeout)
+        if err == nil { break }
+        time.Sleep(time.Duration(1<<attempt) * 100 * time.Millisecond)
+    }
+
+  方式 2：备用 Subject
+    msg, err := nc.Request("orders.get", payload, timeout)
+    if err != nil {
+        msg, err = nc.Request("orders.get.backup", payload, timeout)
+    }
+
+超时设置：
+  connect_timeout: 连接超时
+  request_timeout: 请求超时
+  ping_interval: 心跳间隔
+```
+
+## 六-5、Leaf Node 网络拓扑图
+
+```
+Leaf Node 网络拓扑：
+
+中心集群（Hub Cluster）
+  ├── Node1 ──── Node2
+  │     │           │
+  │     └─── Node3 ─┘
+  │
+  ├── Leaf Node A（边缘区域1）
+  │   ├── 本地 Pub/Sub（离线可用）
+  │   └── 断线重连（缓存消息）
+  │
+  └── Leaf Node B（边缘区域2）
+      ├── 本地 Pub/Sub（离线可用）
+      └── 断线重连（缓存消息）
+
+连接方式：
+  Hub Cluster：全连接（节点互相连接，主题全局路由）
+  Leaf Node：单向连接 Hub（不参与投票）
+  Gateway：跨集群连接（多数据中心）
+
+数据流向：
+  边缘设备 → Leaf Node → Hub Cluster
+  Hub Cluster → Leaf Node → 边缘设备
+```
+
+## 六-6、NATS 在 K8s 上部署（nats-operator）
+
+```yaml
+# NATS Operator 部署
+apiVersion: nats.io/v1alpha2
+kind: NatsCluster
+metadata:
+  name: nats-cluster
+spec:
+  size: 3  # 集群节点数
+  version: "2.10"
+  pod:
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+    nats:
+      jetstream:
+        enabled: true
+        storage: 1Gi
+  auth:
+    clients:
+      credentials:
+        - name: app1
+          password: "secret"
+          account: app1
+```
+
+```
+NATS Operator 功能：
+  1. 自动创建 NATS 集群
+  2. 自动扩缩容
+  3. 滚动升级
+  4. 健康检查
+  5. JetStream 存储管理
+
+部署步骤：
+  1. 安装 Operator
+     kubectl apply -f https://github.com/nats-io/nats-operator/releases/latest/download.yml
+
+  2. 创建集群
+     kubectl apply -f nats-cluster.yaml
+
+  3. 验证
+     kubectl get pods -l app=nats
+     kubectl port-forward nats-cluster-0 4222:4222
+```
+
+## 六-7、NATS 账号隔离实战配置
+
+```yaml
+# NATS 账号隔离配置
+authorization {
+  accounts {
+    # 全局账户
+    global {}
+    
+    # 应用1账户
+    app1 {
+      users: [{user: app1user, password: "pw1"}]
+      permissions: {
+        publish: ["app1.>", "orders.*.events"]
+        subscribe: ["app1.>", "orders.*.events"]
+      }
+    }
+    
+    # 应用2账户
+    app2 {
+      users: [{user: app2user, password: "pw2"}]
+      permissions: {
+        publish: ["app2.>"]
+        subscribe: ["app2.>", "orders.*.events"]
+      }
+    }
+  }
+  
+  # 跨账户通信
+  import: {
+    app1: [{subject: "app1.>"}]  # app2 可以订阅 app1 的消息
+  }
+}
+```
+
+```
+隔离规则：
+  1. 默认：Account 间完全隔离
+  2. 显式导出/导入：跨 Account 通信
+  3. 权限最小化：publish/subscribe 白名单
+
+实战场景：
+  团队隔离：每个业务线一个 Account
+  环境隔离：dev/staging/prod 各一个 Account
+  安全控制：敏感 Topic 只允许特定 Account 访问
+```
+
 ## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；

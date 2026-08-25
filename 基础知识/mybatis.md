@@ -743,3 +743,202 @@ public void batchInsert(List<User> users) {
 </select>
 <!-- fetchSize=Integer.MIN_VALUE 启用 MySQL 流式查询 -->
 ```
+
+---
+
+## 二十四、PageHelper 分页原理
+
+### 24.1 工作流程
+
+```mermaid
+flowchart LR
+    A[设置分页参数] --> B[ThreadLocal 存储]
+    B --> C[拦截器拦截 SQL]
+    C --> D[改写为 COUNT 查询]
+    D --> E[执行 COUNT 获取总数]
+    E --> F[改写为分页 SQL]
+    F --> G[执行分页查询]
+    G --> H[清理 ThreadLocal]
+    H --> I[返回 Page 对象]
+```
+
+```java
+// PageHelper 使用示例
+PageHelper.startPage(1, 10);  // 设置分页参数
+List<User> users = userMapper.selectAll();  // 自动分页
+PageInfo<User> pageInfo = new PageInfo<>(users);
+// pageInfo.getTotal() → 总记录数
+// pageInfo.getPages() → 总页数
+// pageInfo.getList() → 当前页数据
+```
+
+### 24.2 分页拦截器核心逻辑
+
+```java
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "prepare",
+               args = {Connection.class, Integer.class})
+})
+public class PageInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        // 1. 检查是否有分页参数
+        Object[] args = invocation.getArgs();
+        StatementHandler handler = (StatementHandler) args[0];
+        BoundSql boundSql = handler.getBoundSql();
+        String originalSql = boundSql.getSql();
+
+        // 2. 改写为 COUNT 查询
+        String countSql = "SELECT COUNT(*) FROM (" + originalSql + ") _count";
+
+        // 3. 执行 COUNT
+        // ... 获取总数
+
+        // 4. 改写为分页 SQL（MySQL）
+        String pageSql = originalSql + " LIMIT " + offset + ", " + pageSize;
+
+        // 5. 设置回原 SQL
+        ReflectUtil.setFieldValue(boundSql, "sql", pageSql);
+        return invocation.proceed();
+    }
+}
+```
+
+## 二十五、MyBatis 拦截器链机制
+
+| 拦截器类型 | 拦截目标 | 用途 |
+|-----------|----------|------|
+| PageInterceptor | StatementHandler | 分页 |
+| TenantInterceptor | Executor | 多租户 SQL 改写 |
+| DataPermissionInterceptor | Executor | 数据权限过滤 |
+| CacheInterceptor | Executor | 二级缓存 |
+| SqlLogInterceptor | StatementHandler | SQL 日志 |
+
+```java
+// 自定义拦截器：SQL 执行时间统计
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "query",
+               args = {Statement.class, ResultHandler.class})
+})
+public class SqlTimerInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        long start = System.currentTimeMillis();
+        Object result = invocation.proceed();
+        long cost = System.currentTimeMillis() - start;
+        if (cost > 1000) {
+            log.warn("Slow SQL detected: {}ms, sql: {}", cost,
+                ((StatementHandler) invocation.getTarget()).getBoundSql().getSql());
+        }
+        return result;
+    }
+}
+```
+
+## 二十六、LambdaQueryWrapper 高级用法
+
+```java
+// 条件构建
+LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+wrapper.eq(User::getStatus, 1)
+       .like(StringUtils.isNotBlank(name), User::getName, name)
+       .in(User::getAge, Arrays.asList(20, 25, 30))
+       .orderByDesc(User::getCreateTime)
+       .last("LIMIT 10");
+
+// 子查询
+wrapper.inSql(User::getId, "SELECT user_id FROM orders WHERE amount > 1000");
+
+// BETWEEN
+wrapper.between(User::getCreateTime, startDate, endDate);
+
+// EXISTS
+wrapper.exists("SELECT 1 FROM user_roles WHERE user_id = users.id AND role_id = 1");
+```
+
+## 二十七、TransactionManager 与 SqlSession 交互
+
+### 27.1 事务管理流程
+
+```mermaid
+flowchart TD
+    A[获取 SqlSession] --> B[开启事务]
+    B --> C[执行 SQL]
+    C --> D{异常?}
+    D -->|是| E[回滚事务]
+    D -->|否| F[提交事务]
+    E --> G[关闭 SqlSession]
+    F --> G
+    G --> H[返回结果]
+```
+
+```java
+// 编程式事务
+SqlSession sqlSession = sqlSessionFactory.openSession();
+try {
+    sqlSession.getConnection().setAutoCommit(false);
+    UserMapper mapper = sqlSession.getMapper(UserMapper.class);
+    mapper.insert(user);
+    mapper.updateBalance(userId, amount);
+    sqlSession.commit();  // 手动提交
+} catch (Exception e) {
+    sqlSession.rollback();  // 异常回滚
+    throw e;
+} finally {
+    sqlSession.close();
+}
+```
+
+### 27.2 Spring 集成事务
+
+```java
+@Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRED)
+public void transfer(Long fromId, Long toId, BigDecimal amount) {
+    userMapper.deductBalance(fromId, amount);  // 扣款
+    userMapper.addBalance(toId, amount);       // 加款
+    // 若此处抛异常，两个操作都回滚
+}
+```
+
+## 二十八、LazyLoading N+1 问题
+
+### 28.1 问题场景
+
+```xml
+<!-- 一对多关联 -->
+<resultMap id="orderWithItems" type="Order">
+    <id property="id" column="id"/>
+    <collection property="items" ofType="OrderItem"
+                select="selectItemsByOrderId" lazy="true"/>
+</resultMap>
+
+<!-- 每个 Order 都触发一次查询 -->
+<select id="selectItemsByOrderId" resultType="OrderItem">
+    SELECT * FROM order_items WHERE order_id = #{id}
+</select>
+```
+
+### 28.2 解决方案
+
+| 方案 | 做法 | 优点 | 缺点 |
+|------|------|------|------|
+| JOIN 查询 | `resultMap` 用 `association`/`collection` | 一次查询 | SQL 复杂 |
+| 批量查询 | `fetchType="eager"` + 批量 IN | 减少查询次数 | 内存占用 |
+| SubQuery | 嵌套子查询 | 简单 | N+1 问题 |
+| GraphQL | 按需加载 | 灵活 | 需要额外框架 |
+
+```xml
+<!-- JOIN 查询替代 N+1 -->
+<resultMap id="orderWithItemsJoin" type="Order">
+    <id property="id" column="o_id"/>
+    <collection property="items" ofType="OrderItem">
+        <id property="id" column="item_id"/>
+        <result property="name" column="item_name"/>
+    </collection>
+</resultMap>
+
+<select id="selectOrderWithItems" resultMap="orderWithItemsJoin">
+    SELECT o.*, oi.* FROM orders o
+    LEFT JOIN order_items oi ON o.id = oi.order_id
+</select>
+```

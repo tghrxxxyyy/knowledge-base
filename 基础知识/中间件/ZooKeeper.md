@@ -605,6 +605,202 @@ Kafka 3.0+：KRaft 模式（去除 ZK 依赖）
 
 ---
 
+## 十二-2、ZAB 协议消息广播与崩溃恢复两阶段详解
+
+```
+ZAB 协议两阶段：
+
+第一阶段：崩溃恢复（Leader Election + Recovery）
+
+  1. Leader 选举：
+     - 比较 Zxid（高 epoch + 低 counter）
+     - Zxid 大者优先（保证新 Leader 有最新数据）
+     - Zxid 相同则比较 myid（大者胜）
+
+  2. 数据同步：
+     - 新 Leader 与其他节点同步未提交事务
+     - 保证不丢已确认写（committed transactions）
+     - 未提交的事务按最新 Leader 的决定
+
+  3. 原子提交：
+     - 超过 quorum 确认后提交
+     - 各节点提交事务 → 响应客户端
+
+第二阶段：消息广播（Atomic Broadcast）
+
+  1. Leader 接收写请求
+  2. 生成 Proposal（Zxid+1）
+  3. 广播 Proposal 到所有 Follower
+  4. Follower 写入本地事务日志 → 返回 ACK
+  5. Leader 收到 quorum ACK → 发送 Commit
+  6. 各节点提交事务 → 响应客户端
+
+消息广播 = 两阶段提交（2PC）简化版：
+  Proposal → ACK → Commit
+  不需要准备阶段（简化）
+  quorum 保证一致性（不需要所有节点）
+```
+
+## 十二-3、Watcher 事件类型与一次性语义
+
+| 事件类型 | 触发条件 | 说明 |
+|----------|----------|------|
+| NodeCreated | 节点创建 | 持久/临时节点创建时触发 |
+| NodeDeleted | 节点删除 | 节点被删除时触发 |
+| NodeDataChanged | 节点数据变更 | 数据修改时触发 |
+| NodeChildrenChanged | 子节点变更 | 子节点增删时触发 |
+
+```
+Watcher 一次性语义详解：
+
+默认 Watcher（一次性）：
+  1. 客户端注册 Watcher（getData/getChildren/exist）
+  2. 事件触发后自动失效
+  3. 需要客户端重新注册
+  4. 问题：容易遗漏事件（忘记重注册）
+
+持久 Watcher（3.6+）：
+  addWatch /path -p（持久模式）
+  事件触发后不会失效
+  适合需要持续监听的场景
+  缺点：服务端需维护更多 Watcher
+
+递归 Watcher（3.6+）：
+  addWatch /path -r（递归模式）
+  监听整个子树的所有变更
+  减少客户端 Watcher 注册数量
+
+最佳实践：
+  1. 配置变更 → 持久 Watcher（避免重注册）
+  2. 服务上下线 → 临时节点 + Watcher
+  3. 批量监听 → 递归 Watcher（减少注册数）
+```
+
+## 十二-4、Curator InterProcessMutex 可重入锁实现
+
+```java
+// Curator 分布式可重入锁
+InterProcessMutex lock = new InterProcessMutex(client, "/lock/order");
+
+if (lock.acquire(10, TimeUnit.SECONDS)) {
+    try {
+        // 业务逻辑（可重入：同一线程可多次 acquire）
+        lock.acquire();  // 重入 +1
+        // ...
+        lock.release();  // 重入 -1
+    } finally {
+        lock.release();  // 完全释放
+    }
+}
+
+// 锁实现原理：
+// 1. 创建临时顺序节点 /lock/order/lock_0000000001
+// 2. 获取 /lock/order 下所有子节点
+// 3. 判断自己是否最小序号节点
+// 4. 是 → 拿到锁；否 → 监听前一个节点
+// 5. 前一个节点删除（释放锁）→ 唤醒重新判断
+// 6. 宕机 → 会话断开 → 临时节点自动删除（防死锁）
+```
+
+## 十二-5、ZooKeeper 配置中心设计模式（Watch+长轮询）
+
+```
+ZK 配置中心设计：
+
+模式：Watch + 长轮询
+
+1. 配置存储
+   /config/db.url = "jdbc:mysql://..."
+   /config/redis.host = "10.0.0.1"
+
+2. 客户端读取
+   getData("/config/db.url", watch=true)
+
+3. 配置变更
+   setData("/config/db.url", "new-url")
+
+4. Watcher 通知
+   客户端收到 NodeDataChanged 事件
+   → 重新获取配置
+   → 热更新（如数据源切换）
+
+5. 长轮询优化
+   客户端发起长连接 → 服务端有变更才返回
+   → 减少无效轮询
+   → 实时性高
+
+优势：
+  - 实时推送（毫秒级）
+  - 强一致（ZK 保证）
+  - 简单可靠
+
+劣势：
+  - ZK 性能瓶颈（几万 QPS）
+  - Watcher 一次性（需重注册）
+  - 不适合高频变更（通知风暴）
+```
+
+## 十二-6、ZK 集群扩容滚动操作步骤
+
+```bash
+# ZK 集群扩容（滚动操作）
+
+Step 1: 准备新节点
+  安装 ZK 二进制
+  配置 zoo.cfg（添加新节点）
+  myid 设置（如 4）
+
+Step 2: 动态添加节点
+  # 在现有节点执行
+  zkServer.sh add start
+
+Step 3: 验证新节点
+  echo ruok | nc new-node 2181
+  # 返回 imok 表示正常
+
+Step 4: 检查集群状态
+  echo mntr | nc leader 2181
+  # 查看 zk_followers 指标
+
+Step 5: 测试读写
+  create /test "test-data"
+  get /test
+
+注意事项：
+  - 必须奇数节点（3→5，不能 3→4）
+  - 扩容期间集群仍可用
+  - 新节点需要从 Leader 同步数据
+  - 数据同步完成前不要执行下线操作
+```
+
+## 十二-7、ZK → K8s/etcd 迁移评估维度
+
+| 维度 | 评估点 | 迁移建议 |
+|------|--------|----------|
+| 生态依赖 | 是否依赖 ZK（Kafka/HBase/Dubbo） | 逐步替换为 etcd/原生 |
+| Watch 语义 | 是否依赖一次性 Watcher | etcd Watch 是持续流 |
+| 数据模型 | ZNode 树 vs KV | 扁平 KV 更简单 |
+| 事务能力 | 是否需要分布式事务 | etcd Txn 更强 |
+| 运维成本 | ZK 集群运维复杂度 | etcd 更轻量 |
+| 性能要求 | 读写吞吐需求 | etcd 写略慢，读可优化 |
+
+```
+迁移路径评估：
+
+1. Kafka 老版本（依赖 ZK）→ KRaft 模式（去除 ZK）
+2. Dubbo 老版本（ZK 注册中心）→ Nacos/AP 模式
+3. HBase（ZK 管理 Region）→ 保留 ZK（HBase 依赖）
+4. 新项目 → etcd（云原生首选）
+
+迁移步骤：
+  1. 评估依赖方（哪些组件用 ZK）
+  2. 逐个替换（Kafka→KRaft, Dubbo→Nacos）
+  3. 数据迁移（元数据导出/导入）
+  4. 验证（新旧系统并行运行）
+  5. 切换（灰度切流）
+  6. 下线 ZK 集群
+```
+
 ## 十三、与其他板块的关系
 
 - 和「**源码系列/zookeeper**」：本篇讲协议、场景与生产；源码篇有常见 ZK 面试题深挖。

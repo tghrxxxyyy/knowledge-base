@@ -724,7 +724,171 @@ spec:
 
 ---
 
-## 十七、与其他板块的关系
+## 十八、Event Source Mapping 事件源映射
+
+### 18.1 事件源类型
+
+| 事件源 | 平台 | 触发方式 | 适用场景 |
+|--------|------|----------|----------|
+| SQS | AWS | 轮询 | 消息队列消费 |
+| Kinesis | AWS | 轮询 | 流数据处理 |
+| DynamoDB Streams | AWS | 变更流 | 数据同步 |
+| EventBridge | AWS | 事件总线 | 事件路由 |
+| Kafka | 多云 | 消费组 | 消息集成 |
+| Storage | 多云 | 对象事件 | 文件处理 |
+
+### 18.2 配置示例
+
+```yaml
+# AWS SAM Event Source
+Events:
+  SQSEvent:
+    Type: SQS
+    Properties:
+      Queue: !GetAtt MyQueue.Arn
+      BatchSize: 10
+      MaximumBatchingWindow: 60
+      Enabled: true
+```
+
+## 十九、Step Functions 工作流编排
+
+### 19.1 工作流类型
+
+| 类型 | 说明 | 适用 |
+|------|------|------|
+| Standard | 长时间运行，精确一次 | 复杂业务流程 |
+| Express | 高吞吐，至少一次 | 数据处理管道 |
+
+### 19.2 状态机定义
+
+```json
+{
+  "Comment": "订单处理工作流",
+  "StartAt": "ValidateOrder",
+  "States": {
+    "ValidateOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:validate",
+      "Next": "ProcessPayment"
+    },
+    "ProcessPayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Next": "SendConfirmation"
+    },
+    "SendConfirmation": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:confirm",
+      "End": true
+    }
+  }
+}
+```
+
+## 二十、Knative 自动扩缩容
+
+### 20.1 扩缩容配置
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "100"
+        autoscaling.knative.dev/target: "10"
+        autoscaling.knative.dev/window: "60s"
+    spec:
+      containers:
+        - image: order-service:latest
+```
+
+### 20.2 扩缩容算法
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| target | 每个实例的目标并发数 | 100 |
+| minScale | 最小实例数 | 0 |
+| maxScale | 最大实例数 | 无限制 |
+| window | 扩缩容窗口 | 60s |
+
+## 二十一、冷启动优化策略
+
+| 策略 | 做法 | 效果 |
+|------|------|------|
+| 预置并发 | 预留实例 | 消除冷启动 |
+| SnapStart | 快照恢复 | 启动时间<200ms |
+| 代码裁剪 | 移除无用依赖 | 减少初始化 |
+| 依赖注入 | 延迟初始化 | 减少启动负担 |
+| 连接池复用 | 保持连接 | 减少网络开销 |
+
+```java
+// SnapStart 示例（AWS Lambda）
+// 在 Lambda 控制台启用 SnapStart
+// 需要实现 SnapStartInit 优化
+public class MyHandler implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+    static {
+        // 初始化代码（只执行一次）
+        initDependencies();
+    }
+
+    @Override
+    public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent input, Context context) {
+        // 请求处理
+    }
+}
+```
+
+## 二十二、定时任务与 Cron 触发
+
+| 方案 | 适用 | 精度 |
+|------|------|------|
+| CloudWatch Events | AWS Lambda | 分钟级 |
+| EventBridge Scheduler | 多目标 | 秒级 |
+| Cron + API Gateway | 自建 | 分钟级 |
+| Kubernetes CronJob | K8s | 分钟级 |
+
+```yaml
+# AWS CloudWatch Event 规则
+Resources:
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MyFunction.Arn
+          Id: ScheduledTarget
+```
+
+## 二十三、Serverless 成本模型
+
+### 23.1 成本对比
+
+| 场景 | Serverless | 容器（ECS） | VM |
+|------|-----------|-------------|-----|
+| 低频（<1000次/天） | $0.00（免费额度） | $15+/月 | $20+/月 |
+| 中频（1K~100K次/天） | $5~50/月 | $50~200/月 | $100+/月 |
+| 高频（>100K次/天） | $200+/月 | $100~500/月 | $200+/月 |
+| 持续运行（24/7） | 最贵 | 中等 | 最便宜 |
+
+### 23.2 成本优化
+
+```text
+成本优化策略：
+  1. 选择合适内存配置（不要过度配置）
+  2. 启用 ARM64 架构（便宜20%）
+  3. 使用预留并发（降低单价）
+  4. 批处理减少调用次数
+  5. 低频用按量，高频考虑容器
+```
+
+## 与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；
 - 云上消息（事件源）见「[云上消息与集成生态](./云上消息与集成生态.md)」；

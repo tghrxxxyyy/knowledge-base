@@ -511,6 +511,223 @@ groups:
 
 ---
 
+## 十四-2、Sentinel 滑动窗口计数器实现原理
+
+```
+Sentinel 滑动窗口（LeapArray）实现：
+
+数据结构：
+  LeapArray = 环形数组（Array）
+  每个桶（Bucket）= 一段时间窗口的统计数据
+
+配置：
+  窗口大小（windowIntervalMs）：默认 1s
+  桶数（sampleCount）：默认 2
+  桶粒度 = 窗口大小 / 桶数 = 500ms
+
+统计内容：
+  每个桶维护：
+    passCount：通过请求数
+    blockCount：拒绝请求数
+    exceptionCount：异常数
+    completeCount：完成数
+
+QPS 计算：
+  当前 QPS = 当前桶 passCount / 桶粒度
+  窗口 QPS = 所有桶 passCount 之和 / 窗口大小
+
+实现：
+  无锁 CAS + ThreadLocal 局部桶
+  性能：单机 10 万+ QPS
+```
+
+## 十四-3、热点参数限流（ParamFlowThrottling）实战配置
+
+```json
+{
+  "resource": "getOrder",
+  "grade": 1,
+  "count": 100,
+  "paramIdx": 0,
+  "paramFlowItemList": [
+    {
+      "object": "user_123",
+      "count": 10,
+      "grade": 1,
+      "durationSec": 10
+    }
+  ]
+}
+```
+
+```
+热点参数限流原理：
+
+配置：
+  resource：资源名
+  paramIdx：参数索引（从 0 开始）
+  count：默认阈值
+  paramFlowItemList：特定参数值的自定义阈值
+
+场景：
+  1. 某商品 ID 被疯狂访问 → 限流该商品 ID
+  2. 某用户异常调用 → 限流该用户
+  3. 某 IP 恶意请求 → 限流该 IP
+
+原理：
+  1. Sentinel 拦截方法调用
+  2. 提取指定参数值
+  3. 为该参数值维护独立计数器
+  4. 超过阈值 → 拒绝
+
+代码：
+  @SentinelResource(value = "getOrder", 
+      blockHandler = "getOrderBlock")
+  public Order getOrder(String userId, String orderId) {
+      // userId 是热点参数（paramIdx=0）
+  }
+```
+
+## 十四-4、系统自适应保护（CPU/Load/RT 阈值联动）
+
+| 保护维度 | 说明 | 配置 |
+|----------|------|------|
+| CPU 使用率 | 系统 CPU 超阈值限流 | highestCpuUsage=0.8 |
+| 系统负载 | 系统 load 超阈值限流 | highestSystemLoad=10 |
+| 入口 QPS | 入口总 QPS 超阈值限流 | maxQps=10000 |
+| 平均 RT | 入口平均 RT 超阈值限流 | maxRt=500 |
+
+```
+系统保护原理：
+
+1. 定期（默认 1s）采集系统指标
+   CPU 使用率（/proc/stat）
+   系统负载（/proc/loadavg）
+   入口 QPS（Sentinel 统计）
+   平均 RT（Sentinel 统计）
+
+2. 通过滑动窗口计算当前系统负载
+
+3. 负载超阈值 → 自动调整 QPS 上限
+   如 CPU=85% → 限制 QPS=5000
+
+4. 负载恢复 → 逐步放开口径
+
+优势：
+  无需手动设置阈值
+  系统自动感知负载
+  全局保护（防止单接口拖垮系统）
+
+配置示例：
+  {
+    "resource": "系统规则",
+    "highestSystemLoad": 10,
+    "highestCpuUsage": 0.8,
+    "maxRt": 500,
+    "maxQps": 10000
+  }
+```
+
+## 十四-5、Sentinel 与 OpenTelemetry 联动上报
+
+```java
+// Sentinel + OTel 集成
+@SentinelResource(value = "getOrder")
+public Order getOrder(String id) {
+    Span span = tracer.spanBuilder("getOrder").startSpan();
+    try {
+        // 业务逻辑
+        return orderService.findById(id);
+    } finally {
+        span.end();
+    }
+}
+
+// Micrometer 暴露 Sentinel 指标
+management:
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: prometheus
+
+// 指标含义：
+// sentinel_block_total: 被拒绝的请求总数
+// sentinel_pass_total: 通过的请求总数
+// sentinel_exception_total: 异常总数
+// sentinel_thread_count: 当前线程数
+// sentinel_snapshot_thread_count: 快照线程数
+```
+
+## 十四-6、Dashboard 自定义集群流控规则
+
+```java
+// 集群流控 = 全局 Token Server 分配令牌
+
+1. 部署 Token Server（Sentinel Dashboard 内置）
+   - 接收各客户端的 Token 请求
+   - 按规则分配令牌
+   - 返回给客户端
+
+2. 客户端配置
+   cluster_mode=true
+   client_ip=10.0.0.1
+   server_port=8720
+   cluster_config.server_addr=token-server:8719
+
+3. 流控规则
+   {
+     "resource": "cluster-resource",
+     "grade": 1,
+     "count": 1000,
+     "clusterMode": true
+   }
+
+4. Token Server 分配
+   - 客户端请求 Token
+   - Token Server 检查全局 QPS
+   - 未超限 → 返回 Token
+   - 超限 → 返回 BlockException
+```
+
+## 十四-7、Sentinel 客户端限流规则持久化三方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| Nacos 推送 | 规则存 Nacos，变更自动推送到客户端 | Spring Cloud Alibaba 生态 |
+| Apollo 配置 | 规则存 Apollo，客户端拉取 | Apollo 配置中心 |
+| 文件推送 | 规则存文件，定时拉取 | 开发测试环境 |
+
+```
+Nacos 持久化流程：
+
+1. 规则存储在 Nacos
+   Data ID: ${spring.application.name}-flow-rules
+   Group: SENTINEL_GROUP
+   Format: JSON
+
+2. 客户端启动时拉取规则
+   spring.cloud.sentinel.datasource.ds1.nacos.server-addr=...
+   spring.cloud.sentinel.datasource.ds1.nacos.dataId=...
+   spring.cloud.sentinel.datasource.ds1.nacos.rule-type=flow
+
+3. 规则变更自动推送
+   Nacos → 客户端 Listener → 更新本地规则
+
+4. 优势：
+   - 规则持久化（重启不丢）
+   - 动态生效（无需重启）
+   - 集中管理（Dashboard 统一配置）
+
+注意：
+  - Nacos 需高可用（3 节点）
+  - 客户端需实现 Listener
+  - 规则格式需统一（JSON）
+```
+
 ## 十五、与其他板块的关系
 
 - 限流原理（令牌桶/漏桶/滑动窗口）见「[场景设计/稳定性三板斧](../../场景设计/稳定性三板斧：限流-熔断-降级.md)」；

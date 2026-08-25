@@ -558,6 +558,160 @@ spec:
 
 ---
 
+## 十五-2、Flink Watermark 三种策略
+
+### 周期性生成（Periodic）
+
+```
+策略：定时器每隔固定间隔（默认 200ms）从当前最大事件时间生成 Watermark
+配置：env.getConfig().setAutoWatermarkInterval(200)
+特点：简单高效，适合均匀流；极端延迟事件可能在间歇期内漏判
+```
+
+### 对齐生成（Aligned）
+
+```
+策略：多输入算子中，Watermark 取所有输入的最小值
+场景：双流 JOIN 时保证两侧数据到齐
+风险：某输入流停滞 → 整体 Watermark 卡住 → 可用侧输出兜底
+```
+
+### 自定义生成（Punctuated）
+
+```
+策略：每条数据都检查，满足条件即生成 Watermark（如检测到特殊标记事件）
+代码示例：
+  stream.assignTimestampsAndWatermarks(
+    WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5))
+      .withTimestampAssigner((event, ts) -> event.getTimestamp())
+  )
+```
+
+## 十五-3、Side Output 使用场景与代码示例
+
+```java
+// 侧输出 = 从主流中分流出不符合主逻辑的数据
+OutputTag<Event> lateTag = new OutputTag<Event>("late-data"){};
+SingleOutputStreamOperator<Event> mainStream = stream
+  .keyBy(...)
+  .window(...)
+  .allowedLateness(Time.minutes(1))
+  .sideOutputLateData(lateTag)  // 迟到数据走侧输出
+  .process(processFn);
+
+// 读取侧输出
+DataStream<Event> lateStream = mainStream.getSideOutput(lateTag);
+lateStream.addSink(new AlertSink());  // 迟到告警或补数
+```
+
+| 场景 | 说明 |
+|------|------|
+| 迟到数据处理 | 超过 allowedLateness 的数据走侧输出，不丢弃 |
+| 数据分流 | 正常数据走主流，异常/黑名单数据走侧输出 |
+| 多路输出 | 一个算子产生多种结果（如订单流 + 告警流） |
+| 异常日志采集 | 处理失败的数据输出到日志/告警 |
+
+## 十五-4、Flink Async I/O 原理与连接池
+
+```
+Async I/O = 异步查询外部系统（如 Redis/MySQL），不阻塞算子线程
+
+原理：
+  1. 算子发起异步请求 → 注册回调
+  2. 请求挂起期间线程处理其他数据
+  3. 响应到达 → 回调触发 → 输出结果
+
+连接池配置要点：
+  - 最大并发请求数（capacity）：控制同时进行的异步请求量
+  - 超时设置（timeout）：避免慢查询拖死管道
+  - 连接池：Redis/DB 连接复用，避免每次创建新连接
+
+代码示例：
+  AsyncDataStream.unorderedWait(
+    stream,
+    new AsyncFunction<Event, Result>() {
+      public void asyncInvoke(Event event, ResultFuture<Result> resultFuture) {
+        CompletableFuture.supplyAsync(() -> redis.get(event.getKey()))
+          .whenComplete((result, ex) -> {
+            if (ex != null) resultFuture.completeExceptionally(ex);
+            else resultFuture.complete(Collections.singleton(result));
+          });
+      }
+    },
+    30, TimeUnit.SECONDS,  // 超时
+    100                      // 最大并发
+  );
+```
+
+## 十五-5、Flink Exactly-once Sink 三步提交
+
+```
+Flink 两阶段提交（2PC）Sink 实现 Exactly-once：
+
+Step 1 - 预提交（Pre-commit）：
+  Checkpoint Barrier 到达 Sink 算子
+  → 开启事务，写入数据到外部系统（未提交）
+  → 状态后端记录事务句柄
+
+Step 2 - 提交（Commit）：
+  所有算子 Checkpoint 完成
+  → JobManager 通知 Sink 提交事务
+  → 外部系统正式提交数据
+
+Step 3 - 回滚（Rollback）：
+  Checkpoint 失败 → 回滚未提交事务
+  → 下次 Checkpoint 重新预提交
+
+适用场景：Kafka Sink（Transaction API）、数据库 Sink（XA 事务）
+```
+
+## 十五-6、Flink on K8s 三种模式对比
+
+| 模式 | 说明 | 资源隔离 | 适用场景 |
+|------|------|----------|----------|
+| Session Mode | 共享 Flink 集群，Job 动态提交 | 弱（Job 间共享） | 开发测试、Job 数量多 |
+| Per-Job Mode | 每个 Job 独立集群（已废弃） | 强 | 隔离性要求高 |
+| Application Mode | 每个 Application 独立集群 | 强（推荐） | 生产环境首选 |
+
+```
+Application Mode 优势：
+  1. Job Manager 在用户代码内执行（类路径隔离）
+  2. 资源隔离：不同 Application 互不影响
+  3. 弹性：Application 结束自动释放资源
+  4. 不依赖 Session 集群的预热
+
+配置示例：
+  kubernetes.jobmanager.cpu: 1
+  kubernetes.taskmanager.cpu: 2
+  kubernetes.taskmanager.memory: 4096m
+  kubernetes.high-availability: kubernetes
+```
+
+## 十五-7、Flink SQL Join 语义
+
+| Join 类型 | 说明 | 示例 |
+|-----------|------|------|
+| Regular Join | 无时间限制，支持多版本 | `A JOIN B ON A.id = B.id` |
+| Interval Join | 指定时间窗口内的关联 | `A JOIN B ON A.id = B.id AND A.ts BETWEEN B.ts - 10 AND B.ts + 10` |
+| Temporal Join | 时间维度表关联（最新版本） | `A JOIN B FOR SYSTEM_TIME AS OF A.proc_time ON A.id = B.id` |
+| Window Join | 窗口内关联 | `A JOIN B ON A.id = B.id WINDOW TUMBLE(A.ts, 10min)` |
+
+```
+Interval Join 示例：
+  SELECT A.id, A.amount, B.status
+  FROM orders A
+  JOIN payments B
+  ON A.id = B.order_id
+  AND B.ts BETWEEN A.ts - INTERVAL '5' MINUTE AND A.ts + INTERVAL '5' MINUTE
+
+Temporal Join（实时维表关联）：
+  SELECT A.user_id, A.amount, B.user_level
+  FROM orders A
+  JOIN user_dims B
+  FOR SYSTEM_TIME AS OF A.proc_time
+  ON A.user_id = B.user_id
+```
+
 ## 十六、与其他板块的关系
 
 - Kafka（Flink 的 Source/Sink 核心）见「[Kafka](./Kafka.md)」；

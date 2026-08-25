@@ -597,6 +597,179 @@ automountServiceAccountToken: false
 
 > **安全要点**：避免在每个 Deployment 中硬编码 imagePullSecrets，通过 ServiceAccount 自动注入；定期轮换 registry 凭据。
 
+## 十五、Trivy 镜像安全扫描
+
+### 15.1 扫描类型与集成
+
+| 扫描类型 | 命令 | 适用场景 |
+|----------|------|----------|
+| 文件系统扫描 | `trivy fs .` | 代码依赖扫描 |
+| 镜像扫描 | `trivy image app:latest` | 发布前检查 |
+| 配置文件扫描 | `trivy config k8s/` | K8s YAML 安全 |
+| SBOM 生成 | `trivy image --format spdx app:latest` | 供应链清单 |
+
+```yaml
+# GitHub Actions Trivy 扫描
+- name: Trivy Scan
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: ${{ env.IMAGE }}
+    format: 'sarif'
+    output: 'trivy-results.sarif'
+    severity: 'CRITICAL,HIGH'
+    exit-code: '1'
+```
+
+## 十六、Helm 版本管理与回滚
+
+### 16.1 Helm 版本策略
+
+| 策略 | 做法 | 适用 |
+|------|------|------|
+| 固定版本 | `helm upgrade --version 1.2.3` | 生产发布 |
+| 语义化 | SemVer + Values 文件 | 多环境 |
+| atomic | `helm upgrade --atomic` | 自动回滚 |
+| 等待 | `helm upgrade --wait --timeout 5m` | 确保就绪 |
+
+```bash
+# Helm 回滚流程
+helm history myapp -n production       # 查看历史
+helm rollback myapp 5 -n production    # 回滚到版本5
+helm test myapp -n production          # 验证回滚
+```
+
+## 十七、Kustomize Overlay 管理
+
+### 17.1 多环境 Overlay 结构
+
+```text
+k8s/
+├── base/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── kustomization.yaml
+├── overlays/
+│   ├── dev/
+│   │   ├── kustomization.yaml
+│   │   └── replicas-patch.yaml
+│   ├── staging/
+│   │   ├── kustomization.yaml
+│   │   └── resources-patch.yaml
+│   └── prod/
+│       ├── kustomization.yaml
+│       └── hpa-patch.yaml
+```
+
+```yaml
+# overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patchesStrategicMerge:
+  - replicas-patch.yaml
+  - hpa-patch.yaml
+  - env-patch.yaml
+namePrefix: prod-
+commonLabels:
+  environment: production
+```
+
+## 十八、Pre-deploy Hooks 与部署前置检查
+
+| Hook 类型 | 用途 | 工具 |
+|-----------|------|------|
+| Pre-install | 首次安装前检查（CRD/依赖） | Helm hooks |
+| Pre-upgrade | 升级前备份/迁移 | Helm/Argo CD |
+| Pre-rollback | 回滚前清理临时资源 | Helm hooks |
+| Post-install | 初始化数据/管理员创建 | Helm hooks |
+
+```yaml
+# Helm pre-upgrade hook
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: app-migrator:latest
+          command: ["./migrate.sh"]
+      restartPolicy: Never
+```
+
+## 十九、Cosign 镜像签名与验证
+
+| 操作 | 命令 | 用途 |
+|------|------|------|
+| 签名 | `cosign sign --key cosign.key $IMAGE` | 标记可信来源 |
+| 验证 | `cosign verify --key cosign.pub $IMAGE` | 部署前校验 |
+| SBOM附着 | `cosign attach sbom --sbom sbom.spdx $IMAGE` | 供应链清单 |
+| 透明日志 | `cosign verify --certificate-identity=...` | 审计追溯 |
+
+```yaml
+# Kyverno 策略：强制镜像签名
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.example.com/*"]
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+```
+
+## 二十、Rollback 触发条件与自动化
+
+### 20.1 自动回滚触发条件
+
+| 条件 | 阈值 | 检测方式 |
+|------|------|----------|
+| 健康检查失败 | 连续3次 | K8s liveness probe |
+| 错误率上升 | >5% 持续5min | Prometheus alert |
+| P99延迟 | >2s 持续3min | SLO alerting |
+| 内存泄漏 | RSS持续增长 | cAdvisor监控 |
+
+```yaml
+# Argo Rollouts 自动分析回滚
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: success-rate
+      interval: 1m
+      successCondition: result[0] >= 0.99
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}",code=~"2.."}[5m]))
+            /
+            sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
+```
+
 ## 与其他模块的关联
 
 - [10-部署策略](10-部署策略.md)：本文是部署策略在 K8s 上的具体落地（滚动 / 金丝雀 / 蓝绿）。

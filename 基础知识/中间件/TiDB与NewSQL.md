@@ -730,6 +730,132 @@ DM（Data Migration）：
 
 ---
 
+## 十二、Placement Rules 数据放置策略
+
+### 12.1 Placement Rules 概念
+
+| 规则 | 说明 | 示例 |
+|------|------|------|
+| leader | Leader 副本放置位置 | `{"region": "cn", "role": "leader"}` |
+| follower | Follower 副本放置位置 | `{"region": "us", "role": "follower"}` |
+| learner | Learner 副本（不参与投票） | `{"region": "eu", "role": "learner"}` |
+| zone | 可用区级别 | `{"zone": "zone1"}` |
+
+```sql
+-- 创建 Placement Policy
+CREATE PLACEMENT POLICY policy_cn PRIMARY_REGION="cn" REGIONS="cn,us";
+ALTER TABLE orders PLACEMENT POLICY=policy_cn;
+```
+
+## 十三、TiFlash 列存同步
+
+### 13.1 同步模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| 同步复制 | 事务提交时同步到 TiFlash | 强一致 HTAP |
+| 异步复制 | 后台异步同步 | 延迟敏感场景 |
+| 延迟复制 | 可配置延迟 | 兼容性验证 |
+
+```sql
+-- 设置表为 HTAP 模式
+ALTER TABLE orders SET TIFLASH REPLICA 2;
+
+-- 查看同步状态
+SELECT * FROM information_schema.tiflash_replica WHERE TABLE_SCHEMA='mydb';
+```
+
+## 十四、TiDB 运维命令大全
+
+```bash
+# 集群管理
+tiup cluster display          # 查看集群状态
+tiup cluster scale-out       # 扩容
+tiup cluster scale-in        # 缩容
+tiup cluster upgrade         # 滚动升级
+
+# SQL 运维
+SHOW PROCESSLIST;            # 查看正在执行的查询
+SHOW ENGINE TIKV STATUS\G    # 查看 TiKV 状态
+ANALYZE TABLE orders;        # 更新统计信息
+EXPLAIN ANALYZE SELECT ...;  # 执行计划分析
+
+# 备份恢复
+br backup --pd pd:2379 --storage s3://bucket/backup
+br restore --pd pd:2379 --storage s3://bucket/backup
+```
+
+## 十五、MySQL 兼容性
+
+### 15.1 兼容特性
+
+| 特性 | 兼容性 | 说明 |
+|------|--------|------|
+| SQL 语法 | 95%+ | INSERT/UPDATE/DELETE/SELECT |
+| 事务 | ACID | Percolator 两阶段提交 |
+| 索引 | B+Tree | 支持联合索引/覆盖索引 |
+| 存储过程 | 部分 | 不支持触发器 |
+| 外键 | 支持 | 逻辑外键 |
+
+### 15.2 不兼容特性
+
+```text
+不支持：
+  - 空间数据类型（POINT/POLYGON）
+  - 全文索引（FULLTEXT）
+  - 触发器（TRIGGER）
+  - 存储过程（部分语法）
+  - 自定义函数（UDF）
+  - 部分 JSON 函数
+```
+
+## 十六、大事务处理
+
+### 16.1 大事务限制
+
+| 限制类型 | 阈值 | 影响 |
+|----------|------|------|
+| 事务大小 | 100MB | 写入 KV 数量限制 |
+| 锁数量 | 5000 | 锁冲突风险 |
+| 执行时间 | 默认 5min | 超时回滚 |
+
+### 16.2 优化策略
+
+```java
+// 分批处理大事务
+public void batchProcess(List<Order> orders) {
+    int batchSize = 1000;
+    for (int i = 0; i < orders.size(); i += batchSize) {
+        List<Order> batch = orders.subList(i, Math.min(i + batchSize, orders.size()));
+        processBatch(batch);  // 每个批次独立事务
+    }
+}
+```
+
+## 十七、金融案例：银行核心系统迁移
+
+### 17.1 迁移路径
+
+```mermaid
+flowchart TD
+    A[评估阶段] --> B[MySQL 源库分析]
+    B --> C[TiDB 兼容性测试]
+    C --> D[性能压测]
+    D --> E[双写验证]
+    E --> F[灰度切换]
+    F --> G[全量切换]
+    G --> H[旧库下线]
+```
+
+| 阶段 | 时间 | 关键任务 |
+|------|------|----------|
+| 评估 | 2周 | SQL 兼容性、数据量评估 |
+| 开发 | 4周 | 应用改造、适配层开发 |
+| 测试 | 3周 | 功能/性能/压力测试 |
+| 切换 | 1周 | 灰度→全量→观察 |
+
+---
+
 ## 十一、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

@@ -526,6 +526,174 @@ Cache<String, Object> cache = Caffeine.newBuilder()
 | 适用场景 | 缓存+数据结构+业务 | 纯 KV 缓存 |
 | 性能 | 极高 | 极高（多核扩展好） |
 
+## 九-2、Caffeine W-TinyLFU 与 LFU 近似算法详解
+
+```
+W-TinyLFU = Window TinyLFU（频率 + 新鲜度）
+
+算法组成：
+  Window Cache（1% 容量）：LRU，短期热点快速进入
+  Main Cache（99% 容量）：Segmented LRU（sLRU）
+    Probation（10%）：新数据进入，低频淘汰
+    Protected（90%）：高频数据保护，不轻易淘汰
+
+频率统计：
+  Count-Min Sketch：4-bit 计数器（最大 15）
+  每个 key 4-bit 频率计数（节省内存）
+  窗口衰减：定期老化，防止历史热点污染
+
+准入策略：
+  新数据先入 Window Cache
+  要进入 Main Cache → 频率 > Main 中最低频率
+  → 自然淘汰低频数据，保留高频热点
+
+对比传统 LFU：
+  LFU：只看频率，新热点进不来
+  LRU：只看时间，一次性热点会污染
+  W-TinyLFU：频率+新鲜度，兼顾两者
+  准确率接近 LFU，性能接近 LRU
+```
+
+## 九-3、Caffeine expireAfterWrite vs expireAfterAccess 选择
+
+| 策略 | 行为 | 适用场景 |
+|------|------|----------|
+| expireAfterWrite | 写入后固定时间过期 | 防脏数据（如配置/缓存 DB 结果） |
+| expireAfterAccess | 访问后重置过期时间 | 防热点被清（如用户 Session） |
+| 两者组合 | 可叠加（取较短时间） | 热点数据 + 最大容忍时间 |
+
+```
+选择指南：
+  数据会变化 → expireAfterWrite（保证最终一致性）
+  数据不变但要保活 → expireAfterAccess（热点常驻）
+  组合使用：
+    expireAfterWrite(5min) + expireAfterAccess(30min)
+    → 最长 5 分钟过期，热点可续命
+
+refreshAfterWrite（异步刷新）：
+  到期后后台异步刷新，旧值继续可用
+  读不 miss，无回源抖动
+  需配合 CacheLoader 使用
+```
+
+## 九-4、Guava Cache removalListener 异步通知
+
+```java
+LoadingCache<String, Object> cache = CacheBuilder.newBuilder()
+    .maximumSize(10_000)
+    .removalListener(notification -> {
+        // 异步通知（不要做耗时操作）
+        log.info("Removed: key={}, cause={}", 
+            notification.getKey(), notification.getCause());
+        // cause: SIZE/EVICTED/EXPIRED/REPLACED/EXPLICIT/INVALIDATION
+    })
+    .build(key -> loadFromDb(key));
+
+// 注意：
+// 1. removalListener 在删除时同步执行（会阻塞）
+// 2. 需要异步 → 用 AsyncLoadingCache + 异步 listener
+// 3. 通知时机：SIZE=容量满淘汰，EXPIRED=过期，EXPLICIT=手动删除
+```
+
+## 九-5、本地缓存分布式一致性问题
+
+```
+问题：
+  每个实例本地缓存各自一份 → 数据变更后各实例不一致
+
+解决方案：布隆过滤器 + TTL 组合策略
+
+1. 布隆过滤器（Bloom Filter）
+   - 快速判断 key 是否可能存在
+   - 避免大量不存在的 key 打到 DB
+   - 误判率可调（如 1%）
+
+2. TTL 组合策略
+   - 本地缓存短 TTL（如 30s）
+   - 变更时广播失效（MQ/Redis Pub/Sub）
+   - TTL 兜底：广播丢失时最多 30s 不一致
+
+3. 版本号方案
+   - 缓存带版本号
+   - 查询时比较版本号，不匹配则回源
+   - 版本号存 Redis/DB（全局递增）
+
+4. Canal 订阅
+   - DB binlog → Canal → 广播失效本地缓存
+   - 最终一致（延迟秒级）
+```
+
+## 九-6、Redis 与本地缓存双写一致性方案（延迟双删）
+
+```
+延迟双删 = 保证 Redis 与 DB 最终一致
+
+流程：
+  1. 写入 DB（更新数据）
+  2. 删除本地缓存（Caffeine）
+  3. 删除 Redis 缓存
+  4. 延迟 N 毫秒（如 500ms）
+  5. 再次删除 Redis 缓存（防止并发读写脏数据）
+
+为什么延迟双删：
+  并发场景：线程 A 写 DB → 线程 B 读 Redis（旧值）→ 写本地缓存
+  → 线程 A 删 Redis → 线程 B 的本地缓存已是旧值
+  → 延迟后再删一次，确保最终一致
+
+代码示例：
+  public void update(String key, Object value) {
+    db.update(key, value);
+    localCache.invalidate(key);
+    redis.del(key);
+    Thread.sleep(500);  // 延迟
+    redis.del(key);     // 二次删除
+  }
+```
+
+## 九-7、缓存穿透/击穿/雪崩三件套完整代码
+
+```java
+// 1. 缓存穿透（查不存在的 key）→ 布隆过滤器 + 空值缓存
+public Object getWithBloom(String key) {
+    if (!bloomFilter.mightContain(key)) return null;  // 布隆过滤器拦截
+    Object value = cache.getIfPresent(key);
+    if (value == null) {
+        value = db.query(key);
+        if (value == null) {
+            cache.put(key, NULL_VALUE);  // 空值缓存（短 TTL）
+        } else {
+            cache.put(key, value);
+        }
+    }
+    return value;
+}
+
+// 2. 缓存击穿（热点 key 过期）→ 分布式锁重建
+public Object getWithLock(String key) {
+    Object value = cache.getIfPresent(key);
+    if (value != null) return value;
+    String lockKey = "lock:" + key;
+    if (redis.setnx(lockKey, "1", 10, TimeUnit.SECONDS)) {
+        try {
+            value = db.query(key);
+            cache.put(key, value);
+        } finally {
+            redis.del(lockKey);
+        }
+    } else {
+        Thread.sleep(100);
+        return cache.getIfPresent(key);
+    }
+    return value;
+}
+
+// 3. 缓存雪崩（大批 key 同时过期）→ 随机过期时间
+public void putWithRandom(String key, Object value) {
+    int ttl = baseTtl + ThreadLocalRandom.current().nextInt(60);
+    cache.put(key, value, ttl, TimeUnit.SECONDS);
+}
+```
+
 ## 与其他板块的关系
 
 - 和「**基础知识/redis知识**」「**场景设计/多级缓存框架**」「**场景设计/缓存经典三问与一致性**」：本文是「本地 + Memcached」两翼，Redis 与多级缓存体系见那三篇。

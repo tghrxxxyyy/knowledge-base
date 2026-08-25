@@ -588,7 +588,207 @@ dubbo:
     base-packages: com.example.service
 ```
 
-## 八、与其他板块的关系
+## Dubbo 负载均衡策略详解
+
+### Random（随机，默认）
+
+```
+Random = 随机选择 + 权重
+
+算法：
+  1. 计算所有 invoker 权重之和 totalWeight
+  2. 生成 [0, totalWeight) 随机数 offset
+  3. 遍历 invoker，累加权重，offset 落在区间内则选中
+
+特点：
+  权重越大，被选中概率越高
+  大量调用后分布趋于均匀
+  默认选型（无需额外配置）
+
+配置：
+  @DubboService(loadbalance = "random")
+  # 或 consumer 端
+  @DubboReference(loadbalance = "random")
+```
+
+### RoundRobin（轮询）
+
+```
+RoundRobin = 按权重轮询
+
+算法（加权轮询）：
+  1. 维护 currentWeight 数组
+  2. 每次选择 currentWeight 最大的 invoker
+  3. 选中后 currentWeight -= totalWeight
+  4. 每轮所有 invoker currentWeight += weight
+
+示例（A:5, B:1, C:1）：
+  第1轮: A(5)→选A(-2), B(1)→选B(-6), C(1)→选C(-6)
+  第2轮: A(3)→选A(-4), B(2)→选B(-5), C(2)→选C(-5)
+  → A:B:C = 5:1:1
+
+适用：请求耗时均匀的场景
+```
+
+### LeastActive（最少活跃调用）
+
+```
+LeastActive = 选当前活跃调用最少的实例
+
+算法：
+  1. 统计每个 invoker 当前活跃调用数 activeCount
+  2. 选择 activeCount 最小的
+  3. 若多个相同，降级为 Random
+
+特点：
+  快实例自动分担更多请求
+  适合请求耗时差异大的场景
+  需配合 timeout 兜底（防慢实例阻塞）
+
+配置：
+  @DubboService(loadbalance = "leastactive")
+```
+
+### ConsistentHash（一致性哈希）
+
+```
+一致性哈希环：
+  0 ──────────────────── 2^32
+  │                       │
+  Instance A ───────── Instance B
+  │                       │
+  └───────── Instance C ──┘
+
+虚拟节点：每个真实节点 160 个虚拟节点
+增删节点只影响相邻 key（~1/N 数据迁移）
+
+适用：有状态服务（购物车、会话、缓存亲和）
+配置：
+  @DubboService(loadbalance = "consistenthash",
+    loadbalancearguments = "userId")  # 按 userId 哈希
+```
+
+## Dubbo 超时与重试的嵌套陷阱
+
+```
+⚠️ 关键规则：Provider 端超时 < Consumer 端超时
+
+场景（嵌套调用）：
+  Consumer A → Provider B → Provider C
+
+配置陷阱：
+  A→B: timeout=3000ms, retries=2
+  B→C: timeout=5000ms（错误！大于 A→B 超时）
+
+  → A 等 3s 超时放弃，B 继续调 C（浪费资源）
+  → B 重试 2 次，每次等 5s → A 已超时
+
+正确配置：
+  A→B: timeout=3000ms
+  B→C: timeout=2000ms（留出重试时间）
+  
+超时嵌套公式：
+  B→C timeout = A→B timeout / (retries+1) - 网络开销
+  例：3000ms / (2+1) - 200ms = 800ms
+```
+
+| 层级 | timeout | retries | 实际最大耗时 |
+|------|---------|---------|-------------|
+| Consumer→Provider | 3000ms | 2 | 3000ms（首次失败即重试） |
+| Provider→下游 | 800ms | 0 | 800ms（不可重试） |
+
+## Dubbo 集群容错 Retry 次数计算规则
+
+```
+Failover 重试次数 = retries 参数值（默认 2）
+
+重要规则：
+  1. retries=2 表示最多调用 3 次（1 次原始 + 2 次重试）
+  2. 重试不包含首次调用
+  3. 写操作（非幂等）必须 retries=0
+  4. 超时重试 vs 异常重试：超时也算失败，会触发重试
+
+重试次数优先级（从高到低）：
+  Consumer 方法级 > Consumer 接口级 > Consumer 全局
+  > Provider 方法级 > Provider 接口级
+
+最佳实践：
+  读操作：retries=2-3
+  写操作：retries=0
+  关键链路：retries=1（平衡可用性与资源）
+```
+
+## Dubbo 路由规则（Condition/Script/Tag）
+
+```
+路由规则 = 在 LoadBalance 之前过滤候选实例
+
+三种路由：
+  1. Condition Router：条件路由（表达式）
+  2. Script Router：脚本路由（JavaScript/Groovy）
+  3. Tag Router：标签路由（灰度发布）
+```
+
+| 路由类型 | 语法示例 | 适用 |
+|----------|----------|------|
+| Condition | `consumer.host != 'dev' AND provider.env != 'prod'` | 环境隔离 |
+| Tag | `tag=gray → provider.tag=gray` | 灰度发布 |
+| Script | `return invoker.getUrl().getParameter("region") == "cn"` | 复杂逻辑 |
+
+```yaml
+# Tag 路由规则（灰度发布）
+# Consumer 带 tag=gray 请求 → 只路由到 tag=gray 的 Provider
+# Consumer 不带 tag → 走主链路（无 tag 的 Provider）
+```
+
+## Dubbo Triple 协议兼容 HTTP/1.1 的设计
+
+```
+Triple = Dubbo 3 默认协议，基于 HTTP/2 + Protobuf
+
+HTTP/1.1 兼容设计：
+  1. 传统 Dubbo 协议（TCP）→ 无法穿透 HTTP 网关
+  2. Triple（HTTP/2）→ 天然穿透 HTTP 网关/API Gateway
+  3. 支持 HTTP/1.1 客户端（降级为 Unary 调用）
+
+四种调用模式：
+  Unary（一元）：Request → Response（最常用）
+  Server Streaming：Request → Stream Response
+  Client Streaming：Stream Request → Response
+  Bidi Streaming：双向流
+
+性能对比：
+  Triple vs Dubbo 协议：
+  吞吐差距 < 10%（HTTP/2 多路复用优化）
+  延迟略高 1-2ms（HTTP/2 帧开销）
+  网关穿透能力大幅提升
+```
+
+## Dubbo 在 K8s 中注册中心选择决策
+
+```
+注册中心选型决策树：
+
+已有 K8s 基础设施？
+  ├── 是 → K8s 原生服务发现（Dubbo 3 支持）
+  │        优势：零额外组件、与 K8s Service 打通
+  │        劣势：不支持 Dubbo 特有元数据（权重/路由）
+  │
+  └── 否 → 业务规模？
+           ├── 中小 → Nacos（注册+配置一体）
+           │        优势：Spring Cloud Alibaba 生态
+           │        劣势：额外运维 Nacos 集群
+           │
+           └── 大规模 → ZooKeeper / etcd
+                    ZK：强一致、成熟稳定
+                    etcd：云原生、轻量
+
+K8s 注册中心配置：
+  dubbo.registry.address=kubernetes://default.svc.cluster.local:443
+  dubbo.application.metadata-service.port=20880
+```
+
+## 与其他板块的关系（扩展）
 
 - 源码精读见「[源码系列/Dubbo 源码](../../源码系列/Dubbo源码.md)」；
 - 注册中心见「[注册中心与配置中心](./注册中心与配置中心.md)」；

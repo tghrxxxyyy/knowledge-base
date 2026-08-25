@@ -717,6 +717,121 @@ HBase 优势：
 
 ### 22.5 HBase 监控指标
 
+## HBase Compaction 调度器参数详解
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `hbase.hstore.compactionThreshold` | 3 | Minor 触发阈值（HFile 数） |
+| `hbase.hstore.compactionMax` | 10 | 单次 Minor 最大合并数 |
+| `hbase.hregion.majorcompaction` | 604800000ms (7天) | Major 自动触发间隔 |
+| `hbase.hstore.blockingStoreFiles` | 16 | 阻塞写入的文件数阈值 |
+| `hbase.hstore.compaction.check.period` | 120000ms | Compaction 检查周期 |
+
+```
+调优建议：
+  写多场景：调大 compactionThreshold（减少触发频率）
+  读多场景：调小 compactionThreshold（减少文件数）
+  Major Compaction：低峰期调度（凌晨2-6点）
+  阻塞阈值：blockingStoreFiles 调大防写入阻塞
+```
+
+## HBase Coprocessor 观察者模式代码示例
+
+```java
+// RegionObserver：写入时自动维护二级索引
+public class IndexObserver extends BaseRegionObserver {
+  @Override
+  public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                     Put put, WALEdit edit, Durability durability) {
+    // 从原始 Put 中提取索引列
+    byte[] name = put.getValue(Bytes.toBytes("info"), Bytes.toBytes("name"));
+    if (name != null) {
+      Put indexPut = new Put(name);
+      indexPut.addColumn(Bytes.toBytes("idx"), Bytes.toBytes("rowkey"),
+                         put.getRow());
+      e.getEnvironment().getTable().put(indexPut);
+    }
+  }
+}
+
+// 配置方式：
+// 表级：ALTER 'table', {NAME => 'cf', coprocessor => '...'}
+// 系统级：hbase-coprocessor.xml
+```
+
+## HBase 与 Phoenix SQL 访问层
+
+```
+Phoenix = HBase 上的 SQL 层
+
+  支持标准 SQL 语法（SELECT/JOIN/聚合）
+  底层转为 HBase Scan/Get
+  二级索引：全局索引/本地索引/覆盖索引
+
+  优势：
+    用 SQL 操作 HBase（降低门槛）
+    二级索引支持非 RowKey 查询
+    事务支持（轻量级）
+    
+  劣势：
+    写放大（索引维护）
+    复杂查询性能不如原生 HBase
+    
+  适用：
+    需要 SQL 查询 HBase 的场景
+    需要二级索引的场景
+```
+
+## HBase Region Split 策略（KeyPrefixRegionSplit）
+
+```
+Region Split 策略：
+
+  ConstantSizeRegionSplitPolicy（默认）：
+    Region 达 hbase.hregion.max.filesize（10GB）时分裂
+    简单但不考虑数据分布
+
+  KeyPrefixRegionSplitPolicy：
+    按 RowKey 前缀分裂
+    同前缀数据在同一 Region
+    适合前缀查询场景
+
+  DelimitedKeyPrefixRegionSplitPolicy：
+    按分隔符分割 RowKey 后取前缀
+    适合组合键场景
+
+配置：
+  hbase.regionserver.region.split.policy = 
+    org.apache.hadoop.hbase.regionserver.KeyPrefixRegionSplitPolicy
+```
+
+## HBase 监控指标（NumRegionServers/RequestCount）与告警
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| NumRegionServers | < 预期值 | 节点故障 |
+| RequestCount 不均衡 | > 20% 差异 | 热点 Region |
+| BlockCache 命中率 | < 80% | 缓存不足 |
+| Compaction 队列长度 | > 10 | IO 瓶颈 |
+| Region 数量 | > 300/Server | 需分裂/迁移 |
+| GC 暂停时间 | > 1s | JVM 调优 |
+| 写入延迟 P99 | > 50ms | WAL/磁盘问题 |
+
+```yaml
+# Prometheus 告警规则
+groups:
+- name: hbase_alerts
+  rules:
+  - alert: HBaseRegionServerDown
+    expr: up{job="hbase"} == 0
+    for: 1m
+    labels: {severity: critical}
+  - alert: HBaseCompactionBacklog
+    expr: hbase_compaction_queue_length > 10
+    for: 5m
+    labels: {severity: warning}
+```
+
 | 指标 | 说明 | 告警阈值 |
 |------|------|----------|
 | RegionServer 请求延迟 | P99 > 100ms | 告警 |
