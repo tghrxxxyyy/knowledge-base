@@ -680,6 +680,309 @@ graph TD
 
 ---
 
+## Zabbix Proxy 数据同步机制
+
+### cached 与 unsynced 模式
+
+| 模式 | 行为 | 适用场景 |
+|------|------|----------|
+| synced（默认） | Proxy 启动后从 Server 拉取完整配置，缓存本地 | 正常运行，配置一致性要求高 |
+| cached（缓存模式） | 首次同步后缓存配置，定期增量同步 | 大规模 Proxy（万级监控项），减少 Server 压力 |
+| unsynced | Proxy 不从 Server 拉取配置，依赖本地配置 | 断网/隔离环境，手动维护配置 |
+
+```
+Proxy 同步流程：
+  ① Proxy 启动 → 向 Server 请求配置（full sync）
+  ② Server 响应 → 返回 Item/Trigger/Host 清单
+  ③ Proxy 本地缓存（SQLite/MySQL）
+  ④ 定期心跳（默认 10s）→ 增量同步变更
+  ⑤ 断网时使用本地缓存，恢复后自动回传
+
+性能优化：
+  ProxyCacheSize 控制缓存上限（默认 64MB）
+  CacheUpdateFrequency 控制同步频率（默认 60s）
+  大规模场景建议用 cached 模式 + MySQL 后端
+```
+
+### Proxy 数据回传策略
+
+| 策略 | 配置 | 说明 |
+|------|------|------|
+| 即时回传 | 默认（数据产生即推送） | 实时性好，带宽占用高 |
+| 批量回传 | ProxyLocalBuffer=300s | 数据本地攒 5 分钟批量推送 |
+| 断网回传 | 断网期间缓存，恢复后按 FIFO 回传 | 保证数据不丢，但有延迟 |
+| 压缩回传 | ProxyConfigFrequency + Gzip | 配置同步时压缩，减少带宽 |
+
+## LLD 规则高级用法
+
+### LLD 依赖与条件过滤
+
+```yaml
+# LLD 依赖规则：仅当父规则发现实例时才执行子规则
+Discovery Rules:
+  Disk Discovery:
+    Key: vfs.fs.discovery
+    Dependent Item: false
+  Disk IOPS (依赖磁盘发现):
+    Key: vfs.fs.iops[{#DISK}]
+    Type: Dependent
+    Master Item: vfs.fs.discovery
+    LLD Filter: {$DISK_IGNORE}  # 正则过滤
+
+# LLD 正则过滤（排除系统盘、过滤容器卷）
+LLD Filters:
+  - {$DISK_FILTER}: /.+\/(docker|kubelet|overlay).+/
+  - {$NET_FILTER}: /^lo$|^docker[0-9]+|^br-|^veth/
+```
+
+### LLD 宏变量高级用法
+
+| 宏类型 | 语法 | 用途 |
+|--------|------|------|
+| 常量宏 | `{$MACRO_NAME}` | 模板级常量（阈值/端口） |
+| 主机宏 | `{HOST.NAME}` | 引用主机属性 |
+| LLD 宏 | `{#DISK}` | 发现实例变量 |
+| 正则宏 | `{#REGEXP:pattern}` | 从实例名提取子串 |
+| 自定义宏 | `{$USER_MACRO}` | 用户定义的模板参数 |
+
+```
+LLD 宏提取子串示例：
+  实例名：/data/mysql/binlog
+  正则宏：{#REGEXP:/\/(\w+)\/\w+$/}
+  提取结果：mysql → 可用于创建按库分组的监控项
+```
+
+### LLD 规则最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 过滤无用实例 | 排除系统盘、容器临时卷 |
+| 按业务分组 | 利用 LLD 宏创建主机组/标签 |
+| 限制发现数量 | 最大 10,000 条（防 OOM） |
+| 预处理链 | 在 Agent 2 端预处理 LLD JSON（过滤/排序） |
+| 定期执行 | Discovery Interval 设为 1~6 小时 |
+
+## Zabbix 自定义监控项（UserParameter / ExternalCheck）
+
+### UserParameter 配置
+
+```bash
+# zabbix_agentd.conf 配置
+# 语法：UserParameter=key[*],command
+
+# 基础示例
+UserParameter=nginx.active,ss -s | awk '/^Active/{print $2}'
+
+# 带参数（$1,$2 引用参数）
+UserParameter=mysql.connections[*],mysql -u$1 -p$2 -e "SHOW STATUS" 2>/dev/null | grep "Threads_connected" | awk '{print $$2}'
+
+# 脚本型（复杂逻辑推荐）
+UserParameter=custom.healthcheck[*],/etc/zabbix/scripts/healthcheck.sh $1 $2
+
+# 安全配置（限制执行目录）
+# UnsafeUserParameters=0  # 默认关闭
+# AllowKey=system.run[*]  # 白名单执行命令
+```
+
+### ExternalCheck 方式
+
+| 方式 | 延迟 | 安全性 | 适用 |
+|------|------|--------|------|
+| UserParameter（Agent 内） | 低（Agent 进程内执行） | 中（需审计脚本） | 高频采集 |
+| ExternalCheck（独立进程） | 高（启动进程开销） | 高（隔离执行） | 低频/高危脚本 |
+| HTTPAgent（HTTP 接口） | 低 | 高（标准 HTTP） | REST API 指标 |
+| Script Item（Agent 2） | 低 | 中 | Agent 2 专用脚本 |
+
+### 自定义监控项模板
+
+```yaml
+# 模板：自定义应用健康检查
+Template: App Health Check
+Items:
+  - Name: HTTP Status Code
+    Key: http.status[{$APP_URL}]
+    Type: HTTPAgent
+    Interval: 30s
+    Preprocessing:
+      - Type: JSONPath
+        Parameters: $.status_code
+
+  - Name: Response Time
+    Key: http.rtt[{$APP_URL}]
+    Type: HTTPAgent
+    Interval: 30s
+    ValueType: Numeric (float)
+
+  - Name: Process Memory
+    Key: proc.mem[{$PROCESS_NAME}]
+    Type: Zabbix Agent
+    Interval: 60s
+
+Triggers:
+  - Name: HTTP Error Rate > 5%
+    Expression: avg(/App Health Check/http.status[{$APP_URL}],5m,"regexp:^[45]") > 0.05
+    Severity: High
+
+  - Name: Response Time > 2s
+    Expression: avg(/App Health Check/http.rtt[{$APP_URL}],3m) > 2000
+    Severity: Warning
+```
+
+## Zabbix 仪表板设计最佳实践
+
+### 网络拓扑图（Network Map）
+
+```mermaid
+graph TD
+    A[核心交换机] --> B[汇聚交换机 A]
+    A --> C[汇聚交换机 B]
+    B --> D[接入交换机 A1]
+    B --> E[接入交换机 A2]
+    C --> F[接入交换机 B1]
+    D --> G[服务器集群 1]
+    E --> H[服务器集群 2]
+    F --> I[服务器集群 3]
+```
+
+| Map 要素 | 说明 |
+|----------|------|
+| 元素 | 主机/主机组/图片/链接/文本 |
+| 连线 | 表示拓扑关系（网络/逻辑/依赖） |
+| 图标状态 | 绿=正常，黄=警告，红=故障，灰=未知 |
+| 钻取 | 点击元素跳转到主机图形/触发器 |
+| 更新间隔 | 30s~5min（与采集频率匹配） |
+
+### 仪表板布局设计
+
+```
+Dashboard 布局原则：
+  ┌──────────────────────────────────────┐
+  │ 第一行：全局概览（问题数/告警趋势/可用率） │
+  ├──────────────────────────────────────┤
+  │ 第二行：分组状态（按业务/机房分组主机状态） │
+  ├──────────────────────────────────────┤
+  │ 第三行：详细指标（关键主机 TopN）          │
+  ├──────────────────────────────────────┤
+  │ 第四行：趋势图（7天/30天历史趋势）        │
+  └──────────────────────────────────────┘
+
+Widget 类型：
+  Global View：问题计数、可用率汇总
+  Problem Hosts：当前有告警的主机列表
+  Top Hosts：按指标排名的 TopN 主机
+  Graph：关键指标趋势图
+  Pie Chart：资源分布（按状态/类型）
+  Host Navigator：按主机组快速筛选
+```
+
+### 仪表板优化要点
+
+| 要点 | 说明 |
+|------|------|
+| 分层设计 | 管理层看全局，运维看详情 |
+| 响应式布局 | 自适应不同屏幕（1920/2560） |
+| 数据时效 | 趋势图 7 天/30 天，实时图 1 小时 |
+| 权限隔离 | 按用户组可见不同仪表板 |
+| 共享与复用 | 模板化仪表板，按团队定制 |
+| 交互钻取 | 图表 → 主机 → 触发器 → 日志 |
+
+## Zabbix 容量规划
+
+### 主机数/监控项/触发器估算
+
+```
+容量规划公式：
+  监控项总数 = 主机数 × 每主机平均 Item 数
+  触发器总数 = 监控项总数 × 触发器/Item 比（约 0.3~0.5）
+  每日数据量 = 监控项总数 × (86400/采集间隔) × 100B
+
+示例：
+  5000 主机，每主机 150 Item，60s 间隔
+  = 5000 × 150 × 1440 × 100B
+  = 108 GB/天（原始数据）
+  = 3.24 TB/30 天（需分区表 + 自动清理）
+```
+
+### Server 规格选型
+
+| 监控规模 | 主机数 | Item 数 | Server 配置 | DB 配置 | Proxy 数 |
+|----------|--------|---------|-------------|---------|----------|
+| 小型 | <500 | <75K | 4C/8G | 4C/8G | 0 |
+| 中型 | 500~2K | 75K~300K | 8C/16G | 8C/16G（独立） | 1~2 |
+| 大型 | 2K~10K | 300K~1.5M | 16C/32G | 16C/32G（主从） | 3~5 |
+| 超大 | >10K | >1.5M | 32C/64G（集群） | 32C/64G（集群） | 5+ |
+
+### 性能调优参数
+
+```
+Server 端调优：
+  CacheSize=2G              # 元数据缓存（默认 8MB 太小）
+  HistoryCacheSize=1G       # 历史数据缓存
+  TrendCacheSize=256M       # 趋势缓存
+  ValueCacheSize=256M       # 值缓存
+  StartPollers=50           # 被动采集进程数
+  StartPingers=5            # 主动探测进程数
+
+DB 端调优：
+  innodb_buffer_pool_size=服务器内存 60%
+  innodb_log_file_size=1G
+  innodb_flush_log_at_trx_commit=2  # 性能优先
+  innodb_flush_method=O_DIRECT
+  分区表：按天分区原始数据表
+
+Housekeeping 配置：
+  原始数据保留：30 天
+  趋势数据保留：1 年
+  快照数据保留：30 天
+  自动清理任务：每天凌晨执行
+```
+
+## Zabbix 5.x → 6.x → 7.x 升级要点
+
+### 版本演进
+
+| 版本 | 发布年份 | 核心特性 | 注意事项 |
+|------|----------|----------|----------|
+| 5.0 LTS | 2020 | Agent 2、原生容器支持 | LTS 版本，稳定首选 |
+| 5.4 | 2021 | Tag 系统、预处理增强 | 过渡版本 |
+| 6.0 LTS | 2021 | 单一二进制、动态指标、服务端告警 | LTS，推荐升级目标 |
+| 6.2 | 2022 | 标签继承、LLD 增强 | 小版本升级 |
+| 6.4 | 2022 | UI 重构、性能提升 | 推荐版本 |
+| 7.0 LTS | 2024 | 原生 Prometheus 协议、AI 辅助诊断 | 最新 LTS |
+
+### 升级路径
+
+```
+推荐升级路径：
+  5.0 LTS → 5.4 → 6.0 LTS → 6.4 → 7.0 LTS
+  （不支持跳版本升级）
+
+升级前准备：
+  ① 备份数据库（mysqldump/pg_dump）
+  ② 备份配置（Zabbix 配置导出为 YAML）
+  ③ 测试环境验证（副本环境先升级）
+  ④ Agent 版本兼容性检查（Agent 2 向后兼容）
+
+升级后验证：
+  ① 数据采集恢复（Item 有新数据）
+  ② 触发器正常评估
+  ③ 告警动作正常发送
+  ④ API 接口兼容性
+  ⑤ UI 功能正常
+```
+
+### 7.x 新特性速览
+
+| 特性 | 说明 |
+|------|------|
+| Prometheus 协议 | 直接抓取 Prometheus exporter（/metrics） |
+| AI 辅助诊断 | 自动分析告警根因（实验性） |
+| 原生 OpenTelemetry | 支持 OTLP 协议接收 trace/metrics |
+| 增强 Tag 系统 | 标签支持批量操作、继承、过滤 |
+| 容器化部署 | 官方 Helm Chart + Operator |
+
+---
+
 ## 七、与其他板块的关系
 
 - 云原生监控对比见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；

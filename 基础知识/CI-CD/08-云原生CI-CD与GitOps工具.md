@@ -619,6 +619,340 @@ spec:
 - **文件级加密、Flux 用户** → SOPS
 - **生产推荐** → ESO + Vault（动态凭证 + 自动轮换）
 
+## ArgoCD 自定义健康检查（Health.lua）
+
+### 健康检查机制
+
+```
+Argo CD 内置健康检查：
+  Deployment：检查 ReadyReplicas == Replicas
+  Service：检查 Endpoints 有就绪地址
+  Pod：检查 Phase == Running
+  StatefulSet：检查 ReadyReplicas == Replicas
+  
+自定义 Health.lua：
+  针对 CRD（如 Rollout/Canary/Ingress）
+  定义健康判断逻辑（返回 Healthy/Degraded/Unknown）
+  挂载到 argocd-cm ConfigMap
+```
+
+### Health.lua 示例
+
+```lua
+-- health.lua：自定义健康检查
+health_status = {}
+
+function checkHealth()
+  local obj = {}
+  
+  -- 检查 Rollout 是否就绪
+  if obj.status ~= nil and obj.status.conditions ~= nil then
+    for _, condition in ipairs(obj.status.conditions) do
+      if condition.type == "Ready" and condition.status == "True" then
+        health_status.status = "Healthy"
+        health_status.message = "Rollout is ready"
+        return health_status
+      end
+    end
+  end
+  
+  health_status.status = "Degraded"
+  health_status.message = "Rollout not ready"
+  return health_status
+end
+
+return checkHealth()
+```
+
+### 配置方式
+
+```yaml
+# argocd-cm ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  resource.customizations.health.argoproj.io_Rollout: |
+    health.lua: |
+      hs = {}
+      hs.status = "Progressing"
+      hs.message = "Waiting for rollout"
+      if obj.status ~= nil then
+        if obj.status.readyReplicas == obj.spec.replicas then
+          hs.status = "Healthy"
+          hs.message = "Ready"
+        end
+      end
+      return hs
+```
+
+## ArgoCD Notifications 与 Slack/钉钉集成
+
+### Notification 框架
+
+| 组件 | 说明 |
+|------|------|
+| Notification Controller | 接收事件、触发通知 |
+| Notification Service | 发送通知到外部服务 |
+| Notification Trigger | 定义触发条件 |
+| Notification Template | 定义通知模板 |
+
+### Slack 集成
+
+```yaml
+# argocd-notifications-cm ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+data:
+  service.slack: |
+    token: $slack-token
+    signingSecret: $slack-signing-secret
+  
+  trigger.on-sync-succeeded: |
+    - when: app.status.operationState.phase in ['Succeeded']
+      send: [app-sync-succeeded]
+  
+  template.app-sync-succeeded: |
+    message: |
+      {{.app.metadata.name}} sync succeeded
+      revision: {{.app.status.sync.revision}}
+```
+
+### 钉钉集成
+
+```yaml
+service.webhook.dingtalk: |
+  url: https://oapi.dingtalk.com/robot/send?access_token=xxx
+  headers:
+    - name: Content-Type
+      value: application/json
+
+template.app-sync-succeeded: |
+  message: |
+    {
+      "msgtype": "markdown",
+      "markdown": {
+        "title": "ArgoCD 同步成功",
+        "text": "## {{.app.metadata.name}}\n- 状态: 同步成功\n- 版本: {{.app.status.sync.revision}}"
+      }
+    }
+```
+
+### 通知事件矩阵
+
+| 事件 | 触发条件 | 默认通知 |
+|------|----------|----------|
+| sync-succeeded | 同步成功 | Slack/钉钉 |
+| sync-failed | 同步失败 | Slack/钉钉/PagerDuty |
+| health-degraded | 健康状态降级 | Slack/钉钉 |
+| app-created | 应用创建 | Slack |
+| app-deleted | 应用删除 | Slack |
+
+## Flux Kustomization 依赖管理（dependsOn）
+
+### 依赖配置
+
+```yaml
+# 基础设施先部署，应用后部署
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./infrastructure
+  sourceRef:
+    kind: GitRepository
+    name: config
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: ingress-nginx
+      namespace: ingress-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./apps
+  sourceRef:
+    kind: GitRepository
+    name: config
+  dependsOn:
+    - name: infrastructure
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: backend
+      namespace: production
+```
+
+### 依赖管理策略
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| dependsOn | Kustomization 间依赖 | 基础设施 → 应用 |
+| healthChecks | 健康检查通过后才继续 | 等待 Deployment 就绪 |
+| suspend | 暂停 reconcile | 手动控制部署时机 |
+| force | 强制应用（忽略冲突） | 紧急修复 |
+
+## GitOps 下 Helm Chart 版本管理策略（helm-controller）
+
+### HelmRelease 版本管理
+
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: backend
+  namespace: production
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: backend
+      version: "1.2.x"
+      sourceRef:
+        kind: HelmRepository
+        name: backend
+  upgrade:
+    cleanupOnFail: true
+    crds: CreateReplace
+  rollback:
+    cleanupOnFail: true
+```
+
+### 版本策略对比
+
+| 策略 | 配置 | 适用 |
+|------|------|------|
+| 固定版本 | `version: "1.2.3"` | 生产环境（精确控制） |
+| 语义化范围 | `version: "1.2.x"` | 自动升级补丁版本 |
+| 最新版本 | `version: "*"` | 开发环境（自动升级） |
+| 哈希锁定 | `version: "sha256:abc123"` | 最安全（不可变） |
+
+## 渐进式交付指标分析
+
+### 核心指标
+
+| 指标 | 计算公式 | 目标值 |
+|------|----------|--------|
+| 成功率 | 成功部署数 / 总部署数 | >99% |
+| 延迟 | 部署完成时间 - 触发时间 | <5 分钟 |
+| 回滚率 | 回滚次数 / 总部署数 | <1% |
+| MTTR | 平均恢复时间 | <10 分钟 |
+| 部署频率 | 每天部署次数 | 按需 |
+| 变更失败率 | 导致故障的变更比例 | <5% |
+
+### 指标采集
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: progressive-delivery-metrics
+spec:
+  metrics:
+    - name: success-rate
+      interval: 2m
+      count: 5
+      successCondition: result[0] > 0.99
+      provider:
+        prometheus:
+          query: |
+            sum(rate(http_requests_total{status!~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m]))
+    
+    - name: latency-p99
+      interval: 2m
+      count: 5
+      successCondition: result[0] < 200
+      provider:
+        prometheus:
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+```
+
+## GitOps 多租户隔离（ArgoCD ApplicationSet + Projects）
+
+### AppProject 隔离
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-a
+  namespace: argocd
+spec:
+  description: "Team A 隔离项目"
+  sourceRepos:
+    - 'https://github.com/team-a/*'
+  destinations:
+    - namespace: 'team-a-*'
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: 'apps'
+      kind: Deployment
+  roles:
+    - name: developer
+      policies:
+        - p, proj:team-a:developer, applications, get, team-a/*, allow
+        - p, proj:team-a:developer, applications, sync, team-a/*, allow
+```
+
+### ApplicationSet 多租户
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: multi-tenant
+  namespace: argocd
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            team: "*"
+  template:
+    metadata:
+      name: '{{name}}-app'
+    spec:
+      project: '{{name}}'
+      source:
+        repoURL: https://github.com/example/apps.git
+        path: 'apps/{{name}}'
+      destination:
+        namespace: '{{name}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+```
+
+### 多租户隔离矩阵
+
+| 隔离维度 | 实现方式 | 说明 |
+|----------|----------|------|
+| 代码仓库 | sourceRepos 白名单 | 只能访问自己的仓库 |
+| 目标命名空间 | destinations 白名单 | 只能部署到自己的 NS |
+| 集群资源 | clusterResourceWhitelist | 限制集群级资源 |
+| RBAC | AppProject roles | 精细化权限控制 |
+| 网络策略 | NetworkPolicy | 命名空间间网络隔离 |
+| 资源配额 | ResourceQuota | 限制资源使用量 |
+
 ## 九、与其他模块的关联
 
 - [01-概述与核心概念](01-概述与核心概念.md)：CI/CD 总览、持续集成/交付/部署定义，本篇是其"云原生+GitOps"深化。

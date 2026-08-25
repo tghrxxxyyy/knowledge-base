@@ -707,6 +707,244 @@ resources:
 
 ---
 
+## YARN Timeline Service v2 架构
+
+### 架构组件
+
+```
+Timeline Service v2 架构：
+  TimelineReader（读服务）：查询作业历史、应用指标
+  TimelineWriter（写服务）：接收 AM 汇报的事件和指标
+  存储后端：HDFS（事件存储）+ LevelDB（状态缓存）
+  
+工作流程：
+  ① AM 启动 → 注册到 TimelineWriter
+  ② AM 运行期间 → 定期汇报进度/指标/事件
+  ③ 完成后 → 写入完成事件 + 聚合指标
+  ④ 查询时 → TimelineReader 从 HDFS 读取并聚合
+  
+与 v1 对比：
+  v1：单进程（Timeline Server），性能瓶颈
+  v2：读写分离（Reader/Writer 独立），水平扩展
+  v2 存储：HDFS（可扩展）替代 LevelDB（单机瓶颈）
+```
+
+### Timeline Service v2 配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| yarn.timeline-service.enabled | true | 启用 Timeline Service |
+| yarn.timeline-service.versions | v2 | 使用 v2 协议 |
+| yarn.timeline-service.writer.merge.class | 写入合并类 | 批量写入优化 |
+| yarn.timeline-service.reader.class | 读取类 | 支持自定义读取逻辑 |
+| yarn.timeline-service.leveldb-timeline-store.path | LevelDB 路径 | 状态缓存存储 |
+| yarn.timeline-service.hdfs-timeline-store.ttl | 180 天 | 事件保留期 |
+
+## YARN 公平调度器 vs 容量调度器选型
+
+| 维度 | Fair Scheduler | Capacity Scheduler |
+|------|----------------|-------------------|
+| 资源分配 | 动态均分（按权重） | 队列保底 + 弹性借用 |
+| 延迟调度 | 放置限制（避免数据本地性损失） | 无（按队列配额） |
+| 调度粒度 | 用户级 + 队列级 | 队列级（可嵌套） |
+| 预占用 | 支持（抢占低优先级） | 不支持（需配 AM 资源上限） |
+| 队列管理 | XML 配置，运行时动态调整 | XML 配置，支持热更新 |
+| 适用场景 | 交互式/多租户（公平性优先） | 多团队/SLA 保底（稳定性优先） |
+
+```
+选型建议：
+  公平调度器：学术/交互式集群（多用户共享，小作业快返回）
+  容量调度器：企业生产集群（多团队 SLA 保底，实时/批隔离）
+  
+混合方案（推荐）：
+  Capacity Scheduler + Fair Share 策略
+  → 队列保底（Capacity）+ 队列内公平（Fair）
+  → 实时队列保底 40% + 队列内按用户公平
+```
+
+## K8s 调度器扩展（Scheduler Extender / Webhook）
+
+### 扩展方式
+
+| 方式 | 说明 | 适用 |
+|------|------|------|
+| Scheduler Extender | HTTP 回调，在过滤/打分阶段扩展 | 自定义资源过滤 |
+| Scheduler Framework | 插件化扩展（gRPC） | 深度定制调度逻辑 |
+| Webhook（External） | Webhook 回调，独立服务 | 外部系统集成 |
+| 自定义调度器 | 独立调度器 + Pod annotation 选择 | 特殊调度需求 |
+
+### Scheduler Extender 配置
+
+```yaml
+# scheduler-extender 配置示例
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+extenders:
+- urlPrefix: "http://my-extender:8080"
+  filterVerb: "filter"
+  prioritizeVerb: "prioritize"
+  weight: 1
+  enableHttps: false
+  nodeCacheCapable: true
+```
+
+### Framework 插件扩展点
+
+```
+调度周期扩展点：
+  PreFilter → Filter → PostFilter → Score → NormalizeScore → Reserve → Permit
+  → PreBind → Bind → PostBind
+  
+自定义插件示例：
+  Filter：GPU 资源检查（NVIDIA device plugin）
+  Score：拓扑感知打分（跨 AZ 分布）
+  Permit：Gang Scheduling（批量作业原子性调度）
+  Bind：自定义绑定逻辑（优先级队列）
+```
+
+## K8s 资源模型（requests/limits 与 QoS 等级）
+
+### 资源请求与限制
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    resources:
+      requests:           # 调度依据（保证分配）
+        cpu: "500m"       # 0.5 核
+        memory: "512Mi"
+      limits:             # 运行时上限（超限 OOM/Kill）
+        cpu: "1000m"      # 1 核
+        memory: "1Gi"
+```
+
+### QoS 等级详解
+
+| QoS 等级 | 条件 | OOM Kill 优先级 | CPU 保障 | 适用 |
+|----------|------|-----------------|----------|------|
+| Guaranteed | requests = limits | 最后被 Kill | 100% 保障 | 数据库、核心服务 |
+| Burstable | requests < limits | 中间 | 保障 requests | Web 服务、API |
+| BestEffort | 无 requests/limits | 最先被 Kill | 无保障 | 离线批处理 |
+
+### 资源配额最佳实践
+
+```
+资源配置原则：
+  ① requests 设真实均值（保证调度，避免过度预留）
+  ② limits 设合理上限（防止单 Pod 拖垮节点）
+  ③ Guaranteed 给核心服务（数据库/MQ）
+  ④ Burstable 给 Web 服务（有突发流量）
+  ⑤ BestEffort 给离线作业（可被抢占）
+
+常见配置：
+  Web 服务：requests=500m/512Mi limits=1000m/1Gi（Burstable）
+  数据库：requests=2000m/4Gi limits=2000m/4Gi（Guaranteed）
+  离线作业：requests=0 limits=0（BestEffort）
+```
+
+## K8s Pod 优先级与抢占（PriorityClass）
+
+### PriorityClass 配置
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "高优先级：数据库/MQ 等核心服务"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: medium-priority
+value: 500000
+globalDefault: true
+description: "中优先级：Web 服务/API"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 100000
+globalDefault: false
+description: "低优先级：离线批处理"
+```
+
+### 抢占机制
+
+```
+抢占流程：
+  ① 高优 Pod 调度失败（资源不足）
+  ② 调度器寻找可抢占的低优 Pod
+  ③ 驱逐低优 Pod（grace period 秒后删除）
+  ④ 高优 Pod 获得资源并调度
+  
+抢占规则：
+  只能抢占相同或更低 PriorityClass 的 Pod
+  优先抢占「违约金最低」的 Pod（PodDisruptionBudget）
+  抢占后不会自动回退（低优 Pod 不会自动恢复）
+  
+最佳实践：
+  核心服务：高优先级 + Guaranteed QoS
+  Web 服务：中优先级 + Burstable
+  离线作业：低优先级 + BestEffort
+  配置 PDB（PodDisruptionBudget）防止核心服务被抢占
+```
+
+## YARN→K8s 迁移路线图（先批后流策略）
+
+### 迁移三阶段
+
+| 阶段 | 策略 | 目标 |
+|------|------|------|
+| 第一阶段 | 先批后流（批处理先行） | 验证 K8s 批调度能力 |
+| 第二阶段 | 流批共存（混合架构） | 存量 YARN + 增量 K8s |
+| 第三阶段 | 全面 K8s 化（统一调度） | YARN 下线 |
+
+### 迁移路线图
+
+```mermaid
+graph TD
+    A[现状: YARN 集群] --> B{评估}
+    B --> C[第一阶段: 批处理先行]
+    C --> D[Spark Batch on K8s]
+    C --> E[离线 ETL on K8s]
+    C --> F[历史数据分析 on K8s]
+    D --> G[第二阶段: 流批共存]
+    G --> H[Spark Streaming on K8s]
+    G --> I[Flink on K8s]
+    G --> J[存量 MR/Hive 保 YARN]
+    H --> K[第三阶段: 全面 K8s]
+    K --> L[Spark/Flink 全 on K8s]
+    K --> M[YARN 下线]
+```
+
+### 迁移评估清单
+
+| 评估维度 | 判断标准 | 迁移信号 |
+|----------|---------|---------|
+| 作业形态 | 存量 MR/Hive 占比 | >50% 且无改造计划 → 暂缓 |
+| 弹性需求 | 日内负载波动 | 波动 >3 倍 → 收益明显 |
+| 团队技能 | 有无 K8s SRE | 无则先建平台组 |
+| 状态依赖 | 是否重度依赖本地盘 | 是则先改对象存储 |
+| 成本压力 | 集群利用率 | <40% → 弹性收益大 |
+| SLA 要求 | 作业完成时间 | 宽松 → 先迁非关键 |
+
+```
+迁移核心原则：
+  ① 存储先统一（两边读同一份湖/HDFS 数据）
+  ② 增量全走 K8s（YARN 只减不增）
+  ③ 按 SLA 反向迁移（SLA 松的先迁，出问题影响最小）
+  ④ 典型周期 12~18 个月，提前公示下线日期
+```
+
+---
+
 ## 十九、与其他板块的关系
 
 - 数据采集见「[03-数据采集与同步](03-数据采集与同步.md)」；
