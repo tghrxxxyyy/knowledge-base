@@ -202,17 +202,17 @@ await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候�
 
 创建后尚未启动。
 
-[](#可运行-runnable)**可运行(Runnable)**
+**可运行(Runnable)**
 
 可能正在运行，也可能正在等待 CPU 时间片。
 
 包含了操作系统线程状态中的 Running 和 Ready。
 
-[](#阻塞-blocking)阻塞(Blocking)
+阻塞(Blocking)
 
 等待获取一个排它锁，如果其线程释放了锁就会结束此状态。
 
-[](#无限期等待-waiting)无限期等待(Waiting)
+无限期等待(Waiting)
 
 等待其它线程显式地唤醒，否则不会被分配 CPU 时间片。
 
@@ -222,7 +222,7 @@ await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候�
 | 没有设置 Timeout 参数的 Thread.join() 方法 | 被调用的线程执行完毕 |
 | LockSupport.park() 方法 | - |
 
-[](#限期等待-timed-waiting)限期等待(Timed Waiting)
+限期等待(Timed Waiting)
 
 无需等待其它线程显式地唤醒，在一定时间之后会被系统自动唤醒。
 
@@ -242,7 +242,7 @@ await()调用了tryAcquireShared(), 重写后逻辑为当state不为0的时候�
 | LockSupport.parkNanos() 方法 | - |
 | LockSupport.parkUntil() 方法 | - |
 
-[](#死亡-terminated)死亡(Terminated)
+死亡(Terminated)
 
 可以是线程结束任务之后自己结束，或者产生了异常而结束。
 
@@ -550,7 +550,7 @@ MESA模型中，T2唤醒T1之后，T2还是会接着执行，T1并不立即执�
 
 [https://zhuanlan.zhihu.com/p/302654066](https://zhuanlan.zhihu.com/p/302654066)
 
-[深入分析synchronized原理(阿里面试题) - 知乎.webarchive](attachments/WEBRESOURCE2e761aecff1bf52981d81eb2dabee63c深入分析Synchronized原理(阿里面试题) - 知乎.webarchive)
+[深入分析synchronized原理(阿里面试题) - 知乎.webarchive](<attachments/WEBRESOURCE2e761aecff1bf52981d81eb2dabee63c深入分析Synchronized原理(阿里面试题) - 知乎.webarchive>)
 
 ## LockSupport.park()详解
 
@@ -730,43 +730,43 @@ Java语言中，Thread-Per-Message毕竟还是一种高消耗的并发模式，�
 
 在一个线程内，在程序前面的操作先行发生于后面的操作。
 
-[](#_2-管程锁定规则)2. 管程锁定规则
+2. 管程锁定规则
 
 > Monitor Lock Rule
 
 一个 unlock 操作先行发生于后面对同一个锁的 lock 操作。
 
-[](#_3-volatile-变量规则)3. volatile 变量规则
+3. volatile 变量规则
 
 > Volatile Variable Rule
 
 对一个 volatile 变量的写操作先行发生于后面对这个变量的读操作。
 
-[](#_4-线程启动规则)4. 线程启动规则
+4. 线程启动规则
 
 > Thread Start Rule
 
 Thread 对象的 start() 方法调用先行发生于此线程的每一个动作。
 
-[](#_5-线程加入规则)5. 线程加入规则
+5. 线程加入规则
 
 > Thread Join Rule
 
 Thread 对象的结束先行发生于 join() 方法返回。
 
-[](#_6-线程中断规则)6. 线程中断规则
+6. 线程中断规则
 
 > Thread Interruption Rule
 
 对线程 interrupt() 方法的调用先行发生于被中断线程的代码检测到中断事件的发生，可以通过 interrupted() 方法检测到是否有中断发生。
 
-[](#_7-对象终结规则)7. 对象终结规则
+7. 对象终结规则
 
 > Finalizer Rule
 
 一个对象的初始化完成(构造函数执行结束)先行发生于它的 finalize() 方法的开始。
 
-[](#_8-传递性) 8. 传递性
+ 8. 传递性
 
 > Transitivity
 
@@ -778,7 +778,7 @@ Thread 对象的结束先行发生于 join() 方法返回。
 
 线程安全不是一个非真即假的命题，可以将共享数据按照安全程度的强弱顺序分成以下五类: 不可变、绝对线程安全、相对线程安全、线程兼容和线程对立。
 
-[](#_1-不可变) 1. 不可变
+ 1. 不可变
 
 不可变(Immutable)的对象一定是线程安全的，不需要再采取任何的线程安全保障措施。只要一个不可变的对象被正确地构建出来，永远也不会看到它在多个线程之中处于不一致的状态。
 
@@ -796,7 +796,7 @@ Thread 对象的结束先行发生于 join() 方法返回。
 
 对于集合类型，可以使用 Collections.unmodifiableXXX() 方法来获取一个不可变的集合
 
-[](#线程安全-不是一个非真即假的命题)2. 绝对线程安全
+2. 绝对线程安全
 
 不管运行时环境如何，调用者都不需要任何额外的同步措施。
 
@@ -812,7 +812,7 @@ Thread 对象的结束先行发生于 join() 方法返回。
 
 线程兼容是指对象本身并不是线程安全的，但是可以通过在调用端正确地使用同步手段来保证对象在并发环境中可以安全地使用，我们平常说一个类不是线程安全的，绝大多数时候指的是这一种情况。Java API 中大部分的类都是属于线程兼容的，如与前面的 Vector 和 HashTable 相对应的集合类 ArrayList 和 HashMap 等。
 
-[](#_5-线程对立)5. 线程对立
+5. 线程对立
 
 线程对立是指无论调用端是否采取了同步措施，都无法在多线程环境中并发使用的代码。由于 Java 语言天生就具备多线程特性，线程对立这种排斥多线程的代码是很少出现的，而且通常都是有害的，应当尽量避免。
 

@@ -413,6 +413,178 @@ CREATE TABLE td_sink (
 
 ---
 
+## 超级表（STable）设计模式深入
+
+```text
+建模决策树：
+① 设备类型不同、采集列不同？→ 按设备类型分多张 STABLE
+   （meters / cars / env_sensors 各自独立，tag 集不同）
+② 同类设备但有子型号差异列？→ 稀疏列容忍度内合并一张，
+   否则拆「主表 + 扩展属性宽表」
+③ 一台设备多传感器点位？→ 一点位一子表，点位编号进 tbname
+④ 需要跨类型统一查询？→ 用视图 UNION 或上层聚合表
+
+命名规范建议：
+  STABLE：{域}_{设备类型}      如 iot_meter
+  子表 ：t_{设备ID}           如 t_d1001
+  tag  ：{维度}_{语义}        如 tag_region
+```
+
+| 设计项 | 推荐值 | 原因 |
+|--------|--------|------|
+| 单库子表数 | ≤ 千万级 | 元数据内存开销可控 |
+| 单 STABLE 列数 | ≤ 200 | 列多影响元数据与压缩 |
+| tag 数量 | < 10~16 | 标签索引体积 |
+| 首列 | TIMESTAMP ts | 强制约定 |
+
+## TAG 机制与写入模型
+
+```text
+TAG 本质：
+  存储在超级表维度的「静态列」——每个子表只存一份 tag 值，
+  不随数据点重复存储（这是压缩比高的关键之一）
+
+写入路径：
+  INSERT INTO d1001 USING meters TAGS('北京',1) VALUES(...)
+  → 自动建表（若不存在）+ 校验 tag → 定位 vnode → 追加写数据块
+
+更新 tag：
+  ALTER TABLE d1001 SET TAG location='上海'
+  → 只改标签文件，不动数据块（零成本元数据操作）
+  → 但注意：按旧 tag 的缓存/物化结果需要刷新
+```
+
+```sql
+-- 写入模型三种姿势
+-- ① 自动建表写入（推荐，免预建）
+INSERT INTO t_d1003 USING meters TAGS ('广州', 3)
+VALUES ('2026-08-01 10:00:00', 11.0, 221, 0.30);
+
+-- ② 多子表批量写（一次网络往返）
+INSERT INTO t_d1001 VALUES ('2026-08-01 10:00:10', 10.4, 220, 0.31)
+             t_d1002 VALUES ('2026-08-01 10:00:10', 12.5, 222, 0.29);
+
+-- ③ schemaless 行协议（taosAdapter 兼容 InfluxDB/OpenTSDB/OPC）
+--    tags 由行协议中的字段自动映射
+```
+
+要点：高频变化量绝不能放 tag（tag 不参与压缩且变更走元数据）；tag 变更频繁说明建模错了——那应该是普通列。
+
+## TDengine 3.0 架构变化（存算分离）
+
+```text
+2.x：单体 vnode——计算与存储耦合在每个 dnode 内
+3.0：存算分离
+  taosd 拆分为：
+    计算层：查询协调 + 无状态计算（可弹性扩缩）
+    存储层：vnode 只管数据落盘，可挂对象存储
+  新增 taosKeeper（监控指标导出）+ taosAdapter 强化
+  支持云原生部署形态（TDengine Cloud / K8s Operator 弹性伸缩）
+```
+
+| 维度 | TDengine 2.x | TDengine 3.0 |
+|------|--------------|--------------|
+| 架构 | 存算耦合 vnode | **存算分离**（计算/存储独立扩展） |
+| 存储 | 本地盘为主 | 支持 S3/OSS 冷热分层 |
+| 弹性 | 加节点搬数据 | 计算秒级扩缩 |
+| 高可用 | mnode/vnode Raft | 保持，副本策略更灵活 |
+| 运维 | 手工脚本居多 | Explorer 可视化 + Keeper 监控 |
+
+升级注意：3.0 与 2.x 数据格式不兼容原地滚动，需通过 taosX/导出导入迁移；依赖 2.x 私有参数的运维脚本要重审。
+
+## SQL 聚合与窗口查询示例集
+
+```sql
+-- 时间窗口：INTERVAL + FILL 组合（降采样核心语法）
+SELECT _WSTART, _WEND, AVG(current), MAX(voltage)
+FROM meters WHERE tbname = 'd1001' AND ts >= NOW - 6h
+INTERVAL(5m) FILL(LINEAR);
+
+-- 状态窗口：状态持续期聚合（如充电状态期间电量消耗）
+SELECT _WSTART, _WEND, SUM(current) FROM meters
+WHERE tbname='d1001' STATE_WINDOW(status);
+
+-- 会话窗口：空闲超 10 分钟切窗（设备工作段分析）
+SELECT _WSTART, COUNT(*) FROM meters
+WHERE ts >= NOW - 1d SESSION(ts, 10m);
+
+-- 滑动窗口：滑动步长 < 窗口长度（重叠聚合平滑曲线）
+SELECT _WSTART, AVG(voltage) FROM meters
+WHERE ts >= NOW - 1h INTERVAL(10m) SLIDING(5m);
+
+-- 跨子表按 tag 分组 + TOPN
+SELECT tbname, AVG(current) AS avg_c FROM meters
+PARTITION BY group_id
+WHERE ts >= NOW - 10m
+INTERVAL(1m)
+ORDER BY avg_c DESC LIMIT 5;
+```
+
+性能提示：所有查询带 `tbname` 或 tag 过滤 + 时间下界，可命中时间线索引裁剪；无过滤的全 STABLE 扫描会退化为全分片扫描。
+
+## 数据订阅（TMQ）功能
+
+```mermaid
+flowchart LR
+    W[写入流量] --> DB[(TDengine)]
+    DB --> TOPIC{Topic 类型}
+    TOPIC -->|超级表| T1[整表变更流]
+    TOPIC -->|列| T2[指定列变更流]
+    TOPIC -->|SQL 查询| T3[持续查询结果流]
+    T1 & T2 & T3 --> CG[消费组\n组内负载均衡]
+    CG --> APP1[Flink 实时计算]
+    CG --> APP2[告警引擎]
+    CG --> APP3[下游同步]
+```
+
+| 能力 | 说明 | 类比 Kafka |
+|------|------|-----------|
+| Topic 三种 | 超级表 / 列 / SELECT 语句 | topic 定义更灵活 |
+| 消费组 | 组内分区均衡、组间广播 | consumer group |
+| offset 管理 | 服务端持久化，重启续读 | 同 |
+| at-least-once | 提交 offset 前重投 | 同 |
+
+```python
+# Python 订阅示例
+from taosws import Consumer
+
+consumer = Consumer({
+    "group.id": "alert-group",
+    "auto.offset.reset": "latest",
+})
+consumer.subscribe(["meters_topic"])
+while True:
+    msg = consumer.poll(timeout=1.0)
+    if msg:
+        process(msg.value())       # 写告警/同步链路
+        consumer.commit(msg)
+```
+
+价值定位：TMQ 把「写入即分发」内置到库里，简单实时管道可替代 Kafka 中转一跳；复杂流式拓扑（多源 join、大窗口）仍应交给 Flink。
+
+## 与 InfluxDB 写入吞吐对比分析
+
+| 维度 | TDengine | InfluxDB v1/v2 |
+|------|----------|----------------|
+| 单机写入 | 官方基准数百万 points/s | 数十万~百万 points/s |
+| 关键差异来源 | 一设备一线程顺序追加 + 列压 + tag 免重复存储 | TSM 通用 LSM，tag 每点冗余编码 |
+| 批量接口 | 多子表单语句批量 | line protocol batch |
+| 压缩后体积 | ~1/10 原始 | ~1/4~1/6 |
+
+```text
+吞吐推导示例（100 万设备 × 5 指标 × 5s 上报）：
+  总写入 = 1e6 × 5 ÷ 5 = 100 万 points/s
+  TDengine：32 vnode × ~30 万/s ≈ 960 万/s 余量充足
+  InfluxDB：需集群版分片，开源版单机通常吃紧
+
+选型补充视角：
+  吞吐只是维度之一——生态成熟度（InfluxDB Grafana/TICK 全家桶）、
+  Flux 语言、边缘部署（Telegraf 无缝）仍是 InfluxDB 强项；
+  国产化/超大规模设备接入场景 TDengine 优势明显。
+```
+
+---
+
 ## 11. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
 
 ### 11.1 性能基准（推导 / 公开数字）

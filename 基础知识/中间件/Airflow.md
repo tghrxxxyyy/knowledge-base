@@ -649,7 +649,7 @@ Airflow Secrets Backend：
 - 任务调度对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；
 - XXL-JOB 见「[任务调度 XXL-JOB](./任务调度XXL-JOB.md)」；
 - 大数据全链路见「[大数据/README](../大数据/README.md)」；
-- Kubernetes 部署见「[云原生/容器编排](../../云原生/容器编排与DevOps.md)」。
+- Kubernetes 部署见「[Kubernetes 核心](../../云原生/Kubernetes核心.md)」。
 
 ---
 

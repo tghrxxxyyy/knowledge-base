@@ -603,13 +603,13 @@ StarRocks Shared-Data = 存算分离架构
 - 数仓分层见「[大数据/09-数据仓库与OLAP引擎](../大数据/09-数据仓库与OLAP引擎.md)」；
 - 云上对应见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
 - Flink 实时导入见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；
-- 对比 Hive 见「[大数据/Hive](../大数据/Hive.md)」；
+- 对比 Hive 见「[Hive 与数仓体系](../大数据/02-技术体系与架构演进.md)」；
 - 对比 ClickHouse 见「[ClickHouse](./ClickHouse.md)」；
 - 实时数仓见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
 - 数据湖格式见「[Iceberg/Delta/Hudi](./云上数仓与大数据生态.md)」；
 - Kafka 实时导入见「[Kafka](./Kafka.md)」；
 - ETL 调度见「[DolphinScheduler](./DolphinScheduler.md)」；
-- 对比 Hive 见「[大数据/Hive](../大数据/Hive.md)」；
+- 对比 Hive 见「[Hive 与数仓体系](../大数据/02-技术体系与架构演进.md)」；
 - 向量化执行原理见「[ClickHouse](./ClickHouse.md)」。
 
 ---

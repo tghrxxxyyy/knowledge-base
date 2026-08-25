@@ -439,7 +439,7 @@ GDS = Graph Data Science 库（图算法）
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。
 - 与 [MySQL](../mysql知识.md)：二者互补——事务在 MySQL，关系网络在 Neo4j，CDC 同步。
-- 与 [大模型/知识图谱](大模型/)：Neo4j 是经典知识图谱存储底座，配合 LLM 做 RAG 中的「实体-关系」检索。
+- 与 [大模型/知识图谱](../../大模型/README.md)：Neo4j 是经典知识图谱存储底座，配合 LLM 做 RAG 中的「实体-关系」检索。
 
 ---
 
@@ -633,9 +633,9 @@ public class PersonService {
 - 与 [Neo4j 与 RDF/知识图谱关系](#)：Neo4j 是属性图模型，适合落地知识图谱存储与查询；RDF 是另一套语义网标准，二者模型不同。
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。
 - 与 [MySQL](../mysql知识.md)：二者互补——事务在 MySQL，关系网络在 Neo4j，CDC 同步。
-- 与 [大模型/知识图谱](大模型/)：Neo4j 是经典知识图谱存储底座，配合 LLM 做 RAG 中的「实体-关系」检索。
+- 与 [大模型/知识图谱](../../大模型/README.md)：Neo4j 是经典知识图谱存储底座，配合 LLM 做 RAG 中的「实体-关系」检索。
 - 与 [Kafka](Kafka.md)：CDC 同步（MySQL→Neo4j）可通过 Kafka 解耦。
-- 与 [Redis](Redis.md)：热门关系可缓存在 Redis，减少图库遍历压力。
+- 与 [Redis](Redis深度篇.md)：热门关系可缓存在 Redis，减少图库遍历压力。
 
 ---
 

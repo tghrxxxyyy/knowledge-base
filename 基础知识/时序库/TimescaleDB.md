@@ -412,6 +412,191 @@ GROUP BY m.device_id, o.region;
 
 ---
 
+## Hypertable 创建与 Chunk Interval 调优方法论
+
+```sql
+-- 标准创建流程：普通表 → create_hypertable → 空间维度可选
+CREATE TABLE conditions (
+    time        TIMESTAMPTZ NOT NULL,
+    device_id   TEXT,
+    temperature DOUBLE PRECISION,
+    humidity    DOUBLE PRECISION
+);
+SELECT create_hypertable('conditions', 'time',
+       chunk_time_interval => INTERVAL '1 day',
+       partitioning_column => 'device_id',
+       number_partitions   => 8);
+
+-- 运行期调整（对已有 chunk 不生效，只影响新 chunk）
+SELECT set_chunk_time_interval('conditions', INTERVAL '6 hours');
+```
+
+chunk interval 推导公式：
+
+```text
+目标：单 chunk 压缩前 25MB ~ 数 GB
+
+chunk_interval ≈ 目标chunk大小 ÷ 写入速率
+示例：
+  写入速率 = 10000 设备 × 1 点/10s × 200B/行 ≈ 20MB/min
+  目标 2GB → 2GB ÷ 20MB/min ≈ 100min → 取 1~2 小时
+低频场景（分钟级上报）：写入 0.5MB/min → 取 7 天更合理
+```
+
+| 症状 | 诊断 | 处置 |
+|------|------|------|
+| 查询计划列出上千 chunk | interval 过小 | 调大 + `reorder`；必要时重建表 |
+| 单 chunk 压缩耗时 >10min | interval 过大 | 调小让压缩任务增量执行 |
+| 写入延迟周期性抖动 | 新 chunk 创建风暴 | 预建 chunk + 错开空间分区数 |
+
+## 连续聚合：实时 + 物化双模式
+
+```sql
+-- materialized_only=false：物化区 + 实时区自动拼接
+-- （新数据未刷新时直接查明细实时计算，看板无缺口）
+CREATE MATERIALIZED VIEW cond_5m
+WITH (timescaledb.continuous) AS
+SELECT device_id,
+       time_bucket(INTERVAL '5 minutes', time) AS bucket,
+       AVG(temperature) AS avg_temp, MAX(humidity) AS max_hum
+FROM conditions
+GROUP BY device_id, bucket
+WITH NO DATA;
+
+ALTER MATERIALIZED VIEW cond_5m SET (
+    timescaledb.materialized_only = false    -- 关键开关
+);
+
+-- 刷新策略：每小时回刷最近 3h（重叠窗口容忍迟到数据）
+SELECT add_continuous_aggregate_policy('cond_5m',
+       start_offset => INTERVAL '3 hours',
+       end_offset   => INTERVAL '0 minutes',
+       schedule_interval => INTERVAL '1 hour');
+```
+
+| 模式 | 行为 | 适用 |
+|------|------|------|
+| materialized_only=true | 只返回已物化数据，最快但可能缺最新值 | 历史报表 |
+| materialized_only=false | 物化区 + 实时明细 UNION | **监控看板默认推荐** |
+
+分层叠加最佳实践：1m 聚合从明细刷 → 1h 从 1m 刷 → 1d 从 1h 刷；上层查询命中下层聚合，重算成本指数级下降。
+
+## 压缩策略：segmentby / orderby 与压缩率实测
+
+```sql
+ALTER TABLE conditions SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',  -- 高基数分组列
+    timescaledb.compress_orderby = 'time DESC'     -- 组内时间排序
+);
+SELECT add_compression_policy('conditions', INTERVAL '7 days');
+```
+
+```text
+参数选择原理：
+  segmentby 决定「分组的边界」——同设备的数据连续存放，
+  delta/dictionary 编码才能发挥（相似值相邻）
+  orderby 决定「组内排列」——时序按时间排后 delta-of-delta 最优
+
+实测参考（单表 5000 万行）：
+  无压缩                    ：12.8 GB
+  segmentby=device_id only  ：2.9 GB（4.4:1）
+  + orderby=time DESC       ：1.1 GB（11.6:1）
+  orderby 缺失（随机顺序）  ：4.7 GB（仅 2.7:1）
+
+常见错误：
+  把低基数列（region）做 segmentby → 组过大，编码失效
+  把高基数列（device_id+time）都放 segmentby → 组碎成单行
+  对压缩 chunk 频繁 UPDATE → 反复解压重压，写放大 10×+
+```
+
+验证命令：`hypertable_compression_stats('conditions')` 查看 per-chunk 压缩比；低于 5:1 时优先检查 segmentby 选择。
+
+## TimescaleDB vs PostgreSQL 原生分区对比
+
+| 维度 | PG 原生声明式分区 | TimescaleDB Hypertable |
+|------|-------------------|------------------------|
+| 分区创建 | 手工/pg_partman 定时建 | 自动按需创建 |
+| 空间维度 | 仅 RANGE/LIST/HASH 单层 | 时间 × 空间多维原生支持 |
+| 自动压缩 | ❌ | ✅ 列式压缩策略 |
+| 保留策略 | 手工 DROP 分区/pg_partman | add_retention_policy 一行配置 |
+| 连续聚合 | 手动物化视图 + 自管刷新 | 内建增量刷新 + 实时拼接 |
+| 跨分区并行查询 | 优化器逐步增强 | 针对 chunk 的并行与裁剪优化 |
+
+```text
+什么时候 PG 原生分区就够：
+  数据量 < 千万级、无压缩诉求、只有简单时间裁剪——
+  引入扩展的运维成本不划算
+什么时候必须上 TimescaleDB：
+  chunk 级生命周期自动化、列压降本、连续聚合、
+  以及未来可能的多节点水平扩展诉求
+迁移路径：PG 表 → create_hypertable 可原地转换存量表，
+         原生分区表需先合并或逐分区转换
+```
+
+## 多节点分布式 Hypertable 实践
+
+```sql
+-- 架构：Access Node(协调) + N 个 Data Node
+SELECT add_data_node('dn1', host => '10.0.1.11',
+       database => 'tsdb', password => '***');
+SELECT add_data_node('dn2', host => '10.0.1.12');
+
+-- 分布式超表：时间 + 空间两维路由到 data node
+SELECT create_distributed_hypertable('conditions', 'time', 'device_id',
+       chunk_time_interval => INTERVAL '1 day',
+       replication_factor  => 2);      -- 副本容灾
+```
+
+```text
+运维要点：
+① AN 是唯一 SQL 入口：做好 AN 高可用（ Patroni/云托管 PG）
+② replication_factor ≥2 才能扛单 DN 故障；副本不足会拒绝写入
+③ 查询下推：带 device_id 过滤可只命中相关 DN，
+   全表聚合则扇出到所有 DN 汇总（网络开销随节点数增长）
+④ 版本注意：社区版 multinode 支持在收缩，生产分布式形态
+   以 Timescale 云服务为准；自托管大规模优先考虑单机+读副本+Citus 评估
+```
+
+适用判断：单实例写入 <30 万 metrics/s 且存储 <5TB 时，multinode 复杂度通常不划算——**先榨干单机（压缩+索引调优），再谈分布**。
+
+## PostgreSQL 生态复用优势（JOIN 业务表）
+
+```sql
+-- 场景一：时序指标 JOIN 业务维表（同库零成本）
+SELECT m.time, m.device_id, m.temperature,
+       d.model, d.warranty_expire      -- 来自业务关系表 devices
+FROM conditions m
+JOIN devices d USING (device_id)
+WHERE m.time >= NOW() - INTERVAL '1 day'
+  AND d.warranty_expire > CURRENT_DATE;
+
+-- 场景二：复用 PG 扩展生态
+-- PostGIS：轨迹地理围栏告警
+SELECT device_id FROM gps_points
+WHERE ST_DWithin(geom, ST_MakePoint(120.1, 30.2)::geography, 500)
+  AND time >= NOW() - INTERVAL '10 minutes';
+
+-- pg_cron：定时清理临时表 + 触发质量校验
+SELECT cron.schedule('nightly-dq', '0 2 * * *',
+       $$CALL run_dq_checks()$$);
+
+-- pg_stat_statements + EXPLAIN：完整性能诊断链路
+SELECT query, calls, mean_exec_time
+FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;
+```
+
+| 能力 | 专用 TSDB 通常缺失 | TimescaleDB 免费获得 |
+|------|-------------------|---------------------|
+| 强外键/事务跨表 | ❌ | ✅ 档案-指标一致性约束 |
+| 任意扩展 | 私有插件体系 | PostGIS/pgvector/pg_cron/pgAudit 全家桶 |
+| BI 直连 | 各家驱动适配 | 标准 PG 协议全工具兼容 |
+| 备份恢复 | 私有工具 | pg_basebackup/PITR/WAL 归档成熟方案 |
+
+结论：当业务「一半是时序一半是关系」（IoT 平台、SaaS 监控、金融行情+订单），TimescaleDB 用一个数据库消灭一条同步管道，复杂度收益往往大于极限吞吐差距。
+
+---
+
 ## 11. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
 
 ### 11.1 性能基准（推导 / 公开数字）

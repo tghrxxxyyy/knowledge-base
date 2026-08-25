@@ -1206,8 +1206,8 @@ asyncStub.getUser(request, new StreamObserver<User>() {
 - Envoy（gRPC 原生代理/网关转换）见「[Envoy 服务代理](./Envoy服务代理.md)」；
 - 网络协议（HTTP/2/HTTP/3）见「[网络协议深挖](../网络协议深挖.md)」；
 - 云原生通信见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
-- 对比 Thrift 见「[Apache Thrift](./ApacheThrift.md)」；
-- 服务网格见「[Istio 服务网格](../../云原生/Istio服务网格.md)」。
+- 对比 Thrift 见「Apache Thrift」；
+- 服务网格见「[Istio 服务网格（Service Mesh）](../../云原生/ServiceMesh.md)」。
 
 ---
 

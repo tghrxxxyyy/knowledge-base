@@ -409,6 +409,160 @@ GROUP BY device_id, TUMBLE(ts, INTERVAL '1' MINUTE);
 
 ---
 
+## 多模引擎架构深入（宽表 / 时序 / 搜索 / 文件）
+
+```mermaid
+flowchart TB
+    subgraph 接入层
+    API1[宽表: HBase/宽表SQL]
+    API2[时序: TSDB SQL/OpenTSDB/Influx协议]
+    API3[搜索: Solr/OpenSearch兼容]
+    API4[文件: S3/HDFS语义]
+    end
+    subgraph 引擎层
+    E1[宽表引擎\nLSM KV]
+    E2[时序引擎\n列式编码+时间线索引]
+    E3[搜索引擎\n倒排索引]
+    E4[文件引擎\n对象语义]
+    end
+    subgraph 存储底座
+    LDFS[LindormDFS 分布式文件系统\nESSD热层 + OSS冷层]
+    end
+    API1 --> E1
+    API2 --> E2
+    API3 --> E3
+    API4 --> E4
+    E1 & E2 & E3 & E4 --> LDFS
+    MGMT[统一管控:\n多租户/弹性伸缩/备份] -.-> 接入层
+```
+
+| 引擎 | 底层形态 | 互通方式 |
+|------|---------|---------|
+| 宽表 | 类 HBase LSM，RowKey 分片 | 时序数据本质存为宽表 KV；可直接读时序底层明细 |
+| 时序 | 时间线编码 + 列式块 | 聚合结果可写回宽表供在线查询 |
+| 搜索 | 倒排（类 Lucene） | 时序 tag/field 可建二级检索索引 |
+| 文件 | 对象语义 | 统一权限与生命周期策略 |
+
+多模价值：**一份数据免拷贝地获得「KV 点查 + 时间聚合 + 全文检索」三种访问路径**——例如车联网场景中轨迹明细走时序聚合、车辆档案走宽表、故障描述文本走搜索，全部在一个实例内完成。
+
+## TTL 与降采样策略
+
+```sql
+-- 表级 TTL：过期数据自动清理（含冷层归档期控制）
+ALTER TABLE device_metric SET OPTIONS (ttl = '1095d');
+
+-- 降采样两级方案：
+-- ① 查询期降采样：time_bucket/GROUP BY 窗口聚合（不落盘）
+SELECT time_bucket('1 minute', ts) AS bucket,
+       AVG(field_cpu) AS avg_cpu
+FROM device_metric WHERE ts >= NOW() - INTERVAL '1' HOUR
+GROUP BY bucket;
+
+-- ② 物化降采样：Flink 定时窗口聚合写入独立降采样表（落盘）
+INSERT INTO device_metric_1m
+SELECT tag_host, AVG(field_cpu), MAX(field_cpu), TUMBLE_END(ts, INTERVAL '1' MINUTE)
+FROM device_metric WHERE ts >= NOW() - INTERVAL '2' MINUTE
+GROUP BY tag_host, TUMBLE(ts, INTERVAL '1' MINUTE);
+```
+
+| 层级 | 保留策略 | 典型用途 |
+|------|---------|---------|
+| 明细（热 ESSD） | 30~90 天 | 故障回溯、精确点查 |
+| 明细（冷 OSS） | 90 天~1 年 | 低频审计查询 |
+| 1 分钟聚合表 | 1~2 年 | 运营趋势分析 |
+| 1 小时聚合表 | 3~5 年 | 年度容量规划 |
+
+组合公式：**「长周期只查聚合、短周期才查明细」**——配合 TTL 让 95% 的存储成本落在最便宜的 OSS 冷层与高压缩聚合表上。
+
+## 与 HBase 的兼容性及迁移
+
+```text
+兼容范围：
+✅ 原生 HBase Java/REST API（Put/Get/Scan）
+✅ Phoenix 部分语法（二级索引/SQL 查询）
+⚠️ 协处理器（Coprocessor）、自定义 Filter 需评估改写
+❌ 自研 RPC 定制、Region 手工迁移等运维级操作不开放
+
+迁移路径：
+① 结构评估：RowKey 设计/热点风险/大宽表列族规划复核
+② 双写：生产端同时写 HBase 与 Lindorm（或用 BDS 同步链路）
+③ 全量搬迁：BDS 数据同步服务做历史数据批量复制+增量追平
+④ 校验切读：抽样比对 + 灰度应用切流 → 旧集群下线
+```
+
+| 对比项 | 自建 HBase | Lindorm 宽表 |
+|--------|-----------|--------------|
+| 运维 | 自担（HMaster/RSGC/ZK） | 全托管，自动 split/balance |
+| 扩容 | 手工加节点搬 Region | 在线弹性，秒级生效 |
+| 冷热分层 | 需自建归档管道 | 原生 OSS 沉降 |
+| 计费 | 硬件 CAPEX | 按量 OPEX |
+
+迁移收益典型值：运维人力省 1~2 FTE；利用冷热分层后存储成本降 50% 以上。最大风险点是 RowKey 热点设计缺陷被「原样搬运」——迁移前务必重审。
+
+## 冷热分离存储策略（配置模板）
+
+```yaml
+# 实例级：开启冷存储
+cold_storage:
+  enabled: true
+  medium: OSS
+
+# 表级策略示例（三类典型业务）
+policies:
+  iot_raw:                 # IoT 原始点位：热窗口短
+    hot_ttl: 30d
+    cold_ttl: 365d
+    archive_ttl: 0         # 不归档直接过期
+  apm_metrics:             # 监控指标：中等窗口
+    hot_ttl: 90d
+    cold_ttl: 730d
+  vehicle_track:           # 车联网轨迹：合规要求长保留
+    hot_ttl: 60d
+    cold_ttl: 1825d        # 5 年合规留存
+```
+
+```text
+配置原则：
+① 热 TTL = 真实高频查询窗口（看 Grafana 查询时间分布定），拍脑袋设长=白烧钱
+② 冷区间禁高频明细扫描：OSS 读延迟高且计费，一律引导到聚合表
+③ 监控「冷数据占比」：健康值通常 >60%；占比过低说明 TTL 过长
+④ 归档到期自动清理，满足个保法「最小必要」留存义务
+```
+
+## 阿里云内典型应用场景
+
+| 场景 | 数据特征 | Lindorm 组合用法 |
+|------|---------|-----------------|
+| IoT 平台 | 千万设备 × 秒级上报 | 时序引擎承接写入 + 规则引擎联动函数计算告警 |
+| 云监控/APM | 高基数主机指标 | 兼容 Prometheus 远程读写，替代 Thanos 长存储 |
+| 车联网 | 轨迹+车况双流 | 时序存轨迹、宽表存车辆档案、搜索查故障工单 |
+| 风控画像 | 特征点查为主 | 宽表引擎毫秒级特征读取，对接实时决策引擎 |
+| 数字孪生/工业 | PLC 点位 + 文档 | 时序 + 文件引擎混合，一个实例覆盖 |
+
+```mermaid
+flowchart LR
+    DEV[百万设备] --> GW[接入网关/MQTT]
+    GW --> LIN[Lindorm 实例]
+    LIN -->|时序引擎| AGG[Flink 聚合/规则]
+    AGG --> ALERT[告警通知]
+    LIN -->|搜索| APP[运维 App]
+    LIN -->|宽表| BIZ[业务系统档案]
+    GRA[Grafana/Prometheus] --> LIN
+```
+
+选型提示：已在阿里云生态（VPC/RAM/OSS/DataWorks/Flink 实时计算）内的团队，Lindorm 的集成成本最低；多云或重度依赖开源生态（Prometheus 全家桶、HBase 上层工具）的场景要评估锁定风险。
+
+容量速算模板：
+
+```text
+实例规格估算：
+  写入 = 设备数 × 指标数 ÷ 上报间隔 → 决定计算节点数（预留 50% 峰值余量）
+  存储 = 日增原始量 × 压缩比(取 1/10) × (热TTL + 冷TTL) → 决定冷热配比
+  查询 = 并发看板数 × 单查询扫描量 → 决定是否需要聚合表与资源组隔离
+```
+
+---
+
 ## 10. 第三轮深度实战（基准 / 迁移 / 告警 / 流计算 / 成本 / 排障 SOP）
 
 ### 10.1 性能基准（推导 / 公开数字）

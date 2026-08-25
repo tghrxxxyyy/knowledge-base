@@ -609,10 +609,10 @@ NTP 校正风险：
 
 ## 十五、与其他板块的关系
 
-- 分库分表见「[分库分表 ShardingSphere](../基础知识/中间件/分库分表ShardingSphere.md)」；
-- Redis INCR 见「[Redis 深度篇](../基础知识/中间件/Redis深度篇.md)」；
-- 花名册见「[ZooKeeper](../基础知识/中间件/ZooKeeper.md)」「[etcd](../基础知识/中间件/etcd.md)」；
-- 消息 ID 见「[Kafka](../基础知识/中间件/Kafka.md)」「[RocketMQ](../基础知识/中间件/RocketMQ.md)」。
+- 分库分表见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
+- Redis INCR 见「[Redis 深度篇](./Redis深度篇.md)」；
+- 花名册见「[ZooKeeper](./ZooKeeper.md)」「[etcd](./etcd.md)」；
+- 消息 ID 见「[Kafka](./Kafka.md)」「[RocketMQ](./RocketMQ.md)」。
 
 > 一句话：**分布式 ID = 唯一 + 趋势有序 + 本地生成高性能——选型先看「顺序要求（趋势有序→雪花，严格递增→号段）」，再防「雪花三大坑（机器位冲突/时钟回拨/前端精度）」，最后配「降级方案（DB 号段/UUID 兜底）」**。
 
@@ -674,11 +674,11 @@ let id = "1234567890123456789"; // 字符串接收
 
 ## 十、与其他板块的关系（扩展）
 
-- 分库分表见「[分库分表 ShardingSphere](../基础知识/中间件/分库分表ShardingSphere.md)」；
-- Redis INCR 见「[Redis 深度篇](../基础知识/中间件/Redis深度篇.md)」；
-- 花名册见「[ZooKeeper](../基础知识/中间件/ZooKeeper.md)」「[etcd](../基础知识/中间件/etcd.md)」；
-- 消息 ID 见「[Kafka](../基础知识/中间件/Kafka.md)」「[RocketMQ](../基础知识/中间件/RocketMQ.md)」；
-- 号段模式见「[Leaf 源码](../../源码系列/Leaf源码.md)」；
+- 分库分表见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
+- Redis INCR 见「[Redis 深度篇](./Redis深度篇.md)」；
+- 花名册见「[ZooKeeper](./ZooKeeper.md)」「[etcd](./etcd.md)」；
+- 消息 ID 见「[Kafka](./Kafka.md)」「[RocketMQ](./RocketMQ.md)」；
+- 号段模式见「Leaf 源码」；
 - 雪花算法见「[分布式系统](../分布式系统.md)」。
 
 ---

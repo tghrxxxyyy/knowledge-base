@@ -531,6 +531,182 @@ YARN 队列配额管理：
 - [ ] 质量不过关阻断下游（与治理联动）。
 - [ ] 监控队列资源、Pending、作业失败率、调度延迟。
 
+---
+
+## YARN Capacity Scheduler 生产级队列配置实例
+
+```xml
+<configuration>
+  <!-- 三级队列：root 下按业务域，核心域再分实时/批 -->
+  <property><name>yarn.scheduler.capacity.root.queues</name>
+    <value>core,bigdata,sandbox</value></property>
+
+  <property><name>yarn.scheduler.capacity.root.core.capacity</name>
+    <value>60</value></property>                       <!-- 核心保底 60% -->
+  <property><name>yarn.scheduler.capacity.root.core.maximum-capacity</name>
+    <value>100</value></property>                      <!-- 可借满整个集群 -->
+  <property><name>yarn.scheduler.capacity.root.core.queues</name>
+    <value>realtime,batch</value></property>
+  <property><name>yarn.scheduler.capacity.root.core.realtime.capacity</name>
+    <value>40</value></property>
+  <property><name>yarn.scheduler.capacity.root.core.realtime.maximum-capacity</name>
+    <value>80</value></property>
+  <property><name>yarn.scheduler.capacity.root.core.batch.capacity</name>
+    <value>60</value></property>
+
+  <!-- 沙箱队列：限制单用户防误提交打爆集群 -->
+  <property><name>yarn.scheduler.capacity.root.sandbox.capacity</name>
+    <value>5</value></property>
+  <property><name>yarn.scheduler.capacity.root.sandbox.maximum-applications</name>
+    <value>200</value></property>
+  <property><name>yarn.scheduler.capacity.root.sandbox.acl_submit_applications</name>
+    <value>user1,user2 group_dev</value></property>
+
+  <!-- 全局：AM 资源占比上限，防 AM 风暴 -->
+  <property><name>yarn.scheduler.capacity.maximum-am-resource-percent</name>
+    <value>0.2</value></property>
+  <!-- 用户级资源上限因子 -->
+  <property><name>yarn.scheduler.capacity.root.bigdata.user-limit-factor</name>
+    <value>2</value></property>
+</configuration>
+```
+
+配置要点：`capacity` 是保底（空闲可被借走），`maximum-capacity` 是弹性上限；`maximum-am-resource-percent` 默认 0.1，Spark Streaming 多作业场景建议调到 0.2~0.3；改完 `yarn rmadmin -refreshQueues` 热生效。
+
+## YARN Node Label 分区隔离
+
+```text
+场景：把部分节点划为「内存密集型专用区」或「异构 GPU 区」，
+     普通作业进不来，专属作业独享。
+
+步骤：
+① RM 开启标签并给节点打标
+   yarn.node-labels.enabled=true
+   yarn rmadmin -addToClusterNodeLabels "mem_high,exclusive=false"
+   yarn rmadmin -replaceLabelsOnNode "node5.mem_high,node6.mem_high"
+
+② 队列绑定标签 + 配额（按分区独立计算容量）
+   root.core.realtime.accessible-node-labels=mem_high
+   root.core.realtime.accessible-node-labels.mem_high.capacity=50
+
+③ 提交时指定
+   spark-submit --conf yarn.nodeLabelExpression=mem_high ...
+```
+
+| 模式 | 行为 | 适用 |
+|------|------|------|
+| exclusive=true | 打标的节点只跑该标签作业 | 硬隔离（SLA 核心链路） |
+| exclusive=false | 无标签作业空闲时可借用 | 软隔离（提利用率） |
+
+注意：标签分区会降低全局打包率（碎片化），一般划分不超过 2~3 个分区；K8s 的 taint/toleration + nodeSelector 是同构能力的云原生表达。
+
+## K8s 上跑 Spark 的资源模型（Executor Pod Request）
+
+```bash
+spark-submit \
+  --master k8s://https://apiserver:6443 \
+  --deploy-mode cluster \
+  --num-executors 10 \
+  --executor-cores 2 \
+  --executor-memory 8g \
+  --conf spark.kubernetes.executor.request.cores=2 \
+  --conf spark.kubernetes.executor.limit.cores=3 \
+  --conf spark.executor.memoryOverhead=2g \
+  --conf spark.kubernetes.driver.podTemplateFile=/path/driver.yaml \
+  --conf spark.kubernetes.executor.podTemplateFile=/path/exec.yaml
+```
+
+| 参数 | 对应 K8s 概念 | 建议 |
+|------|--------------|------|
+| executor-cores / request.cores | requests.cpu | 调度依据，按真实均值设 |
+| limit.cores | limits.cpu | 可放宽 1.5 倍吃突发配额 |
+| executor-memory + memoryOverhead | requests.memory = 两者之和 | overhead 缺省 0.1×，JVM/堆外多的任务调大 |
+| dynamicAllocation.shuffleTracking | HPA 式动态扩缩 Executor | 替代 external shuffle service |
+
+Pod 模板可注入 nodeSelector/亲和性（如调度到本地盘节点）、priorityClassName（高优作业抢占低优）、taints 容忍等——这是 YARN 时代做不到的细粒度控制。QoS 选择：SLA 敏感作业 Guaranteed（request=limit），普通批 Burstable。
+
+## Volcano 批调度器与 Gang Scheduling
+
+```yaml
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Job
+metadata:
+  name: spark-pi-gang
+spec:
+  schedulerName: volcano
+  minAvailable: 4            # 4 个 Pod 都到位才统一放行
+  queue: batch-queue
+  tasks:
+    - replicas: 4
+      name: executor
+      template:
+        spec:
+          containers:
+          - image: spark:3.5
+            resources:
+              requests: { cpu: "2", memory: "8Gi" }
+```
+
+```text
+为什么大数据作业需要 Gang Scheduling：
+  kube-scheduler 逐 Pod 调度 → 分布式作业「部分启动」：
+  一半 Executor 起来了等另一半 → 已占资源空转 → 死锁式饿死
+
+Volcano 解法：
+  minAvailable 原子性放行（要么全起要么全等）；
+  Queue 层支持 quota/proportion/priority；
+  配合 elastic 语义允许降级运行（minAvailable < replicas）
+```
+
+| 方案 | 定位 | 备注 |
+|------|------|------|
+| Volcano | CNCF 批调度器，生态最广 | Spark/Flink/Ray/Kubeflow 主流选择 |
+| Yunikorn | Apache 项目，多租户队列强 | 类 YARN Capacity 的 K8s 表达 |
+| Kueue | K8s 官方孵化，轻量 | 只管排队与配额，不管 gang 细节 |
+
+## YARN → K8s 迁移评估与共存策略
+
+| 评估维度 | 判断问题 | 迁移信号 |
+|----------|---------|---------|
+| 作业形态 | 存量 MR/Hive 占比？ | >50% 且无改造计划 → 暂缓 |
+| 弹性需求 | 日内负载波动大？ | 波动 >3 倍 → 收益明显 |
+| 团队技能 | 有无 K8s SRE？ | 无则先建平台组 |
+| 状态依赖 | 作业是否重度依赖本地盘？ | 是则先改对象存储 |
+
+```mermaid
+flowchart LR
+    subgraph 共存期架构
+    A[新作业] --> K[K8s 集群\nVolcano+湖表]
+    B[存量 Hive/MR] --> Y[YARN 保留\n只减不增]
+    K --> O[(共享对象存储)]
+    Y --> HMS[HMS 兼容层]
+    K --> HMS
+    end
+```
+
+共存策略三原则：**存储先统一**（两边读同一份湖/HDFS 数据）；**增量全走 K8s**（YARN 只减不增自然萎缩）；**按 SLA 反向迁移**（SLA 松的老作业最后迁，出问题影响最小）。典型周期 12~18 个月，硬性下线日期提前公示。
+
+## GPU 资源调度差异
+
+| 维度 | CPU 作业 | GPU 作业 |
+|------|---------|---------|
+| 资源单位 | vcore/MB 连续可分 | 以整卡为粒度（MIG 可切分） |
+| 调度器 | YARN/K8s 默认即可 | 需 device plugin + 批调度器 |
+| 抢占代价 | 低（进程可挂起重调） | 高（显存迁移困难） |
+| 共享策略 | 天然时分复用 | MPS/MIG/时间片，需显式配置 |
+
+```yaml
+# K8s GPU 请求示例（nvidia device plugin）
+resources:
+  limits:
+    nvidia.com/gpu: 1        # 整卡分配
+# Volcano 场景：训练作业配 minAvailable 实现 N 卡齐活
+```
+
+实践要点：GPU 队列必须开 gang scheduling（分布式训练缺一卡即浪费）；推理服务可用 MIG 把 A100 切成 7 份提升利用率；训练任务记录 GPU 利用率指标（DCGM），长期 <30% 的任务回收整卡改共享模式；YARN 侧的 GPU 支持相对薄弱（resource-types 配置 + isolation 复杂），是迁 K8s 的最强驱动力之一。
+
+---
+
 ## 十九、与其他板块的关系
 
 - 数据采集见「[03-数据采集与同步](03-数据采集与同步.md)」；

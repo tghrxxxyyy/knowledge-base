@@ -502,6 +502,167 @@ WHERE b.user_id IS NULL;  -- 孤儿记录
 | 物化视图 | 自动刷新预计算 |
 | 跨域分析 | 多区域数据统一查询 |
 
+---
+
+## 维度建模完整案例：订单域总线矩阵
+
+```text
+Step1 拆业务过程（可加度量的事件）：下单 / 支付 / 发货 / 退款
+Step2 声明粒度：每个事实表「一行」代表什么
+Step3 定维度：谁/什么/何时/何地/何种渠道
+Step4 确定度量：金额/数量/时长等可加值
+```
+
+**总线矩阵（业务过程 × 维度）**：
+
+| 业务过程 \ 维度 | 时间 | 用户 | 商品 | 商家 | 渠道 | 地址 |
+|----------------|:----:|:----:|:----:|:----:|:----:|:----:|
+| 下单事实 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 支付事实 | ✅ | ✅ | — | ✅ | ✅ | — |
+| 履约事实 | ✅ | ✅ | ✅ | ✅ | — | ✅ |
+| 退款事实 | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+
+矩阵读法：一行 = 一张事实表；一列 = 一个一致性维度；✅ 表示该事实表挂此维度。**打勾的维度必须在全域保持同一套口径与代理键**——这就是总线架构「一致性维度」的含义。
+
+```sql
+-- 下单事实表（事务粒度：一行=一个订单明细行）
+CREATE TABLE dwd_trade_order_detail (
+    order_id      BIGINT COMMENT '订单号',
+    order_item_id BIGINT COMMENT '订单明细行号',
+    user_key      BIGINT COMMENT '用户一致性代理键',
+    sku_key       BIGINT COMMENT '商品一致性代理键',
+    channel_key   INT,
+    dt            STRING,
+    order_amount  DECIMAL(18,2) COMMENT '可加度量',
+    qty           INT COMMENT '可加度量',
+    order_ts      TIMESTAMP COMMENT '半可加'
+) PARTITIONED BY (dt_date STRING);
+```
+
+## 事实表类型对比（事务 / 周期快照 / 累积快照 / 无事实）
+
+| 类型 | 粒度定义 | 示例 | 特点 |
+|------|---------|------|------|
+| 事务事实表 | 一行=一个业务事件瞬间发生 | 支付流水 | 最细粒度，量大，支持任意下钻 |
+| 周期快照 | 一行=一个确定时间段的汇总状态 | 每日账户余额快照 | 量稳定，查趋势快 |
+| 累积快照 | 一行=一个流程实例全生命周期 | 订单从下单到签收里程碑 | 可更新（拉链处理） |
+| 无事实事实表 | 只有外键没有度量 | 学生选课/广告曝光 | 「事件发生过」即事实 |
+
+```sql
+-- 累积快照示例：订单履约里程碑
+CREATE TABLE dwd_trade_order_milestone (
+    order_id BIGINT,
+    create_time TIMESTAMP, pay_time TIMESTAMP,
+    ship_time   TIMESTAMP, finish_time TIMESTAMP,
+    status STRING COMMENT '进行中/已完成/已取消'
+);
+-- 更新策略：status 未完结走 upsert；完结后转拉链不可变
+```
+
+选型口诀：**看下钻建事务表、看趋势建周期快照、盯流程时效建累积快照**；三者常在同一主题共存而非互替。
+
+## 缓慢变化维度 SCD2 实现 SQL（Hive/Spark 方言完整版）
+
+```sql
+-- 目标拉链表 dim_user_zipper(user_id, name, city, start_dt, end_dt)
+
+-- ① 找出当日有变化的当前记录
+DROP TABLE IF EXISTS tmp_user_changed;
+CREATE TABLE tmp_user_changed AS
+SELECT z.user_id
+FROM dim_user_zipper z
+JOIN ods_user_delta s ON z.user_id = s.user_id
+WHERE z.end_dt = '9999-12-31'
+  AND (z.name <> s.name OR z.city <> s.city);
+
+-- ② 关旧：变化的当前记录 end_dt 改为昨天
+INSERT OVERWRITE TABLE dim_user_zipper
+SELECT user_id,
+       CASE WHEN user_id IN (SELECT user_id FROM tmp_user_changed)
+            THEN name ELSE name END AS name,
+       city, start_dt,
+       CASE WHEN user_id IN (SELECT user_id FROM tmp_user_changed)
+            THEN date_sub('${bizdate}', 1) ELSE end_dt END AS end_dt
+FROM dim_user_zipper;
+
+-- ③ 开新：插入当日新版本
+INSERT INTO dim_user_zipper
+SELECT s.user_id, s.name, s.city, '${bizdate}', '9999-12-31'
+FROM ods_user_delta s
+JOIN tmp_user_changed c ON s.user_id = c.user_id;
+
+-- ④ 时点查询：某天的有效版本
+SELECT * FROM dim_user_zipper
+WHERE '2026-06-01' BETWEEN start_dt AND end_dt;
+```
+
+工程注意：必须保证同 user_id 仅一条 `end_dt='9999-12-31'`；Spark/Doris 直接用 MERGE INTO 一次完成关旧开新更稳。
+
+## 大宽表 vs 即席关联权衡
+
+| 维度 | 大宽表（预 JOIN 物化） | 即席关联（查询时 JOIN） |
+|------|----------------------|------------------------|
+| 查询性能 | 亚秒（无运行时 JOIN） | 依赖 CBO 与数据量 |
+| 存储 | 冗余高成本大 | 范式化省存储 |
+| 敏捷性 | 加维度要回刷全量 | 加表即查 |
+| 口径风险 | 快照口径可能过期 | 永远最新口径 |
+| 适用 | 固定报表、高并发 API | 分析师探索、长尾查询 |
+
+```text
+实践分工：
+  ADS 面向固定场景建大宽表（报表/API 直连）
+  DWD/DWS 保持范式化供分析师灵活 JOIN
+  「宽表 + 少量即席」混合是当前主流——StarRocks/Doris 的
+  CBO 已能扛中等规模即席 JOIN，纯宽表时代正在过去
+
+回刷代价公式：
+  宽表加一个维度 ≈ 全量历史重算（TB 级），
+  所以高频变化的维度不进宽表，留给查询期关联
+```
+
+## OLAP 引擎选型评分卡（并发/延迟/更新/QPS）
+
+| 评估项 | 权重 | ClickHouse | StarRocks | Doris | Druid |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| 单表扫描吞吐 | 20% | 5 | 4 | 4 | 4 |
+| 多表复杂 JOIN | 15% | 2 | 5 | 4 | 1 |
+| 高并发 QPS（万级） | 20% | 2 | 5 | 4 | 5 |
+| 实时更新 Upsert | 15% | 2 | 5 | 4 | 3 |
+| 查询延迟 P99 | 10% | 4 | 5 | 4 | 5 |
+| 运维复杂度（越高越简单） | 10% | 2 | 3 | 4 | 3 |
+| 湖仓外表生态 | 10% | 3 | 5 | 4 | 2 |
+| **加权总分** | 100% | **3.0** | **4.7** | **4.0** | **3.5** |
+
+```text
+使用方法：
+① 按自家负载调整权重（日志场景把扫描吞吐提到 35%）
+② POC 用真实数据集跑 Top10 查询 + 目标并发
+③ 得分只作初筛，最终结合团队运维经验与社区活跃度决策
+```
+
+## 数据集市划分规范
+
+| 规范项 | 要求 | 反例 |
+|--------|------|------|
+| 划分依据 | 按业务部门/应用场景，不按人 | 「小王专属集市」 |
+| 数据来源 | 只允许引用 DWS/ADS 共享层 | 集市直连 ODS 私搭管道 |
+| 建模审批 | 新集市需架构师评审建表申请 | 任何人随建随删 |
+| 生命周期 | 半年零访问触发下线评审 | 只建不管无限膨胀 |
+| 命名规范 | adm_{部门}_{主题}_{描述} | test_final_v2_new |
+
+```mermaid
+flowchart LR
+    ODS[ODS] --> DWD[DWD 明细] --> DWS[DWS 共享汇总]
+    DWS --> M1[adm_fin_财务集市]
+    DWS --> M2[adm_mkt_营销集市]
+    DWS --> M3[adm_sc_供应链集市]
+    DWD -.仅限特批场景.-> M3
+```
+
+治理要点：集市是「消费加速器」不是「数据孤岛制造机」——集市内沉淀出的通用逻辑，季度评审后反哺回共享层，防止逻辑分裂成 N 份私有实现。
+
+---
+
 ## 十八、与其他板块的关系
 
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；

@@ -701,7 +701,7 @@ Triple 是 Dubbo 3 的默认协议，基于 HTTP/2 + Protobuf：
 - RPC 协议原理见「[网络协议深挖](../../基础知识/网络协议深挖.md)」；
 - 服务网格见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
 - 对比 gRPC 见「[gRPC](./gRPC.md)」；
-- 对比 Spring Cloud 见「[微服务架构](../../架构/微服务架构.md)」。
+- 对比 Spring Cloud 见「[微服务治理全链路](../../架构/微服务治理全链路.md)」。
 
 ---
 
