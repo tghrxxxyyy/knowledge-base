@@ -558,6 +558,331 @@ StarRocks Shared-Data = 存算分离架构
 
 ---
 
+## Doris 前缀索引与 ZoneMap 剪枝
+
+### 前缀索引原理
+
+```
+Doris 前缀索引 = 每个 Segment 的稀疏索引
+  每 1024 行生成一个索引项（sparse index）
+  索引项 = 前 N 个字段的最小值 + Segment 文件偏移量
+  查询时先查索引 → 定位 Segment → 再精确查找
+
+ZoneMap 索引 = 每列的 min/max 统计信息
+  每个 Segment 记录每列的 min/max 值
+  WHERE 条件 → 对比 ZoneMap → 跳过不匹配的 Segment
+  效果：范围查询可跳过 80%+ 的数据
+
+联合使用：
+  查询 WHERE date='2024-01-01' AND user_id=12345
+  → 前缀索引定位到 user_id 相关 Segment
+  → ZoneMap 过滤 date 不匹配的 Segment
+  → 最终只扫描少量数据
+```
+
+### 前缀索引设计规则
+
+| 规则 | 说明 |
+|------|------|
+| 字段顺序决定索引 | 建表时字段顺序 = 前缀索引顺序 |
+| 最多 36 字节 | 超过部分不参与前缀索引 |
+| 不支持跳列 | 不能跳过中间字段 |
+| 分区键不参与 | 分区键自动排除 |
+
+```sql
+-- 前缀索引生效示例
+CREATE TABLE orders (
+    dt DATE,
+    user_id BIGINT,
+    order_id BIGINT,
+    amount DECIMAL(10,2)
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16;
+
+-- 查询走前缀索引（dt 排在最前面）
+SELECT * FROM orders WHERE dt = '2024-01-01';
+
+-- 查询不走前缀索引（跳过了 dt）
+SELECT * FROM orders WHERE user_id = 12345;
+```
+
+> **口诀：前缀索引 = Segment 级稀疏索引，ZoneMap = 列级 min/max 剪枝——两者联合可跳过 80%+ 无用数据。**
+
+---
+
+## StarRocks Colocate Join 约束
+
+### 原理
+
+```
+Colocate Join = 相同 Colocate Group 的表按相同分桶键分布
+  → 同一桶的数据在同一节点
+  → Join 无需 Shuffle（数据已在同节点）
+
+约束：
+  ① 分桶键类型和分桶数必须相同
+  ② 同一 Colocate Group 内的表必须满足约束
+  ③ 数据分布一致 → Bucket Shuffle Join 无 Shuffle
+
+优势：
+  大表 Join 大表：Shuffle 开销巨大 → Colocate Join 消除 Shuffle
+  小表 Join 大表：Broadcast Join 更合适
+```
+
+```sql
+-- 创建 Colocate Group
+CREATE DATABASE db1;
+CREATE TABLE orders (
+    user_id BIGINT, dt DATE, amount DECIMAL(10,2)
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "colocate_with" = "user_group"
+);
+
+CREATE TABLE users (
+    user_id BIGINT, name VARCHAR(100)
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "colocate_with" = "user_group"
+);
+
+-- Join 自动走 Colocate Join（无 Shuffle）
+SELECT u.name, SUM(o.amount)
+FROM users u JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.name;
+```
+
+### Colocate Join vs 其他 Join
+
+| Join 类型 | 数据移动 | 适用场景 |
+|-----------|---------|---------|
+| Broadcast Join | 小表广播 | 小表 < 100MB |
+| Shuffle Join | 两端重分布 | 无 Colocate 约束 |
+| Colocate Join | 无 Shuffle | 同分桶键大表 Join |
+| Bucket Shuffle Join | 部分 Shuffle | 分桶键部分相同 |
+
+> **口诀：Colocate Join = "让相关数据住在一起"——同分桶键 + 同分桶数 = Join 零 Shuffle。**
+
+---
+
+## 物化视图异步刷新与查询改写
+
+### 刷新机制
+
+```
+异步物化视图刷新策略：
+  ① 定时刷新：CRON 表达式（如每小时）
+  ② 手动刷新：REFRESH MATERIALIZED VIEW mv_name
+  ③ 事件触发：Base 表数据变化时自动刷新（增量）
+  ④ 全量刷新：每次全量重建（小数据集可用）
+
+增量刷新原理：
+  检测 Base 表分区变化 → 只刷新变化分区
+  → 减少刷新数据量 → 提高实时性
+```
+
+### 查询改写
+
+```
+查询改写 = FE 自动将查询重写为物化视图查询
+
+示例：
+  物化视图 mv_daily 聚合了 date+product_id 的销量
+  查询 SELECT date, SUM(amount) FROM orders GROUP BY date
+  → FE 自动匹配 mv_daily → 走物化视图（省扫描量 100x）
+
+FE 自动选择最优物化视图：
+  多个物化视图 → CBO 估算代价 → 选最优
+  EXPLAIN 查看是否命中物化视图
+```
+
+```sql
+-- 创建异步物化视图
+CREATE MATERIALIZED VIEW mv_daily
+BUILD IMMEDIATE REFRESH AUTO ON SCHEDULE
+EVERY 1 HOUR
+AS SELECT date, product_id, SUM(amount) as total
+FROM orders GROUP BY date, product_id;
+
+-- 手动刷新
+REFRESH MATERIALIZED VIEW mv_daily;
+
+-- 查看物化视图状态
+SHOW ALTER MATERIALIZED VIEW FROM db1;
+```
+
+> **口诀：异步物化视图 = "预计算 + 增量刷新"——定时刷新保持数据新鲜，查询改写自动走物化视图加速。**
+
+---
+
+## Broker Load/Routine Load 参数详解
+
+### Broker Load 参数
+
+```sql
+LOAD LABEL db1.batch_load_001
+(
+    DATA INFILE("hdfs://namenode/data/orders/*")
+    INTO TABLE orders
+    FORMAT AS CSV
+    COLUMNS TERMINATED BY ","
+    (user_id, order_id, amount, dt)
+)
+BROKER broker1
+PROPERTIES (
+    "timeout" = "3600",           -- 超时时间（秒）
+    "max_filter_ratio" = "0.1",   -- 最大容忍过滤率
+    "strict_mode" = "false",      -- 严格模式
+    "partition" = "p20240101",    -- 指定分区
+    "load_parallelism" = "4"      -- 并行度
+);
+```
+
+### Routine Load 参数
+
+```sql
+CREATE ROUTINE LOAD orders_kafka ON orders
+COLUMNS(kafka_topic, kafka_partitions, kafka_offsets)
+PROPERTIES (
+    "format" = "json",
+    "max_batch_interval" = "10",         -- 批次间隔（秒）
+    "max_batch_rows" = "200000",         -- 批次行数
+    "max_batch_interval_bytes" = "104857600", -- 批次字节数（100MB）
+    "max_error_number" = "0",            -- 最大错误数（0=不限）
+    "strict_mode" = "false"              -- 严格模式
+)
+FROM KAFKA (
+    "kafka_broker_list" = "kafka:9092",
+    "kafka_topic" = "orders",
+    "kafka_partitions" = "0,1,2,3",
+    "kafka_offsets" = "0,0,0,0"
+);
+```
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| max_batch_interval | 10s | 太小=频繁导入，太大=延迟高 |
+| max_batch_rows | 200000 | 按内存调整 |
+| max_batch_interval_bytes | 100MB | 按吞吐调整 |
+| max_error_number | 0 | 生产建议不限（数据质量由上游保证） |
+
+> **口诀：Broker Load = 离线大批量（HDFS/S3），Routine Load = 实时流式（Kafka）——Routine Load 关键调 batch_interval 和 batch_rows。**
+
+---
+
+## 存算分离 shared-data on S3
+
+### 架构原理
+
+```
+StarRocks Shared-Data = 存算分离架构
+
+组件：
+  FE：调度查询（无变化）
+  BE：只负责计算（无本地存储）
+  数据存储：对象存储（S3/OSS/HDFS）
+  缓存：本地 SSD 缓存热数据
+
+优势：
+  ① 计算存储独立扩展（按需扩计算/存储）
+  ② 成本优化（冷数据存 S3，成本降低 50%+）
+  ③ 快速弹性（扩缩容 BE 无需迁移数据）
+  ④ 数据高可用（S3 本身 11 个 9 可靠性）
+
+劣势：
+  ① 查询延迟略高（热数据走缓存，冷数据走 S3）
+  ② 首次查询冷数据有冷启动延迟
+```
+
+```sql
+-- Shared-Data 配置示例
+-- fe.conf
+shared_data_endpoint = s3://bucket/path
+
+-- 创建表时指定存算分离
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2)
+)
+DISTRIBUTED BY HASH(order_id) BUCKETS 16
+PROPERTIES (
+    "replication_num" = "1",          -- 共享存储无需多副本
+    "storage_cooldown_time" = "2592000" -- 30天后迁移到S3
+);
+```
+
+### 与存算一体对比
+
+| 维度 | 存算一体 | 存算分离 |
+|------|---------|---------|
+| 存储 | BE 本地磁盘 | S3/OSS 对象存储 |
+| 弹性 | 扩缩容需迁移数据 | 计算存储独立扩展 |
+| 成本 | SSD 成本高 | 冷数据存 S3 成本低 |
+| 性能 | 热数据极快 | 首次冷查询有延迟 |
+| 适用 | 性能优先 | 成本优先/弹性需求 |
+
+> **口诀：存算分离 = "计算按需扩，存储按量付"——热数据走 SSD 缓存，冷数据走 S3，成本降 50%+。**
+
+---
+
+## 典型报表场景建模案例
+
+### 电商日报建模
+
+```sql
+-- 原始订单表（Duplicate 模型）
+CREATE TABLE orders (
+    dt DATE,
+    user_id BIGINT,
+    product_id BIGINT,
+    category_id BIGINT,
+    amount DECIMAL(10,2),
+    quantity INT
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PARTITION BY RANGE(dt) (
+    PARTITION p20240101 VALUES [("2024-01-01"), ("2024-01-02")),
+    PARTITION p20240102 VALUES [("2024-01-02"), ("2024-01-03"))
+);
+
+-- 预聚合表（Aggregate 模型）——日报场景
+CREATE TABLE daily_category_stats (
+    dt DATE,
+    category_id BIGINT,
+    order_count BIGINT SUM,
+    total_amount DECIMAL(18,2) SUM,
+    unique_users BIGINT REPLACE
+)
+AGGREGATE KEY(dt, category_id)
+DISTRIBUTED BY HASH(category_id) BUCKETS 8;
+
+-- 物化视图自动维护聚合
+CREATE MATERIALIZED VIEW mv_daily_category
+AS SELECT dt, category_id, 
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount,
+    COUNT(DISTINCT user_id) as unique_users
+FROM orders GROUP BY dt, category_id;
+```
+
+### 报表查询模式
+
+| 查询类型 | 优化手段 |
+|----------|---------|
+| 日/周/月汇总 | 物化视图预聚合 |
+| TopN 排行 | 分区裁剪 + LIMIT |
+| 同比/环比 | 分区裁剪（按日期范围） |
+| 多维度分析 | Rollup / 多物化视图 |
+
+> **口诀：报表建模 = "Duplicate 存明细 + Aggregate 存聚合 + 物化视图自动维护"——查询走预聚合，省 100x 扫描量。**
+
+## Doris 前缀索引与 ZoneMap 剪枝
+
+---
+
 ## 六、Doris vs StarRocks 对比
 
 | 维度 | Doris | StarRocks |

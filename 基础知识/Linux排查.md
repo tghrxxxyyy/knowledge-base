@@ -621,6 +621,343 @@ tcpdump -i any -n port 8080
 
 ---
 
+## 十二、CPU 高定位完整链路
+
+### 12.1 定位四步法（Java 进程）
+
+```bash
+# Step 1: top 找 CPU 高的进程
+top
+# %CPU 列排序，找到高 CPU 的 PID（如 12345）
+
+# Step 2: top -Hp <pid> 找高 CPU 的线程
+top -Hp 12345
+# 找到 CPU 最高的线程 TID（如 12378）
+
+# Step 3: printf 转换为 16 进制
+printf "%x\n" 12378
+# 输出如 305a
+
+# Step 4: jstack <pid> 找对应线程
+jstack 12345 | grep "nid=0x305a" -A 30
+# 定位到具体代码行和调用栈
+```
+
+### 12.2 完整排查流程图
+
+```mermaid
+flowchart TB
+    A[top 看 %CPU] --> B{CPU 高在哪?}
+    B -->|us 高| C[应用代码热点]
+    B -->|sy 高| D[系统调用/锁竞争]
+    B -->|si 高| E[软中断/网络包处理]
+    C --> F[top -Hp pid 找线程]
+    F --> G["printf '%x' tid"]
+    G --> H[jstack pid | grep nid]
+    H --> I[定位代码行]
+    D --> J[strace -p pid -c]
+    J --> K[看系统调用统计]
+    E --> L[cat /proc/softirqs]
+    L --> M[看 NET_RX/SOFTIRQ]
+```
+
+### 12.3 非 Java 进程排查
+
+```bash
+# C/Go 进程：perf + 火焰图
+perf record -g -p <pid> -- sleep 30
+perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+# Python 进程：py-spy
+py-spy top --pid <pid>
+py-spy record -o profile.svg --pid <pid>
+
+# Node.js 进程
+node --inspect=<port>
+# Chrome 打开 chrome://inspect 分析
+```
+
+> **口诀：top → top -Hp → printf → jstack 是 Java CPU 高的黄金四步——先定位到线程，再定位到代码行。**
+
+---
+
+## 十三、内存泄漏 vs 内存溢出判别流程图
+
+### 13.1 判别逻辑
+
+```mermaid
+flowchart TB
+    A[内存异常] --> B{进程是否被 OOM Kill?}
+    B -->|是| C[内存溢出 OOM]
+    B -->|否| D{内存持续增长?}
+    D -->|是且不回收| E[内存泄漏]
+    D -->|是但可回收| F[正常内存使用]
+    D -->|否| G[其他问题]
+    C --> H["dmesg | grep oom"]
+    H --> I[检查 -Xmx/cgroup 限制]
+    E --> J[监控 RSS 增长曲线]
+    J --> K[获取 heap dump]
+    K --> L[MAT 分析 Leak Suspects]
+```
+
+### 13.2 区分方法
+
+| 维度 | 内存泄漏 | 内存溢出 |
+|------|---------|---------|
+| 现象 | RSS 持续增长不释放 | 进程被 OOM Kill |
+| 速度 | 缓慢增长（小时/天） | 快速耗尽（分钟/小时） |
+| 触发 | 内部对象未释放 | 总需求超过限制 |
+| 排查 | heap dump + MAT | dmesg + 检查限制 |
+| 修复 | 修复泄漏代码 | 增大内存/优化使用 |
+
+### 13.3 排查命令
+
+```bash
+# 检查 OOM 记录
+dmesg | grep -i "oom\|killed process"
+# [12345.678] Out of memory: Killed process 12345 (java) score 800
+
+# 监控 RSS 增长
+while true; do
+    echo "$(date +%H:%M:%S) $(ps -o rss= -p <pid>)KB"
+    sleep 60
+done > rss_monitor.log
+
+# Java 堆分析
+jmap -dump:live,format=b,file=heap.hprof <pid>
+# MAT 打开 hprof → Leak Suspects 报告
+
+# 非 Java 进程内存增长
+pmap -x <pid> > pmap_start.txt
+# 等 30 分钟
+pmap -x <pid> > pmap_end.txt
+diff pmap_start.txt pmap_end.txt | grep "total"
+```
+
+> **口诀：泄漏 = RSS 慢慢涨但不 Kill（查代码释放），溢出 = 直接被 OOM Kill（查限制是否太小）。**
+
+---
+
+## 十四、io_wait 高用 iostat/pidstat 定位
+
+### 14.1 定位链路
+
+```bash
+# Step 1: top 看 wa（IO 等待占比）
+top
+# %Cpu(s): ... 15.2 wa ...  → IO 等待 15%
+
+# Step 2: iostat 看哪块磁盘瓶颈
+iostat -x 1
+# 关键指标：
+# %util: 磁盘利用率（>80% 接近瓶颈）
+# await: 平均 IO 等待时间（ms，>10ms 需关注）
+# r/s, w/s: 读写次数
+# rkB/s, wkB/s: 读写吞吐
+
+# Step 3: pidstat 看哪个进程 IO 高
+pidstat -d 1
+# PID   kB_rd/s  kB_wr/s  Command
+# 12345  50000    20000    java
+```
+
+### 14.2 iostat 关键指标解读
+
+| 指标 | 含义 | 阈值 |
+|------|------|------|
+| %util | 磁盘利用率 | > 80% 瓶颈 |
+| await | 平均 IO 延迟 | > 10ms 需关注 |
+| r_await | 读延迟 | > 5ms 需关注 |
+| w_await | 写延迟 | > 10ms 需关注 |
+| avgqu-sz | 平均队列深度 | > 2 需关注 |
+| aqu-sz | 平均 IO 大小 | 越大越好 |
+
+```bash
+# 深度 IO 分析
+iostat -x -d 1 10  # 每秒采样，共 10 次
+
+# 关注 %util 高且 await 高 → 磁盘真瓶颈
+# 关注 %util 低但 await 高 → 可能是 IO 调度问题
+# 关注 %util 高但 await 低 → 吞吐高但磁盘还没到瓶颈
+```
+
+### 14.3 常见 IO 问题
+
+| 现象 | 可能原因 | 排查 |
+|------|---------|------|
+| wa 高 + %util 高 | 磁盘写满/慢 | df -h + iotop |
+| wa 高 + %util 低 | IO 调度不当/文件系统问题 | ionice + mount 参数 |
+| wa 高 + d 状态进程多 | 进程等 IO 阻塞 | ps aux \| grep D |
+
+> **口诀：wa 高 → iostat 看磁盘 → pidstat 定进程 → iotop 定文件——IO 排查三板斧。**
+
+---
+
+## 十五、网络丢包排查（ethtool→netstat→dropwatch）
+
+### 15.1 排查链路
+
+```bash
+# Step 1: ethtool 看网卡级别丢包
+ethtool -S eth0 | grep -i "drop\|error\|miss"
+# rx_dropped: 1000      → 网卡丢包（Ring Buffer 满）
+# rx_missed_errors: 500 → DMA 来不及处理
+# tx_dropped: 0
+
+# Step 2: netstat 看协议栈丢包
+netstat -s | grep -i "drop\|overflow\|reset"
+# 1234 times the listen queue of a socket overflowed  → 全连接队列满
+# 567 segments retransmitted                          → TCP 重传
+# 89 receive buffer errors                            → 接收缓冲区满
+
+# Step 3: dropwatch 精确定位丢包函数
+dropwatch -l kas
+# 监控内核丢包事件，定位到具体函数
+```
+
+### 15.2 Ring Buffer 丢包
+
+```bash
+# 查看 Ring Buffer 大小
+ethtool -g eth0
+# Pre-set:  RX:  4096  TX:  4096
+# Current:  RX:  4096  TX:  4096
+
+# 增大 Ring Buffer
+ethtool -G eth0 rx 8192 tx 8192
+
+# 持久化（/etc/network/interfaces 或 NetworkManager）
+```
+
+### 15.3 接收缓冲区丢包
+
+```bash
+# 查看接收缓冲区
+sysctl net.core.rmem_max
+sysctl net.core.rmem_default
+
+# 增大缓冲区
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.rmem_default=16777216
+
+# 查看 socket 缓冲区使用
+ss -m | grep :8080
+# skmem:(r0,rb131071,t0,tb87380,f0,w0,o0,bl0,d0)
+# rb = 接收缓冲区大小
+# r = 当前使用
+```
+
+> **口诀：丢包排查 ethtool→netstat→dropwatch 三步走——网卡丢包查 Ring Buffer，协议栈丢包查队列/缓冲区。**
+
+---
+
+## 十六、dmesg OOM Killer 日志解读
+
+### 16.1 OOM 日志结构
+
+```bash
+dmesg | grep -i "oom\|killed process"
+```
+
+```text
+[12345.678] java invoked oom-killer: gfp_mask=0xcc0, order=0, oom_score_adj=0
+[12345.679] Out of memory: Killed process 12345 (java) total-vm:8388608kB, anon-rss:6291456kB, file-rss:0kB, shmem-rss:0kB
+[12345.680] oom_reaper: reaped process 12345 (java), now anon-rss:0kB, file-rss:0kB
+```
+
+### 16.2 字段解读
+
+| 字段 | 含义 | 关注点 |
+|------|------|--------|
+| total-vm | 进程虚拟内存总量 | 包含未实际分配的部分 |
+| anon-rss | 匿名页 RSS（实际物理内存） | 真正占用的内存 |
+| file-rss | 文件页 RSS | 映射的文件缓存 |
+| shmem-rss | 共享内存 RSS | tmpfs/shmem |
+| oom_score_adj | OOM 优先级（-1000~1000） | 越高越先被 Kill |
+
+### 16.3 常见 OOM 场景
+
+| 场景 | 日志特征 | 原因 |
+|------|---------|------|
+| Java 堆超限 | anon-rss 接近 -Xmx | -Xmx 设太大超过物理内存 |
+| 堆外内存泄漏 | anon-rss > -Xmx 很多 | NIO direct buffer/Metaspace 泄漏 |
+| cgroup 限制 | cgroup memory limit 触发 | K8s Pod 内存 limit 太小 |
+| 系统整体不足 | 多个进程 RSS 之和 > 物理内存 | 多个内存大户竞争 |
+
+```bash
+# 查看 cgroup 内存限制（K8s Pod）
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+# 或
+cat /sys/fs/cgroup/memory.max  # cgroup v2
+
+# 查看 cgroup 内存使用
+cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+```
+
+> **口诀：OOM 日志看 anon-rss——Java 堆超限 anon-rss≈-Xmx，堆外泄漏 anon-rss>>-Xmx，cgroup 限制看 limit_in_bytes。**
+
+---
+
+## 十七、perf flame graph 使用步骤
+
+### 17.1 火焰图生成步骤
+
+```bash
+# Step 1: 录制性能数据（30秒）
+perf record -g -p <pid> -- sleep 30
+# -g: 记录调用栈
+# -- sleep 30: 录制 30 秒
+
+# Step 2: 生成折叠栈
+perf script | stackcollapse-perf.pl > out.folded
+# 需要安装 FlameGraph 工具集：
+# git clone https://github.com/brendangregg/FlameGraph
+
+# Step 3: 生成火焰图 SVG
+flamegraph.pl out.folded > cpu-flamegraph.svg
+
+# Step 4: 浏览器打开 SVG 分析
+# 横轴 = 采样时长占比（最宽的函数最耗 CPU）
+# 纵轴 = 调用栈深度（从 main → handleRequest → queryDB）
+# 点击可以放大查看子树
+```
+
+### 17.2 火焰图解读
+
+```
+火焰图解读要点：
+  ① 横轴宽度 = 该函数在采样中的占比（越宽越耗 CPU）
+  ② 纵轴深度 = 调用栈深度（越深调用链越长）
+  ③ 颜色无特殊含义（区分不同函数用）
+  ④ 看"平顶"函数（自身耗 CPU 多，不是子调用多）
+  ⑤ 对比两次火焰图找差异（优化前后）
+
+常见模式：
+  宽平顶 → CPU 热点函数（优化目标）
+  深调用栈 → 递归/嵌套过深（可能栈溢出风险）
+  突然变宽 → 某个分支耗 CPU 多（分支热点）
+```
+
+### 17.3 高级用法
+
+```bash
+# 内存火焰图
+perf record -e kmem:kmalloc -g -p <pid> -- sleep 10
+perf script | stackcollapse-perf.pl | flamegraph.pl --color=mem > mem.svg
+
+# Off-CPU 火焰图（分析阻塞等待）
+perf record -e sched:sched_switch -g -p <pid> -- sleep 30
+# 需要 bcc 工具：offcputime-bpfcc <pid> -df | flamegraph.pl > offcpu.svg
+
+# 差异火焰图（对比优化前后）
+difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
+# 红色 = 优化后增加，蓝色 = 优化后减少
+```
+
+> **口诀：火焰图 = "CPU 时间的 X 光片"——perf record → stackcollapse → flamegraph.pl 三步出图，看宽平顶函数就是优化目标。**
+
+---
+
 ## 十二、与其他板块的关系
 
 - 操作系统原理见「[操作系统](./操作系统.md)」；

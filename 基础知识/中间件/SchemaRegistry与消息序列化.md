@@ -594,6 +594,166 @@ Schema 治理体系：
   CI/CD 集成（GitHub Actions）
 ```
 
+## Avro 具体记录 vs 泛型记录（SpecificRecord vs GenericRecord）
+
+| 维度 | SpecificRecord（代码生成） | GenericRecord（运行时反射） |
+|------|---------------------------|----------------------------|
+| 使用方式 | avro-maven-plugin 从 .avsc 生成 POJO | 直接操作 `GenericData.Record` |
+| 类型安全 | 编译期校验，字段拼写错误即编译失败 | 运行时才发现字段缺失/类型错 |
+| 性能 | 无反射，编解码最快 | 反射 + Schema 查找，慢 20%~50% |
+| 升级成本 | Schema 变更必须重新生成并发布 | 只改配置即可读新字段 |
+| 适用 | 生产者、核心消费者 | ETL 脚本、动态字段探查工具 |
+
+```java
+// SpecificRecord：编译期契约
+Order order = Order.newBuilder()
+    .setOrderId("o-1001").setAmount(99.0).setStatus("CREATED")
+    .build();
+producer.send(new ProducerRecord<>("orders", order));
+
+// GenericRecord：运行时动态构造
+Schema schema = new Schema.Parser().parse(new File("Order.avsc"));
+GenericRecord rec = new GenericData.Record(schema);
+rec.put("order_id", "o-1001");
+rec.put("amount", 99.0);
+// 坑：put 了 schema 中不存在的字段不会报错，序列化后静默丢失
+```
+
+**选型口诀**：生产链路一律 SpecificRecord（契约固化），运维/排查工具才用 GenericRecord。
+
+---
+
+## Protobuf 字段编号演进纪律
+
+Protobuf 按**字段编号**匹配而非名称，编号一旦复用 = 数据串位，是最隐蔽的线上事故源：
+
+```protobuf
+message Order {
+  // v1: 1=amount(double) 2=status(string)
+  // v2 错误示范：把 status 删除后又把 coupon(string) 编成 2
+  //   → 老消费者把 string 解析成 string 恰好不崩但语义全错；
+  //   → 若老字段是 int32，新数据是 string，直接解析异常
+}
+```
+
+| 纪律 | 说明 |
+|------|------|
+| 永不复用已删字段编号 | 删字段时必须写 `reserved 2; reserved "status";` 让编译器拦截 |
+| 19000~19999 禁用 | Protobuf 内部实现保留区，编译器强制拒绝 |
+| 新字段只加不改 | 改类型仅限兼容映射（int32→int64 等），string↔int 绝对禁止 |
+| optional/singular 默认值语义 | proto3 中标量不再有显式存在性，需要区分"未设置"用 wrapper 类型 |
+| map 字段不能 required | map 元素顺序不保证，别依赖遍历序 |
+
+```bash
+# CI 卡点：buf breaking 对比基线版本
+buf breaking --against ".git#branch=main" --error-format=json
+```
+
+---
+
+## 兼容性检查失败案例解析
+
+```text
+案例1：加字段没带默认值 → BACKWARD 注册被拒
+  v1: {name}  →  v2: {name, phone}          ❌ Registry 报 INCOMPATIBLE
+  根因：Avro 读 v1 数据时找不到 phone 的默认值。
+  修复：{"name":"phone","type":"string","default":""}
+
+案例2：改类型 double→string → 双向都不通过
+  amount: double → amount: string           ❌
+  正确姿势：新增 amount_str 字段带 default，消费端迁移完成后下一版删旧字段。
+
+案例3：重命名字段 = 删除+新增
+  user_name → username                      ❌（BACKWARD 视为删字段+无默认新增）
+  Avro 有 aliases 补救：v2 字段加 {"aliases":["user_name"]}，
+  但 alias 只对「新 reader 读旧数据」生效，方向别搞反。
+
+案例4：Subject 策略配错导致误拒
+  团队按 TopicNameStrategy 注册，另一服务想复用同一 Topic 发不同 record
+  → 兼容性检查拿 A 记录的 Schema 和 B 比较 → 必然失败。
+  解法：改 RecordNameStrategy 或拆 Topic。
+```
+
+> 排障入口：`GET /compatibility/subjects/{subject}/versions/{version}` 可拿到逐条失败原因，先看 diff 再动手改。
+
+---
+
+## 序列化性能基准（体积 / CPU / 编解码耗时）
+
+以同一条订单消息（10 字符 ID + 3 个数值字段 + 嵌套明细数组）实测量级参考：
+
+| 格式 | 序列化体积 | 编码耗时(μs) | 解码耗时(μs) | CPU 占比特征 |
+|------|-----------|--------------|--------------|--------------|
+| JSON (Jackson) | ~420 B | 2.8 | 4.5 | 字符串处理为主，GC 压力大 |
+| JSON Gzip | ~180 B | 12.0 | 9.0 | 压缩 CPU 换带宽 |
+| Avro（带 Registry） | ~110 B | 0.9 | 1.2 | varint 写入极快，Schema 缓存命中后开销稳定 |
+| Protobuf | ~95 B | 0.7 | 0.9 | 最快最稳 |
+| Avro + Snappy | ~70 B | 1.6 | 2.0 | 大消息场景收益明显 |
+
+```text
+结论速记：
+  - 吞吐敏感管道：Protobuf ≈ Avro > JSON×3~5 倍
+  - Kafka 分区带宽紧张：优先压缩（producer compression.type=lz4/zstd），
+    收益通常大于换格式本身
+  - Registry 客户端务必缓存 Schema（默认缓存），否则每条消息一次 HTTP 是隐形杀手
+```
+
+---
+
+## 消息体过大处理：Claim-Check 模式
+
+Kafka 默认 `message.max.bytes=1MB`，超过阈值的消息走 **Claim-Check（票据模式）**：大 payload 存对象存储，消息里只带取件凭证。
+
+```mermaid
+flowchart LR
+    P[Producer] -->|1 上传大文件| S3[(S3/OSS/MinIO)]
+    P -->|2 发送 claim 引用<br/>uri+hash+schemaId| K[Kafka topic]
+    K --> C[Consumer]
+    C -->|3 凭 uri 取回| S3
+    C -->|4 校验 hash 后处理| BIZ[业务]
+```
+
+```yaml
+# 生产者侧 Spring 示例要点
+claim-check:
+  store: s3://msg-blob/payloads/
+  threshold-bytes: 262144      # 超 256KB 走外存
+  envelope-schema: ClaimEnvelope  # 信封也注册进 Schema Registry，统一演进
+```
+
+| 方案对比 | 做法 | 权衡 |
+|----------|------|------|
+| 调大 broker 限制 | max.message.bytes + replica.fetch.max.bytes 同步调 | 内存/复制放大风险，最后手段 |
+| 应用层分片 | 大对象切片多条消息 + 组装器 | 复杂度高，失败恢复难 |
+| **Claim-Check ⭐** | 外存 payload，消息传引用 | 多一次存储依赖；注意 TTL 清理与权限隔离 |
+
+---
+
+## Schema Registry 高可用部署与灾备
+
+```text
+部署架构（Confluent Schema Registry）：
+  - Registry 自身无状态，元数据全部落在内部 Kafka topic（_schemas）
+  - 因此 HA = Kafka 高可用 + ≥2 个 Registry 实例（前置 LB）
+  - leader.eligible=true 参与主从协调写
+
+关键参数：
+  kafkastore.bootstrap.servers     # 后端 Kafka（建议跨机架）
+  kafkastore.topic=_schemas        # compacted，单分区——写入吞吐瓶颈点
+  host.name / listeners            # 多网卡环境显式指定，避免返回不可达地址
+```
+
+| 灾备能力 | 方案 | 说明 |
+|----------|------|------|
+| 定期导出 | `POST /export` 或脚本 dump 全部 subjects | 冷备最低要求，随 Git 管理更佳 |
+| 跨集群同步 | Confluent Replicator / MM2 同步 `_schemas` topic | 目标集群 ID 映射需一致 |
+| 双活容灾 | 两地各自 Registry + 消息双发 | schemaId 不互通，消费端按集群寻址 |
+| 灾难重建 | 先起 Kafka → 导入 _schemas 快照 → 起 Registry | 演练验证 schemaId 与存量消息一致 |
+
+> 一句话：**Registry 挂了不影响已缓存客户端继续编解码，但新实例扩容、Schema 首次解析全部失败——所以至少两实例 + LB + `_schemas` topic 进灾备复制清单。**
+
+---
+
 ## 九、与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；

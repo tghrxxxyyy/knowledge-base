@@ -363,7 +363,236 @@ histogram_quantile(0.99, sum(rate(traefik_router_request_duration_seconds_bucket
 
 ---
 
+## 补充：IngressRoute CRD 完整字段解析
+
+### IngressRoute 全字段
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: webapp
+  namespace: production
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`example.com`) && PathPrefix(`/api`)
+      kind: Rule
+      priority: 10
+      middlewares:
+        - name: rate-limit
+          namespace: traefik
+        - name: jwt-auth
+      services:
+        - name: webapp-svc
+          port: 80
+          weight: 90
+          passHostHeader: true
+          healthCheck:
+            path: /health
+            interval: 10s
+          serversTransport: my-transport
+  tls:
+    certResolver: letsencrypt
+    domains:
+      - main: example.com
+        sans: ["*.example.com"]
+    options:
+      minVersion: VersionTLS12
+      sniStrict: true
+```
+
+### IngressRouteTCP / IngressRouteUDP
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: postgres-route
+spec:
+  entryPoints:
+    - postgres
+  routes:
+    - match: HostSNI(`*`)
+      services:
+        - name: postgres-svc
+          port: 5432
+  tls:
+    passthrough: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: dns-route
+spec:
+  entryPoints:
+    - dns
+  routes:
+    - services:
+        - name: dns-svc
+          port: 53
+```
+
+## 补充：中间件链组合实例（限流+认证+重试）
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: ip-whitelist
+spec:
+  ipWhiteList:
+    sourceRange:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+spec:
+  rateLimit:
+    average: 100
+    burst: 50
+    period: 1s
+    sourceCriterion:
+      ipStrategy:
+        depth: 1
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: jwt-auth
+spec:
+  forwardAuth:
+    address: http://auth-service:8080/validate
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-User-ID
+      - X-User-Roles
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: retry-middleware
+spec:
+  retry:
+    attempts: 3
+    initialInterval: 100ms
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: full-pipeline
+spec:
+  chain:
+    middlewares:
+      - name: ip-whitelist
+      - name: rate-limit
+      - name: jwt-auth
+      - name: retry-middleware
+      - name: compress
+```
+
+**执行顺序**：IP 白名单 → 限流 → JWT 认证 → 重试 → 压缩。限流尽早拒绝减轻后端压力，认证在限流后避免无谓鉴权开销。
+
+## 补充：Let's Encrypt 证书 HA 部署
+
+### 多副本证书存储方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| ReadWriteMany PVC | NFS/CephFS 共享 acme.json | K8s 有 RWX 存储 |
+| DNS Challenge | 无需 80 端口，天然多副本 | 推荐生产 |
+| 单副本签发 | 只有一个 Pod 做证书签发 | 简单场景 |
+
+```yaml
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: ops@example.com
+      storage: /data/acme.json
+      dnsChallenge:
+        provider: cloudflare
+        delayBeforeCheck: 10s
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
+```
+
+## 补充：TCP/UDP 入口路由
+
+Traefik 原生支持 TCP/UDP 入口，需在 EntryPoint 配置中显式声明：
+
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+  postgres:
+    address: ":5432"
+  dns:
+    address: ":53/udp"
+```
+
+| 协议 | EntryPoint | 路由 CRD | 典型场景 |
+|------|-----------|----------|----------|
+| HTTP/HTTPS | web/websecure | IngressRoute | Web 应用 |
+| TCP | 自定义端口 | IngressRouteTCP | 数据库/Redis/gRPC |
+| UDP | 自定义端口 | IngressRouteUDP | DNS/DHCP |
+
+## 补充：Plugin Catalog 自定义插件
+
+Traefik 支持 Yaegi（Go 解释器）插件：
+
+| 插件 | 功能 | 场景 |
+|------|------|------|
+| **Traefik plugincatalog** | 官方插件市场 | 通用 |
+| **header-rewrite** | 请求/响应头改写 | 灰度标记 |
+| **ip-filtering** | IP 黑白名单增强 | 安全 |
+| **rate-limit** | 高级限流 | 防刷 |
+| **forward-auth** | 外部认证 | SSO 集成 |
+
+```yaml
+# 使用插件
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: my-plugin
+spec:
+  plugin:
+    header-rewrite:
+      headers:
+        X-Custom-Header: "value"
+```
+
+> 插件需在 Traefik 启动时声明 `--experimental.plugins.<name>.moduleName=<module>`。
+
+## 补充：Traefik vs Nginx Ingress 性能功能对比
+
+| 维度 | Traefik | Nginx Ingress |
+|------|---------|---------------|
+| **配置方式** | 声明式 CRD/Provider | Ingress + 注解 |
+| **热更新** | 毫秒级（无 reload） | 需 reload（优雅，但有短暂中断） |
+| **自动发现** | 15+ Provider 原生 | 需 Ingress Controller |
+| **自动 HTTPS** | Let's Encrypt 原生 | cert-manager 配合 |
+| **中间件** | 30+ 内置 | Lua/第三方模块 |
+| **吞吐（极限）** | 高（Go 实现） | 极高（C 实现，Nginx 核心） |
+| **延迟** | 低 | 更低（Nginx 事件驱动优化） |
+| **内存占用** | 中（Go GC） | 低（C 直接管理） |
+| **TCP/UDP** | 原生支持 | stream 模块 |
+| **WAF** | 无内置 | ModSecurity 集成 |
+| **gRPC** | 原生支持 | 需配置 |
+| **学习曲线** | 低 | 中 |
+| **适用** | K8s/Docker 动态环境 | 高性能传统 Web/混合环境 |
+
+> **选型建议**：K8s 原生 + 自动证书 + 动态环境 → Traefik；极致性能 + WAF + 混合环境 → Nginx Ingress。
+
 ## 七、与其他板块的关系
+
+
 
 - 网关选型总览见「[API 网关](./API网关.md)」；
 - Kong/APISIX 对比见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」；

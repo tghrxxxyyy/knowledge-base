@@ -393,6 +393,232 @@ flowchart LR
 
 > ⚠️ **etcd / API Server 压力**：reconcile 间隔过小 + Application 过多，会让 etcd 写延迟飙升、leader 选举失败、sync 超时。给稳定应用调大间隔、配 webhook 即时触发，是生产硬要求。
 
+## 补充：ArgoCD ApplicationSet 多集群批量发布
+
+### ApplicationSet 生成器
+
+ApplicationSet 是 Argo CD 的"多集群批量发布"核心，通过生成器自动创建 Application：
+
+| 生成器 | 说明 | 典型场景 |
+|--------|------|----------|
+| **Cluster** | 遍历所有注册集群 | 同一应用部署到全部集群 |
+| **Git** | 遍历 Git 目录/文件 | 目录结构即环境结构 |
+| **List** | 静态列表 | 手动指定集群+环境 |
+| **Matrix** | 两生成器笛卡尔积 | 多集群×多应用组合 |
+| **Pull Request** | 按 PR 动态生成 | 临时预览环境 |
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: fleet-backend
+  namespace: argocd
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            env: production
+        values:
+          revision: main
+  template:
+    metadata:
+      name: 'backend-{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/k8s-manifests.git
+        targetRevision: '{{values.revision}}'
+        path: 'overlays/{{metadata.labels.cluster}}'
+      destination:
+        server: '{{server}}'
+        namespace: backend
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+### 同步波及与 Prune 危险场景
+
+`prune` 是 GitOps 的双刃剑：
+
+| 场景 | 行为 | 风险 |
+|------|------|------|
+| Git 删除 Deployment | 集群自动删除对应资源 | **误删手动创建的资源** |
+| `kubectl create` 未提交 Git | 下次 reconcile 被 prune 清掉 | 紧急热修被覆盖 |
+| ApplicationSet 删除 | 批量 prune 所有关联资源 | 全面回滚不可控 |
+| Helm/Kustomize 渲染差异 | 差异资源被标记 OutOfSync | 可能误删 |
+
+**安全实践**：
+1. 启用 `prune` 前先用 `argocd diff` 预览影响
+2. 对手动操作先 `git add` 再执行，紧急热修事后补 commit
+3. 关键资源加注解 `argocd.argoproj.io/managed-by: ""` 防 prune
+4. 多集群场景用 `prunePropagationPolicy: foreground` 确保级联删除
+
+## 补充：Flux vs ArgoCD 详细对比矩阵
+
+| 维度 | Argo CD | Flux v2 |
+|------|---------|---------|
+| **架构** | 单体（一个二进制+Web UI） | 模块化（多个独立 Controller） |
+| **UI** | 自带 Web UI，diff 可视化强 | 无官方 UI（Weave GitOps 第三方） |
+| **ApplicationSet** | 原生支持，多生成器类型 | Kustomization/HelmRelease 多实例 |
+| **多集群** | ApplicationSet 集群生成器 | 多实例 + 代理模式 |
+| **渐进式交付** | 原生集成 Argo Rollouts | 集成 Flagger |
+| **Image 自动更新** | Argo Image Updater（独立组件） | Image Automation Controller（内置） |
+| **OCI 制品** | 支持（Helm chart） | 原生 OCI artifact 推送/拉取 |
+| **通知** | Notifications Controller | Notification Controller（内置） |
+| **RBAC** | 强（SSO/OIDC/RBAC） | 弱（依赖 K8s RBAC） |
+| **学习曲线** | 中（UI 友好） | 中高（纯声明，YAML 多） |
+| **社区** | CNCF 毕业，社区大 | CNCF 毕业，Weaveworks 停运后社区接续 |
+| **适用** | 要可视化、要统一门户、要 SSO | 要极简、Git 优先、强合规、OCI 制品 |
+
+## 补充：渐进式交付与 Argo Rollouts 分析模板
+
+### AnalysisTemplate 深入
+
+AnalysisTemplate 是 Argo Rollouts 的"指标门禁"，定义自动晋级/回滚条件：
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: error-rate
+      interval: 2m
+      count: 5
+      successCondition: result[0] < 0.05
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}",status=~"5.."}[5m]))
+            / sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
+    - name: latency
+      interval: 2m
+      successCondition: result[0] < 200
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{service="{{args.service-name}}"}[5m])) by (le))
+```
+
+### Argo Image Updater 自动升级
+
+Image Updater 扫描镜像仓库，按策略自动回写 Git 中的镜像 tag：
+
+```yaml
+apiVersion: image.toolkit.fluxcd.io/v1alpha2
+kind: ImageUpdateAutomation
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 1m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author: fluxbot
+      message: "chore: update image {{range .Updated.Images}}{{println .}}{{end}}"
+    push:
+      branch: main
+  update:
+    path: ./clusters
+    strategy: Setters
+```
+
+**镜像策略选择**：
+- `semver`：自动升级到最新 semver 版本（如 v1.2.3 → v1.2.4）
+- `alphabetic`：按字母排序取最新
+- `numerical`：按数字排序取最新
+- `digest`：跟踪不可变 digest（最安全）
+
+## 补充：GitOps 密钥管理三方案
+
+### 方案对比
+
+| 方案 | 原理 | Git 安全 | 轮换 | 多集群 | 复杂度 |
+|------|------|----------|------|--------|--------|
+| **Sealed Secrets** | 公钥加密进 Git，集群内 controller 解密 | 密文进 Git | 需重加密提交 | 差（每集群密钥不同） | 低 |
+| **External Secrets Operator (ESO)** | Git 只放引用，controller 从 Vault/云拉取 | 仅引用进 Git | 自动（refreshInterval） | 易（同后端多引用） | 中 |
+| **SOPS (Mozilla/CNCF)** | 文件级信封加密，密钥用云 KMS/age | 加密文件进 Git | 需重加密 | 中（KMS 可控） | 中 |
+
+### SOPS + Flux 集成
+
+Flux kustomize-controller 原生支持 SOPS 解密：
+
+```yaml
+# .sops.yaml
+creation_rules:
+- path_regex: .*secrets.*\.yaml$
+  age: age1q9x8g9...公钥...
+  encrypted_regex: ^(data|stringData)$
+```
+
+```bash
+# 加密
+sops -e secrets.yaml > secrets.enc.yaml
+# 解密（部署时自动）
+sops -d secrets.enc.yaml
+```
+
+### ESO 多后端支持
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ap-east-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets-sa
+            namespace: external-secrets
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+  data:
+  - secretKey: password
+    remoteRef:
+      key: prod/db/password
+```
+
+### 三方案选型决策
+
+- **简单 GitOps、无外部依赖** → Sealed Secrets
+- **已有 Vault/云 KMS、需自动轮换** → ESO
+- **文件级加密、Flux 用户** → SOPS
+- **生产推荐** → ESO + Vault（动态凭证 + 自动轮换）
+
 ## 九、与其他模块的关联
 
 - [01-概述与核心概念](01-概述与核心概念.md)：CI/CD 总览、持续集成/交付/部署定义，本篇是其"云原生+GitOps"深化。

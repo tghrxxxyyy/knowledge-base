@@ -636,7 +636,197 @@ INSERT INTO delta_sink SELECT * FROM cdc_source;
 
 ---
 
+## 补充：快照模式全家桶详解
+
+### 快照模式对比
+
+| 模式 | 说明 | 首次启动行为 | 增量阶段 | 适用场景 |
+|------|------|------------|---------|---------|
+| `initial` | 全量快照 + 增量 | 读全表 + 记录 binlog 位点 | 从位点继续消费 binlog | 首次上线（默认） |
+| `never` | 跳过快照 | 不读表，直接消费 binlog | 从指定/最新位点开始 | 已有完整位点 |
+| `when_needed` | 需要时自动快照 | 无位点则快照，有则跳过 | 自动判断 | 自动恢复 |
+| `no_data` | 只记录 Schema | 只建表结构不读数据 | 仅消费 DDL | Schema 同步 |
+| `schema_only` | 只同步 Schema | 类似 no_data | 仅 DDL 事件 | 结构同步 |
+| `schema_only_recover` | Schema + 从头消费 | 不快照但记录 Schema | 从最早 binlog 开始 | 重新消费 |
+
+### incremental 快照配置
+
+```json
+{
+  "snapshot.mode": "initial",
+  "incremental.snapshot.enabled": "true",
+  "incremental.snapshot.chunk.size": "4096",
+  "incremental.snapshot.watermarking.mode": "inserts",
+  "snapshot.fetch.size": "1000"
+}
+```
+
+### 水位线（Watermark）机制
+
+```
+增量快照水位线工作原理：
+  1. 开始块快照 → 插入水位线信号表（signal data table）
+  2. 块内数据读取完成 → 插入结束水位线
+  3. binlog 中遇到水位线信号 → 确认该块快照完成
+  4. 水位线前后的 binlog 事件去重
+  5. 所有块完成 → 纯增量模式
+```
+
+## 补充：增量快照 Chunking 原理
+
+### Chunk 分块策略
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `incremental.snapshot.chunk.size` | 1024 | 每块行数 |
+| `signal.data.collection` | — | 水位线信号表 |
+| `snapshot.select.statement.overrides` | — | 自定义快照 SQL |
+| `incremental.snapshot.window.size` | 1000 | binlog 窗口大小 |
+
+### 大表首刷影响评估
+
+| 表大小 | 首刷耗时（chunk=4096） | binlog 积压 | 评估 |
+|--------|----------------------|------------|------|
+| 100 万行 | ~5 分钟 | 可接受 | 低风险 |
+| 1000 万行 | ~50 分钟 | 需关注 | 中风险 |
+| 1 亿行 | ~8 小时 | 严重积压 | 高风险 |
+| 10 亿行 | ~3 天 | 不可接受 | 需分批/限流 |
+
+**大表首刷优化策略**：
+1. 增大 chunk.size（4096→16384）减少水位线交互
+2. 降低并发（tasks.max=1）避免源库 IO 压力
+3. 选择业务低峰期
+4. 对大表先做增量快照，小表先全量
+5. 监控 binlog 积压（lag 告警）
+
+## 补充：Postgres Slot 滞后与 WAL 堆积
+
+### PostgreSQL WAL 管理
+
+| 概念 | 说明 |
+|------|------|
+| WAL（Write-Ahead Log） | 预写日志，所有变更先写 WAL |
+| Replication Slot | 通知 PG 哪些 WAL 已被消费 |
+| Slot 滞后 | 消费者未及时消费 WAL，slot 位点落后 |
+| WAL 堆积 | 滞后导致 WAL 文件不被清理，磁盘增长 |
+
+### Slot 滞后排查
+
+```sql
+-- 查看 slot 状态
+SELECT slot_name, active, restart_lsn, confirmed_flush_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
+FROM pg_replication_slots;
+
+-- 查看 WAL 文件数量
+SELECT count(*) FROM pg_ls_waldir();
+
+-- 查看复制状态
+SELECT * FROM pg_stat_replication;
+```
+
+### WAL 堆积处理
+
+| 场景 | 处理 |
+|------|------|
+| 消费者慢 | 增加消费者并发/优化消费逻辑 |
+| 消费者挂了 | 重启消费者（slot 未丢） |
+| 需要丢弃积压 | 丢弃旧 slot + 重新快照 |
+| 磁盘紧急 | `SELECT pg_drop_replication_slot('slot_name')` |
+
+> **警告**：丢弃 slot 后需重新快照，否则数据不一致。
+
+## 补充：大表首刷影响评估
+
+### 评估框架
+
+```
+大表首刷评估维度：
+  1. 源库影响：IO/CPU/内存/连接数
+  2. binlog 积压：延迟时间 × 写入速率
+  3. 下游消费：积压消息处理能力
+  4. 业务影响：业务读写延迟是否增加
+```
+
+### 源库压力评估
+
+| 指标 | 安全阈值 | 监控方式 |
+|------|---------|---------|
+| CPU 使用率 | < 70% | `SHOW PROCESSLIST` |
+| IO 等待 | < 30% | `iostat` |
+| 连接数 | < 80% max | `SHOW STATUS LIKE 'Threads%'` |
+| 复制延迟 | < 30s | `SHOW SLAVE STATUS` |
+
+## 补充：常用 SMT 转换链
+
+### SMT 组合实战
+
+```json
+{
+  "transforms": "route,mask,dedupe,timestamp",
+  "transforms.route.type": "io.debezium.transforms.Router",
+  "transforms.route.topic.expression": "cdc.${rdbms}.${database}.${table}",
+  "transforms.route.topic.replacement": "cdc.mysql.order_db.orders",
+  "transforms.mask.type": "io.debezium.transforms.masking.MaskField$Value",
+  "transforms.mask.fields": "card_no,id_card,phone",
+  "transforms.mask.replacement": "******",
+  "transforms.dedupe.type": "io.debezium.transforms.deduplicate.DeduplicateFields$Value",
+  "transforms.dedupe.fields": "id",
+  "transforms.timestamp.type": "org.apache.kafka.connect.transforms.TimestampConverter$Value",
+  "transforms.timestamp.target.type": "Timestamp",
+  "transforms.timestamp.field": "event_time",
+  "transforms.timestamp.format": "yyyy-MM-dd HH:mm:ss"
+}
+```
+
+### SMT 执行顺序最佳实践
+
+| 顺序 | SMT | 理由 |
+|------|-----|------|
+| 1 | TopicRouting | 先路由再处理 |
+| 2 | InsertField | 插入元数据字段 |
+| 3 | RenameField | 统一字段名 |
+| 4 | MaskField | 脱敏（在字段名统一后） |
+| 5 | ExtractNewRecordState | 简化事件 |
+| 6 | TimestampConverter | 时间格式统一 |
+
+## 补充：Debezium 与 Flink CDC 分工
+
+### Debezium vs Flink CDC 分工
+
+| 维度 | Debezium | Flink CDC |
+|------|----------|-----------|
+| **定位** | CDC 数据采集（管道） | 实时计算（引擎） |
+| **输出** | Kafka（消息队列） | Flink DataStream/SQL |
+| **内核** | 自研 binlog/WAL 解析 | 底层调用 Debezium |
+| **SQL 友好** | 需 Kafka Connect | 原生 SQL 定义管道 |
+| **状态管理** | 无（Kafka 负责） | Flink Checkpoint |
+| **Exactly-once** | 依赖 Kafka 事务 | Flink Checkpoint + 两阶段提交 |
+| **运维** | Kafka Connect 集群 | Flink 集群 |
+
+### 推荐分工模式
+
+```
+模式 1：Debezium 采集 + Flink 消费（推荐）
+  MySQL → Debezium → Kafka → Flink SQL → 数仓/ES
+  优点：采集与计算解耦，各自独立扩展
+
+模式 2：Flink CDC 直接采集（简单场景）
+  MySQL → Flink CDC Source → Flink SQL → 数仓
+  优点：架构简单，少一层 Kafka
+  缺点：Flink 故障影响采集
+
+模式 3：Debezium Server 直出（无 Kafka）
+  MySQL → Debezium Server → HTTP/Pulsar → 消费端
+  优点：无 Kafka 依赖
+  缺点：无消息缓冲，消费端故障影响采集
+```
+
+> **选型口诀**：要解耦+高可用选"Debezium→Kafka→Flink"；要简单选"Flink CDC 直连"；无 Kafka 选"Debezium Server"。
+
 ## 十五、与其他板块的关系
+
+
 
 - Canal 对比见「[数据同步 CDC（Canal）](./数据同步CDC-Canal.md)」；
 - Kafka（事件落点）见「[Kafka](./Kafka.md)」；

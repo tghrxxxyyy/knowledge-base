@@ -615,6 +615,189 @@ gpg -c "$BACKUP_DIR/config.tar.gz"
 
 > ⚠️ **备份红线**：`JENKINS_HOME` 包含加密凭据，备份必须加密且异地存储，禁止明文上传对象存储。
 
+## 十八、Kubernetes Pod Template 弹性扩缩（动态 Agent 深化）
+
+```yaml
+# Kubernetes 插件的 podTemplate：每个 Job 起独立 Pod，用完即焚
+podTemplate(
+  yaml: '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: maven
+      image: maven:3.9-eclipse-temurin-21
+      command: ["sleep"]
+      resources:
+        requests: { cpu: "1", memory: "2Gi" }
+        limits:   { cpu: "2", memory: "4Gi" }
+  nodeSelector: { node-type: build }        # 构建流量隔离到专用节点池
+''',
+  containers: [containerTemplate(name: 'maven', ttyEnabled: true, command: 'cat')]
+) {
+  node(POD_LABEL) {
+    container('maven') { sh 'mvn -B verify' }
+  }
+}
+```
+
+| 扩缩机制 | 行为 | 调优点 |
+|----------|------|--------|
+| 按需拉起 | 队列中出现匹配 label 的任务 → 即时创建 Pod | 镜像预热到节点（预拉取 DaemonSet） |
+| 用完回收 | 构建 end → Pod 删除 | workspace 不复用，重活放远端缓存 |
+| 突发限流 | `Max connections to API server`、Pod 并发上限 | 防 CI 风暴打爆 K8s API/配额 |
+| 闲时归零 | 无任务即无 Pod，成本随用量线性 | 与固定 VM Agent 组合：基线走 VM，峰值走 Pod |
+
+> 口诀：**固定 Agent 保底量，动态 Pod 吸尖峰；镜像越大冷启动越痛，构建镜像要分层瘦身。**
+
+---
+
+## 十九、Pipeline 共享库目录结构与版本化深化
+
+```
+corp-shared-lib.git
+├── vars/                     # 全局变量/步骤（一个文件一个步骤，文件名=步骤名）
+│   ├── buildMaven.groovy
+│   ├── deployK8s.groovy
+│   └── notifyFeishu.groovy
+├── src/                      # Groovy 类源码（编译进 classpath）
+│   └── org/corp/PipelineUtils.groovy
+├── resources/                # 静态资源（模板/配置），libraryResource() 读取
+│   └── templates/deploy.yaml
+└── test/                     # PipelineUnit/JenkinsPipelineUnit 单测
+    └── vars/buildMavenSpec.groovy
+```
+
+```groovy
+// vars/buildMaven.groovy —— 带 Config Map 的规范写法
+def call(Map cfg = [:]) {
+    def opts = [jdk: 21, mvnArgs: '-B -ntp', coverageGate: true] + cfg
+    withEnv(["JAVA_HOME=${tool("jdk${opts.jdk}")}"]) {
+        sh "./mvnw ${opts.mvnArgs} clean verify"
+    }
+}
+```
+
+**版本化策略**：
+
+| 方式 | 写法 | 适用 |
+|------|------|------|
+| 固定 Tag ⭐ | `@Library('lib@v2.7.1') _` | 生产流水线，杜绝漂移 |
+| 分支跟随 | `@Library('lib@main') _` | 库开发联调期，禁止生产用 |
+| 全局隐式加载 | Manage Jenkins → Global Pipeline Libraries（default version） | 组织级统一，仍建议 Jenkinsfile 显式覆盖版本 |
+
+升级纪律：共享库改动 = 影响全司流水线——**新版本先在 staging Jenkins 实例回归，再 bump 各仓库引用的 tag**（可用 Renovate 自动提 PR 升级）。
+
+---
+
+## 二十、凭据绑定最佳实践：withCredentials 作用域最小化
+
+```groovy
+// ✅ 正确：作用域收缩到唯一 stage，且不落盘
+stage('Deploy') {
+  steps {
+    withCredentials([string(credentialsId: 'prod-deploy-token', variable: 'TOKEN')]) {
+      sh '''set +x; curl -sSf -H "Authorization: Bearer $TOKEN" \\
+            https://deploy.corp.com/api/release'''
+    }
+  }
+}
+
+// ❌ 反模式一：包住整个 pipeline → 所有日志/所有插件都能碰到 TOKEN
+withCredentials([...]) { pipeline { ... } }
+
+// ❌ 反模式二：echo $TOKEN / set -x 展开命令行 → 凭据进构建日志（即使 masking 也可能被 sh -c 绕过）
+// ❌ 反模式三：凭据写进环境变量注入 agent 进程全局 → 子进程 dump 即泄露
+```
+
+| 原则 | 说明 |
+|------|------|
+| 最小作用域 | `withCredentials` 只包需要它的那几行 step |
+| 最短生命周期 | 用完立即离开闭包；避免传给后台进程长期持有 |
+| 类型匹配 | token 用 Secret text；kubeconfig 用 Secret file（不要塞成 string 再落临时文件） |
+| 可审计 | 定期跑 Credentials Binding 报告，清理无人使用的 credentialsId |
+
+---
+
+## 二十一、Fingerprint 与制品追溯
+
+Jenkins 的 **Fingerprint** 是对文件内容做 MD5+SHA1 摘要并记录「谁产生、谁使用」的溯源数据库（存于 `JENKINS_HOME/fingerprints/`）。
+
+```groovy
+pipeline {
+  agent any
+  stages {
+    stage('Build') {
+      steps {
+        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true   // 记录制品指纹
+      }
+    }
+    stage('Consume') {
+      steps {
+        copyArtifacts projectName: 'svc-a', selector: specific('42'),
+                      fingerprint: true                                  // 记录消费关系
+      }
+    }
+  }
+}
+```
+
+```mermaid
+flowchart LR
+    A[Job svc-a #42<br/>app-1.0.jar md5=abc123] --> FP[(fingerprints/<br/>abc123.xml)]
+    B[Job deploy #99<br/>copyArtifacts app-1.0.jar] --> FP
+    FP --> Q[出问题? 输入 jar 指纹<br/>反查: 哪次构建产出→被哪些部署用过]
+```
+
+价值场景：线上发现 `app-1.0.jar` 有问题 → 拿文件算指纹 → 秒查「哪台 Jenkins 哪次 commit 构建的、被哪些下游 job/部署消费过」——这是审计合规（如等保、供应链追溯）的基础设施。注意 fingerprint 数据会膨胀，需定期用 Fingerprint Cleanup 清理过期条目。
+
+---
+
+## 二十二、性能瓶颈三大件调优（GC / UI / 队列）
+
+| 瓶颈件 | 典型症状 | 根因 | 调优动作 |
+|--------|----------|------|----------|
+| **GC** | UI 偶发卡顿数秒、Full GC 日志频繁 | 大对象（大日志 buffer）、堆不足、老代碎片 | G1GC + `-Xmx` 按 2~4GB/千 job 起步；`-XX:+ParallelRefProcEnabled`；日志分页渲染改 REST 拉取 |
+| **UI** | 打开首页/Job 列表超慢 | 构建历史过多、插件渲染重（如旧版 Blue Ocean）、描述富文本巨大 | Build Discarder 收紧；关闭无用插件；`jenkins.ui.refresh` 场景减少自动刷新频率 |
+| **队列** | 任务长时间 pending、executor 空转却排长队 | label 错配、优先级无差异、动态 Agent 冷启动慢 | Label 规范审计；Strategies 插件做队列优先级；Pod 预热/镜像瘦身缩短启动 |
+
+```bash
+# 三板斧定位命令
+jstat -gcutil $(pgrep -f jenkins.war) 2000          # GC 频率/停顿占比
+curl -s "$JENKINS/queue/api/json" | jq '.items[] | {why, inQueueSince}'   # 队列卡因
+grep -i "took.*sec" logs/all.log | sort -t' ' -k8 -rn | head   # 慢页面请求
+```
+
+---
+
+## 二十三、灾难恢复备份方案深化（ThinBackup / JCasC）
+
+| 维度 | ThinBackup | JCasC + Git | 组合拳（推荐）⭐ |
+|------|------------|-------------|------------------|
+| 备份内容 | JENKINS_HOME 配置类文件（可含构建历史，可选压缩） | jenkins.yaml + plugins.txt + seed job 定义 | 配置走 Git，状态走 ThinBackup |
+| RTO | 小时级（还原目录重启） | 分钟级（新实例挂载 yaml 自举） | 分钟级 ⭐ |
+| RPO | 天（定时增量） | 近零（Git push 即生效） | 近零 |
+| 恢复验证 | 手动解包比对 | `kubectl apply` 即可演练 | 季度 GameDay 实测拉起影子实例 |
+
+```bash
+# ThinBackup 定时策略（Manage Jenkins → ThinBackup → Settings）
+Backup schedule (cron):  H 2 * * *     # 每日凌晨全备
+Max backups:             14
+Wait for idle:           true           # 避免备份时正在写配置导致不一致
+
+# DR 演练脚本骨架：从 Git + 备份桶重建 Controller
+git clone git@scm:platform/jenkins-config.git && cd jenkins-config
+docker run -d --name jenkins-dr \
+  -e CASC_JENKINS_CONFIG=/var/jenkins_home/casc/jenkins.yaml \
+  -v $PWD:/var/jenkins_home/casc \
+  -v s3://backups/thinbackup-latest:/var/jenkins_home/thinBackup \
+  jenkins/jenkins:lts-jdk21
+```
+
+> 口诀：**JCasC 保"形"，ThinBackup 保"忆"；没有做过恢复演练的灾备方案只是心理安慰。**
+
+---
+
 ## 本篇补充 Checklist
 
 - [ ] Controller 轻量化 + Agent 弹性，K8s 动态 Agent 按需扩缩。

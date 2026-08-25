@@ -607,6 +607,195 @@ YouTube 贡献：
   MySQL 兼容性
 ```
 
+## Vitess VReplication 工作流（MoveTables / Reshard 操作步骤）
+
+VReplication 是 Vitess 在线迁移的核心引擎：基于 binlog 的流式复制框架，MoveTables（垂直迁移）与 Reshard（水平重分片）都构建在它之上。
+
+### MoveTables 标准操作步骤
+
+```bash
+# 1. 创建目标 keyspace，并在目标库建表（或由 MoveTables 自动建）
+vtctldclient MoveTables create \
+  --workflow=migrate_customer --source-keyspace=commerce \
+  --tables=customer,users customer
+
+# 2. 观察：先 Copy（全量快照按主键分块流式拷贝），后 Catch up（binlog 追平）
+vtctldclient Workflow --keyspace customer show migrate_customer
+#   状态: Copying → Running(已追平) ；每张表有 copied rows / binlog lag 指标
+
+# 3. 数据校验（VDiff）：对比源/目标行数、内容 checksum
+vtctldclient VDiff create --workflow migrate_customer --target-keyspace customer
+vtctldclient VDiff show  --workflow migrate_customer --target-keyspace customer
+
+# 4. 切换读流量 → 再切写流量（可分开灰度）
+vtctldclient MoveTables switchtraffic --workflow migrate_customer --keyspace customer
+   # --tablet-types=rdonly 先切只读 → replica 切只读副本 → primary 切写
+
+# 5. 观察期后反向留退路（可 reverse 回滚），确认无误再清理源表
+vtctldclient MoveTables complete --workflow migrate_customer --keyspace customer
+```
+
+### Reshard（水平重分片）操作步骤
+
+```bash
+# 1. 定义新分片方案：VSchema 更新 vindex 后创建新分片（如 -80,80- → -40,40-80,80-）
+vtctldclient Reshard create --workflow=reshard_cust \
+  --source-shards='-80,80-' --target-shards='-40,40-80,80-' customer
+
+# 2. 自动执行 SplitClone 式复制 + VReplication 追增量
+# 3. VDiff 校验 → SwitchTraffic（rdonly→replica→primary）→ Complete
+# 全程旧分片持续服务读写，切换是原子路由变更，秒级完成
+```
+
+> 关键认知：**switchtraffic 是唯一「危险时刻」**，之前任何一步都可重跑；切换后仍可 `reverse` 反向回迁——这是 MyCat 完全不具备的在线能力。
+
+---
+
+## MyCat 分片算法源码级解析
+
+### PartitionByMod（取模）
+
+```java
+// 简化后的核心逻辑（io.mycat.route.function.PartitionByMod）
+private int calculate(int segment) {
+    if (count > 0 && segment >= 0) {          // count = 分片总数
+        return segment % count;               // 正数直接取模
+    }
+    // 坑1：负数取模 —— MySQL 的 % 可返回负数，源码用 Math.abs 兜底
+    // 坑2：扩容时 count 变化 → 所有 key 重算 → 全量数据迁移
+    return Math.abs(segment % count);
+}
+```
+
+### PartitionByRange（范围）
+
+```java
+// 基于 partition-range-mod.txt 映射文件：0-200M→dn1, 200M-400M→dn2 ...
+public int calculate(String columnValue) {
+    long value = Long.parseLong(columnValue);
+    Partition p = this.getPartition(value);   // TreeMap.floorEntry 区间查找 O(logN)
+    if (p == null) {
+        // 坑：超出最大区间的值默认抛异常（defaultNode 未配置时直接路由失败）
+        throw new IllegalArgumentException(...);
+    }
+    return p.getNodeIndex();
+}
+```
+
+### PartitionByHashString（字符串哈希）
+
+```java
+// 对字符串列做 hash 后再取模，解决 user_id 为 varchar 的场景
+public int calculate(String columnValue) {
+    int hash = hashString(columnValue);       // 逐字符 FNV/hash 计算
+    return hash % count;
+}
+// 注意点：
+//  - 不同字符集下同一字符串字节不同 → 集群统一 utf8mb4，避免路由漂移
+//  - 大小写敏感：'Tom' 与 'tom' 落不同分片（业务上需归一化）
+```
+
+| 算法 | 扩容友好 | 数据均匀 | 范围查询 | 适用 |
+|------|---------|---------|----------|------|
+| Mod | ❌ 全量迁移 | ✅ | ❌ 广播 | 点查为主 |
+| Range | ✅ 只加新区间 | ❌ 尾部热点 | ✅ 直达单片 | 时序/归档 |
+| HashString | ❌ 全量迁移 | 较均匀 | ❌ | 字符串主键 |
+
+---
+
+## 跨分片 JOIN 三种实现代价对比
+
+```mermaid
+flowchart TB
+    J{跨分片 JOIN} --> A[方案A 全局表广播]
+    J --> B[方案B ER 分片同片]
+    J --> C[方案C 应用层组装]
+    A -->|"字典表小(万行级)<br/>代价低"| OK[✅ 推荐]
+    B -->|"订单+明细同 user_id 分片<br/>零跨片"| OK2[✅ 最优]
+    C -->|"两次SQL + 内存拼装<br/>网络往返×2"| MID[⚠️ 中等]
+    J --> D[方案D 代理层 Shuffle Join<br/>拉全量到内存排序合并] --> BAD[❌ 高危慎用]
+```
+
+| 方案 | 原理 | 代价 | 适用 |
+|------|------|------|------|
+| 全局表（global） | 每个 shard 存全量副本，JOIN 本地完成 | 写放大 = 分片数；仅适合低频更新小表 | 地区/配置/权限表 |
+| ER 分片（childTable） | 子表按父表分片键同片存储 | 设计期约束强；扩容必须整组迁移 | 订单↔订单项、用户↔收货地址 |
+| 应用层组装 | 各查各的，代码内存 JOIN | 多一次 RTT；应用内存压力 | 中小结果集、灵活多变查询 |
+
+> MyCat 的 `childTable` 配置只在 schema.xml 生效于 INSERT 路由校验，**UPDATE 不保证同片**——这是很多团队上线后才发现的暗坑，需 SQL 审核兜住。
+
+---
+
+## Vitess keyspace 概念与垂直拆分实操
+
+```text
+Keyspace ≈ 「逻辑数据库」：
+  - 单体时代：所有表在一个 commerce keyspace
+  - 垂直拆分：customer 表族迁往 customer keyspace，order 表族迁往 orders keyspace
+  - keyspace 可以是 unsharded（单分片，行为≈原生 MySQL）或 sharded
+  - VSchema 里每个 table 归属一个 keyspace；VTGate 据此做跨 keyspace 路由
+```
+
+垂直拆分实操路径：
+
+```bash
+# 目标：把 commerce.customer 拆成独立 customer keyspace
+# 1. 新建 unsharded keyspace customer（MySQL 主从 + VTTablet 由 vitess-operator 拉起）
+vtctldclient CreateKeyspace --durability-policy=none customer
+
+# 2. MoveTables 从 commerce 复制 customer 相关表（见上文工作流）
+vtctldclient MoveTables create --source-keyspace=commerce \
+  --tables='customer.*' --workflow=cust_split customer
+
+# 3. VDiff 校验 → switchtraffic → complete
+# 4. 之后 customer 与 commerce 之间跨库 JOIN 会退化为 VTGate 的跨 keyspace 查询
+#    （性能差），应改为服务边界隔离或冗余字段
+```
+
+> 与传统「拆库」的区别：keyspeed 迁移期间新旧两份同时存在且实时同步，应用连接串完全不用改——VTGate 按 VSchema 路由，这是 Vitess 垂直拆分「无感」的本质。
+
+---
+
+## 连接模型差异（MyCat 前端代理 vs Vitess VTGate）
+
+```mermaid
+flowchart LR
+    subgraph MyCat模型
+        APP1[App ×500连接] --> MY[MyCat]
+        MY -->|前后端连接 1:N 绑定<br/>事务期间独占| DB1[(MySQL×4)]
+    end
+    subgraph Vitess模型
+        APP2[App ×500连接] --> VG[VTGate 无状态×3]
+        VG -->|每语句借还连接<br/>连接池收敛| TT[VTTablet 池化]
+        TT --> DB2[(MySQL×N)]
+    end
+```
+
+| 维度 | MyCat | Vitess VTGate+VTTablet |
+|------|-------|------------------------|
+| 前端协议 | MySQL 协议伪装 | MySQL 协议伪装 |
+| 事务内连接 | 占住一条后端连接直到 commit | 同样绑定，但 tablet 层有严格池上限 |
+| 长事务影响 | 直接耗尽后端连接池 | tablet 池保护其他会话，但事务本身仍受限 |
+| 连接收敛能力 | 有限（前端:后端 ≈ 固定配比） | 强（两层池化，YouTube 级海量前端连接验证） |
+| 无状态扩展 | 单点多活需 HAProxy/VIP | VTGate 天然无状态，随意横向加节点 |
+
+---
+
+## 国产替代品现状：Apache ShardingSphere 对比补充
+
+| 维度 | MyCat | Vitess | ShardingSphere-JDBC | ShardingSphere-Proxy |
+|------|-------|--------|---------------------|---------------------|
+| 形态 | 独立代理进程 | K8s 原生组件族 | 应用内 SDK（jar 包） | 独立代理进程 |
+| 性能损耗 | 一跳代理 ~20-30% | 两层代理但优化深 | 几乎无损（进程内） | 同代理损耗 |
+| 社区活跃度 | 维护放缓 | CNCF 毕业、全球生产 | Apache 顶级项目、国内主流 ⭐ | 同左 |
+| 在线扩容 | 手工 ETL | VReplication 全自动 | 依赖外部工具 | 依赖外部工具 |
+| 分布式事务 | XA 弱 | 2PC | XA + BASE（Seata 兼容） | 同 JDBC |
+| 典型用户 | 传统中小企业存量 | YouTube/Slack/国内云厂商 | 国内互联网广泛使用 | 金融/政企混合部署 |
+
+**现状结论**：新项目国产选型基本收敛到 **ShardingSphere 双形态**（JDBC 保性能、Proxy 兼异构语言）；MyCat 定位退化为存量维护；需要 K8s 云原生与在线 re-shard 则直接上 Vitess。
+
+---
+
 ## 与其他板块的关系
 
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

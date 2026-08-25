@@ -590,7 +590,212 @@ RocketMQ：
 
 ---
 
-## 十一、与其他板块的关系
+## 十一、Artemis 日志型存储架构 vs Classic KahaDB（存储内核深拆）
+
+### 11.1 两种内核的文件布局
+
+```
+KahaDB（Classic 5.x 默认存储）：
+  db.data        元数据索引（页式 B-Tree，随机读写）
+  db-*.log       消息数据日志（append，但索引维护产生随机 IO）
+  db.free/db.redo 空闲页/恢复日志
+  问题：消息写入 = append log + 更新 B-Tree 索引
+       → 大队列下索引页随机 IO 放大，checkpoint 变慢
+
+Artemis Journal（6.x 默认）：
+  *.journal      固定大小数据文件组（默认 10MB × N 个，NIO/AIO 直写）
+  *.bindings     绑定/元数据独立 journal
+  large-messages 大消息旁路目录
+  特点：
+    - 纯 append-only 顺序写 + O_DIRECT，绕过 OS 页缓存双写
+    - 消息删除只置 tombstone，journal 文件整体变空后整文件回收（无 compaction 停顿）
+    - 重启只需校验未完成事务边界 → 秒级恢复
+```
+
+### 11.2 关键差异对照
+
+| 维度 | Classic KahaDB | Artemis Journal |
+|------|----------------|-----------------|
+| 写路径 | append + B-Tree 索引更新（混合随机 IO） | 纯顺序 append |
+| 吞吐上限 | 万级 msg/s 封顶 | 十万级 msg/s（AIO + 批量写） |
+| 大积压启动 | 分钟级（重放校验索引） | 秒级 |
+| 文件回收 | 需 compact 手动触发 | 自动整文件 reclaim |
+| 多队列隔离 | 单库争抢 | 可按 address 分 journal 缓冲 |
+
+> 迁移提示：Artemis 提供 `artemis migrate` 与 Journal 导入工具，但**跨内核迁移本质是数据重灌**——按「新集群并行 → 双写/桥接 → 切流」走，不要原地换二进制。
+
+---
+
+## 十二、JMS 2.0 共享订阅矩阵（含共享非持久订阅）
+
+JMS 1.1 的 Topic 持久订阅只允许单消费者，无法水平扩展；JMS 2.0 补齐了 Shared Subscription：
+
+| 订阅形态 | API | 并发消费者 | 掉线补收 | 适用场景 |
+|----------|-----|-----------|----------|----------|
+| 非持久订阅 | `createConsumer(topic)` | 各自独立收全量 | ❌ 在线才收 | 临时通知、实时行情 |
+| 持久订阅 | `createDurableConsumer` | **仅 1 个** | ✅ | 单实例可靠消费 |
+| **共享非持久订阅** | `createSharedConsumer(topic, name)` | ✅ 组内负载分担 | ❌ 全员掉线即丢 | 广播事件的并行消费（容忍丢失） |
+| 共享持久订阅 | `createSharedDurableConsumer(topic, name)` | ✅ 负载分担 | ✅ 订阅维度补收 | Topic 上做「逻辑队列」，最常用 ⭐ |
+
+```java
+// JMS 2.0 共享持久订阅：多实例消费同一订阅名，Broker 内自动负载均衡
+JMSContext ctx = cf.createContext("app", "pwd");
+ctx.createSharedDurableConsumer(ctx.createTopic("orders.events"), "order-svc-sub")
+   .setMessageListener(msg -> handle(msg.getBody(String.class)));
+// 注意：同一 name 的所有消费者构成一个"组"，等价于 Kafka 的 consumer group；
+// 但非持久共享订阅没有 offset 回溯能力——这是与 Kafka 的本质差距。
+```
+
+---
+
+## 十三、消息组顺序消费实战（Message Groups 深入）
+
+```text
+语义：携带相同 JMSXGroupID 的消息固定路由到同一消费者，组内严格有序。
+分配机制（Artemis）：
+  1. Broker 维护 groupid → consumer 的路由表
+  2. 新 GroupID 到达 → 按"最少分组数"挑消费者并绑定
+  3. 消费者关闭 → 其绑定组自动迁移到剩余消费者（failover 时序内保序）
+  4. 消费者处理完当前组的消息才可能接收新组（组间并行、组内串行）
+
+生产三坑：
+  ① GroupID 设计要均匀（用 orderId/userId，别用固定值）→ 否则退化成单消费者
+  ② 消费端必须单线程处理该组（或按组 hash 到本地内存队列），否则顺序仍被打破
+  ③ 重投消息与原消息竞争时，Artemis 用 group-first 优先清空原组再投新组
+```
+
+```xml
+<!-- Artemis address-setting：开启本地消息组 + 失败迁移 -->
+<address-settings>
+  <address-setting match="order.queue">
+    <group-buckets>16</group-buckets>          <!-- 组桶数，建议=消费者数×2 -->
+    <group-rebalance>true</group-rebalance>    <!-- 消费者变化时重新分配组 -->
+    <group-rebalance-pause-dispatch>-1</group-rebalance-pause-dispatch>
+  </address-setting>
+</address-settings>
+```
+
+---
+
+## 十四、慢消费者处理策略（游标 / Paging / 限流）
+
+```mermaid
+flowchart TB
+    P[Producer 高速写入] --> MEM{内存缓冲<br/>address-full-policy}
+    MEM -->|BLOCK| B[阻塞发送端 流控]
+    MEM -->|PAGE| PG[溢出落盘 paging 文件]
+    MEM -->|DROP/FAIL| D[丢弃或报错]
+    PG --> C[慢消费者从磁盘游标读取]
+    B --> C
+```
+
+| 参数（artemis.xml address-setting） | 含义 | 生产建议 |
+|--------------------------------------|------|----------|
+| `max-size-bytes` | 内存驻留上限 | 按堆外内存预算设（如 512MB/queue） |
+| `page-size-bytes` | 每个分页文件大小 | 默认 10MB；大消息调大减少文件数 |
+| `address-full-policy` | PAGE/BLOCK/DROP/FAIL | 业务队列 PAGE，实时流 BLOCK |
+| `max-delivery-attempts` | 重投次数后进 DLQ | 配合 `<expiry-address>` 兜底 |
+| `consumer-window-size` | 消费者预取窗口 | 慢消费者调小（如 0=逐条拉），避免消息被一个慢消费者囤积 |
+
+```text
+排查慢消费者的三板斧：
+  1. artemis queue stat 看 deliveringCount —— 数值大说明消息压在客户端没 ack
+  2. 看 paging 状态（PagingStore）—— 进入 paging 说明内存已满在落盘
+  3. 抓消费者线程栈/JFR —— 常见根因：下游 RPC 慢、事务过长、单线程瓶颈
+```
+
+---
+
+## 十五、Artemis 集群拓扑（master-slave 与 scale-down）
+
+```mermaid
+flowchart LR
+    subgraph DC-A["机房A live-backup 对"]
+        M1[live-1] -.共享存储/复制.- S1[backup-1]
+    end
+    subgraph DC-B["机房B live-backup 对"]
+        M2[live-2] -.复制.- S2[backup-2]
+    end
+    M1 <-->|cluster-connection 双向桥接| M2
+    APP[应用 failover: static:// (live-1,live-2)] --> M1
+```
+
+| 拓扑方案 | 原理 | 优点 | 代价 |
+|----------|------|------|------|
+| 主备共享存储（shared-store） | backup 等 live 的锁（NFS/ SAN） | 数据零丢失 | 存储是单点，需高可用盘 |
+| 主备复制（replication） | 同步复制 journal 到 backup | 无共享存储依赖 | 写延迟增加，脑裂需 quorum 仲裁 |
+| 集群对称拓扑（cluster-connection） | N 个 live 互联，消息按需负载均衡转发 | 水平扩容+就近消费 | 配置复杂，注意环路 |
+| scale-down / scale-up | `scale-down-to` 把备份的消息合并回目标 broker 后自杀 | 收缩集群免手工搬数 | 仅同版本可用，执行期间有延迟抖动 |
+
+```bash
+# 触发 scale-down（把本节点队列迁给集群内其他节点）
+artemis scale-down --url tcp://target-host:61616
+# 主备切换状态检查
+artemis check node --url tcp://live:61616 --up
+```
+
+---
+
+## 十六、Spring JMS 集成模板代码
+
+```java
+@Configuration
+@EnableJms
+public class ArtemisConfig {
+
+    @Bean
+    public JmsListenerContainerFactory<?> queueFactory(ConnectionFactory cf,
+                                                       DefaultJmsListenerContainerFactoryConfigurer cfg) {
+        DefaultJmsListenerContainerFactory f = new DefaultJmsListenerContainerFactory();
+        cfg.configure(f, cf);
+        f.setSessionAcknowledgeMode(Session.CLIENT_ACKNOWLEDGE); // 手动确认防丢
+        f.setConcurrency("2-8");                                  // 弹性并发
+        return f;
+    }
+}
+
+@Service
+public class OrderSender {
+    private final JmsTemplate jmsTemplate;
+    public void send(OrderEvent evt) {
+        jmsTemplate.setDeliveryPersistent(true);
+        jmsTemplate.convertAndSend("orders", evt, m -> {
+            m.setStringProperty("JMSXGroupID", evt.getOrderId()); // 消息组保序
+            return m;
+        });
+    }
+}
+
+@Component
+public class OrderListener {
+    @JmsListener(destination = "orders", containerFactory = "queueFactory")
+    public void onMessage(Message msg, Session session) throws Exception {
+        try { /* 幂等业务处理 */ }
+        catch (Exception e) { session.recover(); }   // 触发重投，超次进 DLQ
+    }
+}
+```
+
+---
+
+## 十七、企业遗留系统迁移评估清单
+
+| 评估项 | 检查内容 | 风险等级 |
+|--------|----------|----------|
+| 协议依赖 | 是否只用 OpenWire？有无 STOMP/C++ 客户端硬编码 | 高（决定客户端改造量） |
+| JMS 版本 | 1.1 API 还是已用 2.0 Context | 中（影响代码改写面） |
+| ObjectMessage | 有多少处 Java 序列化对象传输 | 高（安全+兼容双重雷区） |
+| XA 事务 | 是否依赖 JTA/XA 两阶段提交 | 高（Artemis 支持但性能模型不同） |
+| Selector 使用 | 深度 selector 过滤的队列清单 | 中（Artemis 行为略有差异） |
+| Virtual Topics | 5.x VirtualTopic 命名约定依赖 | 中（Artemis 用 FQQN 替代，需映射） |
+| KahaDB 数据量 | 存量积压消息规模 | 决定迁移窗口长度 |
+| 监控告警 | JMX 指标采集脚本绑定关系 | 低 |
+
+**迁移路线建议**：评估清单打分 → 搭建 Artemis 并行环境 → Network of Brokers 桥接灰度流量 → 按应用逐个切连接串 → 观察 2 周 → 下线 5.x。全程保留回退开关（客户端 failover URL 同时指向新旧两套）。
+
+---
+
+## 十八、与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；
 - AMQP 协议生态见「[RabbitMQ](./RabbitMQ.md)」；

@@ -207,7 +207,310 @@ flowchart LR
 
 ---
 
-## 七、速查表
+## Kafka 副本放置策略与机架感知
+
+### 副本放置原则
+
+```
+Kafka 副本放置 = 决定 Follower 副本落在哪个 Broker
+
+默认策略：
+  第一个副本：随机分配到 Broker（或指定 Leader）
+  后续副本：依次分配到不同 Broker（轮询）
+  约束：同一 Partition 的副本不在同一 Broker
+
+机架感知（Rack Awareness）：
+  每个 Broker 配置机架 ID
+  → 副本尽量分布在不同机架
+  → 机架故障时数据不丢
+
+配置：
+  broker.rack=/rack1  # broker.properties
+```
+
+### 机架感知配置
+
+```properties
+# broker.properties
+broker.rack=/rack1
+
+# 或通过环境变量
+KAFKA_BROKER_RACK=/rack1
+```
+
+### 副本放置策略对比
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| 默认轮询 | 副本依次分配到不同 Broker | 无机架约束 |
+| 机架感知 | 副本分布在不同机架 | 跨机房/跨 AZ |
+| 同区域优先 | 副本优先同可用区 | 低延迟 |
+| 跨区域 | 副本跨区域分布 | 高可用 |
+
+> **口诀：副本放置 = "让数据住得分散"——默认轮询防单 Broker 故障，机架感知防单机架故障。**
+
+---
+
+## __consumer_offsets 内部机制
+
+### 存储原理
+
+```
+__consumer_offsets = Kafka 内部 Topic（50 个分区，默认 __consumer_offsets）
+
+存储内容：
+  消费组的位移信息（offset）
+  消费组的元数据（group metadata）
+
+位移提交流程：
+  Consumer 处理完消息 → 调用 commitSync/commitAsync
+  → 发送位移到 __consumer_offsets
+  → Broker 持久化
+
+位移存储格式：
+  Key: group_id + topic + partition
+  Value: offset + metadata + timestamp
+
+位移查找：
+  1. Consumer 启动 → 向 Coordinator 发 JoinGroup
+  2. Coordinator 找到 __consumer_offsets 中该组的位移
+  3. 返回位移 → Consumer 从该位置开始消费
+```
+
+### 位移提交最佳实践
+
+```java
+// 手动提交位移（推荐）
+consumer.commitSync();  // 同步提交（可靠）
+consumer.commitAsync(); // 异步提交（快但可能失败）
+
+// 按分区提交位移
+Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+for (ConsumerRecord<String, String> record : records) {
+    offsets.put(
+        new TopicPartition(record.topic(), record.partition()),
+        new OffsetAndMetadata(record.offset() + 1)  // 下一条待消费
+    );
+}
+consumer.commitSync(offsets);  // 按分区精确提交
+```
+
+| 提交方式 | 优点 | 缺点 | 适用 |
+|----------|------|------|------|
+| 自动提交 | 简单 | 可能丢数据 | 开发测试 |
+| 同步提交 | 可靠 | 慢（等确认） | 生产推荐 |
+| 异步提交 | 快 | 可能失败 | 高吞吐场景 |
+| 按分区提交 | 精确 | 复杂 | 精确控制 |
+
+> **口诀：__consumer_offsets = Kafka 的"记忆本"——记录每个消费组消费到哪了，手动提交位移是防丢数据的关键。**
+
+---
+
+## KIP-848 新消费者协议
+
+### 协议变化
+
+```
+KIP-848 = 新版 Consumer Group 协议（Kafka 3.7+）
+
+旧协议（Eager Rebalance）：
+  所有 Consumer 停止消费 → Rebalance → 所有 Consumer 恢复
+  问题：Rebalance 期间全组暂停，消费延迟
+
+新协议（Cooperative Rebalance）：
+  分步 Rebalance：只停止受影响的分区
+  未受影响的分区继续消费
+  优势：减少 Rebalance 影响范围
+
+KIP-848 进一步改进：
+  ① Incremental Rebalance：增量 Rebalance
+  ② Static Membership 增强：实例重启不触发全组 Rebalance
+  ③ 新的 GroupCoordinator：更好的分区分配
+```
+
+### 新旧协议对比
+
+| 维度 | 旧协议 Eager | 新协议 Cooperative |
+|------|-------------|-------------------|
+| Rebalance 方式 | 全组暂停 | 增量（只停受影响分区） |
+| 消费中断 | 全组暂停 | 仅受影响分区暂停 |
+| 恢复速度 | 慢 | 快 |
+| 兼容性 | 所有版本 | Kafka 3.7+ |
+
+```properties
+# 启用新协议
+group.protocol=consumer  # 使用新协议
+session.timeout.ms=45000  # 会话超时
+heartbeat.interval.ms=3000 # 心跳间隔
+```
+
+> **口诀：KIP-848 = "增量 Rebalance"——只停受影响的分区继续消费，比全组暂停的旧协议影响小得多。**
+
+---
+
+## quota 限速配置（producer/consumer/fetch）
+
+### Quota 类型
+
+| Quota 类型 | 限速对象 | 参数 |
+|-----------|---------|------|
+| Producer Byte Rate | 生产者写入速率 | producer_byte_rate |
+| Consumer Byte Rate | 消费者读取速率 | consumer_byte_rate |
+| Request Percentage | 请求处理占比 | request_percentage |
+
+### 配置示例
+
+```bash
+# 全局 Quota
+kafka-configs.sh --alter --add-config 'producer_byte_rate=10485760' \
+  --entity-type users --entity-default
+
+# 按用户 Quota
+kafka-configs.sh --alter --add-config 'producer_byte_rate=5242880,consumer_byte_rate=10485760' \
+  --entity-type users --entity-name alice
+
+# 按客户端 ID Quota
+kafka-configs.sh --alter --add-config 'producer_byte_rate=10485760' \
+  --entity-type clients --entity-name 'my-producer-*'
+
+# 查看 Quota
+kafka-configs.sh --describe --entity-type users --entity-name alice
+```
+
+### Quota 工作机制
+
+```
+Quota 超限处理：
+  ① Broker 检测到请求超过 Quota
+  ② 不立即拒绝（Kafka 选择延迟响应）
+  ③ 延迟时间 = 超限量 / Quota
+  ④ 客户端感知到延迟 → 自动降速
+
+效果：
+  不丢消息，只是变慢
+  平滑限速，不会突然断连
+```
+
+| Quota 场景 | 建议值 | 说明 |
+|-----------|--------|------|
+| 生产者限速 | 10~50 MB/s | 防写满磁盘/带宽 |
+| 消费者限速 | 50~200 MB/s | 防读满网卡/CPU |
+| 全局限速 | 按集群容量 70% | 预留缓冲 |
+
+> **口诀：Quota = "Kafka 的限速带"——超限不丢消息只是变慢，客户端自动降速，防止单个客户端打垮集群。**
+
+---
+
+## Kafka Raft metadata 主题与快照
+
+### KRaft 元数据架构
+
+```
+KRaft 模式 = Kafka 自研 Raft 协议管理元数据
+
+元数据主题：__cluster_metadata（单分区，多副本）
+  存储：集群所有 Topic/Partition/Broker 元数据
+  一致性：Raft 协议保证（Leader + Follower）
+
+Controller Quorum：
+  3~5 个 Controller 节点（奇数）
+  Leader Controller 负责元数据变更
+  Follower 同步元数据
+
+快照（Snapshot）：
+  定期将元数据状态压缩为快照
+  新节点加入 → 从快照恢复 → 增量同步
+  避免回放全量日志
+```
+
+### KRaft vs ZooKeeper 对比
+
+| 维度 | ZooKeeper | KRaft |
+|------|-----------|-------|
+| 依赖 | 需单独部署 ZK 集群 | 内置 Raft |
+| 性能 | 元数据操作受 ZK 限制 | 原生性能更好 |
+| 分区上限 | ~200K 分区 | ~200 万分区 |
+| 故障恢复 | ZK 选主慢 | Raft 选主快 |
+| 运维 | 两套系统（ZK + Kafka） | 一套系统 |
+| 成本 | ZK 集群额外资源 | 节省 ZK 资源 |
+
+```bash
+# KRaft 部署（单节点示例）
+KAFKA_CLUSTER_ID=$(kafka-storage.sh random-uuid)
+kafka-storage.sh format -t $KAFKA_CLUSTER_ID -c kraft-server.properties
+kafka-server-start.sh kraft-server.properties
+```
+
+> **口诀：KRaft = "用 Raft 替代 ZK"——部署更简单，分区上限提升 10x，是 Kafka 未来的方向。**
+
+---
+
+## MirrorMaker2 跨集群拓扑设计
+
+### 拓扑模式
+
+```
+MirrorMaker2（MM2）= Kafka 官方跨集群复制工具
+
+模式一：双向复制（Active-Active）
+  Cluster A ←→ MM2 ←→ Cluster B
+  适用于：多活架构，两地三中心
+
+模式二：中心辐射（Hub-Spoke）
+  Cluster A → MM2 → Hub Cluster → MM2 → Cluster B
+  适用于：集中处理，总部汇聚
+
+模式三：链式复制
+  Cluster A → MM2 → Cluster B → MM2 → Cluster C
+  适用于：多级部署，边缘→区域→总部
+```
+
+### MM2 配置
+
+```properties
+# mm2.properties
+clusters = us-east, us-west
+us-east.bootstrap.servers = broker-us-east:9092
+us-west.bootstrap.servers = broker-us-west:9092
+
+us-east->us-west.enabled = true
+us-west->us-east.enabled = true
+
+us-east->us-west.topics = orders.*, users.*
+us-west->us-east.topics = orders.*, users.*
+
+# 复制策略
+replication.factor = 3
+sync.topic.configs.enabled = true
+offset.lag.max = 1000
+
+# 复制频率
+emit.heartbeats.interval.seconds = 1
+refresh.topics.interval.seconds = 300
+```
+
+### MM2 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| Source Cluster | 数据源集群 |
+| Target Cluster | 数据目标集群 |
+| Internal Topic | MM2 内部主题（__consumer_offsets, checkpoints） |
+| Heartbeat Topic | 心跳主题（检测复制延迟） |
+| Checkpoint Topic | 位移映射主题 |
+
+```bash
+# 启动 MM2
+connect-mirror-maker mm2.properties
+
+# 监控复制延迟
+kafka-consumer-groups --bootstrap-server broker:9092 \
+  --describe --group mm2-connect-cluster
+```
+
+> **口诀：MirrorMaker2 = "Kafka 的数据搬运工"——双向复制做多活，中心辐射做汇聚，关键是配好 topics 白名单和 offset 映射。**
+
+## 六、与其他板块的关系（扩展）
 
 | 项 | 结论 |
 |----|------|

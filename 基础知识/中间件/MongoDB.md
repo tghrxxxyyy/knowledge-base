@@ -568,6 +568,178 @@ Atlas = MongoDB 官方全托管云服务（AWS/Azure/GPC）
 
 ---
 
+## 进阶专题 A：聚合管道 $lookup 性能陷阱与优化
+
+`$lookup` 是类 SQL LEFT JOIN，但 JOIN 发生在 mongod 内存中，是聚合管道里最容易拖垮性能的阶段。
+
+| 陷阱 | 表现 | 根因 |
+|------|------|------|
+| foreignField 无索引 | CPU 打满、慢查询告警 | 每条驱动文档都对被查集合做 COLLSCAN |
+| 驱动集合过大 | 内存超限报错（allowDiskUse 也救不了延迟） | 先 $lookup 后过滤，处理百万级中间结果 |
+| as 数组爆炸 | 文档逼近 16MB 上限 | 一对多未 $unwind+$group 收敛 |
+| 多层 $lookup 嵌套 | 延迟指数级放大 | N+1 式关联在 DB 内复现 |
+
+**优化三板斧**
+
+```javascript
+// 1. foreignField 必须有索引（自定义关联键，不是 _id 时尤其要建）
+db.users.createIndex({ member_no: 1 })
+
+// 2. $match/$limit/$project 前置，把驱动集合压到最小
+db.orders.aggregate([
+  { $match: { status: "PAID", created_at: { $gte: ISODate("2026-08-01") } } }, // 先过滤
+  { $limit: 10000 },                                                            // 再限量
+  { $project: { user_id: 1, amount: 1 } },                                      // 再瘦身
+  { $lookup: {                                                                  // 最后才 JOIN
+    from: "users",
+    localField: "user_id",
+    foreignField: "_id",
+    pipeline: [{ $project: { name: 1, level: 1 } }],   // pipeline 形式可同时投影
+    as: "user"
+  }},
+  { $unwind: "$user" }
+])
+
+// 3. 数据量大时放弃 $lookup，改应用层两步查询（先查 orders 再 $in 查 users）
+const userIds = orders.map(o => o.user_id)
+const users = await db.users.find({ _id: { $in: userIds } }).toArray() // 一次批量 IN
+```
+
+**决策阈值**：驱动集合过滤后 < 1 万行可用 `$lookup`；1 万～10 万谨慎并压测；> 10 万改应用层批量查询或建模期嵌入冗余字段（空间换时间）。
+
+```mermaid
+flowchart LR
+    M[$match 过滤] --> L[$limit 截断]
+    L --> P[$project 瘦身]
+    P --> IX{foreignField<br/>有索引?}
+    IX -->|有| FAST[IXSCAN 点查<br/>毫秒级]
+    IX -->|无| SLOW[COLLSCAN × N<br/>灾难]
+```
+
+---
+
+## 进阶专题 B：索引交集与 ESR 规则（Equality-Sort-Range）
+
+MongoDB 每个查询通常只用一个索引（多计划竞争后选优），**索引交集（Index Intersection）虽存在但不可靠**——优化器可能用 `AND_SORTED`/`AND_HASH` 合并多个单字段索引，但代价高、不稳定，**正确做法是显式建复合索引**。复合索引字段排序遵循 **ESR 原则**：
+
+| 位置 | 含义 | 示例条件 |
+|------|------|----------|
+| **E**quality | 等值过滤字段放最前 | `{ status: "PAID" }` |
+| **S**ort | 排序字段放中间 | `sort({ created_at: -1 })` |
+| **R**ange | 范围字段放最后 | `{ amount: { $gt: 100 } }` |
+
+```javascript
+// 查询：等值 status + 排序 created_at + 范围 amount
+db.orders.find({ status: "PAID", amount: { $gt: 100 } })
+         .sort({ created_at: -1 })
+
+// ✅ 按 ESR 建索引：一次扫描即有序，无需内存排序（无 SORT stage）
+db.orders.createIndex({ status: 1, created_at: -1, amount: 1 })
+
+// ❌ 反例：范围字段夹在中间，排序无法利用索引（出现 SORT stage + 内存限制 100MB）
+db.orders.createIndex({ status: 1, amount: 1, created_at: -1 })
+```
+
+**explain 检验要点**：`winningPlan` 中应看到 `IXSCAN` 且无 `SORT`；`totalKeysExamined ≈ nReturned` 为理想状态；`totalDocsExamined` 远大于返回数说明选择性差。
+
+---
+
+## 进阶专题 C：分片键选择反例复盘
+
+```mermaid
+flowchart TB
+    subgraph 反例1["反例1: 单调递增键 {created_at: 1}"]
+        W1[新写入] --> S3[永远落在最后一个 chunk<br/>单分片热点 写入打满]
+        S1[分片1 冷数据] -.-> S2[分片2] -.-> S3
+    end
+```
+
+| 反例 | 键选择 | 后果 | 正确姿势 |
+|------|--------|------|----------|
+| 单调递增 | 自增 id / created_at / ObjectId | 所有新写集中到最后一个分片，balancer 追不上 | 哈希分片打散：`{ user_id: "hashed" }` |
+| 低基数 | `{ status: 1 }`（仅 3 种取值） | chunk 无法分裂，数据倾斜 | 复合键补高基数字段 |
+| 查询不带键 | 分片键选了 region，但查询都按 user_id | 全分片广播路由（scatter-gather），延迟翻倍 | 分片键=高频查询必带字段，或加二级投影 |
+| 频繁变更 | 用手机号当分片键，用户换号 | 更新分片键代价极高（跨片迁移） | 选稳定不变的业务标识 |
+
+**复盘结论**：分片键定了几乎不可改（在线 refine 可缓解但受限），上线前必须用「写入分布模拟 + Top 查询模式审计」双验证；通用安全解是 `{ 高基数业务键: "hashed" }`，牺牲范围查询换均匀写入。
+
+---
+
+## 进阶专题 D：Change Stream 在缓存失效中的应用
+
+比「删缓存」更优雅的缓存一致性方案：应用只管写库，由独立的 invalidator 监听 Change Stream 精准失效 Redis key，避免定时轮询的延迟与双写的侵入。
+
+```javascript
+// cache-invalidator 服务
+const stream = db.collection("products").watch(
+  [{ $match: { operationType: { $in: ["update", "replace", "delete"] } } }],
+  { fullDocumentBeforeChange: "whenAvailable" }
+);
+
+stream.on("change", async (evt) => {
+  const key = `cache:product:${evt.documentKey._id}`;
+  await redis.del(key);            // 失效而非更新：下次读时回源重建，避免并发写乱序
+  checkpoint.save(evt._id);        // resume token 持久化，重启断点续传
+});
+```
+
+| 要点 | 说明 |
+|------|------|
+| 失效优先于更新缓存 | 删 key 让读路径回源，天然规避「旧值覆盖新值」竞态 |
+| resume token 必须落盘 | 否则服务重启从最新位置开始，漏掉窗口内的变更 |
+| oplog 窗口 | 停机时间超过 oplog 容量则 token 失效，只能全量重建缓存兜底 |
+| 读旧风险 | 失效到回源之间仍可能有并发读到旧值，强一致需求需版本号比对 |
+
+---
+
+## 进阶专题 E：副本集成员角色详解（hidden / delayed / arbiters）
+
+| 角色 | 配置 | 数据 | 投票 | 用途 |
+|------|------|------|------|------|
+| Hidden | `priority: 0, hidden: true` | 有 | 有 | 专供备份/报表，客户端路由永不感知它 |
+| Delayed | `priority: 0, secondaryDelaySecs: 3600` | 滞后 1h | 有 | 误操作人肉保险丝（drop 库后还能从延迟节点捞数据） |
+| Arbiter | `arbiterOnly: true` | **无数据** | 有 | 偶数节点凑多数派，防脑裂；本身不抗数据丢失 |
+
+```javascript
+cfg = rs.conf()
+// 隐藏备份节点
+cfg.members[2].priority = 0
+cfg.members[2].hidden = true
+// 延迟节点
+cfg.members[3].priority = 0
+cfg.members[3].secondaryDelaySecs = 3600
+rs.reconfig(cfg)
+```
+
+**生产组合建议**：标准 3 节点 PSS（Primary+Secondary+Secondary）；需要备份隔离时扩为 PSSS（第 4 个 hidden）；资源不足偶数场景再加 Arbiter——但记住 arbiter 不能提供数据冗余，只是选举权。
+
+---
+
+## 进阶专题 F：备份三方案对比（mongodump / 存储快照+oplog / Atlas 及 PBM）
+
+| 维度 | 方案① mongodump | 方案② 文件系统/云盘快照 + oplog | 方案③ Atlas / Percona Backup for MongoDB |
+|------|-----------------|-------------------------------|------------------------------------------|
+| 原理 | 逻辑导出 BSON | 块设备瞬时快照 + 快照间 oplog 重放实现 PITR | 物理备份代理 + oplog 流（PBM）/ 全托管 PITR |
+| 备份速度 | 慢（随数据量线性恶化，TB 级不可接受） | 秒级（COW 快照，与数据量无关） | 快（物理流式） |
+| 恢复粒度 | 集合/库级灵活 | 整实例级 | 实例/时间点 |
+| PITR 能力 | 无（只能恢复 dump 时刻） | 有（任意秒级时间点） | 有（连续 oplog） |
+| 对线上影响 | 读压力 + 缓存污染 | 几乎无（瞬间冻结 IO） | 低（专用 agent） |
+| 成本 | 低（免费工具） | 中（快照存储费） | 商业版收费 / Atlas 按用量 |
+| 适用 | 小规模、单集合导出迁移 | 自建中大规模主流方案 | 云托管或企业级自建 |
+
+```bash
+# 方案②典型流水线：快照 + binlog 式连续保护
+# 1. fsyncLock 冻结写（可选，LVM/云盘一般不需要）→ 打快照 → 解冻
+# 2. 恢复任意时间点：还原最近快照 → 用 oplog 重放到目标 ts
+mongorestore --oplogReplay --nsInclude "shop.*" dump/
+# 方案③ Percona Backup 定时任务
+pbm config --set storage.type=s3 && pbm backup --type=physical
+```
+
+**选型口诀**：小库 mongodump 凑合，自建上快照+oplog 做 PITR，云上直接 Atlas/PBM——**任何方案都要定期做恢复演练，没验证过的备份等于没有备份**。
+
+---
+
 ## 十九、与其他板块的关系（扩展）
 
 - 与 [MySQL](../mysql知识.md)、[Redis](../redis知识.md)：MongoDB 补「文档/半结构 + 水平扩展」，Redis 补缓存/高性能 KV，MySQL 保强事务。

@@ -408,6 +408,195 @@ spec:
 
 > 口诀：Operator 把「老手的运维经验」写成控制器——集群自己会按最佳实践照顾有状态服务。
 
+## 补充：镜像构建策略对比
+
+### VM docker build vs Kaniko vs Buildah
+
+| 工具 | 需要 Docker daemon | 运行环境 | 缓存支持 | 安全性 | 适用场景 |
+|------|-------------------|----------|----------|--------|----------|
+| **docker build** | 是（挂载 docker.sock） | 需 Docker 环境 | BuildKit 缓存 | 低（daemon root 权限） | 本地开发/CI 有 Docker 环境 |
+| **Kaniko** | 否 | 容器内运行 | GCS/S3 仓库缓存 | 高（无 daemon，非特权） | K8s CI（Jenkins/GitLab） |
+| **Buildah** | 否 | Podman 兼容 | --layers 缓存 | 高（rootless） | OpenShift/无 daemon 场景 |
+| **BuildKit** | 否（独立守护进程） | 独立进程 | 本地/远程缓存 | 中高（secret mount） | 需高级缓存/并行构建 |
+
+```mermaid
+flowchart TB
+    subgraph docker-build[docker build]
+        D1[需要 Docker daemon]
+        D2[docker.sock 暴露]
+        D3[root 权限]
+    end
+    subgraph kaniko[Kaniko]
+        K1[容器内运行]
+        K2[无 daemon]
+        K3[非特权]
+    end
+    subgraph buildah[Buildah]
+        B1[rootless 构建]
+        B2[Podman 兼容]
+        B3[OCI 镜像输出]
+    end
+    docker-build -->|攻击面大| RISK[风险高]
+    kaniko -->|CI 推荐| SAFE[安全]
+    buildah -->|OpenShift| SAFE
+```
+
+### 多阶段构建瘦身实测数据
+
+| 阶段 | 基础镜像 | 最终大小 | 攻击面 |
+|------|----------|----------|--------|
+| 构建阶段 | `golang:1.23` | ~1.2GB（不进入最终镜像） | — |
+| 运行阶段 | `alpine:3.19` | ~15MB | 中（含 shell/包管理） |
+| 运行阶段 | `distroless/static` | ~2MB | 极小（无 shell） |
+| 运行阶段 | `chainguard/static` | ~2MB | 极小（可审计供应链） |
+| Java 多阶段 | `maven:3.9` → `eclipse-temurin:17-jre` | ~180MB | 中 |
+| Java 多阶段 | `maven:3.9` → `distroless/java17` | ~150MB | 小 |
+
+> 口诀：**distroless 是最小攻击面，alpine 是折中，ubuntu/debian 是反模式**。
+
+## 补充：K8s 清单管理工具对比
+
+### Helm / Kustomize / cdk8s
+
+| 工具 | 范式 | 配置方式 | 多环境 | 包管理 | 适合场景 |
+|------|------|----------|--------|--------|----------|
+| **Helm** | 模板化 | Go template + values.yaml | values 覆盖 | Chart 仓库 | 复杂可复用应用（数据库/MQ） |
+| **Kustomize** | 声明式 patch | base + overlays 目录 | overlays 目录 | Git 目录 | 同应用多环境差异化 |
+| **cdk8s** | 编程生成 | TypeScript/Python/Go | 代码复用 | npm/语言包管理 | 需要编程逻辑生成清单 |
+
+```mermaid
+flowchart LR
+    subgraph helm[Helm]
+        H1[values.yaml] --> H2[Go Template]
+        H3[Chart.yaml] --> H2
+        H2 --> H4[渲染 YAML]
+    end
+    subgraph kustomize[Kustomize]
+        K1[base/] --> K2[kustomization.yaml]
+        K3[overlays/prod/] --> K2
+        K2 --> K4[合并 YAML]
+    end
+    subgraph cdk8s[cdk8s]
+        C1[TypeScript/Python] --> C2[cdk8s synth]
+        C2 --> C3[渲染 YAML]
+    end
+```
+
+### cdk8s 示例
+
+```typescript
+import { App } from 'cdk8s';
+import { Deployment } from 'cdk8s-plus-k8s';
+
+const app = new App();
+const deployment = new Deployment(app, 'MyApp', {
+  replicas: 3,
+  containers: [{
+    image: 'registry/myapp:v1.0',
+    ports: [{ number: 8080 }],
+  }],
+});
+app.synth();
+```
+
+## 补充：镜像 Tag 策略与不可变 Digest
+
+### Tag 策略对比
+
+| 策略 | 示例 | 可重现 | 可追溯 | 推荐度 |
+|------|------|--------|--------|--------|
+| **Digest** | `myapp@sha256:abc123...` | 不可变 | 精确到内容 | 最高（生产必用） |
+| **Git SHA** | `myapp:7f3a9c2` | 唯一 | 关联提交 | 高 |
+| **Semver** | `myapp:v1.4.2` | 需锁 digest | 关联版本号 | 中（对外版本号） |
+| **Latest** | `myapp:latest` | 浮动 | 无法追溯 | 禁用 |
+
+```yaml
+# K8s Deployment 使用 digest（不可变）
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: registry.example.com/myapp@sha256:abc123def456...  # 不可变 digest
+```
+
+> **黄金规则**：CI 构建时 `docker build -t myapp:${SHA}` + `docker push myapp:${SHA}`；部署时用 digest `myapp@sha256:...` 确保不可变。
+
+## 补充：滚动更新参数调优
+
+### maxSurge / maxUnavailable 最佳实践
+
+| 场景 | maxSurge | maxUnavailable | 理由 |
+|------|----------|----------------|------|
+| 零停机（推荐） | 1 或 25% | 0 | 确保新 Pod 就绪后再杀旧 |
+| 快速发布 | 25% | 25% | 旧 Pod 快速释放资源 |
+| 资源紧张 | 1 | 1 | 最小化同时运行 Pod 数 |
+| 大规模 | 25% | 0 | 平衡速度与安全 |
+
+```yaml
+# 零停机推荐配置
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 10       # 就绪后等 10s 再继续
+  revisionHistoryLimit: 5   # 保留回滚历史
+  progressDeadlineSeconds: 600  # 10 分钟内未完成则标记失败
+```
+
+### 优雅终止配合
+
+```yaml
+spec:
+  containers:
+    - name: app
+      terminationGracePeriodSeconds: 30  # 给应用排空连接的时间
+      lifecycle:
+        preStop:
+          exec:
+            command: ["/bin/sh", "-c", "sleep 5"]  # 等待 LB 摘除端点
+```
+
+## 补充：私有镜像仓库拉取凭据
+
+### K8s Image Pull Secrets
+
+```yaml
+# 1. 创建 Secret
+kubectl create secret docker-registry regcred \
+  --docker-server=registry.example.com \
+  --docker-username=ci-bot \
+  --docker-password=$TOKEN \
+  -n default
+
+# 2. Deployment 引用
+spec:
+  imagePullSecrets:
+    - name: regcred
+  containers:
+    - name: app
+      image: registry.example.com/myapp:v1.0
+```
+
+### ServiceAccount 自动绑定
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-build-sa
+  namespace: ci
+imagePullSecrets:
+  - name: regcred
+automountServiceAccountToken: false
+```
+
+> **安全要点**：避免在每个 Deployment 中硬编码 imagePullSecrets，通过 ServiceAccount 自动注入；定期轮换 registry 凭据。
+
 ## 与其他模块的关联
 
 - [10-部署策略](10-部署策略.md)：本文是部署策略在 K8s 上的具体落地（滚动 / 金丝雀 / 蓝绿）。

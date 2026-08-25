@@ -104,7 +104,233 @@ graph LR
 
 ---
 
+## 补充：Quorum 队列选举与脑裂处理
+
+### Quorum 队列选举机制
+
+Quorum 队列基于 Raft 共识协议：
+
+```
+Raft 选举流程：
+  1. Leader 心跳超时 → Follower 变 Candidate
+  2. Candidate 递增 term，请求投票
+  3. 多数派（>N/2）投票 → 成为 Leader
+  4. Leader 处理所有写请求，复制到多数派后返回 ack
+
+选举超时：150-300ms 随机（避免活锁）
+心跳间隔：50ms
+```
+
+### 脑裂处理
+
+| 场景 | 行为 | 消息影响 |
+|------|------|---------|
+| 网络分区（少数派隔离） | 少数派 Leader 无法获得多数派 ack | 少数派无法写入 |
+| 网络恢复 | 旧 Leader 发现更高 term，降级为 Follower | 无消息丢失 |
+| 分区期间客户端写少数派 | 写入被拒绝（未达到多数派） | 客户端收到错误 |
+
+**脑裂防护配置**：
+
+```ini
+# rabbitmq.conf
+cluster_partition_handling = autoheal
+# 或
+cluster_partition_handling = pause_minority
+```
+
+| 策略 | 行为 | 适用 |
+|------|------|------|
+| ignore | 不处理（默认） | 测试环境 |
+| autoheal | 自动选择多数派恢复 | 推荐生产 |
+| pause_minority | 少数派节点暂停 | 严格一致性 |
+
+## 补充：惰性队列内存行为
+
+### 惰性队列（Lazy Queue）内存模型
+
+```
+普通队列：消息驻留内存 → 内存满 → page 到磁盘
+惰性队列：消息直接写磁盘 → 内存仅缓存少量
+
+内存行为：
+  1. 消息入队 → 直接追加到磁盘文件（mnesia 表 + 磁盘段）
+  2. 消费者拉取 → 从磁盘读取（有缓存加速）
+  3. 内存占用 ≈ 活跃消费者数 × prefetch_count × 消息大小
+```
+
+### 惰性队列 vs 普通队列
+
+| 维度 | 普通队列 | 惰性队列 |
+|------|---------|---------|
+| 消息存储 | 内存优先 | 磁盘优先 |
+| 内存占用 | 高（消息堆积时） | 低（固定开销） |
+| 消费延迟 | 低（内存读取） | 略高（磁盘读取） |
+| 恢复速度 | 慢（需重新加载） | 快（已在磁盘） |
+| 适用 | 短队列、低延迟 | 长队列、消息堆积、内存紧张 |
+
+### 3.12+ 默认行为
+
+RabbitMQ 3.12+ 默认所有队列为惰性队列（`default_queue_type = quorum`），Quorum 队列本身也使用磁盘存储。
+
+## 补充：blocked connections/consumer timeout 排查
+
+### Blocked Connections
+
+当内存/磁盘接近阈值时，RabbitMQ 阻塞生产者连接：
+
+```bash
+# 查看 blocked 连接
+rabbitmqctl list_connections name state blocks
+
+# 常见 blocked 原因
+# 1. 内存告警：vm_memory_high_watermark
+# 2. 磁盘告警：disk_free_limit
+# 3. Flow Control：内部流控
+```
+
+### Consumer Timeout
+
+消费者处理超时被 Broker 断开：
+
+```java
+// 设置消费者超时（Spring AMQP）
+@Bean
+public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+        ConnectionFactory connectionFactory) {
+    SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+    factory.setAcknowledgeMode(AcknowledgeMode.MANUAL);
+    factory.setPrefetchCount(10);
+    // 消费者超时（默认无限）
+    factory.setReceiveTimeout(30000L);  // 30 秒
+    return factory;
+}
+```
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 消费者频繁断开 | 处理逻辑太慢 | 优化消费逻辑/增加消费者 |
+| blocked 连接 | 内存/磁盘告警 | 增加资源/启用惰性队列 |
+| 消费者卡住 | 死锁/外部依赖慢 | 检查下游依赖/设置超时 |
+
+## 补充：优先级队列代价
+
+### 优先级队列实现原理
+
+RabbitMQ 优先级队列内部维护多个子队列（每个优先级一个）：
+
+```
+优先级队列内部结构：
+  priority-queue
+    ├── sub-queue-0 (优先级 0，最低)
+    ├── sub-queue-1
+    ├── sub-queue-2
+    └── sub-queue-9 (优先级 9，最高)
+
+消费者优先从高优先级子队列消费
+```
+
+### 优先级队列代价
+
+| 代价 | 说明 |
+|------|------|
+| 内存开销 | 每个优先级一个子队列，N 个优先级 = N 倍队列元数据 |
+| 消费效率 | 需遍历子队列找到非空最高优先级 |
+| 消息顺序 | 同优先级内 FIFO，跨优先级不确定 |
+| 吞吐下降 | 相比无优先级队列，吞吐降低 10-30% |
+| 堆积风险 | 高优先级消息少时，低优先级消息可能长期堆积 |
+
+> **建议**：优先级数量尽量少（3-5 级），避免使用 10+ 优先级。
+
+## 补充：Federation 上下游配置实例
+
+### Federation 配置
+
+```bash
+# 启用插件
+rabbitmq-plugins enable federation
+rabbitmq-plugins enable federation_management
+
+# 配置上游（Cluster A）
+rabbitmqctl set_parameter federation-upstream upstream-b   '{"uri": "amqp://user:pass@cluster-b:5672", "prefetch-count": 1000}'
+
+# 配置策略（Cluster A 的 exchange 使用上游）
+rabbitmqctl set_policy federation-test "orders"   '{"federation-upstream": "upstream-b"}'   --apply-to exchanges
+```
+
+### Federation vs Shovel 选型
+
+| 场景 | 推荐 | 原因 |
+|------|------|------|
+| 跨机房异步复制 | Federation | 自动路由，最终一致 |
+| 精确搬运（Queue→Queue） | Shovel | 点对点精确控制 |
+| 广播复制 | Federation | Exchange 级别 |
+| 协议转换（AMQP→STOMP） | Shovel | 支持多协议 |
+| 简单场景 | Federation | 配置简单 |
+
+## 补充：Prometheus 关键告警规则
+
+### Prometheus 告警规则
+
+```yaml
+groups:
+  - name: rabbitmq
+    rules:
+      - alert: RabbitMQHighMemory
+        expr: rabbitmq_process_resident_memory_bytes / rabbitmq_resident_memory_limit_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 内存使用超过 80%"
+
+      - alert: RabbitMQHighDisk
+        expr: rabbitmq_disk_space_available_bytes / rabbitmq_disk_space_available_limit_bytes < 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ 磁盘空间低于 20%"
+
+      - alert: RabbitMQQueueHigh
+        expr: rabbitmq_queue_messages > 100000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "队列消息堆积超过 10 万"
+
+      - alert: RabbitMQConsumerDown
+        expr: rabbitmq_queue_consumers == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "队列无消费者"
+
+      - alert: RabbitMQLagHigh
+        expr: rabbitmq_queue_messages - rabbitmq_queue_messages_ready > 50000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "未确认消息超过 5 万"
+```
+
+### 关键监控指标
+
+| 指标 | 含义 | 阈值建议 |
+|------|------|---------|
+| `rabbitmq_process_resident_memory_bytes` | 内存使用 | < 80% watermark |
+| `rabbitmq_disk_space_available_bytes` | 磁盘剩余 | > 20% 可用 |
+| `rabbitmq_queue_messages` | 队列消息数 | 业务定义 |
+| `rabbitmq_queue_consumers` | 消费者数量 | > 0 |
+| `rabbitmq_queue_messages_unacknowledged` | 未确认消息 | < prefetch × consumers |
+| `rabbitmq_connections` | 连接数 | < channel_max × nodes |
+| `rabbitmq_channel_messages_published_total` | 发布速率 | 基线对比 |
+
 ## 七、与其他板块的关系
+
+
 
 - 与 [消息队列 MQ](../MQ.md)、[Apache Pulsar](ApachePulsar.md)、[MQTT](MQTT与消息broker.md)：同属消息中间件家族，RabbitMQ 偏「业务级可靠路由」，Pulsar/Kafka 偏「高吞吐流」，MQTT 偏「设备协议」。
 - 与 [分布式事务 Seata](分布式事务Seata.md)：可靠消息最终一致性（本地事务表 + 消息确认）是 RabbitMQ 常见分布式事务落地方式。

@@ -494,6 +494,296 @@ IKAnalyzer（中文推荐）：
 
 ---
 
+## SolrCloud 路由与 shard 切分操作
+
+### 路由机制
+
+```
+SolrCloud 路由 = 决定文档落到哪个 Shard
+
+路由方式：
+  ① 隐式路由（默认）：_route_ 参数或 CompositeId
+     hash(_id) % numShards → Shard 编号
+  ② 复合路由：_route_=shard1!  强制路由到指定 Shard
+  ③ 路由键：路由键相同的文档落到同一 Shard
+
+创建 Collection：
+  curl "http://solr:8983/solr/admin/collections?action=CREATE&name=products&numShards=3&replicationFactor=2"
+```
+
+### Shard 切分操作
+
+```bash
+# Split Shard（分裂）
+curl "http://solr:8983/solr/admin/collections?action=SPLITSHARD&collection=products&shard=shard1"
+
+# Merge Shards（合并）
+curl "http://solr:8983/solr/admin/collections?action=MERGESHARDS&collection=products&shards=shard1,shard2"
+
+# Add Shard（添加分片）
+curl "http://solr:8983/solr/admin/collections?action=CREATESHARD&collection=products&shard=shard4"
+
+# Delete Shard
+curl "http://solr:8983/solr/admin/collections?action=DELETESHARD&collection=products&shard=shard4"
+```
+
+| 操作 | 适用场景 | 注意事项 |
+|------|---------|---------|
+| SPLITSHARD | 数据量增长，需要扩容 | 会触发大量数据迁移 |
+| MERGESHARD | Shard 过多，合并减少开销 | 合并后路由重新计算 |
+| CREATESHARD | 手动扩容指定节点 | 数据需手动迁移 |
+| DELETESHARD | 下线空 Shard | 必须先迁移走数据 |
+
+> **口诀：路由 = hash(id) % shards——Shard 扩容用 SPLITSHARD，Shard 合并用 MERGESHARD，扩减都要关注数据迁移开销。**
+
+---
+
+## DIH 全量/增量导入配置
+
+### 全量导入
+
+```xml
+<!-- data-config.xml -->
+<dataConfig>
+  <dataSource type="JdbcDataSource"
+    driver="com.mysql.jdbc.Driver"
+    url="jdbc:mysql://localhost:3306/shop"
+    user="root" password="secret"/>
+  <document>
+    <entity name="product" query="SELECT * FROM products">
+      <field column="id" name="id"/>
+      <field column="name" name="name"/>
+      <field column="price" name="price"/>
+      <field column="category" name="category"/>
+    </entity>
+  </document>
+</dataConfig>
+```
+
+### 增量导入（deltaQuery）
+
+```xml
+<document>
+  <entity name="product" 
+    query="SELECT * FROM products"
+    deltaQuery="SELECT id FROM products WHERE update_time > '${dataimporter.last_index_time}'"
+    deletedPkQuery="SELECT id FROM products WHERE deleted = 1"
+    deltaImportQuery="SELECT * FROM products WHERE id = ${dih.delta.id}">
+    <field column="id" name="id"/>
+    <field column="name" name="name"/>
+    <field column="price" name="price"/>
+  </entity>
+</document>
+```
+
+| 参数 | 说明 |
+|------|------|
+| query | 全量导入 SQL |
+| deltaQuery | 增量检测：哪些 ID 有变化 |
+| deltaImportQuery | 增量导入：按 ID 获取完整数据 |
+| deletedPkQuery | 软删除检测（标记删除的记录） |
+| last_index_time | 上次导入时间戳（自动维护） |
+
+```bash
+# 触发全量导入
+http://localhost:8983/solr/products/dataimport?command=full-import&commit=true
+
+# 触发增量导入
+http://localhost:8983/solr/products/dataimport?command=delta-import&commit=true
+
+# 查看导入状态
+http://localhost:8983/solr/products/dataimport?command=status
+```
+
+> **口诀：全量 = query，增量 = deltaQuery + deltaImportQuery + deletedPkQuery——增量导入的关键是"last_index_time"记录上次时间点。**
+
+---
+
+## 函数查询与排序打分定制
+
+### 函数查询
+
+```
+函数查询 = 用函数计算动态分数
+
+常用函数：
+  recip(x,m,a,b)     → 倒数函数（时间衰减）
+  log(x)              → 对数函数
+  sqrt(x)             → 平方根
+  div(x,y)            → 除法
+  map(x,min,max,target) → 范围映射
+  if(exists(query),a,b) → 条件函数
+
+示例：
+  /select?q={!func}recip(rang(1,1000),1,1,1)&sort=score desc
+  /select?q=*:*&sort=product(popularity) desc
+```
+
+### 排序打分定制
+
+```xml
+<!-- 自定义排序规则 -->
+<requestHandler name="/select" class="solr.SearchHandler">
+  <lst name="defaults">
+    <str name="defType">edismax</str>
+    <str name="qf">title^2.0 content^1.0</str>
+    <str name="pf">title^3.0</str>
+    <str name="bf">recip(rang(1,1000),1,1,1)^1.5</str>
+    <str name="boost">if(exists(query({!v='featured:true'})),10,1)</str>
+  </lst>
+</requestHandler>
+```
+
+| 函数 | 用途 | 示例 |
+|------|------|------|
+| recip | 时间衰减（越新越靠前） | 新闻排序 |
+| log | 对数衰减 | 热度衰减 |
+| bf | 基础因子（字段值直接加分） | 价格/销量排序 |
+| boost | 条件加分 | 精选商品加权 |
+
+> **口诀：函数查询 = "用数学公式定义排序"——recip 做时间衰减，bf 做字段加权，boost 做条件加分。**
+
+---
+
+## 三层缓存调优
+
+### 三层缓存机制
+
+```
+Solr 三层缓存：
+  filterCache → 缓存 FilterQuery 结果（fq 查询的文档 ID 集合）
+  queryResultCache → 缓存完整查询结果
+  documentCache → 缓存文档字段值
+
+filterCache 工作原理：
+  fq=category:electronics → 缓存匹配的文档 ID 集合
+  下次相同 fq → 直接取缓存（不重新查询）
+  多个 fq 组合 → 取缓存交集/并集
+
+queryResultCache 工作原理：
+  完整查询（q+fq+sort+start+rows）→ 缓存结果
+  完全相同查询 → 直接返回缓存
+
+documentCache 工作原理：
+  文档 ID → 缓存字段值
+  多个查询涉及同一文档 → 减少磁盘 I/O
+```
+
+### 调优参数
+
+| 缓存 | 参数 | 建议 |
+|------|------|------|
+| filterCache | size | 常用过滤条件数 x 10 |
+| filterCache | initialSize | 预估常用过滤条件数 |
+| filterCache | autowarmCount | 旧缓存迁移数量（10%） |
+| queryResultCache | size | 高频查询数 x 5 |
+| queryResultCache | autowarmCount | 迁移热门查询 |
+| documentCache | size | 热门文档数 x 10 |
+
+```xml
+<!-- solrconfig.xml 缓存配置 -->
+<query>
+  <filterCache class="solr.FastLRUCache"
+    size="512"
+    initialSize="512"
+    autowarmCount="50"/>
+  <queryResultCache class="solr.LRUCache"
+    size="1024"
+    initialSize="1024"
+    autowarmCount="100"/>
+  <documentCache class="solr.LRUCache"
+    size="10240"/>
+</query>
+```
+
+> **口诀：filterCache 缓存 fq 结果，queryResultCache 缓存完整结果，documentCache 缓存字段值——三层缓存命中率 > 80% 查询延迟降 10x。**
+
+---
+
+## standalone→cloud 迁移路径
+
+### 迁移步骤
+
+```mermaid
+flowchart TB
+    A[Standalone 单机] --> B[导出索引数据]
+    B --> C[部署 ZK 集群]
+    C --> D[部署 SolrCloud 节点]
+    D --> E[创建 Collection]
+    E --> F[导入数据]
+    F --> G[验证查询结果]
+    G --> H[切换流量]
+```
+
+### 迁移命令
+
+```bash
+# Step 1: 导出数据
+curl "http://localhost:8983/solr/products/select?q=*:*&rows=10000&wt=json" > export.json
+
+# Step 2: 部署 ZK（3节点集群）
+# zkServer.sh start（每个节点）
+
+# Step 3: 部署 SolrCloud
+bin/solr start -cloud -s server/cloud1 -p 8983 -z zk1:2181,zk2:2181,zk3:2181
+
+# Step 4: 创建 Collection
+curl "http://solr1:8983/solr/admin/collections?action=CREATE&name=products&numShards=2&replicationFactor=2"
+
+# Step 5: 导入数据
+curl -X POST "http://solr1:8983/solr/products/update?commit=true" --data-binary @export.json -H "Content-type: application/json"
+
+# Step 6: 验证
+curl "http://solr1:8983/solr/products/select?q=*:*&rows=5"
+```
+
+### 迁移注意事项
+
+| 风险点 | 对策 |
+|--------|------|
+| Schema 不兼容 | 导出前检查 Schema，升级到 Managed Schema |
+| 数据量大 | 分批导入，使用 SolrJ 批量 API |
+| 停机窗口 | 双写过渡（Standalone+Cloud 并行） |
+| 路由变化 | 同 ID 路由算法（CompositeId vs 隐式） |
+
+> **口诀：Standalone → Cloud = "导出数据 → 部署 ZK → 创建 Collection → 导入数据 → 切换流量"——双写过渡避免停机。**
+
+---
+
+## 与 ES 运维成本真实对比
+
+| 维度 | Solr | Elasticsearch |
+|------|------|---------------|
+| 部署 | Solr + ZK（6 节点起步） | ES 自身（3 节点起步） |
+| 运维复杂度 | 高（ZK + Solr 双组件） | 中（单组件） |
+| 内存占用 | 中（JVM + Lucene） | 高（JVM + Lucene） |
+| 磁盘占用 | 中（索引 + 日志） | 高（索引 + 日志 + translog） |
+| 升级难度 | 高（ZK + Solr 协调升级） | 滚动升级 |
+| 监控工具 | Solr Admin UI（基础） | Kibana（强大） |
+| 社区活跃度 | 中 | 高 |
+| 云服务 | 少 | AWS OpenSearch/阿里云 ES |
+| 许可证 | Apache 2.0 | SSPL/Elastic License |
+
+```
+真实成本对比（10 节点集群）：
+  Solr：3 ZK + 7 Solr = 10 节点
+  ES：10 ES 节点（无外部依赖）
+
+  运维人力：
+    Solr：需懂 ZK + Solr（招人难）
+    ES：只需懂 ES（人才多）
+
+  升级频率：
+    Solr：年升级 1 次（升级复杂）
+    ES：季度升级（滚动升级简单）
+```
+
+> **口诀：Solr 运维成本比 ES 高 30%~50%——多一个 ZK 依赖 + 人才少 + 升级难，选型时要考虑 TCO（总拥有成本）。**
+
+## 七、与其他板块的关系（扩展）
+
+---
+
 ## 八、Solr 查询语法与高级特性
 
 ### 8.1 查询语法
