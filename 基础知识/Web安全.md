@@ -1013,6 +1013,212 @@ http.headers(headers -> headers
 );
 ```
 
+## CSRF 防护深入
+
+```java
+// CSRF Token 生成与验证
+@Controller
+public class CsrfController {
+    
+    @GetMapping("/form")
+    public String form(HttpServletRequest request, Model model) {
+        CsrfToken token = (CsrfToken) request.getAttribute(CsrfToken.class.getName());
+        model.addAttribute("_csrf", token);
+        return "form";
+    }
+    
+    @PostMapping("/submit")
+    public String submit(@RequestBody String data) {
+        // Spring Security 自动验证 CSRF Token
+        return "success";
+    }
+}
+```
+
+### CSRF 防护方案对比
+
+| 方案 | 原理 | 安全性 | 性能影响 | 适用场景 |
+|------|------|--------|----------|----------|
+| Token验证 | 隐藏表单字段 | 高 | 低 | 传统表单 |
+| SameSite Cookie | 限制第三方请求 | 中 | 无 | 现代浏览器 |
+| 双重提交Cookie | 请求头+Cookie比对 | 高 | 低 | REST API |
+| Referer/Origin | 检查来源头 | 中 | 无 | 简单防护 |
+
+### SameSite Cookie 配置
+
+```java
+// Spring Security SameSite 配置
+http.cors().and().csrf().csrfTokenRepository(csrfTokenRepository);
+
+// 配置 SameSite 属性
+ResponseCookie cookie = ResponseCookie.from("SESSION", sessionId)
+    .httpOnly(true)
+    .secure(true)
+    .sameSite("Strict") // Strict/Lax/None
+    .path("/")
+    .build();
+```
+
+## XXE 防护深入
+
+```java
+// 安全的 XML 解析配置
+DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+
+// 禁用外部实体
+dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+
+// 禁用 DTD
+dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+
+// 使用安全的解析器
+SAXParserFactory spf = SAXParserFactory.newInstance();
+spf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+spf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+```
+
+### XXE 防护检查清单
+
+| 检查项 | 说明 | 验证方法 |
+|--------|------|----------|
+| 禁用DTD | 禁止文档类型定义 | 测试XXE Payload |
+| 禁用外部实体 | 禁止引用外部文件 | 测试file://协议 |
+| 使用安全解析器 | 使用JDK内置安全解析器 | 代码审查 |
+| 输入过滤 | 过滤XML特殊字符 | 输入验证 |
+
+## SSRF 防护方案
+
+```java
+// SSRF 防护实现
+public class SsrfFilter {
+    
+    // 内网IP黑名单
+    private static final List<String> BLACKLIST = Arrays.asList(
+        "127.0.0.1", "localhost", "10.0.0.0/8",
+        "172.16.0.0/12", "192.168.0.0/16"
+    );
+    
+    public boolean isSafe(String url) {
+        try {
+            URI uri = new URI(url);
+            String host = uri.getHost();
+            
+            // 检查是否为内网地址
+            for (String black : BLACKLIST) {
+                if (host.equals(black) || isInRange(host, black)) {
+                    return false;
+                }
+            }
+            
+            // 检查协议
+            String scheme = uri.getScheme();
+            if (!"http".equals(scheme) && !"https".equals(scheme)) {
+                return false;
+            }
+            
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+```
+
+### SSRF 防护策略
+
+| 策略 | 说明 | 实现方式 |
+|------|------|----------|
+| IP黑名单 | 禁止访问内网IP | 正则匹配 |
+| 协议白名单 | 只允许http/https | URI解析 |
+| DNS重绑定防护 | 防止DNS重绑定攻击 | DNS验证 |
+| 请求超时 | 设置合理超时 | 连接池配置 |
+
+## JWT 安全最佳实践
+
+```java
+// JWT 安全配置
+public class JwtConfig {
+    
+    // 使用强密钥
+    private static final String SECRET = "your-256-bit-secret-key-here";
+    
+    // 设置合理过期时间
+    private static final long EXPIRATION = 3600000; // 1小时
+    
+    // 生成JWT
+    public String generateToken(UserDetails userDetails) {
+        return Jwts.builder()
+            .setSubject(userDetails.getUsername())
+            .setIssuedAt(new Date())
+            .setExpiration(new Date(System.currentTimeMillis() + EXPIRATION))
+            .signWith(SignatureAlgorithm.HS256, SECRET)
+            .compact();
+    }
+    
+    // 验证JWT
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parser().setSigningKey(SECRET).parseClaimsJws(token);
+            return true;
+        } catch (JwtException e) {
+            return false;
+        }
+    }
+}
+```
+
+### JWT 安全检查清单
+
+| 检查项 | 说明 | 推荐做法 |
+|--------|------|----------|
+| 密钥强度 | 使用强密钥 | 256位以上 |
+| 过期时间 | 设置合理过期 | 1小时以内 |
+| 签名算法 | 使用安全算法 | RS256/ES256 |
+| 敏感信息 | 不要存放敏感信息 | 只存必要信息 |
+| Token刷新 | 实现Token刷新机制 | 双Token方案 |
+
+## 安全编码规范
+
+```java
+// 输入验证示例
+public class InputValidator {
+    
+    // 邮箱验证
+    public static boolean isValidEmail(String email) {
+        String regex = "^[A-Za-z0-9+_.-]+@(.+)$";
+        return Pattern.matches(regex, email);
+    }
+    
+    // SQL注入防护
+    public static String escapeSql(String input) {
+        if (input == null) return null;
+        return input.replaceAll("['\";]", "");
+    }
+    
+    // XSS防护
+    public static String escapeHtml(String input) {
+        if (input == null) return null;
+        return input.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                    .replace("\"", "&quot;")
+                    .replace("'", "&#x27;");
+    }
+}
+```
+
+### 安全编码原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 最小权限 | 只授予必要权限 | 数据库只给SELECT/INSERT |
+| 纵深防御 | 多层防护 | WAF+输入验证+参数化查询 |
+| 失败安全 | 失败时拒绝访问 | 默认拒绝所有请求 |
+| 代码审计 | 定期安全审查 | 静态代码分析 |
+
 ## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；

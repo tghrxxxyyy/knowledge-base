@@ -1008,3 +1008,196 @@ USING TTL 86400;
 | 查询 | 必须按 Partition Key 查 |
 | 许可证 | Apache 2.0 |
 | 一句话 | 「写为王的去中心化宽列库——时序/IoT/事件流首选」 |
+
+## CDC + Kafka 数据同步方案
+
+```mermaid
+flowchart TB
+    subgraph 写入层
+        APP[应用] --> CASSANDRA[Cassandra]
+    end
+    subgraph CDC层
+        CASSANDRA --> CDC[Change Data Capture]
+        CDC --> KAFKA_CONNECT[Kafka Connect]
+    end
+    subgraph 消费层
+        KAFKA_CONNECT --> TOPIC[CDC Topic]
+        TOPIC --> ES[Elasticsearch]
+        TOPIC --> CACHE[Redis]
+        TOPIC --> ANALYTICS[分析引擎]
+    end
+```
+
+### CDC 方案对比
+
+| 方案 | 实时性 | 数据一致性 | 复杂度 | 适用场景 |
+|------|--------|------------|--------|----------|
+| Kafka Connect Source | 秒级 | 最终一致 | 低 | 标准同步 |
+| Debezium | 秒级 | 最终一致 | 中 | 多源汇聚 |
+| 自定义CDC | 秒级 | 可控 | 高 | 特殊需求 |
+| 定时全量 | 分钟级 | 强一致 | 低 | 离线分析 |
+
+### Cassandra Kafka Connector 配置
+
+```json
+{
+  "name": "cassandra-source",
+  "config": {
+    "connector.class": "io.confluent.connect.cassandra.CassandraSourceConnector",
+    "tasks.max": "3",
+    "keyspace": "my_keyspace",
+    "table": "users",
+    "topic.prefix": "cdc_",
+    "consistency.level": "LOCAL_QUORUM",
+    "poll.interval.ms": "1000"
+  }
+}
+```
+
+## 分区键设计最佳实践
+
+```sql
+-- 错误：单调递增分区键（热点）
+CREATE TABLE bad_design (
+    user_id UUID PRIMARY KEY,
+    created_time TIMESTAMP
+);
+-- user_id 自增导致所有写入集中在一个节点
+
+-- 正确：哈希分区键（分散）
+CREATE TABLE good_design (
+    user_id UUID,
+    bucket INT,
+    created_time TIMESTAMP,
+    PRIMARY KEY ((user_id, bucket))
+);
+-- bucket = user_id.hashCode() % 16
+```
+
+### 分区键设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 均匀分布 | 使用哈希或随机数 | bucket = hash(user_id) % 16 |
+| 查询友好 | 支持等值查询 | PRIMARY KEY ((user_id)) |
+| 聚簇有序 | 范围查询用聚簇列 | PRIMARY KEY ((user_id), created_time DESC) |
+| 数据量控制 | 每个分区<100MB | 拆分大分区 |
+
+## TTL 与墓碑机制
+
+```sql
+-- 设置TTL（自动过期）
+INSERT INTO session_data (session_id, user_id, data)
+VALUES ('abc', 123, '{}')
+USING TTL 3600;  -- 1小时后自动删除
+
+-- 更新TTL
+UPDATE session_data USING TTL 7200
+SET data = '{"new": true}'
+WHERE session_id = 'abc';
+
+-- 查看剩余TTL
+SELECT session_id, TTL(data) as ttl_seconds
+FROM session_data;
+```
+
+### 墓碑问题处理
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 墓碑堆积 | 删除操作产生墓碑 | 调整gc_grace_seconds |
+| 查询变慢 | 墓碑过多影响扫描 | 定期compact |
+| 数据复活 | gc_grace太短 | 保持默认10天 |
+| 复制延迟 | 墓碑未同步 | 增大gc_grace |
+
+### gc_grace_seconds 配置建议
+
+```
+生产环境：默认10天（864000秒）
+低延迟场景：3-5天（需确保复制延迟<1天）
+开发环境：1天（便于测试）
+```
+
+## Cassandra 监控指标
+
+```mermaid
+flowchart TB
+    subgraph 监控层
+        JMX[JMX Exporter] --> PROM[Prometheus]
+        PROM --> GRAFANA[Grafana]
+        PROM --> ALERT[Alertmanager]
+    end
+    subgraph Cassandra集群
+        NODE1[Node1]
+        NODE2[Node2]
+        NODE3[Node3]
+    end
+    NODE1 --> JMX
+    NODE2 --> JMX
+```
+
+### 关键监控指标
+
+| 指标分类 | 指标名 | 告警阈值 | 处理方案 |
+|----------|--------|----------|----------|
+| 读写 | 读延迟 | > 50ms | 检查磁盘/内存 |
+| 读写 | 写延迟 | > 10ms | 检查CommitLog |
+| 存储 | 磁盘使用率 | > 80% | 扩容/清理 |
+| 存储 | Tombstone数量 | > 1000 | 调整gc_grace |
+| 复制 | 复制延迟 | > 30s | 检查网络 |
+| 请求 | 队列深度 | > 1000 | 增加节点 |
+
+## 多数据中心部署
+
+```mermaid
+flowchart TB
+    subgraph DC1[数据中心1-北京]
+        C1[Cassandra Node1]
+        C2[Cassandra Node2]
+    end
+    subgraph DC2[数据中心2-上海]
+        C3[Cassandra Node3]
+        C4[Cassandra Node4]
+    end
+    subgraph DC3[数据中心3-广州]
+        C5[Cassandra Node5]
+        C6[Cassandra Node6]
+    end
+    C1 <-->|异步复制| C3
+    C3 <-->|异步复制| C5
+    C1 <-->|异步复制| C5
+    APP1[北京应用] --> C1
+    APP2[上海应用] --> C3
+    APP3[广州应用] --> C5
+```
+
+### 多DC配置示例
+
+```sql
+-- 创建多DC keyspace
+CREATE KEYSPACE my_keyspace WITH replication = {
+    'class': 'NetworkTopologyStrategy',
+    'dc_bj': 3,
+    'dc_sh': 3,
+    'dc_gz': 3
+};
+
+-- 本地优先查询
+CONSISTENCY LOCAL_QUORUM;
+SELECT * FROM users WHERE user_id = 123;
+-- 只查询本地DC，延迟最低
+
+-- 跨DC查询
+CONSISTENCY QUORUM;
+SELECT * FROM users WHERE user_id = 123;
+-- 需要多DC确认，延迟较高
+```
+
+### 多DC选型建议
+
+| 场景 | 推荐策略 | 一致性级别 |
+|------|----------|------------|
+| 全球化应用 | NetworkTopologyStrategy | LOCAL_QUORUM |
+| 灾备切换 | NetworkTopologyStrategy | EACH_QUORUM |
+| 读多写少 | NetworkTopologyStrategy | LOCAL_ONE |
+| 强一致要求 | SimpleStrategy | QUORUM |

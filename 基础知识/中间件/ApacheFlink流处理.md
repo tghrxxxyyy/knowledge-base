@@ -1073,3 +1073,645 @@ JOIN LATERAL (
 ```
 
 > 一句话：**Flink = 流批一体 + Event Time/Watermark + Checkpoint Exactly-once + 丰富窗口；选型先看「延迟要求（毫秒/秒级）」，再定「状态大小（内存/RocksDB）」，最后定「部署模式（K8s/托管）」**。
+
+## 三十、Flink Table API窗口Join深度解析
+
+### 30.1 Interval Join（区间Join）
+
+```sql
+-- Interval Join：基于时间区间的Join
+-- 语法：BETWEEN区间
+SELECT
+    o.order_id,
+    o.amount,
+    p.payment_id,
+    p.pay_amount
+FROM Orders o
+JOIN Payments p
+    ON o.order_id = p.order_id
+    AND p.pay_time BETWEEN o.order_time AND o.order_time + INTERVAL '24' HOUR;
+
+-- 语义：订单时间到订单时间+24小时内匹配的支付记录
+-- 特点：
+--   基于Event Time
+--   支持处理时间+事件时间
+--   状态自动清理（根据时间区间）
+--   适用：订单-支付匹配、事件关联
+
+-- 配置：
+--   table.exec.emit.allow-unnamed: true（允许未命名的Join结果）
+--   table.exec.state.ttl: 24h（状态保留时间）
+```
+
+### 30.2 Window Join（窗口Join）
+
+```sql
+-- Window Join：基于相同窗口的Join
+SELECT
+    o.order_id,
+    o.amount,
+    p.payment_id
+FROM Orders o
+JOIN Payments p
+    ON o.order_id = p.order_id
+WHERE o.order_time >= p.pay_time - INTERVAL '5' MINUTE
+  AND o.order_time <= p.pay_time + INTERVAL '5' MINUTE;
+
+-- 或使用窗口函数
+SELECT
+    o.order_id,
+    o.amount,
+    p.payment_id
+FROM (
+    SELECT *, TUMBLE_START(order_time, INTERVAL '1' HOUR) AS window_start
+    FROM Orders
+) o
+JOIN (
+    SELECT *, TUMBLE_START(pay_time, INTERVAL '1' HOUR) AS window_start
+    FROM Payments
+) p
+ON o.order_id = p.order_id AND o.window_start = p.window_start;
+
+-- 语义：相同时间窗口内的记录进行Join
+-- 特点：
+--   窗口对齐（TUMBLE/HOP/SESSION/CUMULATE）
+--   窗口内数据进行Join
+--   窗口关闭后结果输出
+--   适用：批量关联分析
+```
+
+### 30.3 Temporal Table Join（时态表Join）
+
+```sql
+-- Temporal Table Join：基于版本化表的Join
+SELECT
+    o.order_id,
+    o.amount,
+    r.currency,
+    o.amount * r.rate AS amount_usd
+FROM Orders o
+JOIN LATERAL (
+    SELECT rate, currency
+    FROM ExchangeRates
+    FOR SYSTEM_TIME AS OF o.order_time
+) r ON o.currency = r.currency;
+
+-- 语义：使用订单发生时的汇率进行转换
+-- 特点：
+--   基于版本化表（Changelog Stream）
+--   支持历史时间点查询
+--   状态持续增长（需TTL）
+--   适用：维度关联、汇率转换、SCD处理
+
+-- 配置：
+--   table.exec.state.ttl: 24h（状态保留时间）
+--   table.exec.legacy-cast-behaviour: true（兼容模式）
+```
+
+### 30.4 三种Join对比
+
+| 维度 | Interval Join | Window Join | Temporal Table Join |
+|------|---------------|-------------|---------------------|
+| 时间语义 | 基于时间区间 | 基于对齐窗口 | 基于版本化表 |
+| 状态管理 | 自动清理（区间） | 窗口关闭清理 | 需要TTL |
+| 结果输出 | 实时输出 | 窗口关闭输出 | 实时输出 |
+| 适用场景 | 事件关联 | 批量关联 | 维度关联 |
+| 典型用例 | 订单-支付匹配 | 统计分析 | 汇率转换 |
+
+## 三十一、Flink JDBC Sink Exactly-Once实现
+
+### 31.1 两阶段提交实现
+
+```java
+// Flink JDBC Sink两阶段提交实现
+public class TwoPhaseCommitJdbcSink extends TwoPhaseCommitSinkFunction<Row> {
+    
+    private transient Connection connection;
+    private transient PreparedStatement stmt;
+    
+    @Override
+    protected void invoke(Row value, Context context) throws Exception {
+        // 第一阶段：预提交（写入本地缓冲）
+        if (stmt == null) {
+            stmt = connection.prepareStatement("INSERT INTO orders VALUES (?, ?, ?)");
+        }
+        stmt.setLong(1, (Long) value.getField(0));
+        stmt.setString(2, (String) value.getField(1));
+        stmt.setDouble(3, (Double) value.getField(2));
+        stmt.addBatch();
+    }
+    
+    @Override
+    protected void preCommit() throws Exception {
+        // 预提交：执行批量写入
+        stmt.executeBatch();
+        connection.commit();
+    }
+    
+    @Override
+    protected void commit() throws Exception {
+        // 第二阶段：正式提交
+        connection.commit();
+    }
+    
+    @Override
+    protected void rollback() throws Exception {
+        // 回滚
+        if (connection != null && !connection.isClosed()) {
+            connection.rollback();
+        }
+    }
+}
+
+// 使用JdbcSink
+DataStream<Row> stream = ...;
+stream.addSink(
+    JdbcSink.sink(
+        "INSERT INTO orders VALUES (?, ?, ?)",
+        (ps, row) -> {
+            ps.setLong(1, (Long) row.getField(0));
+            ps.setString(2, (String) row.getField(1));
+            ps.setDouble(3, (Double) row.getField(2));
+        },
+        JdbcExecutionOptions.builder()
+            .withBatchSize(1000)
+            .withBatchIntervalMs(5000)
+            .withMaxRetries(3)
+            .build(),
+        new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+            .withUrl("jdbc:postgresql://localhost:5432/mydb")
+            .withDriverName("org.postgresql.Driver")
+            .build()
+    ));
+```
+
+### 31.2 批量写入优化
+
+```java
+// 批量写入优化配置
+JdbcExecutionOptions executionOptions = JdbcExecutionOptions.builder()
+    .withBatchSize(1000)           // 批次大小
+    .withBatchIntervalMs(5000)     // 批次间隔（毫秒）
+    .withMaxRetries(3)             // 最大重试次数
+    .build();
+
+// 连接池配置
+HikariConfig hikariConfig = new HikariConfig();
+hikariConfig.setJdbcUrl("jdbc:postgresql://localhost:5432/mydb");
+hikariConfig.setUsername("user");
+hikariConfig.setPassword("password");
+hikariConfig.setMaximumPoolSize(20);
+hikariConfig.setMinimumIdle(5);
+hikariConfig.setConnectionTimeout(30000);
+hikariConfig.setIdleTimeout(600000);
+hikariConfig.setMaxLifetime(1800000);
+
+// 性能优化
+//   1. 批量写入：减少网络往返
+//   2. 连接池：复用数据库连接
+//   3. 异步写入：非阻塞IO
+//   4. 错误重试：自动重试失败批次
+//   5. 幂等处理：唯一键冲突时更新
+```
+
+### 31.3 Exactly-Once保证
+
+```text
+Exactly-Once保证机制：
+
+  两阶段提交：
+    第一阶段：预提交（写入本地缓冲）
+    第二阶段：正式提交（确认写入）
+    回滚：失败时回滚所有操作
+
+  幂等处理：
+    唯一键冲突时更新（INSERT ON CONFLICT UPDATE）
+    消费端幂等（消息ID去重）
+
+  Checkpoint集成：
+    Checkpoint时触发preCommit
+    Checkpoint完成时触发commit
+    Checkpoint失败时触发rollback
+
+  故障恢复：
+    从Checkpoint恢复
+    重新处理未确认的数据
+    保证数据不丢不重
+```
+
+## 三十二、Flink与Iceberg集成
+
+### 32.1 IcebergCatalog配置
+
+```java
+// Flink IcebergCatalog配置
+// 方式1：Hive Catalog
+CatalogConfiguration catalogConfig = new CatalogConfiguration();
+catalogConfig.setProperty("type", "hive");
+catalogConfig.setProperty("uri", "thrift://hive-metastore:9083");
+catalogConfig.setProperty("clients", "5");
+catalogConfig.setProperty("property-version", "2");
+
+// 方式2：Hadoop Catalog
+CatalogConfiguration catalogConfig = new CatalogConfiguration();
+catalogConfig.setProperty("type", "hadoop");
+catalogConfig.setProperty("warehouse", "s3://my-bucket/iceberg/warehouse");
+
+// 方式3：REST Catalog
+CatalogConfiguration catalogConfig = new CatalogConfiguration();
+catalogConfig.setProperty("type", "rest");
+catalogConfig.setProperty("uri", "http://iceberg-rest:8181");
+
+// 创建Catalog
+CatalogContext context = CatalogContext.create(catalogConfig);
+Catalog catalog = Catalogs.load(context);
+```
+
+### 32.2 Flink Sink写入Iceberg
+
+```java
+// Flink Sink写入Iceberg
+DataStream<Row> stream = ...;
+
+// 方式1：使用Iceberg Sink
+stream.addSink(
+    IcebergSink.forRow(stream, schema)
+        .tableCatalog("iceberg")
+        .tableCatalogLoader(new TableCatalogLoader("iceberg"))
+        .writeParallelism(4)
+        .build());
+
+// 方式2：使用Flink SQL
+// CREATE TABLE iceberg_sink (
+//     order_id BIGINT,
+//     order_time TIMESTAMP(3),
+//     amount DOUBLE,
+//     PRIMARY KEY (order_id) NOT ENFORCED
+// ) WITH (
+//     'connector' = 'iceberg',
+//     'catalog-type' = 'hive',
+//     'uri' = 'thrift://hive-metastore:9083',
+//     'warehouse' = 's3://my-bucket/iceberg',
+//     'table-identifier' = 'mydb.orders'
+// );
+//
+// INSERT INTO iceberg_sink SELECT * FROM source_table;
+
+// 配置选项：
+//   write.format.default: parquet（文件格式）
+//   write.target-file-size-bytes: 536870912（目标文件大小512MB）
+//   write.parquet.compression-codec: zstd（压缩算法）
+//   write.upsert.enabled: true（启用upsert）
+```
+
+### 32.3 Flink Source读取Iceberg
+
+```java
+// Flink Source读取Iceberg
+// 方式1：使用Iceberg Source
+DataStream<Row> stream = env.fromSource(
+    IcebergSource.forRowData()
+        .tableCatalog("iceberg")
+        .tableIdentifier("mydb.orders")
+        .streaming(true)
+        .startSnapshotId(12345L)
+        .build(),
+    WatermarkStrategy.forMonotonousTimestamps(),
+    "Iceberg Source");
+
+// 方式2：使用Flink SQL
+// SELECT * FROM iceberg_table
+// WHERE order_time >= TIMESTAMP '2024-01-01 00:00:00'
+//   AND order_time < TIMESTAMP '2024-01-02 00:00:00';
+
+// 流式读取配置：
+//   streaming: true（流式读取）
+//   start-snapshot-id: 12345（起始快照ID）
+//   start-timestamp: 2024-01-01T00:00:00（起始时间戳）
+//   monitor-interval: 30s（监控间隔）
+
+// 批量读取配置：
+//   streaming: false（批量读取）
+//   snapshot-id: 12345（指定快照ID）
+//   as-of-timestamp: 2024-01-01T00:00:00（时间点查询）
+```
+
+### 32.4 Iceberg集成优势
+
+```text
+Flink + Iceberg集成优势：
+
+  ACID事务：
+    写入原子性：要么全部成功，要么全部失败
+    并发写入：支持多Writer并发写入
+    快照隔离：读写不阻塞
+
+  Schema演进：
+    添加列：安全添加新列
+    删除列：安全删除列
+    重命名列：安全重命名列
+
+  时间旅行：
+    历史快照查询：查询历史时间点数据
+    数据回滚：回滚到历史快照
+    审计追踪：查看数据变更历史
+
+  分区演进：
+    动态分区：自动创建分区
+    分区合并：合并小分区
+    分区删除：按时间删除旧分区
+
+  性能优化：
+    列式存储：Parquet/ORC格式
+    压缩：Snappy/Zstd压缩
+    谓词下推：过滤条件下推到存储层
+```
+
+## 三十三、Flink SQL Connector生态
+
+### 33.1 Kafka Connector
+
+```sql
+-- Kafka Source
+CREATE TABLE kafka_source (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'properties.bootstrap.servers' = 'localhost:9092',
+    'properties.group.id' = 'flink-consumer',
+    'scan.startup.mode' = 'latest-offset',
+    'format' = 'json',
+    'json.timestamp-format.standard' = 'ISO-8601'
+);
+
+-- Kafka Sink
+CREATE TABLE kafka_sink (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders-output',
+    'properties.bootstrap.servers' = 'localhost:9092',
+    'format' = 'json',
+    'json.timestamp-format.standard' = 'ISO-8601'
+);
+```
+
+### 33.2 Elasticsearch Connector
+
+```sql
+-- Elasticsearch Source
+CREATE TABLE es_source (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'elasticsearch',
+    'hosts' = 'http://localhost:9200',
+    'index' = 'orders',
+    'document-id' = 'order_id',
+    'format' = 'json'
+);
+
+-- Elasticsearch Sink
+CREATE TABLE es_sink (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE
+) WITH (
+    'connector' = 'elasticsearch',
+    'hosts' = 'http://localhost:9200',
+    'index' = 'orders',
+    'document-id' = 'order_id',
+    'format' = 'json'
+);
+```
+
+### 33.3 JDBC Connector
+
+```sql
+-- JDBC Source
+CREATE TABLE jdbc_source (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'jdbc',
+    'url' = 'jdbc:postgresql://localhost:5432/mydb',
+    'table-name' = 'orders',
+    'username' = 'user',
+    'password' = 'password',
+    'driver' = 'org.postgresql.Driver'
+);
+
+-- JDBC Sink
+CREATE TABLE jdbc_sink (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'jdbc',
+    'url' = 'jdbc:postgresql://localhost:5432/mydb',
+    'table-name' = 'orders',
+    'username' = 'user',
+    'password' = 'password',
+    'driver' = 'org.postgresql.Driver'
+);
+```
+
+### 33.4 Hive Connector
+
+```sql
+-- Hive Source
+CREATE TABLE hive_source (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE
+) WITH (
+    'connector' = 'hive',
+    'table-identifier' = 'mydb.orders',
+    'hivemetastore.uri' = 'thrift://hive-metastore:9083',
+    'format' = 'parquet'
+);
+
+-- Hive Sink
+CREATE TABLE hive_sink (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE
+) WITH (
+    'connector' = 'hive',
+    'table-identifier' = 'mydb.orders',
+    'hivemetastore.uri' = 'thrift://hive-metastore:9083',
+    'format' = 'parquet'
+);
+```
+
+### 33.5 Iceberg Connector
+
+```sql
+-- Iceberg Source
+CREATE TABLE iceberg_source (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE
+) WITH (
+    'connector' = 'iceberg',
+    'catalog-type' = 'hive',
+    'uri' = 'thrift://hive-metastore:9083',
+    'warehouse' = 's3://my-bucket/iceberg',
+    'table-identifier' = 'mydb.orders'
+);
+
+-- Iceberg Sink
+CREATE TABLE iceberg_sink (
+    order_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DOUBLE
+) WITH (
+    'connector' = 'iceberg',
+    'catalog-type' = 'hive',
+    'uri' = 'thrift://hive-metastore:9083',
+    'warehouse' = 's3://my-bucket/iceberg',
+    'table-identifier' = 'mydb.orders'
+);
+```
+
+## 三十四、Flink生产环境问题排查
+
+### 34.1 背压/反压排查
+
+```text
+背压/反压（Backpressure）排查：
+
+  现象：
+    下游算子处理慢 → 上游算子数据积压
+    Checkpoint时间变长
+    吞吐量下降
+
+  排查步骤：
+    1. 检查Flink Web UI → Backpressure标签
+       查看哪些算子有背压
+    2. 检查数据倾斜
+       某个分区数据量远超其他分区
+    3. 检查外部系统
+       数据库/消息队列响应慢
+    4. 检查资源
+       CPU/内存/网络使用率
+
+  解决方案：
+    1. 增加并行度
+       提高算子并行度
+    2. 优化数据分布
+       重新分区避免数据倾斜
+    3. 优化外部系统
+       增加连接池/缓存/批量操作
+    4. 调整Checkpoint参数
+       增加Checkpoint间隔
+       启用非对齐Checkpoint
+```
+
+### 34.2 Checkpoint超时排查
+
+```text
+Checkpoint超时排查：
+
+  现象：
+    Checkpoint频繁失败
+    作业重启频繁
+    数据处理延迟增加
+
+  排查步骤：
+    1. 检查Checkpoint历史
+       查看Checkpoint失败原因
+    2. 检查状态大小
+       状态过大导致Checkpoint时间长
+    3. 检查外部系统
+       读写外部系统阻塞Checkpoint
+    4. 检查资源
+       CPU/内存不足
+
+  解决方案：
+    1. 调整Checkpoint参数
+       checkpointing.interval: 60000（1分钟）
+       checkpointing.timeout: 600000（10分钟）
+       checkpointing.min-pause: 30000（30秒）
+    2. 启用非对齐Checkpoint
+       execution.checkpointing.unaligned: true
+    3. 优化状态大小
+       使用RocksDB状态后端
+       启用状态TTL
+    4. 增加资源
+       增加TaskManager内存
+       增加并行度
+```
+
+### 34.3 数据倾斜排查
+
+```text
+数据倾斜排查：
+
+  现象：
+    某个分区数据量远超其他分区
+    某个Task处理时间远超其他Task
+    吞吐量下降
+
+  排查步骤：
+    1. 检查数据分布
+       查看各分区数据量
+    2. 检查分区键
+       分区键是否合理
+    3. 检查业务逻辑
+       是否有聚合操作导致倾斜
+
+  解决方案：
+    1. 重新分区
+       选择更均匀的分区键
+    2. 加盐打散
+       给Key加随机后缀
+    3. 两阶段聚合
+       先局部聚合，再全局聚合
+    4. 使用广播Join
+       小表广播避免Shuffle
+```
+
+### 34.4 内存溢出排查
+
+```text
+内存溢出（OOM）排查：
+
+  现象：
+    TaskManager频繁重启
+    作业频繁失败
+    日志中有OutOfMemoryError
+
+  排查步骤：
+    1. 检查TaskManager日志
+       查看OOM错误堆栈
+    2. 检查状态大小
+       状态过大导致内存不足
+    3. 检查数据倾斜
+       某个分区数据量过大
+    4. 检查外部系统
+       读写外部系统占用内存
+
+  解决方案：
+    1. 增加内存
+       增加TaskManager内存
+       增加网络缓冲内存
+    2. 使用RocksDB状态后端
+       状态存储在磁盘而非内存
+    3. 启用增量Checkpoint
+       减少Checkpoint内存占用
+    4. 优化数据结构
+       使用更高效的数据结构
+       启用对象复用
+```

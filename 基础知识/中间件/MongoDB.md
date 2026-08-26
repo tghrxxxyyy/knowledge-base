@@ -1026,4 +1026,226 @@ lvremove -f /dev/vg0/mongo_snapshot
 # 4. 支持时间点恢复（PITR）
 ```
 
+## 聚合管道实战
+
+```javascript
+// 复杂聚合管道示例
+db.orders.aggregate([
+  // 第1阶段：匹配
+  { $match: { 
+    status: "completed",
+    createDate: { $gte: ISODate("2024-01-01") }
+  }},
+  
+  // 第2阶段：关联用户
+  { $lookup: {
+    from: "users",
+    localField: "userId",
+    foreignField: "_id",
+    as: "userInfo"
+  }},
+  
+  // 第3阶段：展开数组
+  { $unwind: "$userInfo" },
+  
+  // 第4阶段：分组统计
+  { $group: {
+    _id: { 
+      month: { $month: "$createDate" },
+      userLevel: "$userInfo.level"
+    },
+    totalAmount: { $sum: "$amount" },
+    orderCount: { $sum: 1 },
+    avgAmount: { $avg: "$amount" }
+  }},
+  
+  // 第5阶段：排序
+  { $sort: { "_id.month": 1, "totalAmount": -1 }},
+  
+  // 第6阶段：输出到集合
+  { $out: "order_monthly_stats" }
+]);
+```
+
+### 聚合管道阶段对比
+
+| 阶段 | 作用 | 类比SQL | 性能影响 |
+|------|------|---------|----------|
+| $match | 过滤 | WHERE | 高（尽早过滤） |
+| $project | 投影 | SELECT | 中 |
+| $group | 分组 | GROUP BY | 高 |
+| $sort | 排序 | ORDER BY | 高 |
+| $lookup | 关联 | JOIN | 高（慎用） |
+| $unwind | 展开数组 | LATERAL JOIN | 中 |
+| $out | 输出 | INSERT INTO | 低 |
+
+### 聚合性能优化
+
+```javascript
+// 1. 尽早使用$match减少数据量
+{ $match: { status: "active" } }  // 放在管道最前面
+
+// 2. 使用$limit减少处理数据
+{ $limit: 1000 }
+
+// 3. 创建复合索引支持聚合
+db.orders.createIndex({ status: 1, createDate: -1, userId: 1 })
+
+// 4. 使用allowDiskUse处理大数据集
+db.orders.aggregate([...], { allowDiskUse: true })
+```
+
+## 分片键选择策略
+
+```javascript
+// 分片键选择示例
+// 场景：电商订单表
+
+// 方案1：基于用户ID（推荐）
+sh.shardCollection("orders", { userId: "hashed" })
+// 优点：用户查询高效，数据均匀
+// 缺点：单用户订单集中
+
+// 方案2：基于时间+用户
+sh.shardCollection("orders", { createDate: 1, userId: 1 })
+// 优点：时间范围查询高效
+// 缺点：时间热点
+
+// 方案3：基于订单ID（哈希）
+sh.shardCollection("orders", { orderId: "hashed" })
+// 优点：写入完全均匀
+// 缺点：范围查询低效
+```
+
+### 分片键评估矩阵
+
+| 评估维度 | hashed | 复合键 | 范围分片 |
+|----------|--------|--------|----------|
+| 写入均匀度 | 高 | 中 | 低 |
+| 查询效率 | 低 | 高 | 中 |
+| 范围查询 | 差 | 好 | 好 |
+| 热点风险 | 低 | 中 | 高 |
+| 扩展性 | 好 | 中 | 差 |
+
+## 副本集运维
+
+```javascript
+// 副本集状态检查
+rs.status()
+
+// 副本集配置
+rs.conf()
+
+// 添加副本集成员
+rs.add("secondary2.example.com:27017")
+
+// 添加仲裁节点
+rs.addArb("arbiter.example.com:27017")
+
+// 强制主节点降级
+rs.stepDown(60)
+
+// 查看oplog大小
+rs.printReplicationInfo()
+```
+
+### 副本集监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 副本集状态 | 主节点是否正常 | 不是PRIMARY |
+| 复制延迟 | Secondary落后Primary | > 10秒 |
+| oplog窗口 | oplog可回溯时间 | < 24小时 |
+| 心跳失败 | 成员心跳失败次数 | > 0 |
+| 成员状态 | 成员是否正常 | 不是PRIMARY/SECONDARY |
+
+### 副本集故障处理
+
+```mermaid
+flowchart TD
+    ALERT[副本集故障] --> CHECK{检查主节点}
+    CHECK -->|主节点正常| SECONDARY{检查Secondary}
+    CHECK -->|主节点异常| REELECT[重新选举]
+    SECONDARY -->|正常| SYNC[检查同步]
+    SECONDARY -->|异常| RESTART[重启Secondary]
+    REELECT --> NEW_PRIMARY[新主节点]
+    SYNC --> DELAY[修复延迟]
+    RESTART --> REJOIN[重新加入]
+```
+
+## 索引优化策略
+
+```javascript
+// 索引优化示例
+// 1. 复合索引顺序
+db.orders.createIndex({ userId: 1, createDate: -1, status: 1 })
+// 高选择性字段在前
+
+// 2. 覆盖查询索引
+db.orders.createIndex({ userId: 1, status: 1, amount: 1 })
+// 查询只使用索引，不回表
+
+// 3. 部分索引
+db.orders.createIndex(
+  { status: 1 }, 
+  { partialFilterExpression: { status: { $in: ["pending", "processing"] } } }
+)
+// 只索引特定条件的数据
+
+// 4. 文本索引
+db.articles.createIndex({ title: "text", content: "text" })
+// 支持全文搜索
+```
+
+### 索引优化检查清单
+
+| 检查项 | 说明 | 优化方向 |
+|--------|------|----------|
+| 索引选择性 | 区分度高的字段优先 | 提高查询效率 |
+| 索引顺序 | 等值查询在前，范围在后 | 优化索引使用 |
+| 覆盖查询 | 查询字段全在索引中 | 避免回表 |
+| 索引数量 | 避免过多索引 | 减少写入开销 |
+| 索引大小 | 控制索引大小 | 节省内存 |
+
+## 安全加固配置
+
+```javascript
+// 启用认证
+// mongod.conf
+security:
+  authorization: enabled
+  keyFile: /etc/mongo/keyfile
+
+// 创建管理员用户
+use admin
+db.createUser({
+  user: "admin",
+  pwd: "securePassword",
+  roles: [
+    { role: "userAdminAnyDatabase", db: "admin" },
+    { role: "readWriteAnyDatabase", db: "admin" }
+  ]
+})
+
+// 创建应用用户
+use mydb
+db.createUser({
+  user: "appuser",
+  pwd: "appPassword",
+  roles: [
+    { role: "readWrite", db: "mydb" }
+  ]
+})
+```
+
+### 安全配置检查清单
+
+| 检查项 | 说明 | 实施方法 |
+|--------|------|----------|
+| 启用认证 | 禁止无认证访问 | security.authorization |
+| 网络隔离 | 限制访问IP | bindIp配置 |
+| 加密传输 | TLS/SSL加密 | net.ssl配置 |
+| 审计日志 | 记录操作日志 | auditLog配置 |
+| 权限控制 | 最小权限原则 | 角色权限管理 |
+
 ## 二十六、与其他板块的关系

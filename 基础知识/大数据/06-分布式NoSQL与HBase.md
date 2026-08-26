@@ -1079,3 +1079,503 @@ rules:
 - 实时链路见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」。
 
 > 一句话：**HBase = HDFS 之上 LSM（WAL→MemStore→HFile→Compaction）+ RowKey 字典序 + Region 自动分裂——生产三守则：RowKey 防热点、列族精简、定时 major compaction；选型按能力分（强一致→HBase/跨机房→Cassandra/内存→Redis）**。
+
+## 二十九、HBase Compaction调优参数详解
+
+### 29.1 Compaction参数配置
+
+```xml
+<!-- Compaction参数配置 -->
+<property>
+  <name>hbase.hstore.compactionThreshold</name>
+  <value>3</value>
+  <!-- 触发Minor Compaction的最小文件数 -->
+</property>
+
+<property>
+  <name>hbase.hstore.compactionMax</name>
+  <value>10</value>
+  <!-- 单次Minor Compaction最大文件数 -->
+</property>
+
+<property>
+  <name>hbase.hstore.compaction.max.size</name>
+  <value>2147483648</value>
+  <!-- 2GB：Compaction文件最大大小 -->
+</property>
+
+<property>
+  <name>hbase.hstore.compaction.min.size</name>
+  <value>134217728</value>
+  <!-- 128MB：Compaction文件最小大小 -->
+</property>
+
+<property>
+  <name>hbase.hstore.compaction.ratio</name>
+  <value>1.2</value>
+  <!-- Compaction比例：文件大小差异超过此比例才参与Compaction -->
+</property>
+
+<property>
+  <name>hbase.hstore.compaction.ratio.offpeak</name>
+  <value>5.0</value>
+  <!-- 非高峰期Compaction比例 -->
+</property>
+```
+
+### 29.2 Major Compaction配置
+
+```xml
+<!-- Major Compaction配置 -->
+<property>
+  <name>hbase.hregion.majorcompaction</name>
+  <value>604800000</value>
+  <!-- 7天：Major Compaction间隔（毫秒） -->
+</property>
+
+<property>
+  <name>hbase.hregion.majorcompaction.jitter</name>
+  <value>0.5</value>
+  <!-- 抖动因子：避免所有Region同时Compaction -->
+</property>
+
+<!-- 手动触发Major Compaction -->
+# 触发表的Major Compaction
+hbase shell> compact 'my_table'
+
+# 触发Region的Major Compaction
+hbase shell> compact 'my_table', 'rowkey1'
+
+# 触发列族的Major Compaction
+hbase shell> compact 'my_table', 'cf1'
+```
+
+### 29.3 Compaction调优策略
+
+```text
+Compaction调优策略：
+
+  Minor Compaction调优：
+    compactionThreshold=3：触发阈值
+    compactionMax=10：单次最大文件数
+    compaction.ratio=1.2：文件大小差异比例
+    目标：合并小文件，减少文件数量
+
+  Major Compaction调优：
+    majorcompaction=604800000：7天间隔
+    majorcompaction.jitter=0.5：抖动因子
+    目标：合并所有文件，清理过期数据
+
+  高峰期避免Compaction：
+    配置高峰期避免Major Compaction
+    使用compaction.ratio.offpeak调整比例
+    目标：避免高峰期IO竞争
+
+  监控指标：
+    Compaction队列长度
+    Compaction耗时
+    文件数量变化
+    IO使用率
+```
+
+## 三十、Coprocessor端点计算
+
+### 30.1 Endpoint Coprocessor实现
+
+```java
+// Endpoint Coprocessor实现
+public class AggregationEndpoint extends EndpointCoprocessor implements AggregationServerProtocol {
+    
+    private AggregationServerProtocol protocol;
+    
+    @Override
+    public void start(CoprocessorEnvironment env) {
+        if (env instanceof RegionEnvironment) {
+            protocol = new AggregationServerProtocolImpl();
+        } else {
+            throw new RuntimeException("Endpoint Coprocessor只能在RegionServer上运行");
+        }
+    }
+    
+    @Override
+    public void stop(CoprocessorEnvironment env) {
+        // 清理资源
+    }
+    
+    @Override
+    public long getRowCount(RpcController controller, AggregationProtocol.Parser parser) throws IOException {
+        // 实现行数统计
+        Region region = ((RegionEnvironment) env).getRegion();
+        long count = 0;
+        
+        Scan scan = new Scan();
+        try (ResultScanner scanner = region.getScanner(scan)) {
+            for (Result result : scanner) {
+                count++;
+            }
+        }
+        
+        return count;
+    }
+    
+    @Override
+    public long getSum(RpcController controller, AggregationProtocol.Parser parser) throws IOException {
+        // 实现求和聚合
+        Region region = ((RegionEnvironment) env).getRegion();
+        long sum = 0;
+        
+        Scan scan = new Scan();
+        scan.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("value"));
+        
+        try (ResultScanner scanner = region.getScanner(scan)) {
+            for (Result result : scanner) {
+                byte[] value = result.getValue(Bytes.toBytes("cf"), Bytes.toBytes("value"));
+                if (value != null) {
+                    sum += Bytes.toLong(value);
+                }
+            }
+        }
+        
+        return sum;
+    }
+}
+
+// 部署Endpoint Coprocessor
+// hbase shell> create 'my_table', {NAME => 'cf', COPROCESSOR => '1|com.example.AggregationEndpoint|'}
+```
+
+### 30.2 Coprocessor调用
+
+```java
+// 客户端调用Coprocessor
+Configuration conf = HBaseConfiguration.create();
+Connection connection = ConnectionFactory.createConnection(conf);
+Table table = connection.getTable(TableName.valueOf("my_table"));
+
+// 调用聚合接口
+AggregationClient aggregationClient = new AggregationClient(conf);
+
+// 统计行数
+long rowCount = aggregationClient.getRowCount(table, new AggregationConfiguration());
+
+// 求和聚合
+ColumnInterpreter<Long, Long> columnInterpreter = new LongColumnInterpreter();
+long sum = aggregationClient.sum(table, new AggregationConfiguration(), columnInterpreter);
+
+System.out.println("行数: " + rowCount);
+System.out.println("总和: " + sum);
+```
+
+### 30.3 Coprocessor最佳实践
+
+```text
+Coprocessor最佳实践：
+
+  适用场景：
+    聚合计算：COUNT/SUM/AVG/MAX/MIN
+    过滤过滤：自定义过滤逻辑
+    数据转换：自定义数据转换
+    安全控制：行级权限控制
+
+  性能优化：
+    避免全表扫描：使用Scan过滤
+    减少网络传输：只返回必要数据
+    缓存结果：避免重复计算
+    并行执行：多Region并行
+
+  开发规范：
+    异常处理：正确处理RegionServer异常
+    资源管理：正确关闭Scanner
+    日志记录：记录关键操作日志
+    测试验证：单元测试+集成测试
+```
+
+## 三十一、Phoenix二级索引
+
+### 31.1 Global Index（全局索引）
+
+```sql
+-- Global Index配置
+-- 创建全局索引
+CREATE INDEX idx_user_name ON my_table (user_name) INCLUDE (email, phone);
+
+-- 查询使用索引
+SELECT user_name, email, phone FROM my_table WHERE user_name = 'John';
+
+-- 删除索引
+DROP INDEX idx_user_name ON my_table;
+
+-- Global Index特点：
+--   索引数据存储在独立的HBase表中
+--   查询性能高（索引覆盖查询）
+--   写入开销大（需要维护索引表）
+--   适用：读多写少场景
+```
+
+### 31.2 Local Index（本地索引）
+
+```sql
+-- Local Index配置
+-- 创建本地索引
+CREATE LOCAL INDEX idx_timestamp ON my_table (timestamp);
+
+-- 查询使用索引
+SELECT * FROM my_table WHERE timestamp > '2024-01-01';
+
+-- Local Index特点：
+--   索引数据存储在与原数据相同的Region中
+--   写入开销小（不需要跨Region写入）
+--   查询性能一般（需要扫描本地索引）
+--   适用：写多读少场景
+```
+
+### 31.3 Functional Index（函数索引）
+
+```sql
+-- Functional Index配置
+-- 创建函数索引
+CREATE INDEX idx_upper_name ON my_table (UPPER(user_name));
+
+-- 查询使用索引
+SELECT * FROM my_table WHERE UPPER(user_name) = 'JOHN';
+
+-- Functional Index特点：
+--   支持函数计算作为索引键
+--   灵活性高（支持各种函数）
+--   性能依赖函数计算复杂度
+--   适用：复杂查询条件
+```
+
+### 31.4 索引选择策略
+
+| 索引类型 | 适用场景 | 性能特点 | 维护成本 |
+|----------|----------|----------|----------|
+| Global Index | 读多写少 | 查询性能高 | 写入开销大 |
+| Local Index | 写多读少 | 写入开销小 | 查询性能一般 |
+| Functional Index | 复杂查询 | 灵活性高 | 性能依赖函数 |
+
+## 三十二、HBase集群扩容与缩容
+
+### 32.1 扩容操作步骤
+
+```text
+扩容操作步骤：
+
+  1. 准备新节点
+     安装HBase和HDFS
+     配置集群参数
+     加入集群
+
+  2. 滚动重启
+     逐个重启RegionServer
+     确保服务正常
+
+  3. Region迁移
+     使用balancer迁移Region
+     监控迁移进度
+
+  4. 验证扩容
+     检查Region分布
+     测试读写性能
+     监控集群状态
+
+  注意事项：
+    避免高峰期扩容
+    逐步扩容（一次加1-2个节点）
+    监控RegionServer负载
+    准备回滚方案
+```
+
+### 32.2 缩容操作步骤
+
+```text
+缩容操作步骤：
+
+  1. 选择要下线的节点
+     选择负载最低的节点
+     确认没有Region在该节点
+
+  2. Region迁移
+     使用balancer迁移Region
+     确保Region完全迁出
+
+  3. 停止RegionServer
+     停止RegionServer服务
+     从集群中移除
+
+  4. 清理配置
+     更新集群配置
+     移除节点信息
+
+  注意事项：
+    避免高峰期缩容
+    逐步缩容（一次下1-2个节点）
+    监控集群状态
+    准备回滚方案
+```
+
+### 32.3 扩缩容监控
+
+```text
+扩缩容监控：
+
+  监控指标：
+    RegionServer数量
+    Region分布情况
+    读写QPS
+    告警信息
+
+  监控工具：
+    HBase Master Web UI
+    HBase Shell
+    监控系统（Prometheus+Grafana）
+
+  告警配置：
+    RegionServer宕机告警
+    Region分布不均告警
+    读写性能下降告警
+```
+
+## 三十三、HBase数据迁移工具
+
+### 33.1 ExportTable/ImportTable
+
+```bash
+# ExportTable导出数据
+hbase org.apache.hadoop.hbase.mapreduce.Export my_table /export/my_table
+
+# ImportTable导入数据
+hbase org.apache.hadoop.hbase.mapreduce.Import my_table /export/my_table
+
+# 增量导出
+hbase org.apache.hadoop.hbase.mapreduce.Export my_table /export/my_table 1234567890
+
+# 注意事项：
+#   导出时指定时间戳可以实现增量导出
+#   导入时会自动创建表
+#   适用于全量/增量数据迁移
+```
+
+### 33.2 Replication复制
+
+```bash
+# 配置集群间复制
+# 步骤1：配置peer集群
+hbase shell> add_peer 'peer1', CLUSTER_KEY => 'zk1:2181:/hbase', TABLE_CFS => {'my_table' => ['cf1', 'cf2']}
+
+# 步骤2：启用表复制
+hbase shell> enable_table_replication 'my_table'
+
+# 步骤3：查看复制状态
+hbase shell> list_peers
+hbase shell> peer_status 'peer1'
+
+# 步骤4：禁用复制
+hbase shell> disable_table_replication 'my_table'
+hbase shell> remove_peer 'peer1'
+
+# 注意事项：
+#   复制是异步的
+#   需要网络连通性
+#   适用于跨集群数据同步
+```
+
+### 33.3 迁移工具对比
+
+| 工具 | 适用场景 | 性能特点 | 复杂度 |
+|------|----------|----------|--------|
+| ExportTable/ImportTable | 全量迁移 | 一次性迁移 | 低 |
+| Replication | 实时同步 | 异步复制 | 中 |
+| SnapShot | 快照恢复 | 快速恢复 | 中 |
+| BulkLoad | 大批量导入 | 高性能导入 | 高 |
+
+## 三十四、HBase在IoT宽表中的rowkey设计模式
+
+### 34.1 IoT宽表rowkey设计
+
+```text
+IoT宽表rowkey设计模式：
+
+  设备ID+时间戳：
+    rowkey = 设备ID + 时间戳
+    优点：查询某设备的历史数据高效
+    缺点：时间戳前缀可能导致热点
+
+  设备ID+倒序时间戳：
+    rowkey = 设备ID + Long.MAX_VALUE - 时间戳
+    优点：最新数据在前，查询高效
+    缺点：需要计算倒序时间戳
+
+  设备ID+日期+时间戳：
+    rowkey = 设备ID + 日期 + 时间戳
+    优点：支持按日期分区查询
+    缺点：日期分区可能不均匀
+
+  设备ID+哈希+时间戳：
+    rowkey = 设备ID + 哈希(设备ID) + 时间戳
+    优点：数据分布均匀
+    缺点：查询需要计算哈希
+
+  示例：
+    设备ID：device_001
+    时间戳：2024-01-01 10:00:00
+    rowkey设计：
+      方案1：device_001_20240101100000
+      方案2：device_001_9223372036854775807_20240101100000
+      方案3：device_001_20240101_20240101100000
+      方案4：device_001_abc123_20240101100000
+```
+
+### 34.2 IoT宽表列族设计
+
+```text
+IoT宽表列族设计：
+
+  基础信息列族（info）：
+    info:device_type：设备类型
+    info:manufacturer：制造商
+    info:model：型号
+    info:location：位置
+
+  传感器数据列族（sensor）：
+    sensor:temperature：温度
+    sensor:humidity：湿度
+    sensor:pressure：压力
+    sensor:vibration：振动
+
+  元数据列族（meta）：
+    meta:timestamp：采集时间
+    meta:quality：数据质量
+    meta:source：数据来源
+
+  设计原则：
+    列族数量：2-3个（避免过多列族）
+    列族大小：尽量均匀（避免热点）
+    列族压缩：启用压缩（节省存储）
+```
+
+### 34.3 IoT宽表查询模式
+
+```text
+IoT宽表查询模式：
+
+  单设备历史查询：
+    rowkey前缀：设备ID + 时间范围
+    扫描范围：[device_001_20240101, device_001_20240102)
+    适用：设备监控、故障排查
+
+  多设备实时查询：
+    过滤条件：设备ID列表 + 时间范围
+    并行扫描：多个设备并行查询
+    适用：实时监控、告警
+
+  设备聚合查询：
+    聚合操作：COUNT/AVG/MAX/MIN
+    并行聚合：多Region并行聚合
+    适用：统计分析、报表
+
+  优化建议：
+    使用Bloom Filter：减少无效读
+    使用Column Prefix：只读必要列
+    使用Cache：缓存热点数据
+```

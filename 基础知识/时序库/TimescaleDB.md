@@ -1065,3 +1065,642 @@ flowchart LR
 | 告警规则 | 实时查询 | 低延迟查询 |
 | 历史分析 | 大数据量 | 时间旅行+压缩 |
 | 预测分析 | 特征工程 | 连续聚合+窗口函数 |
+
+## 三十五、连续聚合物化视图自动刷新深度配置
+
+### 35.1 Refresh Policy参数详解
+
+```sql
+-- 连续聚合刷新策略配置
+SELECT add_continuous_aggregate_policy('readings_hourly',
+    start_offset => INTERVAL '3 days',      -- 起始偏移：刷新3天前的数据
+    end_offset => INTERVAL '1 hour',        -- 结束偏移：刷新到1小时前
+    schedule_interval => INTERVAL '1 hour', -- 调度间隔：每小时执行
+    if_not_exists => TRUE                   -- 幂等创建
+);
+
+-- 参数说明：
+-- start_offset: 刷新窗口起始点（越大会扫描更多历史数据）
+-- end_offset: 刷新窗口结束点（留余量避免最新数据未物化）
+-- schedule_interval: 任务调度频率
+-- if_not_exists: 防止重复创建策略
+
+-- 查看刷新策略
+SELECT * FROM timescaledb_information.jobs
+WHERE proc_name = 'refresh_continuous_aggregate';
+
+-- 手动触发刷新
+CALL refresh_continuous_aggregate('readings_hourly',
+    NOW() - INTERVAL '7 days',
+    NOW() - INTERVAL '1 hour');
+
+-- 刷新状态监控
+SELECT * FROM timescaledb_information.jobs
+WHERE proc_name = 'refresh_continuous_aggregate'
+ORDER BY next_start;
+```
+
+### 35.2 刷新窗口设计模式
+
+```text
+刷新窗口设计模式：
+
+  滑动窗口模式：
+    start_offset = INTERVAL '7 days'
+    end_offset = INTERVAL '1 hour'
+    适用：监控看板（需要最新数据）
+
+  固定窗口模式：
+    start_offset = NOW() - start_of_day
+    end_offset = NOW() - start_of_day + INTERVAL '1 day'
+    适用：日报表（按天聚合）
+
+  分层刷新模式：
+    Level 1: 1分钟聚合 → 每5分钟刷新
+    Level 2: 1小时聚合 → 每小时从1分钟聚合刷新
+    Level 3: 1天聚合 → 每天从1小时聚合刷新
+    适用：多级降采样
+
+  迟到数据处理：
+    start_offset = INTERVAL '3 days'（覆盖可能的迟到数据窗口）
+    end_offset = INTERVAL '1 hour'（避免最新数据未物化）
+```
+
+### 35.3 刷新性能优化
+
+```sql
+-- 优化刷新性能的配置
+ALTER MATERIALIZED VIEW readings_hourly SET (
+    timescaledb.materialized_only = false,  -- 实时+物化双模式
+    timescaledb.refresh_lag = INTERVAL '1 hour'  -- 刷新延迟
+);
+
+-- 并发刷新控制
+SELECT alter_job(
+    (SELECT job_id FROM timescaledb_information.jobs
+     WHERE proc_name = 'refresh_continuous_aggregate'
+     AND proc_schema = '_timescaledb_internal'),
+    max_runs => 1  -- 同时只运行1个刷新任务
+);
+
+-- 刷新资源限制
+SET timescaledb.max_background_workers = 4;  -- 限制后台工作进程数
+
+-- 监控刷新性能
+SELECT
+    job_id,
+    start_time,
+    finish_time,
+    duration,
+    rows_processed
+FROM timescaledb_information.job_run_details
+WHERE proc_name = 'refresh_continuous_aggregate'
+ORDER BY start_time DESC;
+```
+
+## 三十六、压缩策略高级配置详解
+
+### 36.1 segmentby与orderby深度优化
+
+```sql
+-- 高级压缩配置
+ALTER TABLE sensor_readings SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id,location_id',  -- 多列分段
+    timescaledb.compress_orderby = 'time DESC,device_id ASC',  -- 多列排序
+    timescaledb.compress_chunk_time_interval = INTERVAL '7 days'  -- 压缩chunk时间间隔
+);
+
+-- 压缩阈值配置
+SELECT add_compression_policy('sensor_readings',
+    INTERVAL '7 days',  -- 压缩时间阈值
+    if_not_exists => TRUE
+);
+
+-- 高级压缩参数
+ALTER TABLE sensor_readings SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby = 'time DESC',
+    timescaledb.compress_orderby_metadata_target = 200MB,  -- 元数据目标大小
+    timescaledb.compress_segmentby_region_size = 1024,     -- 分段区域大小
+    timescaledb.compress_max_rows_per_compression = 1000000  -- 每次压缩最大行数
+);
+```
+
+### 36.2 压缩效果监控与调优
+
+```sql
+-- 压缩效果监控
+SELECT
+    hypertable_name,
+    pg_size_pretty(before_compression_total_bytes) AS before_size,
+    pg_size_pretty(after_compression_total_bytes) AS after_size,
+    compression_ratio,
+    uncompressed_row_count,
+    compressed_row_count
+FROM timescaledb_information.compressed_hypertable_stats
+WHERE hypertable_name = 'sensor_readings';
+
+-- segmentby选择建议
+-- 高基数列（device_id）：适合segmentby（分组边界）
+-- 低基数列（region）：不适合segmentby（组过大）
+-- 时间列：适合orderby（时序局部性）
+
+-- orderby选择建议
+-- 时间列：必须（delta-of-delta编码最优）
+-- 查询模式：按查询频率排序（高频查询列优先）
+
+-- 压缩效果验证
+SELECT
+    _timescaledb_internal.get_compression_stats('sensor_readings');
+
+-- 分析压缩统计
+SELECT
+    chunk_name,
+    pg_size_pretty(before_compression_total_bytes) AS before,
+    pg_size_pretty(after_compression_total_bytes) AS after,
+    compression_ratio
+FROM timescaledb_information.chunk_compression_stats
+WHERE hypertable_name = 'sensor_readings'
+ORDER BY compression_ratio;
+```
+
+### 36.3 压缩与查询性能平衡
+
+```text
+压缩与查询性能平衡策略：
+
+  写入密集型：
+    segmentby：高基数列（device_id）
+    orderby：time DESC
+    压缩阈值：7天
+    查询性能：按device_id查询快
+
+  查询密集型：
+    segmentby：查询过滤列
+    orderby：time DESC, 查询排序列
+    压缩阈值：14天
+    查询性能：按查询模式优化
+
+  混合场景：
+    segmentby：device_id（平衡写入和查询）
+    orderby：time DESC（时序查询）
+    压缩阈值：7天
+    查询性能：通用优化
+
+  监控指标：
+    压缩比：> 5:1为佳
+    查询延迟：< 100ms为佳
+    写入吞吐：> 10k points/s为佳
+```
+
+## 三十七、多节点TimescaleDB部署架构
+
+### 37.1 Access Node与Data Node架构
+
+```text
+TimescaleDB 多节点架构：
+
+  Access Node（访问节点）：
+    接收客户端SQL查询
+    分布式查询计划生成
+    结果合并与返回
+    元数据管理
+    高可用：Patroni/云托管PG
+
+  Data Node（数据节点）：
+    存储实际数据chunk
+    执行本地查询
+    支持水平扩展
+    数据复制与同步
+    资源：CPU/内存/存储
+
+  分布式Hypertable：
+    数据自动分布到多个Data Node
+    基于分片键路由
+    支持分布式聚合和连接
+    透明化查询下推
+```
+
+### 37.2 分布式部署配置
+
+```sql
+-- 添加数据节点
+SELECT add_data_node('dn1', host => '10.0.1.11',
+    port => 5432, database => 'tsdb',
+    password => 'secure_password');
+SELECT add_data_node('dn2', host => '10.0.1.12');
+SELECT add_data_node('dn3', host => '10.0.1.13');
+
+-- 创建分布式超表
+SELECT create_distributed_hypertable('sensor_data', 'time',
+    chunk_time_interval => INTERVAL '1 day',
+    partitioning_column => 'device_id',
+    number_partitions => 4,
+    replication_factor => 2);  -- 副本因子
+
+-- 查看数据分布
+SELECT
+    node_name,
+    chunk_name,
+    pg_size_pretty(chunk_size) AS size
+FROM timescaledb_information.chunks
+WHERE hypertable_name = 'sensor_data'
+ORDER BY node_name, chunk_name;
+
+-- 分布式连续聚合
+CREATE MATERIALIZED VIEW sensor_hourly_distributed
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    device_id,
+    AVG(temperature) AS avg_temp
+FROM sensor_data
+GROUP BY bucket, device_id;
+
+-- 分布式压缩策略
+SELECT add_compression_policy('sensor_data', INTERVAL '7 days');
+```
+
+### 37.3 多节点运维管理
+
+```sql
+-- 数据节点状态监控
+SELECT * FROM timescaledb_information.data_nodes;
+
+-- 节点健康检查
+SELECT
+    node_name,
+    node_type,
+    available,
+    pg_size_pretty(used_disk_space) AS used_space,
+    pg_size_pretty(total_disk_space) AS total_space
+FROM timescaledb_information.data_nodes;
+
+-- 节点故障处理
+-- 1. 移除故障节点
+SELECT delete_data_node('dn2');
+
+-- 2. 添加新节点
+SELECT add_data_node('dn2_new', host => '10.0.1.14');
+
+-- 3. 数据重平衡
+SELECT rebalance_chunk('sensor_data');
+
+-- 备份策略
+-- Access Node：pg_basebackup + WAL归档
+-- Data Node：每个节点独立备份
+-- 分布式恢复：rebalance_chunk + 数据修复
+
+-- 性能监控
+SELECT
+    node_name,
+    query_count,
+    avg_execution_time,
+    total_execution_time
+FROM timescaledb_information.query_stats
+WHERE hypertable_name = 'sensor_data'
+ORDER BY total_execution_time DESC;
+```
+
+## 三十八、TimescaleDB与PostgreSQL生态兼容
+
+### 38.1 JDBC/ORM连接配置
+
+```java
+// JDBC连接配置
+String url = "jdbc:postgresql://timescaledb:5432/tsdb";
+Properties props = new Properties();
+props.setProperty("user", "app_user");
+props.setProperty("password", "secure_password");
+props.setProperty("ssl", "true");
+props.setProperty("sslmode", "require");
+props.setProperty("prepareThreshold", "5");  // 预编译阈值
+props.setProperty("preparedStatementCacheQueries", "256");
+props.setProperty("preparedStatementCacheSizeMiB", "5");
+
+// HikariCP连接池配置
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl(url);
+config.setUsername("app_user");
+config.setPassword("secure_password");
+config.setMaximumPoolSize(20);
+config.setMinimumIdle(5);
+config.setConnectionTimeout(30000);
+config.setIdleTimeout(600000);
+config.setMaxLifetime(1800000);
+config.addDataSourceProperty("cachePrepStmts", "true");
+config.addDataSourceProperty("prepStmtCacheSize", "250");
+config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+```
+
+### 38.2 ORM框架集成
+
+```sql
+-- Hibernate/JPA实体映射
+@Entity
+@Table(name = "sensor_readings")
+public class SensorReading {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "time", nullable = false)
+    private Instant time;
+
+    @Column(name = "device_id", nullable = false)
+    private String deviceId;
+
+    @Column(name = "temperature")
+    private Double temperature;
+
+    @Column(name = "humidity")
+    private Double humidity;
+}
+
+-- SQLAlchemy (Python)映射
+from sqlalchemy import create_engine, Column, DateTime, String, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+Base = declarative_base()
+
+class SensorReading(Base):
+    __tablename__ = 'sensor_readings'
+
+    id = Column(Integer, primary_key=True)
+    time = Column(DateTime(timezone=True), nullable=False)
+    device_id = Column(String, nullable=False)
+    temperature = Column(Float)
+    humidity = Column(Float)
+
+engine = create_engine('postgresql://user:pass@timescaledb:5432/tsdb')
+Session = sessionmaker(bind=engine)
+```
+
+### 38.3 连接池与性能优化
+
+```yaml
+# PgBouncer连接池配置
+# pgbouncer.ini
+[databases]
+tsdb = host=timescaledb port=5432 dbname=tsdb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction  # 事务级连接池
+default_pool_size = 20
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+max_client_conn = 1000
+max_db_connections = 100
+
+# 连接池监控
+SHOW POOLS;
+SHOW CLIENTS;
+SHOW SERVERS;
+```
+
+```text
+连接池优化策略：
+
+  事务级连接池（推荐）：
+    pool_mode = transaction
+    优势：连接复用率高，延迟低
+    适用：OLTP应用
+
+  会话级连接池：
+    pool_mode = session
+    优势：兼容性好
+    适用：长事务应用
+
+  语句级连接池：
+    pool_mode = statement
+    优势：最大化连接复用
+    适用：无事务应用
+
+  性能指标：
+    连接等待时间：< 10ms为佳
+    连接复用率：> 90%为佳
+    活跃连接数：< 80%最大连接数为佳
+```
+
+## 三十九、TimescaleDB在IoT数据平台中的应用案例
+
+### 39.1 设备数据采集架构
+
+```mermaid
+flowchart TB
+    subgraph 设备层
+        D1[传感器] -->|MQTT| G[网关]
+        D2[PLC] -->|Modbus| G
+        D3[摄像头] -->|RTSP| G
+    end
+
+    subgraph 采集层
+        G -->|MQTT| K[Kafka]
+        K -->|Flink| F[Flink Processing]
+    end
+
+    subgraph 存储层
+        F -->|JDBC| T[TimescaleDB]
+        F -->|Parquet| I[Iceberg]
+        F -->|Elasticsearch| ES[日志索引]
+    end
+
+    subgraph 计算层
+        T -->|连续聚合| CA[物化视图]
+        T -->|流计算| SC[实时告警]
+        I -->|批处理| BP[历史分析]
+    end
+
+    subgraph 服务层
+        CA -->|Grafana| V[可视化]
+        SC -->|Webhook| A[告警通知]
+        BP -->|Trino| Q[联邦查询]
+        T -->|REST API| M[设备管理]
+    end
+```
+
+### 39.2 设备数据建模实例
+
+```sql
+-- 设备档案表（关系表）
+CREATE TABLE devices (
+    device_id TEXT PRIMARY KEY,
+    device_type TEXT NOT NULL,
+    manufacturer TEXT,
+    model TEXT,
+    install_date DATE,
+    location GEOGRAPHY(POINT, 4326),  -- PostGIS地理类型
+    metadata JSONB,  -- 设备元数据
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 时序数据超表
+CREATE TABLE sensor_data (
+    time TIMESTAMPTZ NOT NULL,
+    device_id TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    metric_value DOUBLE PRECISION,
+    quality_code INTEGER DEFAULT 0,
+    tags JSONB
+);
+
+SELECT create_hypertable('sensor_data', 'time',
+    chunk_time_interval => INTERVAL '1 day',
+    partitioning_column => 'device_id',
+    number_partitions => 8);
+
+-- 创建索引
+CREATE INDEX idx_sensor_device_time ON sensor_data (device_id, time DESC);
+CREATE INDEX idx_sensor_metric ON sensor_data (metric_name, time DESC);
+
+-- 连续聚合：每小时设备指标
+CREATE MATERIALIZED VIEW device_hourly_stats
+WITH (timescaledb.continuous) AS
+SELECT
+    device_id,
+    metric_name,
+    time_bucket('1 hour', time) AS bucket,
+    AVG(metric_value) AS avg_value,
+    MAX(metric_value) AS max_value,
+    MIN(metric_value) AS min_value,
+    COUNT(*) AS sample_count
+FROM sensor_data
+GROUP BY device_id, metric_name, time_bucket('1 hour', time);
+
+-- 添加刷新策略
+SELECT add_continuous_aggregate_policy('device_hourly_stats',
+    start_offset => INTERVAL '3 days',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour');
+
+-- 压缩策略
+ALTER TABLE sensor_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('sensor_data', INTERVAL '7 days');
+```
+
+### 39.3 IoT数据分析场景
+
+```sql
+-- 场景1：设备状态实时监控
+SELECT
+    d.device_id,
+    d.device_type,
+    d.location,
+    s.avg_value as current_temperature,
+    s.sample_count
+FROM device_hourly_stats s
+JOIN devices d ON s.device_id = d.device_id
+WHERE s.bucket >= NOW() - INTERVAL '1 hour'
+  AND s.metric_name = 'temperature'
+  AND s.avg_value > 80;  -- 温度告警阈值
+
+-- 场景2：设备健康度分析
+WITH device_metrics AS (
+    SELECT
+        device_id,
+        metric_name,
+        AVG(metric_value) as avg_24h,
+        MAX(metric_value) as max_24h,
+        COUNT(*) as sample_count
+    FROM sensor_data
+    WHERE time >= NOW() - INTERVAL '24 hours'
+    GROUP BY device_id, metric_name
+)
+SELECT
+    d.device_id,
+    d.device_type,
+    d.model,
+    m.metric_name,
+    m.avg_24h,
+    m.max_24h,
+    CASE
+        WHEN m.avg_24h > 90 THEN 'CRITICAL'
+        WHEN m.avg_24h > 80 THEN 'WARNING'
+        ELSE 'NORMAL'
+    END as health_status
+FROM devices d
+JOIN device_metrics m ON d.device_id = m.device_id
+WHERE m.metric_name IN ('temperature', 'vibration')
+ORDER BY d.device_id, m.metric_name;
+
+-- 场景3：地理围栏告警
+SELECT
+    d.device_id,
+    d.location,
+    ST_AsText(d.location) as location_text,
+    s.time,
+    s.metric_value
+FROM sensor_data s
+JOIN devices d ON s.device_id = d.device_id
+WHERE s.time >= NOW() - INTERVAL '10 minutes'
+  AND ST_DWithin(
+      d.location,
+      ST_MakePoint(120.1, 30.2)::geography,
+      1000  -- 1公里范围
+  )
+  AND s.metric_name = 'temperature';
+```
+
+### 39.4 可视化与告警配置
+
+```yaml
+# Grafana Dashboard配置示例
+apiVersion: 1
+dashboards:
+  - name: IoT设备监控
+    panels:
+      - title: 设备温度趋势
+        type: time_series
+        targets:
+          - rawSql: |
+              SELECT
+                time_bucket('5 minutes', time) as time,
+                device_id,
+                AVG(metric_value) as value
+              FROM sensor_data
+              WHERE metric_name = 'temperature'
+                AND time >= NOW() - INTERVAL '24 hours'
+              GROUP BY time_bucket('5 minutes', time), device_id
+            legendFormat: "{{device_id}}"
+
+      - title: 设备健康状态
+        type: stat
+        targets:
+          - rawSql: |
+              SELECT
+                device_id,
+                CASE
+                  WHEN AVG(metric_value) > 90 THEN 2
+                  WHEN AVG(metric_value) > 80 THEN 1
+                  ELSE 0
+                END as status
+              FROM sensor_data
+              WHERE metric_name = 'temperature'
+                AND time >= NOW() - INTERVAL '1 hour'
+              GROUP BY device_id
+
+# 告警规则配置
+alerting:
+  rules:
+    - alert: HighTemperature
+      expr: AVG(metric_value) > 80
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "设备 {{ $labels.device_id }} 温度过高"
+        description: "设备 {{ $labels.device_id }} 当前温度 {{ $value }}°C"
+```

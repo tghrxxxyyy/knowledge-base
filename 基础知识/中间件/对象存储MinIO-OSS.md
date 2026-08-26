@@ -1076,3 +1076,407 @@ export MINIO_REGION=us-east-1
 | 维护风险 | 官方已停维护，评估替代 |
 | 替代方案 | 云 OSS / Ceph RGW / SeaweedFS / Garage |
 | 一句话 | 「S3 兼容的自建对象存储——数据不出内网的首选」 |
+
+## 十一、MinIO Erasure Coding原理
+
+### 11.1 纠删码原理
+
+```text
+Erasure Coding原理：
+
+  数据分片：
+    将原始数据分割为N个数据块
+    每个数据块大小相同
+    例如：N=4，12MB文件 → 4个3MB数据块
+
+  校验块生成：
+    生成M个校验块
+    校验块 = 数据块的线性组合
+    例如：M=2，4个数据块 → 2个校验块
+
+  存储布局：
+    数据块和校验块分布在不同磁盘
+    例如：6个磁盘，4个数据块+2个校验块
+    任意2个磁盘故障，数据可恢复
+
+  自修复流程：
+    1. 检测故障磁盘
+    2. 读取剩余数据块和校验块
+    3. 通过线性代数计算恢复数据
+    4. 写入新磁盘
+    5. 验证数据完整性
+```
+
+### 11.2 纠删码配置
+
+```bash
+# MinIO纠删码配置
+# 标准配置：4数据块+2校验块（容忍2个磁盘故障）
+minio server /data{1...6}
+
+# 高可用配置：8数据块+4校验块（容忍4个磁盘故障）
+minio server /data{1...12}
+
+# 最小配置：2数据块+2校验块（容忍1个磁盘故障）
+minio server /data{1...4}
+
+# 纠删码效率计算：
+# 存储效率 = N / (N + M)
+# 例如：4/6 = 66.7%（存储效率）
+# 可用性：容忍M个磁盘故障
+```
+
+### 11.3 纠删码优势
+
+```text
+纠删码优势：
+
+  存储效率：
+    副本：1/3（3副本）
+    纠删码：2/3（4+2配置）
+    节省：33%存储空间
+
+  数据保护：
+    副本：容忍N-1个磁盘故障
+    纠删码：容忍M个磁盘故障
+    可配置：根据需求调整N和M
+
+  性能：
+    读取：可并行读取多个数据块
+    写入：可并行写入多个数据块
+    恢复：可并行恢复多个数据块
+
+  适用场景：
+    冷数据存储：成本敏感
+    归档数据：长期保存
+    大文件存储：视频/图片
+```
+
+## 十二、MinIO多站点复制
+
+### 12.1 Bucket Replication配置
+
+```bash
+# MinIO多站点复制配置
+# 步骤1：配置源站点
+mc alias set source http://source-minio:9000 admin password
+
+# 步骤2：配置目标站点
+mc alias set target http://target-minio:9000 admin password
+
+# 步骤3：配置复制规则
+mc replicate add source/data-bucket \
+  --remote-bucket data-bucket \
+  --target "target" \
+  --replicate "delete,delete-marker,existing-objects" \
+  --priority 1
+
+# 步骤4：验证复制状态
+mc replicate status source/data-bucket
+
+# 步骤5：测试复制
+mc cp test.txt source/data-bucket/
+mc ls target/data-bucket/
+```
+
+### 12.2 复制规则配置
+
+```json
+// 复制规则配置
+{
+  "Rules": [
+    {
+      "ID": "replicate-all",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": ""
+      },
+      "Destination": {
+        "Bucket": "arn:aws:s3:::target-bucket",
+        "StorageClass": "STANDARD"
+      },
+      "ReplicationTime": {
+        "Status": "Enabled",
+        "Time": {
+          "Minutes": 15
+        }
+      },
+      "DeleteMarkerReplication": {
+        "Status": "Enabled"
+      }
+    }
+  ]
+}
+```
+
+### 12.3 复制模式对比
+
+| 模式 | 说明 | 适用场景 | 优缺点 |
+|------|------|----------|--------|
+| 同步复制 | 实时复制 | 高可用 | 数据一致但延迟高 |
+| 异步复制 | 异步复制 | 灾备 | 延迟低但可能丢数据 |
+| 选择性复制 | 按规则复制 | 成本优化 | 灵活但配置复杂 |
+
+## 十三、MinIO生命周期管理
+
+### 13.1 Transition规则配置
+
+```bash
+# MinIO生命周期管理配置
+# 步骤1：创建生命周期配置文件
+cat > lifecycle.json << EOF
+{
+  "Rules": [
+    {
+      "ID": "transition-to-ia",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "logs/"
+      },
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "STANDARD_IA"
+        },
+        {
+          "Days": 90,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
+      }
+    }
+  ]
+}
+EOF
+
+# 步骤2：应用生命周期配置
+mc ilm import source/data-bucket < lifecycle.json
+
+# 步骤3：验证配置
+mc ilm ls source/data-bucket
+```
+
+### 13.2 Expiration规则配置
+
+```bash
+# 过期规则配置
+cat > expiration.json << EOF
+{
+  "Rules": [
+    {
+      "ID": "expire-old-files",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "temp/"
+      },
+      "Expiration": {
+        "Days": 7
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 30
+      }
+    }
+  ]
+}
+EOF
+
+# 应用配置
+mc ilm import source/data-bucket < expiration.json
+```
+
+### 13.3 ILM配置最佳实践
+
+```text
+ILM配置最佳实践：
+
+  分层存储：
+    热数据（0-30天）：STANDARD
+    温数据（30-90天）：STANDARD_IA
+    冷数据（90-365天）：GLACIER
+    归档数据（>365天）：删除或DEEP_ARCHIVE
+
+  成本优化：
+    热数据：高成本，高性能
+    冷数据：低成本，低性能
+    归档数据：最低成本，最低性能
+
+  数据保留：
+    业务数据：按业务需求保留
+    日志数据：按合规要求保留
+    临时数据：及时清理
+
+  监控告警：
+    存储成本监控
+    数据访问频率监控
+    生命周期执行监控
+```
+
+## 十四、MinIO安全配置
+
+### 14.1 IAM策略配置
+
+```json
+// IAM策略配置
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["arn:aws:iam:::user/user1"]
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-bucket",
+        "arn:aws:s3:::my-bucket/*"
+      ]
+    }
+  ]
+}
+```
+
+```bash
+# IAM策略管理
+# 创建策略
+mc admin policy create myminio readonly policy.json
+
+# 分配策略
+mc admin policy attach myminio readonly --user user1
+
+# 查看策略
+mc admin policy ls myminio
+
+# 验证权限
+mc ls myminio/my-bucket/
+```
+
+### 14.2 加密配置
+
+```bash
+# 加密配置
+# 服务器端加密（SSE-S3）
+mc encrypt enable myminio/my-bucket
+
+# 服务器端加密（SSE-KMS）
+mc encrypt set ssekms myminio/my-bucket --kms-key-id my-key
+
+# 传输加密（TLS）
+# 配置TLS证书
+minio server /data --certs-dir /root/.minio/certs
+
+# 验证加密
+mc stat myminio/my-bucket/test.txt
+```
+
+### 14.3 审计日志配置
+
+```bash
+# 审计日志配置
+# 启用审计日志
+mc admin config set myminio audit Enable=on
+
+# 配置审计目标
+mc admin config set myminio audit Target=s3://audit-logs
+
+# 查看审计日志
+mc admin log show myminio
+
+# 集成ELK
+# Filebeat配置
+filebeat.inputs:
+- type: log
+  paths:
+    - /var/log/minio/audit.log
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+```
+
+## 十五、MinIO性能调优
+
+### 15.1 小文件合并
+
+```bash
+# 小文件合并优化
+# 问题：大量小文件导致性能下降
+# 解决：合并小文件
+
+# 步骤1：分析小文件
+mc ls --recursive myminio/my-bucket/ | wc -l
+
+# 步骤2：合并小文件
+# 使用tar合并
+tar -cf merged.tar file1.txt file2.txt file3.txt
+mc cp merged.tar myminio/my-bucket/
+
+# 步骤3：验证合并结果
+mc ls myminio/my-bucket/merged.tar
+```
+
+### 15.2 并行多部分上传
+
+```bash
+# 并行多部分上传配置
+# 配置并发数
+mc config set myminio parallel=10
+
+# 配置分片大小
+mc config set myminio part-size=64MB
+
+# 测试上传性能
+mc cp large-file.bin myminio/my-bucket/ --debug
+
+# 监控上传进度
+mc pipe myminio/my-bucket/large-file.bin < large-file.bin
+```
+
+### 15.3 性能调优最佳实践
+
+```text
+性能调优最佳实践：
+
+  硬件优化：
+    SSD：使用SSD提升IO性能
+    网络：10GbE网络提升传输速度
+    内存：充足内存减少磁盘IO
+
+  配置优化：
+    并发数：调整并发数（10-50）
+    分片大小：调整分片大小（64MB-256MB）
+    连接池：配置连接池（100-500）
+
+  应用优化：
+    批量操作：批量上传/下载
+    并行操作：并行处理多个文件
+    缓存策略：本地缓存热点数据
+
+  监控优化：
+    性能监控：监控IO/网络/CPU
+    容量监控：监控存储使用率
+    告警配置：配置性能告警
+```
+
+## 十六、MinIO vs AWS S3功能对比矩阵
+
+| 功能 | MinIO | AWS S3 | 说明 |
+|------|-------|--------|------|
+| S3 API兼容 | 完全兼容 | 原生支持 | MinIO完全兼容S3 API |
+| 存储类别 | 标准/IA/Glacier | 标准/IA/Glacier/Deep Archive | S3存储类别更丰富 |
+| 版本控制 | 支持 | 支持 | 功能相同 |
+| 生命周期管理 | 支持 | 支持 | 功能相同 |
+| 跨区域复制 | 支持 | 支持 | 功能相同 |
+| 加密 | SSE-S3/SSE-C/SSE-KMS | SSE-S3/SSE-C/SSE-KMS | 功能相同 |
+| 访问控制 | IAM/策略/ACL | IAM/策略/ACL/Block Public Access | S3更精细 |
+| 事件通知 | 支持 | 支持 | 功能相同 |
+| 静态网站托管 | 支持 | 支持 | 功能相同 |
+| 存储类分析 | 不支持 | 支持 | S3特有 |
+| S3 Select | 不支持 | 支持 | S3特有 |
+| 性能 | 高（自建） | 高（托管） | 性能相当 |
+| 成本 | 低（自建） | 中（按量付费） | MinIO成本更低 |
+| 运维 | 自运维 | 托管服务 | S3更省心 |
+| 数据主权 | 自控 | AWS云 | MinIO数据不出境 |

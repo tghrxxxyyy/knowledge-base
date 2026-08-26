@@ -1081,7 +1081,347 @@ SELECT parse_url(url, 'host') AS host FROM urls;
 
 ---
 
-## 十一、速查表（扩展）
+## 十一、Kafka Streams窗口操作配置
+
+### 11.1 窗口操作配置
+
+```java
+// 窗口操作配置
+// 滚动窗口（Tumbling Window）
+KStream<String, Order> orderStream = builder.stream("orders");
+
+KTable<Windowed<String>, Double> tumblingWindow = orderStream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+    .aggregate(
+        () -> 0.0,
+        (key, order, value) -> value + order.getAmount(),
+        Materialized.as("tumbling-window-store")
+    );
+
+// 跳跃窗口（Hopping Window）
+KTable<Windowed<String>, Double> hoppingWindow = orderStream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(10))
+        .advanceBy(Duration.ofMinutes(5)))
+    .aggregate(
+        () -> 0.0,
+        (key, order, value) -> value + order.getAmount(),
+        Materialized.as("hopping-window-store")
+    );
+
+// 滑动窗口（Sliding Window）
+KTable<Windowed<String>, Double> slidingWindow = orderStream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+    .aggregate(
+        () -> 0.0,
+        (key, order, value) -> value + order.getAmount(),
+        Materialized.as("sliding-window-store")
+    );
+
+// 会话窗口（Session Window）
+KTable<Windowed<String>, Long> sessionWindow = orderStream
+    .groupByKey()
+    .windowedBy(SessionWindows.ofGapWithNoGrace(Duration.ofMinutes(10)))
+    .count(Materialized.as("session-window-store"));
+```
+
+### 11.2 窗口操作最佳实践
+
+```text
+窗口操作最佳实践：
+
+  窗口类型选择：
+    滚动窗口：固定时间窗口，不重叠
+    跳跃窗口：固定时间窗口，可重叠
+    滑动窗口：基于时间戳，可重叠
+    会话窗口：基于活动间隔，动态大小
+
+  窗口大小设置：
+    实时场景：1-5分钟
+    准实时：5-30分钟
+    离线场景：1小时-1天
+
+  容错配置：
+    grace period：处理延迟数据
+    changelog：状态存储备份
+    事务：精确一次保证
+
+  监控指标：
+    窗口数量：当前活跃窗口数
+    窗口延迟：窗口处理延迟
+    窗口大小：窗口时间范围
+```
+
+## 十二、Kafka Streams Join操作配置
+
+### 12.1 Join操作配置
+
+```java
+// Join操作配置
+// KStream-KStream Join
+KStream<String, Order> orderStream = builder.stream("orders");
+KStream<String, Customer> customerStream = builder.stream("customers");
+
+KStream<String, OrderWithCustomer> joined = orderStream.join(
+    customerStream,
+    (order, customer) -> new OrderWithCustomer(order, customer),
+    Joined.with(Serdes.String(), orderSerde, customerSerde)
+);
+
+// KStream-GlobalKTable Join
+KStream<String, Order> orderStream = builder.stream("orders");
+GlobalKTable<String, Product> productTable = builder.globalTable("products");
+
+KStream<String, OrderWithProduct> joined = orderStream.join(
+    productTable,
+    (order, product) -> new OrderWithProduct(order, product),
+    Joined.with(Serdes.String(), orderSerde)
+);
+
+// KStream-KTable Join
+KStream<String, Order> orderStream = builder.stream("orders");
+KTable<String, Inventory> inventoryTable = builder.table("inventory");
+
+KStream<String, OrderWithInventory> joined = orderStream.join(
+    inventoryTable,
+    (order, inventory) -> new OrderWithInventory(order, inventory),
+    Joined.with(Serdes.String(), orderSerde)
+);
+```
+
+### 12.2 Join操作最佳实践
+
+```text
+Join操作最佳实践：
+
+  Join类型选择：
+    KStream-KStream：两个流Join
+    KStream-GlobalKTable：流与全局表Join
+    KStream-KTable：流与表Join
+
+  数据准备：
+    分区键：确保相同Key路由到相同分区
+    数据格式：统一数据格式
+    时间对齐：处理时间对齐
+
+  性能优化：
+    缓存策略：合理设置缓存
+    并行度：增加并行度
+    状态存储：使用SSD
+
+  容错处理：
+    重试机制：失败重试
+    死信队列：失败消息处理
+    监控告警：Join失败告警
+```
+
+## 十三、Kafka Streams State Store配置
+
+### 13.1 State Store配置
+
+```java
+// State Store配置
+// RocksDB State Store
+StateStoreBuilder<KeyValueStore<String, Order>> storeBuilder = Stores.keyValueStoreBuilder(
+    Stores.persistentKeyValueStore("order-store"),
+    Serdes.String(),
+    orderSerde
+).withCachingEnabled()
+  .withLoggingEnabled(new HashMap<>());  // 启用changelog
+
+// 内存State Store
+StateStoreBuilder<KeyValueStore<String, Order>> memoryStoreBuilder = Stores.keyValueStoreBuilder(
+    Stores.inMemoryKeyValueStore("memory-order-store"),
+    Serdes.String(),
+    orderSerde
+);
+
+// 窗口State Store
+StateStoreBuilder<WindowStore<String, Double>> windowStoreBuilder = Stores.windowStoreBuilder(
+    Stores.persistentWindowStore("window-order-store",
+        Duration.ofMinutes(10),
+        Duration.ofMinutes(5),
+        false),
+    Serdes.String(),
+    Serdes.Double()
+);
+
+// 使用State Store
+KStream<String, Order> stream = builder.stream("orders");
+KTable<String, Order> table = stream.groupByKey().aggregate(
+    () -> null,
+    (key, order, value) -> order,
+    Materialized.as("order-store")
+);
+```
+
+### 13.2 State Store最佳实践
+
+```text
+State Store最佳实践：
+
+  存储类型选择：
+    RocksDB：持久化存储，支持大数据
+    内存存储：高性能，小数据量
+    窗口存储：时间窗口数据
+
+  配置优化：
+    缓存：启用缓存提高性能
+    changelog：启用数据备份
+    刷写策略：配置刷写频率
+
+  监控指标：
+    存储大小：当前存储大小
+    读写性能：读写延迟
+    刷写频率：刷写次数
+
+  运维管理：
+    状态迁移：版本升级迁移
+    数据清理：定期清理旧数据
+    备份恢复：定期备份数据
+```
+
+## 十四、Kafka Streams Exactly-Once语义配置
+
+### 14.1 Exactly-Once配置
+
+```java
+// Exactly-Once配置
+Properties props = new Properties();
+props.put(StreamsConfig.APPLICATION_ID_CONFIG, "my-stream-app");
+props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, 
+    StreamsConfig.EXACTLY_ONCE_V2);  // 启用Exactly-Once
+
+// 事务配置
+props.put(StreamsConfig.producerPrefix(ProducerConfig.TRANSACTIONAL_ID_CONFIG), 
+    "my-stream-app-transaction");
+props.put(StreamsConfig.producerPrefix(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG), true);
+
+// 消费者配置
+props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+
+// 创建拓扑
+StreamsBuilder builder = new StreamsBuilder();
+KStream<String, Order> stream = builder.stream("orders");
+
+// 处理数据（Exactly-Once保证）
+stream.mapValues(order -> order.withAmount(order.getAmount() * 1.1))
+    .to("processed-orders");
+
+KafkaStreams streams = new KafkaStreams(builder.build(), props);
+streams.start();
+```
+
+### 14.2 Exactly-Once最佳实践
+
+```text
+Exactly-Once最佳实践：
+
+  事务配置：
+    transactional.id：唯一事务ID
+    enable.idempotence：启用了幂等
+    isolation.level：read_committed
+
+  处理保证：
+    exactly_once_v2：推荐，最新版本
+    exactly_once_beta：旧版本，兼容性好
+    at_least_once：最低保证
+
+  性能影响：
+    事务开销：10-20%性能下降
+    幂等开销：5-10%性能下降
+    事务大小：限制16MB
+
+  监控指标：
+    事务提交次数
+    事务回滚次数
+    事务超时次数
+```
+
+## 十五、ksqlDB流式SQL配置
+
+### 15.1 ksqlDB配置
+
+```sql
+-- ksqlDB配置
+-- 创建流
+CREATE STREAM orders_stream (
+    order_id VARCHAR KEY,
+    customer_id VARCHAR,
+    amount DOUBLE,
+    timestamp BIGINT
+) WITH (
+    KAFKA_TOPIC = 'orders',
+    VALUE_FORMAT = 'JSON'
+);
+
+-- 创建表
+CREATE TABLE customer_table (
+    customer_id VARCHAR PRIMARY KEY,
+    name VARCHAR,
+    email VARCHAR
+) WITH (
+    KAFKA_TOPIC = 'customers',
+    VALUE_FORMAT = 'JSON'
+);
+
+-- 创建物化视图
+CREATE TABLE order_summary AS
+SELECT 
+    customer_id,
+    COUNT(*) AS order_count,
+    SUM(amount) AS total_amount
+FROM orders_stream
+GROUP BY customer_id
+EMIT CHANGES;
+
+-- 查询物化视图
+SELECT * FROM order_summary;
+
+-- 创建流处理管道
+CREATE STREAM order_processor AS
+SELECT 
+    o.order_id,
+    o.customer_id,
+    o.amount,
+    c.name AS customer_name
+FROM orders_stream o
+JOIN customer_table c ON o.customer_id = c.customer_id
+EMIT CHANGES;
+```
+
+### 15.2 ksqlDB最佳实践
+
+```text
+ksqlDB最佳实践：
+
+  数据建模：
+    流：append-only事件流
+    表：可更新的实体表
+    物化视图：预计算聚合
+
+  查询优化：
+    WHERE过滤：减少数据量
+    GROUP BY聚合：预计算结果
+    JOIN操作：关联多个流/表
+
+  性能优化：
+    分区策略：合理分区
+    并行度：增加并行度
+    缓存：启用查询缓存
+
+  运维管理：
+    监控查询性能
+    管理流/表生命周期
+    备份恢复数据
+```
+
+---
+
+## 十二、速查表（扩展）
 
 | 项 | 结论 |
 |----|------|

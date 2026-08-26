@@ -1008,6 +1008,304 @@ spec:
   6. 节点亲和性：租户 Pod 分散到不同节点
 ```
 
+## CNI 网络插件对比
+
+```mermaid
+flowchart TB
+    subgraph CNI选型
+        POD1[Pod1] --> CNI{选择CNI}
+        CNI --> CALICO[Calico]
+        CNI --> FLANNEL[Flannel]
+        CNI --> CILIUM[Cilium]
+        CNI --> WEAVE[Weave Net]
+    end
+    CALICO --> |BGP路由| NODE1[节点1]
+    FLANNEL --> |VXLAN| NODE2[节点2]
+    CILIUM --> |eBPF| NODE3[节点3]
+    WEAVE --> |加密| NODE4[节点4]
+```
+
+### CNI 插件对比
+
+| 特性 | Calico | Flannel | Cilium | Weave |
+|------|--------|---------|--------|-------|
+| 网络模式 | BGP/VXLAN | VXLAN/host-gw | eBPF | VXLAN |
+| 网络策略 | 支持 | 不支持 | 支持 | 支持 |
+| 性能 | 高 | 中 | 极高 | 中 |
+| 安全性 | 高 | 中 | 极高 | 高 |
+| 运维复杂度 | 中 | 低 | 高 | 低 |
+| 适用场景 | 企业级 | 简单场景 | 高性能 | 小规模 |
+
+### CNI 选型建议
+
+```
+简单场景（<50节点）：Flannel（简单易用）
+企业级场景：Calico（功能全面）
+高性能场景：Cilium（eBPF加速）
+安全敏感场景：Calico+加密
+```
+
+## Helm 最佳实践
+
+```yaml
+# Helm Chart 结构
+mychart/
+├── Chart.yaml          # Chart元数据
+├── values.yaml         # 默认配置
+├── templates/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   ├── configmap.yaml
+│   ├── secrets.yaml
+│   └── _helpers.tpl   # 模板助手
+├── charts/             # 依赖Chart
+└── README.md
+```
+
+### Helm 仓库管理
+
+```bash
+# 添加仓库
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# 搜索Chart
+helm search repo nginx
+helm search hub prometheus
+
+# 查看Chart信息
+helm show chart bitnami/nginx
+helm show values bitnami/nginx
+```
+
+### Helm 部署策略
+
+| 策略 | 命令 | 适用场景 |
+|------|------|----------|
+| 默认升级 | helm upgrade --install | 正常更新 |
+| 等待部署 | helm upgrade --wait | 依赖检查 |
+| 并行部署 | helm upgrade --atomic | 原子性部署 |
+| 回滚 | helm rollback | 发布失败 |
+
+### Helm 资源管理
+
+```yaml
+# values.yaml 资源配置
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+# 自动扩缩容
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+```
+
+## Argo CD GitOps 实战
+
+```mermaid
+flowchart TB
+    GIT[Git仓库] --> ARGOCD[Argo CD]
+    ARGOCD --> SYNC[同步K8s资源]
+    SYNC --> APP1[应用A]
+    SYNC --> APP2[应用B]
+    SYNC --> APP3[应用C]
+    
+    subgraph 自动同步
+        ARGOCD -->|检测变更| GIT
+        GIT -->|推送| ARGOCD
+    end
+    subgraph 手动同步
+        USER[用户] -->|触发| ARGOCD
+    end
+```
+
+### Argo CD 配置示例
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/org/app.git
+    targetRevision: HEAD
+    path: k8s/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+```
+
+### Argo CD 与 Helm 集成
+
+```yaml
+source:
+  repoURL: https://charts.bitnami.com/bitnami
+  chart: nginx
+  targetRevision: 1.0.0
+  helm:
+    releaseName: my-nginx
+    values: |
+      replicaCount: 3
+      service:
+        type: LoadBalancer
+```
+
+## 容器安全最佳实践
+
+```mermaid
+flowchart TB
+    subgraph 构建安全
+        BASE[基础镜像] -->|扫描| TRIVY[Trivy漏洞扫描]
+        TRIVY -->|阻断| BUILD[构建流水线]
+        BUILD -->|签名| COSIGN[Cosign签名]
+    end
+    subgraph 运行时安全
+        COSIGN -->|验证| ADMISSION[Admission Controller]
+        ADMISSION -->|检查| POLICY[安全策略]
+        POLICY -->|放行| POD[Pod运行]
+    end
+```
+
+### 容器安全检查清单
+
+| 检查项 | 说明 | 实现方式 |
+|--------|------|----------|
+| 镜像漏洞扫描 | 扫描CVE漏洞 | Trivy/Snyk |
+| 镜像签名 | 验证镜像来源 | Cosign/Notary |
+| 非root运行 | 降低容器权限 | USER指令 |
+| 只读根文件系统 | 防止恶意写入 | readOnlyRootFilesystem |
+| 禁止特权模式 | 防止容器逃逸 | privileged:false |
+| 资源限制 | 防止资源耗尽 | resources.limits |
+
+### Pod 安全上下文
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 2000
+  containers:
+  - name: app
+    image: my-app:v1
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+    resources:
+      limits:
+        cpu: "1"
+        memory: 512Mi
+      requests:
+        cpu: "0.5"
+        memory: 256Mi
+```
+
+## 多租户隔离方案
+
+```mermaid
+flowchart TB
+    subgraph 网络隔离
+        NP1[Tenant-A NetworkPolicy] --> POD1[Tenant-A Pods]
+        NP2[Tenant-B NetworkPolicy] --> POD2[Tenant-B Pods]
+        POD1 -.->|禁止| POD2
+    end
+    subgraph 资源隔离
+        RR1[ResourceQuota-A] --> POD1
+        RR2[ResourceQuota-B] --> POD2
+        LR1[LimitRange-A] --> POD1
+        LR2[LimitRange-B] --> POD2
+    end
+    subgraph 配置隔离
+        NS1[Namespace-A] --> CM1[ConfigMap-A]
+        NS2[Namespace-B] --> CM2[ConfigMap-B]
+    end
+```
+
+### 多租户隔离配置
+
+```yaml
+# Namespace 隔离
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+  labels:
+    tenant: a
+
+# ResourceQuota 隔离
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-a-quota
+  namespace: tenant-a
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+
+# NetworkPolicy 网络隔离
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenant-a-isolation
+  namespace: tenant-a
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          tenant: a
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          tenant: a
+```
+
+### 多租户管理组件
+
+| 组件 | 说明 | 用途 |
+|------|------|------|
+| Namespace | 命名空间隔离 | 资源/配置隔离 |
+| ResourceQuota | 资源配额 | 限制资源使用 |
+| LimitRange | 资源限制 | 默认资源限制 |
+| NetworkPolicy | 网络策略 | 网络隔离 |
+| RBAC | 权限控制 | 访问控制 |
+| PodSecurityPolicy | Pod安全策略 | 安全约束 |
+
 ## 二十二、与其他板块的关系
 
 - K8s 原理见「[云原生/Kubernetes核心](../../云原生/Kubernetes核心.md)」；

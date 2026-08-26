@@ -1078,7 +1078,410 @@ tags:
 
 ---
 
-## 十四、速查表（扩展）
+## 十四、Dubbo服务治理配置
+
+### 14.1 限流配置
+
+```java
+// 限流配置
+@DubboService(filter = "echoFilter,myLimitFilter", timeout = 5000)
+public class OrderService implements IOrderService {
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+
+// 自定义限流Filter
+@Activate(group = Constants.PROVIDER)
+public class MyLimitFilter implements Filter {
+    
+    private final RateLimiter rateLimiter = RateLimiter.create(100);  // 100 QPS
+    
+    @Override
+    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        if (!rateLimiter.tryAcquire()) {
+            throw new RpcException(RpcException.LIMIT_EXCEEDED_EXCEPTION, 
+                "请求限流，请稍后重试");
+        }
+        return invoker.invoke(invocation);
+    }
+}
+```
+
+### 14.2 熔断配置
+
+```java
+// 熔断配置（集成Sentinel）
+@DubboService(filter = "sentinel.dubbo.provider.filter", timeout = 5000)
+public class OrderService implements IOrderService {
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+
+// Sentinel配置
+@SentinelResource(
+    value = "createOrder",
+    blockHandler = "createOrderBlockHandler",
+    fallback = "createOrderFallback"
+)
+public Order createOrder(OrderRequest request) {
+    return orderService.createOrder(request);
+}
+
+public Order createOrderBlockHandler(OrderRequest request, BlockException ex) {
+    throw new RuntimeException("请求被限流");
+}
+
+public Order createOrderFallback(OrderRequest request, Throwable ex) {
+    return Order.emptyOrder();  // 降级返回空订单
+}
+```
+
+### 14.3 服务治理最佳实践
+
+```text
+服务治理最佳实践：
+
+  限流策略：
+    QPS限流：限制每秒请求数
+    并发限流：限制并发数
+    自适应限流：根据系统负载动态调整
+
+  熔断策略：
+    错误率熔断：错误率超过阈值
+    慢调用熔断：慢调用比例超过阈值
+    异常数熔断：异常数超过阈值
+
+  降级策略：
+    返回默认值：返回空对象或默认值
+    调用备用服务：调用其他可用服务
+    快速失败：直接抛出异常
+
+  监控告警：
+    限流触发告警
+    熔断触发告警
+    降级触发告警
+```
+
+## 十五、Dubbo线程模型配置
+
+### 15.1 线程模型配置
+
+```java
+// 线程模型配置
+@DubboService(
+    protocol = {"dubbo", "triple"},
+    timeout = 5000,
+    threads = 200,  // 线程池大小
+    dispatcher = "message"  // 消息派发策略
+)
+public class OrderService implements IOrderService {
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+
+// 线程池配置
+dubbo.protocol.threads=200
+dubbo.protocol.threadpool=fixed  // fixed/cached/limited
+dubbo.protocol.queues=0
+dubbo.protocol.thread-pool.queue-size=100
+```
+
+### 15.2 线程模型对比
+
+| 模型 | 说明 | 适用场景 |
+|------|------|----------|
+| fixed | 固定大小线程池 | 生产环境（推荐） |
+| cached | 缓存线程池（弹性伸缩） | 测试环境 |
+| limited | 限制线程池（无队列） | 高并发场景 |
+
+### 15.3 线程模型最佳实践
+
+```text
+线程模型最佳实践：
+
+  线程池大小：
+    CPU密集型：线程数 = CPU核数 + 1
+    IO密集型：线程数 = CPU核数 * 2
+    混合型：线程数 = CPU核数 * (1 + IO时间/CPU时间)
+
+  线程池队列：
+    有界队列：防止内存溢出
+    无界队列：可能导致内存溢出
+    建议：使用有界队列
+
+  线程池拒绝策略：
+    AbortPolicy：抛出异常（默认）
+    CallerRunsPolicy：调用者执行
+    DiscardPolicy：丢弃任务
+    DiscardOldestPolicy：丢弃最旧任务
+
+  监控指标：
+    线程池活跃线程数
+    线程池队列大小
+    线程池拒绝次数
+```
+
+## 十六、Dubbo协议家族对比
+
+### 16.1 协议配置
+
+```java
+// Dubbo协议配置
+@DubboService(protocol = "dubbo", timeout = 5000)
+public class OrderService implements IOrderService {
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+
+// Triple协议配置
+@DubboService(protocol = "triple", timeout = 5000)
+public class OrderService implements IOrderService {
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+
+// REST协议配置
+@DubboService(protocol = "rest", timeout = 5000)
+@Path("/order")
+public class OrderService implements IOrderService {
+    @POST
+    @Path("/create")
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+```
+
+### 16.2 协议对比
+
+| 协议 | 传输层 | 序列化 | 适用场景 |
+|------|--------|--------|----------|
+| Dubbo | TCP | Hessian2 | 内网高性能 |
+| Triple | HTTP/2 | Protobuf | 云原生/跨语言 |
+| REST | HTTP | JSON | 开放API |
+
+### 16.3 协议选择建议
+
+```text
+协议选择建议：
+
+  Dubbo协议：
+    优点：高性能、二进制协议
+    缺点：Java绑定、调试困难
+    场景：内网高性能RPC调用
+
+  Triple协议：
+    优点：跨语言、云原生、HTTP/2
+    缺点：性能略低
+    场景：微服务、服务网格
+
+  REST协议：
+    优点：通用性强、易于调试
+    缺点：性能低、文本协议
+    场景：开放API、第三方集成
+
+  选型建议：
+    内网调用：Dubbo
+    跨语言调用：Triple
+    开放API：REST
+```
+
+## 十七、Dubbo注册中心容错机制
+
+### 17.1 注册中心配置
+
+```java
+// 注册中心配置
+@DubboService(
+    registry = {
+        @RegistryConfig(address = "nacos://127.0.0.1:8848", timeout = 10000),
+        @RegistryConfig(address = "zookeeper://127.0.0.1:2181", timeout = 10000)
+    },
+    timeout = 5000
+)
+public class OrderService implements IOrderService {
+    @Override
+    public Order createOrder(OrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+
+// 注册中心容错配置
+dubbo.registry.address=nacos://127.0.0.1:8848
+dubbo.registry.timeout=10000
+dubbo.registry.check=false  // 启动时不检查注册中心
+dubbo.registry.register=true  // 注册服务
+dubbo.registry.subscribe=true  // 订阅服务
+```
+
+### 17.2 容错机制
+
+```text
+注册中心容错机制：
+
+  故障检测：
+    心跳检测：定期发送心跳
+    超时检测：检测超时
+    连接检测：检测连接状态
+
+  故障转移：
+    自动切换：自动切换到备用注册中心
+    人工切换：手动切换到备用注册中心
+    混合切换：部分自动+部分人工
+
+  数据同步：
+    全量同步：启动时全量同步
+    增量同步：运行时增量同步
+    最终一致：最终一致性保证
+
+  监控告警：
+    注册中心故障告警
+    服务注册失败告警
+    服务订阅失败告警
+```
+
+### 17.3 容错最佳实践
+
+```text
+容错最佳实践：
+
+  注册中心选择：
+    Nacos：推荐，支持动态配置
+    ZooKeeper：稳定，社区活跃
+    Consul：支持健康检查
+    etcd：轻量级
+
+  容错配置：
+    多注册中心：配置多个注册中心
+    超时设置：合理设置超时时间
+    重试机制：配置重试次数
+
+  监控告警：
+    注册中心状态监控
+    服务注册状态监控
+    服务订阅状态监控
+
+  运维管理：
+    定期检查注册中心状态
+    定期备份注册数据
+    定期更新注册中心版本
+```
+
+## 十八、Dubbo K8s部署模式
+
+### 18.1 K8s部署配置
+
+```yaml
+# K8s部署配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: dubbo-system
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+        - name: order-service
+          image: order-service:1.0.0
+          ports:
+            - containerPort: 20880
+              protocol: DUBBO
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: DUBBO_REGISTRY_ADDRESS
+              value: "nacos://nacos.dubbo-system:8848"
+            - name: DUBBO_PROTOCOL_PORT
+              value: "20880"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            tcpSocket:
+              port: 20880
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 20880
+            initialDelaySeconds: 5
+            periodSeconds: 5
+```
+
+### 18.2 K8s部署最佳实践
+
+```text
+K8s部署最佳实践：
+
+  容器配置：
+    镜像：使用官方镜像
+    资源：合理设置资源限制
+    环境变量：配置必要环境变量
+
+  服务发现：
+    K8s Service：使用K8s Service
+    注册中心：配置注册中心
+    健康检查：配置健康检查
+
+  部署策略：
+    滚动更新：逐步更新
+    蓝绿部署：零停机部署
+    金丝雀发布：小流量验证
+
+  监控告警：
+    Pod状态监控
+    服务调用监控
+    资源使用监控
+```
+
+### 18.3 服务网格集成
+
+```text
+服务网格集成：
+
+  Sidecar模式：
+    Istio：使用Istio作为服务网格
+    Envoy：使用Envoy作为Sidecar
+    mTLS：启用双向TLS
+
+  流量管理：
+    路由规则：配置路由规则
+    负载均衡：配置负载均衡策略
+    熔断降级：配置熔断降级策略
+
+  安全策略：
+    认证：启用服务认证
+    授权：配置访问控制
+    加密：启用数据加密
+
+  可观测性：
+    指标：收集服务指标
+    日志：收集访问日志
+    追踪：分布式追踪
+```
 
 | 项 | 结论 |
 |----|------|

@@ -1081,7 +1081,456 @@ upstream grpc_backend {
 
 ---
 
-## 七、速查表
+## 七、Nginx代理缓存配置
+
+### 7.1 缓存配置
+
+```nginx
+# 缓存配置
+# 定义缓存路径和参数
+proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=my_cache:10m max_size=10g inactive=60m use_temp_path=off;
+
+# 配置代理缓存
+server {
+    listen 80;
+    server_name example.com;
+    
+    location / {
+        # 启用缓存
+        proxy_cache my_cache;
+        proxy_cache_valid 200 302 10m;  # 200/302状态码缓存10分钟
+        proxy_cache_valid 404 1m;  # 404状态码缓存1分钟
+        
+        # 缓存键
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        
+        # 缓存条件
+        proxy_cache_bypass $http_pragma;  # 禁用缓存
+        
+        # 缓存状态
+        add_header X-Cache-Status $upstream_cache_status;
+        
+        # 代理配置
+        proxy_pass http://backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+### 7.2 缓存策略
+
+```text
+缓存策略：
+
+  缓存类型：
+    代理缓存：proxy_cache
+    FastCGI缓存：fastcgi_cache
+    客户端缓存：expires
+
+  缓存参数：
+    levels：缓存目录层级
+    keys_zone：缓存区名称和大小
+    max_size：最大缓存大小
+    inactive：缓存过期时间
+
+  缓存状态：
+    HIT：命中缓存
+    MISS：未命中缓存
+    EXPIRED：缓存过期
+    STALE：缓存过期但可用
+
+  缓存优化：
+    预热缓存：提前加载热点数据
+    缓存刷新：定期刷新缓存
+    缓存清理：清理过期缓存
+```
+
+## 八、Nginx限流配置
+
+### 8.1 限流配置
+
+```nginx
+# 限流配置
+# 定义限流区域
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+# 配置限流
+server {
+    listen 80;
+    server_name example.com;
+    
+    # 请求限流
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+        limit_req_status 429;
+        
+        # 代理配置
+        proxy_pass http://backend;
+    }
+    
+    # 连接限流
+    location /download/ {
+        limit_conn conn_limit 10;  # 每个IP最多10个连接
+        limit_conn_status 429;
+        
+        # 文件下载配置
+        root /var/www/downloads;
+    }
+}
+```
+
+### 8.2 限流策略
+
+```text
+限流策略：
+
+  请求限流：
+    rate：每秒请求数
+    burst：突发请求数
+    nodelay：不延迟处理
+
+  连接限流：
+    limit_conn：最大连接数
+    limit_conn_status：限制状态码
+
+  带宽限流：
+    limit_rate：每秒字节数
+    limit_rate_after：超过后限速
+
+  限流状态码：
+    429：Too Many Requests
+    503：Service Unavailable
+```
+
+### 8.3 限流最佳实践
+
+```text
+限流最佳实践：
+
+  限流阈值：
+    API接口：10-100 r/s
+    静态资源：1000-10000 r/s
+    下载接口：1-10 r/s
+
+  突发处理：
+    burst：允许突发请求
+    nodelay：不延迟处理
+    排队机制：超出排队
+
+  监控告警：
+    限流触发告警
+    限流统计分析
+    限流规则调整
+
+  白名单：
+    内网IP：不限流
+    监控系统：不限流
+    健康检查：不限流
+```
+
+## 九、Nginx访问控制
+
+### 9.1 访问控制配置
+
+```nginx
+# 访问控制配置
+# IP黑白名单
+location /admin/ {
+    # 允许内网访问
+    allow 192.168.0.0/16;
+    allow 10.0.0.0/8;
+    
+    # 拒绝其他访问
+    deny all;
+    
+    # 代理配置
+    proxy_pass http://backend;
+}
+
+# 基于地理位置的访问控制
+location / {
+    # 允许中国访问
+    allow 1.0.0.0/8;
+    allow 14.0.0.0/7;
+    allow 27.0.0.0/6;
+    allow 36.0.0.0/6;
+    allow 39.0.0.0/7;
+    allow 42.0.0.0/7;
+    allow 49.0.0.0/6;
+    allow 58.0.0.0/7;
+    allow 61.0.0.0/8;
+    allow 101.0.0.0/8;
+    allow 103.0.0.0/8;
+    allow 106.0.0.0/7;
+    allow 110.0.0.0/7;
+    allow 112.0.0.0/7;
+    allow 114.0.0.0/7;
+    allow 116.0.0.0/6;
+    allow 120.0.0.0/6;
+    allow 124.0.0.0/7;
+    allow 180.0.0.0/7;
+    allow 182.0.0.0/8;
+    allow 183.0.0.0/8;
+    allow 202.0.0.0/7;
+    allow 210.0.0.0/7;
+    allow 211.0.0.0/8;
+    allow 218.0.0.0/7;
+    allow 219.0.0.0/8;
+    allow 220.0.0.0/7;
+    allow 221.0.0.0/8;
+    allow 222.0.0.0/7;
+    allow 223.0.0.0/8;
+    
+    # 拒绝其他地区
+    deny all;
+    
+    # 代理配置
+    proxy_pass http://backend;
+}
+```
+
+### 9.2 访问控制策略
+
+```text
+访问控制策略：
+
+  IP控制：
+    白名单：只允许指定IP
+    黑名单：拒绝指定IP
+    地理位置：按地区控制
+
+  用户控制：
+    HTTP Basic Auth：用户名密码认证
+    客户端证书：证书认证
+    Token认证：JWT Token认证
+
+  时间控制：
+    工作时间：只允许工作时间访问
+    维护窗口：维护时间禁止访问
+    计划任务：定时开关访问
+
+  流量控制：
+    限流：限制请求频率
+    带宽：限制带宽使用
+    连接数：限制连接数
+```
+
+## 十、Nginx日志格式配置
+
+### 10.1 自定义日志格式
+
+```nginx
+# 自定义日志格式
+# 定义JSON日志格式
+log_format json_log escape=json '{'
+    '"time_local": "$time_local",'
+    '"remote_addr": "$remote_addr",'
+    '"request_method": "$request_method",'
+    '"request_uri": "$request_uri",'
+    '"status": $status,'
+    '"body_bytes_sent": $body_bytes_sent,'
+    '"request_time": $request_time,'
+    '"upstream_response_time": "$upstream_response_time",'
+    '"upstream_addr": "$upstream_addr",'
+    '"http_user_agent": "$http_user_agent",'
+    '"http_referer": "$http_referer",'
+    '"http_x_forwarded_for": "$http_x_forwarded_for"'
+'}';
+
+# 使用JSON日志格式
+server {
+    listen 80;
+    server_name example.com;
+    
+    access_log /var/log/nginx/access.log json_log;
+    error_log /var/log/nginx/error.log;
+    
+    location / {
+        proxy_pass http://backend;
+    }
+}
+```
+
+### 10.2 日志格式说明
+
+```text
+日志格式说明：
+
+  常用变量：
+    $remote_addr：客户端IP
+    $remote_user：客户端用户
+    $time_local：本地时间
+    $request：请求行
+    $status：状态码
+    $body_bytes_sent：发送字节数
+    $request_time：请求时间
+    $upstream_response_time：后端响应时间
+    $upstream_addr：后端地址
+    $http_user_agent：用户代理
+    $http_referer：来源页面
+    $http_x_forwarded_for：代理IP
+
+  JSON格式：
+    可读性：结构化日志
+    搜索性：易于搜索分析
+    扩展性：易于添加字段
+```
+
+### 10.3 日志最佳实践
+
+```text
+日志最佳实践：
+
+  日志级别：
+    error：错误日志
+    warn：警告日志
+    info：信息日志
+    debug：调试日志
+
+  日志轮转：
+    按大小：超过100MB轮转
+    按时间：每天轮转
+    保留时间：保留30天
+
+  日志分析：
+    实时分析：ELK/Loki
+    历史分析：Hadoop/Spark
+    可视化：Grafana/Kibana
+
+  日志安全：
+    敏感信息脱敏
+    日志加密
+    访问控制
+```
+
+## 十一、OpenResty/Lua扩展配置
+
+### 11.1 OpenResty配置
+
+```nginx
+# OpenResty配置
+# Lua脚本配置
+server {
+    listen 80;
+    server_name example.com;
+    
+    # 访问控制Lua脚本
+    access_by_lua_block {
+        local redis = require "resty.redis"
+        local red = redis:new()
+        red:connect("127.0.0.1", 6379)
+        
+        -- 检查IP黑名单
+        local ip = ngx.var.remote_addr
+        local is_blocked = red:get("ip:blacklist:" .. ip)
+        if is_blocked == "1" then
+            ngx.exit(403)
+        end
+        
+        -- 检查API限流
+        local api_key = ngx.var.http_x_api_key
+        if api_key then
+            local count = red:incr("api:limit:" .. api_key)
+            if count > 100 then
+                ngx.exit(429)
+            end
+        end
+    }
+    
+    # 内容处理Lua脚本
+    content_by_lua_block {
+        local cjson = require "cjson"
+        
+        -- 获取请求参数
+        local args = ngx.req.get_uri_args()
+        local method = ngx.req.get_method()
+        
+        -- 处理请求
+        local response = {
+            code = 200,
+            message = "success",
+            data = {
+                method = method,
+                args = args
+            }
+        }
+        
+        -- 返回JSON响应
+        ngx.header.content_type = "application/json"
+        ngx.say(cjson.encode(response))
+    }
+    
+    # 日志处理Lua脚本
+    log_by_lua_block {
+        local logger = require "resty.logger"
+        logger.log("info", ngx.var.request_time)
+    }
+}
+```
+
+### 11.2 Lua扩展场景
+
+```text
+Lua扩展场景：
+
+  认证授权：
+    JWT Token验证
+    OAuth2.0认证
+    API Key验证
+
+  限流控制：
+    IP限流
+    用户限流
+    API限流
+
+  请求处理：
+    参数验证
+    数据转换
+    内容过滤
+
+  日志记录：
+    访问日志
+    错误日志
+    性能日志
+
+  缓存控制：
+    Redis缓存
+    本地缓存
+    缓存刷新
+```
+
+### 11.3 OpenResty最佳实践
+
+```text
+OpenResty最佳实践：
+
+  性能优化：
+    使用Lua协程
+    连接池复用
+    缓存热点数据
+
+  安全控制：
+    输入验证
+    SQL注入防护
+    XSS防护
+
+  监控告警：
+    Lua脚本错误监控
+    性能指标监控
+    业务指标监控
+
+  运维管理：
+    灰度发布
+    A/B测试
+    回滚机制
+```
+
+---
+
+## 八、速查表
 
 | 项 | 结论 |
 |----|------|

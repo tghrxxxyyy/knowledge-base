@@ -1075,7 +1075,390 @@ DROP VREPLICATION STREAM 1;
 </function>
 ```
 
-## 十七、与其他板块的关系
+## 十七、Vitess VReplication实时数据同步
+
+### 17.1 VReplication配置
+
+```yaml
+# VReplication配置
+# 步骤1：创建VReplication流
+# vtctlclient命令
+vtctlclient CreateReshardingWorkflow \
+  -keyspace=commerce \
+  -workflow=resharding_workflow \
+  -target_keyspace=customer \
+  -tables="customer,corder" \
+  -cells=zone1
+
+# 步骤2：配置VReplication规则
+# workflow配置
+{
+  "workflow": "resharding_workflow",
+  "source_keyspace": "commerce",
+  "target_keyspace": "customer",
+  "tables": {
+    "customer": {
+      "source": "customer",
+      "target": "customer",
+      "copy_variables": ["id", "name", "email"]
+    },
+    "corder": {
+      "source": "corder",
+      "target": "corder",
+      "copy_variables": ["id", "customer_id", "amount"]
+    }
+  }
+}
+
+# 步骤3：启动VReplication
+vtctlclient WorkflowAction -keyspace=commerce -workflow=resharding_workflow start
+```
+
+### 17.2 VReplication监控
+
+```bash
+# VReplication监控
+# 查看VReplication状态
+vtctlclient WorkflowAction -keyspace=commerce -workflow=resharding_workflow status
+
+# 查看VReplication延迟
+vtctlclient WorkflowAction -keyspace=commerce -workflow=resharding_workflow lag
+
+# 查看VReplication错误
+vtctlclient WorkflowAction -keyspace=commerce -workflow=resharding_workflow errors
+
+# 停止VReplication
+vtctlclient WorkflowAction -keyspace=commerce -workflow=resharding_workflow stop
+
+# 删除VReplication
+vtctlclient WorkflowAction -keyspace=commerce -workflow=resharding_workflow delete
+```
+
+### 17.3 VReplication最佳实践
+
+```text
+VReplication最佳实践：
+
+  数据同步策略：
+    全量同步：初始数据迁移
+    增量同步：实时数据同步
+    双向同步：跨数据中心同步
+
+  性能优化：
+    批量写入：减少网络往返
+    并行复制：多线程复制
+    压缩传输：减少网络带宽
+
+  监控告警：
+    同步延迟监控
+    错误率监控
+    数据一致性监控
+
+  故障处理：
+    同步失败：自动重试
+    数据冲突：人工处理
+    网络中断：自动恢复
+```
+
+## 十八、Vitess Resharding操作步骤
+
+### 18.1 Split操作步骤
+
+```text
+Split操作步骤：
+
+  1. 准备阶段：
+     创建目标分片
+     配置VReplication
+     验证配置
+
+  2. 数据迁移：
+     全量数据迁移
+     增量数据同步
+     验证数据一致性
+
+  3. 切换流量：
+     逐步切换流量
+     监控切换过程
+     验证切换结果
+
+  4. 清理：
+     删除源分片
+     清理VReplication
+     更新配置
+
+  注意事项：
+    避免高峰期操作
+    准备回滚方案
+    监控关键指标
+```
+
+### 18.2 Merge操作步骤
+
+```text
+Merge操作步骤：
+
+  1. 准备阶段：
+     创建目标分片
+     配置VReplication
+     验证配置
+
+  2. 数据合并：
+     全量数据合并
+     增量数据同步
+     验证数据一致性
+
+  3. 切换流量：
+     逐步切换流量
+     监控切换过程
+     验证切换结果
+
+  4. 清理：
+     删除源分片
+     清理VReplication
+     更新配置
+
+  注意事项：
+    避免高峰期操作
+    准备回滚方案
+    监控关键指标
+```
+
+### 18.3 Resharding监控
+
+```bash
+# Resharding监控
+# 查看Resharding状态
+vtctlclient ReshardingStatus -keyspace=commerce
+
+# 查看Resharding进度
+vtctlclient ReshardingProgress -keyspace=commerce
+
+# 查看Resharding错误
+vtctlclient ReshardingErrors -keyspace=commerce
+
+# 停止Resharding
+vtctlclient CancelResharding -keyspace=commerce
+```
+
+## 十九、MyCat读写分离配置
+
+### 19.1 读写分离配置
+
+```xml
+<!-- MyCat读写分离配置 -->
+<dataHost name="readwrite" maxCon="1000" minCon="10" balance="3"
+          writeType="0" dbType="mysql" dbDriver="native">
+  <heartbeat>select user()</heartbeat>
+  <writeHost host="hostM1" url="localhost:3306" user="root" password="password"/>
+  <readHost host="hostS1" url="localhost:3307" user="root" password="password"/>
+  <readHost host="hostS2" url="localhost:3308" user="root" password="password"/>
+</dataHost>
+
+<!-- 配置说明：
+  writeType="0"：写操作只发送到写主机
+  balance="3"：读操作负载均衡到所有读主机
+  dbDriver="native"：MySQL原生协议
+-->
+```
+
+### 19.2 读写分离策略
+
+```text
+读写分离策略：
+
+  writeType配置：
+    0：写操作只发送到写主机（推荐）
+    1：写操作负载均衡到所有写主机
+    2：写操作随机发送到写主机
+
+  balance配置：
+    0：不开启读写分离
+    1：所有读主机负载均衡
+    2：所有主机负载均衡
+    3：所有读主机负载均衡（推荐）
+
+  适用场景：
+    writeType=0 + balance=3：标准读写分离
+    writeType=1 + balance=2：多写主机场景
+    writeType=0 + balance=1：读多写少场景
+```
+
+### 19.3 读写分离最佳实践
+
+```text
+读写分离最佳实践：
+
+  数据一致性：
+    写后读：写操作后读最新数据
+    强一致：读写主机同步
+    最终一致：读从机可能延迟
+
+  负载均衡：
+    读负载：均衡到所有读主机
+    写负载：只发送到写主机
+    故障转移：自动切换到备用主机
+
+  监控告警：
+    主从延迟监控
+    读写比例监控
+    故障告警
+
+  性能优化：
+    连接池：复用数据库连接
+    缓存：热点数据缓存
+    查询优化：避免慢查询
+```
+
+## 二十、ShardingSphere-JDBC与MyCat对比
+
+### 20.1 架构对比
+
+| 维度 | ShardingSphere-JDBC | MyCat |
+|------|---------------------|-------|
+| 架构模式 | 嵌入式（JDBC驱动） | 代理式（独立服务） |
+| 部署方式 | 应用内嵌 | 独立部署 |
+| 性能 | 高（无网络开销） | 中（网络开销） |
+| 资源占用 | 低（共享应用资源） | 高（独立资源） |
+| 运维复杂度 | 低（无需额外运维） | 高（需要运维） |
+| 可用性 | 依赖应用 | 高（独立服务） |
+
+### 20.2 功能对比
+
+| 功能 | ShardingSphere-JDBC | MyCat |
+|------|---------------------|-------|
+| 分库分表 | 支持 | 支持 |
+| 读写分离 | 支持 | 支持 |
+| 分布式事务 | 支持 | 支持 |
+| 数据加密 | 支持 | 不支持 |
+| 影子库 | 支持 | 不支持 |
+| SQL解析 | 支持 | 支持 |
+
+### 20.3 选型建议
+
+```text
+选型建议：
+
+  选择ShardingSphere-JDBC：
+    应用Java技术栈
+    追求高性能
+    团队有能力维护
+    需要嵌入式部署
+
+  选择MyCat：
+    多语言技术栈
+    追求简单运维
+    团队运维能力有限
+    需要代理式部署
+
+  混合方案：
+    ShardingSphere-JDBC用于核心业务
+    MyCat用于辅助业务
+    根据场景选择合适方案
+```
+
+## 二十一、分库分表全局ID方案对比
+
+### 21.1 方案对比
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+|------|------|------|----------|
+| UUID | 简单、无依赖 | 无序、索引性能差 | 低并发场景 |
+| 雪花ID | 有序、高性能 | 依赖时钟 | 高并发场景 |
+| 数据库序列 | 简单、有序 | 性能差、单点 | 低并发场景 |
+| Redis序列 | 高性能、有序 | 依赖Redis | 高并发场景 |
+| 号段模式 | 高性能、有序 | 复杂度高 | 高并发场景 |
+
+### 21.2 雪花ID实现
+
+```java
+// 雪花ID实现
+public class SnowflakeIdGenerator {
+    
+    private long workerId;
+    private long datacenterId;
+    private long sequence = 0;
+    private long workerIdBits = 5L;
+    private long datacenterIdBits = 5L;
+    private long sequenceBits = 12L;
+    private long maxWorkerId = -1L ^ (-1L << workerIdBits);
+    private long maxDatacenterId = -1L ^ (-1L << datacenterIdBits);
+    private long workerIdShift = sequenceBits;
+    private long datacenterIdShift = sequenceBits + workerIdBits;
+    private long timestampLeftShift = sequenceBits + workerIdBits + datacenterIdBits;
+    private long sequenceMask = -1L ^ (-1L << sequenceBits);
+    private long lastTimestamp = -1L;
+    
+    public SnowflakeIdGenerator(long workerId, long datacenterId) {
+        if (workerId > maxWorkerId || workerId < 0) {
+            throw new IllegalArgumentException("Worker ID不能大于" + maxWorkerId);
+        }
+        if (datacenterId > maxDatacenterId || datacenterId < 0) {
+            throw new IllegalArgumentException("Datacenter ID不能大于" + maxDatacenterId);
+        }
+        this.workerId = workerId;
+        this.datacenterId = datacenterId;
+    }
+    
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+        
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("时钟回拨，拒绝生成ID");
+        }
+        
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                timestamp = waitNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        return ((timestamp - 1288834974657L) << timestampLeftShift) |
+               (datacenterId << datacenterIdShift) |
+               (workerId << workerIdShift) |
+               sequence;
+    }
+    
+    private long waitNextMillis(long lastTimestamp) {
+        long timestamp = System.currentTimeMillis();
+        while (timestamp <= lastTimestamp) {
+            timestamp = System.currentTimeMillis();
+        }
+        return timestamp;
+    }
+}
+```
+
+### 21.3 全局ID最佳实践
+
+```text
+全局ID最佳实践：
+
+  方案选择：
+    高并发场景：雪花ID或Redis序列
+    低并发场景：UUID或数据库序列
+    混合场景：号段模式
+
+  性能优化：
+    批量获取：一次获取多个ID
+    本地缓存：缓存生成的ID
+    异步生成：异步生成ID
+
+  可用性保证：
+    主备切换：ID生成服务高可用
+    故障转移：自动切换到备用服务
+    监控告警：ID生成服务监控
+
+  数据一致性：
+    唯一性保证：ID全局唯一
+    有序性保证：ID按时间有序
+    容错处理：时钟回拨处理
+```
 
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - TiDB（NewSQL）见「[TiDB 与 NewSQL](./TiDB与NewSQL.md)」；

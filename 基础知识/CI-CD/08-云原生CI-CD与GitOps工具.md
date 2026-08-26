@@ -1072,11 +1072,563 @@ spec:
 | Sealed Secrets | 加密进 Git | 简单、纯 Git 流 |
 | External Secrets | Vault / AWS SM / GCP SM | 已有密钥中枢、动态轮换 |
 
-## 本篇补充 Checklist
+## 十一、FluxCD GitOps工作流深度解析
 
-- [ ] Argo CD 重可视/统一门户；Flux 重 Git 优先/极简，按需选型。
-- [ ] 渐进式交付用 Rollouts（Argo）或 Flagger（Flux）+ 指标门禁自动回滚。
-- [ ] 多集群用 Hub-Spoke + ApplicationSet，环境晋级用 overlays/values。
-- [ ] Secret 进 Git 必加密（Sealed Secrets）或外挂同步（ESO），绝不明文。
-- CNCF OpenGitOps 四项原则：https://opengitops.dev/
-- Kubernetes 部署策略 2025（Blue-Green / Canary / Rolling）：https://devopsenginer.com/blog/kubernetes-deployment-strategies-2025-complete-guide
+### 11.1 FluxCD工作流架构
+
+```yaml
+# FluxCD工作流架构
+Source → Kustomize/Helm → Reconciliation
+
+# Source：定义Git仓库或Helm仓库
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: my-app
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/myorg/my-app
+  ref:
+    branch: main
+
+# Kustomize：定义Kustomize部署
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: my-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./k8s/production
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: my-app
+
+# HelmRelease：定义Helm部署
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: my-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: my-app
+      version: "1.0.0"
+      sourceRef:
+        kind: HelmRepository
+        name: my-repo
+  values:
+    replicaCount: 3
+```
+
+### 11.2 FluxCD工作流步骤
+
+```text
+FluxCD工作流步骤：
+
+  1. Source阶段：
+     GitRepository：定义Git仓库
+     HelmRepository：定义Helm仓库
+     Bucket：定义对象存储
+     OCIRepository：定义OCI仓库
+
+  2. Kustomize阶段：
+     Kustomization：定义Kustomize部署
+     配置：path、prune、interval
+     依赖：sourceRef
+
+  3. Helm阶段：
+     HelmRelease：定义Helm部署
+     配置：chart、values、interval
+     依赖：sourceRef
+
+  4. Reconciliation阶段：
+     自动同步：Git变更自动部署
+     手动同步：flux reconcile
+     回滚：flux rollback
+
+  优势：
+    GitOps：Git作为单一事实来源
+    自动化：自动同步Git变更
+    可审计：所有变更可追溯
+    可回滚：支持回滚到历史版本
+```
+
+### 11.3 FluxCD最佳实践
+
+```text
+FluxCD最佳实践：
+
+  仓库组织：
+    单一仓库：所有配置在一个仓库
+    多仓库：应用配置和部署配置分离
+    分支策略：main分支用于生产，develop用于开发
+
+  同步策略：
+    自动同步：interval=1m（快速响应）
+    手动同步：interval=0（仅手动触发）
+    拉取策略：sourceAvatar（避免推送）
+
+  安全控制：
+    RBAC：最小权限原则
+    Secret加密：Sealed Secrets
+    网络策略：限制Pod间通信
+
+  监控告警：
+    同步状态监控
+    部署状态监控
+    错误告警
+```
+
+## 十二、Tekton Pipeline流水线设计
+
+### 12.1 Tekton Task定义
+
+```yaml
+# Tekton Task定义
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: build-and-push
+spec:
+  params:
+    - name: image
+      type: string
+      description: 镜像名称
+    - name: tag
+      type: string
+      description: 镜像标签
+  workspaces:
+    - name: source
+      description: 源码目录
+  steps:
+    - name: build
+      image: golang:1.19
+      script: |
+        #!/bin/sh
+        cd $(workspaces.source.path)
+        go build -o myapp .
+      workingDir: $(workspaces.source.path)
+    
+    - name: test
+      image: golang:1.19
+      script: |
+        #!/bin/sh
+        cd $(workspaces.source.path)
+        go test ./...
+      workingDir: $(workspaces.source.path)
+    
+    - name: push
+      image: gcr.io/kaniko-project/executor:latest
+      args:
+        - --dockerfile=$(workspaces.source.path)/Dockerfile
+        - --context=$(workspaces.source.path)
+        - --destination=$(params.image):$(params.tag)
+```
+
+### 12.2 Tekton Pipeline定义
+
+```yaml
+# Tekton Pipeline定义
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: ci-pipeline
+spec:
+  params:
+    - name: image
+      type: string
+    - name: tag
+      type: string
+  workspaces:
+    - name: shared-workspace
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      params:
+        - name: url
+          value: https://github.com/myorg/my-app
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+    
+    - name: build-and-push
+      taskRef:
+        name: build-and-push
+      runAfter:
+        - fetch-source
+      params:
+        - name: image
+          value: $(params.image)
+        - name: tag
+          value: $(params.tag)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+    
+    - name: deploy
+      taskRef:
+        name: kubectl-deploy
+      runAfter:
+        - build-and-push
+      params:
+        - name: image
+          value: $(params.image):$(params.tag)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+```
+
+### 12.3 Tekton When表达式
+
+```yaml
+# Tekton When表达式
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: conditional-pipeline
+spec:
+  params:
+    - name: environment
+      type: string
+  tasks:
+    - name: build
+      taskRef:
+        name: build-task
+    
+    - name: deploy-production
+      taskRef:
+        name: deploy-task
+      when:
+        - input: $(params.environment)
+          operator: in
+          values: ["production"]
+    
+    - name: deploy-staging
+      taskRef:
+        name: deploy-task
+      when:
+        - input: $(params.environment)
+          operator: in
+          values: ["staging"]
+
+# When表达式类型：
+#   equals：等于
+#   notEquals：不等于
+#   in：在列表中
+#   notIn：不在列表中
+```
+
+### 12.4 Tekton最佳实践
+
+```text
+Tekton最佳实践：
+
+  Task设计：
+    单一职责：每个Task只做一件事
+    参数化：使用params使Task可复用
+    工作空间：使用workspaces共享数据
+
+  Pipeline设计：
+    阶段分离：构建、测试、部署分离
+    条件执行：使用When表达式实现条件执行
+    错误处理：配置错误处理策略
+
+  安全控制：
+    ServiceAccount：最小权限原则
+    Secret：使用Secret存储敏感信息
+    网络策略：限制Pod间通信
+
+  性能优化：
+    并行执行：无依赖的任务并行执行
+    缓存：使用缓存加速构建
+    资源限制：配置合理的资源限制
+```
+
+## 十三、Argo CD多集群管理
+
+### 13.1 Hub-Spoke模式配置
+
+```yaml
+# Argo CD Hub-Spoke模式配置
+# Hub集群配置
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spoke-clusters
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            spoke: "true"
+  template:
+    metadata:
+      name: '{{name}}-app'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/myorg/my-app
+        targetRevision: main
+        path: 'k8s/{{name}}'
+      destination:
+        server: '{{server}}'
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+
+# Spoke集群注册
+apiVersion: argoproj.io/v1alpha1
+kind: Cluster
+metadata:
+  name: spoke-cluster-1
+  labels:
+    spoke: "true"
+spec:
+  server: https://spoke-cluster-1:6443
+  config:
+    bearerToken: xxx
+    tlsClientConfig:
+      insecure: false
+      caData: xxx
+```
+
+### 13.2 Cluster Secret配置
+
+```yaml
+# Cluster Secret配置
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spoke-cluster-1
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+type: Opaque
+stringData:
+  name: spoke-cluster-1
+  server: https://spoke-cluster-1:6443
+  config: |
+    {
+      "bearerToken": "xxx",
+      "tlsClientConfig": {
+        "insecure": false,
+        "caData": "xxx"
+      }
+    }
+```
+
+### 13.3 多集群管理最佳实践
+
+```text
+多集群管理最佳实践：
+
+  集群组织：
+    Hub-Spoke模式：中心化管理
+    多Hub模式：区域化管理
+    混合模式：关键应用集中管理
+
+  应用部署：
+    ApplicationSet：批量部署
+    环境隔离：不同集群不同环境
+    滚动升级：逐个集群升级
+
+  安全控制：
+    RBAC：按集群分配权限
+    Secret：每个集群独立Secret
+    网络策略：限制集群间通信
+
+  监控告警：
+    集群状态监控
+    应用同步状态监控
+    错误告警
+```
+
+## 十四、GitOps漂移检测与自动修复
+
+### 14.1 漂移检测机制
+
+```yaml
+# 漂移检测配置
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: my-app
+spec:
+  interval: 5m
+  path: ./k8s/production
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: my-app
+  validation: client
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: my-app
+      namespace: default
+
+# Argo CD漂移检测配置
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+spec:
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+```
+
+### 14.2 自动修复机制
+
+```text
+自动修复机制：
+
+  漂移检测：
+    定期检查：interval=5m
+    实时检查：webhook触发
+    检查内容：配置、副本数、镜像版本
+
+  自动修复：
+    selfHeal=true：自动修复漂移
+    prune=true：自动删除多余资源
+    修复策略：覆盖部署到期望状态
+
+  修复流程：
+    1. 检测到漂移
+    2. 生成修复计划
+    3. 执行修复操作
+    4. 验证修复结果
+    5. 记录修复日志
+
+  注意事项：
+    避免循环修复：设置修复间隔
+    保护关键资源：配置保护策略
+    记录修复历史：便于审计
+```
+
+### 14.3 漂移检测最佳实践
+
+```text
+漂移检测最佳实践：
+
+  检测频率：
+    生产环境：interval=5m
+    开发环境：interval=1m
+    关键应用：interval=30s
+
+  检测内容：
+    配置漂移：镜像版本、环境变量
+    状态漂移：副本数、健康状态
+    资源漂移：资源限制、标签
+
+  修复策略：
+    自动修复：selfHeal=true
+    手动修复：通知运维人员
+    混合策略：自动修复简单问题，手动修复复杂问题
+
+  监控告警：
+    漂移检测告警
+    修复失败告警
+    修复成功通知
+```
+
+## 十五、云原生CI/CD安全
+
+### 15.1 Image签名配置
+
+```bash
+# Cosign签名配置
+# 步骤1：安装Cosign
+go install github.com/sigstore/cosign/cmd/cosign@latest
+
+# 步骤2：生成密钥对
+cosign generate-key-pair
+
+# 步骤3：签名镜像
+cosign sign --key cosign.key myregistry/myapp:latest
+
+# 步骤4：验证签名
+cosign verify --key cosign.pub myregistry/myapp:latest
+
+# 步骤5：在K8s中验证签名
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: cosign-webhook
+webhooks:
+  - name: cosign.sigstore.dev
+    clientConfig:
+      service:
+        name: cosign-webhook
+        namespace: cosign-system
+        path: "/validate"
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+```
+
+### 15.2 Notary v2配置
+
+```bash
+# Notary v2配置
+# 步骤1：安装Notary v2
+# 参考：https://github.com/notaryproject/notary
+
+# 步骤2：生成密钥
+notary key generate mykey
+
+# 步骤3：签名镜像
+notary sign myregistry/myapp:latest --key mykey
+
+# 步骤4：验证签名
+notary verify myregistry/myapp:latest --key mykey.pub
+
+# 步骤5：在K8s中验证签名
+# 使用Kyverno或OPA Gatekeeper验证签名
+```
+
+### 15.3 安全最佳实践
+
+```text
+云原生CI/CD安全最佳实践：
+
+  镜像安全：
+    镜像扫描：Trivy/Clair扫描漏洞
+    镜像签名：Cosign/Notary v2签名
+    镜像验证：Admission Controller验证签名
+
+  Secret管理：
+    Secret加密：Sealed Secrets
+    Secret存储：Vault/AWS SM
+    Secret轮转：定期轮转Secret
+
+  访问控制：
+    RBAC：最小权限原则
+    ServiceAccount：每个应用独立ServiceAccount
+    网络策略：限制Pod间通信
+
+  审计日志：
+    CI/CD审计：记录所有CI/CD操作
+    部署审计：记录所有部署操作
+    访问审计：记录所有访问操作
+
+  合规检查：
+    策略检查：OPA/Gatekeeper策略
+    镜像策略：只允许签名镜像
+    部署策略：只允许安全部署
+```

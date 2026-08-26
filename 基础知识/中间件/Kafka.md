@@ -1058,7 +1058,377 @@ source->target.topics.exclude = __.*
 | `refresh.topics.interval.seconds` | 刷新 topic 间隔 | 600 |
 | `offset.lag.max` | 最大 offset 延迟 | 100 |
 
-## 十七、与其他板块的关系（扩展）
+## 十二、Kafka Replication与ISR机制详解
+
+### 12.1 Replication核心概念
+
+```text
+Replication核心概念：
+
+  副本角色：
+    Leader：处理所有读写请求
+    Follower：从Leader复制数据
+    ISR：与Leader保持同步的副本集合
+
+  关键指标：
+    LEO（Log End Offset）：每个副本的日志结束偏移量
+    HW（High Watermark）：所有ISR副本的最小LEO
+    LSR（In-Sync Replicas）：与Leader同步的副本数
+
+  同步机制：
+    Follower拉取：Follower主动从Leader拉取数据
+    ISR维护：动态维护ISR集合
+    故障转移：Leader故障时从ISR中选举新Leader
+
+  配置参数：
+    replication.factor：副本因子（建议≥3）
+    min.insync.replicas：最小同步副本数（建议≥2）
+    unclean.leader.election.enable：是否允许非ISR成为Leader
+```
+
+### 12.2 ISR机制详解
+
+```java
+// ISR机制配置
+Properties props = new Properties();
+props.put("replication.factor", 3);  // 副本因子
+props.put("min.insync.replicas", 2);  // 最小同步副本数
+props.put("unclean.leader.election.enable", false);  // 禁止非ISR成为Leader
+
+// ISR维护策略
+props.put("replica.lag.time.max.ms", 30000);  // 副本延迟最大时间
+props.put("replica.socket.timeout.ms", 30000);  // 副本Socket超时
+props.put("replica.socket.receive.buffer.bytes", 1048576);  // 副本Socket缓冲区
+
+// 生产者配置
+props.put("acks", "all");  // 等待所有ISR确认
+props.put("retries", 3);  // 重试次数
+props.put("retry.backoff.ms", 1000);  // 重试间隔
+```
+
+### 12.3 ISR最佳实践
+
+```text
+ISR最佳实践：
+
+  副本因子选择：
+    生产环境：replication.factor=3
+    关键业务：replication.factor=5
+    测试环境：replication.factor=1
+
+  最小同步副本数：
+    min.insync.replicas=2：保证数据安全
+    min.insync.replicas=1：保证可用性
+    min.insync.replicas=replication.factor：最高数据安全
+
+  故障处理策略：
+    禁止非ISR成为Leader：unclean.leader.election.enable=false
+    允许非ISR成为Leader：unclean.leader.election.enable=true（可用性优先）
+
+  监控指标：
+    ISR收缩/扩张次数
+    副本延迟时间
+    未同步副本数
+```
+
+## 十三、Kafka批量发送与压缩调优
+
+### 13.1 批量发送配置
+
+```java
+// 批量发送配置
+Properties props = new Properties();
+
+// 批量配置
+props.put("batch.size", 16384);  // 批量大小（字节）
+props.put("linger.ms", 5);  // 等待时间（毫秒）
+props.put("buffer.memory", 33554432);  // 缓冲区大小（32MB）
+props.put("max.in.flight.requests.per.connection", 5);  // 最大请求数
+
+// 压缩配置
+props.put("compression.type", "snappy");  // 压缩类型
+// 可选值：none, gzip, snappy, lz4, zstd
+
+// 发送配置
+props.put("acks", "all");
+props.put("retries", 3);
+props.put("retry.backoff.ms", 1000);
+
+// 批量发送示例
+Producer<String, String> producer = new KafkaProducer<>(props);
+for (int i = 0; i < 1000; i++) {
+    producer.send(new ProducerRecord<>("topic", "key" + i, "value" + i));
+}
+producer.flush();  // 手动刷新
+```
+
+### 13.2 压缩类型对比
+
+| 压缩类型 | 压缩率 | CPU开销 | 适用场景 |
+|----------|--------|---------|----------|
+| none | 1:1 | 无 | 网络充足场景 |
+| gzip | 高 | 高 | 存储受限场景 |
+| snappy | 中 | 低 | 吞吐优先场景 |
+| lz4 | 中 | 低 | 实时性要求高 |
+| zstd | 高 | 中 | 平衡场景 |
+
+### 13.3 批量调优最佳实践
+
+```text
+批量调优最佳实践：
+
+  批量大小调整：
+    小批量：batch.size=8192（延迟优先）
+    中批量：batch.size=16384（平衡）
+    大批量：batch.size=65536（吞吐优先）
+
+  等待时间调整：
+    低延迟：linger.ms=1
+    平衡：linger.ms=5
+    高吞吐：linger.ms=100
+
+  压缩策略选择：
+    CPU充足：gzip（高压缩率）
+    CPU受限：snappy（低开销）
+    平衡：zstd（压缩率与性能平衡）
+
+  监控指标：
+    batch-size-avg：平均批量大小
+    batch-size-max：最大批量大小
+    records-per-request-avg：平均每次请求记录数
+```
+
+## 十四、Kafka限流配置（Quotas）
+
+### 14.1 Quota配置
+
+```bash
+# Quota配置命令
+# 生产者限流（字节/秒）
+kafka-configs.sh --alter --add-config 'producer_byte_rate=1048576' \
+  --entity-type clients --entity-name my-producer
+
+# 消费者限流（字节/秒）
+kafka-configs.sh --alter --add-config 'consumer_byte_rate=2097152' \
+  --entity-type clients --entity-name my-consumer
+
+# 请求处理限流（请求/秒）
+kafka-configs.sh --alter --add-config 'request_percentage=50' \
+  --entity-type clients --entity-name my-client
+
+# 查看Quota配置
+kafka-configs.sh --describe --entity-type clients --entity-name my-producer
+```
+
+### 14.2 Quota类型详解
+
+```text
+Quota类型详解：
+
+  producer_byte_rate：
+    说明：生产者每秒发送的字节数
+    配置：1048576 = 1MB/s
+    监控：生产者发送速率
+
+  consumer_byte_rate：
+    说明：消费者每秒消费的字节数
+    配置：2097152 = 2MB/s
+    监控：消费者消费速率
+
+  request_percentage：
+    说明：请求处理时间百分比
+    配置：50（50%时间处理请求）
+    监控：请求处理延迟
+
+  默认Quota：
+    所有客户端：无限制
+    特定客户端：根据配置限制
+```
+
+### 14.3 限流最佳实践
+
+```text
+限流最佳实践：
+
+  限流策略：
+    按客户端限流：每个客户端独立限制
+    按用户限流：每个用户独立限制
+    按Topic限流：每个Topic独立限制
+
+  限流阈值：
+    生产者：1MB/s（普通）/ 10MB/s（高性能）
+    消费者：2MB/s（普通）/ 20MB/s（高性能）
+    请求处理：50%（普通）/ 80%（高性能）
+
+  监控告警：
+    触发限流告警
+    限流持续时间告警
+    性能影响告警
+
+  动态调整：
+    根据负载动态调整阈值
+    根据优先级调整阈值
+    根据时间窗口调整阈值
+```
+
+## 十五、Kafka监控关键指标
+
+### 15.1 JMX监控指标
+
+```text
+JMX监控指标：
+
+  Broker指标：
+    kafka.server:type=BrokerTopicMetrics
+      MessagesInPerSec：每秒消息数
+      BytesInPerSec：每秒接收字节数
+      BytesOutPerSec：每秒发送字节数
+
+    kafka.server:type=ReplicaManager
+      UnderReplicatedPartitions：未同步分区数
+      ISRShrinkRate：ISR收缩速率
+      ISRExpandRate：ISR扩张速率
+
+    kafka.controller:type=KafkaController
+      ActiveControllerCount：活跃控制器数
+      OfflinePartitionsCount：离线分区数
+
+  Producer指标：
+    kafka.producer:type=producer-metrics
+      record-send-rate：记录发送速率
+      batch-size-avg：平均批量大小
+      record-error-rate：记录错误率
+
+  Consumer指标：
+    kafka.consumer:type=consumer-metrics
+      records-consumed-rate：记录消费速率
+      fetch-rate：获取速率
+      bytes-consumed-rate：字节消费速率
+```
+
+### 15.2 Prometheus监控配置
+
+```yaml
+# Prometheus监控配置
+# prometheus.yml
+scrape_configs:
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-broker:9404']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+
+# Grafana Dashboard配置
+# Dashboard ID: 7589（Kafka Overview）
+# Dashboard ID: 16237（Kafka Exporter）
+```
+
+### 15.3 关键告警规则
+
+```text
+关键告警规则：
+
+  Broker告警：
+    UnderReplicatedPartitions > 0：告警
+    OfflinePartitionsCount > 0：告警
+    ActiveControllerCount != 1：告警
+
+  生产者告警：
+    record-error-rate > 1%：告警
+    batch-size-avg < 8192：告警
+    request-latency-avg > 1000ms：告警
+
+  消费者告警：
+    records-consumed-rate < 1000：告警
+    fetch-rate < 100：告警
+    lag > 10000：告警
+
+  性能告警：
+    CPU使用率 > 80%：告警
+    内存使用率 > 80%：告警
+    磁盘使用率 > 80%：告警
+```
+
+## 十六、Kafka跨数据中心复制
+
+### 16.1 MirrorMaker 2配置
+
+```bash
+# MirrorMaker 2配置
+# mm2.properties
+clusters = dc1, dc2
+dc1.bootstrap.servers = kafka-dc1:9092
+dc2.bootstrap.servers = kafka-dc2:9092
+
+# 复制配置
+dc1->dc2.enabled = true
+dc1->dc2.topics = .*
+dc1->dc2.sync.topic.configs.enabled = true
+
+# 同步配置
+sync.group.offsets.enabled = true
+sync.group.offsets.interval.seconds = 60
+emit.heartbeats.enabled = true
+emit.heartbeats.interval.seconds = 1
+emit.checkpoints.enabled = true
+emit.checkpoints.interval.seconds = 60
+refresh.topics.interval.seconds = 600
+
+# 复制策略
+replication.policy.class = org.apache.kafka.connect.mirror.IdentityReplicationPolicy
+```
+
+### 16.2 跨数据中心复制策略
+
+```text
+跨数据中心复制策略：
+
+  主备模式：
+    DC1为主，DC2为备
+    所有写操作在DC1
+    DC2只读，用于灾备
+
+  双活模式：
+    DC1和DC2同时读写
+    双向复制
+    需要处理冲突
+
+  多活模式：
+    多个数据中心同时读写
+    复杂的一致性保证
+    需要冲突解决策略
+
+  适用场景：
+    主备模式：灾备恢复
+    双活模式：就近访问
+    多活模式：全球分布
+```
+
+### 16.3 跨数据中心最佳实践
+
+```text
+跨数据中心最佳实践：
+
+  网络要求：
+    带宽：≥1Gbps
+    延迟：≤100ms
+    可靠性：≥99.9%
+
+  数据一致性：
+    最终一致性：允许一定延迟
+    强一致性：需要同步机制
+    冲突解决：制定解决策略
+
+  性能优化：
+    批量复制：减少网络往返
+    压缩传输：减少带宽使用
+    并行复制：提高复制速度
+
+  监控告警：
+    复制延迟监控
+    复制失败告警
+    数据一致性监控
+```
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。
 - 和「**基础知识/MQ**」：MQ.md 收录 Kafka 的 Producer 流程、ISR/LEO/HW、清理策略等零散精华；本篇是体系化实用版。

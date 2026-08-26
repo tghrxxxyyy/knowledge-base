@@ -1064,4 +1064,180 @@ span.SetAttributes(attribute.String("key", "value"))
 
 ---
 
+## 采样策略深入
+
+```yaml
+# 采样策略配置
+sampling:
+  # 客户端采样
+  client:
+    - type: probabilistic
+      param: 0.1  # 10%采样率
+    - type: rateLimiting
+      param: 100  # 每秒100条
+    
+  # 服务端采样
+  service:
+    - type: probabilistic
+      param: 0.01  # 1%采样率
+    
+  # 尾部采样
+  tail:
+    - type: error
+      param: 1.0  # 错误请求100%采样
+    - type: latency
+      param: 0.5  # 高延迟50%采样
+```
+
+### 采样策略对比
+
+| 策略 | 说明 | 适用场景 | 资源消耗 |
+|------|------|----------|----------|
+| 概率采样 | 按比例采样 | 高吞吐 | 低 |
+| 速率限制 | 限制每秒采样数 | 资源受限 | 中 |
+| 尾部采样 | 基于结果采样 | 问题排查 | 高 |
+| 自适应采样 | 动态调整 | 变化负载 | 中 |
+
+### 采样率配置建议
+
+| 服务类型 | 采样率 | 说明 |
+|----------|--------|------|
+| 核心服务 | 100% | 关键路径 |
+| 一般服务 | 10% | 常规监控 |
+| 高吞吐 | 1% | 降低成本 |
+| 调试环境 | 100% | 开发测试 |
+
+## 存储后端对比
+
+```yaml
+# 存储后端配置
+storage:
+  elasticsearch:
+    server_urls: ["http://elasticsearch:9200"]
+    index_prefix: "jaeger"
+    num_shards: 5
+    num_replicas: 1
+    
+  cassandra:
+    servers: ["cassandra:9042"]
+    keyspace: "jaeger_v1"
+    replication_factor: 3
+    
+  clickhouse:
+    server_url: "clickhouse:9000"
+    database: "jaeger"
+```
+
+### 存储后端对比
+
+| 特性 | Elasticsearch | Cassandra | ClickHouse |
+|------|---------------|-----------|------------|
+| 写入性能 | 高 | 极高 | 极高 |
+| 查询性能 | 高 | 中 | 高 |
+| 存储成本 | 中 | 低 | 低 |
+| 运维复杂度 | 中 | 高 | 中 |
+| 适用场景 | 通用 | 大规模 | 分析 |
+
+## 性能优化
+
+```yaml
+# Jaeger 性能优化
+optimization:
+  # Agent优化
+  agent:
+    max_queue_size: 1000
+    max_batch_size: 100
+    flush_interval: "1s"
+    
+  # Collector优化
+  collector:
+    num_workers: 50
+    batch_size: 1000
+    batch_timeout: "1s"
+    
+  # 存储优化
+  storage:
+    es_index_shards: 5
+    es_index_replicas: 1
+    span_size_limit: 4096
+```
+
+### 性能优化策略
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| 批量发送 | 合并多个span | 减少网络开销 |
+| 异步写入 | 非阻塞写入 | 提高吞吐量 |
+| 索引优化 | 合理分片和副本 | 提高查询性能 |
+| 缓存配置 | 合理配置缓存 | 减少查询延迟 |
+
+## 故障排查流程
+
+```mermaid
+flowchart TB
+    subgraph 故障排查
+        CHECK[检查Jaeger状态] --> AGENT{Agent是否正常?}
+        AGENT -->|否| AGENT_FIX[检查Agent日志]
+        AGENT -->|是| COLLECTOR{Collector是否正常?}
+        COLLECTOR -->|否| COLLECTOR_FIX[检查Collector日志]
+        COLLECTOR -->|是| STORAGE{存储是否正常?}
+        STORAGE -->|否| STORAGE_FIX[检查存储连接]
+        STORAGE -->|是| SAMPLING{采样策略是否正确?}
+        SAMPLING -->|否| SAMPLING_FIX[调整采样策略]
+        SAMPLING -->|是| CLIENT{客户端配置是否正确?}
+        CLIENT -->|否| CLIENT_FIX[检查客户端配置]
+    end
+```
+
+### 常见问题排查
+
+| 问题 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| 无trace数据 | Agent未启动 | 检查Agent日志 |
+| trace不完整 | 采样率过低 | 提高采样率 |
+| 查询超时 | ES压力大 | 优化ES配置 |
+| 数据丢失 | Collector队列满 | 增大队列大小 |
+
+## 最佳实践
+
+```yaml
+# Jaeger 最佳实践
+best_practices:
+  # 采样策略
+  sampling:
+    - "核心服务100%采样"
+    - "一般服务10%采样"
+    - "错误请求100%采样"
+    - "高延迟请求100%采样"
+    
+  # 存储配置
+  storage:
+    - "使用Elasticsearch存储"
+    - "合理配置分片和副本"
+    - "定期清理旧数据"
+    
+  # 性能优化
+  performance:
+    - "批量发送span"
+    - "异步写入存储"
+    - "合理配置缓存"
+    
+  # 监控告警
+  monitoring:
+    - "监控Agent状态"
+    - "监控Collector性能"
+    - "监控存储使用情况"
+```
+
+### 最佳实践总结
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 采样策略 | 按需采样 | 降低成本 |
+| 存储优化 | 合理配置 | 提高性能 |
+| 监控告警 | 及时发现问题 | 保障稳定性 |
+| 定期维护 | 清理旧数据 | 节省存储 |
+
+---
+
 > 一句话：**Jaeger = OpenTelemetry 原生后端 + W3C Trace Context 传播 + 灵活采样（Head/Tail-based）+ ES/Cassandra/ClickHouse 存储；选型先看「生态（云原生→Jaeger，Java→SkyWalking）」，再定「采样策略（高吞吐→概率采样，找问题→Tail-based）」**。

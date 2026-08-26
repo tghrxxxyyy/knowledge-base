@@ -1031,3 +1031,139 @@ pulsar-admin tenants create my-tenant
 # 创建命名空间
 pulsar-admin namespaces create my-tenant/my-ns
 ```
+
+## Pulsar 分层存储配置
+
+```bash
+# 分层存储配置
+pulsar-admin namespaces set-offload-threshold my-tenant/my-ns \
+  --threshold 10G \
+  --size 10G
+
+# 配置S3卸载
+pulsar-admin bookkeeper tiered-storage \
+  --driver s3 \
+  --s3-endpoint http://s3.amazonaws.com \
+  --s3-bucket my-bucket \
+  --s3-region us-east-1
+
+# 手动卸载
+pulsar-admin topics offload my-tenant/my-ns/my-topic
+```
+
+### 分层存储架构
+
+```mermaid
+flowchart TB
+    subgraph 热数据
+        BOOKIE[BookKeeper] -->|写入| LEDGER[Ledger]
+    end
+    subgraph 冷数据
+        LEDGER -->|卸载| S3[S3/OSS]
+    end
+    subgraph 查询
+        CONSUMER[消费者] --> BOOKIE
+        CONSUMER --> S3
+    end
+```
+
+### 分层存储配置参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| offloadThreshold | 触发卸载阈值 | 10GB |
+| offloadMaxThreads | 卸载线程数 | 4 |
+| managedLedgerMaxSize | Ledger最大大小 | 1GB |
+| offloaderLedgerRollover | 翻滚频率 | 每100MB |
+
+## Pulsar 跨地域复制
+
+```bash
+# 配置跨地域复制
+pulsar-admin namespaces set-clusters my-tenant/my-ns \
+  --clusters us-east,us-west,eu-west
+
+# 查看复制状态
+pulsar-admin topics stats my-tenant/my-ns/my-topic | jq '.replication'
+
+# 配置容灾切换
+pulsar-admin topics get-clusters my-tenant/my-ns/my-topic
+```
+
+### 跨地域复制架构
+
+```mermaid
+flowchart LR
+    subgraph 北京
+        BROKER1[Broker] --> BOOKIE1[BookKeeper]
+    end
+    subgraph 上海
+        BROKER2[Broker] --> BOOKIE2[BookKeeper]
+    end
+    subgraph 广州
+        BROKER3[Broker] --> BOOKIE3[BookKeeper]
+    end
+    BROKER1 <-->|异步复制| BROKER2
+    BROKER2 <-->|异步复制| BROKER3
+    BROKER1 <-->|异步复制| BROKER3
+```
+
+### 跨地域复制策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 主从复制 | 一个主集群，多个从集群 | 读写分离 |
+| 对等复制 | 多集群对等，双向复制 | 多活架构 |
+| 级联复制 | A→B→C链式复制 | 跨地域部署 |
+
+## Pulsar Functions 实战
+
+```java
+// Pulsar Functions 示例
+public class WordCountFunction implements Function<byte[], Optional<Integer>> {
+    
+    @Override
+    public Optional<Integer> process(byte[] input) {
+        String word = new String(input);
+        return Optional.of(word.length());
+    }
+}
+
+// 部署Function
+pulsar-admin functions create \
+  --jar word-count.jar \
+  --classname WordCountFunction \
+  --topic my-input-topic \
+  --output my-output-topic \
+  --name word-count
+```
+
+### Functions 部署模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| 进程内 | 运行在Broker进程 | 简单逻辑 |
+| 独立 | 独立进程 | 复杂逻辑 |
+| Kubernetes | 作为K8s Pod | 云原生部署 |
+
+## Pulsar 与 Kafka 选型决策树
+
+```mermaid
+flowchart TD
+    START[选择消息队列] --> Q1{需要多租户?}
+    Q1 -->|是| PULSAR
+    Q1 -->|否| Q2{需要跨地域复制?}
+    Q2 -->|是| PULSAR
+    Q2 -->|否| Q3{需要延迟消息?}
+    Q3 -->|是| PULSAR
+    Q3 -->|否| Q4{团队熟悉Kafka?}
+    Q4 -->|是| KAFKA
+    Q4 -->|否| Q5{数据量级?}
+    Q5 -->|PB级| KAFKA
+    Q5 -->|TB级| PULSAR
+    
+    PULSAR --> PULSAR_DESC[存算分离,运维复杂]
+    KAFKA --> KAFKA_DESC[生态丰富,运维简单]
+```
+
+## 十二、Pulsar 运维命令

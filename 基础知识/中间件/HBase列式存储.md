@@ -1006,3 +1006,132 @@ RowKey 设计原则：
 ```
 
 > 一句话：**HBase = HDFS 上的 Bigtable + LSM 树写优化 + 列族存储 + 强一致；选型先看「生态（Hadoop→HBase，独立→Cassandra）」，再定「RowKey 设计（散列/有序/短）」，最后调「内存/Compaction/BloomFilter」**。
+
+## HBase 时序数据存储方案
+
+```mermaid
+flowchart LR
+    subgraph 采集层
+        DEVICE[IoT设备] -->|MQTT| KAFKA[Kafka]
+        MONITOR[监控Agent] -->|Collector| KAFKA
+    end
+    subgraph 写入层
+        KAFKA --> HBASE[HBase时序表]
+        HBASE --> TSDB[OpenTSDB/Phoenix]
+    end
+    subgraph 查询层
+        TSDB --> API[查询API]
+        TSDB --> GRAFANA[Grafana]
+    end
+```
+
+### 时序数据 RowKey 设计
+
+```
+设计模式：[metric][timestamp][tags]
+示例：
+  cpu.usage.20240101000001.host01
+  压缩：用字典编码压缩 metric 和 tags
+  散列：metric 前缀加 MD5 防止热点
+```
+
+| 设计要素 | 方案 | 优势 |
+|----------|------|------|
+| metric | 字典编码 | 减少存储 |
+| timestamp | Long.MAX - ts | 降序扫描 |
+| tags | 拼接+哈希 | 支持多维度查询 |
+| TTL | 分区级TTL | 自动清理历史数据 |
+
+## HBase 二级索引方案
+
+```java
+// Phoenix 二级索引示例
+CREATE INDEX idx_user_name ON user_table (user_name)
+    INCLUDE (email, phone);
+
+// 查询自动使用索引
+SELECT * FROM user_table WHERE user_name = '张三';
+```
+
+### 二级索引方案对比
+
+| 方案 | 实现方式 | 一致性 | 性能影响 |
+|------|----------|--------|----------|
+| Phoenix 二级索引 | 协处理器+索引表 | 强一致 | 写入降20% |
+| SALB 索引 | 应用层双写 | 最终一致 | 写入降30% |
+| Coprocessor 索引 | 自定义协处理器 | 强一致 | 写入降15% |
+| ES 二级索引 | 外部ES+同步 | 最终一致 | 增加复杂度 |
+
+## HBase + Kafka 数据同步
+
+```mermaid
+flowchart TB
+    HBASE[HBase] -->|WAL同步| KAFKA_CONNECT[Kafka Connect]
+    KAFKA_CONNECT --> TOPIC[HBase Topic]
+    TOPIC --> CONSUMER[消费者]
+    CONSUMER --> ES[Elasticsearch]
+    CONSUMER --> CACHE[Redis缓存]
+```
+
+### 同步方案对比
+
+| 方案 | 实时性 | 数据一致性 | 复杂度 |
+|------|--------|------------|--------|
+| WAL + Kafka Connect | 秒级 | 最终一致 | 低 |
+| Coprocessor + Producer | 秒级 | 最终一致 | 中 |
+| Phoenix + 触发器 | 秒级 | 强一致 | 中 |
+| Binlog（Talend） | 分钟级 | 最终一致 | 低 |
+
+## Region 热点诊断与处理
+
+```mermaid
+flowchart TD
+    ALERT[Region热点告警] --> CHECK{检查Region分布}
+    CHECK -->|不均匀| SPLIT[Region分裂]
+    CHECK -->|均匀| ROWKEY{检查RowKey设计}
+    ROWKEY -->|单调递增| SALTING[加盐处理]
+    ROWKEY -->|已散列| CHECK2{检查写入模式}
+    CHECK2 -->|批量写入| BATCH[调整批量大小]
+    CHECK2 -->|随机写入| MEM[调整MemStore]
+```
+
+### 热点处理命令
+
+```bash
+# 查看Region热点
+hbase shell
+status 'simple'
+table_description 'user_table'
+scan 'hbase:meta', {COLUMNS => ['info:regioninfo']}
+
+# 手动分裂Region
+split 'user_table', 'user_table,abc123,1234567890'
+
+# 触发Region平衡
+balancer_switch true
+balancer
+```
+
+## HBase 集群监控指标
+
+| 指标分类 | 指标名 | 告警阈值 | 处理方案 |
+|----------|--------|----------|----------|
+| 写入 | MemStore大小 | > 128MB | 调整flush间隔 |
+| 写入 | BlockCache命中率 | < 80% | 增大BlockCache |
+| 读取 | Get延迟 | > 100ms | 检查Region分布 |
+| 读取 | Scan延迟 | > 1s | 优化扫描范围 |
+| 存储 | StoreFile大小 | > 10GB | 触发Compaction |
+| 存储 | HFile数量 | > 100 | 触发Major Compaction |
+| Region | 热点Region数 | > 3 | 检查RowKey设计 |
+| Region | 分裂失败数 | > 0 | 检查HDFS状态 |
+
+### Prometheus + Grafana 监控配置
+
+```yaml
+# Prometheus 配置 HBase Exporter
+scrape_configs:
+  - job_name: 'hbase'
+    static_configs:
+      - targets: ['hbase-regionserver:9100']
+    metrics_path: /metrics
+```

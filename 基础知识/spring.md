@@ -1012,6 +1012,267 @@ Spring Boot 3.2+ 原生镜像支持：
   - 监控启动时间（目标 <100ms）和内存占用（目标 <50MB）
 ```
 
+## Spring AOP 原理深入
+
+```java
+// AOP 核心概念
+@Aspect
+@Component
+public class LoggingAspect {
+    
+    @Before("execution(* com.example.service.*.*(..))")
+    public void logBefore(JoinPoint joinPoint) {
+        System.out.println("Before: " + joinPoint.getSignature().getName());
+    }
+    
+    @After("execution(* com.example.service.*.*(..))")
+    public void logAfter(JoinPoint joinPoint) {
+        System.out.println("After: " + joinPoint.getSignature().getName());
+    }
+    
+    @Around("execution(* com.example.service.*.*(..))")
+    public Object logAround(ProceedingJoinPoint joinPoint) throws Throwable {
+        long start = System.currentTimeMillis();
+        Object result = joinPoint.proceed();
+        long duration = System.currentTimeMillis() - start;
+        System.out.println("Duration: " + duration + "ms");
+        return result;
+    }
+}
+```
+
+### AOP 代理方式对比
+
+| 方式 | 实现 | 优势 | 劣势 |
+|------|------|------|------|
+| JDK动态代理 | 接口代理 | 无侵入 | 只能代理接口 |
+| CGLIB代理 | 子类代理 | 可代理类 | 性能开销大 |
+| AspectJ | 编译时织入 | 性能最好 | 需要特殊编译 |
+
+### AOP 应用场景
+
+| 场景 | 实现方式 | 说明 |
+|------|----------|------|
+| 日志记录 | @Before/@After | 方法执行日志 |
+| 事务管理 | @Transactional | 声明式事务 |
+| 权限控制 | @Before | 方法级权限 |
+| 性能监控 | @Around | 方法耗时统计 |
+| 缓存管理 | @Around | 方法结果缓存 |
+
+## Spring 事件机制
+
+```java
+// 自定义事件
+public class OrderCreatedEvent extends ApplicationEvent {
+    private final Order order;
+    
+    public OrderCreatedEvent(Object source, Order order) {
+        super(source);
+        this.order = order;
+    }
+    
+    public Order getOrder() {
+        return order;
+    }
+}
+
+// 事件监听器
+@Component
+public class OrderEventListener {
+    
+    @EventListener
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        System.out.println("订单创建: " + event.getOrder().getId());
+    }
+    
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void handleAfterCommit(OrderCreatedEvent event) {
+        // 事务提交后执行
+        sendNotification(event.getOrder());
+    }
+}
+
+// 发布事件
+@Service
+public class OrderService {
+    @Autowired
+    private ApplicationEventPublisher eventPublisher;
+    
+    public void createOrder(Order order) {
+        // 保存订单
+        orderRepository.save(order);
+        // 发布事件
+        eventPublisher.publishEvent(new OrderCreatedEvent(this, order));
+    }
+}
+```
+
+### 事件机制原理
+
+| 概念 | 说明 | 用途 |
+|------|------|------|
+| ApplicationEvent | 事件基类 | 封装事件数据 |
+| ApplicationListener | 事件监听器 | 处理事件 |
+| ApplicationEventPublisher | 事件发布器 | 发布事件 |
+| @EventListener | 注解监听器 | 简化配置 |
+| @TransactionalEventListener | 事务监听器 | 事务感知 |
+
+## Spring 条件注解
+
+```java
+// 条件注解使用
+@Configuration
+public class AppConfig {
+    
+    @Bean
+    @ConditionalOnProperty(name = "feature.enabled", havingValue = "true")
+    public FeatureService featureService() {
+        return new FeatureService();
+    }
+    
+    @Bean
+    @ConditionalOnClass(name = "com.example.redis.RedisTemplate")
+    public CacheService cacheService() {
+        return new RedisCacheService();
+    }
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public DefaultService defaultService() {
+        return new DefaultService();
+    }
+    
+    @Bean
+    @ConditionalOnWebApplication
+    public WebService webService() {
+        return new WebService();
+    }
+}
+```
+
+### 条件注解列表
+
+| 注解 | 说明 | 示例 |
+|------|------|------|
+| @ConditionalOnProperty | 配置属性条件 | feature.enabled=true |
+| @ConditionalOnClass | 类存在条件 | 类路径下有Redis |
+| @ConditionalOnMissingBean | Bean缺失条件 | 没有自定义实现 |
+| @ConditionalOnWebApplication | Web应用条件 | Web环境 |
+| @ConditionalOnExpression | SpEL表达式条件 | 复杂逻辑判断 |
+
+## Spring Boot 自动配置原理
+
+```java
+// 自动配置类
+@Configuration
+@EnableConfigurationProperties(MyProperties.class)
+@ConditionalOnClass(MyService.class)
+public class MyAutoConfiguration {
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public MyService myService(MyProperties properties) {
+        return new MyService(properties);
+    }
+}
+
+// 配置属性类
+@ConfigurationProperties(prefix = "my")
+public class MyProperties {
+    private String name;
+    private int timeout;
+    // getters/setters
+}
+```
+
+### 自动配置加载流程
+
+```mermaid
+flowchart TD
+    A[SpringApplication.run] --> B[加载spring.factories]
+    B --> C[扫描AutoConfiguration]
+    C --> D{条件判断}
+    D -->|通过| E[注册Bean]
+    D -->|不通过| F[跳过]
+    E --> G[应用启动完成]
+```
+
+### 自动配置最佳实践
+
+| 实践 | 说明 | 示例 |
+|------|------|------|
+| 命名规范 | 包名以autoconfigure结尾 | com.example.autoconfigure |
+| 条件组合 | 多条件组合使用 | @ConditionalOnClass + @ConditionalOnProperty |
+| 配置元数据 | 提供additional-spring-configuration-metadata.json | IDE提示 |
+| 测试覆盖 | 使用ApplicationContextRunner测试 | 自动配置测试 |
+
+## Spring 测试框架
+
+```java
+// Spring Boot 测试
+@SpringBootTest
+class MyApplicationTests {
+    
+    @Autowired
+    private ApplicationContext context;
+    
+    @Test
+    void contextLoads() {
+        assertNotNull(context);
+    }
+}
+
+// Web 测试
+@WebMvcTest(UserController.class)
+class UserControllerTests {
+    
+    @Autowired
+    private MockMvc mockMvc;
+    
+    @MockBean
+    private UserService userService;
+    
+    @Test
+    void shouldReturnUser() throws Exception {
+        when(userService.findById(1L)).thenReturn(new User("test"));
+        
+        mockMvc.perform(get("/users/1"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.name").value("test"));
+    }
+}
+
+// 数据层测试
+@DataJpaTest
+class UserRepositoryTests {
+    
+    @Autowired
+    private TestEntityManager entityManager;
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Test
+    void shouldFindUser() {
+        User user = new User("test");
+        entityManager.persistAndFlush(user);
+        
+        Optional<User> found = userRepository.findByName("test");
+        assertTrue(found.isPresent());
+    }
+}
+```
+
+### 测试注解列表
+
+| 注解 | 说明 | 用途 |
+|------|------|------|
+| @SpringBootTest | 完整上下文测试 | 集成测试 |
+| @WebMvcTest | Web层测试 | Controller测试 |
+| @DataJpaTest | 数据层测试 | Repository测试 |
+| @MockBean | Mock Bean | 模拟依赖 |
+| @TestConfiguration | 测试配置 | 测试专用配置 |
+
 ## 七、生产就绪检查清单（Spring 视角）
 
 上线前逐项核对，把个人经验变团队流程：

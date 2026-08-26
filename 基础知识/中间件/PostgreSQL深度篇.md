@@ -1030,6 +1030,163 @@ LIMIT 10;
 
 ---
 
+## 分区表实战
+
+```sql
+-- 范围分区
+CREATE TABLE orders (
+    id BIGSERIAL,
+    user_id INT,
+    amount DECIMAL(10,2),
+    create_time TIMESTAMP
+) PARTITION BY RANGE (create_time);
+
+-- 创建分区
+CREATE TABLE orders_2024_q1 PARTITION OF orders
+    FOR VALUES FROM ('2024-01-01') TO ('2024-04-01');
+
+CREATE TABLE orders_2024_q2 PARTITION OF orders
+    FOR VALUES FROM ('2024-04-01') TO ('2024-07-01');
+
+-- 哈希分区
+CREATE TABLE users (
+    id BIGSERIAL,
+    username VARCHAR(50),
+    email VARCHAR(100)
+) PARTITION BY HASH (id);
+
+CREATE TABLE users_p0 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE users_p1 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+```
+
+### 分区类型对比
+
+| 分区类型 | 适用场景 | 优势 | 劣势 |
+|----------|----------|------|------|
+| 范围分区 | 时间序列数据 | 查询高效 | 分区管理复杂 |
+| 列表分区 | 固定枚举值 | 数据隔离 | 分区数量固定 |
+| 哈希分区 | 数据均匀分布 | 写入均匀 | 范围查询低效 |
+| 复合分区 | 复杂场景 | 灵活 | 配置复杂 |
+
+## 并发控制机制
+
+```sql
+-- MVCC 隔离级别
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;  -- 默认
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- 查看事务状态
+SELECT * FROM pg_stat_activity WHERE state = 'active';
+
+-- 查看锁等待
+SELECT * FROM pg_locks WHERE NOT granted;
+```
+
+### 隔离级别对比
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 | 性能 |
+|----------|------|------------|------|------|
+| READ COMMITTED | 避免 | 可能 | 可能 | 高 |
+| REPEATABLE READ | 避免 | 避免 | 可能 | 中 |
+| SERIALIZABLE | 避免 | 避免 | 避免 | 低 |
+
+## JSONB 高级查询
+
+```sql
+-- 创建JSONB索引
+CREATE INDEX idx_metadata ON products USING GIN (metadata);
+
+-- JSONB 查询
+SELECT * FROM products WHERE metadata @> '{"color": "red"}';
+
+-- JSONB 路径查询
+SELECT * FROM products WHERE metadata->>'price'::numeric > 100;
+
+-- JSONB 聚合
+SELECT 
+    metadata->>'category' as category,
+    COUNT(*) as count,
+    AVG((metadata->>'price')::numeric) as avg_price
+FROM products
+GROUP BY metadata->>'category';
+```
+
+### JSONB 操作符
+
+| 操作符 | 说明 | 示例 |
+|--------|------|------|
+| @> | 包含 | '{"a":1}' @> '{"a":1,b":2}' |
+| <@ | 被包含 | '{"a":1}' <@ '{"a":1,b":2}' |
+| ? | 键存在 | '{"a":1}' ? 'a' |
+| -> | 获取字段 | '{"a":1}'->'a' |
+| ->> | 获取文本 | '{"a":1}'->>'a' |
+
+## 扩展生态
+
+```sql
+-- 安装扩展
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+CREATE EXTENSION IF NOT EXISTS "btree_gin";
+
+-- PostGIS 地理扩展
+CREATE EXTENSION postgis;
+SELECT ST_Distance(
+    ST_GeomFromText('POINT(1 1)', 4326),
+    ST_GeomFromText('POINT(2 2)', 4326)
+);
+
+-- pgvector 向量扩展
+CREATE EXTENSION vector;
+CREATE TABLE embeddings (
+    id SERIAL PRIMARY KEY,
+    embedding VECTOR(1536)
+);
+SELECT * FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 5;
+```
+
+### 常用扩展
+
+| 扩展 | 说明 | 用途 |
+|------|------|------|
+| PostGIS | 地理信息 | 空间查询 |
+| pg_trgm | 三元组匹配 | 模糊搜索 |
+| pgvector | 向量检索 | AI相似搜索 |
+| TimescaleDB | 时序数据 | IoT/监控 |
+| Citus | 分布式 | 水平扩展 |
+
+## 性能调优
+
+```sql
+-- 查看慢查询
+SELECT query, calls, mean_time, total_time
+FROM pg_stat_statements
+ORDER BY mean_time DESC
+LIMIT 10;
+
+-- 查看索引使用情况
+SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+ORDER BY idx_scan DESC;
+
+-- 查看表统计
+SELECT relname, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup
+FROM pg_stat_user_tables;
+```
+
+### 调优参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| shared_buffers | 共享缓冲区 | 内存的25% |
+| work_mem | 工作内存 | 64-256MB |
+| effective_cache_size | 有效缓存 | 内存的75% |
+| maintenance_work_mem | 维护内存 | 512MB-1GB |
+| random_page_cost | 随机IO成本 | 1.1(SSD) |
+
+---
+
 ## 十五、速查表（扩展）
 
 | 项 | 结论 |

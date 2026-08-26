@@ -1057,6 +1057,233 @@ Lead Time = 编码时间 + 评审时间 + CI 时间 + 部署时间 + 排队时�
 | 数据库连接池耗尽 | LitmusChaos | 连接池恢复 | 错误率 > 5% |
 | 缓存失效 | 手动清除 | 回源正常 | 延迟 P99 > 1s |
 
+---
+
+## DORA 指标深度解析
+
+```yaml
+# DORA 指标定义
+dora_metrics:
+  # 部署频率
+  deployment_frequency:
+    definition: "代码部署到生产的频率"
+    elite: "按需（一天多次）"
+    high: "每天到每周"
+    medium: "每周到每月"
+    low: "每月以下"
+    
+  # 变更前置时间
+  lead_time:
+    definition: "从提交代码到生产部署的时间"
+    elite: "小于一小时"
+    high: "一天到一周"
+    medium: "一周到一个月"
+    low: "一个月以上"
+    
+  # 变更失败率
+  change_failure_rate:
+    definition: "导致服务故障的变更比例"
+    elite: "0-15%"
+    high: "16-30%"
+    medium: "31-45%"
+    low: "46-60%"
+    
+  # 服务恢复时间
+  mttr:
+    definition: "从故障恢复到服务正常的时间"
+    elite: "小于一小时"
+    high: "小于一天"
+    medium: "一天到一周"
+    low: "一周以上"
+```
+
+### DORA 指标计算
+
+```python
+# DORA 指标计算示例
+def calculate_dora_metrics(deployments, failures, lead_times, incidents):
+    # 部署频率（次/天）
+    deploy_frequency = len(deployments) / 30
+    
+    # 变更前置时间（小时）
+    lead_time_hours = sum(lead_times) / len(lead_times) / 3600
+    
+    # 变更失败率（%）
+    failure_rate = len(failures) / len(deployments) * 100
+    
+    # 服务恢复时间（小时）
+    mttr_hours = sum(incidents) / len(incidents) / 3600
+    
+    return {
+        'deployment_frequency': deploy_frequency,
+        'lead_time': lead_time_hours,
+        'change_failure_rate': failure_rate,
+        'mttr': mttr_hours
+    }
+```
+
+### DORA 指标改进策略
+
+| 指标 | 改进策略 | 工具支持 |
+|------|----------|----------|
+| 部署频率 | CI/CD自动化、Feature Flag | GitHub Actions |
+| 变更前置时间 | 并行测试、快速反馈 | Jenkins/GitLab CI |
+| 变更失败率 | 自动化测试、金丝雀发布 | Argo CD |
+| 服务恢复时间 | 监控告警、自动回滚 | PagerDuty |
+
+## 供应链安全框架
+
+```yaml
+# 供应链安全配置
+supply_chain_security:
+  # SLSA 配置
+  slsa:
+    level: 3
+    provenance: true
+    build_platform: "https://github.com/actions/runner"
+    
+  # 镜像签名
+  cosign:
+    keyless: true
+    fulcio: true
+    rekor: true
+    
+  # SBOM 生成
+  sbom:
+    format: "spdx-json"
+    tool: "syft"
+    upload: true
+```
+
+### SLSA 级别要求
+
+| 级别 | 要求 | 说明 |
+|------|------|------|
+| SLSA 1 | 构建过程有文档 | 基础安全 |
+| SLSA 2 | 使用版本控制构建平台 | 防篡改 |
+| SLSA 3 | 构建平台不可篡改 | 高安全 |
+| SLSA 4 | 双人审查 | 最高安全 |
+
+### 供应链安全检查清单
+
+| 检查项 | 说明 | 工具 |
+|--------|------|------|
+| 依赖扫描 | 检查已知漏洞 | Snyk/Trivy |
+| SBOM生成 | 软件物料清单 | Syft/CycloneDX |
+| 镜像签名 | 验证镜像来源 | Cosign |
+| 构建验证 | 验证构建来源 | SLSA Provenance |
+
+## 合规自动化
+
+```yaml
+# OPA Gatekeeper 策略
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: require-team-label
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    labels: ["team", "environment"]
+```
+
+### 合规检查配置
+
+| 合规要求 | 检查内容 | 工具 |
+|----------|----------|------|
+| 等保三级 | 访问控制、审计 | OPA/Kyverno |
+| GDPR | 数据保护、同意 | 自定义策略 |
+| SOC 2 | 可用性、安全性 | 云平台审计 |
+| PCI DSS | 支付安全 | 专用扫描器 |
+
+## 混沌工程实验
+
+```yaml
+# Chaos Mesh 实验配置
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: network-delay
+  namespace: production
+spec:
+  action: delay
+  mode: all
+  selector:
+    labelSelectors:
+      app: my-service
+  delay:
+    latency: "100ms"
+    jitter: "10ms"
+    correlation: "100"
+  duration: "5m"
+```
+
+### 混沌实验类型
+
+| 实验类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| 网络延迟 | 模拟网络延迟 | 验证超时处理 |
+| 网络丢包 | 模拟网络丢包 | 验证重试机制 |
+| Pod删除 | 模拟Pod故障 | 验证自愈能力 |
+| CPU压力 | 模拟CPU压力 | 验证资源限制 |
+| 内存压力 | 模拟内存压力 | 验证OOM处理 |
+
+## 可观测性架构
+
+```mermaid
+flowchart TB
+    subgraph 数据采集
+        APP[应用] --> OTEL[OpenTelemetry]
+        OTEL --> PROM[Prometheus]
+        OTEL --> LOKI[Loki]
+        OTEL --> JAEGER[Jaeger]
+    end
+    subgraph 数据处理
+        PROM --> TSDB[时序数据库]
+        LOKI --> ES[Elasticsearch]
+        JAEGER --> ES2[Elasticsearch]
+    end
+    subgraph 可视化
+        TSDB --> GRAFANA[Grafana]
+        ES --> KIBANA[Kibana]
+        ES2 --> JAEGER_UI[Jaeger UI]
+    end
+    subgraph 告警
+        PROM --> ALERT[Alertmanager]
+        ALERT --> PAGER[PagerDuty]
+    end
+```
+
+### 可观测性最佳实践
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 统一标准 | 使用OpenTelemetry | 数据互通 |
+| 采样策略 | 智能采样 | 降低成本 |
+| 关联分析 | 指标-日志-追踪关联 | 快速定位 |
+| 成本优化 | 分层存储 | 降低存储成本 |
+
 ## 本篇补充 Checklist
 
 - [ ] DORA 四指标从 CI/Git/Incident 自动抽取，Grafana 看板按团队分组。

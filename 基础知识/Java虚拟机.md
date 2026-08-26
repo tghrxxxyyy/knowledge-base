@@ -1009,6 +1009,193 @@ sc -d com.xxx.Class   # 类详情
 - **常见诱因**：JNI 库野指针、JIT 编译器 bug（可 `-Xint` 纯解释或 `-XX:CompileCommand` 排除某方法编译验证）、栈溢出（`StackOverflowError` 未捕获递归）、glibc 版本不兼容。
 - 配合 `gdb` 加载 core dump（`ulimit -c unlimited`）定位 native 栈；频繁崩先升级 JDK 小版本（已知 JIT bug 多已修）。
 
+## 压缩指针（Compressed Oops）
+
+```bash
+# 压缩指针开启条件
+-XX:+UseCompressedOops          # 默认开启（JDK 6u23+）
+-XX:+UseCompressedClassPointers  # 压缩类指针
+
+# 堆大小限制
+# 32GB以下：压缩指针可用，堆内存效率更高
+# 32GB以上：压缩指针失效，需要更大内存
+```
+
+### 压缩指针原理
+
+| 概念 | 说明 | 优势 |
+|------|------|------|
+| 普通指针 | 64位（8字节） | 寻址空间大 |
+| 压缩指针 | 32位（4字节）+ 偏移 | 内存减半 |
+| 对齐 | 8字节对齐 | 位运算快速解压 |
+| 零基 | 基地址为0 | 无需减基地址 |
+
+### 堆大小与压缩指针关系
+
+```
+堆大小 | 压缩指针 | 原因
+-------|----------|------
+4GB    | 可用     | 32位可表示
+8GB    | 可用     | 32位可表示
+16GB   | 可用     | 32位可表示
+32GB   | 可用     | 32位极限
+33GB   | 不可用   | 超过32位范围
+64GB   | 不可用   | 需要64位指针
+```
+
+## StringTable 优化
+
+```bash
+# StringTable调优参数
+-XX:StringTableSize=60013       # StringTable桶数量（默认60013）
+-XX:+PrintStringTableStatistics # 打印StringTable统计信息
+
+# 输出示例
+StringTable statistics:
+  Mean entry length: 4.0
+  Total entries: 123456
+  Number of buckets: 60013
+  Mean bucket length: 2.1
+  Maximum bucket length: 15
+```
+
+### StringTable 优化策略
+
+| 策略 | 参数 | 效果 |
+|------|------|------|
+| 增加桶数量 | -XX:StringTableSize=1000003 | 减少哈希冲突 |
+| Intern优化 | String.intern() | 复用字符串对象 |
+| 去重 | -XX:+UseStringDeduplication | G1/ZGC去重 |
+| 监控 | -XX:+PrintStringTableStatistics | 观察使用情况 |
+
+### StringTable 内存占用分析
+
+```java
+// String对象内存占用（64位JVM）
+// 对象头：12字节（压缩指针开启）
+// 数组：16字节（char数组）
+// 总计：约40字节/字符串
+
+// 使用jmap查看字符串占用
+// jmap -histo <pid> | grep String
+```
+
+## 模块系统（Jigsaw）
+
+```java
+// 模块描述符 module-info.java
+module com.example.myapp {
+    requires java.sql;           // 依赖java.sql模块
+    requires transitive java.xml; // 传递依赖
+    exports com.example.api;     // 导出包
+    opens com.example.internal;  // 打开包（反射访问）
+    provides com.example.spi with com.example.MyImpl; // 提供服务
+}
+
+// 使用模块编译
+javac --module-source-path src -m com.example.myapp
+java --module com.example.myapp/com.example.Main
+```
+
+### 模块系统核心概念
+
+| 概念 | 说明 | 用途 |
+|------|------|------|
+| requires | 依赖模块 | 编译时检查 |
+| exports | 导出包 | 其他模块可访问 |
+| opens | 打开包 | 反射可访问 |
+| provides | 提供服务 | SPI实现 |
+| uses | 使用服务 | 依赖SPI |
+
+### 模块化优势
+
+```
+传统JAR：
+  classpath扫描 → 启动慢
+  包冲突 → 运行时异常
+  无法强制封装 → 安全性差
+
+模块化JAR：
+  显式依赖 → 启动快
+  模块边界 → 无冲突
+  强制封装 → 安全性高
+```
+
+## ZGC 调优实战
+
+```bash
+# ZGC启用参数
+-XX:+UseZGC                    # 启用ZGC
+-XX:+ZGenerational             # 分代ZGC（JDK 21+）
+-XX:SoftMaxHeapSize=4g         # 软性堆大小
+-XX:ConcGCThreads=2            # 并发GC线程数
+-XX:ZCollectionInterval=5      # GC间隔（秒）
+-XX:+ZProactive                # 主动回收
+```
+
+### ZGC 性能指标
+
+| 指标 | G1 GC | ZGC | 说明 |
+|------|-------|-----|------|
+| 最大停顿时间 | 200-500ms | <1ms | ZGC优势明显 |
+| 吞吐量损失 | 10-20% | 5-10% | ZGC更优 |
+| 内存开销 | 5-10% | 15-20% | ZGC较高 |
+| 并发线程 | 4-8 | 2-4 | ZGC较少 |
+
+### ZGC 日志分析
+
+```bash
+# 启用GC日志
+-Xlog:gc*:file=gc.log:time,uptime,level,tags
+
+# 关键日志指标
+[2024-01-01T00:00:00.000+0800][0.001s][info][gc] GC(0) Pause Mark Start 0.123ms
+[2024-01-01T00:00:00.001+0800][0.002s][info][gc] GC(0) Pause Mark End 0.045ms
+[2024-01-01T00:00:00.002+0800][0.003s][info][gc] GC(0) Pause Relocate Start 0.067ms
+```
+
+## 逃逸分析与优化
+
+```java
+// 逃逸分析示例
+public void process() {
+    // 未逃逸：对象只在方法内使用 → 栈上分配
+    Point p = new Point(1, 2);
+    System.out.println(p.x + p.y);
+    
+    // 逃逸：对象作为返回值 → 堆分配
+    Point p2 = createPoint();
+    return p2;
+}
+
+// 标量替换：对象拆解为基本类型
+// 优化前：
+Point p = new Point(1, 2);
+int sum = p.x + p.y;
+
+// 优化后（标量替换）：
+int x = 1;
+int y = 2;
+int sum = x + y;
+```
+
+### 逃逸分析优化类型
+
+| 优化类型 | 条件 | 效果 |
+|----------|------|------|
+| 栈上分配 | 对象不逃逸方法 | 减少GC压力 |
+| 标量替换 | 对象可拆解 | 消除对象分配 |
+| 锁消除 | 锁对象不逃逸 | 消除同步开销 |
+
+### 逃逸分析参数
+
+```bash
+-XX:+DoEscapeAnalysis      # 开启逃逸分析（默认开）
+-XX:+EliminateAllocations  # 开启标量替换（默认开）
+-XX:+EliminateLocks        # 开启锁消除（默认开）
+-XX:+PrintEscapeAnalysis   # 打印逃逸分析结果
+```
+
 ### 12.5 容器环境 JVM 内存 / CPU 感知陷阱
 
 - **内存陷阱**：JDK 8u191 之前不识 cgroup，读到**宿主机**内存设堆 → 堆远超容器 limit → 被 cgroup OOMKill。务必 JDK 8u191+ 或 11+，且 `-XX:+UseContainerSupport`（默认开）。**正确做法**：`-Xmx` 设为容器内存 limit 的 70%~80%（留堆外 / metaspace / 线程栈 / native 空间）。

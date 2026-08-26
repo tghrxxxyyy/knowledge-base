@@ -1030,6 +1030,173 @@ spec:
             / sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
 ```
 
+## Helm Chart 最佳实践
+
+```yaml
+# Chart.yaml 版本管理
+apiVersion: v2
+name: my-app
+version: 1.2.3  # 语义版本
+appVersion: "1.0.0"
+
+# values.yaml 默认值
+replicaCount: 2
+image:
+  repository: my-app
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+# 条件启用
+monitoring:
+  enabled: true
+
+ingress:
+  enabled: false
+```
+
+### Helm 部署命令
+
+```bash
+# 安装
+helm install my-release ./my-chart -f values-prod.yaml
+
+# 升级
+helm upgrade my-release ./my-chart --set image.tag=1.0.1
+
+# 回滚
+helm rollback my-release 1
+
+# 查看状态
+helm list
+helm status my-release
+```
+
+## Kustomize 环境差异管理
+
+```yaml
+# base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml
+
+# overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patchesStrategicMerge:
+  - patch-replicas.yaml
+  - patch-resources.yaml
+namePrefix: prod-
+commonLabels:
+  environment: production
+```
+
+### Kustomize vs Helm
+
+| 特性 | Kustomize | Helm |
+|------|-----------|------|
+| 配置方式 | 补丁叠加 | 模板渲染 |
+| 版本控制 | 声明式 | 模板化 |
+| 学习曲线 | 低 | 中 |
+| 适用场景 | 简单差异 | 复杂配置 |
+
+## 容器安全扫描
+
+```yaml
+# GitHub Actions 安全扫描
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: my-app:${{ github.sha }}
+    format: 'sarif'
+    output: 'trivy-results.sarif'
+    severity: 'CRITICAL,HIGH'
+
+- name: Upload Trivy scan results
+  uses: github/codeql-action/upload-sarif@v2
+  with:
+    sarif_file: 'trivy-results.sarif'
+```
+
+### 容器安全检查清单
+
+| 检查项 | 说明 | 工具 |
+|--------|------|------|
+| 镜像漏洞 | CVE漏洞扫描 | Trivy/Snyk |
+| 镜像签名 | 验证镜像来源 | Cosign |
+| 运行时安全 | 异常行为检测 | Falco |
+| 网络策略 | 流量控制 | NetworkPolicy |
+| 资源限制 | 防止资源耗尽 | ResourceQuota |
+
+## 服务网格集成
+
+```yaml
+# Istio VirtualService
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-service
+spec:
+  hosts:
+  - my-service
+  http:
+  - route:
+    - destination:
+        host: my-service
+        subset: v1
+      weight: 90
+    - destination:
+        host: my-service
+        subset: v2
+      weight: 10
+```
+
+### 服务网格功能
+
+| 功能 | 说明 | 实现 |
+|------|------|------|
+| 流量管理 | 路由、负载均衡 | VirtualService |
+| 安全 | mTLS、认证授权 | PeerAuthentication |
+| 可观测性 | 指标、日志、追踪 | Kiali/Jaeger |
+| 弹性 | 重试、熔断、超时 | DestinationRule |
+
+## 可观测性集成
+
+```yaml
+# Prometheus ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-service
+spec:
+  selector:
+    matchLabels:
+      app: my-service
+  endpoints:
+  - port: http-metrics
+    path: /metrics
+    interval: 15s
+```
+
+### 可观测性三支柱
+
+| 支柱 | 说明 | 工具 |
+|------|------|------|
+| 指标 | 数值型时间序列 | Prometheus |
+| 日志 | 文本型事件记录 | ELK/Loki |
+| 追踪 | 请求链路追踪 | Jaeger/Tempo |
+
 ## 本篇补充 Checklist
 
 - [ ] 免 daemon 构建用 Kaniko / BuildKit，不挂 docker.sock，secret 用 mount。

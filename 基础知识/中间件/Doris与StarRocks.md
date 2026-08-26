@@ -1035,6 +1035,143 @@ SHOW PROC '/colocate_group';
 
 ---
 
+## 物化视图实战
+
+```sql
+-- Doris 物化视图创建
+CREATE MATERIALIZED VIEW mv_order_stats
+AS
+SELECT 
+    user_id,
+    DATE_FORMAT(create_time, '%Y-%m') as month,
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount
+FROM orders
+GROUP BY user_id, DATE_FORMAT(create_time, '%Y-%m');
+
+-- 查看物化视图
+SHOW ALTER MATERIALIZED VIEW FROM db_name;
+
+-- 删除物化视图
+DROP MATERIALIZED VIEW mv_order_stats ON orders;
+```
+
+### 物化视图类型
+
+| 类型 | 说明 | 适用场景 |
+|------|------|----------|
+| 聚合物化视图 | 预计算聚合 | 报表分析 |
+| 选择物化视图 | 预过滤数据 | 高频查询 |
+| 连接物化视图 | 预关联表 | 复杂查询 |
+
+## 分桶策略
+
+```sql
+-- 哈希分桶
+CREATE TABLE events (
+    event_time DATETIME,
+    user_id BIGINT,
+    event_type VARCHAR(32),
+    data JSON
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "replication_num" = "3"
+);
+
+-- 范围分桶
+CREATE TABLE logs (
+    log_time DATETIME,
+    service VARCHAR(32),
+    level VARCHAR(16),
+    message TEXT
+)
+DISTRIBUTED BY RANGE(log_time) (
+    FROM ('2024-01-01') TO ('2024-04-01') BUCKETS 8,
+    FROM ('2024-04-01') TO ('2024-07-01') BUCKETS 8
+);
+```
+
+### 分桶策略选择
+
+| 策略 | 优势 | 劣势 | 适用场景 |
+|------|------|------|----------|
+| 哈希分桶 | 数据均匀 | 范围查询低效 | 通用场景 |
+| 范围分桶 | 范围查询高效 | 可能热点 | 时间序列 |
+| 两者结合 | 灵活 | 配置复杂 | 复杂场景 |
+
+## 副本管理
+
+```sql
+-- 修改副本数
+ALTER TABLE orders SET ("replication_num" = "3");
+
+-- 查看副本信息
+SHOW TABLET FROM orders;
+
+-- 手动修复副本
+ADMIN REPAIR TABLE orders;
+```
+
+### 副本策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 3副本 | 默认策略 | 一般场景 |
+| 2副本 | 节省存储 | 读多写少 |
+| 1副本 | 测试环境 | 开发测试 |
+
+## 查询优化
+
+```sql
+-- 查看查询计划
+EXPLAIN SELECT * FROM orders WHERE user_id = 123;
+
+-- 开启查询 Profile
+SET enable_profile = true;
+
+-- 查看最近查询
+SHOW QUERY PROFILE 'query_id';
+
+-- 分析查询瓶颈
+ANALYZE PROFILE FOR 'query_id';
+```
+
+### 查询优化技巧
+
+| 技巧 | 说明 | 效果 |
+|------|------|------|
+| 谓词下推 | 尽早过滤 | 减少数据量 |
+| 列裁剪 | 只查需要列 | 减少IO |
+| 物化视图 | 预计算 | 秒级响应 |
+| 分区裁剪 | 跳过无关分区 | 减少扫描 |
+
+## 运维监控
+
+```sql
+-- 查看集群状态
+SHOW PROC '/frontends';
+SHOW PROC '/backends';
+SHOW PROC '/brokers';
+
+-- 查看表统计
+SHOW TABLET FROM orders;
+
+-- 查看负载均衡
+SHOW PROC '/tablet_scheduler';
+```
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| Query P99 | 查询延迟 | > 3s |
+| 内存使用率 | BE内存使用 | > 80% |
+| 磁盘使用率 | 磁盘空间 | > 85% |
+| 复制延迟 | 副本同步 | > 30s |
+
+---
+
 ## 九、速查表（扩展）
 
 | 项 | 结论 |

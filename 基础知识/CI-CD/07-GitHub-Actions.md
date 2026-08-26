@@ -1016,6 +1016,225 @@ jobs:
 
 优化要点：路径过滤只跑变更子项目、`actions/cache` 复用依赖、matrix 并行、大仓用 Nx/Turbo 远程缓存、跳过 CI 用 `[skip ci]`。
 
+## OIDC 免密钥部署实战
+
+```yaml
+# OIDC 部署到 AWS
+name: Deploy to AWS
+on:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/github-actions
+          aws-region: us-east-1
+      
+      - name: Deploy
+        run: aws s3 sync ./dist s3://my-bucket
+```
+
+### OIDC vs 静态密钥
+
+| 特性 | OIDC | 静态密钥 |
+|------|------|----------|
+| 安全性 | 高（临时凭证） | 低（永久凭证） |
+| 轮换 | 自动 | 手动 |
+| 审计 | 可追踪 | 难追踪 |
+| 配置复杂度 | 中 | 低 |
+| 适用场景 | 云部署 | 简单场景 |
+
+### OIDC 信任策略配置
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:org/repo:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+## 缓存策略进阶
+
+```yaml
+# 多层缓存配置
+- name: Cache node modules
+  uses: actions/cache@v4
+  with:
+    path: ~/.npm
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-node-
+
+- name: Cache Docker layers
+  uses: actions/cache@v4
+  with:
+    path: /tmp/.buildx-cache
+    key: ${{ runner.os }}-docker-${{ github.sha }}
+    restore-keys: |
+      ${{ runner.os }}-docker-
+
+- name: Cache Gradle
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.gradle/caches
+      ~/.gradle/wrapper
+    key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+    restore-keys: |
+      ${{ runner.os }}-gradle-
+```
+
+### 缓存命中率优化
+
+| 策略 | 说明 | 命中率提升 |
+|------|------|------------|
+| 精确键值 | 使用hashFiles精确匹配 | +20% |
+| 恢复键 | 设置fallback恢复键 | +15% |
+| 分层缓存 | 多级缓存策略 | +25% |
+| 预热缓存 | 定期更新缓存 | +10% |
+
+## 矩阵策略进阶
+
+```yaml
+# 高级矩阵配置
+strategy:
+  fail-fast: false
+  matrix:
+    os: [ubuntu-latest, macos-latest, windows-latest]
+    node-version: [18, 20, 22]
+    shard: [1, 2, 3, 4, 5]
+    include:
+      - os: ubuntu-latest
+        node-version: 22
+        experimental: true
+    exclude:
+      - os: windows-latest
+        node-version: 18
+    max-parallel: 6
+
+steps:
+  - name: Run tests
+    run: npm test -- --shard=${{ matrix.shard }}/5
+    continue-on-error: ${{ matrix.experimental || false }}
+```
+
+### 矩阵策略最佳实践
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| fail-fast: false | 允许失败继续 | 收集所有失败 |
+| max-parallel | 控制并行度 | 避免资源耗尽 |
+| include/exclude | 精确组合 | 减少无效组合 |
+| continue-on-error | 实验性允许失败 | 核心失败阻断 |
+
+## Self-hosted Runner 安全加固
+
+```yaml
+# 安全加固配置
+jobs:
+  secure-job:
+    runs-on: self-hosted
+    steps:
+      - name: 隔离工作目录
+        run: |
+          mkdir -p ${{ runner.temp }}
+          cd ${{ runner.temp }}
+          
+      - name: 清理敏感信息
+        if: always()
+        run: |
+          rm -rf ${{ runner.temp }}/*
+          unset AWS_SECRET_ACCESS_KEY
+          unset GITHUB_TOKEN
+          
+      - name: 验证代码来源
+        run: |
+          if [ "${{ github.repository }}" != "my-org/my-repo" ]; then
+            echo "不信任的代码来源"
+            exit 1
+          fi
+```
+
+### Runner 安全检查清单
+
+| 检查项 | 说明 | 实施方法 |
+|--------|------|----------|
+| 隔离环境 | 每次运行在新环境 | 容器化Runner |
+| 密钥保护 | 不持久化密钥 | 临时凭证 |
+| 代码验证 | 验证代码来源 | 仓库检查 |
+| 日志脱敏 | 敏感信息不输出 | 日志过滤 |
+| 网络隔离 | 限制网络访问 | 防火墙规则 |
+
+## Monorepo 优化方案
+
+```yaml
+# Monorepo 变更检测
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changes: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'packages/frontend/**'
+            backend:
+              - 'packages/backend/**'
+            shared:
+              - 'packages/shared/**'
+
+  build-frontend:
+    needs: detect-changes
+    if: contains(needs.detect-changes.outputs.changes, 'frontend')
+    runs-on: ubuntu-latest
+    steps: [ ... ]
+
+  build-backend:
+    needs: detect-changes
+    if: contains(needs.detect-changes.outputs.changes, 'backend')
+    runs-on: ubuntu-latest
+    steps: [ ... ]
+```
+
+### Monorepo 优化策略
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| 路径过滤 | 只构建变更部分 | 减少70%构建 |
+| 共享缓存 | 复用依赖和构建产物 | 加速50% |
+| 并行构建 | 多包并行构建 | 缩短50%时间 |
+| 依赖图 | 分析包依赖关系 | 智能构建顺序 |
+
 ## 本篇补充 Checklist
 
 - [ ] reusable workflow 用 `workflow_call` 传 `inputs`/`secrets`，分层复用。

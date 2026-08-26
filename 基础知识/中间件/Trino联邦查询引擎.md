@@ -1058,7 +1058,599 @@ join-distribution-type=AUTOMATIC
   6. 优化数据倾斜（Salting / 自定义 Partitioner）
 ```
 
-## 二十一、与其他板块的关系
+## 二十一、Trino Connector开发框架深度指南
+
+### 21.1 Connector SPI核心接口体系
+
+```java
+// Trino Connector SPI 接口层次
+Connector SPI 核心接口：
+
+  1. Connector（入口接口）
+     ├── getMetadata() → ConnectorMetadata（元数据管理）
+     ├── getSplitManager() → ConnectorSplitManager（分片管理）
+     ├── getPageSourceProvider() → ConnectorPageSourceProvider（数据读取）
+     ├── getPageSinkProvider() → ConnectorPageSinkProvider（数据写入）
+     └── getHandleResolver() → ConnectorHandleResolver（句柄解析）
+
+  2. ConnectorMetadata（元数据接口）
+     ├── listSchemaNames() → List<String>（Schema列表）
+     ├── listTables() → List<SchemaTableName>（表列表）
+     ├── getTableHandle() → ConnectorTableHandle（表句柄）
+     ├── getTableMetadata() → ConnectorTableMetadata（表元数据）
+     ├── getColumns() → List<ColumnHandle>（列信息）
+     ├── applyFilter() → 谓词下推（核心）
+     ├── applyAggregationgregationPushdown() → 聚合下推
+     └── beginUpdate() → 更新操作支持
+
+  3. ConnectorSplitManager（分片管理）
+     ├── getSplits() → ConnectorSplitSource（获取分片）
+     ├── getPreferredLocations() → 分片数据本地性
+     └── DiscountinuousSplitHandling → 分片处理策略
+
+  4. ConnectorPageSourceProvider（数据读取）
+     ├── createPageSource() → ConnectorPageSource（创建页面源）
+     └── 支持列裁剪/谓词下推/分页读取
+```
+
+### 21.2 自定义Connector开发实战
+
+```java
+// 自定义MySQL Connector开发步骤
+public class MySqlConnector implements Connector {
+    private final MySqlMetadata metadata;
+    private final MySqlSplitManager splitManager;
+    private final MySqlPageSourceProvider pageSourceProvider;
+
+    @Override
+    public ConnectorMetadata getMetadata() {
+        return metadata;
+    }
+
+    @Override
+    public ConnectorSplitManager getSplitManager() {
+        return splitManager;
+    }
+
+    @Override
+    public ConnectorPageSourceProvider getPageSourceProvider() {
+        return pageSourceProvider;
+    }
+}
+
+// 分片器实现
+public class MySqlSplitManager implements ConnectorSplitManager {
+    @Override
+    public ConnectorSplitSource getSplits(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            DynamicFilter dynamicFilter) {
+        // 1. 获取表信息
+        MySqlTableHandle myTable = (MySqlTableHandle) table;
+
+        // 2. 生成分片（按主键范围）
+        List<ConnectorSplit> splits = new ArrayList<>();
+        for (Range range : generateRanges(myTable)) {
+            splits.add(new MySqlSplit(range));
+        }
+
+        // 3. 返回分片源
+        return new FixedSplitSource(splits);
+    }
+
+    private List<Range> generateRanges(MySqlTableHandle table) {
+        // 按主键范围生成分片
+        // 例如：[1,1000], [1001,2000], ...
+        return RangeUtils.generateRanges(
+            table.getPartitionColumn(),
+            table.getRowCount(),
+            DEFAULT_SPLIT_SIZE);
+    }
+}
+
+// 过滤下推实现
+public class MySqlMetadata implements ConnectorMetadata {
+    @Override
+    public Optional<ConnectorApplyFilterResult> applyFilter(
+            ConnectorSession session,
+            ConnectorTableHandle handle,
+            TupleDomain<ColumnHandle> filter) {
+        // 将Trino过滤条件转换为MySQL WHERE子句
+        String whereClause = translateFilter(filter);
+
+        // 返回下推结果
+        return Optional.of(new ConnectorApplyFilterResult(
+            handle.withFilter(whereClause),
+            filter));
+    }
+
+    private String translateFilter(TupleDomain<ColumnHandle> filter) {
+        // 实现谓词转换逻辑
+        // 例如：(age > 25 AND status = 'active')
+        StringBuilder sb = new StringBuilder();
+        filter.getDomains().ifPresent(domains -> {
+            domains.forEach((column, domain) -> {
+                if (!sb.isEmpty()) sb.append(" AND ");
+                sb.append(translateDomain(column, domain));
+            });
+        });
+        return sb.toString();
+    }
+}
+```
+
+### 21.3 Split大小调优
+
+```properties
+# Split大小配置
+# 默认Split大小：64MB（Hive Connector）
+hive.max-split-size=64MB
+
+# Split数量计算公式：
+# Split数量 = 表大小 / Split大小
+# 并行度 = min(Split数量, Worker数 × 每Worker并发数)
+
+# 调优策略：
+# 1. 小表（< 1GB）：使用较大Split（128MB-256MB）
+# 2. 大表（> 100GB）：使用较小Split（32MB-64MB）
+# 3. 高并发场景：减小Split大小（16MB-32MB）
+
+# 配置示例：
+hive.max-split-size=64MB
+hive.minimum-split-size=16MB
+hive.maximum-split-size=256MB
+
+# 动态Split调整：
+# 根据数据源特性动态调整Split大小
+# 例如：MySQL按主键范围，Hive按文件大小
+```
+
+## 二十二、Trino内存管理深度解析
+
+### 22.1 内存管理架构
+
+```text
+Trino 内存管理架构：
+
+  内存池（Memory Pool）：
+    ├── 系统内存池（Reserved Pool）：系统预留，用于大查询
+    ├── 通用内存池（General Pool）：普通查询使用
+    └── 查询级内存池：每个查询独立内存限制
+
+  内存分配流程：
+    1. 查询提交 → 分配查询级内存池
+    2. 查询执行 → 从池中申请内存
+    3. 池满 → 等待其他查询释放内存
+    4. 超过限制 → 查询被终止（OOM）
+
+  内存类型：
+    ├── User Memory：用户数据（Join/聚合/排序）
+    ├── System Memory：系统开销（元数据/网络缓冲）
+    └── Reserved Memory：预留内存（大查询专用）
+
+  内存监控：
+    system.runtime.queries → peak_memory
+    system.runtime.memory_pools → 内存池使用率
+    system.runtime.nodes → 节点内存使用
+```
+
+### 22.2 内存配置详解
+
+```properties
+# 内存配置详解
+query.max-memory=50GB              # 单查询最大内存（集群级）
+query.max-memory-per-node=8GB      # 单节点单查询最大内存
+query.max-total-memory-per-node=10GB  # 单节点总内存
+query.memory-headroom=2GB          # 系统预留内存
+
+# 内存分配公式：
+#   每查询内存 = min(query.max-memory, query.max-memory-per-node × Worker数)
+#   例如：50GB查询，8GB/节点 × 10节点 = 80GB → 实际分配50GB
+
+# 内存溢出（OOM）处理：
+#   1. 查询日志：EXCEEDED_MEMORY_LIMIT
+#   2. 监控：trino_queries 查询内存使用
+#   3. 解决方案：
+#      a. 调小query.max-memory
+#      b. 优化查询（减少Join/聚合数据量）
+#      c. 增加Worker数量（分摊内存压力）
+
+# 内存泄漏检测：
+#   监控内存池使用率持续上升
+#   分析查询内存使用趋势
+#   检查Connector内存泄漏
+```
+
+### 22.3 OOM处理策略
+
+```text
+OOM处理策略：
+
+  预防措施：
+    1. 合理设置query.max-memory
+    2. 监控内存使用趋势
+    3. 限制大查询并发数
+
+  处理流程：
+    1. 查询OOM → 立即终止
+    2. 记录错误日志：EXCEEDED_MEMORY_LIMIT
+    3. 释放查询占用的所有资源
+    4. 通知用户/重试
+
+  调优建议：
+    1. 分析查询执行计划（EXPLAIN）
+    2. 优化Join策略（Broadcast vs Partitioned）
+    3. 减少数据倾斜
+    4. 增加资源队列限制
+
+  监控告警：
+    内存使用率 > 80% → 告警
+    查询失败率 > 5% → 告警
+    内存池使用率持续上升 → 告警
+```
+
+## 二十三、Trino安全机制深度配置
+
+### 23.1 Kerberos认证配置
+
+```properties
+# Kerberos认证配置
+http-server.authentication.type=Kerberos
+http-server.authentication.krb5.config=/etc/krb5.conf
+http-server.authentication.krb5.keytab=/etc/trino.keytab
+http-server.authentication.krb5.principal=trino/_HOST@EXAMPLE.COM
+
+# Kerberos服务账号
+http-server.https.required=true
+http-server.https.port=8443
+http-server.https.keystore.path=/etc/trino/keystore.jks
+http-server.https.keystore.password=changeit
+
+# Kerberos客户端配置
+client.authentication.type=Kerberos
+client.krb5.config=/etc/krb5.conf
+client.keytab=/etc/client.keytab
+client.principal=client/_HOST@EXAMPLE.COM
+
+# Hive Connector Kerberos配置
+hive.metastore.authentication.type=Kerberos
+hive.metastore.service.principal=hive/_HOST@EXAMPLE.COM
+hive.metastore.client.principal=trino/_HOST@EXAMPLE.COM
+hive.metastore.client.keytab=/etc/trino.keytab
+```
+
+### 23.2 LDAP认证配置
+
+```properties
+# LDAP认证配置
+http-server.authentication.type=LDAP
+ldap.url=ldap://ldap.example.com:389
+ldap.ssl.enabled=true
+ldap.ssl.keystore=/etc/trino/keystore.jks
+ldap.ssl.keystore.password=changeit
+
+# LDAP用户查找
+ldap.user-base-dn=dc=example,dc=com
+ldap.user.filter=(&(objectClass=person)(uid=${USER}))
+ldap.user.search-scope=SUBTREE
+
+# LDAP组查找
+ldap.group-base-dn=dc=example,dc=com
+ldap.group.filter=(&(objectClass=group)(member=${USERDN}))
+ldap.group.search-scope=SUBTREE
+
+# LDAP连接池
+ldap.connection-pool.enabled=true
+ldap.connection-pool.max-size=100
+ldap.connection-pool.initial-size=10
+ldap.connection-pool.timeout=60s
+```
+
+### 23.3 RBAC权限模型
+
+```json
+// RBAC权限配置示例
+{
+  "roles": [
+    {
+      "name": "data_analyst",
+      "description": "数据分析师角色",
+      "catalogs": [
+        {
+          "catalog": "hive",
+          "schema": "analytics",
+          "tables": ["users", "orders", "products"],
+          "columns": ["user_id", "order_date", "amount"],
+          "privileges": ["SELECT"]
+        }
+      ]
+    },
+    {
+      "name": "data_engineer",
+      "description": "数据工程师角色",
+      "catalogs": [
+        {
+          "catalog": "hive",
+          "schema": "analytics",
+          "tables": ["*"],
+          "columns": ["*"],
+          "privileges": ["SELECT", "INSERT", "DELETE"]
+        }
+      ]
+    },
+    {
+      "name": "admin",
+      "description": "管理员角色",
+      "catalogs": [
+        {
+          "catalog": "*",
+          "schema": "*",
+          "tables": ["*"],
+          "columns": ["*"],
+          "privileges": ["ALL"]
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "name": "analyst1",
+      "roles": ["data_analyst"]
+    },
+    {
+      "name": "engineer1",
+      "roles": ["data_engineer"]
+    },
+    {
+      "name": "admin1",
+      "roles": ["admin"]
+    }
+  ]
+}
+```
+
+### 23.4 Column-level Masking配置
+
+```json
+// 列级掩码配置
+{
+  "column-masks": {
+    "users.phone": {
+      "type": "partial",
+      "mask": "concat('***', substring(${USER} from 8))",
+      "description": "手机号掩码：只显示后4位"
+    },
+    "users.id_card": {
+      "type": "partial",
+      "mask": "concat('****', substring(${USER} from 15))",
+      "description": "身份证掩码：只显示后4位"
+    },
+    "users.email": {
+      "type": "partial",
+      "mask": "concat(substring(${USER} from 1 for 2), '***@', substring(${USER} from locate('@', ${USER}) + 1))",
+      "description": "邮箱掩码：只显示前2位和域名"
+    }
+  },
+  "row-filters": {
+    "orders": {
+      "type": "dynamic",
+      "filter": "region = currentUserRegion()",
+      "description": "行级过滤：按用户区域过滤"
+    }
+  }
+}
+```
+
+## 二十四、Trino性能调优深度指南
+
+### 24.1 Join Reordering优化
+
+```sql
+-- Join Reordering原理
+-- 优化器根据统计信息选择最优Join顺序
+
+-- 示例：三表Join优化
+SELECT * FROM orders o
+JOIN users u ON o.user_id = u.id
+JOIN products p ON o.product_id = p.id
+WHERE o.order_date > '2024-01-01';
+
+-- 优化器自动选择Join顺序：
+-- 1. orders（过滤后最小）→ users → products
+-- 2. 避免大表Join大表
+
+-- 验证Join顺序：
+EXPLAIN SELECT * FROM orders o
+JOIN users u ON o.user_id = u.id
+JOIN products p ON o.product_id = p.id
+WHERE o.order_date > '2024-01-01';
+
+-- EXPLAIN输出关键信息：
+-- JoinNode → 显示Join顺序和策略
+-- 检查是否使用了最优Join顺序
+
+-- 调优建议：
+-- 1. 收集统计信息：ANALYZE table_name;
+-- 2. 检查EXPLAIN输出中的Join顺序
+-- 3. 手动调整Join顺序（如果优化器选择不佳）
+```
+
+### 24.2 Dynamic Filtering调优
+
+```properties
+# Dynamic Filtering配置
+optimizer.dynamic-filtering=true
+dynamic-filtering-max-domain-combinations=1000
+dynamic-filtering-pushdown-filter-factor=10
+
+# 调优策略：
+# 1. 小表Join大表：开启Dynamic Filtering（默认）
+# 2. 大表Join大表：关闭Dynamic Filtering（避免开销）
+# 3. 高选择性过滤：增大pushdown-filter-factor
+# 4. 低选择性过滤：减小pushdown-filter-factor
+
+# 监控Dynamic Filtering效果：
+# EXPLAIN输出中检查DynamicFilter信息
+# 查询性能提升：通常10-100倍
+
+# 常见问题：
+# 1. 过滤选择性低 → 性能提升不明显
+# 2. 分布式Join → 动态过滤开销大
+# 3. 数据倾斜 → 动态过滤效果差
+```
+
+### 24.3 Split大小调优
+
+```properties
+# Split大小配置
+hive.max-split-size=64MB
+hive.minimum-split-size=16MB
+hive.maximum-split-size=256MB
+
+# Split大小计算公式：
+# Split数量 = 表大小 / Split大小
+# 并行度 = min(Split数量, Worker数 × 每Worker并发数)
+
+# 调优策略：
+# 1. 小表（< 1GB）：使用较大Split（128MB-256MB）
+# 2. 大表（> 100GB）：使用较小Split（32MB-64MB）
+# 3. 高并发场景：减小Split大小（16MB-32MB）
+# 4. IO密集型查询：增大Split大小（减少调度开销）
+
+# 动态Split调整：
+# 根据数据源特性动态调整Split大小
+# 例如：MySQL按主键范围，Hive按文件大小
+
+# 监控Split效率：
+# system.runtime.tasks → Split执行时间
+# system.runtime.stages → Stage并行度
+```
+
+## 二十五、Trino Catalog管理深度指南
+
+### 25.1 多源Catalog配置实例
+
+```properties
+# MySQL Catalog配置
+connector.name=mysql
+connection-url=jdbc:mysql://mysql-host:3306/mydb
+connection-user=trino_user
+connection-password=trino_pass
+mysql.jdbc.url=jdbc:mysql://mysql-host:3306/mydb?useSSL=true
+
+# PostgreSQL Catalog配置
+connector.name=postgresql
+connection-url=jdbc:postgresql://pg-host:5432/mydb
+connection-user=trino_user
+connection-password=trino_pass
+
+# Hive Catalog配置
+connector.name=hive
+hive.metastore.uri=thrift://hive-metastore:9083
+hive.config.resources=/etc/hadoop/core-site.xml,/etc/hadoop/hdfs-site.xml
+hive.allow-drop-table=true
+
+# Iceberg Catalog配置
+connector.name=iceberg
+iceberg.catalog-type=hive_metastore
+iceberg.metastore.uri=thrift://hive-metastore:9083
+
+# Kafka Catalog配置
+connector.name=kafka
+kafka.nodes=kafka1:9092,kafka2:9092,kafka3:9092
+kafka.default-schema=kafka
+
+# Elasticsearch Catalog配置
+connector.name=elasticsearch
+elasticsearch.host=elasticsearch-host
+elasticsearch.port=9200
+elasticsearch.schema=json
+```
+
+### 25.2 跨源联合查询示例
+
+```sql
+-- 跨源联合查询示例
+-- MySQL用户表 + Hive订单表 + Elasticsearch日志表
+
+-- 1. 创建跨源视图
+CREATE VIEW analytics.user_orders AS
+SELECT
+    u.id as user_id,
+    u.name as user_name,
+    o.order_id,
+    o.order_date,
+    o.amount,
+    l.action as last_action
+FROM mysql.mydb.users u
+JOIN hive.analytics.orders o ON u.id = o.user_id
+JOIN elasticsearch.logs.events l ON u.id = l.user_id
+WHERE o.order_date > '2024-01-01';
+
+-- 2. 跨源聚合查询
+SELECT
+    u.region,
+    COUNT(DISTINCT o.user_id) as user_count,
+    SUM(o.amount) as total_amount
+FROM mysql.mydb.users u
+JOIN hive.analytics.orders o ON u.id = o.user_id
+WHERE o.order_date BETWEEN '2024-01-01' AND '2024-12-31'
+GROUP BY u.region
+ORDER BY total_amount DESC;
+
+-- 3. 性能优化建议：
+-- a. 启用谓词下推：WHERE条件推到源端
+-- b. 列裁剪：只读需要的列
+-- c. 分区裁剪：只读匹配分区
+-- d. 广播Join：小表广播到所有Worker
+```
+
+### 25.3 Catalog监控与管理
+
+```sql
+-- Catalog监控查询
+SELECT
+    catalog_name,
+    connector_id,
+    table_count,
+    column_count,
+    estimated_size
+FROM system.metadata.catalog_metadata
+ORDER BY estimated_size DESC;
+
+-- 表统计信息
+SELECT
+    table_catalog,
+    table_schema,
+    table_name,
+    row_count,
+    data_size,
+    column_count
+FROM system.metadata.table_metadata
+WHERE table_catalog = 'hive'
+ORDER BY data_size DESC;
+
+-- 查询性能监控
+SELECT
+    source,
+    table_name,
+    query_count,
+    avg_duration,
+    peak_memory
+FROM system.runtime.table_scan_stats
+ORDER BY query_count DESC;
+
+-- 配置自动统计信息收集：
+-- Hive Connector：
+hive.collect-column-statistics-on-write=true
+hive.analyze-optimize-on-write=true
+
+-- Iceberg Connector：
+iceberg.file-format=PARQUET
+iceberg.delete-file-granularity=PARTITION
+```
+
+## 二十六、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../大数据/05-列式存储与数据湖格式.md)」；
 - 与 Spark/ClickHouse 对比见对应文档；

@@ -1065,7 +1065,462 @@ public class OrderListener {
 
 **迁移路线**：评估清单打分 → 搭建 Artemis 并行环境 → Network of Brokers 桥接灰度流量 → 按应用逐个切连接串 → 观察 2 周 → 下线 5.x。全程保留回退开关（客户端 failover URL 同时指向新旧两套）。
 
-## 二十五、与其他板块的关系
+## 二十五、ActiveMQ Artemis vs Classic架构差异深度解析
+
+### 25.1 架构差异对比
+
+```text
+ActiveMQ Classic（5.x）架构：
+  IO模型：BIO（阻塞IO）
+  存储：KahaDB（B+Tree索引）
+  协议：OpenWire（JMS专用）
+  性能：万级msg/s
+  高可用：主备（共享存储/复制）
+  定位：存量兼容
+
+ActiveMQ Artemis（6.x）架构：
+  IO模型：Netty/NIO（非阻塞IO）
+  存储：Journal（预写日志）
+  协议：OpenWire/AMQP/MQTT/STOMP（多协议）
+  性能：十万级msg/s
+  高可用：主备+多活
+  定位：新项目/升级目标
+```
+
+### 25.2 核心组件差异
+
+| 维度 | Classic (5.x) | Artemis (6.x) |
+|------|----------------|----------------|
+| IO模型 | BIO（阻塞IO） | Netty/NIO（非阻塞IO） |
+| 存储引擎 | KahaDB（B+Tree） | Journal（预写日志） |
+| 协议支持 | OpenWire（JMS专用） | 多协议（OpenWire/AMQP/MQTT/STOMP） |
+| 吞吐上限 | 万级msg/s | 十万级msg/s |
+| 高可用 | 主备（共享存储/复制） | 主备+多活 |
+| 内存管理 | 堆内内存 | 堆外内存+页缓存 |
+| 消息模型 | Queue/Topic/Virtual Topic | Queue/Topic/Address |
+| 管理界面 | Hawtio（JMX） | Web Console（内置） |
+| 部署模式 | 单实例/主备 | 单实例/主备/集群 |
+
+### 25.3 性能差异分析
+
+```text
+性能差异原因：
+
+  IO模型：
+    Classic：BIO → 每个连接一个线程 → 高并发时线程切换开销大
+    Artemis：Netty/NIO → 少量线程处理大量连接 → 高并发性能好
+
+  存储引擎：
+    Classic：KahaDB（B+Tree）→ 随机IO多 → 大队列下性能骤降
+    Artemis：Journal（预写日志）→ 顺序IO → 高吞吐持久化
+
+  内存管理：
+    Classic：堆内内存 → GC压力大
+    Artemis：堆外内存+页缓存 → GC压力小
+
+  协议支持：
+    Classic：OpenWire（JMS专用）→ 协议转换开销大
+    Artemis：多协议原生支持 → 协议转换开销小
+
+  性能提升：
+    写入：10倍+（从万级到十万级）
+    读取：5倍+（从万级到十万级）
+    恢复：秒级（从分钟级）
+```
+
+## 二十六、ActiveMQ网络连接器深度配置
+
+### 26.1 网络连接器类型
+
+```text
+Network Connector（网络连接器）：
+  作用：多Broker互联（跨机房/负载分摊）
+  类型：
+    1. Network Connector（单向）：
+       Broker A → Broker B（A的消息自动路由到B）
+    
+    2. Duplex Connector（双向）：
+       Broker A ↔ Broker B（双向路由）
+    
+    3. Hub-Spoke（中心辐射）：
+       中心Broker连接所有边缘Broker
+    
+    4. Fanout（广播）：
+       一个Broker的消息广播到多个Broker
+
+配置示例（activemq.xml）：
+  <networkConnectors>
+    <networkConnector
+        name="bridge"
+        uri="static:(tcp://broker-b:61616)"
+        duplex="true"
+        decreaseNetworkConsumerPriority="true"
+        networkTTL="2"
+        dynamicOnly="false">
+      <excludedDestinations>
+        <queue physicalName="admin.>" />
+      </excludedDestinations>
+    </networkConnector>
+  </networkConnectors>
+```
+
+### 26.2 网络连接器参数详解
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `networkTTL` | 消息在网络中的最大跳数（防环路） | 2-3（避免消息循环） |
+| `decreaseNetworkConsumerPriority` | 降低远程消费者优先级 | true（优先本地消费） |
+| `dynamicOnly` | 只在有消费者时才路由消息 | false（默认） |
+| `excludedDestinations` | 排除不需要路由的目的地 | 按需配置 |
+| `maximumRedirections` | 最大重定向次数 | 5（防止无限循环） |
+| `suppressDuplicateQueueSubscriptions` | 抑制重复队列订阅 | true（减少网络开销） |
+
+### 26.3 Fanout与MultiCast配置
+
+```text
+Fanout（广播）：
+  作用：一个Broker的消息广播到多个Broker
+  配置：
+    <networkConnectors>
+      <networkConnector name="fanout"
+          uri="masterslave:(tcp://broker-a:61616,tcp://broker-b:61616)"
+          duplex="false"
+          decreaseNetworkConsumerPriority="true">
+        <excludedDestinations>
+          <queue physicalName="admin.>" />
+        </excludedDestinations>
+      </networkConnector>
+    </networkConnectors>
+
+MultiCast（多播）：
+  作用：消息多播到多个消费者
+  配置：
+    <destination>
+      <multicast queue="multicast.queue" />
+    </destination>
+
+Fanout vs MultiCast：
+  Fanout：Broker级别（多Broker互联）
+  MultiCast：消费者级别（多消费者消费同一消息）
+```
+
+## 二十七、ActiveMQ消息投递确认模式深度解析
+
+### 27.1 确认模式详解
+
+```text
+JMS确认模式：
+
+  AUTO_ACKNOWLEDGE（自动确认）：
+    流程：receive()返回/onMessage()返回即确认
+    优点：简单，无需手动确认
+    缺点：消费端崩溃=消息已确认但没处理完=丢消息
+    适用：非关键消息，允许丢失
+
+  CLIENT_ACKNOWLEDGE（客户端确认）：
+    流程：处理成功后手动msg.acknowledge()
+    优点：处理成功才确认，崩溃后可重投
+    缺点：需要手动确认，代码复杂
+    适用：关键消息，不允许丢失（推荐）
+
+  DUPS_OK_ACKNOWLEDGE（延迟批量确认）：
+    流程：延迟批量确认（高吞吐）
+    优点：性能好，减少网络开销
+    缺点：可能重复投递（需幂等）
+    适用：高吞吐场景，消费端幂等
+
+  SESSION_TRANSACTED（事务确认）：
+    流程：Session事务提交时确认
+    优点：消息收发与业务操作同事务
+    缺点：性能差（事务开销）
+    适用：消息收发与数据库操作同事务
+```
+
+### 27.2 确认模式对比
+
+| 确认模式 | 性能 | 可靠性 | 复杂度 | 适用场景 |
+|----------|------|--------|--------|----------|
+| AUTO_ACKNOWLEDGE | 高 | 低（可能丢消息） | 低 | 非关键消息 |
+| CLIENT_ACKNOWLEDGE | 中 | 高（推荐） | 中 | 关键消息 |
+| DUPS_OK_ACKNOWLEDGE | 最高 | 中（可能重复） | 低 | 高吞吐+幂等 |
+| SESSION_TRANSACTED | 低 | 最高（事务） | 高 | 消息+DB同事务 |
+
+### 27.3 生产建议
+
+```text
+生产环境确认模式选择：
+
+  关键业务消息：
+    确认模式：CLIENT_ACKNOWLEDGE
+    消费端：手动确认+幂等处理
+    重试：配置最大重投次数+DLQ
+
+  高吞吐场景：
+    确认模式：DUPS_OK_ACKNOWLEDGE
+    消费端：幂等处理（唯一业务键）
+    重试：配置最大重投次数+DLQ
+
+  消息+DB同事务：
+    确认模式：SESSION_TRANSACTED
+    流程：Session事务提交时确认
+    注意：性能差，慎用
+
+  非关键消息：
+    确认模式：AUTO_ACKNOWLEDGE
+    注意：消费端崩溃可能丢消息
+```
+
+## 二十八、ActiveMQ监控与告警深度配置
+
+### 28.1 Web Console配置
+
+```text
+ActiveMQ Web Console（Hawtio）：
+  功能：
+    队列/主题监控：深度、消费者数、消息速率
+    Broker监控：内存、磁盘、连接数
+    消息查看：查看消息内容、属性
+    运维操作：暂停/恢复队列、删除消息
+
+  配置：
+    访问地址：http://broker-host:8161/admin
+    默认用户：admin/admin
+    安全配置：修改conf/jetty.xml
+
+  监控指标：
+    Queue Depth：队列深度（积压告警）
+    Consumer Count：消费者数量
+    Enqueue/Dequeue：入队/出队速率
+    Memory Usage：内存使用率
+    Store Usage：存储使用率
+```
+
+### 28.2 关键监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| Queue Depth | 队列深度（积压） | > 10000 持续5分钟 |
+| Consumer Count | 消费者数量 | = 0（无消费者） |
+| Enqueue Rate | 入队速率 | 突增/突降50% |
+| Dequeue Rate | 出队速率 | 突增/突降50% |
+| Memory Usage | 内存使用率 | > 80% |
+| Store Usage | 存储使用率 | > 80% |
+| Producer Blocked | 生产者阻塞时间 | > 1秒 |
+| DLQ Messages | 死信队列消息数 | > 0 |
+| Redelivery Count | 重投次数 | 持续增长 |
+
+### 28.3 告警配置
+
+```text
+告警配置示例：
+
+  队列积压告警：
+    条件：Queue Depth > 10000 持续5分钟
+    动作：发送告警邮件/钉钉/微信
+    处理：检查消费端性能/增加消费者
+
+  无消费者告警：
+    条件：Consumer Count = 0
+    动作：立即告警
+    处理：检查消费端是否崩溃
+
+  内存使用率告警：
+    条件：Memory Usage > 80%
+    动作：发送告警邮件
+    处理：检查消息大小/增加内存/优化消费
+
+  DLQ告警：
+    条件：DLQ Messages > 0
+    动作：发送告警邮件
+    处理：检查消费逻辑/人工处理DLQ消息
+
+  生产者阻塞告警：
+    条件：Producer Blocked > 1秒
+    动作：发送告警邮件
+    处理：检查消费端性能/调整流控参数
+```
+
+## 二十九、ActiveMQ与Spring JMS集成最佳实践
+
+### 29.1 JmsTemplate最佳实践
+
+```java
+// JmsTemplate配置最佳实践
+@Configuration
+@EnableJms
+public class ActiveMQConfig {
+
+    @Bean
+    public ActiveMQConnectionFactory connectionFactory() {
+        ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory();
+        factory.setBrokerURL("tcp://localhost:61616");
+        factory.setUser("admin");
+        factory.setPassword("admin");
+        
+        // 连接池配置
+        factory.setUseCompression(true);
+        factory.setDispatchAsync(true);
+        
+        // 重连配置
+        factory.setReconnectOnException(true);
+        factory.setInitialReconnectDelay(1000);
+        factory.setReconnectDelay(1000);
+        factory.setMaxReconnectAttempts(-1);
+        
+        return factory;
+    }
+
+    @Bean
+    public CachingConnectionFactory cachingConnectionFactory() {
+        CachingConnectionFactory factory = new CachingConnectionFactory();
+        factory.setTargetConnectionFactory(connectionFactory());
+        factory.setSessionCacheSize(10);
+        factory.setCacheConsumers(true);
+        factory.setCacheProducers(true);
+        return factory;
+    }
+
+    @Bean
+    public JmsTemplate jmsTemplate() {
+        JmsTemplate template = new JmsTemplate();
+        template.setConnectionFactory(cachingConnectionFactory());
+        template.setDeliveryPersistent(true);
+        template.setSessionTransacted(true);
+        template.setPriority(4);
+        template.setTimeToLive(3600000); // 1小时
+        return template;
+    }
+}
+
+// 发送消息最佳实践
+@Service
+public class OrderSender {
+    private final JmsTemplate jmsTemplate;
+    
+    public void send(OrderEvent event) {
+        jmsTemplate.convertAndSend("orders", event, message -> {
+            // 设置消息属性
+            message.setStringProperty("JMSXGroupID", event.getOrderId());
+            message.setStringProperty("orderType", event.getType());
+            message.setIntProperty("priority", event.getPriority());
+            message.setLongProperty("timestamp", System.currentTimeMillis());
+            return message;
+        });
+    }
+}
+```
+
+### 29.2 MessageListenerContainer最佳实践
+
+```java
+// MessageListenerContainer配置最佳实践
+@Configuration
+@EnableJms
+public class ListenerConfig {
+
+    @Bean
+    public DefaultJmsListenerContainerFactory queueListenerFactory() {
+        DefaultJmsListenerContainerFactory factory = new DefaultJmsListenerContainerFactory();
+        factory.setConnectionFactory(cachingConnectionFactory());
+        factory.setSessionAcknowledgeMode(Session.CLIENT_ACKNOWLEDGE);
+        factory.setSessionTransacted(false);
+        factory.setConcurrency("2-8");
+        factory.setRecoveryInterval(5000);
+        factory.setErrorHandler(new DefaultErrorHandler());
+        
+        // 消息选择器
+        factory.setMessageSelector("orderType = 'normal'");
+        
+        return factory;
+    }
+
+    @Bean
+    public DefaultJmsListenerContainerFactory topicListenerFactory() {
+        DefaultJmsListenerContainerFactory factory = new DefaultJmsListenerContainerFactory();
+        factory.setConnectionFactory(cachingConnectionFactory());
+        factory.setPubSubDomain(true);
+        factory.setSubscriptionShared(true);
+        factory.setSubscriptionDurable(true);
+        factory.setConcurrency("1-4");
+        return factory;
+    }
+}
+
+// 消费者最佳实践
+@Component
+public class OrderListener {
+    
+    @JmsListener(destination = "orders", containerFactory = "queueListenerFactory")
+    public void onMessage(Message message, Session session) throws JMSException {
+        try {
+            // 1. 消息验证
+            if (message == null) {
+                return;
+            }
+            
+            // 2. 幂等检查
+            String messageId = message.getJMSMessageID();
+            if (isDuplicate(messageId)) {
+                log.warn("重复消息: {}", messageId);
+                message.acknowledge();
+                return;
+            }
+            
+            // 3. 业务处理
+            OrderEvent event = extractEvent(message);
+            processOrder(event);
+            
+            // 4. 手动确认
+            message.acknowledge();
+            
+        } catch (Exception e) {
+            log.error("消费失败", e);
+            session.recover(); // 触发重投
+        }
+    }
+    
+    private boolean isDuplicate(String messageId) {
+        // 实现幂等检查（Redis/数据库唯一键）
+        return false;
+    }
+}
+```
+
+### 29.3 性能优化配置
+
+```text
+性能优化配置：
+
+  连接池配置：
+    sessionCacheSize=10（缓存Session数量）
+    cacheConsumers=true（缓存消费者）
+    cacheProducers=true（缓存生产者）
+    异步发送：setDispatchAsync(true)
+
+  消费者并发：
+    concurrency="2-8"（弹性并发）
+    minConcurrency=2（最小并发）
+    maxConcurrency=8（最大并发）
+    receiveTimeout=1000（接收超时）
+
+  消息预取：
+    consumerWindowSize=1MB（预取窗口大小）
+    prefetchSize=1000（预取消息数量）
+    setOptimizeAcknowledge(true)（优化确认）
+
+  序列化优化：
+    使用JSON替代Java序列化
+    消息压缩：setUseCompression(true)
+    批量发送：setDeliveryMode(DeliveryMode.PERSISTENT)
+
+  监控指标：
+    消费速率：messages/sec
+    处理延迟：ms/message
+    积压深度：queue depth
+    错误率：failed messages/sec
+```
+
+## 三十、与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；
 - AMQP 协议生态见「[RabbitMQ](./RabbitMQ.md)」；

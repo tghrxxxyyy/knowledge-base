@@ -1080,4 +1080,410 @@ public class DeadLetterConsumer {
         // 记录日志/告警/人工处理
     }
 }
+
+## 十三、RabbitMQ流队列深度解析
+
+### 13.1 Stream Queue架构
+
+```text
+Stream Queue架构：
+
+  核心思想：
+    日志型消息存储（类似Kafka）
+    追加写入（Append-only）
+    顺序读取（Sequential Read）
+    消费者组（Consumer Group）
+
+  架构特点：
+    消息存储：日志文件（Segment）
+    消费模式：拉取模式（Pull）
+    消费位点：消费位点由消费者维护
+    顺序保证：分区内有序
+
+  与经典队列对比：
+    经典队列：推模式，消息删除，位点由Broker维护
+    流队列：拉模式，消息保留，位点由消费者维护
+
+  适用场景：
+    事件溯源：消息需要重放
+    流处理：实时数据处理
+    日志聚合：日志收集分析
+    审计追踪：消息需要保留
+```
+
+### 13.2 Stream Queue配置
+
+```java
+// Stream Queue配置
+@Configuration
+public class StreamQueueConfig {
+    
+    @Bean
+    public Queue streamQueue() {
+        Map<String, Object> args = new HashMap<>();
+        args.put("x-queue-type", "stream");
+        args.put("x-max-length", 1000000);  // 最大消息数
+        args.put("x-max-length-bytes", 1073741824);  // 1GB最大大小
+        args.put("x-stream-max-segment-size-bytes", 67108864);  // 64MB段大小
+        
+        return new Queue("stream.queue", true, false, false, args);
+    }
+    
+    @Bean
+    public SimpleMessageListenerContainer streamListenerContainer(ConnectionFactory factory) {
+        SimpleMessageListenerContainer container = new SimpleMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        container.setQueueNames("stream.queue");
+        container.setMessageListener((message) -> {
+            // 处理消息
+            System.out.println("收到消息: " + new String(message.getBody()));
+        });
+        
+        // Stream消费者配置
+        container.setPrefetchCount(100);
+        container.setConcurrentConsumers(4);
+        
+        return container;
+    }
+}
+```
+
+### 13.3 Stream Queue顺序消费
+
+```text
+Stream Queue顺序消费模式：
+
+  顺序消费原理：
+    消息在Stream中有序存储
+    消费者按顺序读取
+    消费位点由消费者维护
+
+  顺序消费配置：
+    prefetchCount：预取消息数量
+    concurrentConsumers：并发消费者数
+    消费位点：由消费者本地维护
+
+  顺序消费最佳实践：
+    单消费者：保证顺序
+    分区键：相同分区键路由到相同消费者
+    消费位点：定期提交位点
+
+  适用场景：
+    订单状态机：订单操作需要顺序处理
+    事件溯源：事件需要按顺序重放
+    日志处理：日志需要按时间顺序处理
+
+  注意事项：
+    消费者故障：需要重新消费
+    消费位点丢失：需要从头消费
+    消息保留：消息不会自动删除
+```
+
+## 十四、RabbitMQ死信队列与重试策略
+
+### 14.1 死信队列配置
+
+```java
+// 死信队列配置
+@Configuration
+public class DeadLetterConfig {
+    
+    @Bean
+    public Queue deadLetterQueue() {
+        return new Queue("dead.letter.queue", true);
+    }
+    
+    @Bean
+    public DirectExchange deadLetterExchange() {
+        return new DirectExchange("dead.letter.exchange");
+    }
+    
+    @Bean
+    public Binding deadLetterBinding(Queue deadLetterQueue, DirectExchange deadLetterExchange) {
+        return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange).with("dead.letter");
+    }
+    
+    @Bean
+    public Queue orderQueue() {
+        Map<String, Object> args = new HashMap<>();
+        args.put("x-dead-letter-exchange", "dead.letter.exchange");
+        args.put("x-dead-letter-routing-key", "dead.letter");
+        args.put("x-message-ttl", 60000);  // 60秒TTL
+        
+        return new Queue("order.queue", true, false, false, args);
+    }
+}
+```
+
+### 14.2 重试策略配置
+
+```java
+// 重试策略配置
+@Component
+public class RetryStrategy {
+    
+    @Retryable(
+        value = {RuntimeException.class},
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2)
+    )
+    public void processWithRetry(String message) {
+        // 业务处理逻辑
+        try {
+            doProcess(message);
+        } catch (Exception e) {
+            log.error("处理失败，准备重试: {}", message, e);
+            throw e;
+        }
+    }
+    
+    @Recover
+    public void recover(RuntimeException e, String message) {
+        // 重试失败后的恢复逻辑
+        log.error("重试失败，发送到死信队列: {}", message, e);
+        // 发送到死信队列
+        rabbitTemplate.convertAndSend("dead.letter.exchange", "dead.letter", message);
+    }
+}
+```
+
+### 14.3 重试策略对比
+
+| 策略 | 配置 | 适用场景 | 优缺点 |
+|------|------|----------|--------|
+| 固定间隔重试 | delay=1000 | 简单重试 | 简单但可能不够灵活 |
+| 指数退避重试 | delay=1000, multiplier=2 | 网络抖动 | 灵活但可能过度重试 |
+| 最大重试次数 | maxAttempts=3 | 避免无限重试 | 安全但可能不够灵活 |
+
+## 十五、Quorum队列与镜像队列对比
+
+### 15.1 Quorum队列原理
+
+```text
+Quorum队列原理：
+
+  核心思想：
+    基于Raft协议实现
+    多数派确认保证数据安全
+    自动故障转移
+
+  工作原理：
+    1. 生产者发送消息到Leader
+    2. Leader复制消息到Follower
+    3. 多数派确认后返回成功
+    4. Leader故障，Follower选举新Leader
+
+  优势：
+    数据安全：多数派确认
+    自动故障转移：无需人工干预
+    性能优化：批量确认
+
+  配置：
+    x-queue-type: quorum
+    x-quorum-initial-group-size: 3
+```
+
+### 15.2 镜像队列原理
+
+```text
+镜像队列原理：
+
+  核心思想：
+    主从复制
+    所有节点都存储消息
+    手动故障转移
+
+  工作原理：
+    1. Master节点存储消息
+    2. Slave节点复制消息
+    3. Master故障，手动切换
+    4. 数据可能丢失（异步复制）
+
+  优势：
+    简单易用
+    手动控制
+
+  劣势：
+    数据可能丢失
+    手动故障转移
+    性能一般
+
+  配置：
+    x-ha-mode: all
+    x-ha-sync-mode: automatic
+```
+
+### 15.3 Quorum vs Mirror对比
+
+| 维度 | Quorum队列 | 镜像队列 |
+|------|------------|----------|
+| 协议 | Raft协议 | 主从复制 |
+| 数据安全 | 多数派确认 | 异步复制 |
+| 故障转移 | 自动 | 手动 |
+| 性能 | 高 | 中 |
+| 配置复杂度 | 中 | 低 |
+| 适用场景 | 生产环境 | 测试环境 |
+
+## 十六、RabbitMQ延迟消息
+
+### 16.1 延迟消息插件配置
+
+```bash
+# 安装延迟消息插件
+# 步骤1：下载插件
+# rabbitmq_delayed_message_exchange-3.9.0.ez
+
+# 步骤2：安装插件
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+
+# 步骤3：重启RabbitMQ
+rabbitmqctl stop_app
+rabbitmqctl start_app
+```
+
+### 16.2 延迟消息配置
+
+```java
+// 延迟消息配置
+@Configuration
+public class DelayedMessageConfig {
+    
+    @Bean
+    public Queue delayedQueue() {
+        return new Queue("delayed.queue", true);
+    }
+    
+    @Bean
+    public DirectExchange delayedExchange() {
+        Map<String, Object> args = new HashMap<>();
+        args.put("x-delayed-type", "direct");
+        args.put("x-delayed-message", true);  // 启用延迟消息
+        
+        return new DirectExchange("delayed.exchange", true, false, args);
+    }
+    
+    @Bean
+    public Binding delayedBinding(Queue delayedQueue, DirectExchange delayedExchange) {
+        return BindingBuilder.bind(delayedQueue).to(delayedExchange).with("delayed.key");
+    }
+}
+
+// 发送延迟消息
+@Component
+public class DelayedMessageProducer {
+    
+    public void sendDelayedMessage(String message, int delayMs) {
+        rabbitTemplate.convertAndSend("delayed.exchange", "delayed.key", message, msg -> {
+            msg.getMessageProperties().setDelay(delayMs);  // 设置延迟时间
+            return msg;
+        });
+    }
+}
+```
+
+### 16.3 延迟消息使用场景
+
+```text
+延迟消息使用场景：
+
+  订单超时处理：
+    订单创建后30分钟未支付，自动取消
+    发送延迟消息，30分钟后检查支付状态
+
+  定时任务调度：
+    延迟执行任务
+    例如：5分钟后发送提醒邮件
+
+  重试机制：
+    失败后延迟重试
+    例如：1秒后重试，2秒后重试，4秒后重试
+
+  限流控制：
+    限制请求频率
+    例如：每秒最多处理100个请求
+
+  注意事项：
+    延迟精度：毫秒级
+    消息保留：延迟期间消息保留
+    性能影响：大量延迟消息影响性能
+```
+
+## 十七、RabbitMQ监控
+
+### 17.1 Prometheus插件配置
+
+```bash
+# Prometheus插件配置
+# 步骤1：启用插件
+rabbitmq-plugins enable prometheus
+
+# 步骤2：配置Prometheus
+# prometheus.yml
+scrape_configs:
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['rabbitmq:15692']
+    metrics_path: '/metrics'
+
+# 步骤3：配置Grafana
+# 导入RabbitMQ Dashboard
+# Dashboard ID: 10990
+```
+
+### 17.2 关键监控指标
+
+```text
+关键监控指标：
+
+  队列深度：
+    rabbitmq_queue_messages：队列消息数
+    rabbitmq_queue_messages_ready：待消费消息数
+    rabbitmq_queue_messages_unacked：未确认消息数
+
+  消费速率：
+    rabbitmq_queue_messages_published_total：发布消息总数
+    rabbitmq_queue_messages_delivered_total：投递消息总数
+    rabbitmq_queue_messages_acknowledged_total：确认消息总数
+
+  连接数：
+    rabbitmq_connections：连接数
+    rabbitmq_channels：通道数
+
+  资源使用：
+    rabbitmq_process_resident_memory_bytes：内存使用
+    rabbitmq_process_disk_space_available_bytes：磁盘空间
+
+  告警规则：
+    队列深度 > 10000：告警
+    消费速率 < 生产速率：告警
+    连接数 > 1000：告警
+    内存使用 > 80%：告警
+```
+
+### 17.3 监控最佳实践
+
+```text
+监控最佳实践：
+
+  监控频率：
+    实时监控：每秒采集
+    历史监控：每分钟采集
+    趋势监控：每小时采集
+
+  告警配置：
+    队列积压告警：深度 > 10000持续5分钟
+    消费速率告警：速率 < 生产速率持续10分钟
+    连接数告警：连接数 > 1000持续5分钟
+    资源告警：内存/磁盘 > 80%持续5分钟
+
+  监控面板：
+    实时状态：队列深度、消费速率、连接数
+    历史趋势：队列深度趋势、消费速率趋势
+    资源使用：内存使用、磁盘空间、CPU使用
+
+  日志记录：
+    访问日志：记录所有访问
+    错误日志：记录所有错误
+    审计日志：记录所有操作
+```
 ```

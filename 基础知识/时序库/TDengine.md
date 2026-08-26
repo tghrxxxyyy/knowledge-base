@@ -1091,3 +1091,371 @@ INTERVAL(1h);
 **查询超时 SOP**
 - [ ] 是否缺 tag 过滤导致全子表扫；是否跨超大时间范围。
 - [ ] 检查 mnode 选主、dnode 副本同步。
+
+## TDengine超级表与子表设计
+
+### 超级表（STABLE）设计
+
+```sql
+-- 超级表设计示例
+CREATE STABLE devices (
+  ts TIMESTAMP,
+  current FLOAT,
+  voltage FLOAT,
+  temperature FLOAT
+) TAGS (
+  device_id NCHAR(64),
+  location NCHAR(64),
+  model NCHAR(32),
+  firmware_version NCHAR(16)
+);
+
+-- 子表创建（每个设备一张子表）
+CREATE TABLE device_001 USING devices TAGS ('device_001', '北京', 'v2.0', '1.0.0');
+CREATE TABLE device_002 USING devices TAGS ('device_002', '上海', 'v2.0', '1.0.0');
+CREATE TABLE device_003 USING devices TAGS ('device_003', '广州', 'v2.1', '1.0.1');
+
+-- 数据写入
+INSERT INTO device_001 VALUES (NOW, 12.5, 220.1, 25.3);
+INSERT INTO device_002 VALUES (NOW, 13.2, 219.8, 24.8);
+INSERT INTO device_003 VALUES (NOW, 11.8, 220.5, 26.1);
+
+-- 超级表查询（自动聚合所有子表）
+SELECT AVG(current), AVG(voltage), AVG(temperature)
+FROM devices
+WHERE ts > NOW - 1h
+GROUP BY location;
+```
+
+### 子表设计最佳实践
+
+```text
+子表设计最佳实践：
+
+  设备ID设计：
+    使用有意义的设备ID：device_001
+    避免使用数字ID：1, 2, 3
+    保持ID唯一性
+
+  Tag设计：
+    device_id：设备唯一标识
+    location：设备位置
+    model：设备型号
+    firmware_version：固件版本
+
+  Tag数量：
+    建议：< 10个Tag
+    避免：过多Tag影响性能
+    优化：合并相似Tag
+
+  数据写入：
+    批量写入：减少网络往返
+    异步写入：提高写入性能
+    缓冲写入：减少磁盘IO
+```
+
+## TDengine流计算配置
+
+### 流计算配置
+
+```sql
+-- 流计算配置
+-- 创建流计算
+CREATE STREAM device_avg_stream
+TRIGGER WINDOW_CLOSE
+AS
+SELECT _wstart AS ts, device_id, AVG(current) AS avg_current, AVG(voltage) AS avg_voltage
+FROM devices
+PARTITION BY device_id
+INTERVAL(5m);
+
+-- 查看流计算状态
+SHOW STREAMS;
+
+-- 删除流计算
+DROP STREAM device_avg_stream;
+
+-- 流计算结果查询
+SELECT * FROM device_avg_stream
+WHERE ts > NOW - 1h;
+```
+
+### 流计算场景
+
+```text
+流计算场景：
+
+  实时聚合：
+    5分钟平均值
+    10分钟最大值
+    1小时最小值
+
+  异常检测：
+    电流超过阈值
+    电压异常波动
+    温度超标告警
+
+  数据转换：
+    单位转换
+    格式转换
+    数据清洗
+
+  窗口计算：
+    滑动窗口
+    滚动窗口
+    会话窗口
+```
+
+### 流计算最佳实践
+
+```text
+流计算最佳实践：
+
+  触发策略：
+    WINDOW_CLOSE：窗口关闭时触发
+    IMMEDIATE：立即触发
+    定时触发：按固定时间触发
+
+  窗口大小：
+    实时场景：1-5分钟
+    准实时：5-30分钟
+    离线场景：1小时-1天
+
+  性能优化：
+    减少窗口大小：提高实时性
+    合并计算：减少计算次数
+    缓存结果：避免重复计算
+
+  监控告警：
+    流计算延迟监控
+    计算错误监控
+    资源使用监控
+```
+
+## TDengine数据订阅机制
+
+### 数据订阅配置
+
+```sql
+-- 数据订阅配置
+-- 创建订阅
+CREATE SUBSCRIPTION device_data_sub
+TOPICS device_001, device_002, device_003
+CONF 'precision=q;buffer=1000'
+
+-- 消费订阅
+CONSUME device_data_sub
+
+-- 查看订阅状态
+SHOW SUBSCRIPTIONS;
+
+-- 删除订阅
+DROP SUBSCRIPTION device_data_sub;
+```
+
+### 数据订阅场景
+
+```text
+数据订阅场景：
+
+  实时同步：
+    数据同步到其他系统
+    数据备份到其他存储
+    数据分发到多个消费者
+
+  事件驱动：
+    数据变更触发事件
+    异常数据触发告警
+    定时任务触发执行
+
+  数据管道：
+    数据采集 → TDengine → 下游系统
+    数据清洗 → TDengine → 数据仓库
+    数据聚合 → TDengine → 报表系统
+
+  微服务通信：
+    服务间数据同步
+    事件驱动架构
+    最终一致性保证
+```
+
+### 数据订阅最佳实践
+
+```text
+数据订阅最佳实践：
+
+  订阅设计：
+    按设备订阅：每个设备独立订阅
+    按类型订阅：按设备类型订阅
+    按时间订阅：按时间范围订阅
+
+  消费策略：
+    批量消费：批量处理数据
+    异步消费：异步处理数据
+    并行消费：并行处理数据
+
+  错误处理：
+    重试机制：失败重试3次
+    死信队列：失败消息存储
+    告警通知：失败告警
+
+  监控指标：
+    消费延迟监控
+    消费错误监控
+    消费速率监控
+```
+
+## TDengine Grafana集成配置
+
+### Grafana集成配置
+
+```bash
+# Grafana集成配置
+# 安装TDengine数据源插件
+grafana-cli plugins install tdengine-datasource
+
+# 配置TDengine数据源
+# Grafana UI → Configuration → Data Sources → Add data source
+# 选择TDengine
+# 配置连接信息：
+#   Host: http://localhost:6041
+#   User: root
+#   Password: taosdata
+#   Database: test
+
+# 配置Dashboard
+# 创建Dashboard
+# 添加Panel
+# 选择TDengine数据源
+# 编写SQL查询
+```
+
+### Grafana可视化配置
+
+```sql
+-- Grafana SQL查询示例
+-- 实时曲线
+SELECT ts, current, voltage, temperature
+FROM devices
+WHERE ts > NOW - 1h
+ORDER BY ts;
+
+-- 聚合统计
+SELECT _wstart AS ts, AVG(current) AS avg_current
+FROM devices
+WHERE ts > NOW - 24h
+INTERVAL(1h);
+
+-- 设备状态
+SELECT device_id, location, model,
+       MAX(current) AS max_current,
+       MIN(voltage) AS min_voltage,
+       AVG(temperature) AS avg_temperature
+FROM devices
+WHERE ts > NOW - 1h
+GROUP BY device_id;
+```
+
+### Grafana最佳实践
+
+```text
+Grafana最佳实践：
+
+  Dashboard设计：
+    实时监控：1秒刷新
+    历史分析：1分钟刷新
+    报表展示：手动刷新
+
+  Panel配置：
+    曲线图：实时数据趋势
+    仪表盘：当前状态值
+    表格：详细数据列表
+
+  告警配置：
+    阈值告警：超过阈值告警
+    趋势告警：趋势异常告警
+    异常检测：智能异常告警
+
+  性能优化：
+    减少查询范围
+    优化SQL查询
+    使用缓存
+```
+
+## TDengine集群部署架构
+
+### 集群架构
+
+```text
+TDengine集群架构：
+
+  组件说明：
+    dnode：数据节点，存储数据
+    mnode：管理节点，管理集群
+    vnode：虚拟节点，数据分片
+    qnode：查询节点，处理查询
+
+  部署模式：
+    单节点：开发测试环境
+    多节点：生产环境
+    分布式：大规模部署
+
+  数据分片：
+     vnode：数据自动分片
+    副本：数据多副本
+    负载均衡：自动负载均衡
+
+  高可用：
+    故障检测：自动检测故障
+    故障转移：自动故障转移
+    数据恢复：自动数据恢复
+```
+
+### 集群部署配置
+
+```bash
+# 集群部署配置
+# 第一个节点
+taosd -c /etc/taos/taos.cfg
+
+# 第二个节点（加入集群）
+taosd -c /etc/taos/taos.cfg -E
+
+# 第三个节点（加入集群）
+taosd -c /etc/taos/taos.cfg -E
+
+# 查看集群状态
+taos -s "SHOW DNODES;"
+
+# 添加节点
+taos -s "CREATE DNODE 'node2:6030';"
+
+# 查看数据库副本
+taos -s "SHOW DATABASES;"
+```
+
+### 集群最佳实践
+
+```text
+集群最佳实践：
+
+  节点规划：
+    生产环境：至少3个节点
+    数据节点：根据数据量规划
+    管理节点：至少2个节点
+
+  副本策略：
+    1副本：开发测试环境
+    2副本：一般生产环境
+    3副本：关键业务环境
+
+  监控告警：
+    节点状态监控
+    数据同步监控
+    性能指标监控
+
+  运维管理：
+    定期备份
+    版本升级
+    性能调优
+```

@@ -1041,6 +1041,136 @@ DIH（Data Import Handler）工作流：
 
 ---
 
+## 查询优化技巧
+
+```xml
+<!-- Solr 查询参数优化 -->
+<requestHandler name="/select" class="solr.SearchHandler">
+  <lst name="defaults">
+    <str name="echoParams">explicit</str>
+    <str name="wt">json</str>
+    <int name="rows">10</int>
+    <str name="df">text</str>
+    <str name="defType">edismax</str>
+    <str name="mm">75%</str>
+    <str name="bf">recip(ms(NOW,timestamp),3.16e-11,1,1)^1.5</str>
+  </lst>
+</requestHandler>
+```
+
+### 查询优化策略
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| filterQuery | 缓存过滤 | 提升性能 |
+| bf函数 | 时效性加权 | 结果更相关 |
+| mm参数 | 最小匹配 | 平衡精度和召回 |
+| fl参数 | 字段裁剪 | 减少网络传输 |
+
+## 索引设计最佳实践
+
+```xml
+<!-- schema.xml 字段配置 -->
+<field name="id" type="string" indexed="true" stored="true" required="true"/>
+<field name="title" type="text_general" indexed="true" stored="true" termVectors="true"/>
+<field name="content" type="text_general" indexed="true" stored="true" termVectors="true"/>
+<field name="timestamp" type="pdate" indexed="true" stored="true" default="NOW" />
+
+<!-- 动态字段 -->
+<dynamicField name="*_i" type="int" indexed="true" stored="true"/>
+<dynamicField name="*_s" type="string" indexed="true" stored="true"/>
+<dynamicField name="*_t" type="text_general" indexed="true" stored="true"/>
+```
+
+### 索引设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 字段类型 | 选择合适类型 | 日期用pdate |
+| 索引 vs 存储 | 按需索引 | 不搜索字段不索引 |
+| 动态字段 | 灵活扩展 | *_s, *_i |
+| 复制字段 | 多用途 | title -> title_en |
+
+## 分布式架构
+
+```mermaid
+flowchart TB
+    subgraph SolrCloud
+        LEADER[Leader] --> REPLICA1[Replica1]
+        LEADER --> REPLICA2[Replica2]
+        LEADER --> REPLICA3[Replica3]
+    end
+    subgraph 分片
+        SHARD1[Shard1] --> LEADER1[Leader]
+        SHARD2[Shard2] --> LEADER2[Leader]
+    end
+    subgraph 路由
+        CLIENT[客户端] --> ROUTER[路由]
+        ROUTER --> SHARD1
+        ROUTER --> SHARD2
+    end
+```
+
+### 分布式配置
+
+```bash
+# 创建Collection
+bin/solr create -c my_collection -shards 2 -replicationFactor 3
+
+# 添加分片
+bin/solr add_shard -c my_collection -shard shard3
+
+# 查看Collection状态
+bin/solr status -c my_collection
+```
+
+## 缓存策略
+
+```xml
+<!-- solrconfig.xml 缓存配置 -->
+<query>
+  <filterCache class="solr.FastLRUCache" size="512" initialSize="512" autowarmCount="0"/>
+  <queryResultCache class="solr.LRUCache" size="512" initialSize="512" autowarmCount="0"/>
+  <documentCache class="solr.LRUCache" size="512" initialSize="512" autowarmCount="0"/>
+</query>
+```
+
+### 缓存类型
+
+| 缓存类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| FilterCache | 过滤器缓存 | 高频过滤 |
+| QueryResultCache | 查询结果缓存 | 相同查询 |
+| DocumentCache | 文档缓存 | 高频访问 |
+| UserRoleCache | 用户权限缓存 | 权限过滤 |
+
+## 运维监控
+
+```bash
+# 查看核心状态
+bin/solr status
+
+# 查看Collection状态
+bin/solr api -get http://localhost:8983/solr/admin/collections?action=STATUS
+
+# 查看分片状态
+bin/solr api -get http://localhost:8983/solr/admin/cores?action=STATUS
+
+# 查看缓存命中率
+bin/solr api -get http://localhost:8983/solr/admin/cores?action=STATUS&core=my_collection
+```
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| Query P99 | 查询延迟 | > 500ms |
+| 缓存命中率 | 缓存效果 | < 80% |
+| 索引大小 | 索引膨胀 | > 100GB |
+| JVM内存 | 堆内存使用 | > 80% |
+
+---
+
 ## 十三、速查表（扩展）
 
 | 项 | 结论 |

@@ -990,7 +990,175 @@ OLAP 引擎选型维度：
     - SLA 监控
 ```
 
-## 二十四、与其他板块的关系
+## 二十四、ClickHouse 物化视图与实时聚合
+
+```sql
+-- ClickHouse 物化视图实时聚合示例
+CREATE MATERIALIZED VIEW mv_order_daily
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(order_date)
+ORDER BY (product_id, order_date)
+AS SELECT
+    product_id,
+    toDate(create_time) AS order_date,
+    count() AS order_cnt,
+    sum(amount) AS total_amount
+FROM orders
+GROUP BY product_id, order_date;
+
+-- 查询时自动合并
+SELECT product_id, order_date, sum(order_cnt), sum(total_amount)
+FROM mv_order_daily
+GROUP BY product_id, order_date;
+```
+
+### StarRocks 物化视图对比
+
+| 特性 | ClickHouse | StarRocks |
+|------|-----------|-----------|
+| 物化视图引擎 | SummingMergeTree/AggregatingMergeTree | 联合模型（Aggregate/Unique/Primary） |
+| 自动刷新 | 写入时触发（同步） | 手动/定时刷新 |
+| 查询透明 | 需手动查物化视图表 | 查询改写自动路由到物化视图 |
+| 多表关联 | 不支持 | 支持（Rollup） |
+| 增量更新 | 原生支持 | 支持（但配置复杂） |
+
+### ClickHouse 物化视图设计模式
+
+```mermaid
+flowchart LR
+    RAW[原始表 orders] -->|INSERT触发| MV1[mv_order_daily]
+    RAW -->|INSERT触发| MV2[mv_user_stats]
+    MV1 -->|查询| APP1[报表服务]
+    MV2 -->|查询| APP2[用户画像]
+    RAW -->|查询| APP3[明细查询]
+```
+
+## 二十五、Doris Lakehouse 架构实战
+
+```sql
+-- Doris Lakehouse: Iceberg 外表查询
+CREATE EXTERNAL TABLE iceberg_orders
+PROPERTIES (
+    "path" = "s3://data-lake/orders/",
+    "catalog" = "hive_metastore",
+    "format" = "parquet"
+);
+
+-- 统一 Catalog 查询
+SELECT o.product_id, SUM(o.amount) as total
+FROM iceberg_orders o
+JOIN doris_products p ON o.product_id = p.id
+GROUP BY o.product_id;
+```
+
+### Doris Lakehouse 优势
+
+| 能力 | 传统数仓 | Doris Lakehouse |
+|------|---------|----------------|
+| 存储 | 本地磁盘 | S3/OSS（存算分离） |
+| 数据格式 | 私有格式 | Iceberg/Paimon 开放格式 |
+| 多引擎 | 单引擎 | Spark/Flink/Presto 共读 |
+| 成本 | 高（本地盘贵） | 低（对象存储便宜） |
+| 时效性 | T+1 | 分钟级（CDC+流写） |
+
+## 二十六、OLAP 选型决策树
+
+```mermaid
+flowchart TD
+    START[选择 OLAP 引擎] --> Q1{数据量?}
+    Q1 -->|小于 1TB| Q2{实时性要求?}
+    Q1 -->|1TB-100TB| Q3{并发?}
+    Q1 -->|大于 100TB| DORIS
+
+    Q2 -->|秒级响应| CLICKHOUSE
+    Q2 -->|分钟级| TRINO
+    Q2 -->|离线批| SPARK
+
+    Q3 -->|高并发| DORIS
+    Q3 -->|低并发| CLICKHOUSE
+    Q3 -->|交互式| TRINO
+
+    CLICKHOUSE[ClickHouse] -->|列存+向量化| CK_DESC[分析查询极速]
+    DORIS[Doris/StarRocks] -->|MPP+向量化| DORIS_DESC[高并发+实时]
+    TRINO[Trino] -->|联邦查询| TRINO_DESC[跨源分析]
+    SPARK[Spark SQL] -->|批处理| SPARK_DESC[超大规模]
+```
+
+### 选型对比表
+
+| 引擎 | 延迟 | 并发 | 数据量 | 适用场景 |
+|------|------|------|--------|----------|
+| ClickHouse | 毫秒级 | 低 | TB级 | 用户行为分析、日志分析 |
+| Doris | 毫秒级 | 高 | PB级 | 实时报表、高并发查询 |
+| Trino | 秒级 | 中 | PB级 | 跨源联邦查询 |
+| Spark SQL | 分钟级 | 低 | EB级 | 离线批处理、ETL |
+
+## 二十七、数据导入性能对比
+
+| 导入方式 | 吞吐量 | 延迟 | 适用场景 |
+|----------|--------|------|----------|
+| Stream Load | 100MB/s | 秒级 | 实时数据导入 |
+| Broker Load | 500MB/s | 分钟级 | 批量历史数据 |
+| Routine Load | 20MB/s | 秒级 | Kafka 消费 |
+| INSERT INTO | 10MB/s | 毫秒级 | 小批量/单条 |
+| Multi-Catalog | 200MB/s | 分钟级 | 跨源数据同步 |
+
+### Stream Load 性能调优
+
+```bash
+# Doris Stream Load 性能调优
+curl -T data.csv \
+  -H "format:csv" \
+  -H "column_separator:," \
+  -H "max_filter_ratio:0.1" \
+  -H "mem_limit:4294967296" \
+  -H "parallel:4" \
+  http://doris-fe:8030/api/test_db/orders/_stream_load
+```
+
+## 二十八、集群运维与监控
+
+```mermaid
+flowchart TB
+    subgraph 监控层
+        PROM[Prometheus] --> GRAF[Grafana]
+        ALERT[Alertmanager]
+    end
+    subgraph ClickHouse集群
+        CH1[Node1]
+        CH2[Node2]
+        CH3[Node3]
+    end
+    subgraph Doris集群
+        FE1[FE1]
+        FE2[FE2]
+        BE1[BE1]
+        BE2[BE2]
+    end
+    CH1 --> PROM
+    FE1 --> PROM
+    PROM --> ALERT
+```
+
+### ClickHouse 运维关键指标
+
+| 指标 | 告警阈值 | 处理方案 |
+|------|---------|----------|
+| 队列深度 | > 100 | 检查 Merge 速度、增加并发 |
+| 内存使用 | > 80% | 调整 max_memory_usage |
+| 磁盘使用 | > 85% | 清理旧数据、扩容 |
+| 复制延迟 | > 30s | 检查网络、ZooKeeper 状态 |
+
+### Doris 运维关键指标
+
+| 指标 | 告警阈值 | 处理方案 |
+|------|---------|----------|
+| Query Cost | > 10s | 优化 SQL、增加 BE |
+| Tablet Size | > 500MB | 分裂 Tablet |
+| 复制失败 | > 0 | 检查网络、重启 Tablet |
+| 磁盘使用 | > 85% | 扩容或迁移数据 |
+
+## 与其他板块的关系
 
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
 - 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；

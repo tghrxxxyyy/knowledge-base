@@ -1076,3 +1076,451 @@ spark-submit \
 ---
 
 > 一句话：**Spark = 内存计算 + DAG 调度 + Catalyst 优化 + 丰富生态（SQL/ML/Graph）；选型先看「计算类型（批→Spark，流→Flink）」，再定「规模（YARN/K8s/托管）」，最后开「AQE + 广播 Join + 减少 Shuffle」**。
+
+## 十三、Spark Structured Streaming与批处理统一编程模型
+
+### 13.1 统一编程模型原理
+
+```text
+统一编程模型原理：
+
+  核心思想：
+    同一套代码既能处理批数据，也能处理流数据
+    DataFrame/Dataset API统一批流处理
+    SQL语法统一批流查询
+
+  批处理模式：
+    读取完整数据集
+    一次性处理所有数据
+    输出结果到存储
+    适用：ETL、数据分析
+
+  流处理模式：
+    读取数据流（增量）
+    持续处理新数据
+    输出结果到存储（追加/更新）
+    适用：实时监控、实时计算
+
+  统一优势：
+    代码复用：一套代码处理批流
+    学习成本低：只需掌握一套API
+    维护简单：统一的代码库
+    测试方便：批模式测试流逻辑
+```
+
+### 13.2 统一编程模型实现
+
+```scala
+// 批处理模式
+val batchDF = spark.read.parquet("/data/orders")
+batchDF.write.parquet("/output/orders-batch")
+
+// 流处理模式（同一套API）
+val streamDF = spark.readStream.parquet("/data/orders-stream")
+streamDF.writeStream.parquet("/output/orders-stream")
+
+// 统一SQL查询
+// 批模式
+spark.sql("""
+    SELECT product, COUNT(*) as cnt, SUM(amount) as total
+    FROM orders
+    GROUP BY product
+""").show()
+
+// 流模式（同一套SQL）
+spark.sql("""
+    SELECT product, COUNT(*) as cnt, SUM(amount) as total
+    FROM orders_stream
+    GROUP BY product, TUMBLE(event_time, INTERVAL '1 hour')
+""").writeStream.outputMode("update").start()
+
+// 测试流逻辑（用批数据测试）
+val testBatchDF = spark.read.parquet("/test/data")
+val resultDF = processStream(testBatchDF)  // 同一处理逻辑
+resultDF.show()
+```
+
+### 13.3 批流对比
+
+| 维度 | 批处理 | 流处理 | 统一模型优势 |
+|------|--------|--------|--------------|
+| 数据处理 | 全量数据 | 增量数据 | 一套代码 |
+| 处理时间 | 一次性 | 持续性 | 逻辑复用 |
+| 输出模式 | 完整结果 | 增量结果 | 统一输出 |
+| 容错机制 | 重算 | WAL+Checkpoint | 统一容错 |
+| 状态管理 | 无状态 | 有状态 | 统一状态管理 |
+| 测试方式 | 直接测试 | 模拟流测试 | 统一测试 |
+
+## 十四、Spark SQL AQE三大优化
+
+### 14.1 合并小分区优化
+
+```text
+合并小分区优化：
+
+  问题：
+    Shuffle后产生大量小分区
+    每个分区一个Task
+    小文件问题严重
+
+  优化原理：
+    运行时根据Shuffle统计信息
+    自动合并过小的分区
+    减少Task数量
+
+  配置：
+    spark.sql.adaptive.enabled=true
+    spark.sql.adaptive.coalescePartitions.enabled=true
+    spark.sql.adaptive.coalescePartitions.minPartitionSize=1MB
+    spark.sql.adaptive.coalescePartitions.initialPartitionNum=200
+
+  效果：
+    减少Task数量：从2000减少到200
+    减少调度开销：Task调度时间减少90%
+    提升缓存命中率：更少的Task → 更好的缓存
+
+  监控：
+    Spark UI → SQL → 查看AQE优化详情
+    检查是否合并了小分区
+    检查Task数量变化
+```
+
+### 14.2 动态Join策略选择
+
+```text
+动态Join策略选择：
+
+  问题：
+    静态分析时选择Join策略
+    可能选择次优策略
+    性能损失
+
+  优化原理：
+    运行时根据统计信息
+    动态选择最优Join策略
+    自动切换Broadcast/Sort Merge Join
+
+  配置：
+    spark.sql.adaptive.enabled=true
+    spark.sql.adaptive.localShuffleReader.enabled=true
+
+  策略选择：
+    小表Join大表 → Broadcast Join（避免Shuffle）
+    大表Join大表 → Sort Merge Join（内存友好）
+    动态切换：根据运行时统计信息自动选择
+
+  效果：
+    自动选择最优Join策略
+    性能提升：10-100倍（取决于数据量）
+    减少调参负担
+
+  监控：
+    Spark UI → SQL → 查看Join策略
+    检查是否使用了Broadcast Join
+    检查Join性能提升
+```
+
+### 14.3 Skew Join处理
+
+```text
+Skew Join处理：
+
+  问题：
+    数据倾斜导致长尾Task
+    某个分区数据量远超其他分区
+    整体性能下降
+
+  优化原理：
+    自动检测数据倾斜
+    拆分倾斜分区
+    避免长尾Task
+
+  配置：
+    spark.sql.adaptive.enabled=true
+    spark.sql.adaptive.skewJoin.enabled=true
+    spark.sql.adaptive.skewJoin.skewedPartitionFactor=5
+    spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256MB
+
+  处理流程：
+    1. 检测倾斜：某分区数据量 > 平均值 × 因子
+    2. 拆分分区：将倾斜分区拆分为多个子分区
+    3. 并行处理：子分区并行处理
+    4. 合并结果：合并子分区结果
+
+  效果：
+    避免长尾Task：从小时级减少到分钟级
+    提升整体性能：消除倾斜瓶颈
+    自动化：无需手动干预
+
+  监控：
+    Spark UI → Stage → 查看Task数据量分布
+    检查是否有倾斜分区
+    检查Skew Join处理效果
+```
+
+### 14.4 AQE配置汇总
+
+```properties
+# AQE核心配置
+spark.sql.adaptive.enabled=true                    # 开启AQE
+spark.sql.adaptive.coalescePartitions.enabled=true  # 合并小分区
+spark.sql.adaptive.coalescePartitions.minPartitionSize=1MB  # 最小分区大小
+spark.sql.adaptive.coalescePartitions.initialPartitionNum=200  # 初始分区数
+
+# Join策略配置
+spark.sql.adaptive.localShuffleReader.enabled=true  # 本地Shuffle读取
+
+# Skew Join配置
+spark.sql.adaptive.skewJoin.enabled=true            # 开启倾斜Join
+spark.sql.adaptive.skewJoin.skewedPartitionFactor=5  # 倾斜因子
+spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256MB  # 倾斜阈值
+
+# 监控配置
+spark.sql.adaptive.logLevel=INFO  # 日志级别
+```
+
+## 十五、Spark数据倾斜解决方案
+
+### 15.1 Salted Join方案
+
+```scala
+// Salted Join方案
+// 原理：给倾斜Key加随机后缀打散
+val skewedDF = spark.read.parquet("/data/skewed")
+val normalDF = spark.read.parquet("/data/normal")
+
+// 给倾斜Key加盐
+val saltedSkewedDF = skewedDF.withColumn("salt", (rand() * 10).cast("int"))
+    .withColumn("salted_key", concat(col("key"), lit("_"), col("salt")))
+
+// 给正常Key加盐（相同数量）
+val saltedNormalDF = normalDF.crossJoin(
+    spark.range(0, 10).withColumnRenamed("id", "salt")
+).withColumn("salted_key", concat(col("key"), lit("_"), col("salt")))
+
+// 执行Salted Join
+val result = saltedSkewedDF.join(saltedNormalDF, "salted_key")
+    .groupBy("key").agg(sum("value").as("total"))
+
+// 效果：
+//   将倾斜Key拆分为10个子Key
+//   每个子Key处理1/10的数据
+//   避免长尾Task
+```
+
+### 15.2 Broadcast Join方案
+
+```scala
+// Broadcast Join方案
+// 原理：小表广播避免Shuffle
+val largeDF = spark.read.parquet("/data/large")
+val smallDF = spark.read.parquet("/data/small")
+
+// 广播小表
+val result = largeDF.join(broadcast(smallDF), "key")
+
+// 配置
+spark.sql.autoBroadcastJoinThreshold=10MB  # 自动广播阈值
+
+// 效果：
+//   避免Shuffle
+//   性能提升：10-100倍
+//   适用：小表 < 10MB
+```
+
+### 15.3 Skew Join Hint方案
+
+```scala
+// Skew Join Hint方案
+// 原理：手动提示倾斜Join
+val skewedDF = spark.read.parquet("/data/skewed")
+val normalDF = spark.read.parquet("/data/normal")
+
+// 使用Skew Join Hint
+val result = skewedDF.hint("skew", "key").join(normalDF, "key")
+
+// 或使用两阶段聚合
+val partialAgg = skewedDF.groupBy("key").agg(sum("value").as("partial_sum"))
+val finalAgg = partialAgg.groupBy("key").agg(sum("partial_sum").as("total"))
+
+// 效果：
+//   手动提示倾斜列
+//   Spark自动处理倾斜
+//   适用：已知倾斜列
+```
+
+### 15.4 解决方案对比
+
+| 方案 | 实现复杂度 | 适用场景 | 优缺点 |
+|------|------------|----------|--------|
+| Salted Join | 中 | 倾斜Key有限 | 简单有效，但增加Shuffle |
+| Broadcast Join | 低 | 小表Join大表 | 性能好，但受内存限制 |
+| Skew Join Hint | 低 | 已知倾斜列 | 简单，但需手动提示 |
+| 两阶段聚合 | 中 | GroupBy聚合 | 效果好，但需改代码 |
+| AQE Skew Join | 低 | 通用 | 自动化，但需Spark 3.0+ |
+
+## 十六、Spark on YARN资源分配
+
+### 16.1 资源分配公式
+
+```text
+资源分配公式：
+
+  Executor数量：
+    = min(集群总核数 / executor-cores, maxExecutors)
+    计算：集群总核数 × 动态分配比例
+
+  Executor核心数（executor-cores）：
+    推荐：2~5核/executor
+    计算：min(可用核心数/预期executor数, 5)
+    过多 → GC压力大
+    过少 → 线程切换开销
+
+  Executor内存（executor-memory）：
+    = spark.executor.memory + spark.executor.memoryOverhead
+    overhead = max(executor-memory × 0.1, 384MB)
+    推荐：4GB~32GB
+
+  Driver内存（driver-memory）：
+    小作业：4GB
+    中等作业：8GB
+    大作业：16GB
+    计算：取决于collect数据量和广播表大小
+
+  分区数（shuffle.partitions）：
+    = 输入数据量 / 128MB（推荐）
+    ≥ 2 × executor总核数
+    计算：max(输入数据量/128MB, 2 × executor总核数)
+```
+
+### 16.2 推荐配置表
+
+| 作业类型 | executor-cores | executor-memory | driver-memory | shuffle.partitions |
+|----------|----------------|-----------------|---------------|-------------------|
+| 小作业 | 4 | 8GB | 4GB | 200 |
+| 中等作业 | 4 | 16GB | 8GB | 500 |
+| 大作业 | 5 | 32GB | 16GB | 2000 |
+| 流式作业 | 4 | 16GB | 8GB | 200 |
+| ML作业 | 4 | 16GB | 8GB | 200 |
+
+### 16.3 资源分配最佳实践
+
+```text
+资源分配最佳实践：
+
+  Executor核心数：
+    推荐4核（平衡GC和并行度）
+    避免超过6核（GC压力大）
+    考虑HDFS客户端并发（每executor最多5个并发）
+
+  Executor内存：
+    Storage和Execution共享（spark.memory.fraction=0.6）
+    预留30%给User Memory和Reserved
+    堆外内存：spark.memory.offHeap.size=4g
+
+  Driver内存：
+    collect大结果：增加driver-memory
+    广播大表：增加driver-memory
+    避免：driver-oom导致作业失败
+
+  动态分配：
+    spark.dynamicAllocation.enabled=true
+    spark.dynamicAllocation.minExecutors=2
+    spark.dynamicAllocation.maxExecutors=20
+    spark.dynamicAllocation.shuffleTracking.enabled=true
+
+  监控指标：
+    Executor CPU利用率：> 70%为佳
+    Executor内存利用率：> 80%为佳
+    GC时间占比：< 10%为佳
+    Shuffle Read/Write：均匀分布为佳
+```
+
+## 十七、Spark Shuffle管理
+
+### 17.1 Sort Shuffle原理
+
+```text
+Sort Shuffle原理：
+
+  写入流程：
+    1. 每个Task写入内存缓冲（spark.shuffle.file.buffer，默认32KB）
+    2. 内存满 → 排序后溢出到磁盘文件（按分区排序）
+    3. 合并（merge）多个溢出文件 → 一个分区一个文件
+    4. 写索引文件（记录每个分区在数据文件中的offset）
+
+  关键参数：
+    spark.shuffle.spill.numElementsForceSpillThreshold
+      → 内存中元素数超阈值强制溢出（防OOM）
+
+  优势：
+    文件数：每个Task输出一个文件（而非每个Reduce一个文件）
+    排序：按分区排序，便于后续合并
+    压缩：支持压缩（spark.shuffle.compress=true）
+
+  劣势：
+    排序开销：需要排序
+    内存压力：内存满时溢出
+```
+
+### 17.2 Unsafe Shuffle原理
+
+```text
+Unsafe Shuffle原理：
+
+  核心优化：
+    堆外内存直接写入（避免GC）
+    二进制排序（Unsafe.sort）
+    零拷贝序列化
+
+  配置：
+    spark.shuffle.spill.compress=true（压缩溢出文件）
+    spark.io.compression.codec=lz4/zstd
+
+  优势：
+    高性能：避免GC和序列化开销
+    低延迟：堆外内存直接写入
+    高吞吐：零拷贝序列化
+
+  劣势：
+    内存管理复杂：需要手动管理堆外内存
+    调试困难：堆外内存问题难以排查
+```
+
+### 17.3 Tungsten Shuffle原理
+
+```text
+Tungsten Shuffle原理：
+
+  核心优化：
+    堆外内存直接写入（避免GC）
+    二进制排序（Unsafe.sort）
+    零拷贝序列化
+    Whole-Stage Code Generation
+
+  配置：
+    spark.shuffle.spill.compress=true（压缩溢出文件）
+    spark.io.compression.codec=lz4/zstd
+
+  优势：
+    高性能：避免GC和序列化开销
+    低延迟：堆外内存直接写入
+    高吞吐：零拷贝序列化
+    代码生成：减少虚函数调用
+
+  劣势：
+    内存管理复杂：需要手动管理堆外内存
+    调试困难：堆外内存问题难以排查
+    兼容性：需要Spark 2.x+
+```
+
+### 17.4 Shuffle管理对比
+
+| 维度 | Sort Shuffle | Unsafe Shuffle | Tungsten Shuffle |
+|------|--------------|----------------|------------------|
+| 内存管理 | 堆内内存 | 堆外内存 | 堆外内存 |
+| GC压力 | 高 | 低 | 低 |
+| 序列化 | Java序列化 | 零拷贝 | 零拷贝 |
+| 性能 | 中 | 高 | 最高 |
+| 兼容性 | 所有版本 | Spark 2.x+ | Spark 2.x+ |
+| 适用场景 | 通用 | 高性能 | 高性能 |

@@ -1073,4 +1073,677 @@ groups:
       summary: "熔断器已打开"
 ```
 
-## 十七、与其他板块的关系
+## 十七、Gateway Metrics监控深度配置
+
+### 17.1 Micrometer集成配置
+
+```yaml
+# Micrometer配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.75,0.95,0.99
+      slo:
+        http.server.requests: 100ms,500ms
+
+# 自定义指标
+@Component
+public class GatewayMetrics implements MeterBinder {
+    @Override
+    public void bindTo(MeterRegistry registry) {
+        // 请求计数
+        Counter.builder("gateway.requests")
+            .description("Gateway请求总数")
+            .tag("type", "http")
+            .register(registry);
+        
+        // 请求延迟
+        Timer.builder("gateway.request.duration")
+            .description("Gateway请求延迟")
+            .publishPercentiles(0.5, 0.75, 0.95, 0.99)
+            .register(registry);
+        
+        // 错误率
+        Counter.builder("gateway.errors")
+            .description("Gateway错误总数")
+            .tag("type", "http")
+            .register(registry);
+    }
+}
+```
+
+### 17.2 请求延迟分布监控
+
+```text
+请求延迟分布监控：
+
+  监控指标：
+    http_server_requests_seconds：请求延迟分布
+    http_server_requests_seconds_bucket：延迟桶
+    http_server_requests_seconds_count：请求总数
+    http_server_requests_seconds_sum：延迟总和
+
+  关键分位数：
+    P50：中位数延迟（< 100ms为佳）
+    P75：75分位数延迟（< 200ms为佳）
+    P95：95分位数延迟（< 500ms为佳）
+    P99：99分位数延迟（< 1000ms为佳）
+
+  告警规则：
+    P99 > 1秒：性能下降告警
+    P99 > 5秒：严重性能问题
+    错误率 > 5%：服务异常告警
+
+  Grafana面板：
+    请求速率：requests/second
+    延迟分布：延迟分位数趋势
+    错误率：错误请求占比
+    路由延迟：各路由延迟对比
+```
+
+### 17.3 错误率监控
+
+```yaml
+# 错误率监控配置
+management:
+  metrics:
+    enable:
+      all: true
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.75,0.95,0.99
+      sla:
+        http.server.requests: 100ms,200ms,500ms
+
+# 自定义错误率指标
+@Component
+public class ErrorRateMonitor {
+    private final Counter errorCounter;
+    private final Timer errorTimer;
+    
+    public ErrorRateMonitor(MeterRegistry registry) {
+        this.errorCounter = Counter.builder("gateway.errors.total")
+            .description("Gateway错误总数")
+            .register(registry);
+        
+        this.errorTimer = Timer.builder("gateway.errors.duration")
+            .description("Gateway错误延迟")
+            .register(registry);
+    }
+    
+    public void recordError(String route, int statusCode) {
+        errorCounter.increment();
+        errorTimer.record(Duration.ofMillis(0));
+    }
+}
+
+# Prometheus查询规则
+# 错误率计算
+rate(gateway_requests_seconds_count{status=~"5.."}[5m]) / rate(gateway_requests_seconds_count[5m])
+
+# P99延迟
+histogram_quantile(0.99, rate(gateway_requests_seconds_bucket[5m]))
+```
+
+## 十八、Gateway多实例会话共享
+
+### 18.1 Redis会话共享
+
+```yaml
+# Redis会话共享配置
+spring:
+  session:
+    store-type: redis
+    timeout: 1800
+    redis:
+      namespace: spring:session
+  redis:
+    host: localhost
+    port: 6379
+    password: 
+    database: 0
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
+        max-wait: -1ms
+
+# 会话配置
+spring.session.redis.flush-mode: on_save
+spring.session.redis.spring-session-serializer: java
+
+# 自定义Session序列化
+@Configuration
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
+public class RedisSessionConfig {
+    @Bean
+    public RedisSerializer<Object> springSessionRedisSerializer() {
+        return new GenericJackson2JsonRedisSerializer();
+    }
+}
+```
+
+### 18.2 数据库会话共享
+
+```yaml
+# 数据库会话共享配置
+spring:
+  session:
+    store-type: jdbc
+    jdbc:
+      initialize-schema: always
+      table-name: SPRING_SESSION
+      schema: classpath:org/springframework/session/jdbc/schema-@@platform@@.sql
+      platform: postgresql
+
+# 数据库连接配置
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/session_db
+    username: session_user
+    password: session_password
+    driver-class-name: org.postgresql.Driver
+
+# 会话表结构
+CREATE TABLE SPRING_SESSION (
+    SESSION_ID CHAR(36),
+    CREATION_TIME BIGINT,
+    LAST_ACCESS_TIME BIGINT,
+    MAX_INACTIVE_INTERVAL INT,
+    PRINCIPAL_NAME VARCHAR(100),
+    PRIMARY KEY (SESSION_ID)
+);
+
+CREATE TABLE SPRING_SESSION_ATTRIBUTES (
+    SESSION_ID CHAR(36),
+    ATTRIBUTE_NAME VARCHAR(200),
+    ATTRIBUTE_BYTES BYTEA,
+    PRIMARY KEY (SESSION_ID, ATTRIBUTE_NAME)
+);
+```
+
+### 18.3 JWT无状态方案
+
+```java
+// JWT无状态方案
+@Component
+public class JwtSessionManager {
+    private final String jwtSecret = "your-secret-key";
+    private final long jwtExpiration = 1800000; // 30分钟
+    
+    public String createToken(UserDetails userDetails) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("sub", userDetails.getUsername());
+        claims.put("roles", userDetails.getAuthorities());
+        claims.put("iat", System.currentTimeMillis());
+        claims.put("exp", System.currentTimeMillis() + jwtExpiration);
+        
+        return Jwts.builder()
+            .setClaims(claims)
+            .signWith(SignatureAlgorithm.HS256, jwtSecret)
+            .compact();
+    }
+    
+    public UserDetails validateToken(String token) {
+        Claims claims = Jwts.parser()
+            .setSigningKey(jwtSecret)
+            .parseClaimsJws(token)
+            .getBody();
+        
+        String username = claims.getSubject();
+        List<SimpleGrantedAuthority> authorities = claims.get("roles", List.class)
+            .stream()
+            .map(role -> new SimpleGrantedAuthority("ROLE_" + role))
+            .collect(Collectors.toList());
+        
+        return new User(username, "", authorities);
+    }
+}
+
+// Gateway过滤器
+@Component
+public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String token = extractToken(exchange);
+        if (token != null && validateToken(token)) {
+            // 设置用户信息到请求头
+            exchange.getRequest().mutate()
+                .header("X-User-Name", getUsernameFromToken(token))
+                .header("X-User-Roles", getRolesFromToken(token));
+            return chain.filter(exchange);
+        }
+        
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        return exchange.getResponse().setComplete();
+    }
+    
+    @Override
+    public int getOrder() {
+        return -100; // 高优先级
+    }
+}
+```
+
+## 十九、Gateway与服务网格集成
+
+### 19.1 Istio Sidecar集成
+
+```yaml
+# Istio Sidecar配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-cloud-gateway
+spec:
+  template:
+    metadata:
+      labels:
+        app: gateway
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+      - name: gateway
+        image: spring-cloud-gateway:latest
+        ports:
+        - containerPort: 8080
+      - name: istio-proxy
+        image: istio/proxyv2:latest
+        ports:
+        - containerPort: 15090
+          protocol: TCP
+
+# Istio路由配置
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: gateway-service
+spec:
+  hosts:
+  - "*"
+  http:
+  - match:
+    - uri:
+        prefix: /api
+    route:
+    - destination:
+        host: spring-cloud-gateway
+        port:
+          number: 8080
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+    timeout: 10s
+
+# Istio DestinationRule
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: gateway-destination
+spec:
+  host: spring-cloud-gateway
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: DEFAULT
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    loadBalancer:
+      simple: ROUND_ROBIN
+```
+
+### 19.2 Envoy Filter集成
+
+```yaml
+# Envoy Filter配置
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: gateway-filter
+spec:
+  workloadSelector:
+    labels:
+      app: gateway
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.cors
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+        config:
+          enabled: true
+
+# Envoy限流配置
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: gateway-ratelimit
+spec:
+  workloadSelector:
+    labels:
+      app: gateway
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.local_ratelimit
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+          stat_prefix: http_local_rate_limiter
+          token_bucket:
+            max_tokens: 100
+            tokens_per_fill: 10
+            fill_interval: 1s
+          filter_enabled:
+            runtime_key: local_rate_limit_enabled
+            default_value:
+              numerator: 100
+              denominator: HUNDRED
+```
+
+## 二十、Gateway限流降级
+
+### 20.1 Sentinel集成
+
+```yaml
+# Sentinel配置
+spring:
+  cloud:
+    sentinel:
+      transport:
+        dashboard: localhost:8080
+        port: 8719
+      eager: true
+      scg:
+        fallback:
+          mode: response
+          response-status: 429
+          response-body: "请求过多，请稍后重试"
+
+# Sentinel规则配置
+@Component
+public class SentinelConfig {
+    @PostConstruct
+    public void initGatewayRules() {
+        Set<GatewayFlowRule> rules = new HashSet<>();
+        
+        // 限流规则
+        rules.add(new GatewayFlowRule("order-route")
+            .setCount(100) // QPS限制
+            .setIntervalSec(1)
+            .setBurst(20) // 突发容量
+            .setControlBehavior(RuleConstant.CONTROL_BEHAVIOR_DEFAULT));
+        
+        // 熔断规则
+        rules.add(new GatewayDegradeRule("order-route")
+            .setCount(5) // 错误率阈值
+            .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
+            .setTimeWindow(10) // 熔断时间窗口
+            .setMinRequestAmount(10) // 最小请求数
+            .setStatIntervalMs(1000)); // 统计时间窗口
+        
+        GatewayRuleManager.loadRules(rules);
+    }
+}
+```
+
+### 20.2 Resilience4j集成
+
+```yaml
+# Resilience4j配置
+resilience4j:
+  circuitbreaker:
+    instances:
+      gateway:
+        registerHealthIndicator: true
+        slidingWindowSize: 10
+        permittedNumberOfCallsInHalfOpenState: 3
+        waitDurationInOpenState: 10s
+        failureRateThreshold: 50
+        eventConsumerBufferSize: 10
+        failureRateOpenState: 50
+        slowCallRateThreshold: 100
+        slowCallDurationThreshold: 2s
+  ratelimiter:
+    instances:
+      gateway:
+        limitForPeriod: 100
+        limitRefreshPeriod: 1s
+        timeoutDuration: 0
+  retry:
+    instances:
+      gateway:
+        maxAttempts: 3
+        waitDuration: 500ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        retryExceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+
+# 自定义过滤器
+@Component
+public class Resilience4jFilter implements GlobalFilter, Ordered {
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final RateLimiterRegistry rateLimiterRegistry;
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String routeId = exchange.getAttribute("route_id");
+        
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(routeId);
+        RateLimiter rateLimiter = rateLimiterRegistry.rateLimiter(routeId);
+        
+        return Mono.fromCallable(() -> {
+            if (!rateLimiter.acquirePermission()) {
+                throw new RequestNotPermitted("请求被限流");
+            }
+            return "OK";
+        })
+        .transform(CircuitBreakerOperator.of(circuitBreaker))
+        .then(chain.filter(exchange))
+        .onErrorResume(throwable -> {
+            if (throwable instanceof RequestNotPermitted) {
+                exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+                return exchange.getResponse().setComplete();
+            }
+            return Mono.error(throwable);
+        });
+    }
+    
+    @Override
+    public int getOrder() {
+        return -90;
+    }
+}
+```
+
+## 二十一、Gateway生产问题排查
+
+### 21.1 502 Bad Gateway排查
+
+```text
+502 Bad Gateway排查：
+
+  常见原因：
+    1. 后端服务不可用
+    2. 后端服务响应超时
+    3. 网络连接问题
+    4. 负载均衡器问题
+
+  排查步骤：
+    1. 检查后端服务状态
+       curl http://backend-service/health
+       查看后端服务日志
+    
+    2. 检查网络连接
+       telnet backend-host port
+       检查防火墙规则
+    
+    3. 检查负载均衡器
+       查看负载均衡器健康检查
+       检查后端服务是否健康
+    
+    4. 检查Gateway配置
+       查看路由配置是否正确
+       检查超时配置
+
+  解决方案：
+    1. 启动后端服务
+    2. 增加超时时间
+       timeout: 60s
+    3. 检查网络配置
+    4. 调整负载均衡器配置
+```
+
+### 21.2 504 Gateway Timeout排查
+
+```text
+504 Gateway Timeout排查：
+
+  常见原因：
+    1. 后端服务响应慢
+    2. 后端服务处理时间过长
+    3. 网络延迟高
+    4. 资源不足
+
+  排查步骤：
+    1. 检查后端服务性能
+       查看后端服务响应时间
+       检查数据库查询性能
+    
+    2. 检查网络延迟
+       ping backend-host
+       traceroute backend-host
+    
+    3. 检查资源使用
+       查看CPU/内存/磁盘使用率
+       检查网络带宽
+    
+    4. 检查Gateway配置
+       查看超时配置
+       检查连接池配置
+
+  解决方案：
+    1. 优化后端服务
+       增加缓存
+       优化数据库查询
+    2. 增加超时时间
+       timeout: 120s
+    3. 增加资源
+       增加后端服务实例
+       增加网络带宽
+    4. 使用异步处理
+       消息队列解耦
+```
+
+### 21.3 连接超时排查
+
+```text
+连接超时排查：
+
+  常见原因：
+    1. 后端服务不可用
+    2. 网络连接问题
+    3. 连接池耗尽
+    4. DNS解析问题
+
+  排查步骤：
+    1. 检查后端服务状态
+       curl http://backend-service/health
+       查看后端服务日志
+    
+    2. 检查网络连接
+       telnet backend-host port
+       检查防火墙规则
+    
+    3. 检查连接池
+       查看连接池使用情况
+       检查连接泄漏
+    
+    4. 检查DNS
+       nslookup backend-host
+       检查DNS配置
+
+  解决方案：
+    1. 启动后端服务
+    2. 增加连接超时时间
+       connect-timeout: 30s
+    3. 增加连接池大小
+       max-connections: 100
+    4. 检查DNS配置
+```
+
+### 21.4 路由不匹配排查
+
+```text
+路由不匹配排查：
+
+  常见原因：
+    1. 路由配置错误
+    2. 路由规则不匹配
+    3. 路由优先级问题
+    4. 路由过滤器问题
+
+  排查步骤：
+    1. 检查路由配置
+       查看路由配置是否正确
+       检查路由规则
+    
+    2. 测试路由匹配
+       curl -v http://gateway/api/test
+       查看路由匹配结果
+    
+    3. 检查路由过滤器
+       查看过滤器配置
+       检查过滤器逻辑
+    
+    4. 查看Gateway日志
+       查看路由匹配日志
+       检查错误信息
+
+  解决方案：
+    1. 修正路由配置
+       检查URI配置
+       检查谓词配置
+    2. 调整路由优先级
+       使用order属性
+    3. 检查过滤器
+       简化过滤器逻辑
+       检查过滤器配置
+    4. 启用调试日志
+       logging.level.org.springframework.cloud.gateway: DEBUG
+```
+
+## 二十二、与其他板块的关系

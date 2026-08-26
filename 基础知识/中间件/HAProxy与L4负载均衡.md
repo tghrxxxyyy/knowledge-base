@@ -1089,4 +1089,420 @@ echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce
 
 ---
 
-> 一句话：**入口高可用 = LVS（内核转发扛量）+ HAProxy（L4/L7 治理 + 健康检查 + 会话保持）+ Keepalived（VIP 漂移）；选型先定「层级（超大规模→LVS，通用→HAProxy）」，再定「会话保持策略（无状态优先）」，最后配「健康检查 + 超时 + 慢启动」**。
+## 十二、HAProxy健康检查配置
+
+### 12.1 HTTP健康检查
+
+```bash
+# HTTP健康检查配置
+# 配置示例
+frontend http_front
+    bind *:80
+    default_backend http_back
+
+backend http_back
+    option httpchk GET /health HTTP/1.1\r\nHost:\ localhost
+    http-check expect status 200
+    server server1 192.168.1.101:80 check inter 5s fall 3 rise 2
+    server server2 192.168.1.102:80 check inter 5s fall 3 rise 2
+
+# 健康检查参数说明：
+# inter 5s：检查间隔5秒
+# fall 3：连续失败3次标记为DOWN
+# rise 2：连续成功2次标记为UP
+```
+
+### 12.2 TCP健康检查
+
+```bash
+# TCP健康检查配置
+# 配置示例
+backend tcp_back
+    option tcp-check
+    tcp-check connect
+    tcp-check send PING\r\n
+    tcp-check expect string +PONG
+    server server1 192.168.1.101:6379 check inter 2s
+    server server2 192.168.1.102:6379 check inter 2s
+
+# 适用场景：
+# Redis、Memcached等TCP服务
+# 自定义协议服务
+```
+
+### 12.3 健康检查最佳实践
+
+```text
+健康检查最佳实践：
+
+  检查频率：
+    关键服务：inter 2s（2秒检查一次）
+    普通服务：inter 5s（5秒检查一次）
+    非关键服务：inter 10s（10秒检查一次）
+
+  失败阈值：
+    fall 3：连续失败3次标记DOWN
+    rise 2：连续成功2次标记UP
+    快速恢复：减少服务恢复时间
+
+  检查方式：
+    HTTP检查：检查HTTP状态码
+    TCP检查：检查TCP连接
+    自定义检查：检查应用特定响应
+
+  监控告警：
+    服务DOWN告警
+    健康检查失败告警
+    服务恢复通知
+```
+
+## 十三、HAProxy ACL规则配置
+
+### 13.1 ACL规则配置
+
+```bash
+# ACL规则配置
+# 基于域名的路由
+frontend http_front
+    bind *:80
+    acl is_api hdr(host) -i api.example.com
+    acl is_web hdr(host) -i www.example.com
+    use_backend api_back if is_api
+    use_backend web_back if is_web
+    default_backend default_back
+
+# 基于URL的路由
+frontend http_front
+    bind *:80
+    acl is_static path_beg /static /images /css /js
+    acl is_api path_beg /api
+    use_backend static_back if is_static
+    use_backend api_back if is_api
+    default_backend web_back
+
+# 基于源IP的路由
+frontend http_front
+    bind *:80
+    acl is_internal src 192.168.0.0/16
+    acl is_external src 0.0.0.0/0
+    use_backend internal_back if is_internal
+    use_backend external_back if is_external
+```
+
+### 13.2 ACL规则类型
+
+```text
+ACL规则类型：
+
+  基于Header：
+    hdr(host)：域名
+    hdr(User-Agent)：浏览器类型
+    hdr(X-Forwarded-For)：客户端IP
+
+  基于Path：
+    path_beg：URL开头
+    path_end：URL结尾
+    path_reg：正则匹配
+
+  基于Source：
+    src：源IP地址
+    src_port：源端口
+
+  基于Time：
+    time：时间范围
+    cron：定时任务
+```
+
+### 13.3 ACL最佳实践
+
+```text
+ACL最佳实践：
+
+  规则顺序：
+    高优先级规则在前
+    默认规则在最后
+    避免规则冲突
+
+  规则精简：
+    合并相似规则
+    使用正则简化
+    避免重复检查
+
+  性能优化：
+    缓存ACL结果
+    减少规则数量
+    优化匹配算法
+
+  测试验证：
+    测试环境验证
+    灰度发布
+    效果评估
+```
+
+## 十四、HAProxy统计页面配置
+
+### 14.1 统计页面配置
+
+```bash
+# 统计页面配置
+# 启用统计页面
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats admin if LOCALHOST
+    stats auth admin:password
+
+# 配置说明：
+# bind *:8404：监听8404端口
+# stats uri /stats：统计页面URL
+# stats refresh 10s：每10秒刷新
+# stats admin if LOCALHOST：本地可管理
+# stats auth admin:password：认证信息
+```
+
+### 14.2 统计页面功能
+
+```text
+统计页面功能：
+
+  实时监控：
+    当前连接数
+    会话速率
+    后端健康状态
+    服务器状态
+
+  性能指标：
+    响应时间
+    错误率
+    队列长度
+    流量统计
+
+  管理功能：
+    启用/禁用服务器
+    手动故障转移
+    清除统计信息
+    导出配置
+
+  告警配置：
+    服务DOWN告警
+    性能阈值告警
+    错误率告警
+```
+
+### 14.3 监控最佳实践
+
+```text
+监控最佳实践：
+
+  监控频率：
+    实时监控：每秒刷新
+    历史监控：每分钟采集
+    趋势监控：每小时采集
+
+  告警配置：
+    服务DOWN：立即告警
+    性能下降：5分钟告警
+    错误率上升：10分钟告警
+
+  监控面板：
+    实时状态：连接数、速率、健康状态
+    历史趋势：性能趋势、流量趋势
+    资源使用：CPU、内存、网络
+
+  日志记录：
+    访问日志：记录所有访问
+    错误日志：记录所有错误
+    审计日志：记录所有操作
+```
+
+## 十五、HAProxy+Keepalived高可用配置
+
+### 15.1 Keepalived配置
+
+```bash
+# Keepalived配置
+# 主节点配置
+vrrp_script check_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight -20
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 101
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1234
+    }
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+    track_script {
+        check_haproxy
+    }
+}
+
+# 备节点配置
+vrrp_instance VI_1 {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1234
+    }
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+    track_script {
+        check_haproxy
+    }
+}
+```
+
+### 15.2 高可用切换流程
+
+```text
+高可用切换流程：
+
+  1. 故障检测：
+     Keepalived检测HAProxy状态
+     连续失败3次触发切换
+     发送故障告警
+
+  2. VIP漂移：
+     释放VIP地址
+     备节点接管VIP
+     更新ARP表
+
+  3. 服务恢复：
+     备节点启动HAProxy
+     接管流量处理
+     验证服务可用性
+
+  4. 故障恢复：
+     主节点恢复HAProxy
+     等待备节点故障
+     重新接管VIP
+
+  注意事项：
+    避免脑裂：使用仲裁机制
+    监控切换：监控切换过程
+    回滚机制：支持快速回滚
+```
+
+### 15.3 高可用最佳实践
+
+```text
+高可用最佳实践：
+
+  故障检测：
+    检查频率：2秒检查一次
+    失败阈值：连续失败3次
+    恢复阈值：连续成功2次
+
+  切换策略：
+    优先级：主节点优先
+    脑裂防护：使用仲裁机制
+    快速切换：减少切换时间
+
+  监控告警：
+    切换告警：切换发生告警
+    故障告警：服务故障告警
+    恢复告警：服务恢复通知
+
+  测试验证：
+    定期演练：每月演练一次
+    模拟故障：模拟各种故障
+    验证切换：验证切换流程
+```
+
+## 十六、HAProxy连接复用配置
+
+### 16.1 连接复用配置
+
+```bash
+# 连接复用配置
+# HTTP连接复用
+backend http_back
+    option http-server-close
+    option http-keep-alive
+    option forceclose
+    timeout http-keep-alive 10s
+    timeout http-request 30s
+
+# 长连接配置
+backend long_connection_back
+    option http-server-close
+    option http-keep-alive
+    timeout http-keep-alive 60s
+    timeout tunnel 3600s
+
+# 连接池配置
+defaults
+    option http-server-close
+    option http-keep-alive
+    timeout http-keep-alive 10s
+    timeout http-request 30s
+    timeout tunnel 3600s
+```
+
+### 16.2 连接复用策略
+
+```text
+连接复用策略：
+
+  HTTP/1.0：
+    短连接：每次请求新建连接
+    无状态：请求完成后关闭连接
+    性能差：频繁建立连接
+
+  HTTP/1.1：
+    长连接：保持连接复用
+    管道化：支持请求管道化
+    性能好：减少连接建立
+
+  HTTP/2：
+    多路复用：单连接多请求
+    头部压缩：减少传输数据
+    性能优秀：最高效
+
+  配置建议：
+    启用HTTP/1.1长连接
+    配置合理的超时时间
+    根据场景选择协议
+```
+
+### 16.3 连接复用最佳实践
+
+```text
+连接复用最佳实践：
+
+  超时配置：
+    http-keep-alive：10秒（默认）
+    http-request：30秒（请求超时）
+    tunnel：3600秒（隧道超时）
+
+  连接管理：
+    连接池大小：根据负载调整
+    连接超时：合理设置超时
+    连接回收：及时回收空闲连接
+
+  性能优化：
+    启用HTTP/2：最高效复用
+    减少新建连接：复用现有连接
+    监控连接状态：及时发现问题
+
+  监控指标：
+    连接数：当前活跃连接数
+    复用率：连接复用比例
+    错误率：连接错误比例
+```

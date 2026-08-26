@@ -1060,6 +1060,340 @@ Spark 历史服务器排查步骤：
 | Task 频繁失败 | 资源不足/网络问题 | 检查 Executor 日志 |
 | 作业卡住不动 | 死锁/资源争抢 | 检查 Spark UI DAG |
 
+## 二十五、Shuffle外部排序器深度解析
+
+### 25.1 ExternalSorter工作原理
+
+```text
+ExternalSorter = Shuffle写端的核心排序组件
+
+工作流程：
+  1. 接收map端输出的(key, value)对
+  2. 在内存中排序（可选combine预聚合）
+  3. 内存满 → 溢写到磁盘（spill）
+  4. 最终合并（merge）为排序后的分区文件
+
+内存管理：
+  申请内存：execution memory pool
+  缓冲区：spark.shuffle.file.buffer（默认32KB）
+  溢写阈值：内存占用超过execution memory pool可用空间
+
+Spill触发条件：
+  内存占用 > execution memory pool可用空间
+  默认：spark.sql.shuffle.partitions=200
+  每个Task独占一个内存分区
+```
+
+### 25.2 Spill阈值调优
+
+```properties
+# Spill阈值配置
+spark.shuffle.spill.batchSize=10000           # 每批写入条数
+spark.shuffle.spill.initialBuffer=32768       # 初始缓冲区大小
+spark.shuffle.spill.numElementsForceSpillThreshold=1000000  # 强制溢出阈值
+
+# Spill文件压缩
+spark.shuffle.spill.compress=true             # 压缩spill文件
+spark.io.compression.codec=lz4/zstd           # 压缩算法
+
+# Spill合并策略
+spark.shuffle.sort.bypassMergeThreshold=400   # 直接排序阈值
+# 当分区数 < 阈值时，不排序直接合并（减少排序开销）
+
+# 监控Spill
+# Spark UI → Stage → Tasks → 查看Spill Size
+# 如果Spill Size很大 → 增加内存或分区数
+```
+
+### 25.3 内存管理优化
+
+```text
+内存管理优化策略：
+
+  增加分区数：
+    spark.sql.shuffle.partitions=1000
+    每个Task处理更少数据 → 减少spill
+
+  调整内存比例：
+    spark.memory.fraction=0.8（执行+存储占堆内存80%）
+    spark.memory.storageFraction=0.5（存储占执行+存储的50%）
+
+  使用堆外内存：
+    spark.memory.offHeap.enabled=true
+    spark.memory.offHeap.size=4g
+    避免GC压力
+
+  监控指标：
+    Shuffle Read/Write：spark.eventLog → Stage详情
+    Spill Size：看是否有大量spill（越大性能越差）
+    Sort Time：排序耗时
+```
+
+## 二十六、广播Join（BroadcastHashJoin）深度解析
+
+### 26.1 广播Join原理
+
+```text
+BroadcastHashJoin = 小表广播到所有Worker，避免Shuffle
+
+工作流程：
+  1. Driver收集小表数据
+  2. 广播小表到所有Executor
+  3. 大表每个分区与广播的小表进行Hash Join
+  4. 无需Shuffle，性能优异
+
+适用条件：
+  小表大小 < spark.sql.autoBroadcastJoinThreshold（默认10MB）
+  大表 JOIN 小表
+  网络带宽充足（广播消耗网络）
+```
+
+### 26.2 内存限制与调优
+
+```properties
+# 广播Join配置
+spark.sql.autoBroadcastJoinThreshold=10MB    # 自动广播阈值
+spark.sql.broadcastTimeout=300               # 广播超时时间（秒）
+
+# 手动广播
+# DataFrame API：df.join(broadcast(df2), "key")
+# SQL：/*+ BROADCAST(df2) */
+
+# 内存限制：
+# 广播数据占用Driver和Executor内存
+# Driver：spark.driver.memory需足够存放小表
+# Executor：spark.executor.memory需足够存放广播副本
+
+# 调优建议：
+# 1. 小表 < 10MB：自动广播（默认）
+# 1. 小表 10MB~100MB：手动广播（需评估内存）
+# 2. 小表 > 100MB：避免广播（改用Sort Merge Join）
+# 3. 网络带宽：广播消耗带宽，确保网络充足
+```
+
+### 26.3 广播Join vs Sort Merge Join对比
+
+| 维度 | BroadcastHashJoin | Sort Merge Join |
+|------|-------------------|-----------------|
+| 适用条件 | 小表 < 10MB | 任意大小 |
+| Shuffle | 无 | 有 |
+| 内存消耗 | 高（广播全表） | 中（分区处理） |
+| 网络消耗 | 高（广播） | 中（Shuffle） |
+| 性能 | 优秀（无Shuffle） | 良好（有Shuffle） |
+| 限制 | 小表必须足够小 | 无限制 |
+
+## 二十七、AQE（Adaptive Query Execution）动态优化
+
+### 27.1 AQE三大优化
+
+```text
+AQE（自适应查询执行）= 运行时动态优化
+
+优化一：动态合并小分区
+  原理：根据Shuffle统计信息，合并过小的分区
+  效果：减少Task数量，避免小文件问题
+  配置：spark.sql.adaptive.coalescePartitions.enabled=true
+
+优化二：动态Join策略选择
+  原理：根据运行时统计信息，选择最优Join策略
+  效果：自动切换Broadcast/Sort Merge Join
+  配置：spark.sql.adaptive.enabled=true
+
+优化三：Skew Join自动处理
+  原理：自动检测数据倾斜并拆分倾斜分区
+  效果：避免长尾Task
+  配置：spark.sql.adaptive.skewJoin.enabled=true
+```
+
+### 27.2 AQE配置详解
+
+```properties
+# AQE核心配置
+spark.sql.adaptive.enabled=true              # 开启AQE（默认开）
+spark.sql.adaptive.coalescePartitions.enabled=true  # 合并小分区
+spark.sql.adaptive.coalescePartitions.minPartitionSize=1MB  # 最小分区大小
+spark.sql.adaptive.coalescePartitions.initialPartitionNum=200  # 初始分区数
+
+# Skew Join配置
+spark.sql.adaptive.skewJoin.enabled=true     # 开启倾斜Join
+spark.sql.adaptive.skewJoin.skewedPartitionFactor=5  # 倾斜因子
+spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256MB  # 倾斜阈值
+
+# Join策略选择
+spark.sql.adaptive.localShuffleReader.enabled=true  # 本地Shuffle读取
+
+# 监控AQE效果
+# Spark UI → SQL → 查看AQE优化详情
+# 检查是否合并了小分区
+# 检查是否切换了Join策略
+```
+
+### 27.3 AQE性能收益
+
+```text
+AQE性能收益：
+
+  合并小分区：
+    减少Task数量：从2000减少到200
+    减少调度开销：Task调度时间减少90%
+    提升缓存命中率：更少的Task → 更好的缓存
+
+  动态Join策略：
+    自动选择Broadcast Join：避免Shuffle
+    性能提升：10-100倍（取决于数据量）
+
+  Skew Join处理：
+    避免长尾Task：从小时级减少到分钟级
+    提升整体性能：消除倾斜瓶颈
+
+  总体收益：
+    调参负担：大幅降低（AQE自动优化）
+    查询性能：提升2-10倍
+    资源利用率：提升30-50%
+```
+
+## 二十八、Spark推测执行深度配置
+
+### 28.1 推测执行原理
+
+```text
+推测执行（Speculative Execution）= 对慢节点启动备份任务
+
+工作流程：
+  1. 监控Task执行时间
+  2. 检测慢Task（运行时间 > 1.5 × 中位数）
+  3. 在另一个节点启动备份任务
+  4. 先完成的结果被采用，慢的被取消
+
+检测条件：
+  Task运行时间 > spark.speculation.multiplier × 中位数
+  且失败次数 < spark.speculation.maxFailedTasks
+
+适用场景：
+  非确定性计算（网络抖动）
+  外部服务调用慢
+  纯CPU计算受节点性能影响
+```
+
+### 28.2 配置参数详解
+
+```properties
+# 推测执行配置
+spark.speculation.enabled=true               # 开启推测执行
+spark.speculation.multiplier=1.5             # 慢任务判定倍数
+spark.speculation.quantile=0.75              # 分位数
+spark.speculation.interval=100ms             # 检查间隔
+spark.speculation.maxFailedTasks=3           # 最大失败次数
+
+# 调优建议：
+# 1. multiplier=1.5（默认）：适中灵敏度
+# 2. quantile=0.75：超过75%分位数才推测
+# 3. interval=100ms：频繁检查（开销小）
+# 4. maxFailedTasks=3：避免无限重试
+
+# 监控推测执行：
+# Spark UI → Stages → 查看是否有Speculative任务
+# 检查是否有任务被取消（先完成的生效）
+```
+
+### 28.3 适用与限制
+
+```text
+适用场景：
+  非确定性计算（网络抖动/外部服务慢）
+  纯CPU计算受节点性能影响
+  数据倾斜（部分分区数据量大）
+
+不适用场景：
+  有状态计算（幂等性不确定）
+  写操作（可能双写）
+  依赖外部锁的操作
+  确定性计算（结果必须一致）
+
+最佳实践：
+  1. 生产环境谨慎开启（可能双写）
+  2. 监控推测执行任务数量
+  3. 结合AQE使用（AQE处理倾斜更优雅）
+  4. 外部写操作确保幂等性
+```
+
+## 二十九、Spark on K8s资源分配公式
+
+### 29.1 资源分配计算公式
+
+```text
+Executor资源分配公式：
+
+  Executor核心数（executor-cores）：
+    推荐：2~5核/executor
+    计算：min(可用核心数/预期executor数, 5)
+    过多 → GC压力大
+    过少 → 线程切换开销
+
+  Executor内存（executor-memory）：
+    = spark.executor.memory + spark.executor.memoryOverhead
+    overhead = max(executor-memory × 0.1, 384MB)
+    推荐：4GB~32GB
+
+  Executor数量：
+    = min(集群总核数 / executor-cores, maxExecutors)
+    计算：集群总核数 × 动态分配比例
+
+  Driver内存（driver-memory）：
+    小作业：4GB
+    中等作业：8GB
+    大作业：16GB
+    计算：取决于collect数据量和广播表大小
+
+  分区数（shuffle.partitions）：
+    = 输入数据量 / 128MB（推荐）
+    ≥ 2 × executor总核数
+    计算：max(输入数据量/128MB, 2 × executor总核数)
+```
+
+### 29.2 推荐配置表
+
+| 作业类型 | executor-cores | executor-memory | driver-memory | shuffle.partitions |
+|----------|----------------|-----------------|---------------|-------------------|
+| 小作业 | 4 | 8GB | 4GB | 200 |
+| 中等作业 | 4 | 16GB | 8GB | 500 |
+| 大作业 | 5 | 32GB | 16GB | 2000 |
+| 流式作业 | 4 | 16GB | 8GB | 200 |
+| ML作业 | 4 | 16GB | 8GB | 200 |
+
+### 29.3 资源分配最佳实践
+
+```text
+资源分配最佳实践：
+
+  Executor核心数：
+    推荐4核（平衡GC和并行度）
+    避免超过6核（GC压力大）
+    考虑HDFS客户端并发（每executor最多5个并发）
+
+  Executor内存：
+    Storage和Execution共享（spark.memory.fraction=0.6）
+    预留30%给User Memory和Reserved
+    堆外内存：spark.memory.offHeap.size=4g
+
+  Driver内存：
+    collect大结果：增加driver-memory
+    广播大表：增加driver-memory
+    避免：driver-oom导致作业失败
+
+  动态分配：
+    spark.dynamicAllocation.enabled=true
+    spark.dynamicAllocation.minExecutors=2
+    spark.dynamicAllocation.maxExecutors=20
+    spark.dynamicAllocation.shuffleTracking.enabled=true
+
+  监控指标：
+    Executor CPU利用率：> 70%为佳
+    Executor内存利用率：> 80%为佳
+    GC时间占比：< 10%为佳
+    Shuffle Read/Write：均匀分布为佳
+```
+
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；
 - 文件格式/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
 - 资源调度见「[10-资源调度：YARN与Kubernetes](10-资源调度：YARN与Kubernetes.md)」；

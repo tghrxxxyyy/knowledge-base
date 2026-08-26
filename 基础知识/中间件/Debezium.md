@@ -1076,7 +1076,439 @@ flowchart TD
     H -->|否| J[升级处理]
 ```
 
-## 十五、与其他板块的关系
+## 十五、Debezium SQL Server Connector配置
+
+### 15.1 SQL Server Connector配置
+
+```json
+{
+  "name": "sqlserver-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+    "database.hostname": "sqlserver-host",
+    "database.port": "1433",
+    "database.user": "sa",
+    "database.password": "password",
+    "database.names": "mydatabase",
+    "topic.prefix": "sqlserver",
+    "database.encrypt": "false",
+    "snapshot.mode": "initial",
+    "snapshot.isolation.mode": "snapshot",
+    "poll.interval.ms": "500",
+    "max.batch.size": "1024",
+    "max.queue.size": "8192",
+    "tombstones.on.delete": "true",
+    "column.include.list": "dbo\\.orders\\(.+\\)",
+    "table.include.list": "dbo\\.orders,dbo\\.customers"
+  }
+}
+```
+
+### 15.2 SQL Server CDC配置
+
+```sql
+-- SQL Server CDC配置
+-- 步骤1：启用数据库CDC
+USE mydatabase;
+EXEC sys.sp_cdc_enable_db;
+
+-- 步骤2：启用表CDC
+EXEC sys.sp_cdc_enable_table
+    @source_schema = N'dbo',
+    @source_name = N'orders',
+    @role_name = NULL,
+    @supports_net_changes = 1;
+
+-- 步骤3：查看CDC配置
+SELECT 
+    name,
+    is_cdc_enabled
+FROM sys.databases
+WHERE name = 'mydatabase';
+
+-- 步骤4：查看CDC表
+SELECT 
+    name,
+    is_tracked_by_cdc
+FROM sys.tables
+WHERE name = 'orders';
+```
+
+### 15.3 SQL Server最佳实践
+
+```text
+SQL Server最佳实践：
+
+  配置优化：
+    snapshot.isolation.mode：snapshot（避免锁）
+    poll.interval.ms：500（实时性）
+    max.batch.size：1024（性能）
+
+  性能优化：
+    索引优化：为CDC表创建索引
+    日志管理：定期清理事务日志
+    监控告警：监控CDC延迟
+
+  故障处理：
+    CDC失败：重新启动CDC
+    数据不一致：重新快照
+    性能问题：调整配置参数
+```
+
+## 十六、Debezium MongoDB Connector配置
+
+### 16.1 MongoDB Connector配置
+
+```json
+{
+  "name": "mongodb-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
+    "mongodb.connection.mode": "replica_set",
+    "mongodb.connection.hosts": "mongo1:27017,mongo2:27017,mongo3:27017",
+    "mongodb.user": "debezium",
+    "mongodb.password": "password",
+    "mongodb.database": "mydatabase",
+    "topic.prefix": "mongodb",
+    "collection.include.list": "mydatabase\\.orders\\(.+\\)",
+    "snapshot.mode": "initial",
+    "poll.interval.ms": "1000",
+    "max.batch.size": "1024",
+    "max.queue.size": "8192",
+    "tombstones.on.delete": "true",
+    "field.renames": "mydatabase.orders.amount:order_amount"
+  }
+}
+```
+
+### 16.2 MongoDB Change Streams配置
+
+```javascript
+// MongoDB Change Streams配置
+// 步骤1：创建复制集
+rs.initiate({
+  _id: "myreplicaset",
+  members: [
+    { _id: 0, host: "mongo1:27017" },
+    { _id: 1, host: "mongo2:27017" },
+    { _id: 2, host: "mongo3:27017" }
+  ]
+});
+
+// 步骤2：创建用户
+use admin;
+db.createUser({
+  user: "debezium",
+  pwd: "password",
+  roles: [
+    { role: "read", db: "admin" },
+    { role: "read", db: "mydatabase" },
+    { role: "clusterMonitor", db: "admin" }
+  ]
+});
+
+// 步骤3：启用Change Streams
+use mydatabase;
+db.orders.watch();
+
+// 步骤4：查询Change Streams
+db.orders.watch().on("change", (change) => {
+  printjson(change);
+});
+```
+
+### 16.3 MongoDB最佳实践
+
+```text
+MongoDB最佳实践：
+
+  配置优化：
+    mongodb.connection.mode：replica_set
+    poll.interval.ms：1000（实时性）
+    max.batch.size：1024（性能）
+
+  性能优化：
+    索引优化：为CDC字段创建索引
+    分片策略：合理分片提高性能
+    连接池：配置连接池参数
+
+  故障处理：
+    Change Streams失败：重新启动
+    数据不一致：重新快照
+    性能问题：调整配置参数
+```
+
+## 十七、Debezium MySQL GTID模式配置
+
+### 17.1 GTID模式配置
+
+```json
+{
+  "name": "mysql-gtid-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql-host",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "password",
+    "database.server.id": "1",
+    "database.server.name": "mysql-gtid",
+    "database.include.list": "mydatabase",
+    "gtid.source.includes": "uuid:1-100",
+    "gtid.source.excludes": "uuid:200-300",
+    "snapshot.mode": "initial",
+    "snapshot.gtid.mode": "true",
+    "binlog.format": "ROW",
+    "binlog.row.image": "FULL",
+    "poll.interval.ms": "500",
+    "max.batch.size": "1024",
+    "max.queue.size": "8192",
+    "tombstones.on.delete": "true"
+  }
+}
+```
+
+### 17.2 GTID配置示例
+
+```sql
+-- GTID配置示例
+-- 步骤1：启用GTID
+SET GLOBAL gtid_mode = ON;
+SET GLOBAL enforce_gtid_consistency = ON;
+
+-- 步骤2：查看GTID状态
+SHOW MASTER STATUS;
+SHOW VARIABLES LIKE 'gtid_mode';
+
+-- 步骤3：配置GTID源
+CHANGE MASTER TO
+  MASTER_HOST = 'mysql-host',
+  MASTER_USER = 'debezium',
+  MASTER_PASSWORD = 'password',
+  MASTER_AUTO_POSITION = 1;
+
+-- 步骤4：查看GTID执行记录
+SELECT * FROM mysql.gtid_executed;
+```
+
+### 17.3 GTID最佳实践
+
+```text
+GTID最佳实践：
+
+  配置优化：
+    gtid.source.includes：指定GTID源
+    gtid.source.excludes：排除GTID源
+    snapshot.gtid.mode：启用GTID快照
+
+  性能优化：
+    并行复制：配置并行复制
+    日志管理：定期清理binlog
+    监控告警：监控GTID延迟
+
+  故障处理：
+    GTID冲突：重新初始化
+    位点丢失：重新快照
+    数据不一致：重新同步
+```
+
+## 十八、Eventuate Tram框架集成
+
+### 18.1 Eventuate Tram配置
+
+```java
+// Eventuate Tram配置
+@Configuration
+public class EventuateTramConfig {
+    
+    @Bean
+    public EventuateTramMessageProducerInMemory messageProducer() {
+        return new EventuateTramMessageProducerInMemory();
+    }
+    
+    @Bean
+    public EventuateTramTransactionalEventListener messageListener() {
+        return new EventuateTramTransactionalEventListener(messageProducer());
+    }
+    
+    @Bean
+    public EventuateTramOutboxTransactionalRepository outboxRepository() {
+        return new EventuateTramOutboxTransactionalRepository();
+    }
+}
+
+// 发送消息
+@Service
+public class OrderService {
+    
+    @Autowired
+    private EventuateTramMessageProducerInMemory messageProducer;
+    
+    @Transactional
+    public void createOrder(Order order) {
+        // 保存订单
+        orderRepository.save(order);
+        
+        // 发送消息
+        Message message = MessageBuilder
+            .withPayload(new OrderCreatedEvent(order.getId()))
+            .setHeader("aggregateId", order.getId())
+            .build();
+        
+        messageProducer.send("order.events", message);
+    }
+}
+
+// 消费消息
+@Component
+public class OrderEventHandler {
+    
+    @EventHandler
+    public void handleOrderCreated(OrderCreatedEvent event) {
+        // 处理订单创建事件
+        System.out.println("订单创建: " + event.getOrderId());
+    }
+}
+```
+
+### 18.2 Eventuate Tram架构
+
+```text
+Eventuate Tram架构：
+
+  核心组件：
+    EventuateTramMessageProducer：消息生产者
+    EventuateTramTransactionalEventListener：消息监听器
+    EventuateTramOutboxTransactionalRepository：Outbox仓库
+
+  工作流程：
+    1. 业务操作
+    2. 保存业务数据
+    3. 保存消息到Outbox
+    4. 发送消息到消息队列
+    5. 消费者处理消息
+
+  优势：
+    事务性：业务操作和消息发送原子性
+    幂等性：消息消费幂等性
+    可靠性：消息不丢失
+
+  适用场景：
+    微服务通信
+    事件驱动架构
+    分布式事务
+```
+
+### 18.3 Eventuate Tram最佳实践
+
+```text
+Eventuate Tram最佳实践：
+
+  消息设计：
+    事件命名：OrderCreatedEvent
+    消息结构：事件+聚合ID
+    消息大小：尽量小
+
+  事务管理：
+    事务边界：业务操作和消息发送在同一事务
+    消息确认：消费者确认后才提交事务
+    重试机制：失败重试3次
+
+  性能优化：
+    批量发送：批量发送消息
+    异步消费：异步处理消息
+    连接池：配置连接池
+
+  监控告警：
+    消息发送监控
+    消费延迟监控
+    错误率监控
+```
+
+## 十九、Debezium SMT转换配置
+
+### 19.1 SMT转换配置
+
+```json
+{
+  "name": "mysql-smt-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql-host",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "password",
+    "database.server.id": "1",
+    "database.server.name": "mysql-smt",
+    "database.include.list": "mydatabase",
+    "table.include.list": "mydatabase.orders",
+    "transforms": "route,unwrap,cast",
+    "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.route.regex": "([^.]+)\\.([^.]+)\\.([^.]+)",
+    "transforms.route.replacement": "$3",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.cast.type": "org.apache.kafka.connect.transforms.Cast$Value",
+    "transforms.cast.fields": "amount:float64,quantity:int32"
+  }
+}
+```
+
+### 19.2 SMT转换类型
+
+```text
+SMT转换类型：
+
+  RegexRouter：
+    用途：路由消息到不同Topic
+    配置：正则表达式+替换规则
+    示例：orders → mytopic
+
+  ExtractNewRecordState：
+    用途：提取新记录状态
+    配置：drop.tombstones
+    示例：删除tombstone消息
+
+  Cast：
+    用途：类型转换
+    配置：字段类型映射
+    示例：字符串→数值类型
+
+  MaskField：
+    用途：字段脱敏
+    配置：字段名+脱敏规则
+    示例：密码→******  Value：
+    用途：字段值转换
+    配置：转换函数
+    示例：日期格式转换
+```
+
+### 19.3 SMT最佳实践
+
+```text
+SMT最佳实践：
+
+  转换顺序：
+    1. RegexRouter：路由消息
+    2. ExtractNewRecordState：提取状态
+    3. Cast：类型转换
+    4. MaskField：字段脱敏
+
+  性能优化：
+    减少转换数量：只必要的转换
+    缓存转换结果：避免重复转换
+    批量处理：批量转换消息
+
+  错误处理：
+    转换失败：记录错误并跳过
+    类型错误：默认值处理
+    空值处理：空值检查
+
+  监控告警：
+    转换失败监控
+    转换性能监控
+    数据质量监控
+```
 
 
 
