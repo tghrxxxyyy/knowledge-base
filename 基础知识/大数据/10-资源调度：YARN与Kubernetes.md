@@ -954,3 +954,166 @@ graph TD
 - 编排工具深挖见「[中间件/Airflow](../中间件/Airflow.md)」「[中间件/DolphinScheduler](../中间件/DolphinScheduler.md)」。
 
 > 一句话：**资源调度 = YARN（RM/AM/NM/Container + Capacity 队列）→ K8s（Pod + 亲和性 + HPA/KEDA 弹性）——作业编排负责"依赖与触发"（Airflow/DS），资源调度负责"资源分配"；新架构 K8s 化 + 存算分离 + 状态外置，峰时扩谷时缩成本最优**。
+
+---
+
+## 二十、YARN Timeline Service v2 架构（ATS-hub / ats-store）
+
+### 20.1 ATS v2 架构组件
+
+```text
+YARN Timeline Service v2 架构：
+  ATS Hub（Timeline Reader）：
+    - 无状态读取服务
+    - 支持多实例负载均衡
+    - 提供 REST API 查询
+  
+  ATS Store（Timeline Writer）：
+    - 有状态写入服务
+    - 存储 Application/Container 历史信息
+    - 支持 HBase/LevelDB 后端
+
+数据流：
+  AppMaster → ATS Hub → ATS Store → HBase
+  客户端 → ATS Hub → 查询历史数据
+```
+
+### 20.2 配置参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `yarn.timeline-service.enabled` | 启用 ATS | true |
+| `yarn.timeline-service.ats-timeline-service.enabled` | 启用 v2 | true |
+| `yarn.timeline-service.store.class` | 存储后端 | HBase |
+| `yarn.timeline-service.ttl-ms` | 数据保留时间 | 7 天 |
+
+## 二十一、YARN 公平调度器 vs 容量调度器选型对比
+
+### 21.1 两种调度器对比
+
+| 维度 | 公平调度器 Fair Scheduler | 容量调度器 Capacity Scheduler |
+|------|--------------------------|------------------------------|
+| 资源分配 | 公平共享（FIFO/DRF） | 预留容量（队列） |
+| 弹性共享 | 支持（borrow/lend） | 支持（弹性队列） |
+| 优先级 | 支持（权重） | 支持（队列权重） |
+| 用户限制 | 每用户最小/最大资源 | 每队列容量限制 |
+| 适用场景 | 多租户共享集群 | 企业级生产环境 |
+| 默认调度 | Hadoop 默认 | CDH 默认 |
+
+### 21.2 选型建议
+
+| 场景 | 推荐 | 理由 |
+|------|------|------|
+| 多租户共享 | 公平调度器 | 资源公平共享 |
+| 企业生产 | 容量调度器 | 资源隔离性强 |
+| 混合负载 | 容量调度器 + 弹性 | 稳定+灵活 |
+| 开发测试 | 公平调度器 | 简单易用 |
+
+## 二十二、K8s 调度器扩展（Scheduler Extender / Webhook）
+
+### 22.1 调度器扩展方式
+
+| 方式 | 原理 | 适用场景 |
+|------|------|---------|
+| Scheduler Extender | HTTP 调用外部服务 | 简单扩展 |
+| Scheduler Framework | 内置插件接口 | 深度定制 |
+| Webhook | 准入控制 | 策略执行 |
+
+### 22.2 Scheduler Extender 配置
+
+```yaml
+# scheduler extender 配置
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+extenders:
+  - urlPrefix: "http://my-extender:8080"
+    filterVerb: "filter"
+    prioritizeVerb: "prioritize"
+    bindVerb: "bind"
+    nodeCacheCapable: true
+```
+
+## 二十三、K8s 资源模型（requests / limits 与 QoS 等级对照）
+
+### 23.1 资源请求与限制
+
+| 资源类型 | requests | limits | 说明 |
+|----------|----------|--------|------|
+| CPU | 保证分配 | 硬限制 | 超过 limits 被限流 |
+| 内存 | 保证分配 | 硬限制 | 超过 limits 被 OOMKill |
+| 临时存储 | 保证分配 | 硬限制 | 超过 limits 被驱逐 |
+
+### 23.2 QoS 等级
+
+| QoS 等级 | requests/limits 设置 | 驱逐优先级 | 适用场景 |
+|----------|---------------------|-----------|---------|
+| Guaranteed | requests = limits | 最低（最后驱逐） | 关键服务 |
+| Burstable | requests < limits | 中 | 一般服务 |
+| BestEffort | 未设置 requests/limits | 最高（最先驱逐） | 批处理 |
+
+## 二十四、K8s Pod 优先级与抢占（PriorityClass 配置）
+
+### 24.1 PriorityClass 定义
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "高优先级关键服务"
+preemptionPolicy: PreemptLowerPriority
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 100
+globalDefault: true
+description: "低优先级批处理"
+preemptionPolicy: Never
+```
+
+### 24.2 抢占策略
+
+| preemptionPolicy | 行为 | 适用场景 |
+|-----------------|------|---------|
+| PreemptLowerPriority | 抢占低优先级 Pod | 关键服务 |
+| Never | 不抢占 | 批处理/非关键 |
+
+## 二十五、YARN → K8s 迁移路线图（先批后流 / 共存策略）
+
+### 25.1 迁移路线
+
+```text
+YARN → K8s 迁移路线：
+  阶段 1：评估与规划
+    - 盘点现有 YARN 作业
+    - 评估 K8s 集群能力
+    - 制定迁移优先级
+
+  阶段 2：共存期
+    - YARN 运行存量作业
+    - K8s 运行新作业
+    - 统一监控和告警
+
+  阶段 3：渐进迁移
+    - 无状态作业先迁移
+    - 批处理作业迁移（Spark on K8s）
+    - 流处理作业迁移（Flink on K8s）
+
+  阶段 4：全面 K8s
+    - YARN 集群下线
+    - 所有作业运行在 K8s
+    - 统一调度平台
+```
+
+### 25.2 共存策略
+
+| 策略 | 做法 | 适用 |
+|------|------|------|
+| 网络互通 | YARN/K8s 共享网络 | 数据共享 |
+| 存储共享 | 共享 HDFS/S3 | 统一存储 |
+| 监控统一 | Prometheus 统一采集 | 统一运维 |
+| 调度独立 | 各自管理资源 | 避免干扰 |

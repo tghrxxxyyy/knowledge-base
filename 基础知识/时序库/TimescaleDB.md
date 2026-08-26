@@ -854,3 +854,214 @@ IoT 场景：
 **查询超时 SOP**
 - [ ] 是否命中连续聚合；是否带时间下界。
 - [ ] `EXPLAIN` 看是否全 chunk 扫；缩小时间窗。
+
+---
+
+## 二十九、Hypertable Chunk 自动分区策略调优
+
+### 29.1 Chunk 分区策略
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `chunk_time_interval` | 每个 chunk 的时间跨度 | 1天（高写入）/ 1周（低写入） |
+| `chunk_target_size` | 目标 chunk 大小 | 1GB |
+| `chunk_sizing_func` | chunk 大小计算函数 | 默认 |
+
+### 29.2 分区策略选择
+
+| 数据特征 | chunk_time_interval | 理由 |
+|----------|-------------------|------|
+| 高写入（>1GB/天） | 1 天 | 便于压缩和清理 |
+| 低写入（<100MB/天） | 1 周 | 减少 chunk 数量 |
+| 时序查询为主 | 按查询模式 | 时间范围对齐 |
+| 混合查询 | 1 天 | 平衡写入和查询 |
+
+```sql
+-- 设置 chunk 时间间隔
+SELECT create_hypertable('sensor_data', 'time',
+    chunk_time_interval => INTERVAL '1 day');
+
+-- 查看 chunk 信息
+SELECT * FROM timescaledb_information.chunks
+WHERE hypertable_name = 'sensor_data';
+
+-- 调整已存在 hypertable 的 chunk 间隔
+ALTER TABLE sensor_data SET (
+    timescaledb.chunk_time_interval = '7 days'
+);
+```
+
+## 三十、连续聚合刷新策略与性能
+
+### 30.1 连续聚合 vs 物化视图
+
+| 维度 | 连续聚合 | 物化视图 |
+|------|---------|---------|
+| 刷新方式 | 增量自动刷新 | 全量手动刷新 |
+| 性能 | 高（增量计算） | 低（全量重算） |
+| 实时性 | 支持 real-time aggregation | 不支持 |
+| 存储 | 增量更新 | 全量存储 |
+
+### 30.2 刷新策略配置
+
+```sql
+-- 创建连续聚合
+CREATE MATERIALIZED VIEW sensor_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    sensor_id,
+    AVG(value) AS avg_value,
+    MAX(value) AS max_value,
+    COUNT(*) AS sample_count
+FROM sensor_data
+GROUP BY bucket, sensor_id;
+
+-- 添加刷新策略
+SELECT add_continuous_aggregate_policy('sensor_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour');
+
+-- real-time aggregation（实时查询未刷新数据）
+ALTER MATERIALIZED VIEW sensor_hourly SET (timescaledb.materialized_only = false);
+```
+
+## 三十一、压缩策略调优（segmentby / orderby 最佳组合）
+
+### 31.1 压缩配置参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `segmentby` | 分段列（高基数） | sensor_id/device_id |
+| `orderby` | 排序列（时间相关） | time DESC |
+| `compress_after` | 自动压缩时间 | 7 天 |
+
+### 31.2 压缩效果对比
+
+| 配置 | 压缩比 | 查询性能 | 适用场景 |
+|------|--------|---------|---------|
+| segmentby=sensor_id, orderby=time | 10:1 | 高（按 sensor 查询） | IoT 监控 |
+| segmentby=device_type, orderby=time | 8:1 | 中（按类型查询） | 设备管理 |
+| segmentby=time, orderby=sensor_id | 6:1 | 低（按时间查询） | 时间序列分析 |
+
+```sql
+-- 启用压缩
+ALTER TABLE sensor_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'sensor_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+
+-- 添加自动压缩策略
+SELECT add_compression_policy('sensor_data', INTERVAL '7 days');
+
+-- 手动压缩
+SELECT compress_chunk('_timescaledb_internal._compressed_hypertable_1');
+```
+
+## 三十二、多节点分布式 Hypertable 部署架构
+
+### 32.1 分布式架构
+
+```text
+TimescaleDB 多节点架构：
+  数据节点（Data Node）：
+    - 存储实际数据
+    - 执行本地查询
+    - 支持水平扩展
+  
+  访问节点（Access Node）：
+    - 接收客户端查询
+    - 分发查询到数据节点
+    - 合并结果返回
+
+分布式 Hypertable：
+  数据自动分布到多个数据节点
+  基于分片键（distributed hypertable）
+  支持分布式聚合和连接
+```
+
+### 32.2 分布式部署配置
+
+```sql
+-- 创建分布式 Hypertable
+SELECT create_distributed_hypertable('sensor_data', 'time',
+    chunk_time_interval => INTERVAL '1 day',
+    partitioning_column => 'sensor_id',
+    number_partitions => 4);
+
+-- 查看数据分布
+SELECT * FROM timescaledb_information.chunks
+WHERE hypertable_name = 'sensor_data'
+ORDER BY node_name;
+
+-- 添加数据节点
+SELECT add_data_node('data-node-1', host => '10.0.0.1');
+SELECT add_data_node('data-node-2', host => '10.0.0.2');
+```
+
+## 三十三、TimescaleDB 与 Grafana 集成最佳实践
+
+### 33.1 Grafana 配置
+
+```yaml
+# grafana/provisioning/datasources/timescaledb.yml
+apiVersion: 1
+datasources:
+  - name: TimescaleDB
+    type: postgres
+    url: timescaledb:5432
+    database: tsdb
+    user: grafana
+    secureJsonData:
+      password: ${TSDB_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 120000
+      timescaledb: true
+```
+
+### 33.2 Grafana 查询优化
+
+| 优化策略 | 做法 | 效果 |
+|----------|------|------|
+| 时间范围对齐 | 查询带时间下界 | 避免全表扫描 |
+| 连续聚合 | 预计算聚合 | 查询加速 10x |
+| 分区裁剪 | chunk 过滤 | 减少扫描数据 |
+| 降采样 | 低精度数据 | 减少传输量 |
+
+## 三十四、TimescaleDB 在 IoT 数据平台中的应用案例
+
+### 34.1 IoT 数据平台架构
+
+```mermaid
+flowchart LR
+    subgraph 设备层
+        D1[传感器] --> D2[网关]
+    end
+    subgraph 采集层
+        D2 --> K[Kafka]
+    end
+    subgraph 存储层
+        K --> T[TimescaleDB]
+        K --> I[Iceberg]
+    end
+    subgraph 计算层
+        T --> F[Flink]
+        I --> F
+    end
+    subgraph 服务层
+        T --> G[Grafana]
+        F --> API[API]
+    end
+```
+
+### 34.2 应用场景
+
+| 场景 | 数据特征 | TimescaleDB 优势 |
+|------|---------|-----------------|
+| 设备监控 | 高写入、时间序列 | 压缩+连续聚合 |
+| 告警规则 | 实时查询 | 低延迟查询 |
+| 历史分析 | 大数据量 | 时间旅行+压缩 |
+| 预测分析 | 特征工程 | 连续聚合+窗口函数 |

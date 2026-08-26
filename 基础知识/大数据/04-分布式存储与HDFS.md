@@ -984,3 +984,181 @@ Schema治理：
 ```
 
 > 一句话：**HDFS = 分块（128MB）+ 多副本（机架感知）+ 中心元数据（NN+QJM HA）——理解"小文件是杀手、随机写是弱项、EC 是冷数据降本神器"；新平台转对象存储 + 开放表格式实现存算分离**。
+
+---
+
+## 二十一、HDFS 3.x Erasure Coding 性能与 RAID 对比
+
+### 21.1 Erasure Coding 原理
+
+```text
+Erasure Coding（纠删码）：
+  将数据编码为 n 个数据块 + m 个校验块
+  任意 m 个块丢失可恢复
+  存储开销 = (n+m)/n（远低于 3 副本）
+
+HDFS 3.x 默认策略：
+  RS-6-3-1024k：6 数据块 + 3 校验块
+  存储开销：9/6 = 1.5x（vs 3 副本 3x）
+  容错：任意 3 块丢失可恢复
+```
+
+### 21.2 EC vs RAID 对比
+
+| 维度 | HDFS EC | RAID 5 | RAID 6 |
+|------|---------|--------|--------|
+| 存储开销 | 1.5x | 1.33x | 1.25x |
+| 容错能力 | 3 块丢失 | 1 块丢失 | 2 块丢失 |
+| 扩展性 | 横向扩展 | 受限 | 受限 |
+| 适用场景 | 冷数据/归档 | 本地磁盘 | 本地磁盘 |
+| HDFS 集成 | 原生支持 | 需要外部存储 | 需要外部存储 |
+
+### 21.3 EC 配置
+
+```bash
+# 启用 EC 策略
+hdfs ec -setPolicy -path /cold-data -policy RS-6-3-1024k
+
+# 查看 EC 策略
+hdfs ec -getPolicy -path /cold-data
+
+# 查看所有 EC 策略
+hdfs ec -listPolicies
+```
+
+## 二十二、HDFS 存储策略（HOT / WARM / COLD / ALL_SSD）配置
+
+### 22.1 存储策略对比
+
+| 策略 | 副本数 | 介质 | 适用场景 |
+|------|--------|------|---------|
+| HOT | 3 | 磁盘 | 频繁访问 |
+| WARM | 2 | 磁盘+归档 | 偶尔访问 |
+| COLD | 1 | 归档/冷存储 | 极少访问 |
+| ALL_SSD | 3 | SSD | 高性能需求 |
+| ONE_SSD | 2 | SSD+磁盘 | 性能+成本平衡 |
+| LAZY_PERSIST | 2 | 内存+磁盘 | 写密集 |
+
+### 22.2 存储策略配置
+
+```bash
+# 设置存储策略
+hdfs storagepolicies -setStoragePolicy -path /data/hot -policy HOT
+hdfs storagepolicies -setStoragePolicy -path /data/warm -policy WARM
+hdfs storagepolicies -setStoragePolicy -path /data/cold -policy COLD
+
+# 迁移数据到新策略
+hdfs mover -p /data/warm
+
+# 查看存储策略
+hdfs storagepolicies -getStoragePolicy -path /data/hot
+```
+
+## 二十三、HDFS Balancer 最佳实践（带宽限制 / 阈值设置）
+
+### 23.1 Balancer 配置参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `dfs.datanode.balance.bandwidthPerSec` | 每节点带宽限制 | 100MB/s |
+| `dfs.balancer.period` | Balancer 周期 | 300s |
+| `dfs.datanode.balance.bandwidthPerSec` | 并发平衡线程数 | 5 |
+| 阈值 | 节点利用率差异 | 10% |
+
+### 23.2 Balancer 执行
+
+```bash
+# 启动 Balancer（阈值 10%）
+hdfs balancer -threshold 10 -policy datanode
+
+# 限制带宽
+hdfs balancer -threshold 10 -policy datanode \
+  -Ddfs.datanode.balance.bandwidthPerSec=104857600
+
+# 查看 Balancer 状态
+hdfs dfsadmin -printTopology
+```
+
+## 二十四、HDFS NameNode RPC 处理优化（handler.count）
+
+### 24.1 关键配置参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `dfs.namenode.handler.count` | NameNode RPC 处理线程数 | 100~200 |
+| `dfs.namenode.service.handler.count` | 服务 RPC 处理线程数 | 100 |
+| `dfs.namenode.max-extra-delay` | 超时延迟 | 2s |
+| `dfs.namenode.max-lock-hold-time` | 锁持有时间 | 5s |
+
+### 24.2 优化建议
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.namenode.handler.count</name>
+  <value>200</value>
+</property>
+<property>
+  <name>dfs.namenode.service.handler.count</name>
+  <value>100</value>
+</property>
+<property>
+  <name>dfs.namenode.safemode.threshold-pct</name>
+  <value>0.999</value>
+</property>
+```
+
+## 二十五、云对象存储替代 HDFS（S3A / GCS 配置对比）
+
+### 25.1 对象存储对比
+
+| 维度 | S3A (AWS) | GCS (GCP) | OSS (阿里云) |
+|------|-----------|-----------|-------------|
+| 协议 | S3 API | GCS API | S3 兼容 |
+| 一致性 | 最终一致 | 强一致 | 最终一致 |
+| 延迟 | 10~100ms | 10~100ms | 10~100ms |
+| 成本 | 按量计费 | 按量计费 | 按量计费 |
+| 适用 | AWS 体系 | GCP 体系 | 阿里云体系 |
+
+### 25.2 S3A 配置示例
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>fs.s3a.endpoint</name>
+  <value>s3.amazonaws.com</value>
+</property>
+<property>
+  <name>fs.s3a.access.key</name>
+  <value>${AWS_ACCESS_KEY}</value>
+</property>
+<property>
+  <name>fs.s3a.path.style.access</name>
+  <value>false</value>
+</property>
+<property>
+  <name>fs.s3a.fast.upload</name>
+  <value>true</value>
+</property>
+```
+
+## 二十六、数据治理工具（Apache Atlas / DataHub）在 HDFS 中的应用
+
+### 26.1 数据治理工具对比
+
+| 工具 | 功能 | 适用场景 |
+|------|------|---------|
+| Apache Atlas | 元数据管理+血缘+分类 | Hadoop 生态 |
+| DataHub | 元数据平台+搜索+血缘 | 现代数据栈 |
+| Amundsen | 元数据搜索+数据发现 | 数据发现 |
+| OpenMetadata | 元数据标准+治理 | 通用 |
+
+### 26.2 HDFS 数据治理实践
+
+| 治理维度 | 工具 | 实现方式 |
+|----------|------|---------|
+| 元数据管理 | Atlas/DataHub | 自动采集 HDFS 表/列元数据 |
+| 数据血缘 | Atlas | ETL 任务血缘自动关联 |
+| 数据分类 | Atlas | 敏感数据自动分类标签 |
+| 数据质量 | Great Expectations | 数据质量规则校验 |
+| 生命周期 | HDFS 策略 | HOT/WARM/COLD 自动迁移 |

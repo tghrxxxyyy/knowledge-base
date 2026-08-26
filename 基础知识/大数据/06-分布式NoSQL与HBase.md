@@ -873,7 +873,204 @@ groups:
 | 价格 | 自运维成本 | 按使用量付费 |
 | 适用 | 国内自建/混合云 | GCP 原生/全球部署 |
 
-## 二十三、与其他板块的关系
+## 二十三、HBase Compaction 调度器参数详解
+
+### 23.1 Compaction 类型与参数
+
+| Compaction 类型 | 触发条件 | 目标 | 影响 |
+|----------------|---------|------|------|
+| Minor Compaction | HFile 数量达到阈值 | 合并小文件 | 低 I/O |
+| Major Compaction | 定时/手动触发 | 合并所有文件 | 高 I/O |
+| Flush | MemStore 达到阈值 | 写入磁盘 | 瞬时 I/O |
+
+### 23.2 关键参数配置
+
+```xml
+<!-- hbase-site.xml -->
+<!-- Minor Compaction 触发阈值 -->
+<property>
+  <name>hbase.hstore.compactionThreshold</name>
+  <value>3</value>  <!-- 最少 3 个 HFile 触发 Minor -->
+</property>
+
+<!-- Major Compaction 周期 -->
+<property>
+  <name>hbase.hstore.majorcompaction.time</name>
+  <value>604800000</value>  <!-- 7 天 -->
+</property>
+
+<!-- Compaction 并发数 -->
+<property>
+  <name>hbase.regionserver.compacting.large.thread.count</name>
+  <value>3</value>
+</property>
+<property>
+  <name>hbase.regionserver.compacting.small.thread.count</name>
+  <value>3</value>
+</property>
+```
+
+### 23.3 Compaction 调度策略
+
+| 策略 | 参数 | 说明 |
+|------|------|------|
+| FIFO | 默认 | 按 HFile 创建时间排序 |
+| RatioBased | hbase.store.compaction.ratio | 按大小比率合并 |
+| Exploring | 探索式 | 寻找最优合并组合 |
+
+## 二十四、Coprocessor 观察者模式代码示例
+
+### 24.1 RegionObserver 接口
+
+```java
+public class MyObserver extends BaseRegionObserver {
+    
+    // Pre-Put：写入前拦截
+    @Override
+    public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                       Put put, WALEdit edit, Durability durability) throws IOException {
+        // 添加自动时间戳
+        if (put.getTimestamp() == HConstants.LATEST_TIMESTAMP) {
+            put.putColumn(Bytes.toBytes("cf"), Bytes.toBytes("ts"),
+                         Bytes.toBytes(System.currentTimeMillis()));
+        }
+    }
+    
+    // Post-Get：读取后处理
+    @Override
+    public void postGetOp(ObserverContext<RegionCoprocessorEnvironment> e,
+                          Get get, List<Cell> results) throws IOException {
+        // 解密敏感字段
+        for (Cell cell : results) {
+            if (Bytes.toString(CellUtil.cloneQualifier(cell)).equals("encrypted_data")) {
+                // 解密逻辑
+            }
+        }
+    }
+}
+```
+
+### 24.2 注册 Coprocessor
+
+```bash
+# 方式 1：表级注册
+hbase shell
+alter 'my_table', {NAME => 'cf', COPROCESSOR => 
+  '1|com.example.MyObserver|priority=1000'}
+
+# 方式 2：配置文件全局注册
+hbase.coprocessor.region.classes=com.example.MyObserver
+```
+
+## 二十五、Phoenix 二级索引（Global / Local / Functional Index）
+
+### 25.1 索引类型对比
+
+| 索引类型 | 存储位置 | 适用场景 | 写入影响 |
+|----------|---------|---------|---------|
+| Global Index | 独立 HBase 表 | 读多写少 | 写放大（多表同步） |
+| Local Index | 同 Region | 写多读少 | 无跨 Region 开销 |
+| Functional Index | 表达式索引 | 复杂查询 | 表达式计算开销 |
+
+### 25.2 索引创建示例
+
+```sql
+-- Global Index
+CREATE INDEX my_idx ON my_table (col1) INCLUDE (col2, col3);
+
+-- Local Index
+CREATE LOCAL INDEX my_local_idx ON my_table (col1);
+
+-- Functional Index
+CREATE INDEX my_func_idx ON my_table (UPPER(col1));
+
+-- 查询自动使用索引
+SELECT col1, col2 FROM my_table WHERE col1 = 'value';
+```
+
+## 二十六、Region Split 策略与热点预防
+
+### 26.1 Split 策略
+
+| 策略 | 算法 | 适用场景 |
+|------|------|---------|
+| ConstantSize | 固定大小分裂 | 均匀写入 |
+| IncreasingToUpperBound | 翻倍增长 | 默认策略 |
+| KeyPrefixRegionSplitPolicy | 前缀分组 | 前缀热点 |
+
+### 26.2 热点预防
+
+```text
+热点预防策略：
+  1. RowKey 设计：加盐/反转/散列
+  2. 预分区：建表时指定 Split Point
+  3. 负载均衡：启用 RegionServer 自动负载均衡
+  4. 监控：观察 Region 热点分布
+
+RowKey 加盐示例：
+  原始 RowKey: user_12345
+  加盐后: 3_user_12345（0~9 随机前缀）
+```
+
+```bash
+# 预分区创建表
+create 'my_table', {NAME => 'cf', VERSIONS => 3}, 
+  SPLITS => ['1000', '2000', '3000', '4000', '5000']
+```
+
+## 二十七、HBase 监控指标（NumRegionServers / RequestCount / BlockCacheHitRatio）
+
+### 27.1 关键监控指标
+
+| 指标 | 含义 | 告警阈值 |
+|------|------|---------|
+| NumRegionServers | 在线 RS 数量 | < 预期值 |
+| RequestCount | 每秒请求数 | 突增/突降 |
+| BlockCacheHitRatio | BlockCache 命中率 | < 80% |
+| CompactionQueueSize | Compaction 队列长度 | > 100 |
+| MemStoreSize | MemStore 大小 | > 1GB |
+| StoreFileCount | StoreFile 数量 | > 100 |
+
+### 27.2 Prometheus 监控配置
+
+```yaml
+# JMX Exporter 配置
+rules:
+  - pattern: "HBase<name=RegionServer,.*>(.*RequestCount.*)"
+    name: "hbase_regionserver_requests_total"
+    type: GAUGE
+  - pattern: "HBase<name=RegionServer,.*>(.*BlockCacheHitRatio.*)"
+    name: "hbase_regionserver_blockcache_hit_ratio"
+    type: GAUGE
+```
+
+## 二十八、HBase 在海量宽表场景的查询优化
+
+### 28.1 宽表查询优化策略
+
+| 优化策略 | 做法 | 效果 |
+|----------|------|------|
+| 列族精简 | 减少列族数量 | 减少 I/O |
+| Bloom Filter | 启用布隆过滤器 | 减少无效读 |
+| Block Cache | 增大 BlockCache | 提升读性能 |
+| 二级索引 | Phoenix Global Index | 支持多维查询 |
+| 预聚合 | Coprocessor 聚合 | 减少网络传输 |
+
+### 28.2 查询优化配置
+
+```xml
+<!-- 启用 Bloom Filter -->
+<property>
+  <name>hfile.block.cache.size</name>
+  <value>0.4</value>  <!-- BlockCache 占堆内存 40% -->
+</property>
+
+<!-- 启用 LRU Bloom Filter -->
+<property>
+  <name>hbase.regionserver.storefile.enabled</name>
+  <value>true</value>
+</property>
+```
 
 - HDFS 基础见「[04-分布式存储与HDFS](04-分布式存储与HDFS.md)」；
 - 宽列存储对比见「[中间件/Cassandra与宽列存储](../中间件/Cassandra与宽列存储.md)」；

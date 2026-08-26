@@ -861,3 +861,192 @@ flowchart TD
 | 缓存大小 | 增加TSM缓存 | 提高读性能 |
 | 并行查询 | 启用并行执行 | 加速复杂查询 |
 | 索引优化 | 使用时间索引 | 加速时间范围查询 |
+
+---
+
+## 二十九、InfluxDB 3.0 架构演进（IOx / Parquet / 对象存储）
+
+### 29.1 架构演进
+
+| 版本 | 存储引擎 | 架构 | 特点 |
+|------|---------|------|------|
+| 1.x | TSM | 单机 | 简单、有限扩展 |
+| 2.x | TSM | 单机/集群 | 增强查询、任务 |
+| 3.0 | IOx+Parquet | 分布式 | 云原生、列存、对象存储 |
+
+### 29.2 InfluxDB 3.0 核心组件
+
+```text
+InfluxDB 3.0 架构：
+  IOx（查询引擎）：
+    - Apache Arrow 列存格式
+    - DataFusion 查询引擎
+    - 支持 SQL 和 InfluxQL
+  
+  Parquet（存储格式）：
+    - 列式存储
+    - 高压缩比
+    - 列式查询优化
+  
+  对象存储（S3/GCS）：
+    - 成本低
+    - 无限扩展
+    - 持久化保障
+
+数据流：
+  写入 → Arrow → WAL → Parquet → 对象存储
+  查询 → Arrow → DataFusion → 结果
+```
+
+## 三十、Flux 查询语言与 InfluxQL 对比
+
+### 30.1 查询语言对比
+
+| 维度 | InfluxQL | Flux |
+|------|---------|------|
+| 语法风格 | SQL-like | 函数式 |
+| 功能范围 | 基础查询+聚合 | 高级分析+脚本 |
+| 跨数据源 | 有限 | 支持多数据源 |
+| 学习曲线 | 低 | 中 |
+| 性能 | 高（优化好） | 中（通用引擎） |
+
+### 30.2 Flux 查询示例
+
+```flux
+// Flux 查询：按小时聚合
+from(bucket: "my-bucket")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> filter(fn: (r) => r._field == "usage_user")
+  |> aggregateWindow(every: 1h, fn: mean)
+  |> yield(name: "mean")
+
+// Flux 跨数据源查询
+from(bucket: "my-bucket")
+  |> range(start: -1d)
+  |> filter(fn: (r) => r._measurement == "sensor")
+  |> join(tables: {temp: temperature, humidity: humidity})
+  |> map(fn: (r) => ({_time: r._time, temp: r._value_temp, hum: r._value_humidity}))
+```
+
+## 三十一、连续查询（Continuous Query）vs Task 实现降采样
+
+### 31.1 降采样方式对比
+
+| 方式 | InfluxDB 版本 | 原理 | 适用 |
+|------|--------------|------|------|
+| Continuous Query | 1.x/2.x | 后台自动聚合 | 传统架构 |
+| Task | 2.x/3.0 | Flux 脚本定时执行 | 现代架构 |
+
+### 31.2 实现示例
+
+```sql
+-- Continuous Query（InfluxDB 1.x）
+CREATE CONTINUOUS QUERY "cpu_1h" ON "mydb"
+BEGIN
+  SELECT MEAN("usage_user") AS "avg_user"
+  INTO "cpu_1h"
+  FROM "cpu"
+  GROUP BY time(1h), *
+END
+```
+
+```flux
+// Flux Task（InfluxDB 2.x/3.0）
+option task = {name: "downsample_cpu", every: 1h}
+
+from(bucket: "my-bucket")
+  |> range(start: -task.every)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> aggregateWindow(every: 1h, fn: mean)
+  |> to(bucket: "downsampled-bucket", org: "my-org")
+```
+
+## 三十二、InfluxDB 集群方案（Kubernetes Operator / K8s 部署）
+
+### 32.1 集群部署方式
+
+| 方式 | 架构 | 适用 |
+|------|------|------|
+| 单机 | 单节点 | 开发/测试 |
+| K8s Operator | 分布式集群 | 生产环境 |
+| InfluxDB Cloud | 全托管 SaaS | 云原生 |
+
+### 32.2 InfluxDB Kubernetes Operator
+
+```yaml
+# InfluxDB 集群部署
+apiVersion: influxdata.com/v1alpha1
+kind: InfluxDB
+metadata:
+  name: influxdb-cluster
+spec:
+  size: 3
+  image: influxdb:3.0
+  storage:
+    size: 100Gi
+    storageClassName: fast-ssd
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+```
+
+## 三十三、InfluxDB vs Prometheus vs TDengine 选型决策树
+
+### 33.1 选型决策树
+
+```mermaid
+flowchart TD
+    A{数据特征?} -->|纯时序| B{规模?}
+    B -->|中小规模| C{功能需求?}
+    C -->|基础监控| D[Prometheus]
+    C -->|高级查询| E[InfluxDB]
+    B -->|大规模| F{部署方式?}
+    F -->|自建| G[TDengine]
+    F -->|云托管| H[InfluxDB Cloud]
+    A -->|混合负载| I{分析需求?}
+    I -->|时序分析| J[TDengine]
+    I -->|实时+分析| K[InfluxDB 3.0]
+```
+
+### 33.2 选型对比
+
+| 维度 | Prometheus | InfluxDB | TDengine |
+|------|-----------|----------|----------|
+| 数据模型 | 指标 | 指标+事件 | 超级表 |
+| 查询语言 | PromQL | InfluxQL/Flux | SQL |
+| 存储引擎 | 本地TSDB | TSM/IOx | 时序引擎 |
+| 扩展性 | 联邦/Thanos | 单机/集群 | 原生集群 |
+| 适用场景 | K8s监控 | IoT/DevOps | 大规模IoT |
+
+## 三十四、InfluxDB 性能优化（Retention Policy / Shard Duration）
+
+### 34.1 性能优化策略
+
+| 策略 | 做法 | 效果 |
+|------|------|------|
+| Retention Policy | 自动过期旧数据 | 减少存储量 |
+| Shard Duration | 按时间分片 | 减少扫描数据 |
+| 压缩 | 启用压缩算法 | 减少存储空间 |
+| 索引优化 | 时间索引 | 加速时间查询 |
+
+### 34.2 配置示例
+
+```sql
+-- 创建 Retention Policy
+CREATE RETENTION POLICY "7d" ON "mydb" 
+  DURATION 7d REPLICATION 1 DEFAULT;
+
+-- 创建 Shard Group
+CREATE SUBSCRIPTION "sub" ON "mydb"."default" 
+  DESTINATIONS ALL 'http://other-influxdb:8086';
+
+-- InfluxDB 2.x 保留规则
+influx delete --bucket my-bucket \
+  --start 1970-01-01T00:00:00Z \
+  --stop $(date -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
+```

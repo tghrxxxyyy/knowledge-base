@@ -841,7 +841,211 @@ Flink K8s Operator：
   适合 GitOps 流程
 ```
 
-## 二十、与其他板块的关系
+## 二十、Flink 状态后端对比（HashMapStateBackend vs RocksDBStateBackend）
+
+### 20.1 两种状态后端对比
+
+| 维度 | HashMapStateBackend | RocksDBStateBackend |
+|------|-------------------|-------------------|
+| 存储位置 | JVM 堆内存 | 本地磁盘（LSM-Tree） |
+| 状态大小限制 | 受 JVM 堆限制（通常 < 10GB） | 受磁盘限制（TB 级） |
+| 读写速度 | 极快（内存访问） | 较快（磁盘 I/O + 缓存） |
+| Checkpoint | 全量快照（序列化到外存） | 增量快照（SST 文件上传） |
+| 适用场景 | 小状态/低延迟 | 大状态/高吞吐 |
+
+### 20.2 选择标准
+
+```text
+选择 HashMapStateBackend：
+  - 状态 < 10GB
+  - 延迟要求 < 10ms
+  - 有充足 JVM 堆内存
+  - 开发/测试环境
+
+选择 RocksDBStateBackend：
+  - 状态 > 10GB
+  - 高吞吐场景
+  - 需要增量 Checkpoint
+  - 生产环境（推荐默认）
+```
+
+```java
+// 配置状态后端
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+// 方式 1：HashMapStateBackend
+env.setStateBackend(new HashMapStateBackend());
+
+// 方式 2：RocksDBStateBackend（推荐生产）
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true)); // true = 增量 checkpoint
+env.getCheckpointConfig().setCheckpointStorage("hdfs:///flink/checkpoints");
+```
+
+## 二十一、Savepoint vs Checkpoint 区别与最佳实践
+
+### 21.1 核心区别
+
+| 维度 | Checkpoint | Savepoint |
+|------|-----------|----------|
+| 触发方式 | Flink 自动（定时） | 手动触发 |
+| 存储格式 | 增量/全量（状态后端决定） | 标准化（全量） |
+| 生命周期 | 作业取消后可配置保留 | 永久保留（手动删除） |
+| 用途 | 故障恢复 | 版本升级/迁移/重启 |
+| 性能 | 快（增量优化） | 慢（全量序列化） |
+
+### 21.2 最佳实践
+
+```text
+最佳实践：
+  1. 定期 Savepoint：每次大版本升级前触发 Savepoint
+  2. Checkpoint 频率：30s~1min 一次（平衡恢复时间与开销）
+  3. Savepoint 保留策略：保留最近 3~5 个，定期清理旧的
+  4. 外部存储：Checkpoint/Savepoint 存储到 HDFS/S3（非本地）
+  5. 状态 TTL：设置合理的 TTL 避免状态无限膨胀
+```
+
+```bash
+# 手动触发 Savepoint
+flink savepoint :jobId hdfs:///flink/savepoints/
+
+# 从 Savepoint 恢复
+flink run -s hdfs:///flink/savepoints/savepoint-xxx -c com.example.Job job.jar
+
+# 取消作业并保留 Checkpoint
+flink cancel -s hdfs:///flink/savepoints/ :jobId
+```
+
+## 二十二、Flink CEP 复杂事件处理
+
+### 22.1 Pattern 定义
+
+```java
+// CEP 模式定义：5 分钟内连续 3 次登录失败
+Pattern<Event, ?> pattern = Pattern.<Event>begin("start")
+    .where(new SimpleCondition<Event>() {
+        @Override
+        public boolean filter(Event event) {
+            return "LOGIN_FAILED".equals(event.getType());
+        }
+    })
+    .timesOrMore(3)
+    .within(Time.minutes(5));
+
+// 应用模式
+PatternStream<Event> patternStream = CEP.pattern(input, pattern);
+
+// 处理匹配结果
+patternStream.select(new PatternTimeoutFunction<Event, String>() {
+    @Override
+    public String timeout(Map<String, List<Event>> pattern, long timeoutTimestamp) {
+        return "Timeout: " + pattern.get("start").size() + " failures";
+    }
+}).withTimeout(Time.minutes(5));
+```
+
+### 22.2 超时处理
+
+| 超时策略 | 配置 | 适用场景 |
+|----------|------|---------|
+| withTimeout | `within(Time.minutes(5))` | 限时事件序列 |
+| withTimestampsAndWatermarks | 事件时间驱动 | 基于事件时间的超时 |
+| Processing Time | 处理时间驱动 | 简单超时场景 |
+
+## 二十三、Flink Table API/SQL 转换流程
+
+```java
+// 创建表环境
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+StreamTableEnvironment tableEnv = StreamTableEnvironment.create(env);
+
+// 定义 DataStream
+DataStream<Event> inputStream = env.addSource(...);
+
+// DataStream → Table
+Table eventTable = tableEnv.fromDataStream(inputStream);
+
+// Table → SQL 查询
+Table result = tableEnv.sqlQuery(
+    "SELECT user_id, COUNT(*) as fail_count " +
+    "FROM " + eventTable + " " +
+    "WHERE event_type = 'LOGIN_FAILED' " +
+    "GROUP BY user_id " +
+    "HAVING COUNT(*) >= 3"
+);
+
+// Table → DataStream
+DataStream<Result> resultStream = tableEnv.toDataStream(result, Result.class);
+```
+
+## 二十四、Flink on K8s 三种模式对比
+
+| 模式 | 原理 | 资源管理 | 适用场景 |
+|------|------|---------|---------|
+| Session | 共享 Flink 集群 | 固定资源 | 开发/测试/短作业 |
+| Per-Job | 每个作业独立集群 | 独立资源 | 生产环境（推荐） |
+| Application | 作业代码打包成镜像 | K8s 原生 | 云原生/Serverless |
+
+```yaml
+# Flink on K8s Per-Job 模式
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-flink-job
+spec:
+  image: my-flink-job:1.0
+  flinkVersion: v1_17
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.checkpoints.dir: "s3://bucket/checkpoints"
+    state.backend: rocksdb
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: "local:///opt/flink/usrlib/my-job.jar"
+    entryClass: "com.example.MyJob"
+    parallelism: 4
+```
+
+## 二十五、Flink Exactly-Once Sink 两阶段提交原理
+
+### 25.1 两阶段提交流程
+
+```mermaid
+flowchart TD
+    A[算子处理完成] --> B[预提交 Pre-Commit]
+    B --> C[写入本地事务日志]
+    C --> D[Checkpoint 完成]
+    D --> E[提交 Commit]
+    E --> F[写入下游系统]
+    F --> G[确认提交]
+    D -->|失败| H[回滚 Abort]
+    H --> I[清理本地事务日志]
+```
+
+### 25.2 支持 Exactly-Once 的 Sink
+
+| Sink | 事务机制 | 适用场景 |
+|------|---------|---------|
+| Kafka | 事务 Producer | Kafka 到 Kafka |
+| JDBC | 数据库事务 | 关系型数据库 |
+| HDFS | 原子写入 | HDFS 文件 |
+| S3 | 幂等写入 | 对象存储 |
+
+```java
+// Kafka Exactly-Once Sink 配置
+KafkaSink.builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(...)
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-")
+    .build();
+```
 
 - 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；
 - 批处理对比见「[07-批处理计算：MapReduce与Spark](07-批处理计算：MapReduce与Spark.md)」；

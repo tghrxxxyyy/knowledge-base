@@ -852,7 +852,213 @@ Shuffle Tracking（Spark 3.0+）：
   缩容：Executor 空闲超过 60s
 ```
 
-## 十九、与其他板块的关系
+## 十九、Shuffle 内存管理（ExternalSorter Spill 策略 / UnifiedMemoryManager）
+
+### 19.1 Shuffle 内存管理机制
+
+| 组件 | 功能 | 内存管理策略 |
+|------|------|-------------|
+| ExternalSorter | Shuffle 写端排序 | 内存→磁盘 Spill |
+| UnifiedMemoryManager | 统一内存管理 | Storage/Execution 动态共享 |
+| UnsafeExternalSorter | 外部排序器 | 内存+磁盘混合排序 |
+| SortBasedShuffleWriter | 排序写入 | 按分区排序写入 |
+
+### 19.2 ExternalSorter Spill 策略
+
+```text
+Spill 策略：
+  1. 内存缓冲区满（spark.shuffle.spill.batchSize）
+  2. 排序后写入磁盘临时文件
+  3. 最终合并多个临时文件（Merge）
+  4. 压缩（spark.shuffle.compress=true）
+
+配置参数：
+  spark.shuffle.spill.batchSize=10000    # 每批写入条数
+  spark.shuffle.spill.initialBuffer=32768 # 初始缓冲区大小
+  spark.shuffle.sort.bypassMergeThreshold=400  # 直接排序阈值
+```
+
+### 19.3 UnifiedMemoryManager 内存分配
+
+```text
+UnifiedMemoryManager 内存分配：
+  总可用内存 = JVM Heap - 300MB (Reserved)
+  
+  Storage 内存：缓存 RDD/DataFrame
+  Execution 内存：Shuffle/Join/Sort/Aggregation
+  
+  动态共享：
+    Storage 可借用 Execution 空闲内存
+    Execution 可借用 Storage 空闲内存
+    互相借用优先级由 spark.memory.storageFraction 控制
+
+配置参数：
+  spark.memory.fraction=0.6           # 总可用内存比例
+  spark.memory.storageFraction=0.5    # Storage 默认占比
+```
+
+## 二十、数据倾斜解决方案大全（Salting / Broadcast Join / AFS / AQE Skew Join）
+
+### 20.1 数据倾斜识别
+
+```text
+数据倾斜信号：
+  1. Stage 中某 Task 执行时间远超其他 Task
+  2. Shuffle Read/Write 数据量分布极不均匀
+  3. 某个 Stage 长时间卡在 99% 进度
+
+诊断方法：
+  Spark UI → Stages → 查看各 Task 的 Shuffle Read/Write
+  如果某 Task 的 Shuffle Read 是平均值的 10 倍以上 → 倾斜
+```
+
+### 20.2 解决方案对比
+
+| 方案 | 原理 | 适用场景 | 优点 | 缺点 |
+|------|------|---------|------|------|
+| Salting | 给 Key 加随机后缀打散 | Shuffle Join | 简单有效 | 增加 Shuffle 量 |
+| Broadcast Join | 小表广播避免 Shuffle | 大小表 Join | 无 Shuffle | 受内存限制 |
+| AQE Skew Join | 自动检测倾斜并拆分 | 已知倾斜 | 自动化 | 需 Spark 3.0+ |
+| 两阶段聚合 | 局部聚合 + 全局聚合 | GroupBy 聚合 | 效果好 | 需改代码 |
+| 自定义 Partitioner | 自定义分区逻辑 | 已知倾斜 Key | 精确控制 | 需改代码 |
+
+### 20.3 Salting 实现
+
+```scala
+// Salting 打散倾斜 Key
+val saltedDf = df.withColumn("salt", (rand() * 10).cast("int"))
+  .withColumn("salted_key", concat(col("key"), lit("_"), col("salt")))
+
+// 两阶段聚合
+val partialAgg = saltedDf.groupBy("salted_key").agg(sum("value").as("partial_sum"))
+val finalAgg = partialAgg.withColumn("key", split(col("salted_key"), "_")(0))
+  .groupBy("key").agg(sum("partial_sum").as("total_sum"))
+```
+
+### 20.4 AQE Skew Join 配置
+
+```scala
+// AQE 自动处理倾斜
+spark.conf.set("spark.sql.adaptive.enabled", true)
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", true)
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", 5)
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", 256 * 1024 * 1024)
+```
+
+## 二十一、Spark Speculative Execution 配置与调优
+
+### 21.1 推测执行原理
+
+```text
+推测执行（Speculative Execution）：
+  当某个 Task 执行时间明显慢于其他 Task 时
+  Spark 会在另一个节点上启动该 Task 的副本
+  先完成的结果被采用，慢的被取消
+
+适用场景：
+  - 数据倾斜（部分分区数据量大）
+  - 节点硬件差异（慢节点）
+  - 网络抖动（偶发慢）
+```
+
+### 21.2 配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `spark.speculation` | false | 是否开启推测执行 |
+| `spark.speculation.multiplier` | 3 | 任务耗时倍数（超过中位数） |
+| `spark.speculation.quantile` | 0.75 | 分位数（超过该分位数才推测） |
+| `spark.speculation.interval` | 100ms | 检查间隔 |
+
+```scala
+// 推测执行配置
+spark.conf.set("spark.speculation", true)
+spark.conf.set("spark.speculation.multiplier", 3)
+spark.conf.set("spark.speculation.quantile", 0.75)
+```
+
+## 二十二、Spark on K8s 资源分配公式
+
+### 22.1 资源分配计算
+
+```text
+Executor 数量 = ceil(总核心数 / Executor 核心数)
+  总核心数 = 集群总核心数 × spark.dynamicAllocation.maxExecutors
+
+Executor 内存 = Driver 内存 × 2（经验值）
+  Driver 内存 = 4GB（默认）/ 大作业 8~16GB
+
+每个 Executor 核心数 = 4~5（推荐）
+  过多 → GC 压力大
+  过少 → 并行度不够
+
+总内存 = Executor 数量 × Executor 内存
+```
+
+### 22.2 推荐配置
+
+| 作业类型 | Executor 核心数 | Executor 内存 | Driver 内存 |
+|----------|----------------|--------------|------------|
+| 小作业 | 4 | 8GB | 4GB |
+| 中等作业 | 4 | 16GB | 8GB |
+| 大作业 | 5 | 32GB | 16GB |
+| 流式作业 | 4 | 16GB | 8GB |
+
+## 二十三、Spark 动态资源分配（Shuffle Tracking 模式）
+
+### 23.1 Shuffle Tracking 原理
+
+```text
+Shuffle Tracking：
+  基于 Shuffle 数据的存活状态决定 Executor 是否可回收
+  如果 Executor 上有未完成的 Shuffle 数据 → 保留
+  如果 Executor 上的 Shuffle 数据已被其他 Executor 读取 → 可回收
+
+优势：
+  - 比固定超时更精确
+  - 避免频繁扩缩
+  - 资源利用率更高
+```
+
+### 23.2 配置
+
+```scala
+spark.conf.set("spark.dynamicAllocation.enabled", true)
+spark.conf.set("spark.dynamicAllocation.shuffleTracking.enabled", true)
+spark.conf.set("spark.dynamicAllocation.minExecutors", 2)
+spark.conf.set("spark.dynamicAllocation.maxExecutors", 20)
+spark.conf.set("spark.dynamicAllocation.executorIdleTimeout", "60s")
+```
+
+## 二十四、Spark 历史服务器排查步骤
+
+### 24.1 排查流程
+
+```text
+Spark 历史服务器排查步骤：
+  1. 访问 History Server UI（默认 18080 端口）
+  2. 找到目标作业 → 查看 Overview
+  3. 检查 Stage 信息：
+     - 哪个 Stage 耗时最长？
+     - 各 Task 的 Shuffle Read/Write 是否均匀？
+     - GC 时间占比是否过高？
+  4. 检查 SQL 信息：
+     - 是否有全表扫描？
+     - Join 策略是否合理？
+  5. 检查 Event Timeline：
+     - 是否有长时间等待？
+     - 是否有任务失败重试？
+```
+
+### 24.2 常见问题诊断
+
+| 问题现象 | 可能原因 | 排查方向 |
+|----------|---------|---------|
+| Stage 耗时极长 | 数据倾斜 | 检查 Task 数据量分布 |
+| GC 时间 > 50% | 内存不足 | 增大 Executor 内存 |
+| Shuffle Read 异常大 | Shuffle 数据膨胀 | 检查 Shuffle 分区数 |
+| Task 频繁失败 | 资源不足/网络问题 | 检查 Executor 日志 |
+| 作业卡住不动 | 死锁/资源争抢 | 检查 Spark UI DAG |
 
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；
 - 文件格式/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
