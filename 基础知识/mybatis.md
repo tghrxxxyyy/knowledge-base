@@ -902,7 +902,212 @@ public void transfer(Long fromId, Long toId, BigDecimal amount) {
 
 ## 二十八、LazyLoading N+1 问题
 
-### 28.1 问题场景
+## MyBatis 拦截器链机制深度
+
+```
+拦截器链执行流程：
+
+  Executor.query()
+      │
+      ├── ExecutorInterceptor 1
+      │     └── plugin.intercept(invocation)
+      │           └── invocation.proceed()
+      │
+      ├── ExecutorInterceptor 2
+      │     └── plugin.intercept(invocation)
+      │           └── invocation.proceed()
+      │
+      ├── StatementHandler
+      │     ├── StatementHandlerInterceptor 1
+      │     └── StatementHandlerInterceptor 2
+      │
+      └── 返回结果
+
+  可拦截四大对象：
+    ├── Executor（SQL 执行）
+    ├── StatementHandler（SQL 预编译）
+    ├── ParameterHandler（参数设置）
+    └── ResultSetHandler（结果集处理）
+```
+
+```java
+// 自定义分页拦截器
+@Intercepts({
+    @Signature(type = StatementHandler.class,
+               method = "prepare",
+               args = {Connection.class, Integer.class})
+})
+public class PageInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        StatementHandler handler = (StatementHandler) invocation.getTarget();
+        BoundSql boundSql = handler.getBoundSql();
+        String sql = boundSql.getSql();
+
+        // 判断是否需要分页
+        if (isPage(boundSql)) {
+            // 改写 SQL
+            String pageSql = sql + " LIMIT " + getOffset() + "," + getLimit();
+            // 反射设置 SQL
+            Field sqlField = boundSql.getClass().getDeclaredField("sql");
+            sqlField.setAccessible(true);
+            sqlField.set(boundSql, pageSql);
+        }
+
+        return invocation.proceed();
+    }
+}
+
+// 注册拦截器
+@Configuration
+public class MyBatisConfig {
+    @Bean
+    public PageInterceptor pageInterceptor() {
+        return new PageInterceptor();
+    }
+}
+```
+
+## PageHelper 分页原理
+
+```
+PageHelper 分页流程：
+
+  1. 设置分页参数
+     PageHelper.startPage(1, 10);  // ThreadLocal 存储
+
+  2. 执行查询
+     mapper.selectList()  // 拦截器检测到分页参数
+
+  3. 拦截器处理
+     ├── 获取原始 SQL
+     ├── 改写为分页 SQL
+     │     ├── MySQL: SELECT * FROM t LIMIT 0, 10
+     │     ├── PostgreSQL: SELECT * FROM t LIMIT 10 OFFSET 0
+     │     └── Oracle: SELECT * FROM (SELECT ROWNUM r, t.* FROM t) WHERE r BETWEEN 1 AND 10
+     ├── 执行 count 查询（可选）
+     └── 封装 Page 对象
+
+  4. 清理参数
+     └── PageHelper.clearPage();  // 清除 ThreadLocal
+
+  5. 返回结果
+     └── Page<T> 包含数据 + 总数 + 当前页 + 每页大小
+```
+
+```java
+// PageHelper 使用
+PageHelper.startPage(1, 10);
+List<User> users = userMapper.selectAll();
+PageInfo<User> pageInfo = PageInfo.of(users);
+
+// 获取分页信息
+pageInfo.getTotal();     // 总数
+pageInfo.getPages();     // 总页数
+pageInfo.getPageNum();   // 当前页
+pageInfo.getPageSize();  // 每页大小
+
+// 嵌套分页
+PageHelper.startPage(1, 5);
+List<Order> orders = orderMapper.selectWithItems();  // 每个 Order 的 items 也被分页
+```
+
+## LambdaQueryWrapper 高级用法
+
+```java
+// 条件构造器
+LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+wrapper.eq(User::getStatus, 1)
+       .like(User::getName, "张")
+       .between(User::getAge, 18, 30)
+       .orderByDesc(User::getCreateTime);
+
+List<User> users = userMapper.selectList(wrapper);
+
+// 动态条件
+String name = null;
+Integer age = 18;
+
+LambdaQueryWrapper<User> dynamicWrapper = new LambdaQueryWrapper<>();
+if (name != null) {
+    dynamicWrapper.eq(User::getName, name);
+}
+if (age != null) {
+    dynamicWrapper.ge(User::getAge, age);
+}
+
+// 更新条件
+LambdaUpdateWrapper<User> updateWrapper = new LambdaUpdateWrapper<>();
+updateWrapper.eq(User::getId, 1)
+             .set(User::getName, "李四")
+             .set(User::getStatus, 0);
+
+userMapper.update(null, updateWrapper);
+
+// 子查询
+wrapper.inSql(User::getId, "SELECT user_id FROM orders WHERE amount > 1000");
+```
+
+## TransactionManager 与 SqlSession 交互
+
+```
+事务管理流程：
+
+  编程式事务：
+    SqlSession session = sqlSessionFactory.openSession();
+    try {
+        session.update("insertOrder", order);
+        session.update("updateStock", stock);
+        session.commit();
+    } catch (Exception e) {
+        session.rollback();
+        throw e;
+    } finally {
+        session.close();
+    }
+
+  声明式事务：
+    @Transactional
+    public void createOrder(Order order) {
+        orderMapper.insert(order);        // SqlSession 1
+        stockMapper.update(stock);        // SqlSession 2（同一线程复用）
+    }
+    // Spring 通过 ThreadLocal 管理 SqlSession 生命周期
+```
+
+```
+事务传播行为：
+
+  REQUIRED（默认）
+    └── 有事务则加入，无则新建
+
+  REQUIRES_NEW
+    └── 始终新建事务
+
+  NESTED
+    └── 嵌套事务（savepoint）
+
+  SUPPORTS
+    └── 有则加入，无则非事务执行
+
+  NOT_SUPPORTED
+    └── 挂起当前事务
+
+  MANDATORY
+    └── 必须在事务中，否则抛异常
+
+  NEVER
+    └── 不能在事务中，否则抛异常
+```
+
+| 传播行为 | 事务 | 嵌套 | 说明 |
+|----------|------|------|------|
+| REQUIRED | 新建/加入 | 否 | 默认，最常用 |
+| REQUIRES_NEW | 新建 | 否 | 独立事务 |
+| NESTED | 加入 | 是 | savepoint 嵌套 |
+| SUPPORTS | 加入/无 | 否 | 查询方法 |
+
+## LazyLoading N+1 问题
 
 ```xml
 <!-- 一对多关联 -->

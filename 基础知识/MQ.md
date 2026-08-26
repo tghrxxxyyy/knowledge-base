@@ -982,6 +982,156 @@ public void consume(ConsumerRecord<String, String> record) {
 
 ## 三十五、消息队列最佳实践
 
+## 消息幂等消费深度方案
+
+```
+幂等消费方案：
+
+  1. 数据库唯一约束
+     ├── 消息表记录 message_id
+     ├── 消费前查询是否已存在
+     └── 存在则跳过
+
+  2. Redis SETNX
+     ├── SET message_id 1 NX EX 3600
+     ├── 成功则消费
+     └── 失败则跳过
+
+  3. 业务去重
+     ├── 订单号去重
+     ├── 业务流水号去重
+     └── 数据库唯一索引
+
+  4. 乐观锁
+     ├── UPDATE ... WHERE version = ?
+     └── version 不匹配则跳过
+```
+
+```java
+// 方案 1：数据库去重
+public void consume(Message message) {
+    String msgId = message.getMessageId();
+    if (messageMapper.exists(msgId)) {
+        return; // 已消费，跳过
+    }
+    try {
+        messageMapper.insert(new MessageRecord(msgId, "PROCESSED"));
+        processBusiness(message);
+    } catch (DuplicateKeyException e) {
+        // 并发重复，忽略
+    }
+}
+
+// 方案 2：Redis 去重
+public void consume(Message message) {
+    String key = "msg:" + message.getMessageId();
+    if (redisTemplate.opsForValue().setIfAbsent(key, "1", 1, TimeUnit.HOURS)) {
+        processBusiness(message);
+    }
+}
+
+// 方案 3：业务幂等
+public void createOrder(OrderDTO dto) {
+    // 使用订单号作为幂等键
+    if (orderMapper.existsByOrderNo(dto.getOrderNo())) {
+        return;
+    }
+    orderMapper.insert(dto);
+}
+```
+
+## 延迟消息实现方案对比
+
+| 方案 | 实现方式 | 精度 | 适用场景 |
+|------|---------|------|---------|
+| RocketMQ | 原生延迟消息 | 秒级 | 延迟订单 |
+| RabbitMQ | TTL + 死信队列 | 秒级 | 简单延迟 |
+| Kafka | 延迟 Topic + 定时消费 | 分钟级 | 大批量 |
+| Redis | ZSet + 定时扫描 | 毫秒级 | 高精度 |
+| 数据库 | 定时任务扫描 | 秒级 | 低频场景 |
+
+```java
+// Redis 延迟消息实现
+public void sendDelayedMessage(Message message, long delayMs) {
+    String key = "delay:queue";
+    long executeTime = System.currentTimeMillis() + delayMs;
+    redisTemplate.opsForZSet().add(key, message.toJson(), executeTime);
+}
+
+// 定时消费
+@Scheduled(fixedRate = 1000)
+public void consumeDelayedMessages() {
+    String key = "delay:queue";
+    long now = System.currentTimeMillis();
+    Set<String> messages = redisTemplate.opsForZSet().rangeByScore(key, 0, now);
+    for (String msg : messages) {
+        processMessage(Message.fromJson(msg));
+        redisTemplate.opsForZSet().remove(key, msg);
+    }
+}
+```
+
+## 消息积压应急扩容方案
+
+```
+积压应急流程：
+
+  ① 监控告警
+     ├── 积压数量 > 阈值
+     └── 消费延迟 > 阈值
+
+  ② 快速扩容
+     ├── 增加消费者实例
+     ├── 增加分区/队列（Kafka）
+     └── 增加线程池
+
+  ③ 临时方案
+     ├── 跳过非关键消息
+     ├── 降级处理
+     └── 紧急手动消费
+
+  ④ 根因分析
+     ├── 消费者代码 Bug
+     ├── 下游依赖超时
+     └── 消息格式异常
+
+  ⑤ 恢复
+     ├── 修复问题
+     ├── 回放消息
+     └── 确认积压清零
+```
+
+```bash
+# Kafka 消费者扩容
+# 1. 增加消费者实例（自动 Rebalance）
+# 2. 增加分区
+kafka-topics.sh --alter --topic my-topic --partitions 16 --bootstrap-server localhost:9092
+
+# RocketMQ 消费者扩容
+# 1. 增加消费者实例
+# 2. 增加队列数
+mqadmin updateTopic -b brokerAddr -t my-topic -n 16
+```
+
+## 消息体大小对性能的影响
+
+| 消息大小 | 吞吐量 | 延迟 | 网络开销 | 建议 |
+|----------|--------|------|----------|------|
+| < 1KB | 高 | 低 | 低 | 小消息 |
+| 1-10KB | 中 | 中 | 中 | 正常范围 |
+| 10-100KB | 低 | 高 | 高 | 压缩或引用 |
+| > 100KB | 极低 | 极高 | 极高 | 避免大消息 |
+
+```
+大消息优化：
+  ├── 消息压缩（gzip/snappy/lz4）
+  ├── 引用模式（消息存 URL，正文存 OSS）
+  ├── 分片传输
+  └── 异步拉取
+```
+
+## 三十五、消息队列最佳实践
+
 | 实践 | 说明 |
 |------|------|
 | 消息幂等 | 消费端做去重 |

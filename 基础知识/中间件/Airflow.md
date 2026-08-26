@@ -865,6 +865,193 @@ Pod 模板（per-task 资源覆盖）：
 - 大数据全链路见「[大数据/README](../大数据/README.md)」；
 - Kubernetes 部署见「[Kubernetes 核心](../../云原生/Kubernetes核心.md)」。
 
+## Airflow 2.x 与 1.x 差异
+
+| 特性 | Airflow 1.x | Airflow 2.x |
+|------|------------|------------|
+| 调度器 | 单调度器（需 HA） | 支持多调度器（自动 HA） |
+| Web Server | Flask | Flask + Gunicorn（更稳定） |
+| DAG 解析 | 全量解析 | 增量解析（性能提升 10x+） |
+| TaskFlow API | ❌ | ✅（@task 装饰器） |
+| Connection 编辑 | 仅 UI | CLI + API |
+| Smart Sensor | ❌ | ✅（合并传感器） |
+| SLA Miss | 基础 | 增强告警 |
+| Kubernetes | 需第三方 | 原生支持 |
+| DAG Bundle | ❌ | ✅（插件化） |
+
+```python
+# Airflow 2.x TaskFlow API 示例
+from airflow.decorators import task, dag
+from datetime import datetime
+
+@dag(
+    schedule_interval="@daily",
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=["etl"],
+)
+def my_dag():
+    @task
+    def extract():
+        return {"data": [1, 2, 3]}
+
+    @task
+    def transform(raw):
+        return {"data": [x * 2 for x in raw["data"]]}
+
+    @task
+    def load(transformed):
+        print(f"Loaded: {transformed}")
+
+    raw = extract()
+    transformed = transform(raw)
+    load(transformed)
+
+my_dag()
+```
+
+## Airflow 与 dbt 集成模式
+
+```
+Airflow + dbt 集成方式：
+
+  方式 1: BashOperator 调用 dbt
+    ├── 简单，但无日志集成
+    └── 需安装 dbt
+
+  方式 2: airflow-dbt 插件
+    ├── 原生 Airflow 集成
+    └── 支持 dbt 核心命令
+
+  方式 3: DbtTaskGroup
+    ├── TaskGroup 封装
+    └── 可视化 dbt 运行流程
+
+  推荐：
+    ├── 小项目 → BashOperator
+    ├── 中项目 → DbtTaskGroup
+    └── 大项目 → dbt Cloud + Airflow 编排
+```
+
+```python
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+
+run_dbt = DbtCloudRunJobOperator(
+    task_id="run_dbt_job",
+    job_id=12345,
+    trigger_rule="all_success",
+)
+
+from airflow.operators.bash import BashOperator
+
+run_dbt = BashOperator(
+    task_id="run_dbt",
+    bash_command="cd /opt/dbt && dbt run --models tag:daily",
+)
+```
+
+## Airflow in K8s（Helm Chart 部署架构）
+
+```
+K8s 部署架构：
+
+  ┌─ Airflow Helm Chart ─────────────────────┐
+  │  ┌─ Web Server ─┐  ┌─ Scheduler ──┐      │
+  │  │  (1 replica)  │  │ (1 replica)  │      │
+  │  └───────────────┘  └──────────────┘      │
+  │  ┌─ Workers ────┐  ┌─ Triggerer ──┐      │
+  │  │ (auto-scale) │  │ (1 replica)  │      │
+  │  └──────────────┘  └──────────────┘      │
+  │  ┌─ PostgreSQL ─┐  ┌─ Redis ──────┐      │
+  │  │ (StatefulSet) │  │ (StatefulSet)│      │
+  │  └───────────────┘  └──────────────┘      │
+  └────────────────────────────────────────────┘
+         │
+  ┌─── Pod 级别 ───┐
+  │ K8sExecutor     │  ← 每个 Task 一个 Pod
+  │ 无状态 Worker   │
+  └─────────────────┘
+```
+
+```yaml
+workers:
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilization: 70
+```
+
+## Airflow 任务重试与幂等设计
+
+```
+重试策略：
+
+  重试次数（retries）：
+    └── 默认 0，建议 2-3 次
+
+  重试间隔（retry_delay）：
+    └── timedelta(minutes=5) 或 exponential
+
+  重试指数退避：
+    └── retry_exponential_backoff=True
+
+  幂等设计：
+    ├── 使用唯一业务 ID
+    ├── Upsert 而非 Insert
+    ├── 去重表
+    └── 幂等文件操作
+```
+
+```python
+from airflow.operators.python import PythonOperator
+from datetime import timedelta
+
+task = PythonOperator(
+    task_id="process_order",
+    python_callable=process_order,
+    retries=3,
+    retry_delay=timedelta(minutes=5),
+    retry_exponential_backoff=True,
+    max_retry_delay=timedelta(minutes=30),
+)
+```
+
+## Airflow 连接管理与 Secrets Backend
+
+```
+连接存储方式：
+
+  1. Airflow UI（默认）
+     └── 存储在 metadata DB（加密）
+
+  2. 环境变量
+     └── AIRFLOW_CONN_MY_CONN=...
+
+  3. Secrets Backend
+     ├── AWS Secrets Manager
+     ├── HashiCorp Vault
+     ├── GCP Secrets Manager
+     └── Azure Key Vault
+
+  推荐：
+    ├── 开发环境 → UI / 环境变量
+    ├── 生产环境 → Secrets Backend
+    └── 多环境 → Secrets Backend + 前缀隔离
+```
+
+```python
+from airflow.hooks.base import BaseHook
+conn = BaseHook.get_connection("my_conn")  # 自动从 Secrets Backend 获取
+```
+
 ---
 
 ## 八、Airflow 生产配置清单

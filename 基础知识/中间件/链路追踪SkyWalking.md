@@ -912,6 +912,220 @@ storage:
 |----|------|
 | 核心模型 | Trace（整链）+ Span（每跳）+ SpanContext（透传） |
 | 探针方式 | SkyWalking Java Agent 字节码注入（零侵入）/ OTel SDK |
+
+## SkyWalking OAP 集群部署
+
+```
+OAP 集群架构：
+
+  ┌─────────────────────────────────────────────┐
+  │              Load Balancer (Nginx/HAProxy)   │
+  └───────────────────┬─────────────────────────┘
+                      │
+    ┌─────────────────┼─────────────────┐
+    ↓                 ↓                 ↓
+  OAP Node 1      OAP Node 2      OAP Node 3
+  (Standalone)    (Standalone)    (Standalone)
+    │                 │                 │
+    └─────────────────┼─────────────────┘
+                      │
+              Storage (ES/MySQL/H2)
+
+  工作模式：
+    ├── Standalone：单节点开发
+    ├── Mixed：混合模式（接收 + 处理）
+    ├── Receiver：仅接收 Agent 数据
+    └── Aggregator：仅聚合查询
+
+  集群部署：
+    ├── 同一命名空间 / 集群
+    ├── 共享存储后端
+    └── 负载均衡 Agent 连接
+```
+
+```yaml
+# OAP 集群配置
+SW_CLUSTER=standalone  # 或 zookeeper / kubernetes
+SW_STORAGE=elasticsearch
+SW_STORAGE_ES_CLUSTER_NODES=es1:9200,es2:9200,es3:9200
+
+# Kubernetes 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skywalking-oap
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: skywalking-oap
+  template:
+    spec:
+      containers:
+        - name: oap
+          image: apache/skywalking-oap-server:9.7.0
+          env:
+            - name: SW_CLUSTER
+              value: "kubernetes"
+            - name: SW_STORAGE
+              value: "elasticsearch"
+```
+
+## SkyWalking 告警规则配置
+
+```yaml
+# alarm-settings.yml
+rules:
+  service_resp_time_rule:
+    metrics-name: service_resp_time
+    op: ">"
+    threshold: 1000
+    period: 5
+    count: 3
+    message: "服务 {name} 响应时间超过 1s"
+
+  service_error_rate_rule:
+    metrics-name: service_sla
+    op: "<"
+    threshold: 95
+    period: 5
+    count: 3
+    message: "服务 {name} SLA 低于 95%"
+
+  instance_cpu_rule:
+    metrics-name: service_instance_cpu_usage
+    op: ">"
+    threshold: 80
+    period: 5
+    count: 3
+    message: "实例 {name} CPU 使用率超过 80%"
+
+  endpoint_resp_time_rule:
+    metrics-name: endpoint_avg
+    op: ">"
+    threshold: 2000
+    period: 5
+    count: 3
+    message: "接口 {name} 平均响应时间超过 2s"
+
+  alarm_webhook:
+    - http://alert-service:8080/api/alert
+  alarm-email:
+    - to: admin@example.com
+```
+
+| 告警指标 | 阈值 | 持续时间 | 说明 |
+|----------|------|----------|------|
+| service_resp_time | > 1000ms | 5min | 服务响应时间 |
+| service_sla | < 95% | 5min | 服务可用性 |
+| instance_cpu | > 80% | 5min | 实例 CPU |
+| endpoint_avg | > 2000ms | 5min | 接口延迟 |
+| service_cpm | < 10 | 5min | 调用量异常 |
+
+## SkyWalking Trace 分析实战
+
+```
+Trace 分析流程：
+
+  1. 定位慢调用链
+     ├── 进入 Trace 页面
+     ├── 按响应时间排序
+     └── 找到最慢的 Trace ID
+
+  2. 分析 Span 瀑布图
+     ├── 查看每个 Span 耗时
+     ├── 标记红色 Span（异常/慢）
+     └── 分析调用层级
+
+  3. 定位瓶颈
+     ├── 网络延迟：Span 间 gap 大
+     ├── 应用逻辑：Span 自身耗时长
+     ├── 数据库：SQL Span 耗时长
+     └── 外部调用：HTTP Span 耗时长
+
+  4. 优化建议
+     ├── SQL 优化（添加索引）
+     ├── 缓存热点数据
+     ├── 异步化非关键路径
+     └── 连接池调优
+```
+
+```
+# API 查找慢 Trace
+curl -X POST "http://oap:12800/api/query" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "query { generalServiceEndpointMetrics(duration: {start: \"2024-01-01 10:00\", end: \"2024-01-01 11:00\", step: MINUTE}, condition: {name: \"/api/orders\", normal: true}) { normal { avg { value } } } }"
+  }'
+
+# 导出 Trace
+curl -X GET "http://skywalking:8080/api/traces/{traceId}"
+```
+
+## SkyWalking 与 Istio/Envoy 集成
+
+```
+Service Mesh 集成架构：
+
+  Istio/Envoy Sidecar
+       │
+       ├── 遥测数据（access log）
+       │     └── SkyWalking OAP Receiver
+       │
+       ├── 指标数据（metrics）
+       │     └── SkyWalking OAP Metrics
+       │
+       └── 链路数据（trace）
+             └── SkyWalking OAP Trace
+
+  配置步骤：
+    1. 部署 OAP + SkyWalking UI
+    2. Istio 配置 telemetry
+    3. Envoy 访问日志格式化
+    4. OAP 接收遥测数据
+```
+
+```yaml
+# Istio telemetry 配置
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: skywalking
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: skywalking
+      randomSamplingPercentage: 100
+  metrics:
+    - providers:
+        - name: prometheus
+```
+
+## SkyWalking Agent 性能开销
+
+| 指标 | 开销 | 说明 |
+|------|------|------|
+| CPU 增加 | 2-5% | 正常业务影响 |
+| 内存增加 | 50-200MB | Agent + 缓冲区 |
+| 延迟增加 | < 1ms | 本地缓冲区 |
+| 网络带宽 | < 1% | 采样数据 |
+
+```
+Agent 性能优化：
+
+  1. 采样率调整
+     agent.sample_n_per_3_secs=10  # 每 3 秒采样 10 条
+
+  2. 缓冲区大小
+     agent.span_limit_per_segment=300  # 每段最大 Span 数
+
+  3. 异步上报
+     agent.span_asynchronous_send=true
+
+  4. 日志级别
+     agent.logging.level=INFO  # 避免 DEBUG
+```
 | 透传通道 | HTTP Header / MQ 属性 / gRPC metadata（W3C traceparent） |
 | 采样 | 头部采样为主 + 错误/慢请求强制采样 |
 | 国内主流 | SkyWalking（拓扑/指标/告警全家桶） |

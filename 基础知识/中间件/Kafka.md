@@ -917,6 +917,147 @@ flowchart TB
 
 ---
 
+## Rack Awareness 机架感知
+
+```
+机架感知配置：
+
+  broker.rack=rack1    # 在 server.properties 中配置
+  broker.rack=rack2
+
+  复制策略：
+    ├── rack1 → rack2 → rack3
+    └── 每个分区副本跨 3 个不同 rack
+
+  效果：
+    ├── 单个 rack 宕机不影响数据可用性
+    └── 跨 rack 带宽成本可控
+```
+
+```properties
+# server.properties
+broker.rack=/rack/zone1
+# 或
+broker.rack=us-east-1a
+```
+
+## Consumer Offsets 深度解析
+
+```
+Offset 提交流程：
+
+  Consumer 消费消息
+       │
+       ├── 自动提交（enable.auto.commit=true）
+       │     └── 定时提交当前 offset
+       │
+       └── 手动提交
+             ├── commitSync（同步，可靠）
+             └── commitAsync（异步，高性能）
+
+  Offset 存储：
+    └── __consumer_offsets（内部 topic）
+    ├── key: group.id + topic + partition
+    └── value: offset + metadata + timestamp
+
+  重平衡触发条件：
+    ├── consumer 加入/离开 group
+    ├── topic 分区数变化
+    ├── 订阅 topic 变化
+    └── session.timeout 超时
+```
+
+```java
+// 手动提交 offset
+consumer.subscribe(Arrays.asList("topic"));
+while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+    for (ConsumerRecord<String, String> record : records) {
+        processRecord(record);
+    }
+    consumer.commitSync();
+}
+
+// 从指定 offset 开始消费
+consumer.seek(new TopicPartition("topic", 0), 1000L);
+```
+
+## KRaft 模式与 ZooKeeper 移除
+
+```
+KRaft 架构（Kafka 3.3+ 生产可用）：
+
+  旧架构：
+    Broker ←→ ZooKeeper 集群（3/5 节点）
+
+  新架构（KRaft）：
+    Controller Quorum（3/5 节点）
+         │
+    ┌────┴────┐
+    │ 元数据   │
+    │ 日志     │
+    │ 快照     │
+    └─────────┘
+         │
+    Broker 节点（无状态）
+
+  优势：
+    ├── 无需 ZooKeeper 依赖
+    ├── 元数据管理更快
+    ├── 扩容更简单
+    └── 支持更多分区（百万级）
+```
+
+```properties
+# KRaft 模式配置
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@controller1:9093,2@controller2:9093,3@controller3:9093
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+```
+
+## MirrorMaker2 跨集群复制
+
+```
+MirrorMaker2 架构：
+
+  源集群                     目标集群
+  ┌──────────┐             ┌──────────┐
+  │ Topic-A  │ ──MM2──→   │ Source-A  │
+  │ Topic-B  │             │ Source-B  │
+  │ Topic-C  │             │ Topic-C   │ (未复制)
+  └──────────┘             └──────────┘
+
+  配置要点：
+    ├── source clusters
+    ├── target cluster
+    ├── topic prefix（源 topic 加前缀）
+    ├── replication factor
+    └── sync group offsets
+```
+
+```properties
+# mm2.properties
+clusters = source, target
+source.bootstrap.servers = source-kafka:9092
+target.bootstrap.servers = target-kafka:9092
+
+source->target.enabled = true
+source->target.topics = .*
+source->target.replication.policy.class = org.apache.kafka.connect.mirror.IdentityReplicationPolicy
+source->target.sync.group.offsets.enabled = true
+source->target.emit.heartbeats.enabled = true
+source->target.topics.exclude = __.*
+```
+
+| 配置项 | 说明 | 建议值 |
+|--------|------|--------|
+| `replication.factor` | 复制因子 | ≥ 3 |
+| `sync.topic.configs.enabled` | 同步 topic 配置 | true |
+| `emit.heartbeats.interval.seconds` | 心跳间隔 | 1 |
+| `refresh.topics.interval.seconds` | 刷新 topic 间隔 | 600 |
+| `offset.lag.max` | 最大 offset 延迟 | 100 |
+
 ## 十七、与其他板块的关系（扩展）
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。

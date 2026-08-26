@@ -328,6 +328,217 @@ groups:
 | `rabbitmq_connections` | 连接数 | < channel_max × nodes |
 | `rabbitmq_channel_messages_published_total` | 发布速率 | 基线对比 |
 
+## Quorum Queue 深度解析
+
+```
+Quorum Queue 架构（3.8+ 默认）：
+
+  Producer → Leader Node → Follower Node 1
+                        → Follower Node 2
+
+  Raft 协议保证：
+    ├── 写入需 quorum（多数派）确认
+    ├── Leader 故障自动选举
+    ├── 消息持久化到磁盘
+    └── 保证 at-least-once 语义
+
+  优势：
+    ├── 网络分区时仍可服务（有 quorum）
+    ├── 消息不丢失（磁盘 + 多副本）
+    ├── 比镜像队列更可靠
+    └── 支持优先级和 TTL
+```
+
+| 对比项 | Classic Mirror | Quorum Queue |
+|--------|---------------|-------------|
+| 可靠性 | 镜像同步 | Raft quorum |
+| 吞吐 | 较高 | 略低（Raft 开销） |
+| 存储 | 内存为主 | 磁盘持久化 |
+| 优先级 | ❌ | ✅（需插件） |
+| 消息顺序 | 打乱 | 保证 |
+| 适用场景 | 高吞吐非关键 | 可靠业务消息 |
+
+```
+# 创建 Quorum Queue
+rabbitmqadmin declare queue name=order-quorum \
+  arguments='{"x-queue-type": "quorum", "x-quorum-initial-group-size": 3}'
+
+# 查看队列类型
+rabbitmqctl list_queues name type
+
+# 从 Classic 迁移到 Quorum
+rabbitmqadmin declare queue name=order-v2 \
+  arguments='{"x-queue-type": "quorum"}'
+# 消费者切换到新队列后删除旧队列
+```
+
+## Lazy Queue 与磁盘存储模式
+
+```
+Lazy Queue 工作原理：
+
+  消息写入 → 内存（有限） → 溢出到磁盘
+                          │
+  消费者读取 ← 内存 ← 从磁盘加载
+
+  默认阈值：
+    ├── 高水位线 = 内存可用量的 50%
+    └── 超过后强制落盘
+
+  配置：
+    x-queue-mode: lazy
+    x-max-memory-bytes: 104857600  # 100MB
+```
+
+| 模式 | 内存占用 | 消费延迟 | 磁盘 IO | 适用场景 |
+|------|---------|---------|---------|----------|
+| 默认 | 高 | 低 | 低 | 消费快、内存充足 |
+| lazy | 低 | 中 | 高 | 消息积压、内存有限 |
+| 默认（高水位） | 中 | 中 | 中 | 一般业务 |
+
+```
+# 设置 Lazy Queue
+rabbitmqadmin declare queue name=log-events \
+  arguments='{"x-queue-mode": "lazy"}'
+
+# 已有队列修改
+rabbitmqadmin declare queue name=log-events \
+  arguments='{"x-queue-mode": "lazy"}'
+# 需要重新声明才能生效
+
+# 监控磁盘使用
+rabbitmqctl list_queues name messages message_bytes_ram message_bytes_disk
+```
+
+## Federation 与 Shovel 跨集群同步
+
+```
+Federation 架构（单向/双向）：
+
+  集群 A                           集群 B
+  ┌──────────┐                   ┌──────────┐
+  │ Exchange │ ─── Federation ──→│ Exchange │
+  │ (upstream)│    (单向)         │(downstream)│
+  └──────────┘                   └──────────┘
+  ┌──────────┐                   ┌──────────┐
+  │  Queue   │ ←── Shovel ──────│  Queue   │
+  │          │    (点对点)        │          │
+  └──────────┘                   └──────────┘
+
+  Federation：
+    ├── 基于 Exchange
+    ├── 支持 AMQP 0.9.1 / AMQP 1.0
+    ├── 可跨版本/跨数据中心
+    └── 自动重连
+
+  Shovel：
+    ├── 基于 Queue 或 Exchange
+    ├── 点对点复制
+    └── 更灵活（可自定义路由）
+```
+
+| 特性 | Federation | Shovel |
+|------|-----------|--------|
+| 复制粒度 | Exchange | Queue/Exchange |
+| 方向 | 单向 | 单向/双向 |
+| 延迟 | 中 | 低 |
+| 适用场景 | 跨数据中心 | 点对点迁移 |
+| 消息顺序 | 保证 | 保证 |
+
+```
+# 启用 Federation 插件
+rabbitmq-plugins enable federation
+
+# 配置 upstream
+rabbitmqadmin declare parameter federation-upstream \
+  name=my-upstream \
+  component=federation-upstream \
+  value='{"uri":"amqp://user:pass@cluster-b:5672","prefetch-count":1000}'
+
+# 配置 policy
+rabbitmqadmin declare policy name=fed-policy \
+  pattern="^federated\\." \
+  definition='{"federation-upstream":"my-upstream"}' \
+  apply-to=queues
+
+# Shovel 配置
+rabbitmqadmin declare parameter shovel \
+  name=my-shovel \
+  component=shovel \
+  value='{"src-protocol":"amqp091","src-uri":"amqp://cluster-a","src-queue":"migrate-queue","dest-protocol":"amqp091","dest-uri":"amqp://cluster-b","dest-queue":"target-queue"}'
+```
+
+## Prometheus 告警规则配置
+
+```yaml
+# rabbitmq-alerts.yml
+groups:
+  - name: rabbitmq
+    rules:
+      # 消费者下降告警
+      - alert: RabbitMQConsumerCountLow
+        expr: rabbitmq_queue_consumers < 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 消费者不足: {{ $labels.queue }}"
+
+      # 队列积压告警
+      - alert: RabbitMQQueueBacklog
+        expr: rabbitmq_queue_messages > 10000
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ 队列积压: {{ $labels.queue }} 有 {{ $value }} 条消息"
+
+      # 内存告警
+      - alert: RabbitMQHighMemory
+        expr: rabbitmq_process_resident_memory_bytes / rabbitmq_resident_memory_limit_bytes > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ 内存使用率 {{ $value | humanizePercentage }}"
+
+      # 磁盘告警
+      - alert: RabbitMQDiskLow
+        expr: rabbitmq_disk_space_available_bytes < 1073741824
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ 磁盘空间不足: {{ $value | humanize1024 }}B"
+
+      # 连接数告警
+      - alert: RabbitMQHighConnections
+        expr: rabbitmq_connections > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 连接数过高: {{ $value }}"
+
+      # 未确认消息告警
+      - alert: RabbitMQUnackedHigh
+        expr: rabbitmq_queue_messages_unacknowledged > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 未确认消息过多: {{ $labels.queue }}"
+```
+
+| 告警指标 | 阈值 | 持续时间 | 严重级别 |
+|----------|------|----------|----------|
+| 消费者数 | < 2 | 5min | warning |
+| 队列积压 | > 10000 | 10min | critical |
+| 内存使用率 | > 80% | 5min | critical |
+| 磁盘空间 | < 1GB | 5min | critical |
+| 连接数 | > 1000 | 10min | warning |
+| 未确认消息 | > 5000 | 10min | warning |
+
 ## 七、与其他板块的关系
 
 

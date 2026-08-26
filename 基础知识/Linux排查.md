@@ -966,4 +966,257 @@ difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
 - 可观测性见「[云原生/可观测性](../云原生/可观测性.md)」；
 - 场景设计排障见「[场景设计/问题定位](../场景设计/问题定位.md)」。
 
+## CPU 分析完整链路
+
+```
+CPU 排查完整流程：
+
+  ① 确认 CPU 使用率
+     top -bn1 | head -5
+     mpstat -P ALL 1 5
+
+  ② 定位高 CPU 进程
+     top -bn1 | head -15
+     pidstat -u 1 10
+
+  ③ 定位高 CPU 线程
+     top -Hp <pid>
+     pidstat -t -p <pid> 1 10
+
+  ④ 分析线程状态
+     jstack <pid> | grep <tid> -A 30
+     jstack <pid> | grep "RUNNABLE"
+
+  ⑤ 火焰图分析
+     perf record -g -p <pid> -- sleep 30
+     perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+  ⑥ Java 线程分析
+     jcmd <pid> Thread.print
+     arthas thread -n 5
+```
+
+| 工具 | 用途 | 适用场景 |
+|------|------|---------|
+| top | 整体 CPU | 快速定位 |
+| mpstat | 每核 CPU | 多核分析 |
+| pidstat | 进程/线程 CPU | 精确定位 |
+| perf | CPU 采样 | 热点函数 |
+| jstack | 线程快照 | Java 线程 |
+| Arthas | 在线诊断 | 生产环境 |
+
+## OOM 排查完整流程
+
+```
+OOM 排查步骤：
+
+  ① 确认 OOM 类型
+     ├── Java heap space → 堆内存
+     ├── GC overhead limit exceeded → GC 超时
+     ├── Metaspace → 元空间
+     ├── Direct buffer memory → 堆外内存
+     └── unable to create new native thread → 线程数
+
+  ② 获取堆内存信息
+     jmap -heap <pid>
+     jstat -gcutil <pid> 1000 10
+
+  ③ 分析堆 dump
+     jmap -dump:live,format=b,file=heap.hprof <pid>
+     MAT / VisualVM 分析
+
+  ④ 线程数排查
+     ls /proc/<pid>/task | wc -l
+     jstack <pid> | grep "java.lang.Thread.State" | wc -l
+
+  ⑤ 堆外内存
+     pmap <pid> | sort -rnk 3 | head
+     -XX:MaxDirectMemorySize
+```
+
+```
+# OOM Killer 日志解读
+dmesg | grep -i "oom"
+
+# 查看进程内存详情
+cat /proc/<pid>/status | grep -E "VmRSS|VmSize|VmSwap"
+cat /proc/<pid>/smaps_rollup
+pmap -x <pid> | sort -rnk 3 | head -10
+
+# 查看 OOM 分数
+cat /proc/<pid>/oom_score
+cat /proc/<pid>/oom_score_adj
+```
+
+## io_wait 高用 iostat/pidstat 定位
+
+```
+io_wait 排查流程：
+
+  ① 确认 io_wait
+     top → %wa 列
+     vmstat 1 → wa 列
+
+  ② 定位磁盘 IO 瓶颈
+     iostat -x 1 10
+     ├── %util > 80% → 磁盘繁忙
+     ├── await > 10ms → IO 延迟高
+     └── r/s + w/s → IOPS
+
+  ③ 定位 IO 高的进程
+     pidstat -d 1 10
+     iotop -oP
+
+  ④ 分析 IO 操作
+     strace -p <pid> -e trace=read,write,fsync
+     perf trace -p <pid>
+
+  ⑤ Java IO 分析
+     jstack <pid> | grep -A 20 "BLOCKED"
+     jcmd <pid> GC.heap_info
+```
+
+```bash
+# iostat 详细输出
+iostat -x 1 10
+# Device  r/s   w/s   rkB/s   wkB/s  await  %util
+# sda     100   50    400     200    5.2    45.2
+
+# pidstat IO 监控
+pidstat -d 1 10
+# PID   kB_rd/s  kB_wr/s  kB_ccwr/s
+# 1234  1024     512      0
+
+# 查看进程 IO
+cat /proc/<pid>/io
+# read_bytes: 1024000
+# write_bytes: 512000
+```
+
+## 网络丢包排查
+
+```
+网络丢包排查流程：
+
+  ① 确认丢包
+     netstat -s | grep -i "drop\|retrans"
+     ss -s
+
+  ② 网卡级别
+     ethtool -S eth0 | grep -i "drop\|error"
+     cat /proc/net/dev
+
+  ③ 内核级别
+     nstat -az | grep -i "drop\|retrans"
+     cat /proc/net/snmp
+
+  ④ 连接级别
+     ss -tnp state established
+     netstat -an | grep ESTABLISHED | wc -l
+
+  ⑤ 抓包分析
+     tcpdump -i eth0 -w /tmp/drop.pcap
+     wireshark 分析
+```
+
+```bash
+# ethtool 网卡统计
+ethtool -S eth0 | grep -E "drop|error|miss"
+
+# 内核丢包统计
+nstat -az | grep -E "Drop|Retrans|Reasm"
+
+# socket 缓冲区
+cat /proc/net/udp
+cat /proc/net/tcp
+# Recv-Q 满 = 缓冲区溢出
+
+# 网络接口统计
+cat /proc/net/dev
+# 累计丢包数
+```
+
+## dmesg OOM Killer 日志解读
+
+```
+OOM Killer 日志格式：
+
+  [xxx.xxx] Out of memory: Kill process 12345 (java) score 800 or sacrifice child
+  [xxx.xxx] Killed process 12345 (java) total-vm:4096000kB, anon-rss:2048000kB
+
+  解读：
+    ├── Kill process 12345 → 被杀进程 PID
+    ├── score 800 → OOM 分数（越高越容易被杀）
+    ├── total-vm → 虚拟内存总量
+    └── anon-rss → 物理内存使用量
+
+  OOM 分数计算：
+    ├── 基础分 = 进程 RSS / 总内存 × 1000
+    ├── 调整分 = oom_score_adj
+    └── 最终分 = 基础分 + 调整分
+
+  防止 OOM：
+    ├── 设置 oom_score_adj = -1000（不被杀）
+    ├── 限制 cgroup 内存
+    └── 增加物理内存
+```
+
+```bash
+# 查看 OOM 分数
+cat /proc/<pid>/oom_score
+cat /proc/<pid>/oom_score_adj
+
+# 设置 OOM 分数调整
+echo -1000 > /proc/<pid>/oom_score_adj  # 不被 OOM Kill
+
+# 查看历史 OOM 事件
+dmesg | grep -i "oom"
+journalctl -k | grep -i "oom"
+
+# cgroup 内存限制
+cat /sys/fs/cgroup/memory/<cgroup>/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/<cgroup>/memory.usage_in_bytes
+```
+
+## perf flame graph 使用步骤
+
+```
+火焰图使用完整流程：
+
+  ① 安装工具
+     apt install linux-tools-common linux-tools-$(uname -r)
+     pip install perf-flamegraph
+
+  ② 采集数据
+     perf record -g -p <pid> -- sleep 30
+     # 或
+     perf record -g -F 99 -p <pid> -- sleep 30
+
+  ③ 生成火焰图
+     perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+  ④ 分析火焰图
+     ├── 横轴 = 采样比例（越宽占用 CPU 越多）
+     ├── 纵轴 = 调用栈深度（越深调用链越长）
+     ├── 颜色无特殊含义
+     └── 看"平顶"函数（自身耗 CPU 多）
+
+  ⑤ 差异火焰图（优化前后）
+     difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
+```
+
+```bash
+# 基础火焰图
+perf record -g -p <pid> -- sleep 30
+perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+# 内存火焰图
+perf record -e kmem:kmalloc -g -p <pid> -- sleep 10
+perf script | stackcollapse-perf.pl | flamegraph.pl --color=mem > mem.svg
+
+# Off-CPU 火焰图（分析阻塞等待）
+perf record -e sched:sched_switch -g -p <pid> -- sleep 30
+# 需要 bcc 工具：offcputime-bpfcc <pid> -df | flamegraph.pl > offcpu.svg
+```
+
 > 一句话：**Linux 排障三板斧：`top` 看整体 → `perf/strace` 定热点 → `jstack/jmap` 进应用——wa 高查 IO、us 高查代码、load 高查阻塞（D 状态）**。

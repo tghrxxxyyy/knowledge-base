@@ -955,3 +955,351 @@ withCredentials([string(credentialsId: 'api-key', variable: 'API_KEY')]) {
 - [ ] 重 stage 用 `parallel` + `failFast:false`；报告收集用 `catchError`。
 - [ ] `post` 统一 `cleanWs()` + 通知；凭据只走 `withCredentials`。
 - [ ] 警惕 6 类反模式：Controller 上 IO、硬编码、不清理、agent any、巨石文件、关 Script Security。
+
+---
+
+## 二十一、Jenkins 共享库开发最佳实践
+
+### 21.1 共享库目录结构
+
+```text
+jenkins-shared-library/
+├── vars/                    # 全局变量/函数（Groovy 脚本）
+│   ├── buildDocker.groovy   # vars.buildDocker()
+│   ├── runTests.groovy      # vars.runTests()
+│   └── notifySlack.groovy   # vars.notifySlack()
+├── src/                     # OOP 封装（Groovy 类）
+│   └── com/
+│       └── company/
+│           └── ci/
+│               ├── Pipeline.groovy
+│               └── DockerBuilder.groovy
+├── resources/               # 非 Groovy 资源（模板/配置）
+│   └── templates/
+│       └── Jenkinsfile.tpl
+└── test/                    # 单元测试
+    └── groovy/
+        └── BuildDockerTest.groovy
+```
+
+### 21.2 vars 目录 API 设计
+
+```groovy
+// vars/buildDocker.groovy
+def call(Map config = [:]) {
+    def image = config.image ?: error("image is required")
+    def tag = config.tag ?: env.BUILD_NUMBER
+    def dockerfile = config.dockerfile ?: 'Dockerfile'
+    
+    sh """
+        docker build -t ${image}:${tag} -f ${dockerfile} .
+        docker push ${image}:${tag}
+    """
+    return "${image}:${tag}"
+}
+
+// 调用方式
+def imageTag = buildDocker image: 'myapp', tag: env.BUILD_NUMBER
+```
+
+### 21.3 src 目录 OOP 封装
+
+```groovy
+// src/com/company/ci/DockerBuilder.groovy
+package com.company.ci
+
+class DockerBuilder implements Serializable {
+    private String image
+    private String tag
+    private String dockerfile
+    
+    DockerBuilder(String image) {
+        this.image = image
+        this.tag = 'latest'
+        this.dockerfile = 'Dockerfile'
+    }
+    
+    DockerBuilder withTag(String tag) {
+        this.tag = tag
+        return this
+    }
+    
+    String build(steps) {
+        steps.sh "docker build -t ${image}:${tag} -f ${dockerfile} ."
+        return "${image}:${tag}"
+    }
+}
+```
+
+## 二十二、Pipeline 错误处理（try/catch/retry/timeout/when）
+
+### 22.1 错误处理模式
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Deploy') {
+            steps {
+                // try-catch 错误处理
+                script {
+                    try {
+                        sh './deploy.sh'
+                    } catch (Exception e) {
+                        echo "部署失败: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
+                
+                // retry 重试
+                retry(3) {
+                    sh './flaky-command.sh'
+                }
+                
+                // timeout 超时
+                timeout(time: 10, unit: 'MINUTES') {
+                    sh './long-running-task.sh'
+                }
+            }
+        }
+        
+        stage('Canary') {
+            when {
+                branch 'main'
+                expression { return params.DEPLOY_CANARY }
+            }
+            steps {
+                sh './canary-deploy.sh'
+            }
+        }
+    }
+    post {
+        failure {
+            script {
+                notifySlack channel: '#ci-alerts', 
+                           message: "❌ ${env.JOB_NAME} 失败"
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+```
+
+### 22.2 when 条件组合
+
+| 条件 | 用途 | 示例 |
+|------|------|------|
+| `branch` | 分支过滤 | `when { branch 'main' }` |
+| `expression` | 自定义表达式 | `when { expression { return params.DEPLOY } }` |
+| `environment` | 环境变量 | `when { environment name: 'ENV', value: 'prod' }` |
+| `not` | 取反 | `when { not { branch 'develop' } }` |
+| `allOf` | 全部满足 | `when { allOf { branch 'main'; expression {...} } }` |
+| `anyOf` | 任一满足 | `when { anyOf { branch 'main'; branch 'release/*' } }` |
+
+## 二十三、Credential 管理（withCredentials 绑定范围）
+
+### 23.1 凭证绑定方式
+
+```groovy
+// Secret 文本
+withCredentials([string(credentialsId: 'api-key', variable: 'API_KEY')]) {
+    sh 'curl -H "Authorization: $API_KEY" https://api.example.com'
+}
+
+// Secret 文件
+withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+    sh 'kubectl --kubeconfig=$KUBECONFIG get pods'
+}
+
+// SSH 密钥
+withCredentials([sshUserPrivateKey(credentialsId: 'ssh-key', 
+                                   keyFileVariable: 'SSH_KEY',
+                                   usernameVariable: 'SSH_USER')]) {
+    sh 'ssh -i $SSH_KEY $SSH_USER@server "ls"'
+}
+
+// 用户名密码
+withCredentials([usernamePassword(credentialsId: 'docker-cred',
+                                   usernameVariable: 'USER',
+                                   passwordVariable: 'PASS')]) {
+    sh 'echo $PASS | docker login -u $USER --password-stdin registry.example.com'
+}
+```
+
+### 23.2 凭据作用域最小化
+
+| 作用域 | 说明 | 安全性 |
+|--------|------|--------|
+| 全局 | Jenkins 全局凭证 | 最低 |
+| 文件夹 | 文件夹级别凭证 | 中 |
+| Pipeline 级 | `withCredentials` 绑定 | 最高（仅当前 stage 可见） |
+
+> 口诀：凭证绑定范围越小越安全——`withCredentials` 仅在需要的 stage 内使用，不要放在全局 environment。
+
+## 二十四、Pipeline 测试（Jenkins Pipeline Unit / declarative-linter）
+
+### 24.1 Jenkins Pipeline Unit
+
+```groovy
+// test/groovy/BuildDockerTest.groovy
+import com.lesfurets.jenkins.unit.BasePipelineTest
+import org.junit.Before
+import org.junit.Test
+
+class BuildDockerTest extends BasePipelineTest {
+    @Override
+    @Before
+    void setUp() throws Exception {
+        super.setUp()
+        // Mock 外部命令
+        helper.registerAllowedMethod("sh", [String.class], { cmd ->
+            echo "Mock: ${cmd}"
+        })
+    }
+    
+    @Test
+    void testBuildDocker() {
+        def result = loadScript("vars/buildDocker.groovy")
+        result.call(image: "myapp", tag: "1.0")
+        
+        // 验证调用
+        assertJobStatusSuccess()
+    }
+}
+```
+
+### 24.2 declarative-linter
+
+```bash
+# 检查 Jenkinsfile 语法
+java -jar declarative-linter-cli.jar Jenkinsfile
+
+# CI 集成
+lint-check:
+  stage: lint
+  script:
+    - java -jar declarative-linter-cli.jar Jenkinsfile
+  allow_failure: false
+```
+
+## 二十五、Pipeline 优化（parallel stage / WS 清理 / stash 传递）
+
+### 25.1 parallel stage 优化
+
+```groovy
+stage('Parallel Tests') {
+    parallel {
+        stage('Unit Tests') {
+            steps {
+                sh 'mvn test -pl module-core'
+            }
+        }
+        stage('Integration Tests') {
+            steps {
+                sh 'mvn test -pl module-integration'
+            }
+        }
+        stage('Security Scan') {
+            steps {
+                sh 'trivy fs --severity HIGH,CRITICAL .'
+            }
+        }
+    }
+}
+```
+
+### 25.2 stash 跨 agent 传递
+
+```groovy
+// 构建 agent 上 stash
+stash name: 'build-output', includes: 'target/*.jar'
+
+// 部署 agent 上 unstash
+unstash 'build-output'
+sh 'java -jar target/app.jar'
+```
+
+### 25.3 工作区清理
+
+```groovy
+post {
+    always {
+        cleanWs()                    // 清理工作区
+        cleanWs patterns: [          // 自定义清理
+            [pattern: 'target/', type: 'INCLUDE'],
+            [pattern: '.git/', type: 'INCLUDE']
+        ]
+    }
+}
+```
+
+## 二十六、Docker Pipeline（docker.build / docker.image / Kaniko）
+
+### 26.1 Docker Pipeline DSL
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                script {
+                    def image = docker.build("myapp:${env.BUILD_NUMBER}")
+                    image.push()
+                    image.push('latest')
+                }
+            }
+        }
+        stage('Test') {
+            steps {
+                docker.image("myapp:${env.BUILD_NUMBER}").inside {
+                    sh 'mvn test'
+                }
+            }
+        }
+    }
+}
+```
+
+### 26.2 Kaniko 在 K8s Agent 构建
+
+```yaml
+# Jenkinsfile 中使用 Kaniko
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:latest
+      command: ['sleep']
+      args: ['infinity']
+      volumeMounts:
+        - name: docker-config
+          mountPath: /kaniko/.docker
+'''
+        }
+    }
+    stages {
+        stage('Build with Kaniko') {
+            steps {
+                container('kaniko') {
+                    sh '''
+                        /kaniko/executor \
+                            --context=${WORKSPACE} \
+                            --destination=registry/myapp:${BUILD_NUMBER} \
+                            --cache=true \
+                            --cache-repo=registry/cache
+                    '''
+                }
+            }
+        }
+    }
+}
+```

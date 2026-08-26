@@ -907,6 +907,135 @@ DC1 (北京) → CDCR → DC2 (上海)
 - Lucene 原理见「[搜索系统设计](../../场景设计/搜索系统设计.md)」；
 - 云上搜索服务见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」；
 - 云上中间件总览见「[云上中间件体系总览](./云上中间件体系总览.md)」；
+
+## SolrCloud 高可用运维实战
+
+```
+SolrCloud 运维要点：
+
+  集群健康检查
+    ├── curl http://solr:8983/solr/admin/collections?action=CLUSTERSTATUS
+    ├── 关注 live_nodes、collections 状态
+    └── 异常节点自动下线 + 恢复后自动加入
+
+  集群扩容（添加节点）
+    ├── 启动新 Solr 节点
+    ├── 添加到集群：solr create_collection -c my_coll -shards 2 -replicationFactor 2
+    └── 迁移分片：collectionaction SPLITSHARD
+
+  集群缩容（移除节点）
+    ├── 迁移分片到其他节点
+    ├── 确认节点无分片：CLUSTERSTATUS
+    └── 关闭节点
+
+  故障恢复
+    ├── 检查副本状态：REPLICA��态为DOWN
+    ├── 重新加入：RECREATE REPLICA
+    └── 重新平衡分片：SPLITSHARD / MERGESHARDS
+```
+
+```
+# 查看集群状态
+curl -s "http://solr:8983/solr/admin/collections?action=CLUSTERSTATUS" | python3 -m json.tool
+
+# 查看特定 collection 状态
+curl -s "http://solr:8983/solr/admin/collections?action=CLUSTERSTATUS&collection=products"
+
+# 查看分片分布
+curl -s "http://solr:8983/solr/admin/cores?action=STATUS&core=products_shard1_replica1"
+
+# 触发副本同步
+curl -s "http://solr:8983/solr/admin/collections?action=DELETEREPLICA&collection=products&shard=shard1&replica=replica2"
+curl -s "http://solr:8983/solr/admin/collections?action=ADDREPLICA&collection=products&shard=shard1&node=192.168.1.10:8983_solr"
+
+# 手动平衡分片
+curl -s "http://solr:8983/solr/admin/collections?action=SPLITSHARD&collection=products&shard=shard1"
+```
+
+## DIH 数据导入与增量同步
+
+```
+DIH（Data Import Handler）工作流：
+
+  数据库/文件
+      │
+      ├── Entity 配置
+      │     ├── query（全量导入 SQL）
+      │     ├── deltaQuery（增量查询）
+      │     ├── deletedPkQuery（删除检测）
+      │     └── transformer（数据转换）
+      │
+      ├── Processor
+      │     ├── EntityProcessor
+      │     ├── FieldStreamDataSource
+      │     └── ResponseWriter
+      │
+      └── Solr Index
+
+  触发方式：
+    ├── 全量：http://localhost:8983/solr/mycore/dataimport?command=full-import
+    ├── 增量：http://localhost:8983/solr/mycore/dataimport?command=delta-import
+    └── 定时：配合 cron 定期触发增量
+```
+
+```xml
+<!-- data-config.xml -->
+<dataConfig>
+  <dataSource type="JdbcDataSource" driver="com.mysql.jdbc.Driver"
+              url="jdbc:mysql://localhost:3306/mydb" user="root" password="pass"/>
+  <document>
+    <entity name="item" query="SELECT id, name, price FROM products"
+            deltaQuery="SELECT id FROM products WHERE update_time > '${dih.last_index_time}'"
+            deletedPkQuery="SELECT id FROM products WHERE deleted = 1">
+      <field column="id" name="id"/>
+      <field column="name" name="name"/>
+      <field column="price" name="price"/>
+    </entity>
+  </document>
+</dataConfig>
+```
+
+## Solr 缓存体系详解
+
+| 缓存类型 | 作用 | 配置参数 | 调优建议 |
+|----------|------|---------|---------|
+| filterCache | 缓存过滤器结果 | `size` | 高频查询场景增大 |
+| queryResultCache | 缓存查询结果 | `size` | 热点查询命中率高 |
+| documentCache | 缓存文档字段 | `size` | 小数据集有效 |
+| 自定义缓存 | 业务级缓存 | 实现 SolrCache | 高级场景 |
+
+```xml
+<!-- solrconfig.xml -->
+<query>
+  <filterCache class="solr.FastLRUCache" size="512" initialSize="512" autowarmCount="128"/>
+  <queryResultCache class="solr.LRUCache" size="512" initialSize="512" autowarmCount="128"/>
+  <documentCache class="solr.LRUCache" size="512" initialSize="512"/>
+</query>
+```
+
+## Solr vs Elasticsearch 深度对比
+
+| 维度 | Solr | Elasticsearch |
+|------|------|---------------|
+| 架构 | 主从（Leader-Follower） | 对等（Peer-to-Peer） |
+| 查询语法 | SolrQL（类 SQL） | Query DSL（JSON） |
+| 实时搜索 | Near Real-Time（有延迟） | Near Real-Time（1s 延迟） |
+| 分片管理 | 手动 + 自动 | 全自动 |
+| 生态 | 成熟、稳定 | 活跃、发展快 |
+| 监控 | Solr Admin UI | Kibana |
+| 使用场景 | 企业搜索、电商 | 日志分析、全文搜索 |
+| 社区 | 稳定但较慢 | 非常活跃 |
+
+## Solr 常见坑与最佳实践
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 查询慢 | 缓存未命中 | 调大 filterCache/queryResultCache |
+| 索引慢 | 文档过大 | 拆分文档、关闭不需要的 field |
+| OOM | 堆内存不足 | 增大 JVM 堆 + 调整缓存 |
+| 分片不均 | 热点 shard | 使用 HASH 分片 + 重新平衡 |
+| 数据不一致 | 副本延迟 | 强一致写入 + 监控同步延迟 |
+| DIH 失败 | SQL 异常 | 检查 deltaQuery + 错误日志 |
 - 中文分词见「IKAnalyzer」；
 - 对比 Elasticsearch 见「[ES 集群调优](./ES集群调优.md)」。
 

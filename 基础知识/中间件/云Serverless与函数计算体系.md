@@ -888,6 +888,183 @@ Resources:
   5. 低频用按量，高频考虑容器
 ```
 
+## Lambda 事件源与触发器深度配置
+
+```
+Lambda 事件源矩阵：
+
+  ┌─────────────────────┬─────────────────────┐
+  │ 推送模型（Push）     │ 拉取模型（Pull）     │
+  ├─────────────────────┼─────────────────────┤
+  │ API Gateway         │ Kinesis Stream      │
+  │ S3                  │ DynamoDB Streams    │
+  │ SNS                 │ SQS                 │
+  │ CloudWatch Events   │ EventBridge         │
+  │ IoT Rules           │ MSK (Kafka)         │
+  │ Alexa Smart Home    │ SQS FIFO            │
+  │ CodeCommit          │                     │
+  │ Cognito             │                     │
+  └─────────────────────┴─────────────────────┘
+```
+
+| 事件源 | 批处理 | 并发控制 | 重试机制 | 最大并发 |
+|--------|--------|---------|---------|---------|
+| API Gateway | ❌ | 自动 | ❌ | 无限制 |
+| S3 | ❌ | 自动 | 3 次 | 无限制 |
+| SQS | ✅ | 可配置 | 可配置 | 可配置 |
+| Kinesis | ✅ | 可配置 | 可配置 | 可配置 |
+| DynamoDB Streams | ✅ | 可配置 | 可配置 | 可配置 |
+| EventBridge | ❌ | 自动 | 180 天 | 无限制 |
+
+```
+# SQS 事件源配置
+{
+  "EventSourceArn": "arn:aws:sqs:us-east-1:123:my-queue",
+  "FunctionName": "my-handler",
+  "Enabled": true,
+  "BatchSize": 10,
+  "MaximumBatchingWindowInSeconds": 30,
+  "ScalingConfig": {
+    "ProvisionedConcurrency": 10
+  },
+  "FunctionResponseTypes": ["ReportBatchItemFailures"]
+}
+
+# Kinesis 事件源配置
+{
+  "EventSourceArn": "arn:aws:kinesis:us-east-1:123:my-stream",
+  "FunctionName": "my-handler",
+  "BatchSize": 100,
+  "StartingPosition": "LATEST",
+  "TumblingWindowInSeconds": 300,
+  "FunctionResponseTypes": ["ReportBatchItemFailures"]
+}
+
+# DynamoDB Streams 事件源配置
+{
+  "EventSourceArn": "arn:aws:dynamodb:us-east-1:123:table/my-table/stream/2024-01-01T00:00:00.000",
+  "FunctionName": "my-handler",
+  "BatchSize": 100,
+  "StartingPosition": "TRIM_HORIZON",
+  "MaximumRetryAttempts": 3,
+  "BisectBatchOnFunctionError": true
+}
+```
+
+## SnapStart 与冷启动优化
+
+```
+SnapStart 工作流程：
+
+  ① 首次调用：初始化 → 执行 → 生成快照
+  │
+  ② 后续调用：快照恢复 → 执行（跳过初始化）
+  │
+  快照内容：
+    ├── JVM 堆内存
+    ├── 已加载类
+    ├── 已打开连接（RDS、Redis）
+    └── 临时文件
+
+  支持运行时：
+    ├── Java 8/11/17/21（Corretto/Amazon Corretto）
+    └── Python 3.8+（部分）
+
+  限制：
+    ├── 不支持 /tmp 写入
+    ├── 不支持 GPU
+    ├── 快照大小 ≤ 512MB
+    └── 需要启用 Provisioned Concurrency
+```
+
+| 冷启动优化方案 | 启动时间 | 成本 | 适用场景 |
+|---------------|---------|------|----------|
+| 无优化 | 1-10s | 低 | 低频调用 |
+| 预热 | 100-500ms | 中 | 中频调用 |
+| SnapStart | 10-200ms | 中 | Java 高频 |
+| Provisioned Concurrency | < 10ms | 高 | 极低延迟 |
+
+```
+# 启用 SnapStart
+aws lambda publish-version \
+  --function-name my-function \
+  --description "SnapStart enabled"
+
+aws lambda put-function-concurrency \
+  --function-name my-function \
+  --provisioned-concurrency-config {
+    "ProvisionedConcurrentExecutions": 10
+  }
+
+# Python 冷启动优化
+# requirements.txt 中使用 Lambda Layer
+arn:aws:lambda:us-east-1:123456789012:layer:my-layer:1
+```
+
+## Lambda 成本模型深度分析
+
+```
+成本计算公式：
+
+  总成本 = 调用成本 + 计算成本 + 存储成本 + 网络成本
+
+  调用成本：
+    └── $0.20 / 1M 次请求
+
+  计算成本（GB-秒）：
+    └── $0.0000166667 / GB-秒
+    └── 计算公式 = 内存(GB) × 执行时间(s)
+
+  存储成本：
+    └── $0.0000000309 / GB-秒（/tmp 存储）
+    └── $0.023 / GB/月（EFS 存储）
+
+  网络成本：
+    └── $0.09 / GB（出站数据传输）
+    └── $0.00 / GB（入站）
+```
+
+| 场景 | 内存 | 执行时间 | 月调用次数 | 月成本 |
+|------|------|---------|-----------|--------|
+| API 处理 | 128MB | 50ms | 100 万 | ~$15 |
+| 数据处理 | 1GB | 5s | 10 万 | ~$12 |
+| 定时任务 | 256MB | 30s | 1 万 | ~$0.5 |
+| 高频 API | 512MB | 20ms | 1000 万 | ~$30 |
+
+```
+# 成本优化策略：
+
+1. 右调内存（Right-sizing）
+   ├── 内存翻倍，CPU 也翻倍
+   ├── 找到内存-速度平衡点
+   └── AWS Lambda Power Tuning 工具
+
+2. 批量处理
+   ├── SQS 批量 10 条 = 10 次调用 → 1 次
+   └── 减少 90% 调用成本
+
+3. 预置并发
+   ├── 避免冷启动延迟
+   └── 适合稳定流量
+
+4. ARM 架构
+   ├── Graviton2 比 x86 便宜 20%
+   └── 性能相当
+```
+
+```
+# Power Tuning 分析
+aws lambda power-tuning \
+  --lambda-function my-function \
+  --power-values 128,256,512,1024,2048 \
+  --payload '{"test": true}' \
+  --num 100 \
+  --parallel invocations 10
+
+# 输出示例：
+# 512MB 是最优选择（成本-性能平衡点）
+```
+
 ## 与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；

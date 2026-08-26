@@ -870,6 +870,193 @@ spec:
                       - { issuer: https://oauth.corp.com }
 ```
 
+## 十四、DORA 四指标采集埋点位置详解
+
+### 14.1 采集链路架构
+
+```mermaid
+flowchart TB
+    subgraph 采集点
+        A1[Git Commit Hook] --> B[事件收集器]
+        A2[CI Build Webhook] --> B
+        A3[部署系统事件] --> B
+        A4[Incident 工单系统] --> B
+        A5[监控系统 Alert] --> B
+    end
+    B --> C[指标计算引擎]
+    C --> D[DORA 四指标 + 返工率]
+    D --> E[Grafana Dashboard]
+    D --> F[团队看板]
+```
+
+### 14.2 各指标埋点位置与采集方式
+
+| 指标 | 埋点位置 | 采集方式 | 计算公式 | 数据源 |
+|------|---------|---------|---------|--------|
+| 部署频率 DF | ArgoCD/K8s deploy 事件 | Webhook/API | 成功部署次数/天 | CI/CD 平台 |
+| 变更前置时间 LT | Git PR merge → 生产部署 | 时间戳差值 | deploy_time - first_commit_time | Git + 部署系统 |
+| 变更失败率 CFR | 部署后 incident / 回滚 | 关联变更与故障 | 因变更导致故障的部署占比 | 事故工单 + 监控 |
+| 服务恢复时间 MTTR | 告警开启→关闭 | incident 时长 | 故障确认到恢复的时间差 | 告警系统 |
+| 返工率 Rework | 非计划修复 commit | Git commit 分类 | 非计划修复数/总部署数 | Git 分析 |
+
+## 十五、DevSecOps 工具链集成（SonarQube + Trivy + OWASP ZAP）
+
+### 15.1 SonarQube 静态分析集成
+
+```yaml
+- name: SonarQube Scan
+  uses: SonarSource/sonarqube-scan-action@master
+  env:
+    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+  with:
+    args: >
+      -Dsonar.projectKey=my-project
+      -Dsonar.sources=src/
+      -Dsonar.qualitygate.wait=true
+```
+
+| 扫描维度 | 规则 | 阻断条件 |
+|----------|------|---------|
+| Bug | Critical/Major | Critical 阻断 |
+| 漏洞 | High/Critical | High 阻断 |
+| 安全热点 | High | High 阻断 |
+| 覆盖率 | 新增代码 ≥ 80% | 低于阈值阻断 |
+
+### 15.2 Trivy 镜像扫描 + SBOM 生成
+
+```yaml
+- name: Trivy Image Scan
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: ${{ env.IMAGE }}
+    format: 'sarif'
+    output: 'trivy.sarif'
+    severity: 'CRITICAL,HIGH'
+    exit-code: '1'
+    scanners: 'vuln,secret,misconfig'
+
+- name: Generate SBOM
+  run: |
+    trivy image --format cyclonedx --output sbom.cdx.json $IMAGE
+    trivy image --format spdx-json --output sbom.spdx.json $IMAGE
+```
+
+### 15.3 OWASP ZAP 动态扫描
+
+```yaml
+zap-scan:
+  stage: security
+  image: ghcr.io/zaproxy/zaproxy:stable
+  script:
+    - zap-full-scan.py -t https://staging.example.com \
+        -r zap-report.html -x zap-report.xml -J zap-report.json
+    - python scripts/evaluate_zap.py \
+        --input zap-report.json --max-high 0 --max-medium 5
+```
+
+## 十六、安全门禁实现（Pipeline Stage Gate）
+
+```mermaid
+flowchart LR
+    subgraph 提交级门禁
+        G1[Secret Scan]
+        G2[SAST]
+        G3[SCA]
+    end
+    subgraph 构建级门禁
+        G4[Trivy 镜像扫描]
+        G5[SBOM 生成]
+        G6[镜像签名]
+    end
+    subgraph 部署级门禁
+        G7[DAST: OWASP ZAP]
+        G8[许可证合规]
+        G9[人工审批]
+    end
+    G1 --> G4 --> G7
+```
+
+| 门禁级别 | 拦截条件 | 处理方式 |
+|----------|---------|---------|
+| CRITICAL | 安全漏洞 | 阻断发布 |
+| HIGH | 安全漏洞 | 阻断或安全豁免 |
+| MEDIUM | 安全问题 | 警告，限期修复 |
+| LOW | 安全建议 | 信息，知悉即可 |
+
+## 十七、混沌工程在 CI/CD 中的实验
+
+### 17.1 混沌实验类型与工具
+
+| 实验类型 | 工具 | 目标 | 适用阶段 |
+|----------|------|------|---------|
+| Pod 故障 | Chaos Monkey / LitmusChaos | 验证自愈能力 | 预发/生产 |
+| 网络延迟 | tc / LitmusChaos | 验证超时处理 | 预发 |
+| 磁盘压力 | stress-ng | 验证资源限制 | 预发 |
+| DNS 故障 | LitmusChaos | 验证 DNS 容错 | 预发 |
+| 依赖服务故障 | Toxiproxy | 验证降级能力 | 预发 |
+
+### 17.2 混沌实验与发布门禁
+
+| 混沌实验结果 | 对发布的影响 | 处理方式 |
+|-------------|-------------|---------|
+| Pod 故障后 30s 内恢复 | 不阻断发布 | 继续放量 |
+| Pod 故障后 60s 内恢复 | 警告 | 延长观察窗口 |
+| Pod 故障后 60s 未恢复 | 阻断发布 | 回滚并修复 |
+| 依赖服务故障后降级正常 | 不阻断发布 | 继续放量 |
+
+## 十八、部署频率优化策略
+
+| 杠杆 | 策略 | 预期效果 |
+|------|------|---------|
+| 小批量提交 | 每次变更 < 400 行代码 | -50% 故障半径 |
+| 并行化 CI | 测试并行+构建缓存 | -60% 构建时间 |
+| 自动化门禁 | SAST/SCA/测试自动拦截 | -80% 人工审批 |
+| Feature Flags | 部署与发布分离 | 随时可部署 |
+| 数据库解耦 | Expand-Contract 模式 | -90% Schema 变更风险 |
+
+## 十九、Lead Time 测量方法
+
+### 19.1 Lead Time 拆解
+
+```text
+Lead Time = 编码时间 + 评审时间 + CI 时间 + 部署时间 + 排队时间
+
+各段时间占比（典型）：
+  编码时间：30%
+  评审时间：25%
+  CI 时间：20%
+  部署时间：10%
+  排队时间：15%
+```
+
+| 时间段 | 优化策略 | 工具/方法 |
+|--------|---------|----------|
+| 编码时间 | 代码模板、AI 辅助 | GitHub Copilot |
+| 评审时间 | 自动分配 reviewer、SLA | CODEOWNERS + 告警 |
+| CI 时间 | 并行、缓存、增量 | BuildKit + Matrix |
+| 部署时间 | 自动化、金丝雀 | ArgoCD + Rollouts |
+| 排队时间 | 自动化门禁、优先级队列 | OPA Gatekeeper |
+
+## 二十、混沌工程实验清单
+
+### 20.1 基础设施层实验
+
+| 实验 | 工具 | 预期结果 | 回滚条件 |
+|------|------|---------|---------|
+| Pod 随机删除 | Chaos Monkey | 30s 内自愈 | 60s 未恢复 |
+| 节点故障 | LitmusChaos | 工作负载迁移 | 5min 未恢复 |
+| 网络延迟注入 | tc / LitmusChaos | 超时重试成功 | 错误率 > 5% |
+| 磁盘压力 | stress-ng | 资源限制生效 | OOMKill |
+
+### 20.2 应用层实验
+
+| 实验 | 工具 | 预期结果 | 回滚条件 |
+|------|------|---------|---------|
+| 依赖服务故障 | Toxiproxy | 降级逻辑生效 | 错误率 > 10% |
+| 数据库连接池耗尽 | LitmusChaos | 连接池恢复 | 错误率 > 5% |
+| 缓存失效 | 手动清除 | 回源正常 | 延迟 P99 > 1s |
+
 ## 本篇补充 Checklist
 
 - [ ] DORA 四指标从 CI/Git/Incident 自动抽取，Grafana 看板按团队分组。

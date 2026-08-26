@@ -933,6 +933,102 @@ FROM orders GROUP BY dt, category_id;
 - 实时数仓见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；
 - 数据湖格式见「[Iceberg/Delta/Hudi](./云上数仓与大数据生态.md)」；
 - Kafka 实时导入见「[Kafka](./Kafka.md)」；
+
+## Doris 前缀索引与 ZoneMap 剪枝
+
+```
+Doris 查询优化机制：
+
+  前缀索引（Prefix Index）
+    ├── 每个 Segment 的前 36 字节生成稀疏索引
+    ├── 适合等值/范围查询（按前缀匹配）
+    ├── 主键设计影响查询性能
+    └── 示例：主键 (user_id, order_id)
+         → WHERE user_id = 100 快速定位
+         → WHERE order_id = 123 无法利用
+
+  ZoneMap（列级索引）
+    ├── 每个 Segment 每列记录 min/max
+    ├── 范围查询时快速跳过不匹配 Segment
+    └── 建议高频过滤列放在前面
+
+  Bloom Filter
+    ├── 等值查询快速排除
+    ├── 误判率可配置
+    └── 适合低基数列
+
+  倒排索引（2.0+）
+    ├── 支持文本全文检索
+    ├── LIKE '%keyword%' 走倒排
+    └── 替代 ES 做简单搜索
+```
+
+```sql
+-- 主键设计原则（高频过滤列在前）
+CREATE TABLE orders (
+    user_id BIGINT,
+    order_id BIGINT,
+    amount DECIMAL(10,2),
+    ...
+) UNIQUE KEY(user_id, order_id);
+
+-- 查看前缀索引命中
+EXPLAIN SELECT * FROM orders WHERE user_id = 100;
+-- 输出中 prefix_index = true 表示命中
+
+-- Bloom Filter 过滤
+SET enable_bloom_filter = true;
+SET bloom_filter_size = 256;
+
+-- 倒排索引（2.0+）
+CREATE TABLE logs (
+    id BIGINT,
+    message STRING,
+    INDEX idx_msg(message) USING INVERTED COMMENT '倒排索引'
+);
+```
+
+## Colocate Join 与数据本地化
+
+```
+Colocate Join 原理：
+
+  表 A（Bucket 3）    表 B（Bucket 3，Colocate Group）
+    ├── Bucket 0 → BE1    ├── Bucket 0 → BE1  ← 同一 BE
+    ├── Bucket 1 → BE2    ├── Bucket 1 → BE2  ← 同一 BE
+    └── Bucket 2 → BE3    └── Bucket 2 → BE3  ← 同一 BE
+
+  JOIN 时：
+    └── 同一 Bucket 数据在同一 BE → 无需 shuffle → 网络开销为 0
+```
+
+```sql
+CREATE TABLE db1.user (
+    user_id BIGINT,
+    user_name STRING
+) DISTRIBUTED BY HASH(user_id) BUCKETS 3
+PROPERTIES ("colocate_with" = "user_group");
+
+CREATE TABLE db1.orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2)
+) DISTRIBUTED BY HASH(user_id) BUCKETS 3
+PROPERTIES ("colocate_with" = "user_group");
+
+SHOW PROC '/colocate_group';
+```
+
+## 报表系统落地案例
+
+```
+某电商 BI 报表系统架构：
+
+  数据源：MySQL（订单）、HBase（日志）、Redis（实时指标）
+  数据采集：Flink CDC → Doris（实时）、Flume → Kafka → Doris（批量）
+  查询层：Metabase（自助 BI）、Superset（高级分析）
+  性能指标：简单查询 P99 < 100ms、复杂聚合 < 3s、支持 500+ 并发
+```
 - ETL 调度见「[DolphinScheduler](./DolphinScheduler.md)」；
 - 对比 Hive 见「[Hive 与数仓体系](../大数据/02-技术体系与架构演进.md)」；
 - 向量化执行原理见「[ClickHouse](./ClickHouse.md)」。

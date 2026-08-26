@@ -991,3 +991,284 @@ docker run -d --name jenkins-dr \
 - [ ] 并行阶段用 `failFast: true` 实现快速失败，矩阵构建控制维度爆炸。
 - [ ] JCasC + plugins.txt 声明式配置，杜绝 UI 手动漂移。
 - [ ] 定期备份 `JENKINS_HOME` 关键文件，加密异地存储。
+
+---
+
+## 二十一、Jenkins 分布式 Agent 弹性扩缩（K8s Pod Template）
+
+### 21.1 K8s Pod Template 配置
+
+```yaml
+# Jenkins K8s Pod Template
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: agent
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+      resources:
+        requests: { cpu: "500m", memory: "512Mi" }
+        limits: { cpu: "1", memory: "1Gi" }
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+    - name: kubectl
+      image: bitnami/kubectl:latest
+      command: ['sleep']
+      args: ['infinity']
+  volumes:
+    - name: docker-sock
+      emptyDir: {}
+```
+
+### 21.2 Agent 弹性扩缩策略
+
+| 策略 | 配置 | 适用场景 |
+|------|------|---------|
+| 固定池 | K8s Deployment 固定副本数 | 稳定负载 |
+| 动态扩缩 | K8s HPA + Jenkins 负载 | 波动负载 |
+| 按需起停 | Pod Template + 超时回收 | 低频任务 |
+| 优先级队列 | 多队列 + 优先级调度 | 混合负载 |
+
+```groovy
+// Jenkinsfile: 动态 Pod Template
+pipeline {
+    agent {
+        kubernetes {
+            label 'dynamic-agent'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: maven
+      image: maven:3.9-eclipse-temurin-17
+      command: ['sleep']
+      args: ['infinity']
+      resources:
+        requests: { cpu: '1', memory: '2Gi' }
+"""
+        }
+    }
+    stages {
+        stage('Build') {
+            steps {
+                container('maven') {
+                    sh 'mvn clean package'
+                }
+            }
+        }
+    }
+}
+```
+
+## 二十二、共享库目录结构与版本化管理
+
+### 22.1 共享库完整目录
+
+```text
+jenkins-shared-library/
+├── vars/                    # 全局函数（Pipeline 可直接调用）
+│   ├── buildMaven.groovy
+│   ├── deployK8s.groovy
+│   └── notifySlack.groovy
+├── src/                     # OOP 类库
+│   └── com/company/ci/
+│       ├── Pipeline.groovy
+│       └── Deployer.groovy
+├── resources/               # 非 Groovy 资源
+│   └── templates/
+│       └── Jenkinsfile.tpl
+├── test/                    # Pipeline Unit 测试
+│   └── groovy/
+└── vars.txt                 # API 文档
+```
+
+### 22.2 版本化管理
+
+```groovy
+// 引用特定版本的共享库
+@Library('my-shared-lib@v2.3.0') _
+
+// 或在 Jenkinsfile 声明
+library(
+    identifier: 'my-shared-lib@v2.3.0',
+    retriever: modernSCM([
+        $class: 'GitSCMSource',
+        remote: 'https://github.com/org/jenkins-shared-library.git'
+    ])
+)
+```
+
+| 版本策略 | 做法 | 适用 |
+|----------|------|------|
+| SemVer tag | `v1.2.3` | 稳定版本 |
+| 分支引用 | `main`/`develop` | 开发中 |
+| Git SHA | `abc1234` | 精确锁定 |
+
+## 二十三、凭据绑定最佳实践（withCredentials 作用域最小化）
+
+### 23.1 凭据绑定范围
+
+| 绑定方式 | 作用域 | 安全性 | 示例 |
+|----------|--------|--------|------|
+| 全局环境变量 | 整个 Pipeline | 低 | `environment { API_KEY = credentials('api-key') }` |
+| withCredentials stage | 当前 stage | 高 | `withCredentials([...]) { ... }` |
+| withCredentials step | 仅该 step | 最高 | 嵌套在具体命令中 |
+
+### 23.2 凭据类型与绑定
+
+```groovy
+// Secret 文本
+withCredentials([string(credentialsId: 'api-key', variable: 'API_KEY')]) {
+    sh 'curl -H "Authorization: $API_KEY" https://api.example.com'
+}
+
+// Secret 文件
+withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+    sh 'kubectl --kubeconfig=$KUBECONFIG get pods'
+}
+
+// SSH 密钥
+withCredentials([sshUserPrivateKey(
+    credentialsId: 'ssh-key',
+    keyFileVariable: 'SSH_KEY',
+    usernameVariable: 'SSH_USER'
+)]) {
+    sh 'scp -i $SSH_KEY file.txt $SSH_USER@server:/path/'
+}
+
+// 用户名密码
+withCredentials([usernamePassword(
+    credentialsId: 'docker-cred',
+    usernameVariable: 'USER',
+    passwordVariable: 'PASS'
+)]) {
+    sh 'echo $PASS | docker login -u $USER --password-stdin'
+}
+```
+
+## 二十四、Fingerprint 制品追溯原理
+
+### 24.1 Fingerprint 工作原理
+
+```text
+Fingerprint = 对制品内容计算 MD5/SHA 指纹
+  用途：追溯制品来源、检测篡改、关联构建
+  存储：Jenkins 数据库（fingerprints/）
+  查询：Jenkins UI → Manage Jenkins → Fingerprint
+
+流程：
+  1. 构建时记录指纹：archiveFingerprint: true
+  2. 部署时验证指纹：是否来自可信构建
+  3. 审计时查询指纹：谁在何时构建了什么
+```
+
+### 24.2 Fingerprint 使用示例
+
+```groovy
+// 归档制品并记录指纹
+archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+
+// 验证指纹
+def fp =udson.test.meta.Fingerprint.getById('abc123')
+echo "构建者: ${fp.getTimestamp()}"
+echo "来源: ${fp.getOriginal().getName()}"
+```
+
+## 二十五、Jenkins 性能瓶颈三大件（GC / UI / WebSocket）调优
+
+### 25.1 性能瓶颈与调优
+
+| 瓶颈 | 症状 | 调优方案 |
+|------|------|---------|
+| GC 停顿 | UI 卡顿、构建延迟 | 增大堆内存、G1GC、调优 GC 参数 |
+| UI 渲染 | 页面加载慢 | 禁用不需要的插件、开启 AJAX |
+| WebSocket | 实时日志延迟 | 启用 WebSocket、配置反向代理 |
+| 磁盘 IO | 构建慢、日志写入慢 | SSD、日志外置、Build Discarder |
+| 内存泄漏 | OOM、进程重启 | 分析 heap dump、升级插件 |
+
+### 25.2 JVM 调优配置
+
+```bash
+# Jenkins JVM 参数（/etc/default/jenkins 或 systemd）
+JAVA_OPTS="-Xms2g -Xmx4g \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/var/log/jenkins/heapdump.hprof \
+  -Dhudson.model.DirectoryBrowserSupport.CSP="
+```
+
+### 25.3 WebSocket 优化
+
+```bash
+# 启用 WebSocket（减少轮询开销）
+# Jenkins 2.264+ 默认启用
+# 如需禁用：-Dhudson.model.ParametersAction.keepUndefinedParameters=true
+```
+
+## 二十六、JCasC 配置即代码与灾难恢复备份
+
+### 26.1 JCasC 配置示例
+
+```yaml
+# casc.yaml
+jenkins:
+  systemMessage: "Jenkins Configuration as Code"
+  numExecutors: 0
+  mode: EXCLUSIVE
+  
+  securityRealm:
+    ldap:
+      configurations:
+        - server: "ldap.example.com"
+          rootDN: "dc=example,dc=com"
+          
+  nodes:
+    - kubernetes:
+        name: "k8s-agent"
+        serverUrl: "https://kubernetes.default"
+        namespace: "jenkins"
+        jenkinsUrl: "http://jenkins:8080"
+        
+  credentials:
+    system:
+      domainCredentials:
+        - credentials:
+            - string:
+                scope: GLOBAL
+                id: "api-key"
+                secret: "${API_KEY}"
+```
+
+### 26.2 灾难恢复备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| JENKINS_HOME | ThinBackup / rsync | 每日 | 30 天 |
+| JCasC 配置 | Git 版本控制 | 每次变更 | 永久 |
+| Pipeline 定义 | Git 版本控制 | 每次变更 | 永久 |
+| 制品 | 制品库同步 | 实时 | 按策略 |
+| 凭据 | 外部密钥管理 | 实时 | 永久 |
+
+```bash
+# ThinBackup 备份脚本
+curl -X POST "http://jenkins:8080/job/backup/build" \
+  --user admin:token
+
+# 手动备份关键文件
+tar czf jenkins-backup-$(date +%Y%m%d).tar.gz \
+  JENKINS_HOME/config.xml \
+  JENKINS_HOME/secrets/ \
+  JENKINS_HOME/plugins/*.jpi \
+  JENKINS_HOME/jobs/*/config.xml
+```

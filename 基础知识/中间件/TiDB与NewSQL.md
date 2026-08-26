@@ -856,6 +856,266 @@ flowchart TD
 
 ---
 
+## TiDB Placement Rules 与数据放置策略
+
+```
+Placement Rules 核心概念：
+
+  Rule Group（规则组）
+    ├── 可针对不同表/分区设置不同副本策略
+    └── scope = REGION / ZONE / HOST
+
+  Rule（规则）
+    ├── role = FOLLOWER / LEARNER / RESTRICTED_FOLLOWER
+    ├── count = 副本数
+    ├── location_labels = [zone, rack, host]
+    └── isolation_level = ZONE（同 zone 不放多副本）
+
+  Rule Calculator
+    └── 根据 rules 自动调度 region 到合适 store
+```
+
+| 配置项 | 说明 | 典型值 |
+|--------|------|--------|
+| `location_labels` | 物理拓扑标签 | `["zone","rack","host"]` |
+| `isolation_level` | 隔离级别 | `ZONE`（zone 级隔离） |
+| `leader_constraints` | Leader 放置约束 | `+zone=zone1` |
+| `learner_constraints` | Learner 放置约束 | `+zone=zone3` |
+| `schedule_policy` | 调度策略 | `even` / `explicit` |
+
+```
+# 查看当前 Placement Rules
+pd-ctl config placement-rules
+
+# 导出规则到文件
+pd-ctl config placement-rules export --outpath ./rules.json
+
+# 导入规则
+pd-ctl config placement-rules import --inpath ./rules.json
+
+# 示例：为某表设置 2follower+1learner
+{
+  "group_id": "tenant_a",
+  "rules": [
+    {
+      "id": 1,
+      "role": "VOTER",
+      "count": 2,
+      "location_labels": ["zone"],
+      "isolation_level": "ZONE"
+    },
+    {
+      "id": 2,
+      "role": "LEARNER",
+      "count": 1,
+      "constraints": {"+zone": "zone3"}
+    }
+  ]
+}
+```
+
+## TiFlash 同步机制深度解析
+
+```
+TiFlash 同步流程：
+
+  TiKV Region Leader
+      │
+      ├── Raft Learner (TiFlash)
+      │     ├── 异步复制 Raft 日志
+      │     ├── 延迟通常 < 1s
+      │     └── 可配置同步模式：
+      │           ├── Async（默认，低延迟）
+      │           └── Sync（强一致，高延迟）
+      │
+  只读快照：
+      └── TiFlash 定期做 snapshot
+          └── MVCC 读取历史版本
+```
+
+| 同步模式 | 一致性 | 延迟 | 适用场景 |
+|----------|--------|------|----------|
+| `Async` | 最终一致 | 1-5s | 实时报表、OLAP 查询 |
+| `Sync` | 强一致 | 10-50ms | 实时风控、强一致分析 |
+| `RocksDB 引擎` | 本地一致 | 0ms | TiKV 内部 |
+
+```
+# 查看 TiFlash 同步状态
+pd-ctl region check --zone=tiflash
+
+# TiFlash 同步延迟监控
+curl http://tiflash:12313/metrics | grep tiflash_proxy_raft_apply_log_duration_seconds
+
+# 强同步设置
+ALTER TABLE t SET TIFLASH REPLICA 1 LOCATION LABELS "zone=tiflash" FOLLOWER_COUNT 1;
+
+# 检查同步进度
+SELECT * FROM information_schema.tiflash_replica;
+```
+
+## pd-ctl 运维操作大全
+
+```
+# 集群状态
+pd-ctl cluster info
+pd-ctl member list
+pd-ctl region status
+
+# Store 管理
+pd-ctl store list
+pd-ctl store stats <store_id>
+pd-ctl store remove <store_id>          # 下线节点
+pd-ctl store limit <store_id> add-peer 10  # 限制调度速率
+
+# Region 调度
+pd-ctl region operator add transfer-leader <region_id> <target_store_id>
+pd-ctl region operator add scatter-region <region_id>
+pd-ctl region operator remove <region_id>
+
+# 调度器控制
+pd-ctl scheduler list
+pd-ctl scheduler pause balance-leader-scheduler
+pd-ctl scheduler resume balance-leader-scheduler
+pd-ctl scheduler config balance-leader
+
+# 配置热更新
+pd-ctl config set max-snapshot-count 3
+pd-ctl config set leader-schedule-limit 4
+pd-ctl config set region-schedule-limit 2048
+```
+
+| 命令 | 用途 | 注意事项 |
+|------|------|----------|
+| `store remove` | 下线节点 | 先 `prepare-stop` 再 `remove` |
+| `scatter-region` | 打散 region | 大规模扩缩容前必做 |
+| `balance-leader` | Leader 均衡 | 高峰期暂停避免抖动 |
+| `hot-region` | 热 region 调度 | 配合 `hot-region-schedule-limit` |
+
+## tikv-ctl 运维工具箱
+
+```
+# 查看 Region 信息
+tikv-ctl --host tikv0:20160 region -r <region_id>
+
+# 查看 RocksDB 统计
+tikv-ctl --host tikv0:20160 region-properties -r <region_id>
+tikv-ctl --host tikv0:20160 engine-info
+
+# 人工 compact（大版本升级后必做）
+tikv-ctl --host tikv0:20160 compact --db /var/lib/tikv/db
+tikv-ctl --all --host tikv0:20160 compact --db /var/lib/tikv/db
+
+# RocksDB SST 文件分析
+tikv-ctl --host tikv0:20160 scan --from 'key1' --to 'key2' --limit 10
+
+# 恢复（危险操作）
+tikv-ctl --host tikv0:20160 recover -r <region_id>
+
+# Tombstone 清理
+tikv-ctl --host tikv0:20160 tombstone --pd http://pd:2379
+```
+
+## MySQL 工具兼容性矩阵
+
+| 工具 | 兼容性 | 注意事项 |
+|------|--------|----------|
+| MySQL 5.7 Client | ✅ 完全兼容 | 基础 CRUD 无差异 |
+| MySQL 8.0 Client | ✅ 完全兼容 | 新语法支持 |
+| Navicat | ✅ 兼容 | DDL 操作需 PD 在线 |
+| DBeaver | ✅ 兼容 | 部分系统表差异 |
+| MySQL Workbench | ⚠️ 部分兼容 | 逆向工程可能报错 |
+| pt-online-schema-change | ✅ 兼容 | 大表 DDL 推荐使用 |
+| gh-ost | ✅ 兼容 | 无外键场景更优 |
+| mysqldump | ✅ 兼容 | 逻辑备份 |
+| mydumper/myloader | ✅ 兼容 | 并行备份恢复 |
+| Canal | ✅ 兼容 | 需配置 GTID 模式 |
+| Maxwell | ✅ 兼容 | 需 binlog_row_image=FULL |
+| Debezium | ✅ 兼容 | CDC 首选 |
+
+## 大事务处理与规避方案
+
+```
+TiDB 大事务限制：
+
+  1. 默认单事务大小限制：
+     ├── raft_log_max_size = 6MB（建议值）
+     └── 超过会报 "transaction too large"
+
+  2. 默认事务 KV 数限制：
+     └── 5000 KV（单次事务）
+         └── 超过会回退到 pessimistic retry
+
+  3. 写入 QPS 限制：
+     └── 单 Region 写入不超过 1MB/s
+         └── 超过触发 split
+
+  4. Snapshot 大小限制：
+     └── 单 Region 不超过 256MB
+```
+
+```
+# 大事务规避策略：
+
+1. 分批写入
+   ├── 每批 1000-5000 条
+   ├── 每批独立事务
+   └── 用 batch_id 做幂等
+
+2. 使用悲观事务
+   SET SESSION tidb_txn_mode = 'pessimistic';
+   -- 降低冲突重试概率
+
+3. 压缩写入
+   ├── 合并小 Key 为大 Key
+   └── 减少 MVCC 版本数
+
+4. 流式写入
+   ├── 使用 LOAD DATA INFILE
+   └── 使用 TiDB Lightning 批量导入
+```
+
+| 场景 | 推荐方案 | 预期效果 |
+|------|----------|----------|
+| 百万级批量插入 | 分批 5000 条/批 + 悲观事务 | 吞吐 10w+/s |
+| 大表 DDL | pt-osc 或 gh-ost | 零锁表时间 |
+| 跨表事务 | 拆分为多事务 + 最终一致 | 避免大事务 |
+| 实时写入 | 批量攒批 + 异步提交 | 延迟 < 100ms |
+
+## 金融系统迁移实战案例
+
+```
+某银行核心系统迁移路径：
+
+  Phase 1: 双写验证（2周）
+    ├── 应用双写 MySQL + TiDB
+    ├── 定时对账脚本
+    └── 差异告警
+
+  Phase 2: 灰度切换（1周）
+    ├── 10% 流量切 TiDB
+    ├── 观察延迟/P99/错误率
+    └── 逐步提升到 50%
+
+  Phase 3: 全量切换（3天）
+    ├── 停止 MySQL 写入
+    ├── TiDB 独立运行
+    └── MySQL 作为备份
+
+  Phase 4: 下线 MySQL（2周）
+    ├── 观察期
+    ├── 清理双写代码
+    └── 成本回收
+```
+
+| 迁移阶段 | 风险等级 | 回滚时间 | 核心指标 |
+|----------|----------|----------|----------|
+| 双写验证 | 低 | 即时 | 对账差异率 < 0.01% |
+| 灰度切换 | 中 | < 5min | P99 延迟 ≤ MySQL 2倍 |
+| 全量切换 | 高 | < 30min | 错误率 < 0.1% |
+| 下线 MySQL | 低 | 不可回滚 | 稳定运行 7 天 |
+
+---
+
 ## 十一、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

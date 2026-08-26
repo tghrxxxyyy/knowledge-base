@@ -872,6 +872,164 @@ kind delete cluster --name pr-${{ github.event.number }}
 | 命名空间隔离 | 快 | 低 | 共用集群多 PR |
 | 临时托管集群（ACK/EKS） | 慢 | 高 | 近生产验证 |
 
+## 二十一、镜像扫描集成到流水线（Trivy exit code / SARIF 输出）
+
+### 21.1 Trivy 扫描模式对比
+
+| 模式 | 命令 | 输出格式 | 适用场景 |
+|------|------|---------|---------|
+| Exit Code 阻断 | `trivy image --exit-code 1` | 纯文本 | CI 门禁阻断 |
+| SARIF 上传 | `trivy image --format sarif` | SARIF | GitHub Security 面板 |
+| JSON 报告 | `trivy image --format json` | JSON | 自定义分析 |
+| Table 展示 | `trivy image --format table` | 表格 | 人工查看 |
+
+```yaml
+trivy-scan:
+  stage: security
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE
+    - trivy image --format sarif --output trivy.sarif $IMAGE
+    - trivy image --format cyclonedx --output sbom.cdx.json $IMAGE
+  artifacts:
+    paths: [trivy.sarif, sbom.cdx.json]
+    when: always
+```
+
+## 二十二、Helm Chart 版本管理
+
+### 22.1 Chart 仓库策略
+
+| 策略 | 做法 | 适用 |
+|------|------|------|
+| ChartMuseum | 自建 OCI 仓库 | 中小团队 |
+| Artifactory | 企业级制品库 | 大型企业 |
+| Harbor | OCI 原生支持 | K8s 原生环境 |
+
+```bash
+# Chart 版本管理
+helm package ./mychart
+helm push mychart-1.2.3.tgz oci://registry.example.com/charts
+helm upgrade --install myapp oci://registry.example.com/charts/myapp \
+  --version 1.2.3 --namespace production
+```
+
+## 二十三、Kustomize Overlay 环境差异管理
+
+```yaml
+# overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patchesStrategicMerge:
+  - replicas-patch.yaml
+  - hpa-patch.yaml
+namePrefix: prod-
+commonLabels:
+  environment: production
+```
+
+| 差异维度 | dev | staging | prod |
+|----------|-----|---------|------|
+| 副本数 | 2 | 3 | 6+ |
+| 资源限制 | 低 | 中 | 高 |
+| HPA | 无 | 有 | 有 |
+| 镜像 Tag | latest | semver | digest |
+
+## 二十四、部署前置条件检查（Pre-deploy Hooks）
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: app-migrator:latest
+          command: ["./migrate.sh"]
+      restartPolicy: Never
+```
+
+| 检查项 | 工具 | 阻断条件 |
+|--------|------|---------|
+| K8s 版本兼容 | kubectl version | 版本不兼容 |
+| CRD 存在 | kubectl get crd | CRD 缺失 |
+| 依赖服务就绪 | curl health check | 依赖不可用 |
+| 资源配额 | kubectl describe quota | 配额不足 |
+
+## 二十五、镜像签名验证（Cosign / Notary v2）
+
+```bash
+# Cosign keyless 签名
+COSIGN_EXPERIMENTAL=1 cosign sign $IMAGE
+
+# 验证
+cosign verify \
+  --certificate-identity "https://github.com/myorg/myrepo/.github/workflows/ci.yml@refs/heads/main" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  $IMAGE
+```
+
+```yaml
+# Kyverno 强制签名验证
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.example.com/*"]
+          attestors:
+            - entries:
+                - keyless:
+                    identities:
+                      - { issuer: "https://token.actions.githubusercontent.com" }
+```
+
+## 二十六、K8s Rollout Undo 自动触发条件配置
+
+| 条件 | 阈值 | 检测方式 | 处理 |
+|------|------|---------|------|
+| 健康检查失败 | 连续 3 次 | liveness probe | 自动重启 |
+| 错误率上升 | >5% 持续 5min | Prometheus alert | 自动回滚 |
+| P99 延迟 | >2s 持续 3min | SLO alerting | 自动回滚 |
+| 部署超时 | 10min 未完成 | progressDeadlineSeconds | 标记失败 |
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: success-rate
+      interval: 1m
+      count: 5
+      successCondition: result[0] >= 0.99
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}",code=~"2.."}[5m]))
+            / sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
+```
+
 ## 本篇补充 Checklist
 
 - [ ] 免 daemon 构建用 Kaniko / BuildKit，不挂 docker.sock，secret 用 mount。

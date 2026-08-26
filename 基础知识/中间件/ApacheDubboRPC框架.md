@@ -903,6 +903,179 @@ Triple 是 Dubbo 3 的默认协议，基于 HTTP/2 + Protobuf：
 - 对比 gRPC 见「[gRPC](./gRPC.md)」；
 - 对比 Spring Cloud 见「[微服务治理全链路](../../架构/微服务治理全链路.md)」。
 
+## Dubbo 3 Triple 协议深度
+
+```
+Triple 协议架构：
+
+  ┌─────────────────────────────────────────────┐
+  │                  Triple                      │
+  │  ┌─────────────┐  ┌─────────────────────┐   │
+  │  │ HTTP/2      │  │ gRPC 兼容           │   │
+  │  │ 二进制帧     │  │ 四种调用模式        │   │
+  │  └─────────────┘  └─────────────────────┘   │
+  │  ┌─────────────┐  ┌─────────────────────┐   │
+  │  │ 流式通信     │  │ 健康检查            │   │
+  │  │ Streaming   │  │ HTTP/2 PING        │   │
+  │  └─────────────┘  └─────────────────────┘   │
+  └─────────────────────────────────────────────┘
+
+  支持特性：
+    ├── 四种调用模式：
+    │     ├── Unary（一元调用）
+    │     ├── Server Streaming
+    │     ├── Client Streaming
+    │     └── Bidirectional Streaming
+    │
+    ├── 元数据传递（Header/Trailer）
+    ├── 取消传播（Cancellation Propagation）
+    ├── 超时传播（Timeout Propagation）
+    ├── 异步化（Async）
+    └── 流控（Flow Control）
+```
+
+```protobuf
+// Triple IDL 定义（Proto3）
+syntax = "proto3";
+package com.example;
+
+service OrderService {
+    rpc GetOrder(GetOrderRequest) returns (OrderResponse);
+    rpc ListOrders(ListOrdersRequest) returns (stream OrderResponse);
+    rpc BatchCreateOrders(stream CreateOrderRequest) returns (BatchCreateResponse);
+    rpc StreamOrders(stream OrderRequest) returns (stream OrderResponse);
+}
+```
+
+| 协议 | 传输层 | 序列化 | 兼容性 | 性能 |
+|------|--------|--------|--------|------|
+| Dubbo2 | TCP（私有） | Hessian2 | Dubbo 客户端 | 高 |
+| Triple | HTTP/2 | Protobuf | gRPC/HTTP 客户端 | 高 |
+| gRPC | HTTP/2 | Protobuf | gRPC 客户端 | 高 |
+| REST | HTTP/1.1 | JSON | 任何 HTTP 客户端 | 中 |
+
+## Dubbo 负载均衡策略
+
+```
+负载均衡算法：
+
+  Random（默认）
+    ├── 按权重随机
+    ├── 支持动态权重（活跃度）
+    └── 适合大多数场景
+
+  RoundRobin
+    ├── 轮询（加权）
+    ├── 平滑加权轮询
+    └── 适合请求耗时均匀场景
+
+  LeastActive
+    ├── 最少活跃数优先
+    ├── 慢服务自动降权
+    └── 适合耗时差异大场景
+
+  ConsistentHash
+    ├── 一致性哈希
+    ├── 同一参数请求路由到同一节点
+    └── 适合缓存场景
+
+  ShortestResponse
+    ├── 最短响应时间优先
+    ├── 适合低延迟场景
+    └── Dubbo 3.1+ 支持
+```
+
+```yaml
+dubbo:
+  provider:
+    loadbalance: roundrobin    # 全局默认
+  service:
+    com.example.OrderService:
+      loadbalance: leastactive # 服务级配置
+    com.example.UserService:
+      loadbalance: consistenthash
+      parameters:
+        hash.arguments: 0,2    # 对第 0、2 个参数做 hash
+```
+
+## Dubbo 超时与重试机制
+
+```
+超时设置层级（优先级从高到低）：
+
+  consumer method → consumer service → provider method → provider service
+       │                  │                   │                │
+    最细粒度           服务级              服务级           全局默认
+
+  重试机制：
+    ├── retries: 2（默认）
+    ├── 非幂等操作建议 retries=0
+    └── 异常类型决定是否重试：
+          ├── 网络异常 → 重试
+          ├── 业务异常 → 不重试
+          └── 超时异常 → 可配置重试
+```
+
+```yaml
+dubbo:
+  consumer:
+    timeout: 5000
+    retries: 2
+    check: false
+  reference:
+    com.example.OrderService:
+      timeout: 3000
+      retries: 1
+      methods:
+        createOrder:
+          timeout: 10000
+          retries: 0      # 非幂等不重试
+```
+
+## Dubbo 路由规则
+
+```
+路由规则类型：
+
+  条件路由（Condition）
+    ├── 基于表达式
+    └── 适合灰度/AB 测试
+
+  标签路由（Tag）
+    ├── 按标签分组
+    └── 适合环境隔离
+
+  动态配置（Dynamic）
+    ├── 运行时修改
+    └── 支持配置中心热更新
+```
+
+```yaml
+conditions:
+  - force: false
+    rule: "arguments[0].version == '2.0' => addresses.*.host == '10.0.0.1'"
+
+tags:
+  - name: gray
+    addresses:
+      - 10.0.0.1
+      - 10.0.0.2
+    force: false
+```
+
+## Dubbo 常见坑与最佳实践
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 调用超时 | 网络延迟/服务慢 | 检查网络、调优超时参数 |
+| 序列化失败 | 类不兼容 | 统一版本、检查 Serializable |
+| 连接池耗尽 | 并发过高 | 调大 connections、异步化 |
+| Provider OOM | 请求堆积 | 限流、降级、扩容 |
+| 消费者找不到服务 | 注册中心问题 | 检查注册中心、网络连通性 |
+| ClassCastException | 版本不一致 | 统一接口版本 |
+| 随机负载不均 | 权重设置不当 | 使用 LeastActive 或加权 |
+| 重试导致重复 | 非幂等操作 | 设置 retries=0 + 幂等设计 |
+
 ---
 
 ## 十四、速查表（扩展）

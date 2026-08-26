@@ -969,6 +969,112 @@ flowchart TD
 | 超大规模 + K8s | Vitess | — |
 | 新系统原生分布式 | TiDB | Vitess |
 
+## 国产数据库中间件选型决策树
+
+```
+选型决策流程：
+
+  ┌─ 需要分布式事务？
+  │   ├── 是 → ShardingSphere-Proxy（SEATA 集成）
+  │   └── 否 ↓
+  │
+  ├─ 需要在线 DDL？
+  │   ├── 是 → Vitess（Online DDL）或 ShardingSphere
+  │   └── 否 ↓
+  │
+  ├─ 数据量 > 10TB？
+  │   ├── 是 → Vitess（自动 split + scatter-gather）
+  │   └── 否 ↓
+  │
+  ├─ 需要跨分片 JOIN？
+  │   ├── 是 → Vitess（VReplication）或 ShardingSphere
+  │   └── 否 → MyCat（简单路由）
+  │
+  └─ 运维能力？
+      ├── 强 → Vitess（K8s 部署复杂但强大）
+      └── 一般 → MyCat（单进程简单）或 ShardingSphere（Proxy/Boot 二选一）
+```
+
+| 选型维度 | MyCat | Vitess | ShardingSphere |
+|----------|-------|--------|----------------|
+| 分布式事务 | 无 | 无 | ✅ SEATA |
+| 在线 DDL | 无 | ✅ | 有限 |
+| 跨分片 JOIN | 有限 | ✅ VReplication | 有限 |
+| 自动分片 | 静态 | ✅ 动态 split | 静态 |
+| 监控 | 基础 | ✅ 丰富 | 中等 |
+| 社区活跃度 | 低 | 高 | 高 |
+| 学习曲线 | 低 | 高 | 中 |
+
+## VReplication 实操详解
+
+```
+VReplication 工作流程：
+
+  源 VTGate → Binlog 流 → VReplication 引擎 → 目标 VTGate
+                         │
+                    ① Filter（过滤规则）
+                    ② Transform（数据转换）
+                    ③ MaxReplicationLag（延迟控制）
+
+  使用场景：
+    ├── 数据迁移（MySQL → Vitess）
+    ├── 跨 Keyspace 同步
+    ├── 分片重组（Reshard）
+    └── 只读副本同步
+```
+
+```sql
+-- 创建 VReplication 流
+CREATE VReplication vstream1
+  ON KEYSPACE 'commerce'
+  FOR TABLES 'orders', 'order_items'
+  WHERE 'created_at > ''2024-01-01'''
+  TO REPLICA 'target-keyspace'
+  STOP POS 'current';
+
+-- 查看 VReplication 状态
+SHOW VREPLICATION STREAMS;
+
+-- 暂停/恢复
+PAUSE VREPLICATION STREAM 1;
+RESUME VREPLICATION STREAM 1;
+
+-- 删除
+DROP VREPLICATION STREAM 1;
+```
+
+## MyCat 分片算法深度对比
+
+| 算法 | 说明 | 适用场景 | 优点 | 缺点 |
+|------|------|---------|------|------|
+| Range | 范围分片（1-1000→s1） | 时间序列 | 范围查询快 | 数据倾斜 |
+| Hash | 取模（id%8） | 均匀分布 | 均匀 | 扩容迁移难 |
+| Range-Hash | 组合分片 | 混合场景 | 灵活 | 复杂 |
+| 一致性哈希 | 虚拟节点映射 | 扩容友好 | 迁移少 | 配置复杂 |
+
+```
+# MyCat 分片配置示例
+<schema name="shop_db">
+  <table name="orders" dataNode="dn$1-8" rule="orders_hash">
+    <!-- orders_hash 规则：id % 8 -->
+  </table>
+  <table name="logs" dataNode="dn$1-4" rule="logs_range">
+    <!-- logs_range 规则：按时间范围 -->
+  </table>
+</schema>
+
+# 分片规则
+<tableRule name="orders_hash">
+  <rule>
+    <columns>id</columns>
+    <algorithm>mod</algorithm>
+  </rule>
+</tableRule>
+<function name="mod">
+  <property name="count">8</property>
+</function>
+```
+
 ## 十七、与其他板块的关系
 
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

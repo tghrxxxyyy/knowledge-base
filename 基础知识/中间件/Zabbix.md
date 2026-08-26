@@ -990,4 +990,216 @@ Housekeeping 配置：
 - 日志体系见「[ELK 日志体系](./ELK日志体系.md)」「[Loki](./Loki.md)」；
 - 云上监控见「[云上可观测性体系](./云上可观测性体系.md)」。
 
+## Zabbix Proxy 同步与分布式监控
+
+```
+Zabbix Proxy 架构：
+
+  ┌─────────────────────┐
+  │     Zabbix Server   │
+  └──────────┬──────────┘
+             │
+  ┌──────────┴──────────┐
+  │     Proxy 1         │     Proxy 2
+  │  ┌──────────────┐   │   ┌──────────────┐
+  │  │ Agent (A)    │   │   │ Agent (C)    │
+  │  │ Agent (B)    │   │   │ Agent (D)    │
+  │  └──────────────┘   │   └──────────────┘
+  └─────────────────────┘
+
+  Proxy 类型：
+    ├── 普通 Proxy（默认）
+    │     └── 本地缓存，断网可继续采集
+    └── 自动发现 Proxy
+          └── 动态发现 Agent
+
+  同步模式：
+    ├── 主动模式：Proxy 主动拉取 Server 配置
+    └── 被动模式：Server 主动推送配置
+
+  断网保护：
+    ├── Proxy 本地缓存（SQLite / MySQL）
+    ├── 数据保留时间可配置
+    └── 恢复后自动同步
+```
+
+```bash
+# Proxy 配置
+ProxyMode=0                    # 0=主动, 1=被动
+Server=zabbix-server
+Hostname=Proxy-1
+DBName=/var/lib/zabbix/proxy.sqlite3
+CacheSize=128M
+HistoryCacheSize=64M
+# 断网数据保留
+ProxyLocalBuffer=12            # 本地保留 12 小时
+ProxyOfflineBuffer=24          # 断网保留 24 小时
+```
+
+## Zabbix LLD（Low-Level Discovery）详解
+
+```
+LLD 自动发现流程：
+
+  ① 定义发现规则
+     └── Key: vfs.fs.discovery / net.if.discovery
+
+  ② 执行发现
+     └── Agent 返回 JSON 格式发现数据
+
+  ③ 创建监控项原型
+     └── vfs.fs.size[{#FSNAME},used]
+
+  ④ 创建触发器原型
+     └── vfs.fs.size[{#FSNAME},used] > 80%
+
+  ⑤ 自动创建监控项/触发器
+
+  支持类型：
+    ├── 文件系统发现
+    ├── 网络接口发现
+    ├── SNMP OID 发现
+    ├── HTTP Agent 发现
+    └── 自定义 Key 发现
+```
+
+```bash
+# Agent 自定义发现
+UserParameter=custom.discovery[*],/etc/zabbix/scripts/discovery_$1.sh
+
+# discovery_fs.sh
+#!/bin/bash
+echo '{"data":['
+first=1
+for fs in $(df -h | awk 'NR>1{print $6}'); do
+    [ $first -eq 0 ] && echo ","
+    echo "{\"{#FSNAME}\":\"$fs\"}"
+    first=0
+done
+echo ']}'
+
+# Discovery 网络接口
+net.if.discovery
+# 返回：{"data":[{"{#IFNAME}":"eth0"},{"{#IFNAME}":"lo"}]}
+
+# 使用宏
+net.if.in[{#IFNAME}]
+net.if.out[{#IFNAME}]
+```
+
+## Zabbix 自定义监控项进阶
+
+```bash
+# /etc/zabbix/zabbix_agentd.d/custom.conf
+
+# 检查端口是否存活
+UserParameter=net.tcp.port[*],nc -z -w $1 $2 $3; echo $?
+
+# 检查进程数
+UserParameter=proc.num[*],ps aux | grep $1 | grep -v grep | wc -l
+
+# 获取 JVM 堆内存
+UserParameter=jvm.heap.used[*],jcmd $1 GC.heap_info | grep "Heap Usage" -A 2 | grep "used" | awk '{print $3}'
+
+# 获取 MySQL 查询数
+UserParameter=mysql.queries[*],mysql -h $1 -u $2 -p$3 -e "SHOW GLOBAL STATUS LIKE 'Queries'" | awk '/Queries/{print $2}'
+
+# 依赖项（确保服务先启动）
+# Zabbix Server 配置：
+# Dependency=service.running
+```
+
+## Zabbix Dashboard 设计最佳实践
+
+```
+Dashboard 分层设计：
+
+  总览层（Overview）
+    ├── 服务可用性 SLA
+    ├── 告警数量趋势
+    └── 关键业务指标
+
+  服务层（Service）
+    ├── 各服务响应时间
+    ├── 错误率
+    └── 资源使用率
+
+  基础设施层（Infrastructure）
+    ├── CPU/内存/磁盘/网络
+    ├── JVM/GC 指标
+    └── 连接池状态
+
+  业务层（Business）
+    ├── 订单量/交易额
+    ├── 用户在线数
+    └── 核心业务指标
+```
+
+```yaml
+# Dashboard JSON 示例
+{
+  "name": "Production Overview",
+  "pages": [
+    {
+      "name": "Overview",
+      "widgets": [
+        {
+          "type": "problem_hosts",
+          "name": "Problem Hosts"
+        },
+        {
+          "type": "problems",
+          "name": "Active Problems"
+        },
+        {
+          "type": "top_hosts",
+          "name": "Top CPU Users"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Zabbix 容量规划
+
+| 节点类型 | 规格建议 | 适用规模 |
+|----------|---------|---------|
+| Zabbix Server | 8C/16G/100G SSD | 10000+ 主机 |
+| Database | 16C/64G/500G SSD | 10000+ 主机 |
+| Proxy | 4C/8G/50G SSD | 每 Proxy 1000+ Agent |
+| Frontend | 4C/8G | Web UI |
+
+```
+容量规划公式：
+
+  Server CPU = (主机数 × 监控项数 × 采集频率) / 基准值
+  Database 存储 = 主机数 × 监控项数 × 数据点 × 保留天数 × 压缩比
+  内存 = 活跃主机数 × 5MB + 历史缓存 + 趋势缓存
+
+  示例：
+    10000 主机 × 100 项 × 60s 采集
+    → 10000 × 100 × 1440 = 14.4 亿数据点/天
+    → 压缩后约 50GB/天
+    → 30 天保留 = 1.5TB
+```
+
+## Zabbix 5.x → 6.x → 7.x 升级要点
+
+| 版本 | 关键变化 | 升级建议 |
+|------|---------|---------|
+| 5.0→6.0 | 原生 HA、Tag 管理、新 UI | 测试环境验证 |
+| 6.0→6.4 | 增强发现、新 Agent | 备份数据库 |
+| 6.4→7.0 | 原生 OTLP、新模板 | 全面测试 |
+
+```
+升级步骤：
+  1. 备份数据库和配置
+  2. 升级 Zabbix Server
+  3. 升级 Proxy（逐个）
+  4. 升级 Agent
+  5. 更新模板
+  6. 验证监控数据
+```
+
 > 一句话：**Zabbix = 采集（Agent/SNMP/主动）+ 触发器（阈值）+ 告警（升级/媒介）+ 报表——传统企业监控闭环；选型先看「环境（传统机房→Zabbix，云原生→Prometheus）」，再定「部署（多机房→Proxy 级联 + Server HA）」，最后配「模板批量 + 告警收敛 + 分级采集频率 + 数据保留策略」**。
