@@ -784,7 +784,213 @@ groups:
     labels: {severity: critical}
 ```
 
-## 十八、与其他板块的关系
+## 十八、Kimball 维度建模完整案例
+
+### 18.1 需求分析
+
+```text
+电商数据仓库建模需求：
+  业务过程：订单创建、支付、发货、退款
+  维度：时间、商品、用户、地区、渠道
+  指标：GMV、订单数、客单价、退款率
+```
+
+### 18.2 维度表设计
+
+```sql
+-- 时间维度表
+CREATE TABLE dim_time (
+    time_key INT PRIMARY KEY,  -- 20240115
+    full_date DATE,
+    year INT,
+    quarter INT,
+    month INT,
+    day INT,
+    weekday VARCHAR(10),
+    is_holiday BOOLEAN,
+    fiscal_year INT
+);
+
+-- 商品维度表
+CREATE TABLE dim_product (
+    product_key INT PRIMARY KEY,
+    product_id VARCHAR(50),
+    product_name VARCHAR(200),
+    category_l1 VARCHAR(50),
+    category_l2 VARCHAR(50),
+    category_l3 VARCHAR(50),
+    brand VARCHAR(100),
+    supplier VARCHAR(100),
+    price DECIMAL(10,2)
+);
+
+-- 用户维度表
+CREATE TABLE dim_user (
+    user_key INT PRIMARY KEY,
+    user_id VARCHAR(50),
+    username VARCHAR(100),
+    gender VARCHAR(10),
+    age_group VARCHAR(20),
+    city VARCHAR(50),
+    province VARCHAR(50),
+    register_date DATE,
+    user_level VARCHAR(20)
+);
+```
+
+### 18.3 事实表设计
+
+```sql
+-- 订单事实表（事务粒度）
+CREATE TABLE fact_order (
+    order_key BIGINT PRIMARY KEY,
+    order_id VARCHAR(50),
+    time_key INT REFERENCES dim_time(time_key),
+    product_key INT REFERENCES dim_product(product_key),
+    user_key INT REFERENCES dim_user(user_key),
+    order_amount DECIMAL(12,2),
+    order_quantity INT,
+    discount_amount DECIMAL(12,2),
+    shipping_fee DECIMAL(10,2),
+    order_status VARCHAR(20),
+    create_time TIMESTAMP
+);
+
+-- 支付事实表（累积快照）
+CREATE TABLE fact_payment (
+    payment_key BIGINT PRIMARY KEY,
+    payment_id VARCHAR(50),
+    order_key BIGINT REFERENCES fact_order(order_key),
+    time_key INT REFERENCES dim_time(time_key),
+    payment_amount DECIMAL(12,2),
+    payment_method VARCHAR(20),
+    payment_status VARCHAR(20),
+    create_time TIMESTAMP,
+    complete_time TIMESTAMP
+);
+```
+
+## 十九、缓慢变化维度（SCD Type 2）
+
+```sql
+-- SCD Type 2 实现（历史版本保留）
+CREATE TABLE dim_user_scd (
+    user_key INT PRIMARY KEY,
+    user_id VARCHAR(50),
+    username VARCHAR(100),
+    city VARCHAR(50),
+    user_level VARCHAR(20),
+    effective_date DATE,
+    expiration_date DATE,
+    is_current BOOLEAN
+);
+
+-- 插入新版本（城市变更）
+-- 1. 旧版本失效
+UPDATE dim_user_scd
+SET expiration_date = CURRENT_DATE, is_current = FALSE
+WHERE user_id = 'U001' AND is_current = TRUE;
+
+-- 2. 插入新版本
+INSERT INTO dim_user_scd (user_key, user_id, username, city, user_level, effective_date, expiration_date, is_current)
+VALUES (1001, 'U001', '张三', '上海', 'VIP', CURRENT_DATE, '9999-12-31', TRUE);
+
+-- 查询当前版本
+SELECT * FROM dim_user_scd WHERE user_id = 'U001' AND is_current = TRUE;
+
+-- 查询历史版本
+SELECT * FROM dim_user_scd WHERE user_id = 'U001' ORDER BY effective_date;
+```
+
+## 二十、事实表粒度选择
+
+```text
+事实表粒度对比：
+
+| 粒度 | 说明 | 适用 | 存储 |
+|------|------|------|------|
+| 事务粒度 | 每笔交易一行 | 订单/支付/退款 | 大 |
+| 周期快照 | 每天/每周汇总 | 库存/余额 | 中 |
+| 累积快照 | 业务过程完成时 | 发货/退款完成 | 小 |
+
+选择原则：
+  1. 尽可能细粒度（事务粒度）
+  2. 不同业务过程分别建事实表
+  3. 避免混合粒度（一个表多种粒度）
+  4. 聚合表单独建（提升查询性能）
+```
+
+## 二十一、OLAP 引擎选型四维度
+
+```text
+OLAP 引擎选型维度：
+
+| 维度 | ClickHouse | Doris | StarRocks | Presto |
+|------|-----------|-------|-----------|--------|
+| 查询延迟 | 毫秒级 | 毫秒级 | 毫秒级 | 秒级 |
+| 并发能力 | 低（100） | 高（1000+） | 高（1000+） | 中（100） |
+| 数据规模 | PB 级 | PB 级 | PB 级 | PB 级 |
+| 部署复杂度 | 中 | 低 | 中 | 高 |
+
+选型决策：
+  低延迟 + 低并发 → ClickHouse
+  高并发 + 实时分析 → Doris/StarRocks
+  联邦查询 + 多数据源 → Presto
+```
+
+## 二十二、大宽表 vs 实时 JOIN 权衡
+
+```text
+大宽表 vs 实时 JOIN：
+
+大宽表方案：
+  优点：查询简单（单表查询），性能高
+  缺点：数据冗余，ETL 复杂，实时性差
+  适用：BI 看板，固定维度分析
+
+实时 JOIN 方案：
+  优点：数据实时，无冗余
+  缺点：查询复杂（多表 JOIN），性能差
+  适用：实时分析，Ad-hoc 查询
+
+权衡建议：
+  1. BI 看板 → 大宽表（预计算）
+  2. 实时分析 → 实时 JOIN（物化视图优化）
+  3. 混合场景 → 大宽表 + 实时 JOIN（互补）
+```
+
+## 二十三、性能优化清单
+
+```text
+数据仓库性能优化 Checklist：
+
+  1. 数据模型优化：
+    - 星型/雪花模型选择
+    - 维度表设计（SCD Type 2）
+    - 事实表粒度选择
+
+  2. 存储优化：
+    - 列式存储（Parquet/ORC）
+    - 分区策略（时间/地区）
+    - 分桶策略（哈希）
+
+  3. 查询优化：
+    - 物化视图（预计算）
+    - 索引（Bloom Filter/排序键）
+    - 数据倾斜治理
+
+  4. 计算优化：
+    - 并行度配置
+    - 内存管理
+    - 资源调度
+
+  5. 监控优化：
+    - 慢查询监控
+    - 资源利用率监控
+    - SLA 监控
+```
+
+## 二十四、与其他板块的关系
 
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
 - 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；

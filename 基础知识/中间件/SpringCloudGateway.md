@@ -775,3 +775,302 @@ public class DynamicRouteRefresh implements ApplicationEventPublisherAware {
 - 全链路可观测见「[OpenTelemetry](./OpenTelemetry.md)」。
 
 > 一句话：**SCG = WebFlux 响应式（Netty 非阻塞）+ Route/Predicate/Filter 三层模型 + GlobalFilter 链（鉴权/限流/熔断/追踪）+ Redis 令牌桶限流 + 配置中心热更新——生产守则：无阻塞 IO、限流熔断全配、traceId 透传、监控告警齐全**。
+
+## 十一、自定义谓词工厂（Custom Predicate Factory）
+
+```java
+// 自定义谓词工厂：按用户 ID 范围路由
+@Component
+public class UserIdRangePredicateFactory extends AbstractRoutePredicateFactory {
+
+    public UserIdRangePredicateFactory() {
+        super(UserIdRangePredicateFactory.class);
+    }
+
+    @Override
+    public ShortcutMetadata shortcutMetadata() {
+        return ShortcutConfiguration.builder()
+            .field("from")
+            .field("to")
+            .build();
+    }
+
+    @Override
+    public Predicate<ServerWebExchange> apply(Config config) {
+        return exchange -> {
+            String userId = exchange.getRequest().getHeaders().getFirst("X-User-Id");
+            if (userId == null) return false;
+            long id = Long.parseLong(userId);
+            return id >= config.getFrom() && id <= config.getTo();
+        };
+    }
+
+    @Data
+    public static class Config {
+        private long from;
+        private long to;
+    }
+}
+```
+
+```yaml
+# 使用自定义谓词
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: vip-route
+          uri: lb://vip-service
+          predicates:
+            - UserIdRange=1000,9999  # 用户 ID 1000-9999
+```
+
+## 十二、自定义过滤器工厂（Custom Filter Factory）
+
+```java
+// 自定义过滤器工厂：请求签名验证
+@Component
+public class SignatureFilterFactory extends AbstractGatewayFilterFactory<Config> {
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            ServerHttpRequest request = exchange.getRequest();
+
+            // 1. 获取签名参数
+            String signature = request.getHeaders().getFirst("X-Signature");
+            String timestamp = request.getHeaders().getFirst("X-Timestamp");
+            String nonce = request.getHeaders().getFirst("X-Nonce");
+
+            // 2. 验证签名
+            String signStr = request.getMethod() + "\n"
+                + request.getURI().getPath() + "\n"
+                + timestamp + "\n"
+                + nonce;
+            String expectedSign = HmacUtils.hmacSha256Hex(config.getSecret(), signStr);
+
+            if (!expectedSign.equals(signature)) {
+                exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                return exchange.getResponse().setComplete();
+            }
+
+            // 3. 验证时间戳（防止重放攻击）
+            long ts = Long.parseLong(timestamp);
+            if (System.currentTimeMillis() - ts > 300000) { // 5 分钟
+                exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                return exchange.getResponse().setComplete();
+            }
+
+            return chain.filter(exchange);
+        };
+    }
+}
+```
+
+```yaml
+# 使用自定义过滤器
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: secure-route
+          uri: lb://my-service
+          filters:
+            - name: Signature
+              args:
+                secret: ${SIGNATURE_SECRET}
+```
+
+## 十三、Resilience4j 熔断集成
+
+```yaml
+# 熔断配置
+resilience4j:
+  circuitbreaker:
+    instances:
+      myService:
+        slidingWindowSize: 100          # 滑动窗口大小
+        minimumNumberOfCalls: 10        # 最小调用次数
+        failureRateThreshold: 50        # 失败率阈值（%）
+        waitDurationInOpenState: 30s    # 熔断器打开持续时间
+        permittedNumberOfCallsInHalfOpenState: 10  # 半开状态允许调用数
+        registerHealthIndicator: true
+
+  timelimiter:
+    instances:
+      myService:
+        timeoutDuration: 3s             # 超时时间
+
+# Gateway 配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: resilient-route
+          uri: lb://my-service
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: myService
+                fallbackUri: forward:/fallback
+            - name: Retry
+              args:
+                retries: 3
+                backoff:
+                  firstBackoff: 100ms
+                  maxBackoff: 5s
+```
+
+```java
+// 熔断降级
+@RestController
+public class FallbackController {
+    @RequestMapping("/fallback")
+    public Mono<String> fallback() {
+        return Mono.just("服务暂时不可用，请稍后重试");
+    }
+}
+```
+
+## 十四、请求重写（Request Rewrite）
+
+```yaml
+# 请求重写配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: rewrite-route
+          uri: lb://my-service
+          predicates:
+            - Path=/api/v1/**
+          filters:
+            # 路径重写：/api/v1/users → /users
+            - RewritePath=/api/v1/(?<segment>.*), /$\{segment}
+
+            # 请求头添加
+            - AddRequestHeader=X-Request-Source, gateway
+
+            # 请求参数添加
+            - AddRequestParameter=source, gateway
+
+            # 请求体修改（自定义过滤器）
+            - name: RequestBodyRewrite
+              args:
+                pattern: "${old}"
+                replacement: "${new}"
+```
+
+```java
+// 请求体重写过滤器
+@Component
+public class RequestBodyRewriteFilter implements GatewayFilterFactory<Config> {
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            ServerHttpRequest request = exchange.getRequest();
+
+            // 修改请求体
+            ServerHttpRequest modifiedRequest = request.mutate()
+                .header("X-Rewritten", "true")
+                .path(request.getPath().value().replace("/old", "/new"))
+                .build();
+
+            return chain.filter(exchange.mutate().request(modifiedRequest).build());
+        };
+    }
+}
+```
+
+## 十五、响应重写（Response Rewrite）
+
+```java
+// 响应重写过滤器
+@Component
+public class ResponseRewriteFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpResponse response = exchange.getResponse();
+
+        // 包装响应（添加响应头）
+        ServerHttpResponse wrappedResponse = new ServerHttpResponseDecorator(response) {
+            @Override
+            public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
+                // 添加响应头
+                getHeaders().add("X-Response-Time", Instant.now().toString());
+                getHeaders().add("X-Gateway-Version", "1.0");
+                return super.writeWith(body);
+            }
+        };
+
+        return chain.filter(exchange.mutate().response(wrappedResponse).build());
+    }
+
+    @Override
+    public int getOrder() {
+        return -1; // 高优先级
+    }
+}
+```
+
+## 十六、生产监控指标
+
+```yaml
+# Prometheus 监控配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+```
+
+```yaml
+# 关键监控指标
+- http_server_requests_seconds_count        # 请求总数
+- http_server_requests_seconds_sum          # 请求总耗时
+- http_server_requests_seconds_bucket       # 请求耗时分布
+- gateway_requests_seconds_count            # 网关请求总数
+- gateway_requests_seconds_sum              # 网关请求总耗时
+- circuitbreaker_state                      # 熔断器状态
+- circuitbreaker_calls_seconds_count        # 熔断器调用次数
+- resilience4j_timelimiter_timeout_seconds  # 超时次数
+```
+
+```yaml
+# 告警规则
+groups:
+- name: scg_alerts
+  rules:
+  - alert: SCGHighLatency
+    expr: histogram_quantile(0.99, rate(gateway_requests_seconds_bucket[5m])) > 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "SCG P99 延迟 > 1 秒"
+
+  - alert: SCGHighErrorRate
+    expr: rate(gateway_requests_seconds_count{status=~"5.."}[5m]) / rate(gateway_requests_seconds_count[5m]) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "SCG 错误率 > 5%"
+
+  - alert: CircuitBreakerOpen
+    expr: circuitbreaker_state == 1
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "熔断器已打开"
+```
+
+## 十七、与其他板块的关系

@@ -906,6 +906,223 @@ curl -X PUT -H "Content-Type: application/json" \
   http://schema-registry:8081/config/orders-value
 ```
 
+## 附录 A：兼容性检查失败案例
+
+### A.1 不兼容变更类型
+
+| 变更类型 | 兼容性 | 说明 |
+|----------|--------|------|
+| 新增可选字段 | ✅ 向后兼容 | 旧消费者忽略新字段 |
+| 删除字段 | ❌ 不兼容 | 旧消费者找不到字段 |
+| 重命名字段 | ❌ 不兼容 | 语义改变 |
+| 改变字段类型 | ❌ 不兼容 | 类型不匹配 |
+| 新增必需字段 | ❌ 不兼容 | 旧生产者无值 |
+| 改变枚举值 | ❌ 不兼容 | 未知枚举值 |
+
+### A.2 常见错误场景
+
+```text
+场景1：删除字段后兼容性检查失败
+
+错误信息：
+  "Schema being registered is incompatible with an earlier schema"
+
+原因：
+  BACKWARD 兼容模式下不允许删除字段
+
+解决方案：
+  1. 先标记字段为可选（optional）
+  2. 等待所有消费者更新
+  3. 再删除字段
+
+场景2：修改字段类型
+
+错误信息：
+  "Field 'amount' type changed from INT to STRING"
+
+解决方案：
+  1. 新增字段（amount_v2）
+  2. 迁移数据
+  3. 删除旧字段
+```
+
+### A.3 兼容性检查配置
+
+```json
+{
+  "compatibility": "BACKWARD_TRANSITIVE",
+  "compatibilityGroup": "AVRO",
+  "normalize": true
+}
+```
+
+## 附录 B：序列化格式性能基准
+
+### B.1 性能对比
+
+| 格式 | 序列化速度 | 反序列化速度 | 包大小 | CPU 使用 |
+|------|------------|-------------|--------|----------|
+| JSON | 1x | 1x | 1x | 1x |
+| Avro | 2.5x | 3x | 0.6x | 0.7x |
+| Protobuf | 3x | 3.5x | 0.5x | 0.6x |
+| Thrift | 2.8x | 3.2x | 0.55x | 0.65x |
+| MessagePack | 2x | 2.2x | 0.7x | 0.8x |
+
+### B.2 内存使用对比
+
+```text
+序列化 100 万条消息（平均 200 字节/条）：
+
+JSON：
+  - 堆内存峰值：2.5GB
+  - GC 时间：450ms
+  - 总耗时：2.3s
+
+Avro：
+  - 堆内存峰值：1.2GB
+  - GC 时间：120ms
+  - 总耗时：0.9s
+
+Protobuf：
+  - 堆内存峰值：1.0GB
+  - GC 时间：100ms
+  - 总耗时：0.7s
+```
+
+### B.3 选型建议
+
+| 场景 | 推荐格式 | 理由 |
+|------|----------|------|
+| REST API | JSON | 标准、易调试 |
+| 高吞吐 | Avro | 紧凑、快速 |
+| 跨语言 | Protobuf | 工具链完善 |
+| 存储 | Avro | Schema 演进好 |
+| 实时流 | Avro/Protobuf | 性能优先 |
+
+## 附录 C：Claim-Check 模式
+
+### C.1 模式原理
+
+```mermaid
+flowchart TD
+    A[大消息] --> B[拆分存储]
+    B --> C[消息只含引用]
+    C --> D[消费者获取引用]
+    D --> E[按需拉取大消息]
+```
+
+### C.2 实现方案
+
+```java
+// 生产者：存储大消息
+public void sendLargeMessage(String key, byte[] payload) {
+    // 1. 存储到对象存储
+    String reference = objectStore.put(payload);
+    
+    // 2. 发送引用
+    Message message = new Message();
+    message.setKey(key);
+    message.setHeader("X-Payload-Reference", reference);
+    message.setHeader("X-Payload-Size", payload.length);
+    producer.send(message);
+}
+
+// 消费者：按需获取
+public void consume(Message message) {
+    String reference = message.getHeader("X-Payload-Reference");
+    
+    // 检查是否需要完整载荷
+    if (needsFullPayload(message)) {
+        byte[] payload = objectStore.get(reference);
+        processFullPayload(payload);
+    } else {
+        processMessage(message);
+    }
+}
+```
+
+### C.3 配置参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| threshold | 启用阈值 | 100KB |
+| storage.type | 存储类型 | S3/Redis |
+| ttl | 引用有效期 | 24h |
+| compression | 压缩算法 | LZ4 |
+
+## 附录 D：Schema Registry 高可用部署
+
+### D.1 高可用架构
+
+```mermaid
+flowchart TD
+    A[客户端] --> B[负载均衡器]
+    B --> C[SR 节点 1]
+    B --> D[SR 节点 2]
+    B --> E[SR 节点 3]
+    C --> F[共享存储<br/>Kafka/数据库]
+    D --> F
+    E --> F
+```
+
+### D.2 集群配置
+
+```properties
+# Schema Registry 集群配置
+kafkastore.bootstrap.servers=kafka1:9092,kafka2:9092,kafka3:9092
+kafkastore.topic=_schemas
+leader.election.interval.ms=5000
+master.eligibility=true
+```
+
+### D.3 高可用测试
+
+| 测试场景 | 预期结果 | 验证方法 |
+|----------|----------|----------|
+| 单节点故障 | 服务不中断 | 监控可用性 |
+| 网络分区 | 选举新主 | 检查主节点 |
+| 存储故障 | 数据不丢失 | 恢复验证 |
+| 全集群重启 | 自动恢复 | 启动后验证 |
+
+## 附录 E：Schema 在流处理中的角色
+
+### E.1 流处理 Schema 集成
+
+```text
+流处理 Schema 流程：
+
+生产者 → Schema Registry ← 消费者
+           ↓
+    Schema 验证
+           ↓
+    自动反序列化
+           ↓
+    流处理引擎
+```
+
+### E.2 Kafka Streams Schema 使用
+
+```java
+// 配置 Schema Registry
+StreamsConfig config = new StreamsConfig();
+config.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, 
+           "http://schema-registry:8081");
+
+// 使用 Avro Serde
+KStream<String, User> stream = builder.stream("users",
+    Consumed.with(Serdes.String(), 
+                  new GenericAvroSerde().getClass()));
+```
+
+### E.3 Schema 变更处理
+
+| 场景 | 处理方式 | 工具 |
+|------|----------|------|
+| 新增字段 | 自动兼容 | Schema Registry |
+| 删除字段 | 兼容性检查 | 兼容模式 |
+| 类型变更 | 迁移工具 | Connect SMT |
+| 格式切换 | 双写过渡 | 并行生产 |
+
 ## 九、与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；

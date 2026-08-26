@@ -695,7 +695,199 @@ COPY keyspace.table FROM 'data.csv'
   6. 单分区批量写入（原子性 + 性能）
 ```
 
-## 七、与其他板块的关系
+## 七、Consistency Level 矩阵与读写一致性代价计算
+
+### 7.1 一致性级别详解
+
+| 一致性级别 | 写确认数 | 读返回数 | 一致性 | 延迟 | 容错 |
+|-----------|---------|---------|--------|------|------|
+| ANY | 1（含 Hint） | — | 最弱 | 最低 | 最高 |
+| ONE | 1 | 1 | 弱 | 低 | 高 |
+| TWO | 2 | — | 中 | 中 | 中 |
+| QUORUM | ⌈N/2⌉+1 | ⌈N/2⌉+1 | 强 | 较高 | 中 |
+| ALL | N | N | 最强 | 最高 | 低 |
+| LOCAL_QUORUM | 本地DC ⌈N/2⌉+1 | 本地DC ⌈N/2⌉+1 | 本地强 | 中 | 中 |
+
+### 7.2 读写一致公式
+
+```
+读写一致公式：W + R > N → 强一致
+
+示例（RF=3）：
+  W=QUORUM(2) + R=ONE(1) → 2+1=3 = 3? → 弱一致
+  W=QUORUM(2) + R=QUORUM(2) → 2+2=4 > 3? → 强一致
+  W=ONE(1) + R=QUORUM(2) → 1+2=3 = 3? → 弱一致
+  W=ALL(3) + R=ONE(1) → 3+1=4 > 3? → 强一致
+
+生产建议：
+  写多读少 → W=ONE + R=QUORUM
+  读多写少 → W=QUORUM + R=ONE
+  强一致 → W=QUORUM + R=QUORUM
+  低延迟 → W=ONE + R=ONE（最终一致）
+```
+
+## 八、Tombstone 堆积导致查询超时排查
+
+### 8.1 Tombstone 问题根因
+
+```
+Tombstone 堆积问题：
+  大量删除 → 产生 Tombstone 标记 → 查询扫描大量 Tombstone → 超时
+
+常见原因：
+  1. 大量 DELETE 操作未设 TTL
+  2. GC Grace Seconds 过长（默认 10 天）
+  3. Compaction 未及时清理
+  4. 全表删除操作
+```
+
+### 8.2 排查步骤
+
+```
+排查四步法：
+  1. 检查查询日志
+     查找 "TombstoneAbortException" 或 "tombstone_error"
+
+  2. 统计 Tombstone 数量
+     nodetool tablehistograms keyspace.table
+     → 查看 tombstone_cells 计数
+
+  3. 分析原因
+     - 哪些表有大量 DELETE 操作？
+     - GC Grace Seconds 是否过长？
+     - Compaction 策略是否合适？
+
+  4. 解决方案
+     - 设置 TTL 自动过期（避免手动删除）
+     - 缩短 GC Grace Seconds（如 1 天）
+     - 强制 Compact 清理
+     - 调整 tombstone_failure_threshold（默认 1000）
+```
+
+### 8.3 预防措施
+
+| 措施 | 说明 |
+|------|------|
+| TTL 替代 DELETE | 数据自动过期，不产生 Tombstone |
+| 分区设计 | 避免大分区（减少 Tombstone 数量） |
+| GC Grace 调优 | 跨 DC 适当延长，同 DC 可缩短 |
+| 监控告警 | tombstone_cells > 1000 告警 |
+
+## 九、Cassandra 权限控制（RBAC GRANT/REVOKE）
+
+```sql
+-- 创建角色
+CREATE ROLE 'app_user' WITH PASSWORD = 'secret' AND LOGIN = true;
+
+-- 授权
+GRANT SELECT ON KEYSPACE shop TO 'app_user';
+GRANT INSERT, UPDATE ON KEYSPACE shop TO 'app_writer';
+GRANT ALL ON KEYSPACE shop TO 'admin';
+
+-- 撤销权限
+REVOKE INSERT ON KEYSPACE shop FROM 'app_writer';
+
+-- 查看权限
+LIST ALL PERMISSIONS OF 'app_user';
+
+-- 角色继承
+GRANT 'app_user' TO 'app_writer';
+
+-- 认证配置（cassandra.yaml）
+authenticator: PasswordAuthenticator
+authorizer: CassandraAuthorizer
+role_manager: CassandraRoleManager
+```
+
+## 十、Compaction 策略选择决策树
+
+```
+选择 Compaction 策略：
+
+数据是时序数据？ → TWCS（TimeWindowCompactionStrategy）
+  ├── 按小时/天/月分窗口
+  ├── 写放大最低
+  └── TTL 自动过期
+
+读多写少？ → LCS（LeveledCompactionStrategy）
+  ├── 层内无重叠，读性能好
+  ├── 空间放大低
+  └── 写放大较高
+
+写多读少？ → STCS（SizeTieredCompactionStrategy）
+  ├── 按大小合并
+  ├── 写放大低
+  └── 空间放大高
+
+混合负载？ → STCS + 合理窗口
+  └── 或按表粒度选择不同策略
+
+配置示例：
+  compaction = {'class': 'TimeWindowCompactionStrategy',
+                'compaction_window_size': 1,
+                'compaction_window_unit': 'HOURS'}
+```
+
+## 十一、Cassandra 作为时序存储的设计模式
+
+### Time Bucket 模式
+
+```sql
+CREATE TABLE sensor_readings (
+    sensor_id UUID,
+    bucket TIMESTAMP,       -- 时间桶（如每小时）
+    event_time TIMESTAMP,
+    value DOUBLE,
+    PRIMARY KEY ((sensor_id, bucket), event_time)
+) WITH CLUSTERING ORDER BY (event_time DESC)
+  AND default_time_to_live = 7776000  -- 90 天 TTL
+  AND compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_size': 1,
+    'compaction_window_unit': 'HOURS'
+  };
+```
+
+```
+查询模式：
+  按 sensor_id + 时间桶查询 → 单分区高效查询
+  不跨桶查询 → 避免大分区
+
+写入优化：
+  批量写同一 sensor_id + bucket（原子性）
+  降低一致性（写 ONE）
+  TWCS 合并（窗口内不合并，写放大最低）
+
+生命周期：
+  TTL 自动过期（旧桶自动清理）
+  TWCS 优化过期数据的清理效率
+```
+
+## 十二、CQL COPY 命令批量导入性能优化
+
+```bash
+# 基本 COPY
+COPY keyspace.table (col1, col2, col3) FROM 'data.csv';
+
+# 性能优化选项
+COPY keyspace.table FROM 'data.csv'
+  WITH
+    HEADER = true
+    DELIMITER = ','
+    MAXBATCHSIZE = 100     -- 增大批量大小（默认 20）
+    INGESTRATE = 10000     -- 每秒导入行数（限流）
+    CLIENT_ENCODING = 'UTF8'
+    NUMPROCESSES = 4       -- 并行进程数（默认 1）
+
+优化建议：
+  1. 提前创建索引和表结构
+  2. 使用 BATCH 写入同一分区
+  3. 调大 MAXBATCHSIZE（100~1000）
+  4. 先导入数据后建索引（快 5~10 倍）
+  5. 单分区批量写入（原子性 + 性能）
+```
+
+## 十三、与其他板块的关系
 
 - HBase 对比见「[HBase 列式存储](./HBase列式存储.md)」；
 - 大数据写入见「[大数据/06-分布式NoSQL与HBase](../大数据/06-分布式NoSQL与HBase.md)」；

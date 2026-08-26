@@ -590,7 +590,360 @@ spec:
 
 > **选型建议**：K8s 原生 + 自动证书 + 动态环境 → Traefik；极致性能 + WAF + 混合环境 → Nginx Ingress。
 
-## 七、与其他板块的关系
+## 六、Traefik 与 Consul/Nacos 服务发现集成
+
+### 6.1 Consul 集成
+
+```yaml
+# docker-compose.yml Traefik + Consul 集成
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--providers.consul=true"
+      - "--providers.consul.endpoint=consul:8500"
+      - "--providers.consul.prefix=traefik"
+      - "--providers.consul.exposedByDefault=false"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Dashboard
+
+  consul:
+    image: consul:1.15
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
+    ports:
+      - "8500:8500"
+```
+
+```text
+Consul 集成流程：
+  1. 服务注册到 Consul（健康检查 + 元数据标签）
+  2. Traefik 通过 Consul API 发现服务
+  3. 自动创建路由规则
+  4. 健康检查失败 → 自动移除路由
+
+Consul 优势：
+  - 服务网格（Consul Connect mTLS）
+  - 多数据中心支持
+  - KV 存储 + 配置中心
+  - 健康检查丰富（HTTP/TCP/Script/gRPC）
+```
+
+### 6.2 Nacos 集成
+
+```yaml
+# Traefik + Nacos 集成（通过 File Provider 桥接）
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--providers.file=true"
+      - "--providers.file.watch=true"
+    volumes:
+      - ./dynamic.yaml:/etc/traefik/dynamic.yaml
+
+  nacos-sync:
+    image: nacos-sync:latest
+    environment:
+      - NACOS_SERVER=nacos:8848
+      - TRAEFIK_PROVIDER=consul
+```
+
+```yaml
+# dynamic.yaml（Nacos 同步生成）
+http:
+  routers:
+    user-service:
+      rule: "Host(`api.example.com`) && PathPrefix(`/users`)"
+      service: user-service
+      middlewares:
+        - rate-limit
+  services:
+    user-service:
+      loadBalancer:
+        servers:
+          - url: "http://10.0.0.1:8080"
+          - url: "http://10.0.0.2:8080"
+```
+
+## 七、Traefik EntryPoints 安全配置
+
+```yaml
+# EntryPoints 安全配置
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+    http2:
+      maxConcurrentStreams: 250
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "example.com"
+            sans: ["*.example.com"]
+    http2:
+      maxConcurrentStreams: 250
+    forwardedHeaders:
+      trustedIPs:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+    originalRequestHeaders:
+      forwardedHeaders:
+        trustedIPs:
+          - "10.0.0.0/8"
+
+  metrics:
+    address: ":8082"
+    # 仅内网暴露 Prometheus 指标
+
+# 安全加固：
+#   1. 强制 HTTPS 重定向
+#   2. 限制 HTTP/2 并发流
+#   3. 信任代理 IP 转发头
+#   4. 指标端点仅内网暴露
+#   5. TLS 1.3 强制（默认）
+```
+
+## 八、Traefik 中间件链执行优先级
+
+```yaml
+# 中间件链执行顺序（按声明顺序依次执行）
+http:
+  routers:
+    api-router:
+      rule: "Host(`api.example.com`)"
+      middlewares:
+        - ip-whitelist      # 1. 先检查 IP 白名单
+        - rate-limit         # 2. 再做速率限制
+        - circuit-breaker    # 3. 然后熔断保护
+        - jwt-auth           # 4. 最后 JWT 认证
+
+  middlewares:
+    ip-whitelist:
+      ipWhiteRange:
+        sourceRange:
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+
+    rate-limit:
+      rateLimit:
+        average: 100
+        burst: 200
+        period: 1s
+
+    circuit-breaker:
+      circuitBreaker:
+        expression: "LatencyAtQuantileMS(50.0) > 100 || NetworkErrorRatio() > 0.30"
+
+    jwt-auth:
+      forwardAuth:
+        address: "http://auth-service:8080/verify"
+        trustForwardHeader: true
+```
+
+```text
+中间件执行顺序原则：
+  1. 安全类优先：IP 白名单 → 认证授权
+  2. 保护类次之：限流 → 熔断 → 重试
+  3. 转换类最后：请求改写 → 响应改写 → 压缩
+
+  执行顺序错误示例：
+    ❌ JWT 认证 → IP 白名单（认证前无法检查 IP）
+    ❌ 限流 → IP 白名单（限流后才检查 IP，浪费资源）
+
+  正确顺序：
+    ✅ IP 白名单 → 限流 → 熔断 → JWT 认证
+```
+
+## 九、Traefik IngressRoute vs 原生 K8s Ingress 对比
+
+| 维度 | IngressRoute（CRD） | 原生 K8s Ingress |
+|------|---------------------|------------------|
+| 声明方式 | CRD（YAML） | Ingress 资源 |
+| 中间件 | 原生支持（链式） | 需注解（有限） |
+| TCP/UDP | 原生支持 | 不支持 |
+| 金丝雀发布 | 原生支持 | 需 Ingress annotation |
+| 路由规则 | 丰富（Host/Path/Header/Query） | 基础（Host/Path） |
+| TLS | 自动（Let's Encrypt） | 需 cert-manager |
+| 版本管理 | CRD 版本化 | 注解无版本 |
+| 社区生态 | Traefik 专属 | 通用（Nginx/Traefik 均支持） |
+| 学习曲线 | 低（声明式） | 中（注解式） |
+| 适用 | Traefik 专属部署 | 多网关混合环境 |
+
+```yaml
+# IngressRoute 示例（推荐）
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: api-route
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`api.example.com`) && PathPrefix(`/v1`)
+      kind: Rule
+      services:
+        - name: api-service
+          port: 8080
+          weight: 100
+      middlewares:
+        - name: rate-limit
+        - name: jwt-auth
+  tls:
+    certResolver: letsencrypt
+```
+
+## 十、Traefik 生产环境速率限制 + 网络策略
+
+```yaml
+# 速率限制中间件（生产配置）
+http:
+  middlewares:
+    # 全局限流：每 IP 100 QPS，突发 200
+    global-rate-limit:
+      rateLimit:
+        average: 100
+        burst: 200
+        period: 1s
+        sourceCriterion:
+          ipStrategy:
+            depth: 1  # 获取真实 IP 深度
+
+    # API 限流：每用户 10 QPS
+    api-rate-limit:
+      rateLimit:
+        average: 10
+        burst: 20
+        period: 1s
+        sourceCriterion:
+          requestHost: {}
+
+    # 登录限流：每 IP 5 次/分钟
+    login-rate-limit:
+      rateLimit:
+        average: 0.083  # 5/60
+        burst: 5
+        period: 1s
+```
+
+```yaml
+# K8s NetworkPolicy（限制 Traefik 访问范围）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traefik-network-policy
+  namespace: traefik
+spec:
+  podSelector:
+    matchLabels:
+      app: traefik
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: frontend
+      ports:
+        - port: 80
+        - port: 443
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: backend
+      ports:
+        - port: 8080
+    - to:  # 允许访问外部服务
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+```
+
+## 十一、Traefik 高可用架构设计
+
+```text
+Traefik HA 架构（生产推荐）：
+
+  层级 1：入口负载均衡
+    Cloud LB（ALB/NLB）→ Traefik Pod（多副本）
+    L4 负载均衡 → L7 Traefik 处理
+
+  层级 2：Traefik 集群
+    Traefik Pod 1 ←→ Traefik Pod 2 ←→ Traefik Pod 3
+    无状态设计 → 水平扩展
+    共享配置：CRD（K8s API Server）
+
+  层级 3：后端服务
+    Traefik → Service（K8s Service）→ Pod
+    健康检查 → 自动摘除不健康 Pod
+
+  关键配置：
+    replicas: 3（至少 3 副本）
+    Pod 反亲和性（分散到不同节点）
+    PDB（Pod Disruption Budget，最少 2 副本可用）
+    资源限制（CPU/Memory requests/limits）
+```
+
+```yaml
+# Traefik Deployment（HA 配置）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traefik
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: traefik
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: traefik
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: traefik
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: traefik-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: traefik
+```
+
+## 十二、与其他板块的关系
 
 
 

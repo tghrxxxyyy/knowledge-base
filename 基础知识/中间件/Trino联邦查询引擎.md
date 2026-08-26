@@ -742,7 +742,323 @@ helm install trino trino/trino \
 
 ---
 
-## 十五、与其他板块的关系
+## 十五、Trino 容错执行深入（Exchange/Split/Single Task）
+
+### 15.1 容错执行架构
+
+```
+Fault-Tolerant Execution（容错执行）核心机制：
+
+  Exchange（交换）：
+    Stage 间数据传输的中间层
+    支持物化到磁盘/对象存储（S3/HDFS）
+    Task 失败时可从 Exchange 重读中间结果
+    避免从头重算整个 Stage
+
+  Split（分片）：
+    数据源的最小调度单元
+    每个 Split 对应一个数据源片段（如 Hive 表的一个分区）
+    失败的 Split 可重新调度到其他 Worker
+
+  Single Task 模型：
+    每个 Stage 只创建一个 Task（而非 N 个并行 Task）
+    Task 内部按 Split 流水线执行
+    失败时整体重新调度（而非单个并行 Task 重试）
+    简化容错逻辑
+
+容错执行配置：
+  query.fault-tolerant-execution.enabled=true
+  exchange.deduplication.max-buffer-size=1GB
+  fault-tolerant-execution.target-stage-input-positions=100000000
+```
+
+### 15.2 容错执行 vs 传统执行对比
+
+| 维度 | 传统执行 | 容错执行 |
+|------|---------|---------|
+| 中间结果 | 内存传输 | 物化到存储（S3/HDFS） |
+| Task 失败 | 整个查询失败 | 单 Task 重试 |
+| Stage 失败 | 整个查询失败 | Stage 级重试 |
+| 资源浪费 | 重试全量计算 | 仅重算失败部分 |
+| 性能开销 | 无额外开销 | 增加 10-20% IO |
+| 适用场景 | 交互式查询 | 大规模 ETL / Spot 实例 |
+
+```text
+容错执行适用场景：
+  1. 大规模 ETL 查询（运行数小时，失败代价高）
+  2. Spot 实例集群（实例随时被回收）
+  3. 多租户环境（资源竞争频繁，任务易失败）
+  4. 数据源不稳定（网络抖动导致读取失败）
+```
+
+## 十六、动态过滤器（Dynamic Filtering）原理与 EXPLAIN 输出
+
+### 16.1 动态过滤原理
+
+```
+动态过滤 = Join 时从大表提取过滤条件，应用到小表扫描
+
+原理详解：
+  1. Phase 1（构建阶段）：
+     扫描大表 orders，提取 JOIN 键的值集合
+     如：SELECT DISTINCT user_id FROM orders WHERE order_date > '2024-01-01'
+     → 提取 user_id 集合 {101, 102, 103, ...}
+
+  2. Phase 2（推送阶段）：
+     将 user_id 集合推送到小表 users 的 Connector
+     → Connector 生成过滤条件：WHERE id IN (101, 102, 103, ...)
+
+  3. Phase 3（执行阶段）：
+     users 表扫描量大幅减少（从全量 → 仅匹配行）
+     → Join 性能提升显著
+
+配置：
+  optimizer.dynamic-filtering=true（默认开启）
+  dynamic-filtering-max-domain-combinations=1000
+  dynamic-filtering-pushdown-filter-factor=10
+```
+
+### 16.2 EXPLAIN 输出解读
+
+```sql
+-- 开启动态过滤后的 EXPLAIN
+EXPLAIN SELECT * FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.order_date > '2024-01-01';
+
+-- EXPLAIN 输出关键信息：
+-- DynamicFilter: [o.user_id IN (101, 102, 103, ...)]
+-- → 表示动态过滤已生效
+-- → users 表只扫描 id IN (...) 的行
+
+-- 未开启动态过滤的 EXPLAIN：
+-- → users 表全表扫描（无 IN 条件）
+-- → Join 在内存中完成（慢）
+```
+
+```text
+EXPLAIN 输出解读：
+  DynamicFilter: [...] → 动态过滤已生效
+  FilterExpression: (id IN (...)) → Connector 层过滤
+  Estimates: rows=1000 (vs 全量 100 万) → 扫描量大幅减少
+  性能提升：通常 10-100 倍（取决于过滤选择性）
+```
+
+## 十七、字典聚合优化（DictionaryAggregationOperator）
+
+```
+字典聚合 = 用字典编码优化 GROUP BY
+
+原理：
+  低基数列（如 status, region, gender）GROUP BY 时
+  传统：逐行比较字符串 → CPU 开销大（字符串哈希+比较）
+  字典聚合：将字符串映射为整数 → 整数 GROUP BY → 极快
+
+  适用条件：
+    列的唯一值数量有限（< 几千）
+    GROUP BY 列是低基数列
+
+  工作流程：
+    1. 扫描时构建字典（string → int 映射）
+    2. GROUP BY 用整数比较（替代字符串比较）
+    3. 聚合完成后将整数映射回字符串
+
+  配置：
+    dictionary-aggregation=true（默认开启）
+
+  验证：
+    EXPLAIN 输出中看到 "DictionaryAggregation" 节点
+    表示字典聚合已生效
+
+  性能提升：
+    低基数列 GROUP BY：2-10 倍提速
+    高基数列（如 user_id）：不适用（字典过大）
+```
+
+```sql
+-- 验证字典聚合是否生效
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+-- 输出中应包含 "DictionaryAggregation" 节点
+
+-- 如果没有出现，检查：
+-- 1. status 列基数是否过高（> 10000）
+-- 2. dictionary-aggregation 是否被禁用
+```
+
+## 十八、Trino on Kubernetes（trino-operator）
+
+### 18.1 trino-operator 部署
+
+```yaml
+# 使用 trino-operator 部署 Trino 集群
+apiVersion: trino.apache.org/v1alpha1
+kind: TrinoCluster
+metadata:
+  name: trino-cluster
+spec:
+  coordinator:
+    replicas: 2
+    image:
+      repository: trinodb/trino
+      tag: "433"
+    resources:
+      requests:
+        memory: "4Gi"
+        cpu: "2"
+      limits:
+        memory: "8Gi"
+        cpu: "4"
+  worker:
+    replicas: 3
+    image:
+      repository: trinodb/trino
+      tag: "433"
+    resources:
+      requests:
+        memory: "8Gi"
+        cpu: "4"
+      limits:
+        memory: "16Gi"
+        cpu: "8"
+    autoscaling:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 10
+      targetCPUUtilization: 70
+  catalog:
+    mysql: |
+      connector.name=mysql
+      connection-url=jdbc:mysql://mysql:3306/mydb
+      connection-user=user
+      connection-password=pass
+    hive: |
+      connector.name=hive
+      hive.metastore.uri=thrift://hive-metastore:9083
+```
+
+### 18.2 trino-operator vs Helm Chart 对比
+
+| 维度 | trino-operator | Helm Chart |
+|------|---------------|------------|
+| 部署方式 | K8s Operator（CRD） | Helm 安装 |
+| 扩缩容 | 自动（HPA） | 手动/HPA |
+| 版本升级 | 滚动更新 | Helm upgrade |
+| 配置管理 | CRD 声明式 | values.yaml |
+| 运维复杂度 | 低（Operator 管理） | 中 |
+| 适用 | K8s 原生部署 | 传统部署 |
+
+## 十九、Trino 安全模型（System Access Control）
+
+```
+Trino 安全模型（System Access Control）：
+
+  认证（Authentication）：
+    LDAP：集成 Active Directory / OpenLDAP
+    Kerberos：企业级身份认证
+    Password：内置密码认证
+    Certificate：双向 TLS 认证
+    OAuth 2.0：集成身份提供商
+
+  授权（Authorization）：
+    System Access Control：全局授权框架
+    文件型（file）：JSON 配置文件定义权限
+    Ranger：Apache Ranger 集成（Hadoop 生态）
+    访问控制粒度：Catalog / Schema / Table / Column
+
+  列级掩码（Column Masking）：
+    敏感列自动脱敏（如手机号、身份证号）
+    不同角色看到不同数据
+
+  配置示例：
+    access-control.name=file
+    access-control.config-file=/etc/trino/access-control.json
+
+  行级过滤（Row Filtering）：
+    不同角色只能看到部分行（如区域数据隔离）
+
+  审计日志：
+    记录所有查询操作（用户/时间/查询/结果行数）
+    集成 ELK/Splunk 做安全分析
+```
+
+```json
+// access-control.json 示例
+{
+  "tables": [
+    {
+      "group": "analytics",
+      "catalog": "hive",
+      "schema": "default",
+      "table": "users",
+      "columns": ["phone", "id_card"],
+      "mask": {
+        "phone": "concat('***', substring(phone from 8))",
+        "id_card": "concat('****', substring(id_card from 15))"
+      }
+    }
+  ],
+  "row-filters": [
+    {
+      "group": "regional",
+      "catalog": "hive",
+      "schema": "default",
+      "table": "orders",
+      "filter": "region = currentUserRegion()"
+    }
+  ]
+}
+```
+
+## 二十、Trino 性能调优（query.max-memory-per-node / join-distribution-type）
+
+### 20.1 内存调优
+
+```properties
+# Worker 内存配置
+query.max-memory=50GB              # 单查询最大内存（集群级）
+query.max-memory-per-node=8GB      # 单节点单查询最大内存
+query.max-total-memory-per-node=10GB  # 单节点总内存
+query.memory-headroom=2GB          # 系统预留内存
+
+# 内存分配公式：
+#   每查询内存 = min(query.max-memory, query.max-memory-per-node × Worker 数)
+#   Join/聚合操作消耗最多内存
+#   大表 JOIN → 可能 OOM → 调小 query.max-memory
+
+# 内存溢出排查：
+#   查询日志：EXCEEDED_MEMORY_LIMIT
+#   监控：trino_queries 查询内存使用
+#   解决：调小并发/查询内存限制/优化查询
+```
+
+### 20.2 Join 分布式类型
+
+```properties
+# join-distribution-type 配置
+# AUTOMATIC（默认）：优化器自动选择 Broadcast 或 Partitioned
+# BROADCAST：强制广播 Join（小表广播到所有 Worker）
+# PARTITIONED：强制分区 Join（大表按 JOIN 键分区）
+
+# 选择策略：
+#   小表 < 几百 MB → BROADCAST（避免 Shuffle）
+#   大表 JOIN 大表 → PARTITIONED（内存友好）
+#   AUTOMATIC → 优化器根据统计信息自动选择
+
+# 配置示例：
+join-distribution-type=AUTOMATIC
+```
+
+```text
+调优 Checklist：
+  1. 收集统计信息：ANALYZE table_name;
+  2. 检查 EXPLAIN 输出中的 Join 类型
+  3. 调整 query.max-memory-per-node（单节点内存）
+  4. 调整 join-distribution-type（Broadcast vs Partitioned）
+  5. 监控查询内存使用（system.runtime.queries）
+  6. 优化数据倾斜（Salting / 自定义 Partitioner）
+```
+
+## 二十一、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../大数据/05-列式存储与数据湖格式.md)」；
 - 与 Spark/ClickHouse 对比见对应文档；

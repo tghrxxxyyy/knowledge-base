@@ -824,6 +824,258 @@ SELECT * FROM pg_stat_replication;
 
 > **选型口诀**：要解耦+高可用选"Debezium→Kafka→Flink"；要简单选"Flink CDC 直连"；无 Kafka 选"Debezium Server"。
 
+## 附录 A：Snapshot 模式深度对比
+
+### A.1 四种 Snapshot 模式
+
+| 模式 | 首次快照 | 增量快照 | 停机影响 | 适用场景 |
+|------|----------|----------|----------|----------|
+| `initial` | ✅ | ❌ | 有锁 | 首次全量同步 |
+| `never` | ❌ | ❌ | 无锁 | 已有 binlog 位点 |
+| `when_needed` | 按需 | ❌ | 有锁 | 按需全量刷新 |
+| `schema_only` | ❌ | ❌ | 无锁 | 仅 DDL 变更 |
+| `incremental` | ✅ | ✅ | 低锁 | 大表在线同步 |
+
+### A.2 增量快照工作原理
+
+```mermaid
+flowchart TD
+    A[启动增量快照] --> B[表分片<br/>chunk]
+    B --> C[逐 chunk 读取]
+    C --> D[开启 binlog 快照点]
+    D --> E[读取 chunk 数据]
+    E --> F[切换 binlog 位点]
+    F --> G[处理切换期间变更]
+    G --> H{还有 chunk?}
+    H -->|是| B
+    H -->|否| I[快照完成]
+```
+
+### A.3 PostgreSQL 相关注意事项
+
+```text
+PostgreSQL WAL 槽位管理：
+
+① WAL 槽位必须预创建
+   SELECT pg_create_physical_replication_slot('debezium_slot');
+
+② 槽位膨胀监控
+   SELECT slot_name, 
+          pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
+   FROM pg_replication_slots;
+
+③ 槽位清理（槽位堆积会导致磁盘空间问题）
+   SELECT pg_drop_replication_slot('debezium_slot');
+
+④ 关键配置
+   wal_level = logical
+   max_replication_slots = 10  (根据实际调整)
+   max_wal_senders = 10
+```
+
+## 附录 B：大表增量同步影响评估
+
+### B.1 资源消耗基线
+
+| 表大小 | 初始快照时间 | 快照期间 IO 影响 | 快照期间 CPU 影响 |
+|--------|-------------|------------------|------------------|
+| 100MB | ~30s | 低 | 低 |
+| 1GB | ~2min | 中 | 中 |
+| 10GB | ~15min | 高 | 中 |
+| 100GB | ~2h | 极高 | 高 |
+| 1TB | ~20h | 极高 | 极高 |
+
+### B.2 优化策略
+
+```sql
+-- 1. 调整快照抓取批量大小（默认 1000）
+"snapshot.fetch.size": "5000"
+
+-- 2. 并行读取（企业版）
+"snapshot.max.threads": "4"
+
+-- 3. 降低快照期间对源库影响
+"snapshot.isolation.level": "read_uncommitted"
+
+-- 4. 流式读取避免内存溢出
+"snapshot.mode": "incremental"
+"snapshot.incremental.allow.chunking": "true"
+"snapshot.incremental.chunk.size": "1024"
+```
+
+### B.3 大表同步最佳实践
+
+```text
+分阶段同步方案：
+
+阶段1：初始化
+  - 创建 Debezium Connector
+  - 设置 snapshot.mode = "initial"
+  - 等待 snapshot 完成
+
+阶段2：追赶 binlog
+  - 监控 source connector lag
+  - 等待消费到最新 binlog 位点
+
+阶段3：增量同步
+  - 切换为 snapshot.mode = "never"
+  - 正常消费 binlog 变更
+
+大表特殊处理：
+  - 分批同步：按主键范围分多个 connector
+  - 低峰执行：安排在业务低峰期
+  - 读从库：从只读副本读取减少主库压力
+```
+
+## 附录 C：SMT（Single Message Transforms）实战
+
+### C.1 常用 SMT 速查
+
+| SMT | 功能 | 示例 |
+|-----|------|------|
+| `InsertField` | 添加字段 | 添加服务器名/时间戳 |
+| `RemoveField` | 删除字段 | 去掉敏感列 |
+| `ReplaceField` | 重命名/替换字段 | 字段名脱敏 |
+| `MaskField` | 字段遮盖 | 手机号/身份证遮盖 |
+| `ExtractField` | 提取嵌套字段 | JSON 内字段提取 |
+| `TimestampConverter` | 时间格式转换 | Unix→ISO |
+| `RegexRouter` | 路由到不同 Topic | 按表名路由 |
+| `Flatten` | 扁平化嵌套结构 | JSON 展平 |
+| `ContentBasedRouter` | 基于内容路由 | 按数据内容分发 |
+| `Filter` | 过滤记录 | 按条件过滤 |
+
+### C.2 SMT 配置示例
+
+```json
+{
+  "transforms": "route,maskTime",
+  "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+  "transforms.route.regex": "([^.]+)\\.([^.]+)\\.([^.]+)",
+  "transforms.route.replacement": "$3",
+  "transforms.maskTime.type": "org.apache.kafka.connect.transforms.MaskField$Value",
+  "transforms.maskTime.fields": "created_at,updated_at",
+  "transforms.maskTime.replacement": "NULL"
+}
+```
+
+### C.3 SMT 执行顺序问题
+
+```text
+SMT 执行顺序（按配置声明顺序）：
+
+1. 首先应用 Route 类 SMT（影响 Topic 选择）
+2. 然后应用 Field 类 SMT（修改字段内容）
+3. 最后应用 Flatten/Filter 类 SMT（结构变换）
+
+注意：
+- Route SMT 在其他 SMT 之前执行
+- 多个 SMT 之间可能产生冲突
+- 测试时务必验证完整链路
+```
+
+## 附录 D：Debezium vs Flink CDC 对比
+
+| 特性 | Debezium | Flink CDC |
+|------|----------|-----------|
+| 架构 | Connect 框架 | Flink 引擎 |
+| 状态管理 | Kafka Connect | Flink Checkpoint |
+| Exactly-Once | 依赖 Kafka | Flink Checkpoint |
+| 流处理 | ❌（需配合 Flink） | ✅ 原生支持 |
+| DDL 支持 | ✅ | ✅ |
+| 全量+增量 | ✅ | ✅ |
+| Schema 变更 | 自动同步 | 需手动处理 |
+| 延迟 | 毫秒级 | 毫秒级 |
+| 运维复杂度 | 中等 | 中等 |
+| 社区生态 | 广泛 | 快速增长 |
+
+```text
+选型建议：
+
+Debezium + Kafka + Flink：
+  → 需要解耦的 CDC 场景
+  → 多个消费者需要消费同一数据流
+  → 已有 Kafka 基础设施
+
+Flink CDC 直连：
+  → 需要实时 ETL/流处理
+  → 追求低延迟和简单架构
+  → 无 Kafka 基础设施
+
+组合方案：
+  Debezium → Kafka → Flink → 目标
+  → 兼顾解耦和流处理能力
+  → 适合复杂的企业级场景
+```
+
+## 附录 E：Debezium 监控与告警
+
+### E.1 关键监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `debezium_source_connector_lag` | 源端延迟 | > 10s |
+| `debezium_sink_connector_lag` | 目标端延迟 | > 30s |
+| `kafka_connect_connector_status` | 连接器状态 | FAILED |
+| `debezium_snapshot_completed` | 快照完成状态 | 未完成 |
+| `debezium_event_count` | 事件处理量 | 异常波动 |
+| `debezium_error_count` | 错误数量 | > 0 |
+
+### E.2 告警配置示例
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: debezium_alerts
+    rules:
+      - alert: DebeziumConnectorDown
+        expr: kafka_connect_connector_status{state="FAILED"} > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Debezium 连接器故障"
+          description: "连接器 {{ $labels.connector }} 失败超过 1 分钟"
+      
+      - alert: DebeziumReplicationLag
+        expr: debezium_source_connector_lag > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC 复制延迟过高"
+          description: "延迟 {{ $value }}s 超过 10s 阈值"
+```
+
+## 附录 F：Debezium 常见问题排查
+
+### F.1 问题排查清单
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| binlog 位点丢失 | binlog 被清理 | 重新做快照 |
+| 内存溢出 | 快照数据量过大 | 启用增量快照 |
+| 连接超时 | 网络/防火墙 | 检查网络和端口 |
+| 表结构不一致 | DDL 变更 | 重启 connector |
+| 数据重复 | 位点回退 | 检查位点提交逻辑 |
+| 高延迟 | 消费能力不足 | 增加 task 数量 |
+
+### F.2 故障恢复流程
+
+```mermaid
+flowchart TD
+    A[发现故障] --> B{故障类型}
+    B -->|连接失败| C[检查网络/认证]
+    B -->|位点丢失| D[重新快照]
+    B -->|内存溢出| E[调整配置]
+    C --> F[重启 Connector]
+    D --> F
+    E --> F
+    F --> G[验证数据一致性]
+    G --> H{恢复成功?}
+    H -->|是| I[记录故障报告]
+    H -->|否| J[升级处理]
+```
+
 ## 十五、与其他板块的关系
 
 

@@ -611,7 +611,227 @@ State 存储：
   已有 Kafka 生态 → 留 Kafka
 ```
 
-## 十四、与其他板块的关系
+## 十四、BookKeeper Write Quorum / Read Quorum 原理详解
+
+### 14.1 Quorum 写入流程
+
+```
+BookKeeper Quorum 写入：
+
+  1. Broker 选择 Ensemble（参与写入的 Bookie 集合，如 3 个）
+  2. 数据并发写入 Write Quorum 个 Bookie（如 W=3）
+  3. 等待 Ack Quorum 个 Bookie 确认（如 A=2）
+  4. 返回 Producer 写入成功
+
+参数关系：
+  Ensemble (E) ≥ Write Quorum (W) ≥ Ack Quorum (A)
+  容错 = E - W + 1（最多允许 E-W 个 Bookie 故障）
+
+常见配置：
+  E=3, W=3, A=2 → 3 个 Bookie 都写入，2 个确认即返回
+  容错：1 个 Bookie 故障不影响写入
+
+  E=3, W=2, A=2 → 选 2 个 Bookie 写入，2 个都确认
+  容错：1 个 Bookie 故障不影响，但写入副本少
+```
+
+### 14.2 Quorum 读取流程
+
+```
+读取一致性保证：
+  读取时从 Ack Quorum 个 Bookie 读取
+  对比版本号，返回最新版本的数据
+  如果有不一致，触发 Read Repair（修复过期副本）
+```
+
+## 十五、Pulsar Tiered Storage 配置（S3/GCS/Azure Blob）
+
+### 15.1 分层存储工作流
+
+```
+写入流程：
+  Producer → Broker → BookKeeper（热存储）
+
+冷数据卸载（异步）：
+  Ledger 不活跃 → 达到阈值 → 异步上传到 S3
+  → BookKeeper 标记为已卸载
+
+读取流程：
+  Consumer → Broker → 检查本地/远程
+    → 热数据：直接从 BookKeeper 读
+    → 冷数据：从 S3 读取（延迟略高）
+```
+
+### 15.2 S3 配置示例
+
+```bash
+# 配置 S3 分层存储
+pulsar-admin namespaces set-offload-threshold my-tenant/my-ns \
+  --size-threshold 1GB
+
+# 按消息时间卸载
+pulsar-admin namespaces set-offload-deletion-lag my-tenant/my-ns \
+  --deletion-lag 24h
+
+# 配置 S3 存储配置
+pulsar-admin brokers get-broker-config | grep -i offload
+
+# 热温冷数据流向：
+# 热：BookKeeper（近 24h）
+# 温：BookKeeper（24h~7d）→ S3 过渡
+# 冷：S3/OSS（>7d）→ 降本 70%+
+```
+
+### 15.3 GCS / Azure Blob 配置
+
+```bash
+# GCS 配置
+pulsar-admin namespaces set-offload-threshold my-tenant/my-ns \
+  --size-threshold 1GB
+
+# 需要在 broker.conf 中配置：
+# offloadDriver=google-cloud-storage
+# gcsCredentialPath=/path/to/credentials.json
+
+# Azure Blob 配置
+# offloadDriver=azure-blob-storage
+# azureStorageAccountName=your-account
+# azureStorageAccountKey=your-key
+```
+
+## 十六、Pulsar Functions 无状态处理模型与部署
+
+### 16.1 处理模型
+
+```
+Pulsar Functions = 轻量 Serverless 消息处理
+
+  Input Topic → Function 实例 → Output Topic
+  每个 Function 实例无状态（或通过 State 存储简单 KV）
+
+State 存储：
+  本地状态：内存/文件（简单场景）
+  外部状态：RocksDB（持久化）
+  限制：不能做复杂事务
+```
+
+### 16.2 部署命令
+
+```bash
+# Java Function 部署
+pulsar-admin functions create \
+  --jar my-function.jar \
+  --classname com.example.ExclamationFunction \
+  --tenant public --namespace default \
+  --name my-function \
+  --input-topic input-topic \
+  --output-topic output-topic \
+  --processing-guarantee at-least-once
+
+# Python Function 部署
+pulsar-admin functions create \
+  --py my_function.py \
+  --classname MyFunction \
+  --tenant public --namespace default \
+  --name py-function \
+  --input-topic input-topic \
+  --output-topic output-topic
+```
+
+### 16.3 vs 外部流处理
+
+| 维度 | Pulsar Functions | Flink |
+|------|------------------|-------|
+| 部署 | 无独立集群 | 独立集群 |
+| 复杂度 | 简单转换/聚合 | 复杂流处理 |
+| 状态 | 有限本地状态 | RocksDB 大状态 |
+| 延迟 | 毫秒 | 毫秒 |
+| 适用 | 轻量 ETL/过滤 | 复杂事件处理 |
+
+## 十七、Geo-replication 复制策略详解
+
+### 17.1 复制模式对比
+
+| 策略 | 说明 | 延迟 | 一致性 |
+|------|------|------|--------|
+| 异步复制 | 默认，写入本地集群即返回 | 秒级 | 最终一致 |
+| 同步复制 | 写入多个集群后才返回 | 高（跨地域） | 强一致 |
+| 半同步 | 写入本地 + 一个远程集群 | 中等 | 准强一致 |
+
+### 17.2 geo-replication-groups 配置
+
+```bash
+# 创建跨地域复制集群
+pulsar-admin clusters create cluster-bj --url http://bj:8080
+pulsar-admin clusters create cluster-sh --url http://sh:8080
+
+# 创建租户并配置跨地域
+pulsar-admin tenants create my-tenant \
+  --allowed-clusters cluster-bj,cluster-sh
+
+# 配置 Namespace 复制策略
+pulsar-admin namespaces set-clusters my-tenant/my-ns \
+  --clusters cluster-bj,cluster-sh
+
+# 设置复制延迟
+pulsar-admin namespaces set-retention my-tenant/my-ns \
+  --size -1 --time 168h
+```
+
+### 17.3 故障转移
+
+```
+区域故障处理：
+  Broker 感知目标集群不可用 → 消息暂存本地
+  目标集群恢复 → 自动重新复制
+
+客户端自动切换：
+  Pulsar Client 支持多集群配置
+  当前集群不可用 → 自动切换到健康集群
+  消费进度（Cursor）独立存储，不丢失
+```
+
+## 十八、Pulsar 消息去重（Dedup）
+
+```
+去重方式：
+  1. Producer 端：设置 ProducerName + SequenceId
+     → Broker 校验：同 Producer + 同 SequenceId 不重复投递
+
+  2. Broker 端：开启去重配置
+     brokerDeduplicationEnabled=true
+     brokerDeduplicationSnapshotInterval=10000
+
+  3. Consumer 端：幂等消费（业务层去重）
+
+去重原理：
+  Broker 维护已投递消息的 (ProducerName, SequenceId) 映射
+  新消息到达时检查是否已存在
+  → 存在则丢弃，不存在则写入
+```
+
+## 十九、Pulsar vs Kafka 特定场景选型
+
+| 场景 | 首选 | 原因 |
+|------|------|------|
+| 多租户 SaaS | Pulsar | 原生 Tenant/Namespace 隔离 |
+| 跨地域复制 | Pulsar | 原生 Geo-replication |
+| 队列模型 | Pulsar | Shared/Key_Shared 订阅 |
+| 极致吞吐/延迟 | Kafka | 存算一体，本地盘快 |
+| 已有 Kafka 生态 | Kafka | 迁移成本高 |
+| 日志/大数据 | Kafka | 生态更丰富 |
+| 弹性扩缩容 | Pulsar | Broker 无状态，秒级扩缩 |
+| 延迟消息 | Pulsar | 原生支持 |
+
+```
+选择决策：
+  已有 Kafka 生态 + 日志/大数据 → 留 Kafka
+  新建云原生 + 多租户 + 跨地域 → Pulsar
+  极致吞吐/延迟 → Kafka
+  队列+流统一 → Pulsar
+```
+
+## 二十、与其他板块的关系
 
 - 与 [RabbitMQ](RabbitMQ.md)、[消息队列 MQ](../MQ.md)、[MQTT](MQTT与消息broker.md)：同属消息家族。Pulsar 是「云原生统一消息流」，RabbitMQ 是「业务路由」，MQTT 是「设备协议」。
 - 与 [注册中心与配置中心](注册中心与配置中心.md)：Pulsar 自带元数据层，不依赖外部注册中心。

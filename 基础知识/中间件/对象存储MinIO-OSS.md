@@ -877,6 +877,191 @@ helm install myminio minio/minio \
 
 ---
 
+## 附录 A：纠删码（Erasure Coding）详解
+
+### A.1 纠删码参数
+
+| 配置 | 数据块 | 校验块 | 容错 | 空间效率 |
+|------|--------|--------|------|----------|
+| 默认 | 8 | 4 | 4 块 | 67% |
+| 高可用 | 10 | 4 | 4 块 | 71% |
+| 高性能 | 4 | 2 | 2 块 | 67% |
+| 默认(12盘) | 8 | 4 | 4 块 | 67% |
+
+### A.2 纠删码工作原理
+
+```mermaid
+flowchart LR
+    A[原始数据] --> B[分片<br/>8 块]
+    B --> C[编码<br/>4 块校验]
+    C --> D[存储<br/>12 块分布]
+    D --> E[恢复<br/>任意 8 块]
+```
+
+### A.3 纠删码 vs 副本
+
+| 特性 | 纠删码 | 3 副本 |
+|------|--------|--------|
+| 空间效率 | 67% | 33% |
+| 写性能 | 中等 | 高 |
+| 读性能 | 中等 | 高 |
+| 恢复速度 | 慢 | 快 |
+| 适合场景 | 冷数据 | 热数据 |
+
+## 附录 B：生命周期策略
+
+### B.1 存储类别转换
+
+| 规则 | 天数 | 存储类别 | 成本降低 |
+|------|------|----------|----------|
+| 标准→低频 | 30 天 | IA | 50% |
+| 低频→归档 | 90 天 | Archive | 75% |
+| 归档→深度归档 | 180 天 | Deep Archive | 90% |
+| 删除 | 365 天 | — | 100% |
+
+### B.2 生命周期配置
+
+```json
+{
+  "rules": [
+    {
+      "ID": "MoveToIA",
+      "Status": "Enabled",
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "STANDARD_IA"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
+      }
+    }
+  ]
+}
+```
+
+## 附录 C：复制拓扑
+
+### C.1 复制类型
+
+| 类型 | 说明 | 延迟 | 适合场景 |
+|------|------|------|----------|
+| 同步复制 | 实时同步 | 低 | 灾备 |
+| 异步复制 | 最终一致 | 高 | 异地容灾 |
+| 跨区域复制 | 区域级 | 分钟级 | 合规要求 |
+
+### C.2 复制配置
+
+```yaml
+# MinIO 跨区域复制
+replication:
+  enabled: true
+  destination:
+    bucket: backup-bucket
+    endpoint: https://minio-backup.example.com
+  credentials:
+    accessKey: xxx
+    secretKey: xxx
+  rules:
+    - prefix: data/
+      status: Enabled
+      destination:
+        storageClass: STANDARD_IA
+```
+
+## 附录 D：AI 训练数据存储角色
+
+### D.1 AI 训练数据流
+
+```text
+AI 训练数据架构：
+
+数据采集 → 数据湖（对象存储）
+              ↓
+         数据预处理
+              ↓
+         训练数据集
+              ↓
+         GPU 集群训练
+              ↓
+         模型存储
+```
+
+### D.2 性能优化
+
+| 优化点 | 配置 | 效果 |
+|--------|------|------|
+| 并发读取 | 多连接并行 | 提升 3-5x |
+| 数据预取 | 预加载下一批 | 减少延迟 |
+| 本地缓存 | SSD 缓存热数据 | 降低延迟 |
+| 压缩 | LZ4/Snappy | 减少网络传输 |
+
+## 附录 E：S3 兼容性矩阵
+
+### E.1 API 兼容性
+
+| API | MinIO | AWS S3 | 阿里 OSS |
+|-----|-------|--------|----------|
+| PUT Object | ✅ | ✅ | ✅ |
+| GET Object | ✅ | ✅ | ✅ |
+| Multipart Upload | ✅ | ✅ | ✅ |
+| Presigned URL | ✅ | ✅ | ✅ |
+| Bucket Policy | ✅ | ✅ | ✅ |
+| Versioning | ✅ | ✅ | ✅ |
+| Lifecycle | ✅ | ✅ | ✅ |
+| Replication | ✅ | ✅ | ✅ |
+
+### E.2 SDK 兼容性
+
+| SDK | MinIO | AWS S3 | 说明 |
+|-----|-------|--------|------|
+| AWS SDK v2 | ✅ | ✅ | 直接使用 |
+| Boto3 | ✅ | ✅ | Python |
+| MinIO SDK | ✅ | ❌ | 专用 |
+| 阿里 OSS SDK | ❌ | ❌ | 不兼容 |
+
+## 附录 F：Gateway 模式替代 HDFS
+
+### F.1 架构对比
+
+```text
+传统 HDFS 架构：
+  HDFS NameNode ← HDFS DataNode × N
+  - 需要 Java 生态
+  - 运维复杂
+  - 资源消耗大
+
+MinIO Gateway 架构：
+  MinIO Gateway → S3/OSS
+  - 无状态设计
+  - 轻量级
+  - 云原生
+```
+
+### F.2 Gateway 模式配置
+
+```bash
+# 启动 Gateway 模式
+minio gateway s3 \
+  --address :9000 \
+  --console-address :9001
+
+# 配置环境变量
+export MINIO_ROOT_USER=admin
+export MINIO_ROOT_PASSWORD=password
+export MINIO_REGION=us-east-1
+```
+
+### F.3 迁移方案
+
+| 步骤 | 任务 | 工具 |
+|------|------|------|
+| 1 | 数据导出 | distcp |
+| 2 | 数据导入 | mc cp |
+| 3 | 验证 | checksum |
+| 4 | 切换 | DNS 切换 |
+
 ## 十、速查表（扩展）
 
 | 项 | 结论 |

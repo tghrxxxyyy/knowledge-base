@@ -765,3 +765,205 @@ Canal Server → Kafka → Consumer Group
 | 替代方案 | Flink CDC / Debezium / Maxwell |
 | 适用场景 | MySQL→缓存/ES/数仓 实时同步 |
 | 一句话 | 「MySQL binlog 零侵入实时同步的标准方案」 |
+
+## 十四、Canal vs Debezium vs Maxwell 差异图
+
+| 维度 | Canal | Debezium | Maxwell |
+|------|-------|----------|---------|
+| 数据源 | MySQL binlog | MySQL/PG/MongoDB/Oracle | MySQL binlog |
+| 输出 | Kafka/MQ/直写 | Kafka/Event Bus | Kafka/RabbitMQ |
+| 语言 | Java | Java | Java |
+| 部署 | Canal Server | Kafka Connect | 独立进程 |
+| HA | ZK 选主 | Kafka Connect 集群 | 无内置 |
+| DDL | 支持 | 支持 | 支持 |
+| 消息格式 | 自定义 JSON | CloudEvents | JSON |
+| 社区 | 阿里开源 | Red Hat 主导 | 独立开发 |
+| 适用 | MySQL 同步 | 多数据库同步 | MySQL 轻量同步 |
+
+```text
+选型决策：
+  MySQL 专属 → Canal（成熟稳定，阿里生态）
+  多数据库 → Debezium（支持 10+ 数据库）
+  轻量 MySQL → Maxwell（简单易用，无依赖）
+  Flink 生态 → Flink CDC（原生集成 Flink）
+```
+
+## 十五、Canal HA + ZooKeeper 配置
+
+```yaml
+# canal.properties（HA 配置）
+canal.zk.servers=zk1:2181,zk2:2181,zk3:2181
+canal.id=1  # 每个 Canal Server 唯一 ID
+canal.ip=10.0.0.1
+
+# ZooKeeper 选主配置
+canal.instance.global.mode=spring
+canal.instance.global.spring.xml=classpath:spring/file-instance.xml
+
+# 容错配置
+canal.auto.scan=true
+canal.auto.scan.interval=5  # 扫描间隔（秒）
+canal.instance.tsdb.enable=true  # 位点持久化
+```
+
+```text
+Canal HA 架构：
+  ZooKeeper 集群（3 节点）
+    ↕ 选主 + 配置管理
+  Canal Server 1（Master）←→ Canal Server 2（Slave）
+    ↕                              ↕
+  MySQL Master                  MySQL Slave
+
+  故障转移流程：
+    1. Master 检测到 MySQL 不可达
+    2. Master 释放 ZK 锁
+    3. Slave 抢占 ZK 锁成为新 Master
+    4. 新 Master 从上次位点继续同步
+    5. 旧 Master 恢复后成为 Slave
+```
+
+## 十六、Canal 消息格式与过滤规则
+
+```json
+// Canal 消息格式示例
+{
+  "database": "mydb",
+  "table": "orders",
+  "type": "UPDATE",
+  "ts": 1699999999000,
+  "xid": 12345,
+  "data": [
+    {
+      "id": 1001,
+      "user_id": "u123",
+      "amount": 99.9,
+      "status": "paid",
+      "update_time": "2024-01-15 10:00:00"
+    }
+  ],
+  "old": [
+    {
+      "status": "pending"
+    }
+  ]
+}
+```
+
+```yaml
+# canal.properties（过滤规则）
+# 库过滤
+canal.instance.filter.regex=mydb\\..*
+
+# 表过滤（白名单）
+canal.instance.filter.regex=mydb\\.(orders|users|products)
+
+# 表过滤（黑名单）
+canal.instance.filter.black.regex=mydb\\.log_.*
+
+# 字段过滤
+canal.instance.filter.fields=id,user_id,amount,status
+```
+
+## 十七、Canal + Kafka + Flink 实时链路
+
+```text
+Canal + Kafka + Flink 实时数仓架构：
+
+  MySQL Master
+    → Canal Server（binlog 订阅）
+      → Kafka（消息缓冲）
+        → Flink CDC（实时计算）
+          → 数仓分层：
+            ODS（原始层）
+            DWD（明细层）
+            DWS（汇总层）
+            ADS（应用层）
+          → OLAP 引擎（ClickHouse/Doris）
+            → BI 看板
+```
+
+```java
+// Flink 读取 Canal 消息
+public class CanalToFlink {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        KafkaSource<String> kafkaSource = KafkaSource.<String>builder()
+            .setBootstrapServers("kafka:9092")
+            .setTopics("canal-mydb")
+            .setGroupId("flink-consumer")
+            .setValueOnlyDeserializer(new SimpleStringSchema())
+            .build();
+
+        DataStream<String> stream = env.fromSource(
+            kafkaSource,
+            WatermarkStrategy.noWatermarks(),
+            "Kafka Source"
+        );
+
+        // 解析 Canal 消息
+        DataStream<Order> orders = stream
+            .map(json -> parseCanalMessage(json))
+            .filter(order -> order != null);
+
+        // 写入 ClickHouse
+        orders.sinkTo(
+            ClickHouseSink.<Order>builder()
+                .setUrl("clickhouse://8123")
+                .setTableName("orders")
+                .build()
+        );
+
+        env.execute("Canal to Flink");
+    }
+}
+```
+
+## 十八、Canal 监控与告警
+
+```yaml
+# Prometheus 监控配置
+scrape_configs:
+  - job_name: 'canal'
+    static_configs:
+      - targets: ['canal:11112']  # Canal Metrics 端口
+    metrics_path: '/metrics'
+
+# 关键监控指标
+- canal_instance_status  # 实例状态（1=运行中，0=停止）
+- canal_instance_delay    # 同步延迟（秒）
+- canal_instance_rows     # 同步行数
+- canal_instance_bytes    # 同步字节数
+```
+
+```yaml
+# 告警规则
+groups:
+- name: canal_alerts
+  rules:
+  - alert: CanalInstanceDown
+    expr: canal_instance_status == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Canal 实例停止"
+
+  - alert: CanalSyncDelay
+    expr: canal_instance_delay > 60
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Canal 同步延迟 > 60 秒"
+
+  - alert: CanalMessageLag
+    expr: kafka_consumergroup_lag > 10000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Canal 消息堆积 > 10000"
+```
+
+## 十九、与其他板块的关系

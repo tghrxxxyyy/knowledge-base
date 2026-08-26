@@ -784,3 +784,196 @@ DATE=$(date +%Y%m%d)
 # 清理旧备份
 aws s3 ls s3://backup-bucket/vmbackup/ | awk '{print $2}' | sort | head -n -7 | xargs -I {} aws s3 rm s3://backup-bucket/vmbackup/{}
 ```
+
+## 十七、VictoriaMetrics 集群架构详解
+
+### 17.1 vminsert/vmselect/vmstorage 三组件
+
+```text
+VictoriaMetrics 集群架构：
+
+  vminsert（写入层）：
+    接收 Prometheus remote_write 请求
+    按 metric name 哈希分发到 vmstorage
+    无状态，可水平扩展
+    支持多副本（高可用写入）
+
+  vmselect（查询层）：
+    接收 PromQL 查询请求
+    从所有 vmstorage 节点获取数据
+    合并结果返回给客户端
+    无状态，可水平扩展
+
+  vmstorage（存储层）：
+    存储时序数据（本地磁盘/S3）
+    按 metric name 哈希分片
+    有状态，不可随意扩缩容
+    支持副本（数据冗余）
+
+  数据流：
+    Prometheus → vminsert → vmstorage ← vmselect ← Grafana
+```
+
+```yaml
+# vminsert 部署配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vminsert
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vminsert
+  template:
+    spec:
+      containers:
+        - name: vminsert
+          image: victoriametrics/vminsert:v1.96.0-cluster
+          args:
+            - --storageNode=vmstorage-0.vmstorage:8400
+            - --storageNode=vmstorage-1.vmstorage:8400
+            - --storageNode=vmstorage-2.vmstorage:8400
+            - --replicationFactor=2
+            - --listenAddr=:8480
+          ports:
+            - containerPort: 8480
+```
+
+### 17.2 去重策略与降采样配置
+
+```yaml
+# vmstorage 去重配置
+- dedup.minScrapeInterval=15s  # 15 秒内重复数据去重
+
+# 降采样配置（retention 路径）
+- retentionPeriod=90d           # 原始数据保留 90 天
+- downsample.period=5m:30d     # 5 分钟聚合保留 30 天
+- downsample.period=1h:365d    # 1 小时聚合保留 1 年
+```
+
+```text
+去重策略：
+  场景：多个 Prometheus 实例采集相同目标
+  机制：相同时间戳+metric name → 保留一条
+  配置：dedup.minScrapeInterval（默认 0，建议 15s）
+
+降采样策略：
+  原始数据（秒级）→ 5 分钟聚合 → 1 小时聚合
+  存储空间：降采样后减少 10-100 倍
+  查询性能：聚合查询快 10-100 倍
+  数据精度：降采样后丢失细节（看趋势足够）
+```
+
+## 十八、多租户隔离配置
+
+```yaml
+# 多租户配置
+# vminsert 按 tenant_id 分发
+- replicationFactor=1
+- storageNode=vmstorage-0.vmstorage:8400
+
+# 访问控制
+# vmselect 按 tenant_id 过滤
+- storageNode=vmstorage-0.vmstorage:8400
+- tenantID=team-a
+
+# API 访问格式
+# http://vminsert:8480/insert/0/prometheus/api/v1/write  # 默认租户
+# http://vminsert:8480/insert/team-a/prometheus/api/v1/write  # team-a 租户
+```
+
+```text
+多租户隔离：
+  1. 数据隔离：每个租户独立存储路径
+  2. 查询隔离：vmselect 按 tenant_id 过滤
+  3. 资源隔离：每个租户独立 vminsert/vmselect
+  4. 配额控制：每个租户独立指标数量限制
+```
+
+## 十九、Prometheus Remote Write 配置
+
+```yaml
+# prometheus.yml 配置 remote_write
+remote_write:
+  - url: "http://vminsert:8480/insert/0/prometheus/api/v1/write"
+    queue_config:
+      batch_send_deadline: 5s
+      max_shards: 30
+      max_samples_per_send: 10000
+      capacity: 20000
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*'
+        action: drop  # 丢弃 go_* 指标
+
+# 配置说明：
+# batch_send_deadline: 批量发送间隔（5秒）
+# max_shards: 并发发送线程数（30）
+# max_samples_per_send: 每次发送最大样本数（10000）
+# capacity: 发送队列容量（20000）
+```
+
+## 二十、K8s 部署与容量规划公式
+
+```yaml
+# VictoriaMetrics 集群 K8s 部署
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: victoria-metrics
+spec:
+  chart:
+    spec:
+      chart: victoria-metrics-cluster
+      version: "0.9.16"
+      sourceRef:
+        kind: HelmRepository
+        name: victoriametrics
+  values:
+    vminsert:
+      replicaCount: 3
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+    vmselect:
+      replicaCount: 3
+      resources:
+        requests:
+          cpu: "1"
+          memory: "1Gi"
+    vmstorage:
+      replicaCount: 3
+      persistentVolume:
+        size: "100Gi"
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+```
+
+```text
+容量规划公式：
+
+  存储空间计算：
+    原始数据 = 指标数量 × 采样间隔 × 单样本大小 × 保留天数
+    示例：100 万指标 × 15s × 1.5 字节 × 90 天 = ~780 GB
+
+  vmstorage 节点数：
+    节点数 = 总存储 / 单节点存储
+    示例：780 GB / 500 GB = 2 节点（+1 副本 = 3 节点）
+
+  vminsert 节点数：
+    写入 QPS = 指标数量 / 采样间隔
+    示例：100 万 / 15s = 6.7 万 QPS
+    节点数 = 写入 QPS / 单节点能力（~10 万 QPS）
+    示例：6.7 万 / 10 万 = 1 节点（+1 副本 = 2 节点）
+
+  vmselect 节点数：
+    查询 QPS = 预期并发查询数
+    节点数 = 查询 QPS / 单节点能力（~1000 QPS）
+    示例：100 / 1000 = 1 节点（+1 副本 = 2 节点）
+```
+
+## 二十一、与其他板块的关系

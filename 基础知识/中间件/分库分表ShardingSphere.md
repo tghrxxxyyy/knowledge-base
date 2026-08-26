@@ -737,6 +737,292 @@ spec:
 # 3. ShardingSphere Operator：K8s Operator 自动化管理
 ```
 
+## 附录 A：Rewrite 引擎工作原理
+
+### A.1 SQL 改写流程
+
+```mermaid
+flowchart TD
+    A[原始 SQL] --> B[解析 AST]
+    B --> C[路由改写<br/>路由到分片]
+    C --> D[执行单元改写<br/>分布式主键生成]
+    D --> E[结果归并<br/>聚合/排序/分页]
+    E --> F[最终结果]
+```
+
+### A.2 改写示例
+
+```sql
+-- 原始 SQL
+SELECT * FROM t_order WHERE order_id = 1001 AND user_id = 1000;
+
+-- 改写后（假设按 user_id 分片）
+SELECT * FROM t_order_0 WHERE order_id = 1001 AND user_id = 1000;
+
+-- 原始 SQL（分布式 ID）
+INSERT INTO t_order (order_id, user_id, amount) VALUES (1001, 1000, 100.00);
+
+-- 改写后（自动生成分片键）
+INSERT INTO t_order_0 (order_id, user_id, amount) VALUES (1001, 1000, 100.00);
+```
+
+### A.3 改写类型
+
+| 改写类型 | 说明 | 示例 |
+|----------|------|------|
+| 路由改写 | 表名→分片表名 | `t_order` → `t_order_0` |
+| 主键改写 | 分布式主键生成 | UUID/Snowflake |
+| 分页改写 | LIMIT 改写 | `LIMIT 10, 10` → `LIMIT 0, 20` |
+| 排序改写 | 分片结果合并排序 | 多分片 ORDER BY |
+| 聚合改写 | COUNT/SUM 合并 | 多分片聚合 |
+| 分组改写 | GROUP BY 合并 | 多分片分组 |
+
+## 附录 B：SPI 分片算法详解
+
+### B.1 内置分片算法
+
+| 算法 | 说明 | 配置示例 |
+|------|------|----------|
+| Standard | 标准分片 | `algorithm-expression: t_order_$->{user_id % 2}` |
+| Complex | 复合分片 | `algorithm-expression: t_order_$->{user_id % 2 + order_id % 3}` |
+| Hint | 强制路由 | 编程方式指定分片 |
+| Inline | 行内表达式 | `algorithm-expression: t_order_$->{user_id % 2}` |
+| Class | 自定义类 | 实现 `StandardShardingAlgorithm` |
+
+### B.2 自定义分片算法
+
+```java
+public class CustomShardingAlgorithm implements StandardShardingAlgorithm<String> {
+    
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, 
+                              PreciseShardingValue<String> shardingValue) {
+        String value = shardingValue.getValue();
+        // 自定义分片逻辑
+        int shard = calculateShard(value);
+        return "t_order_" + shard;
+    }
+    
+    @Override
+    public Collection<String> doSharding(Collection<String> availableTargetNames, 
+                                          RangeShardingValue<String> shardingValue) {
+        // 范围分片
+        return availableTargetNames;
+    }
+    
+    private int calculateShard(String value) {
+        // 自定义算法
+        return Math.abs(value.hashCode()) % 4;
+    }
+}
+```
+
+### B.3 SPI 配置
+
+```properties
+# META-INF/services/org.apache.shardingsphere.sharding.spi.ShardingAlgorithm
+com.example.CustomShardingAlgorithm
+
+# YAML 配置
+sharding:
+  tables:
+    t_order:
+      actual-data-nodes: ds_$->{0..1}.t_order_$->{0..3}
+      database-strategy:
+        standard:
+          sharding-column: user_id
+          sharding-algorithm-name: custom-db
+      table-strategy:
+        standard:
+          sharding-column: order_id
+          sharding-algorithm-name: custom-table
+  sharding-algorithms:
+    custom-db:
+      type: CUSTOM
+      props:
+        algorithm-class-name: com.example.CustomShardingAlgorithm
+    custom-table:
+      type: INLINE
+      props:
+        algorithm-expression: t_order_$->{order_id % 4}
+```
+
+## 附录 C：数据脱敏实现
+
+### C.1 脱敏策略
+
+| 策略 | 说明 | 示例输出 |
+|------|------|----------|
+| MASK | 遮盖 | 138****1234 |
+| MD5 | 哈希 | 5d41402abc4b2a76... |
+| SHA256 | 哈希 | 2cf24dba5fb0a30e... |
+| KEYZERO | 保留前N位 | 13800001234 |
+| REPLACE | 替换 | *** |
+| CUSTOM | 自定义 | 自定义格式 |
+
+### C.2 脱敏配置示例
+
+```yaml
+rules:
+  - !MASK
+    columns:
+      phone:
+        type: MASK
+        algorithm:
+          type: MASK
+          props:
+            mask-type: CUSTOM
+            mask-char: '*'
+            mask-start: 3
+            mask-end: 4
+      id_card:
+        type: MASK
+        algorithm:
+          type: MASK
+          props:
+            mask-type: CUSTOM
+            mask-char: '*'
+            mask-start: 6
+            mask-end: 14
+```
+
+## 附录 D：影子库压测
+
+### D.1 影子库架构
+
+```mermaid
+flowchart LR
+    A[应用] --> B{流量识别}
+    B -->|正常流量| C[生产库]
+    B -->|压测流量| D[影子库]
+    D --> E[影子库<br/>独立集群]
+```
+
+### D.2 影子库配置
+
+```yaml
+rules:
+  - !SHADOW
+    data-sources:
+      shadow_ds:
+        source-data-source: ds_0
+        shadow-data-source: shadow_ds_0
+    tables:
+      t_order:
+        data-source-names: ds_0
+        shadow-data-source-names: shadow_ds_0
+    shadow-algorithm-names:
+      - user-id-insert
+      - user-id-select
+    shadow-algorithms:
+      user-id-insert:
+        type: VALUE_MATCH
+        props:
+          column: user_id
+          operation: insert
+          value: 1000
+      user-id-select:
+        type: VALUE_MATCH
+        props:
+          column: user_id
+          operation: select
+          value: 1000
+```
+
+## 附录 E：Hint 强制路由
+
+### E.1 Hint 使用场景
+
+| 场景 | 说明 | 实现方式 |
+|------|------|----------|
+| 租户隔离 | 按租户路由 | Hint 算法 |
+| 读写分离 | 强制走主库 | Hint 算法 |
+| 数据归档 | 按时间路由 | Hint 算法 |
+| 紧急修复 | 指定分片 | Hint 算法 |
+
+### E.2 Hint 配置示例
+
+```java
+// Java API 方式
+HintManager hintManager = HintManager.getInstance();
+hintManager.addTableShardingValue("t_order", "user_id", 1000);
+hintManager.setDatabaseShardingValue(1);
+
+String sql = "SELECT * FROM t_order WHERE user_id = ?";
+List<Object> result = jdbcTemplate.query(sql, new Object[]{1000}, 
+    new HintShardingResultProcessor());
+
+hintManager.close();
+```
+
+## 附录 F：Proxy 模式部署
+
+### F.1 Proxy 架构
+
+```mermaid
+flowchart LR
+    A[应用] --> B[ShardingSphere-Proxy<br/>3307 端口]
+    B --> C[MySQL 1<br/>分片0]
+    B --> D[MySQL 2<br/>分片1]
+    B --> E[MySQL 3<br/>分片2]
+```
+
+### F.2 Proxy vs JDBC 模式对比
+
+| 特性 | Proxy 模式 | JDBC 模式 |
+|------|------------|-----------|
+| 语言支持 | 任意 SQL 客户端 | 仅 Java |
+| 部署方式 | 独立进程 | 嵌入应用 |
+| 性能开销 | 网络+协议 | 直连 |
+| 运维复杂度 | 中等 | 低 |
+| 连接池 | 共享 | 每应用独立 |
+| 灰度发布 | 需重启 Proxy | 需重启应用 |
+| 适合场景 | 多语言/大集群 | 单一 Java 应用 |
+
+### F.3 Proxy 部署配置
+
+```yaml
+# server.yaml
+rules:
+  - !AUTHORITY
+    users:
+      - user: root
+        password: root
+        authorized-databases: "*"
+    privilege:
+      type: ALL_PERMITTED
+
+# config-sharding.yaml
+schemaName: sharding_db
+dataSources:
+  ds_0:
+    url: jdbc:mysql://mysql1:3306/db_0
+    username: root
+    password: root
+  ds_1:
+    url: jdbc:mysql://mysql2:3306/db_1
+    username: root
+    password: root
+rules:
+  - !SHARDING
+    tables:
+      t_order:
+        actual-data-nodes: ds_$->{0..1}.t_order_$->{0..3}
+        database-strategy:
+          standard:
+            sharding-column: user_id
+            sharding-algorithm-name: inline
+        table-strategy:
+          standard:
+            sharding-column: order_id
+            sharding-algorithm-name: inline
+    sharding-algorithms:
+      inline:
+        type: INLINE
+        props:
+          algorithm-expression: t_order_$->{order_id % 4}
+```
+
 ## 十九、与其他板块的关系
 
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。

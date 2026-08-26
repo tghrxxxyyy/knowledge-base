@@ -740,7 +740,280 @@ http.headers(headers -> headers
 );
 ```
 
-## 二十、与其他板块的关系
+## 二十、JWT 签名算法攻击与防御
+
+### 20.1 alg:none 攻击
+
+```
+攻击原理：
+  JWT 头部 { "alg": "none" } → 服务端误认为无需签名
+  → 攻击者篡改 Payload 后不带签名直接发送
+  → 服务端跳过签名校验，接受伪造 Token
+
+攻击流程：
+  1. 获取合法 Token（或构造伪造 Token）
+  2. 修改 Header: { "typ": "JWT", "alg": "none" }
+  3. 修改 Payload（如 role=admin）
+  4. 不带签名部分直接发送
+  5. 服务端未校验 alg 字段 → 接受伪造 Token
+```
+
+### 20.2 混淆攻击（Key Confusion）
+
+```
+攻击原理：
+  服务端用 RS256（非对称）签发 Token
+  攻击者用公钥（公开可得）作为 HMAC 密钥重新签名
+  服务端用 HS256 校验（用公钥做密钥）→ 验证通过
+
+防御：
+  禁止 alg 字段可配置
+  签名算法硬编码（不信任客户端 Header）
+```
+
+```java
+// 安全 JWT 校验：禁止 alg:none + 混淆攻击
+public Claims verifyToken(String token) {
+    // 1. 强制指定签名算法（不从 Header 读取）
+    Key key = getSecretKey(); // 或 publicKey
+    Claims claims = Jwts.parserBuilder()
+        .setSigningKey(key)
+        .build()
+        .parseClaimsJws(token)
+        .getBody();
+
+    // 2. 校验 alg 是否合法
+    String algorithm = Jwts.parserBuilder()
+        .build()
+        .parseHeaderUnsecured(token).get("alg", String.class);
+    if (!"HS256".equals(algorithm) && !"RS256".equals(algorithm)) {
+        throw new SecurityException("非法签名算法: " + algorithm);
+    }
+    return claims;
+}
+```
+
+## 二十一、SSRF 防御进阶：DNS 重绑定检测
+
+### 21.1 DNS 重绑定攻击
+
+```
+攻击流程：
+  1. 攻击者注册域名 evil.com，TTL 设为 0
+  2. 第一次解析 → 返回白名单 IP（通过 SSRF 校验）
+  3. 第二次解析 → 返回内网 IP（127.0.0.1 / 10.0.0.1）
+  4. 服务端先校验 IP（第一次解析），再请求（第二次解析）
+  5. 请求打到内网服务
+
+防御：DNS 重绑定检测
+  方案 1：解析一次，IP 缓存复用（不二次解析）
+  方案 2：检查解析结果是否为内网 IP
+  方案 3：使用预解析的 IP（不使用域名）
+```
+
+```java
+// 防 DNS 重绑定：解析一次 + 内网 IP 校验
+public boolean safeRequest(String url) {
+    URI uri = URI.create(url);
+    // 1. 解析一次，记录 IP
+    InetAddress addr = InetAddress.getByName(uri.getHost());
+    byte[] octets = addr.getAddress();
+
+    // 2. 校验是否为内网 IP
+    if (isPrivateIP(octets)) {
+        throw new SecurityException("SSRF: 拒绝内网 IP");
+    }
+
+    // 3. 使用原始 IP 发起请求（不使用域名）
+    HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create(uri.getScheme() + "://" + addr.getHostAddress() + uri.getPath()))
+        .build();
+    return true;
+}
+
+private boolean isPrivateIP(byte[] octets) {
+    if (octets[0] == 10) return true;
+    if (octets[0] == 172 && (octets[1] & 0xFF) >= 16 && (octets[1] & 0xFF) <= 31) return true;
+    if (octets[0] == 192 && octets[1] == (byte)168) return true;
+    if (octets[0] == 127) return true;
+    if (octets[0] == 169 && octets[1] == (byte)254) return true;
+    return false;
+}
+```
+
+## 二十二、XSS 三种类型防护代码示例
+
+### 22.1 反射型 XSS
+
+```java
+// Spring MVC 输出编码
+@GetMapping("/search")
+public String search(@RequestParam String keyword, Model model) {
+    // Thymeleaf 默认 HTML 编码（防反射型 XSS）
+    model.addAttribute("keyword", keyword); // 自动转义
+    return "search";
+}
+
+// 直接输出时手动编码
+String safe = HtmlUtils.htmlEscape(userInput); // &lt;script&gt;
+```
+
+### 22.2 存储型 XSS
+
+```java
+// 入库前转义
+public String sanitize(String input) {
+    if (input == null) return null;
+    return input
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#x27;");
+}
+
+// 富文本过滤（保留格式，过滤脚本）
+import org.jsoup.Jsoup;
+String safeHtml = Jsoup.clean(userContent, Safelist.relaxed()
+    .addTags("b", "i", "u", "p", "br", "img")
+    .addAttributes("img", "src", "alt")
+    .addProtocols("img", "src", "http", "https"));
+```
+
+### 22.3 DOM 型 XSS
+
+```javascript
+// 危险：直接操作 DOM
+document.getElementById("output").innerHTML = location.hash.substring(1);
+
+// 安全：使用 textContent 替代 innerHTML
+document.getElementById("output").textContent = location.hash.substring(1);
+
+// 使用 DOMPurify 过滤
+import DOMPurify from 'dompurify';
+document.getElementById("output").innerHTML = DOMPurify.sanitize(userInput);
+```
+
+## 二十三、文件上传安全完整方案
+
+```java
+// 文件上传安全检查
+public void uploadFile(MultipartFile file) {
+    // 1. MIME 类型白名单
+    String contentType = file.getContentType();
+    Set<String> allowedTypes = Set.of("image/jpeg", "image/png", "application/pdf");
+    if (!allowedTypes.contains(contentType)) {
+        throw new SecurityException("禁止的文件类型: " + contentType);
+    }
+
+    // 2. 文件头魔数校验
+    byte[] header = new byte[8];
+    file.getInputStream().read(header);
+    if (!isValidMagicBytes(header, contentType)) {
+        throw new SecurityException("文件头与类型不匹配");
+    }
+
+    // 3. UUID 重命名
+    String ext = getExtension(file.getOriginalFilename());
+    String newName = UUID.randomUUID() + ext;
+
+    // 4. 隔离存储（非 Web 根目录）
+    Path storage = Paths.get("/data/uploads/" + newName);
+    file.transferTo(storage.toFile());
+}
+
+// 魔数校验
+private boolean isValidMagicBytes(byte[] header, String type) {
+    if ("image/jpeg".equals(type)) return header[0] == (byte)0xFF && header[1] == (byte)0xD8;
+    if ("image/png".equals(type)) return header[0] == (byte)0x89 && header[1] == 0x50;
+    if ("application/pdf".equals(type)) return header[0] == 0x25 && header[1] == 0x50;
+    return false;
+}
+```
+
+## 二十四、API 速率限制实现（Redis 滑动窗口 + Lua 脚本）
+
+```lua
+-- Redis Lua 脚本：滑动窗口限流
+local key = KEYS[1]
+local window = tonumber(ARGV[1])  -- 窗口大小（秒）
+local limit = tonumber(ARGV[2])   -- 窗口内最大请求数
+local now = tonumber(ARGV[3])     -- 当前时间戳（毫秒）
+
+-- 移除窗口外的请求记录
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window * 1000)
+
+-- 统计窗口内请求数
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+    -- 未超限，记录本次请求
+    redis.call('ZADD', key, now, now .. math.random())
+    redis.call('EXPIRE', key, window)
+    return 1  -- 允许
+else
+    return 0  -- 拒绝
+end
+```
+
+```java
+// Java 调用 Lua 脚本
+public boolean isAllowed(String userId, int limit, int windowSeconds) {
+    String key = "rate:" + userId;
+    Long now = System.currentTimeMillis();
+    Long result = redisTemplate.execute(
+        rateLimitScript,
+        List.of(key),
+        windowSeconds, limit, now
+    );
+    return result != null && result == 1L;
+}
+```
+
+## 二十五、安全 Headers 一键配置清单
+
+```yaml
+# Nginx 安全 Headers 一键配置
+server {
+    # 传输安全
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # 内容安全
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+
+    # 缓存安全
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    add_header Pragma "no-cache" always;
+
+    # CORS 安全
+    add_header Access-Control-Allow-Origin "https://trusted.com" always;
+
+    # 其他安全
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header X-XSS-Protection "0" always;
+}
+```
+
+```java
+// Spring Security 一键配置
+http.headers(headers -> headers
+    .httpStrictTransportSecurity(hsts -> hsts
+        .includeSubDomains(true).maxAgeInSeconds(31536000).preload(true))
+    .contentSecurityPolicy(csp -> csp
+        .policyDirectives("default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'"))
+    .frameOptions(frame -> frame.deny())
+    .contentTypeOptions(Customizer.withDefaults())
+    .referrerPolicy(referrer -> referrer
+        .policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+    .permissionsPolicy(permissions -> permissions
+        .policy("camera=(), microphone=(), geolocation=()"))
+);
+```
+
+## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；
 - API 网关安全见「[API 网关](./中间件/API网关.md)」；

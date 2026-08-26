@@ -771,7 +771,244 @@ CI/CD 安全扫描：
 
 ---
 
-## 十七、与其他板块的关系
+## 十七、EKS/AKS/GKE 托管 K8s 差异对比
+
+| 维度 | EKS（AWS） | AKS（Azure） | GKE（GCP） |
+|------|-----------|-------------|------------|
+| 控制面费用 | $0.10/小时 | 免费 | 免费 |
+| 节点费用 | EC2 实例 | VM 实例 | Compute Engine |
+| 自动升级 | 可配置 | 自动 | 自动 |
+| 节点池 | 托管节点池 | 节点池 | 节点池 |
+| 网络插件 | VPC CNI | Azure CNI | GKE Dataplane |
+| 服务网格 | App Mesh | Istio | Anthos Service Mesh |
+| CI/CD | CodePipeline | Azure DevOps | Cloud Build |
+| 监控 | CloudWatch | Azure Monitor | Cloud Monitoring |
+| 成本 | 中 | 低（控制面免费） | 低（控制面免费） |
+
+```text
+托管 K8s 升级策略：
+  1. 自动升级：云厂商自动升级控制面（需测试兼容性）
+  2. 手动升级：控制面 + 节点池同时升级
+  3. 滚动升级：节点池逐个升级（零停机）
+  4. 蓝绿升级：新节点池 + 旧节点池同时存在
+```
+
+## 十八、节点池管理与自动扩缩
+
+```yaml
+# AWS EKS 节点池配置
+apiVersion: eks.amazonaws.com/v1
+kind: Nodegroup
+metadata:
+  name: production-pool
+spec:
+  instanceTypes:
+    - m5.xlarge
+    - m5.2xlarge
+  minSize: 3
+  maxSize: 20
+  desiredSize: 5
+  labels:
+    role: production
+  taints:
+    - key: "env"
+      value: "production"
+      effect: "NoSchedule"
+  updateConfig:
+    maxUnavailable: 1
+```
+
+```yaml
+# 自动扩缩配置（Cluster Autoscaler）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+spec:
+  template:
+    spec:
+      containers:
+        - name: cluster-autoscaler
+          command:
+            - ./cluster-autoscaler
+            - --v=4
+            - --cloud-provider=aws
+            - --skip-nodes-with-local-storage=false
+            - --expander=least-waste
+            - --node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/my-cluster
+```
+
+```text
+节点池最佳实践：
+  1. 业务节点池：生产/测试/开发 分开
+  2. 系统节点池：监控/日志/基础设施
+  3. GPU 节点池：AI/ML 训练任务
+  4. Spot 节点池：成本敏感型任务
+  5. 混合实例：按需 + Spot（平衡成本和可用性）
+```
+
+## 十九、ArgoCD ApplicationSet 多环境管理
+
+```yaml
+# ApplicationSet 生成多环境应用
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: my-app-set
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            url: https://dev.example.com
+            revision: develop
+          - env: staging
+            url: https://staging.example.com
+            revision: main
+          - env: prod
+            url: https://prod.example.com
+            revision: main
+  template:
+    metadata:
+      name: 'my-app-{{env}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/myorg/myapp
+        targetRevision: '{{revision}}'
+        path: 'k8s/{{env}}'
+      destination:
+        server: '{{url}}'
+        namespace: my-app
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+```text
+ApplicationSet 优势：
+  1. 一次定义，多环境生成
+  2. Git 分支对应环境（develop/staging/main）
+  3. 自动同步 + 自愈
+  4. 环境隔离（独立项目）
+```
+
+## 二十、Helm 版本管理与回滚
+
+```bash
+# Helm 部署与回滚
+# 1. 安装
+helm install my-app ./my-chart -f values-prod.yaml
+
+# 2. 升级
+helm upgrade my-app ./my-chart -f values-prod.yaml --set image.tag=v2.0
+
+# 3. 查看历史
+helm history my-app
+
+# 4. 回滚到指定版本
+helm rollback my-app 3  # 回滚到版本 3
+
+# 5. 查看差异
+helm diff upgrade my-app ./my-chart -f values-prod.yaml
+```
+
+```yaml
+# Helm Chart 版本管理
+apiVersion: v2
+name: my-app
+version: 1.0.0
+appVersion: "2.0.0"
+description: My Application Helm Chart
+maintainers:
+  - name: devops-team
+dependencies:
+  - name: postgresql
+    version: "12.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+```
+
+## 二十一、K8s 资源配额与多租户隔离
+
+```yaml
+# Namespace 资源配额
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: "40Gi"
+    limits.cpu: "40"
+    limits.memory: "80Gi"
+    pods: "100"
+    services: "20"
+    persistentvolumeclaims: "10"
+
+# LimitRange（默认资源限制）
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-a-limits
+  namespace: team-a
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu: "100m"
+        memory: "128Mi"
+      max:
+        cpu: "2"
+        memory: "4Gi"
+      min:
+        cpu: "50m"
+        memory: "64Mi"
+```
+
+```yaml
+# NetworkPolicy（网络隔离）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: team-a-network-policy
+  namespace: team-a
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: team-a
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: team-a
+```
+
+```text
+多租户隔离方案：
+  1. Namespace 隔离：每个租户一个 Namespace
+  2. 资源配额：CPU/内存/Pod 数量限制
+  3. LimitRange：默认资源限制
+  4. NetworkPolicy：网络隔离
+  5. RBAC：权限隔离
+  6. 节点亲和性：租户 Pod 分散到不同节点
+```
+
+## 二十二、与其他板块的关系
 
 - K8s 原理见「[云原生/Kubernetes核心](../../云原生/Kubernetes核心.md)」；
 - CI/CD 原理见「[基础知识/CI-CD](../../基础知识/CI-CD/README.md)」；

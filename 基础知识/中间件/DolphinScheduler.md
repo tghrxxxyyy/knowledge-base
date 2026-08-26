@@ -788,7 +788,171 @@ Worker 分组 = 按业务或资源特性隔离执行环境
   代码即编排 + 灵活最强 → Airflow
   混合场景 → DS 编排数据管道，Airflow 做 ML Pipeline
 
-## 十四、与其他板块的关系
+## 十四、Master 任务分配算法
+
+```
+Master 任务分配流程：
+
+  1. 任务提交：
+    用户提交工作流 → Master 接收 → 解析 DAG 依赖
+    → 生成任务实例（TaskInstance）
+
+  2. 任务分配：
+    Master 按 Worker 负载分配任务
+    算法：Round Robin / Least Load / Resource Aware
+
+  3. 任务执行：
+    Worker 接收任务 → 创建线程池执行
+    → 上报状态（Running/Success/Failed）
+    → Master 更新任务状态
+
+  4. 失败重试：
+    任务失败 → Master 检查重试次数
+    → 未超限 → 重新分配到其他 Worker
+    → 超限 → 标记失败 → 触发告警
+
+  关键配置：
+    master.task.dispatch.strategy=round-robin  # 分配策略
+    master.task.retry.max=3  # 最大重试次数
+    master.task.timeout=600  # 任务超时（秒）
+```
+
+## 十五、Worker 分组任务隔离
+
+```
+Worker 分组隔离：
+
+  场景：
+    不同业务线使用不同 Worker 组
+    大数据任务和实时任务隔离
+    测试和生产环境隔离
+
+  配置：
+    Worker 启动时指定分组：
+    --worker.group=data-pipeline
+
+  任务路由：
+    任务提交时指定 Worker 分组：
+    workerGroup=data-pipeline
+
+  隔离效果：
+    1. 资源隔离：不同分组 Worker 资源独立
+    2. 故障隔离：一个分组故障不影响其他分组
+    3. 权限隔离：不同分组不同权限
+
+  配置示例：
+    worker.groups=data-pipeline,realtime,test
+    worker.group=data-pipeline  # 当前 Worker 分组
+```
+
+## 十六、自定义告警插件
+
+```java
+// 自定义告警插件（飞书通知）
+public class FeishuAlertPlugin implements AlertPlugin {
+    @Override
+    public void send(AlertInfo alertInfo) {
+        String webhook = alertInfo.getWebhook();
+        String title = alertInfo.getTitle();
+        String content = alertInfo.getContent();
+
+        // 构造飞书消息
+        Map<String, Object> body = new HashMap<>();
+        body.put("msg_type", "interactive");
+        body.put("card", Map.of(
+            "header", Map.of("title", Map.of("tag", "plain_text", "content", title)),
+            "elements", List.of(
+                Map.of("tag", "div", "text", Map.of("tag", "lark_md", "content", content))
+            )
+        ));
+
+        // 发送请求
+        HttpUtil.post(webhook, JSONUtil.toJsonStr(body));
+    }
+}
+```
+
+```yaml
+# 告警插件配置
+alert.plugin.type=feishu
+alert.plugin.feishu.webhook=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+alert.plugin.feishu.secret=your_secret
+```
+
+## 十七、任务依赖关系详解
+
+```
+任务依赖类型：
+
+  1. 依赖上游任务：
+    A → B → C（串行）
+    A → B, A → C（并行）
+
+  2. 依赖上游工作流：
+    Workflow-A → Workflow-B（跨工作流依赖）
+
+  3. 依赖时间：
+    定时触发（cron 表达式）
+
+  4. 依赖数据：
+    数据到达触发（文件/表/消息）
+
+  依赖配置：
+    1. 依赖上游任务：前置任务完成
+    2. 依赖上游工作流：前置工作流完成
+    3. 依赖时间：定时触发
+    4. 依赖数据：数据到达触发
+```
+
+```yaml
+# 任务依赖配置
+task:
+  name: etl_task
+  dependencies:
+    - type: upstream_task
+      task_id: 12345
+    - type: upstream_workflow
+      workflow_id: 67890
+    - type: schedule
+      cron: "0 2 * * *"
+    - type: data
+      path: "/data/input/*.csv"
+```
+
+## 十八、生产 HA 部署架构
+
+```
+DolphinScheduler 生产 HA 架构：
+
+  Master 集群（3 节点）：
+    Master-1 ←→ Master-2 ←→ Master-3
+    ↕ 选主（ZK）
+    任务分配 + 状态管理
+
+  Worker 集群（N 节点）：
+    Worker-1, Worker-2, ..., Worker-N
+    任务执行 + 状态上报
+
+  ZooKeeper 集群（3 节点）：
+    ZK-1 ←→ ZK-2 ←→ ZK-3
+    选主 + 配置管理
+
+  MySQL 集群（主从）：
+    MySQL-Master ←→ MySQL-Slave
+    元数据存储
+
+  Redis 集群：
+    缓存 + 分布式锁
+
+  关键配置：
+    master.master数量=3
+    worker.worker数量=5
+    zk.connect.string=zk1:2181,zk2:2181,zk3:2181
+    database.type=mysql
+    database.url=jdbc:mysql://mysql:3306/dolphinscheduler
+```
+
+## 十九、与其他板块的关系
 
 - 定时任务对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；
 - XXL-JOB 深度篇见「[任务调度 XXL-JOB](./任务调度XXL-JOB.md)」；

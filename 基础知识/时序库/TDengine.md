@@ -803,6 +803,258 @@ Topic 三种类型：
   简单实时管道可替代 Kafka 中转一跳
 ```
 
+## 附录 A：STable 设计深度
+
+### A.1 STable 最佳实践
+
+| 场景 | STable 设计 | 子表策略 |
+|------|-------------|----------|
+| IoT 设备 | `devices` STable | 按设备 ID 分表 |
+| 服务器监控 | `server_metrics` STable | 按主机名分表 |
+| 应用监控 | `app_metrics` STable | 按应用名+实例分表 |
+| 车联网 | `vehicle_data` STable | 按 VIN 分表 |
+
+### A.2 子表自动创建
+
+```sql
+-- 自动创建子表（通过写入）
+INSERT INTO devices.d1001 
+USING devices.devices TAGS ('sensor_a', 'building_1')
+VALUES (NOW, 25.5, 60.0);
+
+-- 批量创建子表
+CREATE TABLE devices.d1002 USING devices.devices TAGS ('sensor_b', 'building_1');
+CREATE TABLE devices.d1003 USING devices.devices TAGS ('sensor_c', 'building_2');
+```
+
+### A.3 STable 数量规划
+
+```text
+经验法则：
+
+小型系统：< 100 万子表
+  - 单 STable 可管理数十万子表
+  - 建议按业务模块拆分
+
+中型系统：100-1000 万子表
+  - 需要多 STable 拆分
+  - 按时间/设备类型分组
+
+大型系统：> 1000 万子表
+  - 必须分库部署
+  - 使用多 vnode 并行写入
+  - 考虑存算分离架构
+```
+
+## 附录 B：TAG 优化与查询性能
+
+### B.1 TAG 设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 高基数放 TAG | TAG 值域大 | device_id, user_id |
+| 低基数放 TAG | TAG 值域小 | status, region |
+| 不放 TAG | 值域极大 | timestamp, random_id |
+| 字符串优先 | TAG 支持字符串 | 设备名、路径 |
+
+### B.2 TAG 查询优化
+
+```sql
+-- 1. 使用 TAG 过滤（走 TAG 索引）
+SELECT * FROM devices 
+WHERE device_id = 'd1001' 
+  AND ts > NOW - 1h;
+
+-- 2. 避免 TAG 函数调用（不走索引）
+SELECT * FROM devices 
+WHERE device_id LIKE 'd100%'  -- 无法使用索引
+
+-- 3. 使用 TAG IN 查询（批量查询）
+SELECT * FROM devices 
+WHERE device_id IN ('d1001', 'd1002', 'd1003');
+
+-- 4. TAG 统计查询
+SELECT device_id, COUNT(*) as cnt
+FROM devices 
+WHERE ts > NOW - 24h
+GROUP BY device_id
+ORDER BY cnt DESC
+LIMIT 10;
+```
+
+### B.3 TAG 索引机制
+
+```text
+TAG 索引结构：
+
+内存索引：
+  - B+ 树索引（默认）
+  - 倒排索引（新版本）
+  - 支持等值查询、范围查询
+
+索引大小估算：
+  - 每个 TAG 值约 50-100 字节
+  - 100 万子表 ≈ 100-200MB 索引
+  - 建议内存 > 2GB
+
+索引维护：
+  - 自动创建和更新
+  - 子表删除时自动清理
+  - 支持手动重建索引
+```
+
+## 附录 C：窗口函数实战
+
+### C.1 窗口函数类型
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| INTERVAL | 固定时间窗口 | 每 5 分钟聚合 |
+| SESSION | 会话窗口 | 按活跃间隔分组 |
+| TUMBLE | 滚动窗口 | 固定大小不重叠 |
+| HOP | 滑动窗口 | 固定大小可重叠 |
+| SESSION窗口 | 会话窗口 | 按空闲间隔分组 |
+
+### C.2 窗口查询示例
+
+```sql
+-- 1. INTERVAL：每 5 分钟聚合
+SELECT _wstart as start_time, 
+       _wend as end_time,
+       AVG(temperature) as avg_temp,
+       MAX(humidity) as max_humidity
+FROM server_metrics
+WHERE ts > NOW - 24h
+INTERVAL(5m)
+FILL(PREV);
+
+-- 2. SESSION：会话窗口（空闲超过 30 分钟为新会话）
+SELECT _wstart as session_start,
+       _wend as session_end,
+       COUNT(*) as request_count,
+       AVG(response_time) as avg_response
+FROM api_access_log
+WHERE ts > NOW - 24h
+SESSION(ts, 30m);
+
+-- 3. HOP：滑动窗口（窗口 10 分钟，滑动 5 分钟）
+SELECT _wstart as window_start,
+       AVG(cpu_usage) as avg_cpu
+FROM server_metrics
+WHERE ts > NOW - 24h
+HOP(ts, 5m, 10m);
+
+-- 4. FILL 策略
+SELECT _wstart, AVG(temperature)
+FROM server_metrics
+WHERE ts > NOW - 24h
+INTERVAL(10m)
+FILL(PREV);    -- 前向填充
+-- FILL(NULL);  -- 空值填充
+-- FILL(0);     -- 零值填充
+-- FILL-linear); -- 线性插值
+```
+
+## 附录 D：存算分离架构详解
+
+### D.1 架构组件
+
+```text
+架构层级：
+
+计算层：
+  - 负责 SQL 解析、优化、执行
+  - 无状态设计，可水平扩展
+  - 支持多副本高可用
+
+存储层：
+  - 负责数据持久化
+  - 使用对象存储/分布式文件系统
+  - 支持数据压缩和生命周期管理
+
+协调层：
+  - 管理元数据
+  - 协调计算和存储
+  - 处理数据迁移和恢复
+```
+
+### D.2 部署配置
+
+```yaml
+# TDengine 存算分离配置
+storage:
+  type: s3
+  endpoint: https://s3.amazonaws.com
+  bucket: tdengine-data
+  access_key_id: xxx
+  secret_access_key: xxx
+
+compute:
+  nodes: 3
+  vnodes_per_node: 4
+  memory_per_node: 16GB
+
+coordinator:
+  nodes: 3
+  replication_factor: 3
+```
+
+### D.3 性能对比
+
+| 指标 | 本地存储 | 存算分离 |
+|------|----------|----------|
+| 写入吞吐 | 100K points/s | 80K points/s |
+| 查询延迟 | 5ms | 10ms |
+| 存储成本 | 高（SSD） | 低（对象存储） |
+| 弹性扩缩 | 慢 | 快 |
+| 数据持久性 | 99.9% | 99.999999999% |
+
+## 附录 E：Prometheus 集成详解
+
+### E.1 集成架构
+
+```mermaid
+flowchart LR
+    A[Prometheus] --> B[TDengine<br/>Remote Write]
+    B --> C[TDengine<br/>存储]
+    D[Grafana] --> C
+    D --> E[可视化]
+```
+
+### E.2 配置示例
+
+```yaml
+# prometheus.yml
+remote_write:
+  - url: "http://tdengine:6041/prometheus/v1/write"
+    basic_auth:
+      username: root
+      password: taosdata
+
+# 标签映射
+metric_relabel_configs:
+  - source_labels: [__name__]
+    regex: '(.*)'
+    target_label: __name__
+    replacement: 'tdengine_$1'
+```
+
+### E.3 查询示例
+
+```sql
+-- 从 TDengine 查询 Prometheus 指标
+SELECT ts, value 
+FROM prometheus.cpu_usage_percent
+WHERE ts > NOW - 1h
+  AND tags->>'instance' = 'server01';
+
+-- 聚合查询
+SELECT _wstart, AVG(value) as avg_cpu
+FROM prometheus.cpu_usage_percent
+WHERE ts > NOW - 24h
+INTERVAL(1h);
+```
+
 ## TDengine 与 Prometheus 集成方案
 
 ```

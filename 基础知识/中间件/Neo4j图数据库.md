@@ -610,6 +610,277 @@ JVM Heap：
   → 检查页缓存命中率（>99%）
 ```
 
+## 附录 A：GDS（Graph Data Science）算法库
+
+### A.1 内置算法分类
+
+| 类别 | 算法 | 用途 |
+|------|------|------|
+| 中心性 | PageRank, Betweenness, Closeness | 关键节点识别 |
+| 社区检测 | Louvain, Label Propagation, Triangle Count | 社区发现 |
+| 路径 | Shortest Path, A*, Dijkstra | 路径规划 |
+| 相似度 | Node Similarity, Cosine Similarity | 实体匹配 |
+| 节点嵌入 | Node2Vec, FastRP | 图表示学习 |
+| 链接预测 | Adamic Adar, Common Neighbors | 关系预测 |
+
+### A.2 GDS 使用示例
+
+```cypher
+-- 加载图投影
+CALL gds.graph.project(
+  'my-graph',
+  'Person',
+  'KNOWS',
+  {
+    relationshipProperties: ['weight']
+  }
+);
+
+-- PageRank 计算
+CALL gds.pageRank.stream('my-graph')
+YIELD nodeId, score
+WITH gds.util.asNode(nodeId) AS person, score
+RETURN person.name, score
+ORDER BY score DESC
+LIMIT 10;
+
+-- 社区检测
+CALL gds.louvain.stream('my-graph')
+YIELD nodeId, communityId
+WITH gds.util.asNode(nodeId) AS person, communityId
+RETURN communityId, COLLECT(person.name) AS members
+ORDER BY SIZE(members) DESC;
+```
+
+### A.3 GDS 配置调优
+
+```yaml
+# neo4j.conf
+gds:
+  memory:
+    default_value: 4G
+    max_value: 16G
+  parallelism:
+    default_value: 4
+    max_value: 16
+  batch_size:
+    default_value: 10000
+    max_value: 100000
+```
+
+## 附录 B：事务隔离与锁机制
+
+### B.1 事务隔离级别
+
+| 级别 | 说明 | 并发性 | 一致性 |
+|------|------|--------|--------|
+| READ COMMITTED | 读已提交 | 高 | 低 |
+| REPEATABLE READ | 可重复读 | 中 | 中 |
+| SERIALIZABLE | 序列化 | 低 | 高 |
+
+### B.2 锁类型
+
+| 锁类型 | 说明 | 粒度 |
+|--------|------|------|
+| 节点锁 | 锁定节点属性 | 节点级 |
+| 关系锁 | 锁定关系属性 | 关系级 |
+| 图锁 | 锁定整个图 | 图级 |
+| Schema 锁 | 锁定结构变更 | Schema 级 |
+
+### B.3 事务配置
+
+```yaml
+# neo4j.conf
+dbms:
+  transaction:
+    timeout: 60s
+    threads_per_transaction: 4
+  memory:
+    transaction:
+      max_size: 256M
+```
+
+## 附录 C：APOC 实用过程
+
+### C.1 常用 APOC 过程
+
+| 过程 | 功能 | 示例 |
+|------|------|------|
+| `apoc.periodic.iterate` | 批量操作 | 大数据量更新 |
+| `apoc.load.json` | JSON 导入 | 外部数据集成 |
+| `apoc.export.csv.all` | CSV 导出 | 数据备份 |
+| `apoc.path.expand` | 路径遍历 | 多跳查询 |
+| `apoc.algo.cover` | 图算法 | 覆盖率计算 |
+| `apoc.meta.graph` | 元数据 | 图结构分析 |
+
+### C.2 APOC 使用示例
+
+```cypher
+-- 批量更新
+CALL apoc.periodic.iterate(
+  "MATCH (n:Person) WHERE n.age IS NULL RETURN n",
+  "SET n.age = 30",
+  {batchSize: 1000, parallel: true}
+);
+
+-- JSON 导入
+CALL apoc.load.json('file:///data/users.json')
+YIELD value
+CREATE (n:Person {name: value.name, age: value.age});
+
+-- 路径遍历
+CALL apoc.path.expandConfig(
+  startNode,
+  {
+    minLevel: 1,
+    maxLevel: 5,
+    relationshipFilter: 'KNOWS|FOLLOWS',
+    uniqueness: 'NODE_GLOBAL'
+  }
+)
+YIELD path
+RETURN path;
+```
+
+## 附录 D：Fabric 多数据库架构
+
+### D.1 Fabric 架构
+
+```text
+Fabric 架构：
+
+用户查询
+  ↓
+Fabric 协调器
+  ↓
+数据库分片1  数据库分片2  数据库分片3
+  ↓            ↓            ↓
+查询结果合并
+  ↓
+返回用户
+```
+
+### D.2 Fabric 配置
+
+```yaml
+# fabric 配置
+databases:
+  - name: shard1
+    url: bolt://neo4j-shard1:7687
+  - name: shard2
+    url: bolt://neo4j-shard2:7687
+  - name: shard3
+    url: bolt://neo4j-shard3:7687
+
+# 查询使用
+USE fabric.shard1
+MATCH (n:Person) RETURN n;
+
+-- 跨分片查询
+UNION ALL
+USE fabric.shard1
+MATCH (n:Person) RETURN n
+UNION ALL
+USE fabric.shard2
+MATCH (n:Person) RETURN n;
+```
+
+## 附录 E：Cypher EXPLAIN/PROFILE 分析
+
+### E.1 执行计划分析
+
+```cypher
+-- 查看执行计划
+EXPLAIN MATCH (p:Person)-[:KNOWS]->(f:Person)
+WHERE p.name = 'Alice'
+RETURN f.name;
+
+-- 带统计信息的执行计划
+PROFILE MATCH (p:Person)-[:KNOWS]->(f:Person)
+WHERE p.name = 'Alice'
+RETURN f.name;
+```
+
+### E.2 执行计划节点
+
+| 节点类型 | 说明 | 优化建议 |
+|----------|------|----------|
+| AllNodesScan | 全表扫描 | 添加索引 |
+| NodeIndexSeek | 索引查找 | 保持 |
+| NodeHashJoin | 哈希连接 | 优化查询 |
+| Expand(All) | 关系遍历 | 限制深度 |
+| ProduceResults | 结果输出 | 减少字段 |
+
+### E.3 索引优化
+
+```cypher
+-- 创建索引
+CREATE INDEX FOR (p:Person) ON (p.name);
+
+-- 创建复合索引
+CREATE INDEX FOR (p:Person) ON (p.name, p.age);
+
+-- 创建全文索引
+CREATE FULLTEXT INDEX personName FOR (n:Person) ON EACH [n.name];
+
+-- 查看索引
+SHOW INDEXES;
+```
+
+## 附录 F：内存调优配置
+
+### F.1 内存分配
+
+```yaml
+# neo4j.conf
+server:
+  memory:
+    pagecache:
+      size: 4G
+    heap:
+      initial_size: 2G
+      max_size: 4G
+
+dbms:
+  memory:
+    transaction:
+      max_size: 256M
+    result:
+      max_size: 128M
+```
+
+### F.2 内存使用监控
+
+```text
+内存使用分布：
+
+Page Cache：
+  - 存储图数据
+  - 建议：数据集大小的 1.2 倍
+
+Heap Memory：
+  - 事务处理
+  - 建议：最大 8GB（GC 压力）
+
+Transaction Memory：
+  - 单个事务
+  - 建议：256MB-1GB
+
+Result Memory：
+  - 查询结果
+  - 建议：128MB-512MB
+```
+
+### F.3 性能调优清单
+
+| 配置项 | 默认值 | 推荐值 | 说明 |
+|--------|--------|--------|------|
+| `pagecache.size` | 1G | 数据集 1.2x | 图数据缓存 |
+| `heap.max_size` | 1G | 4-8G | JVM 堆内存 |
+| `transaction.max_size` | 8M | 256M | 单事务大小 |
+| `query.max_size` | 1000 | 10000 | 结果集大小 |
+| `batch_size` | 1000 | 10000 | 批处理大小 |
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。

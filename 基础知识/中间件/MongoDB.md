@@ -765,3 +765,265 @@ pbm config --set storage.type=s3 && pbm backup --type=physical
 | 聚合管道 | $match → $group → $lookup → $sort |
 | 许可证 | SSPL v1（2018-10 后） |
 | 一句话 | 「写文档」式灵活存储 + 原生水平扩展 |
+
+## 二十、MongoDB 事务 ACID 与 WiredTiger MVCC 深入
+
+### 20.1 多文档事务 ACID
+
+```
+MongoDB 4.0+ 多文档 ACID 事务：
+
+  A（原子性）：
+    事务内所有操作要么全部成功，要么全部回滚
+    支持跨文档、跨集合事务
+
+  C（一致性）：
+    事务开始前和结束后，数据保持一致状态
+    唯一索引约束在事务中强制执行
+
+  I（隔离性）：
+    默认：Read Committed（读已提交）
+    可选：Snapshot（快照隔离）
+    写操作使用 WiredTiger MVCC 实现隔离
+
+  D（持久性）：
+    Write Concern: majority（多数节点写入成功才返回）
+    Journal 日志保证崩溃恢复
+
+  事务使用限制：
+    1. 默认超时 60 秒（可配置）
+    2. 单事务操作文档数 < 100 万
+    3. 事务大小 < 16MB（单文档限制）
+    4. 不支持嵌套事务
+    5. 不支持延迟写入（w:0）
+```
+
+### 20.2 WiredTiger MVCC 机制
+
+```
+WiredTiger MVCC（多版本并发控制）：
+
+  原理：
+    每次更新创建新版本（多版本链）
+    旧版本保留在 WiredTiger 版本链中
+    读操作读取快照（事务开始时的版本）
+    写操作创建新版本（不影响读）
+
+  版本链结构：
+    文档 _id=1：
+      version-3（当前） ← version-2 ← version-1（最旧）
+    读操作读取事务开始时的快照版本
+
+  回收机制：
+    Checkpoint：定期创建快照（默认 60 秒）
+    日志回收：Checkpoint 后删除旧版本
+    空间回收：expired 版本被清理
+
+  配置：
+    wiredTiger.cache.sizeGB=1          # 缓存大小
+    wiredTiger.checkpoint.waitSecs=60  # Checkpoint 间隔
+    wiredTiger.log.preallocSize=2       # 日志预分配
+```
+
+```sql
+-- 事务示例
+session.startTransaction({
+  readConcern: { level: "snapshot" },
+  writeConcern: { w: "majority" },
+  readPreference: "primary"
+});
+
+db.accounts.updateOne({ _id: "user1" }, { $inc: { balance: -100 } });
+db.accounts.updateOne({ _id: "user2" }, { $inc: { balance: 100 } });
+db.transactions.insertOne({ from: "user1", to: "user2", amount: 100 });
+
+session.commitTransaction();
+```
+
+## 二十一、Change Streams 实时缓存失效方案
+
+```java
+// Change Streams 监听变更 → 失效 Redis 缓存
+public class CacheInvalidator {
+    private MongoDatabase database;
+    private RedisTemplate<String, Object> redis;
+
+    public void startWatching() {
+        List<Bson> pipeline = Arrays.asList(
+            Aggregates.match(Document.parse(
+                "{ operationType: { $in: ['insert', 'update', 'replace', 'delete'] } }"
+            ))
+        );
+
+        ChangeStreamIterable<Document> changeStream = database.getCollection("orders")
+            .watch(pipeline)
+            .fullDocument(FullDocument.UPDATE_LOOKUP);
+
+        changeStream.forEach(event -> {
+            String docId = event.getDocumentKey().get("_id").toString();
+            String cacheKey = "order:" + docId;
+
+            // 1. 失效 Redis 缓存
+            redis.delete(cacheKey);
+
+            // 2. 失效本地缓存（如 Caffeine）
+            localCache.invalidate(cacheKey);
+
+            // 3. 发送消息到 MQ（通知其他服务）
+            kafkaTemplate.send("cache-invalidation", cacheKey);
+
+            log.info("缓存失效: {}", cacheKey);
+        });
+    }
+}
+```
+
+```text
+Change Streams 缓存失效流程：
+  MongoDB 变更 → Change Stream 捕获
+    → 失效 Redis 缓存
+    → 失效本地缓存
+    → 发送 MQ 消息通知其他服务
+  优势：
+    - 真正实时（毫秒级延迟）
+    - 无需轮询（事件驱动）
+    - 自动重连（断点续传）
+```
+
+## 二十二、分片键选择反例与正例
+
+```text
+分片键选择反例：
+  ❌ 单调递增 _id：所有写入集中到单个 Chunk（热点）
+  ❌ 低基数字段（如 status）：Chunk 分布不均
+  ❌ 高频更新字段：频繁迁移 Chunk
+  ❌ 时序字段（如 timestamp）：最新数据集中到单个 Chunk
+
+分片键选择正例：
+  ✅ 高基数 + 低频更新：user_id + order_id 组合
+  ✅ 哈希分片：_id 哈希（均匀分布，但范围查询差）
+  ✅ 复合分片键：{ region: 1, user_id: 1 }（支持区域查询）
+  ✅ 业务相关：{ tenant_id: 1, created_at: 1 }（多租户隔离）
+```
+
+```javascript
+// 分片键选择决策树
+// 1. 写入为主 → 哈希分片（均匀分布）
+sh.shardCollection("db.orders", { _id: "hashed" })
+
+// 2. 查询为主 → 复合分片键（支持范围查询）
+sh.shardCollection("db.orders", { region: 1, user_id: 1 })
+
+// 3. 混合场景 → 哈希前缀 + 范围后缀
+sh.shardCollection("db.orders", { user_id: "hashed", created_at: 1 })
+```
+
+## 二十三、副本集选举机制与配置
+
+```
+MongoDB 副本集选举：
+  触发条件：
+    1. Primary 心跳超时（默认 10 秒）
+    2. Primary 主动 Step Down
+    3. 网络分区恢复后
+
+  选举流程：
+    1. Secondary 检测到 Primary 不可达
+    2. Secondary 发起选举请求
+    3. 其他节点投票（多数票通过）
+    4. 新 Primary 选出（优先级最高者获胜）
+
+  配置建议：
+    副本集节点数：奇数（3/5/7）
+    原因：多数票 = (N/2)+1
+    3 节点：需要 2 票（容忍 1 个故障）
+    5 节点：需要 3 票（容忍 2 个故障）
+
+  优先级配置：
+    rs.conf().members[0].priority = 3  # 优先成为 Primary
+    rs.conf().members[1].priority = 2  # 次优先
+    rs.conf().members[2].priority = 1  # 最后
+    rs.reconfig(cfg)
+```
+
+```javascript
+// 副本集配置示例
+rs.initiate({
+  _id: "rs0",
+  members: [
+    { _id: 0, host: "mongo1:27017", priority: 3 },
+    { _id: 1, host: "mongo2:27017", priority: 2 },
+    { _id: 2, host: "mongo3:27017", priority: 1, votes: 0 }  # 仲裁节点
+  ]
+});
+
+// 读写分离配置
+db.getMongo().setReadPref("secondaryPreferred");  // 读优先从节点
+db.getMongo().setReadPref("primary");              // 读优先主节点
+```
+
+## 二十四、时序集合（Time Series）IoT 场景
+
+```javascript
+// 创建时序集合
+db.createCollection("sensor_data", {
+  timeseries: {
+    timeField: "timestamp",      // 时间字段
+    metaField: "metadata",       // 元数据字段（设备ID等）
+    granularity: "hours"         // 粒度：seconds/minutes/hours
+  },
+  expireAfterSeconds: 7776000    // 90 天后自动过期
+});
+
+// 插入传感器数据
+db.sensor_data.insertOne({
+  timestamp: new Date(),
+  metadata: { deviceId: "sensor-001", location: "factory-A" },
+  temperature: 25.6,
+  humidity: 60.2
+});
+
+// 时序集合优化：
+//   1. 自动按时间分区（减少扫描范围）
+//   2. 元数据索引（快速过滤设备）
+//   3. 自动压缩（时间序列数据压缩率高）
+//   4. 自动过期（TTL 索引）
+//   5. 性能提升：比普通集合快 10-50 倍
+```
+
+```text
+IoT 时序数据最佳实践：
+  1. 使用时序集合（而非普通集合）
+  2. 设置合适的粒度（seconds/minutes/hours）
+  3. 启用自动过期（避免数据无限增长）
+  4. 元数据字段存储设备信息（便于过滤）
+  5. 批量写入（减少网络开销）
+```
+
+## 二十五、MongoDB 备份三方案对比
+
+| 方案 | 工具 | 原理 | RPO | RTO | 适用 |
+|------|------|------|-----|-----|------|
+| 文件拷贝 | mongodump | 逻辑备份 | 小时级 | 小时级 | 小数据量 |
+| 快照备份 | LVM/S3 | 物理备份 | 分钟级 | 分钟级 | 中等数据量 |
+| 持续备份 | Ops Manager | 增量备份 | 秒级 | 分钟级 | 大数据量 |
+
+```bash
+# 方案 1：mongodump（逻辑备份）
+mongodump --host=rs0/mongo1:27017 --out=/backup/$(date +%Y%m%d)
+
+# 方案 2：LVM 快照（物理备份）
+lvcreate -L 10G -s -n mongo_snapshot /dev/vg0/mongo_data
+mount /dev/vg0/mongo_snapshot /mnt/backup
+tar czf /backup/mongo_$(date +%Y%m%d).tar.gz /mnt/backup
+umount /mnt/backup
+lvremove -f /dev/vg0/mongo_snapshot
+
+# 方案 3：Ops Manager（企业级）
+# 1. 安装 Ops Manager Agent
+# 2. 配置备份计划
+# 3. 自动增量备份到 S3
+# 4. 支持时间点恢复（PITR）
+```
+
+## 二十六、与其他板块的关系

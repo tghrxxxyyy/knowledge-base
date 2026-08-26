@@ -699,6 +699,237 @@ Jaeger 横向扩展架构：
   Storage：ES/Cassandra 水平扩展
 ```
 
+## 附录 A：Remote Sampling 深度配置
+
+### A.1 采样策略矩阵
+
+| 策略类型 | 配置方式 | 适用场景 | 精度 |
+|----------|----------|----------|------|
+| 概率采样 | `probabilistic` | 高流量服务 | 可调 |
+| 限速采样 | `rateLimiting` | 控制采样率上限 | 固定 |
+| 尾部采样 | `tail-based` | 延迟/错误采样 | 精准 |
+| 自适应采样 | `adaptive` | 动态负载 | 智能 |
+
+### A.2 采样配置示例
+
+```yaml
+# agent 配置
+sampling:
+  default_strategy:
+    type: probabilistic
+    param: 0.1  # 10% 采样率
+  
+  service_strategies:
+    - service: payment-service
+      type: probabilistic
+      param: 0.5  # 支付服务 50%
+    - service: order-service
+      type: rateLimiting
+      param: 100  # 每秒最多 100 个 span
+```
+
+### A.3 尾部采样配置
+
+```yaml
+# tail-based sampling 配置
+sampling:
+  policies:
+    - name: error-policy
+      type: probabilistic
+      param: 1.0
+      condition:
+        status: error
+    - name: slow-policy
+      type: probabilistic
+      param: 1.0
+      condition:
+        latency: ">1000ms"
+    - name: normal-policy
+      type: probabilistic
+      param: 0.1
+```
+
+## 附录 B：Span 树分析与查询 API
+
+### B.1 Span 树结构
+
+```
+Trace: abc123
+└── Service A (root span, 500ms)
+    ├── GET /api/users (200ms)
+    │   ├── SELECT * FROM users (50ms)
+    │   └── SELECT * FROM orders (100ms)
+    ├── GET /api/orders (300ms)
+    │   ├── Order Service (250ms)
+    │   │   ├── Redis GET order:123 (10ms)
+    │   │   └── SELECT * FROM orders (200ms)
+    │   └── Response Transform (50ms)
+    └── Client Response (100ms)
+```
+
+### B.2 查询 API 示例
+
+```bash
+# 查询特定 trace
+curl "http://jaeger:16686/api/traces/abc123"
+
+# 按服务和操作查询
+curl "http://jaeger:16686/api/traces?service=order-service&operation=GET+/api/orders&limit=10"
+
+# 按时间范围查询
+curl "http://jaeger:16686/api/traces?service=order-service&start=1625097600000000&end=1625097700000000"
+
+# 按标签查询
+curl "http://jaeger:16686/api/traces?tags=http.status_code=500&service=payment-service"
+```
+
+### B.3 Span 分析指标
+
+| 指标 | 计算方式 | 意义 |
+|------|----------|------|
+| Span Duration | end - start | 单个操作耗时 |
+| Self Time | duration - (sum(children durations)) | 纯处理时间 |
+| Depth | 嵌套层级 | 调用复杂度 |
+| Fan-out | 子 span 数量 | 并发度 |
+| Child Count | 直接子 span 数 | 调用链宽度 |
+
+## 附录 C：Span Metrics + Prometheus 集成
+
+### C.1 指标暴露配置
+
+```yaml
+# jaeger-metrics 配置
+metrics:
+  type: prometheus
+  port: 14269
+  path: /metrics
+
+# 暴露的指标
+jaeger_traces_total{service,operation,type}  # 总 traces
+jaeger_spans_total{service,operation,type}   # 总 spans
+jaeger_span_duration{service,operation}       # span 耗时
+jaeger_spans_per_second{service}             # 每秒 span 数
+```
+
+### C.2 Grafana Dashboard 关键面板
+
+```text
+面板1：服务调用拓图
+  - 节点大小 = 请求量
+  - 边粗细 = 调用频率
+  - 颜色 = 错误率
+
+面板2：延迟分布
+  - P50 / P95 / P99 延迟
+  - 按服务/操作分组
+  - 时间趋势
+
+面板3：错误率 Top 10
+  - 错误率最高的操作
+  - 错误类型分布
+  - 影响范围
+```
+
+## 附录 D：Tail Sampling 策略详解
+
+### D.1 策略类型
+
+| 策略 | 说明 | 配置示例 |
+|------|------|----------|
+| probabilistic | 概率采样 | `probabilistic: {samplingProbability: 0.1}` |
+| rateLimiting | 限速采样 | `rateLimiting: {maxTracesPerSecond: 100}` |
+| status | 按状态码 | `status: {code: error}` |
+| latency | 按延迟 | `latency: {thresholdMs: 1000}` |
+| attribute | 按属性 | `attribute: {key: http.method, value: POST}` |
+| composite | 组合策略 | `composite: {maxTotalSpansPerSecond: 100, policy1: {...}, policy2: {...}}` |
+
+### D.2 组合策略配置
+
+```yaml
+sampling:
+  default_strategy:
+    type: composite
+    param: 100000  # maxTotalSpansPerSecond
+    sub:
+      - type: probabilistic
+        param: 0.1
+        id: 1
+      - type: rateLimiting
+        param: 500
+        id: 2
+```
+
+## 附录 E：Jaeger 水平扩展（Kafka 方案）
+
+```mermaid
+flowchart LR
+    A[应用] --> B[Jaeger Agent]
+    B --> C[Kafka]
+    C --> D[Jaeger Collector<br/>实例1]
+    C --> E[Jaeger Collector<br/>实例2]
+    D --> F[Elasticsearch]
+    E --> F
+```
+
+| 组件 | 扩展方式 | 配置要点 |
+|------|----------|----------|
+| Agent | 每节点部署 | 端口 6831/5775 |
+| Collector | Kafka 解耦 | consumer group |
+| Kafka | 分区扩展 | 按 trace ID 分区 |
+| Elasticsearch | 分片+副本 | 热温冷架构 |
+
+### E.1 Kafka 配置示例
+
+```yaml
+# collector 配置
+kafka:
+  producer:
+    brokers: kafka1:9092,kafka2:9092,kafka3:9092
+    topic: jaeger-spans
+    batch-size: 16384
+    linger-ms: 5
+  consumer:
+    brokers: kafka1:9092,kafka2:9092,kafka3:9092
+    topic: jaeger-spans
+    group-id: jaeger-collectors
+```
+
+## 附录 F：Jaeger 性能调优
+
+### F.1 关键配置参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `collector.num-workers` | 50 | 100-200 | 处理线程数 |
+| `collector.batch-size` | 1000 | 5000 | 批处理大小 |
+| `collector.batch-timeout` | 1s | 500ms | 批处理超时 |
+| `agent.max-packet-size` | 65536 | 131072 | UDP 包大小 |
+| `agent.server-host-port` | :6831 | :6831 | Compact 协议端口 |
+
+### F.2 性能基准测试
+
+```text
+单节点 Collector 性能：
+
+场景：1000 spans/sec，每个 span 500 bytes
+
+配置1：默认
+  - CPU: 40%
+  - 内存: 2GB
+  - 延迟 P99: 50ms
+
+配置2：优化后
+  - CPU: 25%
+  - 内存: 4GB
+  - 延迟 P99: 20ms
+
+配置3：Kafka 方案
+  - CPU: 15% (Collector)
+  - 内存: 3GB (Collector)
+  - 延迟 P99: 15ms
+  - 吞吐量提升 3x
+```
+
 ## 七、与其他板块的关系
 
 - 链路追踪原理（SkyWalking）见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；

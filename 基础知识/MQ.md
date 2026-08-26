@@ -807,7 +807,180 @@ RocketMQ 监控：
   - Grafana Dashboard
 ```
 
-## 二十九、消息队列最佳实践
+## 二十九、消息幂等消费三方案对比
+
+| 方案 | 实现 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|---------|
+| 去重表 | 消息带唯一 ID，DB 唯一索引 | 简单可靠 | 增加 DB 压力 | 通用（推荐） |
+| 天然幂等 | 更新操作（set not add） | 无额外成本 | 只适用部分场景 | 状态更新 |
+| 事务消息 | RocketMQ 半消息+本地事务 | 发端事务一致 | 实现复杂 | 分布式事务 |
+
+```
+去重表设计：
+  message_id VARCHAR(64) PRIMARY KEY
+  consumer_group VARCHAR(64)
+  consumed_at TIMESTAMP
+
+  消费时：INSERT INTO msg_dedup(message_id) VALUES(?)
+  若插入成功 → 处理消息
+  若重复 → 跳过（DuplicateKeyException）
+
+Redis SETNX 去重：
+  SET mq:dedup:{message_id} 1 NX EX 86400
+  设置 24 小时 TTL（覆盖重试窗口）
+
+状态机幂等：
+  订单状态流转：CREATED → PAID → SHIPPED → COMPLETED
+  拒绝逆向/重复流转（如 PAID 不能重复扣款）
+```
+
+## 三十、延迟消息在订单超时中的完整实现
+
+### 30.1 RocketMQ 定时消息 + 补偿
+
+```
+订单超时关闭流程：
+
+  1. 用户下单 → 发送延迟消息（30 分钟后投递）
+     msg.setDeliverTimeMs(System.currentTimeMillis() + 30*60*1000);
+
+  2. 30 分钟后 Consumer 收到消息
+     检查订单状态：
+       若 still CREATED → 关闭订单 + 释放库存
+       若 already PAID → 忽略（不关闭）
+
+  3. 补偿机制（兜底）
+     定时任务扫描：created_at < NOW() - 30min AND status = 'CREATED'
+     → 关闭超时订单
+
+  4. 延迟级别配置
+     RocketMQ 默认 18 级：1s/5s/10s/30s/1m/2m/3m/4m/5m/6m/7m/8m/9m/10m/20m/30m/1h/2h
+     精确任意时间：时间轮或外部调度
+```
+
+### 30.2 Kafka 延迟消息实现
+
+```
+Kafka 原生不支持延迟消息，需要外部方案：
+
+  方案一：RocketMQ 延迟消息（推荐）
+  方案二：Kafka + 时间轮（HashedWheelTimer）
+  方案三：Kafka + 延迟 topic（消费者 sleep，不推荐）
+
+  最佳实践：延迟消息用 RocketMQ，其他用 Kafka
+```
+
+## 三十一、请求应答模式的 correlationId 设计
+
+```java
+// correlationId = 请求-应答匹配的唯一标识
+
+// 生产端：发送请求并设置 correlationId
+String correlationId = UUID.randomUUID().toString();
+Message msg = MessageBuilder.withPayload(payload)
+    .setHeader("correlationId", correlationId)
+    .setHeader("timestamp", System.currentTimeMillis())
+    .build();
+kafkaTemplate.send("request-topic", msg);
+
+// 消费端：提取 correlationId 并透传到应答
+@KafkaListener(topics = "request-topic")
+public void consume(ConsumerRecord<String, String> record) {
+    String correlationId = record.headers().lastHeader("correlationId").value();
+    // 处理请求...
+    // 发送应答（带同一 correlationId）
+    Message reply = MessageBuilder.withPayload(result)
+        .setHeader("correlationId", correlationId)
+        .build();
+    kafkaTemplate.send("reply-topic", reply);
+}
+
+// 客户端：匹配应答
+// 用 correlationId 关联请求和应答，支持异步超时
+```
+
+## 三十二、消息积压应急扩容方案
+
+```
+消息积压百万级治理 SOP：
+
+  1. 先止血：确认消费侧是否宕机/慢
+     看 lag（kafka-consumer-groups --describe）
+
+  2. 快速扩容消费者
+     Kafka 受分区数限制，分区不够先扩分区
+     RocketMQ 增 queue 并扩容消费组
+
+  3. 提升消费并发
+     线程池 / 批量消费 max.poll.records 调大
+     消费逻辑降级（先落库/标记，重计算异步补）
+
+  4. 旁路追平（积压极大）
+     新建临时 topic + 更多分区
+     写脚本把旧 topic 积压搬运到新 topic
+     多实例并发消费，追平后切回
+
+  5. 防复发
+     消费幂等 + 监控 lag 告警
+     大促前压测消费能力留 2x 余量
+```
+
+| 等级 | 积压量 | 处理方式 |
+|------|--------|---------|
+| 轻微 | <1万条 | 自动扩容消费者 |
+| 中等 | 1~10万条 | 手动扩容+提升消费线程 |
+| 严重 | 10~100万条 | 增加分区+消费者 |
+| 紧急 | >100万条 | 停止生产+紧急扩容+消息重放 |
+
+## 三十三、消息体大小对性能的影响
+
+| 维度 | 小消息（<1KB） | 中消息（1KB~100KB） | 大消息（>100KB） |
+|------|---------------|-------------------|----------------|
+| 批量吞吐 | 高（batch 聚合好） | 中 | 低（序列化开销大） |
+| 网络开销 | 低 | 中 | 高 |
+| 内存占用 | 低 | 中 | 高（可能 OOM） |
+| 压缩效果 | 差（压缩率低） | 中 | 好（压缩率高） |
+
+```
+最佳实践：
+  批量消费：多条小消息合并为一批处理
+  消息压缩：大消息开启 gzip/snappy 压缩
+  消息体大小：控制在 10KB 以内
+  大对象：走对象存储，消息只传引用
+  批量 vs 单条：batch 吞吐 > 单条 × N
+```
+
+## 三十四、消息中间件容量规划公式
+
+```
+容量规划核心公式：
+
+  1. 吞吐需求：
+     消息生产速率 = QPS × 每条消息大小
+     消息消费速率 = QPS × 处理延迟
+
+  2. 存储需求：
+     存储 = 消息速率 × 保留时间 × 副本数 × 安全系数
+     例：10000 msg/s × 1KB × 7天 × 3副本 × 1.5 = ~3TB
+
+  3. 带宽需求：
+     生产带宽 = 消息速率 × 消息大小
+     消费带宽 = 消息速率 × 消息大小 × 消费者数
+
+  4. 分区/队列数：
+     Kafka 分区数 ≥ max(消费者数, 目标吞吐 / 单分区吞吐)
+     RocketMQ 队列数 ≥ 消费者数
+```
+
+| 指标 | 计算公式 |
+|------|----------|
+| Broker 数 | `ceil(目标TPS / 单Broker TPS) × 副本因子` |
+| 分区数 | `max(消费者数, 目标TPS / 单分区TPS)` |
+| 磁盘容量 | `消息速率 × 消息大小 × 保留时间 × 副本数 × 1.5` |
+| 内存 | `分区数 × segment大小 + 消费缓冲` |
+| 带宽 | `(生产TPS + 消费TPS × 消费者数) × 消息大小` |
+
+## 三十五、消息队列最佳实践
 
 | 实践 | 说明 |
 |------|------|
@@ -817,3 +990,5 @@ RocketMQ 监控：
 | 死信队列 | 失败消息单独处理 |
 | 消息压缩 | 大消息压缩传输 |
 | 批量消费 | 提高消费效率 |
+| 延迟消息 | 订单超时/定时任务 |
+| 容量规划 | 按公式预留余量 |

@@ -796,7 +796,180 @@ flowchart LR
 
 ---
 
-## 与其他板块的关系
+## 十一、Vitess VReplication 工作流详解
+
+### 11.1 MoveTables 标准操作步骤
+
+```bash
+# 1. 创建目标 keyspace，建表（或由 MoveTables 自动建）
+vtctldclient MoveTables create \
+  --workflow=migrate_customer --source-keyspace=commerce \
+  --tables=customer,users customer
+
+# 2. 观察状态：Copying → Running(已追平)
+vtctldclient Workflow --keyspace customer show migrate_customer
+# 每张表有 copied rows / binlog lag 指标
+
+# 3. 数据校验（VDiff）：对比源/目标行数、内容 checksum
+vtctldclient VDiff create --workflow migrate_customer --target-keyspace customer
+vtctldclient VDiff show --workflow migrate_customer --target-keyspace customer
+
+# 4. 切换流量：先只读 → 再只读副本 → 最后写流量
+vtctldclient MoveTables switchtraffic --workflow migrate_customer --keyspace customer
+# --tablet-types=rdonly 先切只读
+
+# 5. 确认无误后清理源表
+vtctldclient MoveTables complete --workflow migrate_customer --keyspace customer
+```
+
+### 11.2 Reshard 操作步骤
+
+```bash
+# 1. 定义新分片方案（如 -80,80- → -40,40-80,80-）
+vtctldclient Reshard create --workflow=reshard_cust \
+  --source-shards='-80,80-' --target-shards='-40,40-80,80-' customer
+
+# 2. 自动执行：SplitClone 式复制 + VReplication 追增量
+# 3. VDiff 校验 → SwitchTraffic → Complete
+# 旧分片持续服务读写，切换是原子路由变更，秒级完成
+```
+
+> **switchtraffic 是唯一「危险时刻」**，之前任何一步都可重跑；切换后仍可 reverse 反向回迁——这是 MyCat 完全不具备的在线能力。
+
+## 十二、MyCat 分片算法源码级解析
+
+### 12.1 PartitionByMod（取模）
+
+```java
+// 简化后的核心逻辑（io.mycat.route.function.PartitionByMod）
+private int calculate(int segment) {
+    if (count > 0 && segment >= 0) {
+        return segment % count;  // 正数直接取模
+    }
+    // 坑1：负数取模 —— MySQL 的 % 可返回负数，源码用 Math.abs 兜底
+    // 坑2：扩容时 count 变化 → 所有 key 重算 → 全量数据迁移
+    return Math.abs(segment % count);
+}
+```
+
+### 12.2 PartitionByRange（范围）
+
+```java
+// 基于 partition-range-mod.txt 映射文件：0-200M→dn1, 200M-400M→dn2 ...
+public int calculate(String columnValue) {
+    long value = Long.parseLong(columnValue);
+    Partition p = this.getPartition(value);  // TreeMap.floorEntry O(logN)
+    if (p == null) {
+        // 坑：超出最大区间的值默认抛异常
+        throw new IllegalArgumentException(...);
+    }
+    return p.getNodeIndex();
+}
+```
+
+### 12.3 PartitionByHashString（字符串哈希）
+
+```java
+// 对字符串列做 hash 后再取模
+public int calculate(String columnValue) {
+    int hash = hashString(columnValue);  // 逐字符 FNV/hash 计算
+    return hash % count;
+}
+// 注意点：
+//  - 不同字符集下同一字符串字节不同 → 集群统一 utf8mb4
+//  - 大小写敏感：'Tom' 与 'tom' 落不同分片
+```
+
+### 12.4 算法对比
+
+| 算法 | 扩容友好 | 数据均匀 | 范围查询 | 适用 |
+|------|---------|---------|----------|------|
+| Mod | ❌ 全量迁移 | ✅ | ❌ 广播 | 点查为主 |
+| Range | ✅ 只加新区间 | ❌ 尾部热点 | ✅ 直达单片 | 时序/归档 |
+| HashString | ❌ 全量迁移 | 较均匀 | ❌ | 字符串主键 |
+
+## 十三、跨分片 JOIN 三种实现代价对比
+
+| 方案 | 原理 | 代价 | 适用 |
+|------|------|------|------|
+| 全局表（global） | 每个 shard 存全量副本 | 写放大 = 分片数；仅适合低频更新小表 | 地区/配置/权限表 |
+| ER 分片（childTable） | 子表按父表分片键同片存储 | 设计期约束强；扩容必须整组迁移 | 订单↔订单项 |
+| 应用层组装 | 各查各的，代码内存 JOIN | 多一次 RTT；应用内存压力 | 中小结果集 |
+
+```mermaid
+flowchart TB
+    J{跨分片 JOIN} --> A[方案A 全局表广播]
+    J --> B[方案B ER 分片同片]
+    J --> C[方案C 应用层组装]
+    A -->|"字典表小(<1万行)"| OK[推荐]
+    B -->|"订单+明细同 user_id 分片"| OK2[最优]
+    C -->|"两次SQL+内存拼装"| MID[中等]
+    J --> D[方案D 代理层 Shuffle Join] --> BAD[高危慎用]
+```
+
+> MyCat 的 `childTable` 配置只在 schema.xml 生效于 INSERT 路由校验，**UPDATE 不保证同片**——这是很多团队上线后才发现的暗坑。
+
+## 十四、Vitess keyspace 垂直拆分实操
+
+```
+Keyspace ≈ 「逻辑数据库」：
+  - 单体时代：所有表在一个 commerce keyspace
+  - 垂直拆分：customer 表族迁往 customer keyspace
+  - keyspace 可以是 unsharded（单分片）或 sharded
+  - VSchema 里每个 table 归属一个 keyspace
+```
+
+```bash
+# 目标：把 commerce.customer 拆成独立 customer keyspace
+# 1. 新建 unsharded keyspace customer
+vtctldclient CreateKeyspace --durability-policy=none customer
+
+# 2. MoveTables 从 commerce 复制 customer 相关表
+vtctldclient MoveTables create --source-keyspace=commerce \
+  --tables='customer.*' --workflow=cust_split customer
+
+# 3. VDiff 校验 → switchtraffic → complete
+# 之后 customer 与 commerce 之间跨库 JOIN 退化为跨 keyspace 查询
+```
+
+## 十五、MyCat 2.0 vs ShardingSphere 5.x 功能矩阵
+
+| 维度 | MyCat 2.0 | ShardingSphere 5.x |
+|------|-----------|---------------------|
+| 形态 | 独立代理进程 | JDBC + Proxy 双形态 |
+| 分片 | 规则路由 | 规则+Hint+SPI 扩展 |
+| 分布式事务 | XA/弱 | XA + BASE + Seata 兼容 |
+| 读写分离 | 内置 | 内置 + Hint 强制走主 |
+| 在线扩容 | 手工 ETL | EDC（弹性数据迁移） |
+| 分布式 ID | 号段/雪花 | 内置多种生成器 |
+| SQL 解析 | MySQL 方言 | MySQL/PostgreSQL/Oracle 方言 |
+| 监控 | 简单 Stats | Prometheus + SPI |
+| 社区 | 维护放缓 | Apache 顶级、国内活跃 |
+
+## 十六、国产数据库中间件选型决策树
+
+```mermaid
+flowchart TD
+    A{数据量超单库?} -->|否| M[单机 MySQL 够用]
+    A -->|是| B{想不改应用?}
+    B -->|是| C{规模/云原生?}
+    C -->|大/云原生| V[Vitess]
+    C -->|存量/Java| MC[MyCat/ShardingSphere]
+    B -->|否| D{Java 微服务?}
+    D -->|是| SS[ShardingSphere]
+    D -->|否| E{新系统?}
+    E -->|是| TI[TiDB]
+    E -->|否| V2[Vitess]
+```
+
+| 场景 | 首选 | 备选 |
+|------|------|------|
+| 存量 MySQL 透明拆分 | ShardingSphere Proxy | Vitess |
+| Java 微服务精细分片 | ShardingSphere JDBC | — |
+| 超大规模 + K8s | Vitess | — |
+| 新系统原生分布式 | TiDB | Vitess |
+
+## 十七、与其他板块的关系
 
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - TiDB（NewSQL）见「[TiDB 与 NewSQL](./TiDB与NewSQL.md)」；
