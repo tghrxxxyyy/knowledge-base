@@ -1138,7 +1138,116 @@ data:
   api-key: c2VjcmV0LWFwaS1rZXk=
 ```
 
-## 十七、与其他板块的关系
+## 十七、Spring Cloud 配置中心深度对比
+
+### 17.1 Config Server / Consul / Nacos 对比
+
+| 维度 | Spring Cloud Config | Consul KV | Nacos Config |
+|------|---------------------|-----------|--------------|
+| 存储后端 | Git/SVN/JDBC | Consul KV | 内置 Derby/MySQL |
+| 推送机制 | Bus（Spring Cloud Bus + MQ） | Long Polling | Long Polling（长轮询） |
+| 版本管理 | Git 原生版本 | Consul 内置版本 | 内置版本+回滚 |
+| 灰度发布 | 不原生支持 | 不原生支持 | 支持（Beta发布） |
+| 权限控制 | Git 权限 | ACL/Token | RBAC（内置权限） |
+| 多环境 | Profile + Label | Key 前缀隔离 | Namespace + Group + DataID |
+| 动态刷新 | @RefreshScope + Bus | @RefreshScope | @RefreshScope（自动推送） |
+| 运维复杂度 | 高（需维护 Git + Bus） | 中（依赖 Consul 集群） | 低（自带管理界面） |
+
+### 17.2 Nacos Config 动态刷新原理
+
+```mermaid
+sequenceDiagram
+    participant A as 应用
+    participant N as Nacos Server
+    participant C as 配置变更
+
+    A->>N: 长轮询注册监听
+    C->>N: 配置修改（控制台/API）
+    N->>A: 推送配置变更通知
+    A->>A: @RefreshScope 重新注入
+    Note over A: 新配置立即生效
+```
+
+### 17.3 Spring Cloud Stream 消息驱动 Binder 抽象
+
+```
+Binder 抽象层：
+  统一 API → Kafka Binder / RabbitMQ Binder / RocketMQ Binder
+
+  Producer:
+    output channel → Binder → Kafka/RabbitMQ/RocketMQ
+
+  Consumer:
+    Kafka/RabbitMQ/RocketMQ → Binder → input channel → @StreamListener
+
+  优势：
+    切换 MQ 只需改配置，代码零改动
+    支持 consumer group / partition / DLQ
+```
+
+### 17.4 CircuitBreaker（Resilience4j）核心组件
+
+| 组件 | 功能 | 配置 |
+|------|------|------|
+| CircuitBreaker | 熔断器（Closed/Open/HalfOpen） | slidingWindowSize/failureRateThreshold |
+| RateLimiter | 限流器（令牌桶） | limitForPeriod/limitRefreshPeriod |
+| Retry | 重试（指数退避） | maxAttempts/waitDuration |
+| Bulkhead | 隔离器（信号量/线程池） | maxConcurrentCalls |
+| TimeLimiter | 超时控制 | timeoutDuration |
+
+### 17.5 微服务间通信模式对比
+
+| 模式 | 协议 | 延迟 | 吞吐 | 适用场景 |
+|------|------|------|------|----------|
+| HTTP/REST | HTTP/JSON | 中 | 中 | 通用、跨语言 |
+| gRPC | HTTP/2 + Protobuf | 低 | 高 | 高性能内部调用 |
+| 异步MQ | Kafka/RocketMQ | 高 | 极高 | 解耦、削峰、事件驱动 |
+| Feign+LB | HTTP + Ribbon | 中 | 中 | Spring 生态标准 |
+| Dubbo RPC | TCP 二进制 | 低 | 高 | Java 体系高性能 RPC |
+
+```
+选型决策：
+  同步调用 → gRPC（性能优先）或 Feign（简单优先）
+  异步解耦 → MQ（Kafka/RocketMQ）
+  跨语言 → HTTP/REST 或 gRPC
+  高吞吐 → gRPC（多路复用）或 MQ
+```
+
+### 17.6 Spring Cloud Gateway 路由谓词与过滤器
+
+| 说明 | 参数 |
+|------|------|
+| Path | Path=/api/\*\* |
+| Header | Header=X-Tenant, \d+ |
+| Method | Method=GET,POST |
+| Query | Query=name, zhangsan |
+| Host | Host=\*\*.example.com |
+| Weight | Weight=group1, 80 |
+| After/Before/Between | 时间窗口灰度 |
+
+```yaml
+# Gateway 路由 + 限流配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+            - Weight=group1, 90
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+            - name: CircuitBreaker
+              args:
+                name: orderCB
+                fallbackUri: forward:/fallback
+```
+
+## 十八、与其他板块的关系
 
 - Spring Cloud Gateway 见「[Spring Cloud Gateway](../基础知识/中间件/SpringCloudGateway.md)」；
 - Nacos 源码见「[源码系列/Nacos](../源码系列/Nacos.md)」；

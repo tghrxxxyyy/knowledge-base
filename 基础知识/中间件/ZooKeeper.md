@@ -801,7 +801,116 @@ Step 5: 测试读写
   6. 下线 ZK 集群
 ```
 
-## 十三、与其他板块的关系
+## 十三、ZAB 协议详解与一致性保障
+
+### 13.1 ZAB 协议核心流程
+
+```
+ZAB（ZooKeeper Atomic Broadcast）协议：
+
+  1. Leader Election（选举）
+    - FastLeaderElection（快速选举）
+    - 每个节点广播 (myId, zxid) 投票
+    - 获得 > n/2 票数 → 成为 Leader
+
+  2. Discovery（发现）
+    - Leader 收集所有 Follower 的 epoch
+    - 确定最新的 epoch + 1 作为新 epoch
+
+  3. Synchronization（同步）
+    - Leader 将最新数据同步给 Follower
+    - Follower 更新本地数据树
+
+  4. Broadcast（广播）
+    - Leader 接收客户端写请求
+    - 生成 proposal（zxid = epoch + counter）
+    - 广播给所有 Follower
+    - Follower 发送 ACK
+    - Leader 收到 > n/2 ACK → 提交
+```
+
+### 13.2 Watcher 事件监听机制
+
+| 事件类型 | 触发条件 | 典型场景 |
+|----------|----------|----------|
+| NodeCreated | 节点创建 | 配置项上线 |
+| NodeDeleted | 节点删除 | 配置项下线 |
+| NodeDataChanged | 数据变更 | 配置值更新 |
+| NodeChildrenChanged | 子节点变化 | 服务注册/下线 |
+
+```
+Watcher 机制特点：
+  一次性触发：Watch 触发后需重新注册（4.0+ 可选永久监听）
+  事件有序：所有 Watch 事件串行通知
+  轻量级：只通知事件类型，不含详细数据
+  客户端 Watch → 服务端 WatchTable → 事件触发 → 回调处理
+
+  Curator 封装（推荐使用）：
+    NodeCache → 监听单个节点
+    PathChildrenCache → 监听子节点
+    TreeCache → 监听整棵子树
+```
+
+### 13.3 Curator 分布式锁使用指南
+
+| 锁类型 | 类名 | 语义 | 使用场景 |
+|--------|------|------|----------|
+| 排他锁 | InterProcessMutex | 独占访问 | 共享资源保护 |
+| 可重入锁 | InterProcessMutex | 同一线程可多次获取 | 嵌套锁 |
+| 读写锁 | InterProcessReadWriteLock | 读共享/写独占 | 读多写少 |
+| 节段锁 | InterProcessSemaphoreV2 | 信号量控制并发 | 连接池限制 |
+| 临时锁 | LeaderLatch | 领导者选举 | 主节点选举 |
+
+```java
+// Curator 分布式锁使用示例
+InterProcessMutex lock = new InterProcessMutex(client, "/locks/resource");
+if (lock.acquire(10, TimeUnit.SECONDS)) {
+    try {
+        // 业务逻辑（线程安全）
+        doSomething();
+    } finally {
+        lock.release();
+    }
+}
+```
+
+### 13.4 ZooKeeper 作为配置中心
+
+```
+配置中心方案：
+  ZK 存储：/config/app1/db.url, /config/app1/db.password
+  配置变更：监听子节点事件 → 重新加载配置
+  优势：一致性、持久化、Watcher 通知
+  劣势：不适合大量配置（ZNode 有大小限制）
+
+  推荐替代方案：
+    Nacos：更适合配置管理（支持动态推送、灰度发布）
+    Apollo：更适合应用配置管理（版本管理、灰度）
+    Consul：更适合服务发现+配置
+```
+
+### 13.5 ZooKeeper 集群动态扩容
+
+| 步骤 | 操作 | 命令/工具 |
+|------|------|----------|
+| 1. 添加新节点 | 部署新实例 | zkServer.sh start |
+| 2. 更新配置 | 修改 zoo.cfg | server.N=ip:port:port |
+| 3. 通知所有节点 | 逐个执行 | zkServer.sh restart |
+| 4. 验证 | 查看集群状态 | echo mntr \| nc localhost 2181 |
+
+### 13.6 ZooKeeper 与 Consul 选型评估
+
+| 维度 | ZooKeeper | Consul |
+|------|-----------|--------|
+| 一致性协议 | ZAB（CP） | Raft（CP） |
+| 服务发现 | 手动实现（临时节点） | 内置健康检查+DNS |
+| 配置管理 | Watcher 机制 | KV Store + Watch |
+| 健康检查 | 不原生支持 | HTTP/TCP/gRPC 检查 |
+| 多数据中心 | 不支持 | 原生支持 |
+| 运维工具 | 四字命令 | Web UI + CLI |
+| 语言 | Java | Go |
+
+## 十四、与其他板块的关系
 
 - 和「**源码系列/zookeeper**」：本篇讲协议、场景与生产；源码篇有常见 ZK 面试题深挖。
 - 和「**基础知识/中间件/etcd**」：同是 CP 协调服务，etcd 是云原生替代者（对比见上）。

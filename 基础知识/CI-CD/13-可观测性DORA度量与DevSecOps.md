@@ -1284,7 +1284,127 @@ flowchart TB
 | 关联分析 | 指标-日志-追踪关联 | 快速定位 |
 | 成本优化 | 分层存储 | 降低存储成本 |
 
-## 本篇补充 Checklist
+## 变更失败率深度分析
+
+### 变更失败率（CFR）计算与优化
+
+| 指标 | 计算方式 | 目标值 | 改进方向 |
+|------|----------|--------|----------|
+| 变更失败率 | 失败部署/总部署 | < 5% | 自动化回滚、灰度发布 |
+| 平均恢复时间 | 总恢复时间/故障次数 | < 1 小时 | 告警自动化、Runbook |
+| 变更失败频率 | 月失败次数 | < 2 次 | 代码审查、自动化测试 |
+| 回滚成功率 | 成功回滚/总回滚 | > 95% | 蓝绿部署、快速回滚 |
+
+```
+变更失败率归因分析：
+  代码缺陷 → 单元测试覆盖率不足 → 提升测试覆盖率
+  配置错误 → 配置管理混乱 → GitOps 配置管理
+  环境差异 → 开发/生产环境不一致 → 容器化 + IaC
+  依赖问题 → 第三方组件漏洞 → SCA 扫描
+  人为操作 → 手动部署 → CI/CD 自动化
+```
+
+### Lead Time 拆解与优化
+
+```
+Lead Time = 代码提交 → 生产部署完成
+
+  拆解：
+    开发时间：编码 + 代码审查
+    构建时间：编译 + 打包 + 测试
+    部署时间：部署 + 验证
+    等待时间：环境准备 + 人工审批
+
+  优化：
+    开发时间 → 代码审查自动化、PR 模板
+    构建时间 → 增量构建、并行测试
+    部署时间 → 蓝绿部署、Canary
+    等待时间 → 自动化审批流
+
+  目标：
+    Elite：小于 1 小时
+    High：1 天 ~ 1 周
+    Medium：1 周 ~ 1 月
+    Low：大于 1 月
+```
+
+### SAST/DAST/SCA 安全集成
+
+| 工具类型 | 工具示例 | 集成阶段 | 扫描对象 |
+|----------|----------|----------|----------|
+| SAST | SonarQube、Checkmarx | 代码提交/PR | 源代码 |
+| DAST | OWASP ZAP、Burp Suite | 预发布/生产 | 运行时应用 |
+| SCA | Snyk、OWASP Dep-Check | 构建阶段 | 依赖组件 |
+| IaC 扫描 | Checkov、Terrascan | IaC 提交 | Terraform/CloudFormation |
+| Secret 扫描 | GitLeaks、TruffleHog | Git 提交 | 代码中的密钥 |
+
+```yaml
+# GitLab CI 安全扫描配置
+stages:
+  - security-sast
+  - security-dast
+
+sast:
+  stage: security-sast
+  image: sonarqube:latest
+  script:
+    - sonar-scanner -Dsonar.projectKey=myapp
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+
+dependency_scanning:
+  stage: security-sast
+  image: snyk/snyk:latest
+  script:
+    - snyk test --all-projects
+
+dast:
+  stage: security-dast
+  image: owasp/zap2docker-stable
+  script:
+    - zap-baseline.py -t https://staging.example.com
+```
+
+### 混沌工程实验框架
+
+| 实验类型 | 实验内容 | 工具 | 影响范围 |
+|----------|----------|------|----------|
+| Pod 故障 | 随机 Kill Pod | Chaos Mesh | 单 Pod |
+| 网络故障 | 延迟/丢包/分区 | Litmus Chaos | 服务间网络 |
+| 磁盘故障 | 磁盘填满/只读 | Chaos Mesh | 单节点 |
+| DNS 故障 | DNS 解析失败 | Litmus Chaos | 集群级 |
+| 时钟偏移 | 系统时钟跳变 | Chaos Mesh | 单节点 |
+
+```yaml
+# Chaos Mesh 实验示例
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: api-latency
+spec:
+  action: delay
+  mode: all
+  selector:
+    labelSelectors:
+      app: api-server
+  delay:
+    latency: "200ms"
+    correlation: "50"
+    jitter: "50ms"
+  duration: "5m"
+```
+
+### DORA 指标与业务价值映射
+
+| DORA 指标 | 业务价值 | 量化影响 |
+|-----------|----------|----------|
+| 部署频率 | 快速响应市场 | 每日部署 → 功能上线速度提升 30x |
+| Lead Time | 缩短交付周期 | 1天交付 → 客户满意度提升 40% |
+| 变更失败率 | 降低线上事故 | 5% → 1% → 事故成本降低 80% |
+| 恢复时间 | 提升系统韧性 | 1小时 → 5分钟 → SLA 提升至 99.99% |
+
+### 本篇补充 Checklist
 
 - [ ] DORA 四指标从 CI/Git/Incident 自动抽取，Grafana 看板按团队分组。
 - [ ] SLI/SLO 接入发布门禁，跌破阈值自动暂停/回滚。

@@ -945,6 +945,67 @@ graph TD
 
 ---
 
+## YARN vs K8s 调度器对比
+
+| 维度 | YARN Scheduler | K8s Scheduler |
+|------|----------------|---------------|
+| 资源模型 | vcore + memory | CPU/Memory/GPU/自定义 |
+| 队列 | Capacity/Fair | ResourceQuota + LimitRange |
+| 调度策略 | FIFO/Fair/Capacity | Priority + Preemption |
+| 弹性 | 无原生支持 | HPA/KEDA/VPA |
+| 优先级 | Priority Queue | PriorityClass |
+| 抢占 | 有（Queue 内） | 有（跨 Namespace） |
+| GPU | 支持 | 支持（更成熟） |
+| 状态 | RM 内存 | etcd（声明式） |
+
+## K8s Scheduler Extender 扩展
+
+### Filter / Prioritize / Bind
+
+```
+Scheduler Extender 机制：
+  Filter：排除不满足条件的节点
+  Prioritize：给节点打分（自定义权重）
+  Bind：绑定 Pod 到节点（可覆盖默认）
+
+扩展点示例：
+  1. 资源预留：Filter 排除资源不足节点
+  2. 数据本地化：Prioritize 优先调度到数据所在节点
+  3. 硬件亲和：Prioritize 优先调度到 GPU/SSD 节点
+  4. 自定义调度：Bind 完全接管调度决策
+
+对比 Scheduling Framework（原生扩展）：
+  Extender：HTTP 调用（延迟高）
+  Framework：插件式（延迟低）
+  推荐：新项目用 Framework，旧项目用 Extender
+```
+
+## 资源模型深入对比
+
+### vcore vs CPU / memory vs memory
+
+```
+YARN 资源模型：
+  vcore：虚拟 CPU 核（可超售）
+  memory：MB 单位
+  特点：可超售（10 vcore 实际 8 核）
+  适用：批处理（MapReduce/Spark）
+
+K8s 资源模型：
+  CPU：毫核（1000m = 1 核，不可超售）
+  memory：字节单位
+  特点：不可超售（request ≤ limit）
+  适用：在线服务（微服务）
+
+混合调度（K8s 上跑批处理）：
+  方案 1：Volcano（批处理调度器）
+    支持 Gang Scheduling（全部就绪才启动）
+    支持 Queue（类 YARN 队列）
+  方案 2：Spark on K8s
+    Spark Driver/Executor 作为 Pod
+    动态分配资源
+```
+
 ## 十九、与其他板块的关系
 
 - 数据采集见「[03-数据采集与同步](03-数据采集与同步.md)」；

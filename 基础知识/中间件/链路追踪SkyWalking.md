@@ -602,7 +602,171 @@ Istio + SkyWalking：
 
 ---
 
-## 十七、与其他板块的关系（扩展）
+## SkyWalking OAP 集群部署
+
+### 单机 / 集群 / 存储选型
+
+```
+OAP 部署模式：
+
+单机模式（开发）：
+  一个 OAP 进程
+  H2 内存数据库
+  适用：开发/测试
+
+集群模式（生产）：
+  2+ OAP 节点
+  选举 Leader（ZK/etcd）
+  数据分片（Sharding）
+
+存储选型：
+  Elasticsearch：最成熟（推荐）
+  MySQL/PostgreSQL：小规模
+  BanyanDB：SkyWalking 原生存储（推荐新项目）
+
+集群配置：
+  # application.yml
+  cluster:
+    selector: ${SW_CLUSTER:standalone}
+    zookeeper:
+      nameSpace: /skywalking
+      hostPort: zookeeper:2181
+      enableSniffer: true
+
+  storage:
+    selector: ${SW_STORAGE:h2}
+    elasticsearch:
+      nameSw: ${SW_STORAGE_ES_CLUSTER_NAME:elasticsearch}
+      clusterNodes: ${SW_STORAGE_ES_CLUSTER_NODES:localhost:9200}
+```
+
+## SkyWalking 告警配置
+
+### 告警规则 / 通知渠道 / SLO 联动
+
+```yaml
+# 告警规则配置
+# alarm-settings.yml
+rules:
+  service_resp_time_rule:
+    metrics-name: service_resp_time
+    op: '>='
+    threshold: 1000
+    period: 5
+    count: 3
+    silence-period: 10
+    message: Service {name} response time is too high
+
+  service_sla_rule:
+    metrics-name: service_sla
+    op: '<'
+    threshold: 99
+    period: 5
+    count: 2
+    message: Service {name} SLA is too low
+
+  endpoint_resp_time_rule:
+    metrics-name: endpoint_resp_time
+    op: '>='
+    threshold: 2000
+    period: 5
+    count: 3
+    message: Endpoint {name} response time is too high
+
+# 通知渠道
+webhooks:
+  - url: http://alertmanager:9093/api/v1/alerts
+  - url: http://dingtalk-webhook:8080/send
+```
+
+| 告警规则 | 指标 | 阈值 | 说明 |
+|----------|------|------|------|
+| service_resp_time | 服务响应时间 | > 1s | 慢服务 |
+| service_sla | 服务可用性 | < 99% | 可用性下降 |
+| endpoint_resp_time | 端点响应时间 | > 2s | 慢端点 |
+| service_instance_resp_time | 实例响应时间 | > 1s | 慢实例 |
+
+## SkyWalking 日志关联
+
+### traceId 注入 / 日志格式 / ELK 集成
+
+```
+日志关联配置：
+
+1. Logback 配置
+  <encoder>
+    <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - [%tid] - %msg%n</pattern>
+  </encoder>
+
+  %tid → traceId（SkyWalking Agent 自动注入）
+
+2. Log4j2 配置
+  <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - [%X{tid}] - %msg%n"/>
+
+  %X{tid} → traceId（MDC 注入）
+
+3. ELK 集成
+  日志中包含 traceId
+  Kibana 中按 traceId 搜索
+  与 SkyWalking UI 关联（点击 traceId 跳转）
+```
+
+## SkyWalking Istio 集成
+
+### Mesh 探针 / Sidecar 采集
+
+```
+Istio 集成：
+
+1. 安装 SkyWalking OAP（支持 Istio）
+  helm install skywalking skywalking/skywalking \
+    --set oap.replicas=2 \
+    --set oap.env.SW_ENVOY_METRIC_ALS_HOST=istio-telemetry \
+    --set oap.env.SW_ENVOY_METRIC_ALS_PORT=18090
+
+2. 配置 Istio Telemetry
+  apiVersion: telemetry.istio.io/v1alpha1
+  kind: Telemetry
+  metadata:
+    name: skywalking
+  spec:
+    accessLogging:
+      - providers:
+          - name: skywalking
+
+3. 效果：
+  Istio Sidecar 自动上报指标到 SkyWalking
+  服务拓扑自动发现
+  流量指标自动采集
+```
+
+## SkyWalking Agent 开销
+
+### CPU / 内存 / 延迟影响
+
+| 指标 | 开销 | 说明 |
+|------|------|------|
+| CPU | < 1% | 异步上报（不影响业务线程） |
+| 内存 | 50-200MB | 取决于类数量 |
+| 延迟 | < 1ms | 字节码增强（同步方法） |
+| GC | 轻微 | Agent 对象分配 |
+
+```
+Agent 开销优化：
+  1. 按需加载插件
+    agent.config: plugin.mount=plugins/,activations/
+
+  2. 采样率调整
+    agent.config: agent.sample_n_per_3_secs=10
+    → 每 3 秒采样 10 个请求
+
+  3. 禁用不需要的插件
+    agent.config: plugin.woocommerce.disabled=true
+
+  4. 预编译 Agent
+    使用 SkyWalking Agent 预构建镜像
+    → 减少运行时字节码增强开销
+```
 
 - 和「**基础知识/中间件/ELK日志体系**」：链路 + 日志双剑合璧（traceId 关联），排障黄金组合。
 - 和「**云原生/可观测性**」：可观测性三支柱中，链路由 SkyWalking/Jaeger/OTel 承载，与 Prometheus（指标）、Loki/ELK（日志）并列。

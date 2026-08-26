@@ -943,6 +943,255 @@ spec:
       app: traefik
 ```
 
+## Traefik IngressRoute CRD 详解
+
+### HTTP / TCP / UDP 路由规则
+
+```yaml
+# HTTP 路由
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: my-app
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`app.example.com`) && PathPrefix(`/api`)
+      kind: Rule
+      services:
+        - name: api-service
+          port: 8080
+      middlewares:
+        - name: rate-limit
+        - name: jwt-auth
+    - match: Host(`app.example.com`)
+      kind: Rule
+      services:
+        - name: frontend-service
+          port: 3000
+  tls:
+    certResolver: letsencrypt
+
+# TCP 路由
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: mysql-route
+spec:
+  entryPoints:
+    - tcp-mysql
+  routes:
+    - match: HostSNI(`mysql.example.com`)
+      services:
+        - name: mysql-service
+          port: 3306
+
+# UDP 路由
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: dns-route
+spec:
+  entryPoints:
+    - dns
+  routes:
+    - services:
+        - name: dns-service
+          port: 53
+```
+
+## Middleware 链配置
+
+### Chain / 组合
+
+```yaml
+# Chain 中间件链
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-chain
+spec:
+  chain:
+    middlewares:
+      - name: rate-limit
+      - name: ip-whitelist
+      - name: jwt-auth
+      - name: headers
+
+# 内置中间件
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+spec:
+  rateLimit:
+    average: 100
+    burst: 200
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: jwt-auth
+spec:
+  forwardAuth:
+    address: "http://auth-service:8080/verify"
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-User-Id
+      - X-User-Role
+```
+
+| 中间件 | 功能 | 配置要点 |
+|--------|------|----------|
+| rateLimit | 限流 | average/burst |
+| ipWhitelist | IP 白名单 | sourceRange |
+| basicAuth | 基本认证 | secret |
+| headers | 安全头 | 自定义响应头 |
+| compress | 压缩 | excludes/contentType |
+| circuitBreaker | 熔断 | expression/checkPeriod |
+
+## Gateway API 支持
+
+```yaml
+# Gateway API（K8s 标准网关 API）
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: traefik-gateway
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: web
+      protocol: HTTP
+      port: 80
+    - name: websecure
+      protocol: HTTPS
+      port: 443
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app-route
+spec:
+  parentRefs:
+    - name: traefik-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-service
+          port: 8080
+```
+
+## Traefik Dashboard 配置
+
+```yaml
+# 启用 Dashboard
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: dashboard
+spec:
+  entryPoints:
+    - traefik
+  routes:
+    - match: Host(`traefik.example.com`)
+      kind: Rule
+      services:
+        - name: api@internal
+  # 安全：只允许内网访问
+  tls: {}
+
+# 或通过文件配置
+[api]
+  dashboard = true
+  insecure = false  # 生产关闭
+
+[entryPoints.traefik]
+  address = ":8080"
+```
+
+## 负载均衡策略
+
+### Weighted Round Robin / Mirroring
+
+```yaml
+# 加权负载均衡
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: weighted-lb
+spec:
+  weighted:
+    services:
+      - name: service-v1
+        port: 8080
+        weight: 90
+      - name: service-v2
+        port: 8080
+        weight: 10
+
+# 流量镜像（影子测试）
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: traffic-mirror
+spec:
+  mirroring:
+    name: service-v1
+    port: 8080
+    mirrors:
+      - name: service-v2
+        port: 8080
+        percentage: 10
+```
+
+| 策略 | 配置 | 说明 |
+|------|------|------|
+| Round Robin | 默认 | 轮询 |
+| Weighted | weight 字段 | 加权轮询 |
+| Mirroring | mirroring | 流量镜像 |
+| Sticky Session | sticky | 会话保持 |
+
+## TLS 证书管理
+
+### Let's Encrypt / 自定义证书 / TLS Store
+
+```yaml
+# Let's Encrypt 自动证书
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: default
+spec:
+  minVersion: VersionTLS12
+  cipherSuites:
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+
+# ACME 配置
+[certificatesResolvers.letsencrypt.acme]
+  email = "admin@example.com"
+  storage = "/acme.json"
+  [certificatesResolvers.letsencrypt.acme.tlsChallenge]
+  # 或 [certificatesResolvers.letsencrypt.acme.httpChallenge]
+  # 或 [certificatesResolvers.letsencrypt.acme.dnsChallenge]
+
+# TLS Store（默认证书）
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+spec:
+  defaultCertificate:
+    secret: default-tls-secret
+```
+
 ## 十二、与其他板块的关系
 
 

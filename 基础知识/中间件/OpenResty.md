@@ -1144,4 +1144,249 @@ access_by_lua_block {
 - 服务网格（边车替代网关场景）见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；
 - 网关对比见「[API 网关](./API网关.md)」。
 
+## OpenResty 限流库
+
+### lua-resty-limit-traffic / 多维度限流
+
+```
+lua-resty-limit-traffic 库：
+
+限流算法：
+  1. fixedwindow：固定窗口（简单）
+  2. slidinglog：滑动日志（精确）
+  3. limitreq：漏桶（平滑）
+
+使用示例：
+  local limit_req = require "resty.limit.req"
+
+  -- 固定窗口限流（每秒 100 请求）
+  local lim, err = limit_req.new("my_store", 100, 200)
+  -- 100 = rate, 200 = burst
+
+  local key = ngx.var.remote_addr
+  local delay, err = lim:incoming(key, true)
+  if not delay then
+    if err == "rejected" then
+      ngx.exit(503)
+    end
+    ngx.log(ngx.ERR, err)
+    return
+  end
+
+  -- delay > 0 → 需要延迟处理
+  if delay > 0 then
+    ngx.sleep(delay)
+  end
+
+多维度限流：
+  -- 按 IP 限流
+  local ip_limit = limit_req.new("ip_store", 100, 200)
+  -- 按用户限流
+  local user_limit = limit_req.new("user_store", 1000, 2000)
+  -- 按 API 限流
+  local api_limit = limit_req.new("api_store", 500, 1000)
+```
+
+## OpenResty HTTP 客户端
+
+### lua-resty-http / 连接池 / 超时
+
+```lua
+-- lua-resty-http 使用
+local http = require "resty.http"
+local httpc = http.new()
+
+-- 设置超时
+httpc:set_timeout(5000)  -- 5 秒
+
+-- 连接池
+httpc:connect("api.example.com", 443)
+httpc:set_keepalive(60000, 100)  -- 60 秒，100 个连接
+
+-- 发送请求
+local res, err = httpc:request({
+  method = "POST",
+  path = "/api/data",
+  body = ngx.var.request_body,
+  headers = {
+    ["Content-Type"] = "application/json",
+    ["Authorization"] = "Bearer " .. token
+  }
+})
+
+if not res then
+  ngx.log(ngx.ERR, "request failed: ", err)
+  ngx.exit(502)
+  return
+end
+
+-- 处理响应
+if res.status == 200 then
+  ngx.say(res.body)
+else
+  ngx.exit(res.status)
+end
+```
+
+## OpenResty JWT 验证
+
+### lua-resty-jwt / Token 校验
+
+```lua
+-- JWT 验证
+local jwt = require "resty.jwt"
+
+-- 验证 JWT
+local function verify_jwt(token)
+  local jwt_obj = jwt:verify("secret-key", token)
+  
+  if not jwt_obj.verified then
+    return false, jwt_obj.reason
+  end
+  
+  -- 检查过期
+  if jwt_obj.payload.exp < ngx.time() then
+    return false, "token expired"
+  end
+  
+  return true, jwt_obj.payload
+end
+
+-- 使用
+local auth_header = ngx.req.get_headers()["Authorization"]
+if not auth_header then
+  ngx.exit(401)
+  return
+end
+
+local token = string.match(auth_header, "Bearer%s+(.+)")
+local ok, payload = verify_jwt(token)
+
+if not ok then
+  ngx.exit(401)
+  return
+end
+
+-- 注入用户信息到请求头
+ngx.req.set_header("X-User-Id", payload.sub)
+ngx.req.set_header("X-User-Role", payload.role)
+```
+
+## OpenResty 日志
+
+### 自定义日志格式 / 结构化日志
+
+```lua
+-- 自定义日志格式
+-- nginx.conf
+log_format json_log escape=json '{'
+  '"time":"$time_iso8601",'
+  '"remote_addr":"$remote_addr",'
+  '"request":"$request",'
+  '"status":$status,'
+  '"body_bytes_sent":$body_bytes_sent,'
+  '"request_time":$request_time,'
+  '"upstream_response_time":"$upstream_response_time",'
+  '"trace_id":"$http_x_trace_id",'
+  '"user_id":"$http_x_user_id"'
+'}';
+
+access_log /var/log/nginx/access.log json_log;
+
+-- Lua 日志
+local cjson = require "cjson"
+
+local log_data = {
+  time = ngx.now(),
+  level = "INFO",
+  message = "request processed",
+  trace_id = ngx.var.http_x_trace_id,
+  user_id = ngx.var.http_x_user_id,
+  request_time = ngx.var.request_time
+}
+
+ngx.log(ngx.INFO, cjson.encode(log_data))
+```
+
+## OpenResty WAF 模式
+
+### SQL 注入 / XSS / CC 攻击防护
+
+```lua
+-- WAF 规则
+local waf = {}
+
+-- SQL 注入检测
+function waf.check_sql_injection(input)
+  local patterns = {
+    "union.*select",
+    "insert.*into",
+    "delete.*from",
+    "drop.*table",
+    "update.*set",
+    "' or '1'='1",
+    "' or ''='",
+    "1' or '1'='1"
+  }
+  
+  input = string.lower(input)
+  for _, pattern in ipairs(patterns) do
+    if string.match(input, pattern) then
+      return true
+    end
+  end
+  return false
+end
+
+-- XSS 检测
+function waf.check_xss(input)
+  local patterns = {
+    "<script",
+    "javascript:",
+    "onload=",
+    "onerror=",
+    "onclick="
+  }
+  
+  input = string.lower(input)
+  for _, pattern in ipairs(patterns) do
+    if string.match(input, pattern) then
+      return true
+    end
+  end
+  return false
+end
+
+-- CC 攻击防护（连接频率限制）
+function waf.check_cc_attack()
+  local limit_req = require "resty.limit.req"
+  local lim, err = limit_req.new("cc_store", 10, 20)
+  
+  local key = ngx.var.remote_addr
+  local delay, err = lim:incoming(key, true)
+  
+  if not delay then
+    if err == "rejected" then
+      ngx.exit(503)
+      return true
+    end
+  end
+  return false
+end
+```
+
+## Nginx 性能对比
+
+### OpenResty vs Nginx vs Envoy
+
+| 特性 | Nginx | OpenResty | Envoy |
+|------|-------|-----------|-------|
+| 扩展性 | 编译模块 | Lua 脚本 | Wasm/Lua |
+| 动态配置 | reload | cosocket | xDS |
+| 学习曲线 | 低 | 中 | 高 |
+| 性能 | 极高 | 高 | 高 |
+| 适用 | 静态/反向代理 | API 网关/WAF | 服务网格 |
+| 社区 | 大 | 中 | 大 |
+| 配置 | nginx.conf | nginx.conf + Lua | API/JSON |
+
 > 一句话：**OpenResty = Nginx 阶段模型（rewrite/access/content...）+ LuaJIT（worker 内协程）+ cosocket（异步 IO 不阻塞事件循环）+ 共享内存（跨 worker 状态）——生产要点：禁阻塞 IO、配超时连接池、共享内存容量规划、阶段职责清晰**。

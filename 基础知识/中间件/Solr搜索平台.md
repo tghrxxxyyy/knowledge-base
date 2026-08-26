@@ -901,7 +901,89 @@ DC1 (北京) → CDCR → DC2 (上海)
 
 ---
 
-## 十二、与其他板块的关系（扩展）
+## 十二、SolrCloud 分片管理与搜索 API
+
+### SolrCloud 分片策略
+
+| 策略 | 配置 | 适用场景 |
+|------|------|----------|
+| 哈希分片 | numShards=3 | 均匀分布 |
+| 路由分片 | router.name=compositeId | 按业务分片 |
+| 自定义分片 | router.name=implicit | 精确控制 |
+
+### Solr Stream API 实时搜索
+
+```json
+// Solr Stream API 查询
+{
+  "stream": {
+    "q": "*:*",
+    "filter": "author:张三",
+    "sort": "create_time desc",
+    "facet": "category",
+    "limit": 20
+  }
+}
+```
+
+### Solr 缓存策略
+
+| 缓存类型 | 用途 | 调优建议 |
+|----------|------|----------|
+| filterCache | 过滤器缓存 | size=10000, autowarmCount=1000 |
+| queryResultCache | 查询结果缓存 | size=5000, autowarmCount=500 |
+| documentCache | 文档缓存 | size=50000 |
+| userValueCache | 用户自定义缓存 | 按需配置 |
+
+### Solr DIH 数据导入
+
+```xml
+<!-- DataImportHandler 配置 -->
+<dataConfig>
+  <dataSource type="JdbcDataSource"
+              driver="com.mysql.jdbc.Driver"
+              url="jdbc:mysql://localhost:3306/db"
+              user="root" password="secret"/>
+  <document>
+    <entity name="item" query="SELECT * FROM items">
+      <field column="id" name="id"/>
+      <field column="name" name="name"/>
+      <field column="description" name="description"/>
+    </entity>
+  </document>
+</dataConfig>
+```
+
+### Solr vs Elasticsearch 搜索能力对比
+
+| 能力 | Solr | Elasticsearch |
+|------|------|---------------|
+| 全文检索 | ★★★★★ | ★★★★★ |
+| 分面搜索 | ★★★★★ | ★★★★☆ |
+| 地理搜索 | ★★★★☆ | ★★★★★ |
+| 聚合分析 | ★★★☆☆ | ★★★★★ |
+| 实时索引 | ★★★★☆ | ★★★★★ |
+| 运维工具 | ★★★☆☆ | ★★★★★ |
+| 中文分词 | ★★★★☆ | ★★★★★ |
+
+### 电商搜索案例
+
+```
+电商搜索架构：
+  用户输入 → 分词器（IKAnalyzer）→ Solr 查询
+    → 分面过滤（品牌/价格/分类）
+    → 排序（相关度/销量/价格）
+    → 高亮显示
+    → 搜索建议（Suggest）
+
+  性能优化：
+    - 热门查询缓存（queryResultCache）
+    - 过滤器预热（filterCache）
+    - 增量索引（DIH）
+    - 分片路由（CompositeIdRouter）
+```
+
+## 十三、与其他板块的关系（扩展）
 
 - Elasticsearch 见「[ES 体系](../ES体系.md)」；
 - Lucene 原理见「[搜索系统设计](../../场景设计/搜索系统设计.md)」；

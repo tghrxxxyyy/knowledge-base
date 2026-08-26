@@ -1142,3 +1142,168 @@ mqadmin updateTopic -b brokerAddr -t my-topic -n 16
 | 批量消费 | 提高消费效率 |
 | 延迟消息 | 订单超时/定时任务 |
 | 容量规划 | 按公式预留余量 |
+
+## 消息幂等消费
+
+### 去重表 / Redis 去重 / 数据库唯一约束
+
+```
+幂等消费方案：
+
+1. 数据库唯一约束
+  消息表：
+    CREATE TABLE msg_dedup (
+      msg_id VARCHAR(64) PRIMARY KEY,
+      status ENUM('PROCESSING','DONE') DEFAULT 'PROCESSING',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+  消费流程：
+    BEGIN
+    INSERT INTO msg_dedup(msg_id) VALUES('msg-123')
+    ON DUPLICATE KEY UPDATE status=status;
+    -- 如果插入成功 → 处理消息
+    -- 如果重复 → 跳过
+    COMMIT;
+
+2. Redis 去重
+  SETNX msg:msg-123 1 EX 3600
+  → 存在则跳过，不存在则处理
+
+3. 业务去重
+  订单号唯一（业务天然幂等）
+  支付回调（订单状态机保证）
+```
+
+## 延迟消息实现
+
+### RocketMQ 延迟级别 / RabbitMQ TTL / Redis ZSet
+
+| 方案 | 延迟精度 | 延迟范围 | 适用 |
+|------|----------|----------|------|
+| RocketMQ 延迟级别 | 秒级 | 1s-2h | 订单超时 |
+| RabbitMQ TTL | 毫秒级 | 任意 | 定时任务 |
+| Redis ZSet | 毫秒级 | 任意 | 高精度场景 |
+| 数据库定时扫描 | 秒级 | 任意 | 低频场景 |
+
+```java
+// RocketMQ 延迟消息
+producer.send(message, 3, TimeUnit.SECONDS);  // 延迟 3 秒
+producer.send(message, 10, TimeUnit.SECONDS); // 延迟 10 秒
+
+// RabbitMQ 延迟队列
+@Bean
+public Queue delayQueue() {
+    Map<String, Object> args = new HashMap<>();
+    args.put("x-dead-letter-exchange", "dlx.exchange");
+    args.put("x-message-ttl", 10000);  // 10 秒
+    return new Queue("delay.queue", true, false, false, args);
+}
+```
+
+## 消息 Correlation ID 传递
+
+### 链路追踪 / 请求关联 / 上下文透传
+
+```
+Correlation ID 作用：
+  关联请求-响应（异步场景）
+  链路追踪（traceId）
+  问题排查（按 ID 查完整链路）
+
+传递方式：
+  1. 消息属性
+    MessageBuilder
+      .setHeader("correlationId", "req-123")
+      .setHeader("traceId", "trace-456")
+      .build();
+
+  2. 消息体
+    {
+      "correlationId": "req-123",
+      "traceId": "trace-456",
+      "payload": { ... }
+    }
+
+  3. 消费端
+    @RabbitListener(queues = "my-queue")
+    public void consume(Message message) {
+        String correlationId = message.getMessageProperties()
+            .getHeader("correlationId");
+        // 处理消息
+    }
+```
+
+## MQ 积压扩容
+
+### 消费者扩容 / 分区扩容 / 应急方案
+
+```
+积压处理流程：
+
+1. 监控告警
+  积压数量 > 阈值
+  消费延迟 > 阈值
+
+2. 快速扩容
+  增加消费者实例
+  增加分区/队列（Kafka）
+  增加线程池
+
+3. 临时方案
+  跳过非关键消息
+  降级处理
+  紧急手动消费
+
+4. 根因分析
+  消费者代码 Bug
+  下游依赖超时
+  消息格式异常
+
+5. 恢复
+  修复问题
+  回放消息
+  确认积压清零
+```
+
+## 消息体大小对性能的影响
+
+| 消息大小 | 吞吐量 | 延迟 | 网络开销 | 建议 |
+|----------|--------|------|----------|------|
+| < 1KB | 高 | 低 | 低 | 小消息 |
+| 1-10KB | 中 | 中 | 中 | 正常范围 |
+| 10-100KB | 低 | 高 | 高 | 压缩或引用 |
+| > 100KB | 极低 | 极高 | 极高 | 避免大消息 |
+
+```
+大消息优化：
+  消息压缩（gzip/snappy/lz4）
+  引用模式（消息存 URL，正文存 OSS）
+  分片传输
+  异步拉取
+```
+
+## MQ 容量规划公式
+
+### 生产能力 / 消费能力 / 缓冲区
+
+```
+容量规划公式：
+
+生产能力：
+  生产 QPS = 消息量 / 时间窗口
+  生产带宽 = 消息大小 × 生产 QPS
+
+消费能力：
+  消费 QPS = 消费者数 × 单消费者 QPS
+  消费带宽 = 消息大小 × 消费 QPS
+
+缓冲区：
+  缓冲时间 = 消息保留时间（Kafka: 7 天）
+  缓冲空间 = 生产 QPS × 消息大小 × 保留时间
+
+规划建议：
+  1. 生产能力 = 预期峰值 × 2
+  2. 消费能力 = 预期峰值 × 1.5
+  3. 缓冲空间 = 预期峰值 × 消息大小 × 保留时间 × 2
+```

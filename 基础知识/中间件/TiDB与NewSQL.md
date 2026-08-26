@@ -1116,6 +1116,177 @@ TiDB 大事务限制：
 
 ---
 
+## TiDB Placement Rules 亲和性配置
+
+### 标签 / 存储引擎亲和 / 跨地域部署
+
+```
+Placement Rules：
+  控制 Region 在不同存储引擎/标签的分布
+  实现：热数据放 TiKV，分析数据放 TiFlash
+
+配置步骤：
+  1. 设置节点标签
+    tikv-1: zone=us-east-1, engine=tikv
+    tikv-2: zone=us-east-2, engine=tikv
+    tiflash-1: zone=us-east-1, engine=tiflash
+
+  2. 创建 Placement Policy
+    CREATE PLACEMENT POLICY hot_data PRIMARY_REGION="us-east-1"
+    FOLLOWERS=2 REGION_LABELS="zone";
+
+  3. 应用到表
+    CREATE TABLE logs (...) PLACEMENT POLICY=hot_data;
+
+  4. TiFlash 副本配置
+    ALTER TABLE logs SET TIFLASH REPLICA 2;
+    → 自动同步到 2 个 TiFlash 节点
+
+效果：
+  热数据 → TiKV（us-east-1）
+  分析查询 → TiFlash（列存加速）
+  跨地域 → Follower 在其他 zone
+```
+
+## TiFlash 列存同步机制
+
+### 异步复制 / Raft Learner / 一致性
+
+```
+TiFlash 同步机制：
+  TiKV → TiFlash 异步复制（Raft Learner）
+  通过 Raft Log 复制（非物理复制）
+  一致性：最终一致（异步）
+  延迟：通常 < 1 秒
+
+Raft Learner：
+  TiFlash 作为 Raft Learner（只读）
+  不参与选举（不投票）
+  只接收日志（异步）
+  保证数据一致性
+
+同步模式：
+  SYNCHRONOUS：等待 TiFlash 确认（慢）
+  ASYNCHRONOUS：不等待（默认）
+  SESSION：会话级别控制
+
+监控：
+  SHOW PLACEMENT;
+  → 查看副本分布和同步状态
+```
+
+## TiDB 运维命令速查
+
+### 日常运维 / 故障处理
+
+```sql
+-- 查看集群信息
+SELECT * FROM information_schema.tikv_store_status;
+SELECT * FROM information_schema.tiflash_store_status;
+
+-- 查看 Region 分布
+SHOW TABLE TABLE_REGIONS;
+
+-- 查看执行计划
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123;
+
+-- 热点 Region 调度
+SPLIT TABLE orders BY (user_id) 10;
+→ 手动分裂 Region
+
+-- 手动 compact
+COMPACT TABLE orders;
+
+-- 灾难恢复
+FLASHBACK TABLE orders TO TIMESTAMP '2026-01-15 10:00:00';
+```
+
+## TiDB MySQL 工具兼容性
+
+### 备份/导入/同步工具
+
+| 工具 | 兼容性 | 说明 |
+|------|--------|------|
+| mysqldump | 兼容 | 全量导出/导入 |
+| mydumper | 兼容 | 快速并行导出 |
+| TiDB Lightning | 原生 | 高速导入（推荐） |
+| TiCDC | 原生 | 增量同步到 MySQL/Kafka |
+| DM | 原生 | MySQL→TiDB 迁移 |
+| Canal | 兼容 | 增量订阅 |
+| Debezium | 兼容 | CDC 采集 |
+
+```
+迁移方案选择：
+  MySQL → TiDB（全量+增量）→ DM
+  TiDB → MySQL（同步）→ TiCDC
+  TiDB → Kafka（事件流）→ TiCDC
+  大文件导入 → TiDB Lightning（并行导入）
+```
+
+## TiDB 大事务处理
+
+### 拆分策略 / 超时控制
+
+```
+大事务问题：
+  单事务写入数据量 > 10GB → 性能下降
+  事务持锁时间长 → 冲突增多
+  GC 压力大 → 影响其他事务
+
+拆分策略：
+  1. 按用户/订单拆分
+    单事务只处理一个用户/订单
+    减小事务粒度
+
+  2. 批量提交
+    每 1000 条提交一次
+    降低单事务大小
+
+  3. 异步处理
+    写入消息队列（RocketMQ）
+    消费者批量处理
+
+超时控制：
+  -- tidb_gc_life_time=10m（GC 保留时间）
+  -- tidb_txn_entry_count_limit=300000（单事务 key 数限制）
+  -- tidb_txn_total_size_limit=104857600（单事务大小限制 100MB）
+```
+
+## TiDB 金融级应用案例
+
+### 强一致 / 分布式事务 / MySQL 兼容
+
+```
+金融场景：
+  账户余额（强一致）
+  转账交易（分布式事务）
+  对账报表（HTAP）
+
+TiDB 方案：
+  1. 强一致：Raft 协议保证（可调）
+   tidb_txn_mode=PESSIMISTIC（悲观锁，默认）
+   tidb_txn_mode=OPTIMISTIC（乐观锁，冲突少时快）
+
+  2. 分布式事务：Percolator 两阶段提交
+    Prewrite → Commit
+    保证 ACID（跨 Region）
+
+  3. HTAP：TiKV（OLTP）+ TiFlash（OLAP）
+    交易数据实时同步到 TiFlash
+    报表查询走 TiFlash（不阻塞交易）
+
+  4. MySQL 兼容：
+    应用零改动迁移
+    MySQL 驱动/ORM 直接使用
+    生态工具（Navicat/DBeaver）兼容
+
+效果：
+  从 MySQL 单机 → TiDB 分布式
+  QPS 从 1 万 → 10 万+
+  存储从 1TB → 10TB+
+  查询延迟：OLTP < 10ms，OLAP < 1s
+```
+
 ## 十一、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

@@ -1105,6 +1105,206 @@ accounts: {
   安全控制：敏感 Topic 只允许特定 Account 访问
 ```
 
+## NATS JetStream Stream 配置详解
+
+### AckPolicy / Retention / MaxAge
+
+```
+Stream 配置示例：
+  nats stream add orders \
+    --subjects="orders.*" \
+    --storage=file \
+    --replicas=3 \
+    --retention=limits \
+    --max-msgs=1000000 \
+    --max-bytes=10GB \
+    --max-age=72h \
+    --discard=old \
+    --acks=all
+
+AckPolicy 选项：
+  none：不需 ACK（广播场景）
+  all：所有副本 ACK（强一致）
+  quorum：多数副本 ACK（折中）
+
+Retention 选项：
+  limits：保留到 limits 配额
+  interest：消费者确认后删除
+  workqueue：消费后删除（队列模式）
+
+MaxAge 配置：
+  --max-age=72h → 超过 72 小时自动删除
+  --max-age=168h → 7 天保留（审计场景）
+```
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| replicas | 副本数 | 3（生产） |
+| retention | 保留策略 | limits（通用）/ interest（队列） |
+| max-msgs | 最大消息数 | 按业务量 |
+| max-age | 最大保留时间 | 72h（日志）/ 168h（审计） |
+| discard | 超限策略 | old（覆盖）/ new（拒绝） |
+| acks | ACK 策略 | all（强一致）/ quorum（折中） |
+
+## NATS Request-Reply 模式
+
+### 服务发现 + 超时 + 重试
+
+```
+Request-Reply 模式：
+  客户端发送请求到主题
+  服务端监听主题并回复
+  NATS 自动路由到可用服务
+
+特点：
+  1. 服务端可水平扩展（NATS 自动负载均衡）
+  2. 支持超时（inbox 超时自动取消）
+  3. 支持多服务端（队列组自动选一个回复）
+
+适用场景：
+  同步查询（用户信息/订单状态）
+  RPC 调用（替代 HTTP/gRPC）
+  分布式任务分发
+```
+
+```go
+// Go Request-Reply 示例
+// 客户端
+nc, _ := nats.Connect("nats://localhost:4222")
+defer nc.Close()
+
+// 发送请求（5秒超时）
+resp, err := nc.Request("orders.query", []byte(`{"id":"123"}`), 5*time.Second)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Response: %s\n", resp.Data)
+
+// 服务端
+nc.Subscribe("orders.query", func(msg *nats.Msg) {
+    // 处理请求
+    result := processQuery(msg.Data)
+    msg.Respond(result)
+})
+```
+
+## NATS Leaf Node 部署
+
+### 边缘集群 / 混合云
+
+```
+Leaf Node 架构：
+  Hub Cluster（中心集群）：
+    3+ 节点
+    生产环境核心服务
+
+  Leaf Node（边缘节点）：
+    1-3 节点
+    边缘设备/分支机构
+    通过 Leafnode 协议连接 Hub
+
+混合云场景：
+  本地数据中心：Leaf Node
+  公云：Hub Cluster
+  通过 TLS 加密连接
+
+优势：
+  1. 边缘自治（断网时本地服务可用）
+  2. 统一消息（边缘数据汇总到中心）
+  3. 安全隔离（Leaf Node 只暴露必要主题）
+```
+
+```bash
+# Leaf Node 配置
+listen: 0.0.0.0:4223
+leafnodes {
+  remotes [
+    {
+      urls: ["nats://hub-server1:4222", "nats://hub-server2:4222"]
+      tls {
+        cert_file: "/etc/nats/leaf-cert.pem"
+        key_file: "/etc/nats/leaf-key.pem"
+      }
+    }
+  ]
+}
+```
+
+## NATS K8s 部署
+
+### Helm / Operator
+
+```yaml
+# NATS Helm Chart
+helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+helm install my-nats nats/nats \
+  --set cluster.enabled=true \
+  --set cluster.replicas=3 \
+  --set jetstream.enabled=true \
+  --set jetstream.fileStorage.size=10Gi
+
+# NATS Operator（生产推荐）
+apiVersion: nats.io/v1alpha2
+kind: NatsCluster
+metadata:
+  name: my-nats
+spec:
+  size: 3
+  version: "2.10"
+  jetstream:
+    enabled: true
+    fileStorage:
+      size: 10Gi
+      storageClassName: fast-ssd
+  pod:
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+```
+
+## NATS Account 隔离
+
+### 多租户 / 权限控制
+
+```
+Account 隔离：
+  每个 Account 独立的主题空间
+  Account 间默认完全隔离
+  通过 export/import 实现跨 Account 通信
+
+配置示例：
+  accounts: {
+    orders: {
+      users: [{user: order-svc, password: pass1}]
+      exports: [
+        {stream: "orders.public.>"}
+      ]
+    }
+    inventory: {
+      users: [{user: inv-svc, password: pass2}]
+      exports: [
+        {stream: "inventory.public.>"}
+      ]
+      imports: [
+        {stream: {account: orders, subject: "orders.public.>"}}
+      ]
+    }
+  }
+
+权限控制：
+  publish：允许发布的主题
+  subscribe：允许订阅的主题
+  deny：禁止的主题（白名单模式）
+```
+
+| 特性 | 说明 | 适用 |
+|------|------|------|
+| Account 隔离 | 独立主题空间 | 多租户 |
+| 权限控制 | publish/subscribe 白名单 | 安全 |
+| export/import | 跨 Account 通信 | 系统集成 |
+| JWT 认证 | 去中心化身份 | 大规模部署 |
+
 ## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；

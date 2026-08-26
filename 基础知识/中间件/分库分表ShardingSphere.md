@@ -1023,6 +1023,211 @@ rules:
           algorithm-expression: t_order_$->{order_id % 4}
 ```
 
+## ShardingSphere 分片算法详解
+
+### Hash / Range / Complex / Hint
+
+| 算法 | 配置 | 说明 | 适用 |
+|------|------|------|------|
+| Hash | sharding-count | 均匀分布 | 订单/用户 |
+| Range | range-sharding-key | 范围查询 | 日志/时序 |
+| Complex | sharding-columns | 多分片键 | 复杂路由 |
+| Hint | hint-manual-value | 强制路由 | 特殊场景 |
+
+```yaml
+# Hash 分片配置
+spring:
+  shardingsphere:
+    rules:
+      sharding:
+        tables:
+          orders:
+            actual-data-nodes: ds$->{0..1}.orders_$->{0..3}
+            table-strategy:
+              standard:
+                sharding-column: order_id
+                sharding-algorithm-name: orders-inline
+            database-strategy:
+              standard:
+                sharding-column: user_id
+                sharding-algorithm-name: db-inline
+        sharding-algorithms:
+          orders-inline:
+            type: INLINE
+            props:
+              algorithm-expression: orders_$->{order_id % 4}
+          db-inline:
+            type: INLINE
+            props:
+              algorithm-expression: ds$->{user_id % 2}
+```
+
+## ShardingSphere 读写分离组合
+
+### 主从分离 / 一主多从 / 负载均衡
+
+```
+读写分离 + 分片组合：
+
+写入流程：
+  写操作 → 路由到主库 → 按分片规则分片
+
+读取流程：
+  读操作 → 路由到从库 → 按分片规则分片
+  支持 Hint 指定走主库
+
+配置：
+  data-sources:
+    ds0:
+      master-data-source: ds0-master
+      slave-data-sources: ds0-slave-1,ds0-slave-2
+    ds1:
+      master-data-source: ds1-master
+      slave-data-sources: ds1-slave-1,ds1-slave-2
+
+负载均衡算法：
+  round_robin：轮询
+  random：随机
+  weight：权重（按从库性能配置）
+
+故障转移：
+  主库故障 → 自动切换到从库
+  需要配置检测 SQL（如 SELECT 1）
+```
+
+## ShardingSphere 分布式事务
+
+### XA / Seata AT / BASE
+
+| 模式 | 一致性 | 性能 | 适用 |
+|------|--------|------|------|
+| XA | 强一致 | 低 | 金融/支付 |
+| Seata AT | 最终一致 | 中 | 电商/业务 |
+| BASE | 最终一致 | 高 | 日志/统计 |
+
+```yaml
+# XA 事务配置
+spring:
+  shardingsphere:
+    props:
+      sql-show: true
+    rules:
+      transaction:
+        type: XA
+        provider-name: Atomikos
+
+# Seata AT 事务配置
+spring:
+  shardingsphere:
+    rules:
+      transaction:
+        type: BASE
+        props:
+          atomikos:
+            properties:
+              transactions:
+                default_timeout: 60000
+              transactions:
+                force-shutdown-on-transaction-timeout: true
+```
+
+## ShardingSphere-Proxy vs JDBC 模式
+
+### 架构对比 / 性能 / 运维
+
+| 特性 | ShardingSphere-JDBC | ShardingSphere-Proxy |
+|------|---------------------|----------------------|
+| 架构 | 客户端嵌入 | 独立代理 |
+| 延迟 | 无额外延迟 | 网络延迟 |
+| 多语言 | 仅 Java | 任意语言 |
+| 运维 | 需修改应用 | 独立运维 |
+| 连接池 | 应用管理 | 代理管理 |
+| 性能 | 高（直连） | 中（代理层） |
+
+```
+选型建议：
+  纯 Java + 性能优先 → JDBC 模式
+  多语言 + 运维友好 → Proxy 模式
+  K8s 部署 → Proxy 模式（Sidecar）
+  传统部署 → JDBC 模式（嵌入应用）
+```
+
+## ShardingSphere 数据加密
+
+### 脱敏 / 加密算法 / 透明查询
+
+```yaml
+# 加密配置
+spring:
+  shardingsphere:
+    rules:
+      encrypt:
+        tables:
+          users:
+            columns:
+              phone:
+                cipher: phone_cipher
+                plain: phone_plain
+              id_card:
+                cipher: id_card_cipher
+                plain: id_card_plain
+        encryptors:
+          phone_cipher:
+            type: AES
+            props:
+              aes-key-value: abcdef1234567890
+          id_card_cipher:
+            type: AES
+            props:
+              aes-key-value: abcdef1234567890
+
+# 效果：
+# 写入：明文 → 自动加密 → 存密文
+# 读取：密文 → 自动解密 → 返回明文
+# 查询：WHERE phone = '...' → 自动加密后查询
+```
+
+## ShardingSphere 性能调优参数
+
+### SQL 连接池 / 线程池 / 缓存
+
+```yaml
+# 性能调优配置
+spring:
+  shardingsphere:
+    props:
+      sql-show: true                    # 打印 SQL
+      check-table-metadata-enabled: false  # 关闭元数据检查
+      max-connections-size-per-query: 1    # 每查询连接数
+      executor-size: 16                     # 线程池大小
+      proxy-frontend-database-protocol-type: MySQL
+
+# 连接池配置
+spring:
+  shardingsphere:
+    datasource:
+      ds0:
+        hikari:
+          maximum-pool-size: 20
+          minimum-idle: 5
+          idle-timeout: 30000
+          connection-timeout: 30000
+
+# 缓存优化
+shardingsphere:
+  cache:
+    enabled: true
+    initial-capacity: 1024
+    maximum-size: 10000
+```
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| sql-show | false | true（开发） | 打印 SQL |
+| executor-size | 16 | CPU 核数 × 2 | 线程池 |
+| max-connections-size-per-query | 1 | 1-3 | 连接数 |
+| check-table-metadata-enabled | true | false（生产） | 元数据检查 |
+
 ## 十九、与其他板块的关系
 
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。

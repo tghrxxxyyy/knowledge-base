@@ -1222,4 +1222,111 @@ spec:
   总内存 = 3MB + 查询缓存
 ```
 
-## 二十一、与其他板块的关系
+## 二十一、VictoriaMetrics 集群架构与运维
+
+### 集群架构设计
+
+```
+VictoriaMetrics 集群架构：
+
+  vminsert：数据写入层
+    - 接收 Prometheus remote_write
+    - 按 metric name Hash 分片
+    - 支持水平扩展（多实例）
+
+  vmstorage：数据存储层
+    - 存储时序数据（本地磁盘）
+    - 按 time range 分块
+    - 支持水平扩展（多实例）
+
+  vmselect：查询层
+    - 接收 PromQL 查询
+    - 聚合多 vmstorage 结果
+    - 支持水平扩展（多实例）
+
+  部署拓扑（推荐）：
+    vminsert × 2（高可用）
+    vmstorage × 3（数据冗余）
+    vmselect × 2（查询高可用）
+```
+
+### 去重策略与数据一致性
+
+| 策略 | 配置 | 说明 |
+|------|------|------|
+| 去重窗口 | `-dedup.minScrapeInterval=30s` | 相同时间戳去重 |
+| 最后写入 | 默认策略 | 保留最新数据 |
+| 最小时间戳 | `-storage.minTimestampForDedup` | 去重起始时间 |
+| 跨集群去重 | vminsert 多集群写入同一 vmstorage | 需要协调 |
+
+### 降采样配置
+
+```yaml
+# vmstorage 降采样配置
+-dedup.minScrapeInterval=10s  # 原始数据间隔
+-retentionPeriod=90d            # 原始数据保留 90 天
+
+# 降采样规则（通过 -downsampling.period 参数）
+-downsampling.period=5m:1h     # 5 分钟数据 → 1 小时聚合
+-downsampling.period=1h:1d     # 1 小时数据 → 1 天聚合
+-downsampling.period=1d:30d    # 1 天数据 → 30 天聚合
+```
+
+### 多租户隔离
+
+```
+VictoriaMetrics 多租户架构：
+
+  租户隔离方式：
+    - 每个租户独立 vmstorage 集群（物理隔离）
+    - 共享 vmstorage，按 accountID 区分（逻辑隔离）
+
+  资源配额：
+    - 写入 QPS 限制
+    - 查询并发限制
+    - 存储空间配额
+    - 网络带宽限制
+
+  安全隔离：
+    - 每个租户独立 API Key
+    - 查询结果按租户过滤
+    - 审计日志按租户记录
+```
+
+### remote write 高可用配置
+
+```yaml
+# Prometheus remote_write 高可用配置
+remote_write:
+  - url: http://vminsert-1:8428/api/v1/write
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      max_shards: 30
+      capacity: 20000
+  - url: http://vminsert-2:8428/api/v1/write
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      max_shards: 30
+      capacity: 20000
+```
+
+### K8s 部署与容量规划
+
+| 节点类型 | CPU | 内存 | 磁盘 | 数量 |
+|----------|-----|------|------|------|
+| vminsert | 4C | 8GB | 无 | 2+ |
+| vmstorage | 8C | 32GB | 500GB SSD | 3+ |
+| vmselect | 4C | 16GB | 无 | 2+ |
+| 合计 | 36C | 120GB | 1.5TB | 7+ |
+
+```
+容量规划公式：
+  写入量：QPS × 每条数据大小 × 3600 × 24 × 30 × 副本数
+  存储量：写入量 × 压缩比（约 10:1）
+  内存：活跃时间序列数 × 每序列内存开销（约 4KB）
+  CPU：查询 QPS × 查询复杂度
+```
+
+## 二十二、与其他板块的关系

@@ -881,6 +881,210 @@ Result Memory：
 | `query.max_size` | 1000 | 10000 | 结果集大小 |
 | `batch_size` | 1000 | 10000 | 批处理大小 |
 
+## Neo4j 集群架构
+
+### Core / Read Replica / 单实例选型
+
+```
+Neo4j 集群部署模式：
+
+单实例（开发/测试）：
+  一个 neo4j 进程
+  无高可用
+  适用：开发、测试、小规模生产
+
+因果集群（Causal Cluster）：
+  Core 节点（Raft 共识）：
+    最少 3 个（奇数）
+    写入通过 Raft 同步
+    保证强一致
+  Read Replica（只读副本）：
+    只读扩展（分担读压力）
+    异步复制（最终一致）
+    支持多个
+
+选型决策：
+  开发测试 → 单实例
+  生产小规模 → 3 Core
+  生产中大规模 → 3 Core + 2 Read Replica
+  多数据中心 → 跨地域 Core 集群
+```
+
+| 模式 | 高可用 | 读扩展 | 写性能 | 适用 |
+|------|--------|--------|--------|------|
+| 单实例 | 无 | 无 | 高 | 开发/测试 |
+| 3 Core | 是 | 有限 | 中 | 小规模生产 |
+| 3 Core + N Read Replica | 是 | 强 | 中 | 中大规模生产 |
+| 多数据中心 Core | 是 | 强 | 低（跨地域延迟） | 异地容灾 |
+
+## Cypher 查询优化
+
+### EXPLAIN / PROFILE / 索引提示
+
+```cypher
+-- EXPLAIN：查看执行计划（不执行）
+EXPLAIN MATCH (p:Person {name: '张三'})-[:FRIEND]->(f:Person)
+RETURN f.name
+
+-- PROFILE：执行并统计实际耗时
+PROFILE MATCH (p:Person {name: '张三'})-[:FRIEND*1..3]->(f:Person)
+RETURN f.name
+
+-- 执行计划关键指标：
+--   DbHits：数据库访问次数（越少越好）
+--   Rows：返回行数
+--   优化方向：减少 DbHits（建索引/限制深度）
+
+-- 索引提示（强制使用索引）
+MATCH (p:Person) USING INDEX p:Person(name)
+WHERE p.name = '张三'
+RETURN p
+
+-- 强制全表扫描（调试用）
+MATCH (p:Person) USING SCAN p:Person
+WHERE p.name = '张三'
+RETURN p
+```
+
+## Neo4j 内存配置
+
+### heap / .pagecache
+
+```yaml
+# neo4j.conf 内存配置
+
+# JVM Heap（事务状态/遍历状态）
+dbms.memory.heap.initial_size=4G
+dbms.memory.heap.max_size=4G
+
+# Page Cache（图数据缓存，最重要）
+dbms.memory.pagecache.size=8G
+
+# 内存分配公式：
+# Page Cache = 热点图数据全量 × 1.2
+# JVM Heap = 物理内存 × 50%（不超过 32GB）
+# 如 16GB 服务器 → Heap=8G, PageCache=8G
+
+# 监控页缓存命中率
+CALL dbms.queryJmx("org.neo4j:instance=kernel#0,name=Page cache")
+-- 命中率 > 99% 正常
+```
+
+| 配置项 | 默认值 | 推荐值 | 说明 |
+|--------|--------|--------|------|
+| heap.initial_size | 1G | 4-8G | JVM 初始堆 |
+| heap.max_size | 1G | 4-8G | JVM 最大堆 |
+| pagecache.size | 1G | 数据集 1.2x | 图数据缓存 |
+| transaction.max_size | 8M | 256M | 单事务大小 |
+
+## Neo4j 数据导入
+
+### neo4j-admin import / batch-import
+
+```bash
+# neo4j-admin import（全量导入，最快速）
+neo4j-admin import \
+  --database=neo4j \
+  --nodes=Person=people.csv \
+  --nodes=Company=companies.csv \
+  --relationships=WORKS_AT=works_at.csv \
+  --trim-strings=true \
+  --skip-bad-rows=true
+
+# CSV 格式要求：
+# people.csv: :ID,name,age
+# companies.csv: :ID,name,industry
+# works_at.csv: :START_ID,:END_ID,since
+
+# batch-import（APOC 批量导入）
+CALL apoc.periodic.iterate(
+  "LOAD CSV WITH HEADERS FROM 'file:///people.csv' AS row RETURN row",
+  "CREATE (p:Person {name: row.name, age: toInteger(row.age)})",
+  {batchSize: 1000, parallel: true}
+)
+```
+
+## Neo4j 与应用集成
+
+### Spring Data Neo4j / ODM
+
+```java
+// Spring Data Neo4j 实体
+@Node
+public class Person {
+    @Id @GeneratedValue
+    private Long id;
+    
+    private String name;
+    private int age;
+    
+    @Relationship(type = "FRIEND", direction = Relationship.Direction.OUTGOING)
+    private List<Person> friends;
+    
+    @Relationship(type = "WORKS_AT", direction = Relationship.Direction.OUTGOING)
+    private Company company;
+}
+
+// Repository
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    List<Person> findByName(String name);
+    @Query("MATCH (p:Person)-[:FRIEND]->(f:Person) WHERE p.name = $name RETURN f")
+    List<Person> findFriendsByName(String name);
+}
+
+// 使用
+@Service
+public class PersonService {
+    @Autowired PersonRepository repo;
+    
+    public Person createPerson(String name) {
+        Person p = new Person();
+        p.setName(name);
+        return repo.save(p);
+    }
+}
+```
+
+## Neo4j 在知识图谱/推荐系统中的应用案例
+
+### 知识图谱
+
+```
+知识图谱数据模型：
+  实体 = 节点（Entity）
+  关系 = 关系（Relation）
+  属性 = 属性（Property）
+
+示例：
+  (p:Person {name: '张三'})
+  (c:Company {name: '阿里巴巴'})
+  (p)-[:WORKS_AT {since: 2020}]->(c)
+
+查询：
+  // 查找 3 度人脉
+  MATCH (p:Person {name: '张三'})-[:KNOWS*1..3]->(friend:Person)
+  RETURN friend.name
+
+  // 查找同事关系
+  MATCH (p1:Person)-[:WORKS_AT]->(c:Company)<-[:WORKS_AT]-(p2:Person)
+  WHERE p1 <> p2
+  RETURN p1.name, p2.name, c.name
+```
+
+### 推荐系统
+
+```
+推荐场景：
+  相似用户推荐（共同好友/兴趣）
+  商品推荐（购买路径/相似商品）
+  内容推荐（标签关联/作者关联）
+
+GDS 算法：
+  PageRank：识别关键节点（KOL/热门商品）
+  Node Similarity：相似用户/商品计算
+  Louvain：社群发现（用户分群）
+```
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。

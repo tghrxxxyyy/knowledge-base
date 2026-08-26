@@ -734,6 +734,216 @@ GET _cluster/allocation/explain?pretty
 
 ---
 
+## ILM 完整配置与索引生命周期
+
+### rollover / shrink / forcemerge / delete
+
+```json
+// ILM Policy 完整配置
+PUT /_ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "5d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {},
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+| 阶段 | 动作 | 说明 |
+|------|------|------|
+| hot | rollover | 超过 50GB/1天滚动索引 |
+| warm | shrink + forcemerge | 合并分片 + 压缩段 |
+| cold | freeze | 冻结索引（只读） |
+| delete | delete | 自动清理 |
+
+## Searchable Snapshots 按需加载
+
+### 冷数据查询优化
+
+```
+Searchable Snapshots：
+  原理：索引快照存到对象存储（S3/GCS）
+  查询时按需加载（不全量加载）
+  适用：冷数据/归档数据偶尔查询
+
+配置：
+  1. 创建快照仓库
+  PUT _snapshot/s3_backup
+  {
+    "type": "s3",
+    "settings": {
+      "bucket": "my-backup-bucket",
+      "region": "us-east-1"
+    }
+  }
+
+  2. 创建可搜索快照索引
+  PUT _snapshot/my_backup/snapshot_1/_restore
+  {
+    "indices": "logs-*",
+    "index_settings": {
+      "index.searchable_snowflake": {
+        "data_set": "logs",
+        "max_concurrent_node_deciders": 2
+      }
+    }
+  }
+
+优势：
+  存储成本降低 90%+
+  查询延迟增加（毫秒级到秒级）
+  自动缓存热数据
+```
+
+## Doc Values vs Fielddata
+
+### 内存使用与性能对比
+
+| 特性 | Doc Values | Fielddata |
+|------|-----------|-----------|
+| 存储位置 | 磁盘（列式） | 堆内存 |
+| 内存占用 | 低（压缩） | 高（全量加载） |
+| 适用字段 | keyword/数值/date | text（分词后） |
+| 排序聚合 | 极快 | 快但占内存 |
+| 风险 | 无 OOM 风险 | 可能 OOM |
+| 禁用 | 不可禁用 | 可禁用 |
+
+```json
+// 禁用 Fielddata（避免 OOM）
+PUT /logs/_mapping
+{
+  "properties": {
+    "message": {
+      "type": "text",
+      "fielddata": false
+    }
+  }
+}
+
+// 使用 Doc Values 排序
+GET /logs/_search
+{
+  "sort": [
+    { "timestamp": { "order": "desc" } },
+    { "response_time": { "order": "asc" } }
+  ]
+}
+```
+
+## Bulk Best Practices
+
+### 批量写入优化
+
+```
+Bulk 写入最佳实践：
+  1. 批量大小：1000-5000 条/批
+  2. 批次大小：5-15MB（避免单批过大）
+  3. 线程数：CPU 核数 × 2（避免上下文切换）
+  4. 重试：自动重试 3 次（网络抖动）
+  5. 刷新间隔：关闭自动刷新（写入后批量刷新）
+
+Bulk 请求格式：
+  POST _bulk
+  { "index": { "_index": "logs", "_id": "1" } }
+  { "timestamp": "...", "message": "..." }
+  { "index": { "_index": "logs", "_id": "2" } }
+  { "timestamp": "...", "message": "..." }
+
+监控 Bulk 响应：
+  items[].index.error：写入错误
+  errors：是否有错误
+  took：总耗时
+```
+
+## ES 监控指标
+
+### JVM / Thread Pool / Circuit Breaker
+
+```
+关键监控指标：
+
+1. JVM 内存
+   GET _cat/nodes?v&h=name,heap.percent,heap.current,heap.max
+   告警阈值：heap.percent > 75%
+
+2. 线程池
+   GET _cat/thread_pool/write?v&h=node_name,active,queue,rejected
+   rejected > 0 → 写入压力过大
+   active > 线程池大小 → 线程耗尽
+
+3. 熔断器
+   GET _nodes/stats/breaker
+   tripped > 0 → 内存压力触发熔断
+
+4. 磁盘使用率
+   GET _cat/allocation?v
+   used_disk_percent > 80% → 预警
+
+5. 分片状态
+   GET _cat/health?v
+   unassigned_shards > 0 → 分片未分配
+```
+
+| 指标 | 告警阈值 | 处理 |
+|------|----------|------|
+| JVM Heap | > 75% | 增加节点/调大 heap |
+| Thread Pool rejected | > 0 | 降低写入并发/增加节点 |
+| Circuit Breaker tripped | > 0 | 检查查询/增加内存 |
+| 磁盘使用率 | > 80% | 扩容/清理 |
+| 未分配分片 | > 0 | 检查节点健康/reroute |
+
+## 线程池调优
+
+### write / search / get / bulk
+
+```yaml
+# 线程池配置（elasticsearch.yml）
+thread_pool.write.size: 16        # 写线程池大小
+thread_pool.write.queue_size: 100 # 写队列大小
+
+thread_pool.search.size: 32       # 搜索线程池
+thread_pool.search.queue_size: 200
+
+thread_pool.get.size: 16          # 单文档获取
+thread_pool.get.queue_size: 64
+
+# 调优原则：
+# write.size = CPU 核数（默认即可）
+# search.size = CPU 核数 × 2（搜索密集型）
+# queue_size = 预期并发 × 2（避免 rejected）
+```
+
 ## 十三、与其他板块的关系
 
 - ES 基础见「[ES 体系](../ES体系.md)」；

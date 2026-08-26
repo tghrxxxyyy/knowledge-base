@@ -1243,4 +1243,107 @@ groups:
   - 冷特征：ClickHouse（分析查询）
 ```
 
-## 十九、与其他板块的关系
+## 十九、Canal vs Debezium vs Maxwell 架构差异对比
+
+### 核心架构对比
+
+| 维度 | Canal（阿里） | Debezium（Red Hat） | Maxwell（Zendesk） |
+|------|---------------|---------------------|-------------------|
+| 支持数据库 | MySQL | MySQL/PostgreSQL/MongoDB | MySQL |
+| 输出格式 | JSON/MQ/HTTP | Kafka/Event/JSON | Kafka/Redis/Stdout |
+| 外部依赖 | 无（自解析 binlog） | Kafka Connect | 无 |
+| 运维方式 | 独立进程 | Kafka Connect Worker | 独立进程 |
+| 社区活跃度 | 高（国内） | 极高（国际） | 低（已停止维护） |
+| 支持协议 | Canal 协议 | Debezium 协议 | Maxwell 协议 |
+| 数据过滤 | 支持（正则/表达式） | 支持（SMT） | 支持（blacklist） |
+| DDL 支持 | 支持 | 支持 | 支持 |
+
+### Canal HA + ZK 选主配置
+
+```
+Canal HA 架构（基于 ZooKeeper）：
+
+  1. Canal Server 启动
+    → 竞争注册 /canal/instances/LOCK 临时节点
+    → 获得锁 → 成为 Master
+    → 未获得锁 → 进入 Standby 状态
+
+  2. Master 故障
+    → ZK 会话超时 → 删除临时节点
+    → Standby 节点竞争获得锁 → 升级为 Master
+    → 自动切换，无需人工干预
+
+  3. canal.properties 关键配置：
+    canal.zkServers = zk1:2181,zk2:2181,zk3:2181
+    canal.instance.global.spring.xml = classpath:spring/file-instance.xml
+```
+
+### Canal 消息格式详解
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | long | 事件 ID |
+| schema | string | 数据库名 |
+| table | string | 表名 |
+| type | string | INSERT/UPDATE/DELETE |
+| es | long | 事件时间戳（毫秒） |
+| ts | long | 执行时间戳 |
+| data | array | 变更后数据 |
+| old | array | 变更前数据（UPDATE 时） |
+
+### Canal 过滤规则正则实战
+
+```properties
+# canal.properties 过滤规则
+canal.filter.regex = .*\\..*
+# 白名单：只监听 db1 的所有表
+canal.filter.regex = db1\\..*
+# 黑名单：排除日志表
+canal.filter.regex = db1\\.t_log_.*
+# 精确匹配：只监听 db1 的 t_user, t_order
+canal.filter.regex = db1\\.(t_user|t_order)
+```
+
+### Canal + Kafka + Flink 完整实时链路
+
+```mermaid
+graph LR
+    A[MySQL] -->|binlog| B[Canal Server]
+    B -->|Canal Message| C[Kafka Topic]
+    C -->|Flink Consumer| D[Flink SQL]
+    D -->|ETL| E[Sink: HBase/ES/ClickHouse]
+    D -->|实时特征| F[Feature Store]
+    D -->|实时报表| G[数据大屏]
+```
+
+### Canal 监控指标与告警配置
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| canal.instanceestination.delay | > 10s | 数据同步延迟 |
+| canal.instance.binlog.fetch.size | 持续为 0 | binlog 读取异常 |
+| canal.instance.error.count | > 10 | 错误数量累积 |
+| kafka.producer.send.failure | > 0 | Kafka 发送失败 |
+| canal.instance.running.status | != 1 | 实例运行异常 |
+
+### Canal 在实时特征存储中的应用
+
+```
+实时特征存储架构：
+  Canal 监听 MySQL → binlog 变更
+    → 实时计算特征（Flink）
+    → 写入特征存储（Redis/HBase）
+    → 供模型在线推理使用
+
+  典型场景：
+    - 用户实时行为特征（最近 N 次点击/下单）
+    - 商品实时热度特征（最近 N 小时浏览/购买次数）
+    - 实时风控特征（最近 N 分钟异常交易次数）
+
+  存储选择：
+    - 热特征：Redis（毫秒级读取）
+    - 温特征：HBase（秒级读取）
+    - 冷特征：ClickHouse（分析查询）
+```
+
+## 二十、与其他板块的关系

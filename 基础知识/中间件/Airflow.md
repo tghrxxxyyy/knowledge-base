@@ -857,7 +857,223 @@ Pod 模板（per-task 资源覆盖）：
 | Worker | 0~N（弹性） | K8sExecutor 按需创建 Pod |
 | Metadata DB | 1（RDS） | PostgreSQL 高可用托管 |
 
-## 七、与其他板块的关系
+## Airflow Sensor vs Deferrable
+
+### 同步阻塞 / 异步等待 / 资源优化
+
+```
+Sensor（同步）：
+  原理：占用 worker slot，轮询检查条件
+  问题：大量 sensor → worker slot 耗尽
+  适用：少量 sensor（< 10）
+
+Deferrable Operator（异步）：
+  原理：释放 worker slot，等待触发器回调
+  优势：不占用 worker slot，可大量并发
+  适用：大量 sensor（> 10）
+
+示例对比：
+  # Sensor（同步）
+  file_sensor = FileSensor(
+      task_id='wait_for_file',
+      path='/data/input.csv',
+      poke_interval=60,
+      timeout=600
+  )
+
+  # Deferrable（异步）
+  file_sensor = FileSensorAsync(
+      task_id='wait_for_file',
+      path='/data/input.csv',
+      poke_interval=60,
+      timeout=600
+  )
+```
+
+| 模式 | Worker Slot | 并发数 | 资源 | 适用 |
+|------|-------------|--------|------|------|
+| Sensor | 占用 | 低 | 高 | 少量 sensor |
+| Deferrable | 释放 | 高 | 低 | 大量 sensor |
+
+## Airflow Variable 加密
+
+### Fernet / 环境变量 / 密钥管理
+
+```python
+# Fernet 加密配置
+# airflow.cfg
+[core]
+fernet_key = your-fernet-key
+
+# 创建加密 Variable
+from cryptography.fernet import Fernet
+key = Fernet.generate_key()
+print(key.decode())
+
+# 使用加密 Variable
+api_key = Variable.get("api_key", deserialize_json=False)
+# → 自动解密
+
+# 环境变量优先级
+export AIRFLOW_VAR_API_KEY=xxx
+# → 覆盖数据库中的 Variable
+
+# 最佳实践：
+# 1. 敏感信息用环境变量
+# 2. 非敏感用 Variable（UI 可管理）
+# 3. 定期轮换 Fernet Key
+```
+
+## Airflow Pool 与 Slot
+
+### 并发控制 / 资源隔离
+
+```
+Pool 作用：
+  限制同时运行的任务数
+  防止资源竞争
+  实现资源隔离
+
+配置 Pool：
+  # UI 创建 Pool
+  Admin → Pools → Create
+  Name: db_pool
+  Slots: 5  # 最多同时 5 个任务
+
+  # 代码指定 Pool
+  task = BashOperator(
+      task_id='process',
+      bash_command='echo "hello"',
+      pool='db_pool',
+      pool_slots=1
+  )
+
+Slot 算法：
+  可用 Slot = Pool Slots - 已占用 Slots
+  任务启动条件：可用 Slot ≥ 任务所需 Slots
+
+最佳实践：
+  数据库操作 → db_pool（限制并发）
+  API 调用 → api_pool（限流）
+  默认池 → default_pool（兜底）
+```
+
+## Airflow Trigger Rules
+
+### 依赖触发 / 流程控制
+
+```python
+# Trigger Rules
+from airflow.utils.trigger_rule import TriggerRule
+
+# 默认：所有上游成功才触发
+task = BashOperator(
+    task_id='task',
+    bash_command='echo "hello"',
+    trigger_rule=TriggerRule.ALL_SUCCESS
+)
+
+# 任意一个成功就触发
+task = BashOperator(
+    task_id='task',
+    bash_command='echo "hello"',
+    trigger_rule=TriggerRule.ONE_SUCCESS
+)
+
+# 所有完成（不管成功失败）
+task = BashOperator(
+    task_id='task',
+    bash_command='echo "hello"',
+    trigger_rule=TriggerRule.ALL_DONE
+)
+
+# 上游失败时触发（告警/回滚）
+alert_task = BashOperator(
+    task_id='alert',
+    bash_command='echo "failed"',
+    trigger_rule=TriggerRule.ONE_FAILED
+)
+```
+
+| Trigger Rule | 说明 | 适用 |
+|--------------|------|------|
+| ALL_SUCCESS | 所有上游成功 | 默认 |
+| ALL_FAILED | 所有上游失败 | 回滚/告警 |
+| ALL_DONE | 所有完成 | 统计/清理 |
+| ONE_SUCCESS | 任意成功 | 竞速/多路径 |
+| ONE_FAILED | 任意失败 | 告警/补偿 |
+
+## Airflow dbt 集成
+
+### dbtOperator / 数据质量
+
+```python
+# dbt Operator
+from airflow.providers.dbt.cloud.operators.dbt import (
+    DbtCloudRunJobOperator,
+    DbtCloudJobRunStatus
+)
+
+# 运行 dbt 任务
+run_dbt = DbtCloudRunJobOperator(
+    task_id='run_dbt',
+    job_id=12345,
+    trigger_rule=TriggerRule.ALL_SUCCESS,
+    poll_interval=10,
+    timeout=3600
+)
+
+# 数据质量检查
+check_quality = BashOperator(
+    task_id='check_quality',
+    bash_command='dbt test --select +model_name'
+)
+
+# 依赖链
+extract >> transform >> run_dbt >> check_quality >> load
+```
+
+## Airflow K8s 部署
+
+### Helm / Executor 选型
+
+```
+K8s 部署模式：
+
+CeleryExecutor + K8s：
+  Workers 部署在 K8s（弹性伸缩）
+  Metadata DB 用 RDS
+  Broker 用 Redis/RabbitMQ
+  适用：中大规模
+
+KubernetesExecutor：
+  每个 Task 一个 Pod
+  动态创建/销毁
+  资源利用率高
+  适用：弹性/成本敏感
+
+Helm 部署：
+  helm install airflow apache-airflow/airflow \
+    --set executor=KubernetesExecutor \
+    --set scheduler.replicas=2 \
+    --set webserver.replicas=2 \
+    --set postgresql.enabled=false \
+    --set postgresql.externalHost=rds-host
+
+配置：
+  [kubernetes_executor]
+  namespace = airflow
+  image = apache-airflow:2.8.0
+  delete_worker_pods = true
+  worker_containers_resources = {"request_memory": "1Gi", "limit_memory": "2Gi"}
+```
+
+| Executor | 适用 | 弹性 | 复杂度 |
+|----------|------|------|--------|
+| SequentialExecutor | 开发测试 | 无 | 低 |
+| LocalExecutor | 小规模 | 无 | 低 |
+| CeleryExecutor | 中大规模 | 手动 | 中 |
+| KubernetesExecutor | 弹性 | 自动 | 高 |
 
 - DolphinScheduler 对比见「[DolphinScheduler](./DolphinScheduler.md)」；
 - 任务调度对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；

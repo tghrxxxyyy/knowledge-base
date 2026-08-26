@@ -1459,3 +1459,178 @@ taos -s "SHOW DATABASES;"
     版本升级
     性能调优
 ```
+
+## TDengine STable 设计与建模
+
+### STable（超级表）设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 高基数 | Tag 值应有足够多的唯一值 | device_id（好），status（差） |
+| 查询友好 | 按查询模式设计 Tag | 常用过滤条件作为 Tag |
+| 原子性 | STable 内子表结构相同 | 同一设备类型用同一 STable |
+| 分区 | 按时间或设备 ID 分区 | 自动分区（推荐） |
+
+### STable 建模示例
+
+```sql
+-- 创建超级表（设备监控）
+CREATE STABLE device_metrics (
+  ts TIMESTAMP,
+  temperature FLOAT,
+  humidity FLOAT,
+  voltage FLOAT,
+  current FLOAT
+) TAGS (
+  device_id NCHAR(64),
+  device_type NCHAR(32),
+  location NCHAR(128),
+  region NCHAR(32)
+);
+
+-- 创建子表（每设备一张）
+CREATE TABLE device_001 USING device_metrics 
+  TAGS ('device_001', 'temperature_sensor', 'factory_A', 'north');
+
+-- 插入数据
+INSERT INTO device_001 VALUES 
+  (NOW, 25.5, 60.2, 220.1, 5.2);
+```
+
+## TDengine 流计算配置
+
+### 流计算示例
+
+```sql
+-- 创建流计算（实时聚合）
+CREATE STREAM avg_temperature_stream 
+  TRIGGER WINDOW_CLOSE
+  AS SELECT 
+    device_id,
+    AVG(temperature) as avg_temp,
+    MAX(temperature) as max_temp,
+    MIN(temperature) as min_temp
+  FROM device_metrics
+  WHERE device_type = 'temperature_sensor'
+  PARTITION BY device_id
+  INTERVAL(5m);
+
+-- 查询流计算结果
+SELECT * FROM avg_temperature_stream 
+WHERE avg_temp > 30;
+```
+
+### 流计算触发模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| WINDOW_CLOSE | 窗口关闭时触发 | 批量聚合 |
+| WINDOW_OPEN | 窗口打开时触发 | 实时计算 |
+| IMMEDIATE | 数据到达立即触发 | 实时告警 |
+| MAX_DELAY | 最大延迟触发 | 容错场景 |
+
+## TDengine 数据订阅机制
+
+### 数据订阅架构
+
+```
+TDengine 数据订阅：
+  1. 创建订阅（Subscription）
+    - 指定数据库/表
+    - 指定过滤条件
+    - 指定消费位点
+
+  2. 消费者组（Consumer Group）
+    - 多消费者协作消费
+    - 负载均衡
+    - 故障转移
+
+  3. 消费位点管理
+    - 自动提交（推荐）
+    - 手动提交
+    - 重置位点
+
+  适用场景：
+    - 实时 ETL
+    - 数据同步
+    - 实时特征计算
+```
+
+## TDengine Grafana 集成配置
+
+### Grafana 集成
+
+```json
+// Grafana 数据源配置
+{
+  "name": "TDengine",
+  "type": "tdengine-datasource",
+  "url": "http://tdengine:6030",
+  "user": "root",
+  "password": "taosdata",
+  "database": "device_db"
+}
+```
+
+### Grafana Dashboard 配置
+
+```json
+{
+  "panels": [
+    {
+      "title": "设备温度监控",
+      "type": "timeseries",
+      "targets": [
+        {
+          "rawSql": "SELECT ts, temperature FROM device_metrics WHERE device_id = '$device'",
+          "format": "time_series"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## TDengine 集群部署架构
+
+### 集群架构
+
+```
+TDengine 集群架构：
+
+  节点角色：
+    - dnode：数据节点（存储数据）
+    - mnode：管理节点（集群管理）
+    - vnode：虚拟节点（数据分片）
+
+  部署拓扑（推荐）：
+    - 3 节点集群（开发测试）
+    - 5 节点集群（一般生产）
+    - 7+ 节点集群（关键业务）
+
+  副本策略：
+    1副本：开发测试环境
+    2副本：一般生产环境
+    3副本：关键业务环境
+
+  监控告警：
+    节点状态监控
+    数据同步监控
+    性能指标监控
+
+  运维管理：
+    定期备份
+    版本升级
+    性能调优
+```
+
+### TDengine IoT 建模最佳实践
+
+| 场景 | STable 设计 | Tag 设计 | 说明 |
+|------|-------------|----------|------|
+| 设备监控 | device_metrics | device_id, type, location | 一设备一子表 |
+| 车辆追踪 | vehicle_tracking | vehicle_id, plate, driver | 一车一子表 |
+| 环境监测 | env_monitoring | station_id, region, type | 一站一子表 |
+| 能耗统计 | energy_consumption | meter_id, building, floor | 一表一子表 |
+
+## 与其他板块的关系

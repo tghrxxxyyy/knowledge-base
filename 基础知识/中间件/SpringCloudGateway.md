@@ -766,7 +766,100 @@ public class DynamicRouteRefresh implements ApplicationEventPublisherAware {
 | 扩展 | Java 生态 | Java 生态 | Lua/Go 插件 |
 | 适用 | Spring 微服务 | Spring 生态 | 跨语言/高性能 |
 
-## 十、与其他板块的关系
+## 十、Spring Cloud Gateway 生产运维
+
+### Metrics 监控指标
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| spring.cloud.gateway.requests | Timer | 请求延迟分布 |
+| spring.cloud.gateway.request.count | Counter | 请求总数 |
+| jvm.memory.used | Gauge | JVM 内存使用 |
+| netty.pooled.allocated.num | Gauge | Netty 连接池分配 |
+| hikaricp.connections.active | Gauge | 数据库连接池 |
+
+### 会话共享与粘滞路由
+
+```
+Spring Cloud Gateway 会话共享方案：
+
+  1. Redis 会话（Spring Session）
+    - Session 存储到 Redis
+    - 所有实例共享会话
+    - 无状态网关，支持水平扩展
+
+  2. JWT Token（推荐）
+    - 用户信息存储在 JWT Token 中
+    - 网关无状态，无需会话共享
+    - 支持多终端登录
+
+  3. 粘滞路由（Sticky Session）
+    - 基于用户 ID Hash 路由到固定实例
+    - 不推荐（不支持水平扩展）
+```
+
+### 服务网格集成
+
+```yaml
+# Spring Cloud Gateway + Istio 集成
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: gateway-service
+spec:
+  hosts:
+    - gateway.example.com
+  gateways:
+    - istio-system/ingressgateway
+  http:
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: spring-cloud-gateway
+            port:
+              number: 8080
+```
+
+### 限流降级配置
+
+```yaml
+# Gateway 限流 + 熔断配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+                key-resolver: "#{@userKeyResolver}"
+            - name: CircuitBreaker
+              args:
+                name: orderCB
+                fallbackUri: forward:/fallback
+                statusCodes:
+                  - 500
+                  - 503
+```
+
+### 生产问题排查清单
+
+| 问题现象 | 排查方向 | 排查工具 |
+|----------|----------|----------|
+| 502 Bad Gateway | 后端服务不可用 | 日志 + curl 测试 |
+| 504 Gateway Timeout | 后端响应超时 | 超时配置 + 线程池 |
+| 连接池耗尽 | 并发过高 | Netty 连接池监控 |
+| 内存溢出 | 大对象/连接泄漏 | JVM 堆分析 |
+| 路由不生效 | 路由配置错误 | 路由日志 + Actuator |
+
+## 十一、与其他板块的关系
 
 - 网关选型整体见「[API 网关](./API网关.md)」；
 - 非 Java 网关见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」「[OpenResty](./OpenResty.md)」；

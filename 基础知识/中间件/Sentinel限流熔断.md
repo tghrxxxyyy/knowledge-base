@@ -1154,4 +1154,147 @@ public class SentinelLogAnalyzer {
 }
 ```
 
+## Sentinel 滑动窗口计数器实现原理
+
+### 滑动窗口数据结构
+
+```
+Sentinel 滑动窗口算法：
+  将时间窗口划分为多个小窗口（bucket）
+  每个小窗口有独立的计数器
+  窗口滑动时，旧窗口计数器逐渐失效
+
+  示例（1秒窗口，2个小窗口）：
+    Window[0]: [0ms, 500ms)  → count = 80
+    Window[1]: [500ms, 1000ms) → count = 60
+    当前时间 750ms → 有效计数 = Window[0] + Window[1] = 140
+```
+
+### 滑动窗口 vs 固定窗口对比
+
+| 维度 | 固定窗口 | 滑动窗口 |
+|------|----------|----------|
+| 实现复杂度 | 简单 | 中等 |
+| 并发边界问题 | 有（窗口临界突发） | 无 |
+| 内存开销 | 低 | 中（多窗口） |
+| 精确度 | 低 | 高 |
+| 适用场景 | 简单限流 | 精确限流 |
+
+## 热点参数限流配置实战
+
+### 热点参数限流规则
+
+```java
+// 热点参数限流配置
+@SentinelResource(
+    value = "getOrder",
+    blockHandler = "getOrderBlockHandler"
+)
+public Order getOrder(String userId, String productId) {
+    // userId 为热点参数，QPS = 10 限流
+    // 但 userId = "vip_user" 的 QPS = 100（例外配置）
+    return orderService.getOrder(userId, productId);
+}
+
+// 规则配置（JSON）
+{
+    "resource": "getOrder",
+    "paramIdx": 0,
+    "grade": 1,
+    "count": 10,
+    "paramStreamItemList": [
+        {"param": "vip_user", "threshold": 100},
+        {"param": "test_user", "threshold": 1000}
+    ]
+}
+```
+
+### 热点参数限流使用场景
+
+| 场景 | 参数 | 限流策略 | 说明 |
+|------|------|----------|------|
+| 用户限流 | userId | 普通用户10 QPS，VIP 100 QPS | 差异化服务 |
+| 接口限流 | apiName | 热门接口放宽，冷门接口收紧 | 精细化控制 |
+| 地域限流 | regionId | 核心城市放宽 | 业务优先级 |
+| 商品限流 | skuId | 爆款商品放宽，普通商品收紧 | 热点隔离 |
+
+## 系统自适应保护配置
+
+### CPU/Load/RT 阈值联动
+
+```java
+// 系统保护规则配置
+SystemRule rule = new SystemRule();
+rule.setHighestSystemLoad(3.0);           // 系统最高负载
+rule.setHighestCpuUsage(0.8);             // 最高 CPU 使用率
+rule.setAvgRt(200);                       // 平均 RT 阈值（ms）
+rule.setMaxRt(1000);                      // 最大 RT 阈值（ms）
+rule.setMaxThread(100);                   // 最大并发线程数
+rule.setQps(1000);                        // 入口 QPS
+SystemRuleManager.loadRules(Collections.singletonList(rule));
+```
+
+### 系统自适应保护决策流程
+
+```
+系统自适应保护流程：
+  采集系统指标（CPU/Load/RT/线程数）
+    → 计算当前系统压力
+    → 对比阈值规则
+    → 压力超限 → 动态调整流量控制阈值
+    → 压力正常 → 恢复原始阈值
+    → 关键：基于反馈的动态调节，无需人工干预
+```
+
+## Sentinel 与 OpenTelemetry 联动上报
+
+### Metrics 导出配置
+
+```yaml
+# Sentinel OpenTelemetry 集成
+sentinel:
+  metrics:
+    exporter:
+      enabled: true
+    internode:
+      metrics:
+        port: 0
+        path: /metrics
+    command:
+      server:
+        port: 0
+    log:
+      info:
+        enabled: false
+
+# OTel Collector 配置
+processors:
+  batch:
+    send_batch_size: 1000
+    timeout: 5s
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+```
+
+## 客户端限流规则持久化三方案
+
+| 方案 | 存储 | 推送方式 | 一致性 | 运维复杂度 |
+|------|------|----------|--------|-----------|
+| Pull 模式 | Nacos/Apollo | 客户端定时拉取 | 最终一致 | 低 |
+| Push 模式 | Nacos | 配置变更推送 | 强一致 | 低 |
+| Push 模式 | ZooKeeper | Watcher 通知 | 强一致 | 中 |
+| 混合模式 | Nacos + DB | Push + DB 持久化 | 强一致 | 中 |
+
+## Sentinel 限流算法选型
+
+| 算法 | 特点 | 适用场景 | QPS 精确度 |
+|------|------|----------|-----------|
+| 计数器 | 简单、有边界问题 | 简单限流 | 低 |
+| 滑动窗口 | 精确、内存适中 | 通用限流 | 高 |
+| 令牌桶 | 允许突发 | 允许突发流量 | 高 |
+| 漏桶 | 均匀消费 | 削峰填谷 | 高 |
+| WarmUp | 预热启动 | 冷启动场景 | 高 |
+| 匀速队列 | 匀速通过 | 消息队列消费 | 高 |
+
 > 一句话：**Sentinel = 限流（QPS/线程/匀速/WarmUp）+ 熔断（慢调用/异常）+ 热点参数 + 系统保护 + 授权 + 控制台动态规则；选型先看「生态（Spring Cloud Alibaba → Sentinel）」，再定「规则持久化（Nacos）」，最后配「控制台监控」**。

@@ -746,7 +746,124 @@ public void batchInsert(List<User> users) {
 
 ---
 
-## 二十四、PageHelper 分页原理
+## 二十四、MyBatis 拦截器链执行顺序与四大拦截点
+
+### 24.1 四大拦截点详解
+
+| 拦截对象 | 拦截方法 | 典型用途 | 优先级 |
+|----------|----------|----------|--------|
+| Executor | update/query | 分页改写、数据权限、SQL审计 | 1（最外层） |
+| StatementHandler | prepare/parameterize | SQL改写、分表路由、读写分离 | 2 |
+| ParameterHandler | setParameters | 参数加密、租户ID注入 | 3 |
+| ResultSetHandler | handleResultSets | 结果解密、字段脱敏 | 4（最内层） |
+
+### 24.2 插件嵌套代理执行流程
+
+```
+多个插件按配置顺序形成嵌套代理：
+
+  Plugin A → Plugin B → Plugin C → 真实对象
+
+  调用链：
+    A.intercept()
+      → B.intercept()
+        → C.intercept()
+          → 真实方法执行
+        ← C 后置处理
+      ← B 后置处理
+    ← A 后置处理
+
+  关键：invocation.proceed() 必须调用，否则链断裂
+```
+
+### 24.3 MyBatis-Plus 条件构造器使用场景
+
+```java
+// LambdaQueryWrapper：类型安全，避免字段名硬编码
+LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+wrapper.eq(User::getStatus, 1)
+       .like(StringUtils.isNotBlank(name), User::getName, name)
+       .in(User::getAge, Arrays.asList(20, 25, 30))
+       .orderByDesc(User::getCreateTime)
+       .last("LIMIT 10");
+
+// LambdaUpdateWrapper：更新指定字段
+LambdaUpdateWrapper<User> updateWrapper = new LambdaUpdateWrapper<>();
+updateWrapper.eq(User::getId, 1)
+             .set(User::getName, "李四")
+             .set(User::getStatus, 0);
+```
+
+### 24.4 MyBatis 与 Spring TransactionManager 交互细节
+
+| 传播行为 | 事务行为 | 典型场景 |
+|----------|----------|----------|
+| REQUIRED | 有则加入，无则新建 | 默认，最常用 |
+| REQUIRES_NEW | 始终新建事务 | 独立日志记录 |
+| NESTED | 嵌套事务（savepoint） | 部分回滚 |
+| SUPPORTS | 有则加入，无则非事务 | 查询方法 |
+
+```
+Spring 集成事务流程：
+  @Transactional → TransactionManager
+    → TransactionSynchronizationManager 绑定 SqlSession 到线程
+    → 同一事务复用同一 Connection
+    → 事务提交/回滚 → 关闭 SqlSession
+
+  关键点：
+    自调用不经过代理 → 事务不生效
+    异常被 catch 吞掉 → 事务不回滚
+    rollbackFor 需指定（默认只回滚 RuntimeException）
+```
+
+### 24.5 延迟加载原理与 N+1 问题规避
+
+```
+延迟加载原理：
+  fetchType=LAZY → 使用 CGLIB/Javassist 创建代理对象
+  访问关联属性时 → 拦截器检测到延迟加载触发 → 发送额外 SQL 查询
+
+  N+1 问题：
+    查询 N 条主记录 → 每条触发 1 次关联查询 → N+1 次 SQL
+
+  规避方案：
+    1. join fetch（一次查询全部关联数据）
+    2. batch fetch（按批次预加载，@BatchSize）
+    3. 子查询 + IN（2 次查询解决 N+1）
+```
+
+```xml
+<!-- Batch Fetch 规避 N+1 -->
+<resultMap id="orderWithItems" type="Order">
+    <id property="id" column="id"/>
+    <collection property="items" ofType="OrderItem"
+                select="selectItemsByOrderId"
+                fetchType="lazy"/>
+</resultMap>
+```
+
+### 24.6 MyBatis 多数据源配置
+
+```java
+// AbstractRoutingDataSource 动态数据源切换
+public class DynamicDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return DataSourceContextHolder.getDataSourceType();
+    }
+}
+
+// 使用：切换数据源
+DataSourceContextHolder.setDataSource("slave");
+try {
+    // 执行读操作
+    userMapper.selectById(1);
+} finally {
+    DataSourceContextHolder.clear();
+}
+```
+
+## 二十五、PageHelper 分页原理
 
 ### 24.1 工作流程
 

@@ -887,7 +887,79 @@ COPY keyspace.table FROM 'data.csv'
   5. 单分区批量写入（原子性 + 性能）
 ```
 
-## 十三、与其他板块的关系
+## 十三、Cassandra 分区键设计与性能调优
+
+### 分区键设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 高基数 | 分区键值应有足够多的唯一值 | user_id（好），status（差） |
+| 均匀分布 | 避免热点分区 | 使用 Murmur3Hash 分布 |
+| 查询友好 | 按查询模式设计分区键 | 时间序列：device_id + date |
+| 分区大小 | 单分区 < 100MB | 大分区影响读写性能 |
+
+### 性能调优参数
+
+```
+Cassandra 性能调优关键参数：
+
+  读优化：
+    - consistency_level: ONE（降低一致性换取性能）
+    - speculative_retry: 99p（99百分位重试）
+    - row_cache_size: 100MB（行缓存）
+
+  写优化：
+    - consistency_level: ONE
+    - commitlog_sync: batch（批量提交）
+    - memtable_heap_space_in_mb: 2048
+
+  压缩优化：
+    - compaction_strategy: TimeWindowCompactionStrategy
+    - compaction_window_size: 1（天）
+    - sstable_compression: LZ4Compressor
+```
+
+### Cassandra 多数据中心配置
+
+```
+多数据中心架构：
+  DC1（北京） → DC2（上海） → DC3（广州）
+  本地一致性：LOCAL_QUORUM（本地仲裁读写）
+  跨数据中心复制：ASYNC（异步复制）
+  读写路径：
+    写：客户端 → 本地 DC（同步写入多数节点）→ 异步复制到其他 DC
+    读：客户端 → 本地 DC（读取本地数据）→ 本地仲裁
+
+  配置示例：
+    keyspace replication = {
+      'class': 'NetworkTopologyStrategy',
+      'DC1': 3,
+      'DC2': 3,
+      'DC3': 3
+    }
+```
+
+### Cassandra 监控与告警
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| Read Latency P99 | > 100ms | 读延迟过高 |
+| Write Latency P99 | > 50ms | 写延迟过高 |
+| Pending Compactions | > 10 | 压缩任务堆积 |
+| Tombstone Warning | > 1000 | 墓碑过多 |
+| Dropped Messages | > 0 | 消息丢失 |
+| ThreadPool Blocked | > 0 | 线程池阻塞 |
+
+### Cassandra 与 Kafka 集成模式
+
+| 模式 | 架构 | 适用场景 |
+|------|------|----------|
+| Kafka → Cassandra | Kafka Connect Sink | 数据导入 |
+| Cassandra → Kafka | CDC（Change Data Capture） | 数据导出 |
+| 双向同步 | CDC + Sink | 数据迁移 |
+| 事件溯源 | Kafka + Cassandra | 事件存储 |
+
+## 十四、与其他板块的关系
 
 - HBase 对比见「[HBase 列式存储](./HBase列式存储.md)」；
 - 大数据写入见「[大数据/06-分布式NoSQL与HBase](../大数据/06-分布式NoSQL与HBase.md)」；

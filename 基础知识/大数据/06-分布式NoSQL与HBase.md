@@ -1078,6 +1078,114 @@ rules:
 - Redis 基础见「[redis知识](../redis知识.md)」、ES 见「[ES体系](../ES体系.md)」；
 - 实时链路见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」。
 
+## HBase RowKey 设计模式大全
+
+### RowKey 设计模式对比
+
+| 模式 | 适用场景 | 优点 | 缺点 |
+|------|----------|------|------|
+| 纯时间戳 | 时间序列数据 | 简单 | 热点（单 Region） |
+| Hash 前缀 | 通用场景 | 均匀分布 | 无法范围查询 |
+| Reverse 前缀 | 邮箱/手机号 | 均匀分布 | 需要反转处理 |
+| Region Split 前缀 | 大表 | 预分 Region | 需要预规划 |
+| 复合 RowKey | 多维查询 | 灵活 | 设计复杂 |
+
+### RowKey 热点规避示例
+
+```
+时间序列 RowKey 设计：
+  原始 RowKey：20250101120000_device_001（热点！）
+  优化方案1：Hash(device_001)_20250101120000（均匀分布）
+  优化方案2：device_001_20250101120000（按设备散列）
+  优化方案3：20250101_device_001_120000（时间+设备混合）
+
+  Salting 技术：
+    在 RowKey 前加随机前缀（0-9）
+    确保同一时间戳的记录分布在不同 Region
+    读取时需要扫描所有 Region
+```
+
+## Coprocessor 端点计算
+
+### Coprocessor 类型与使用
+
+| 类型 | 用途 | 执行位置 | 性能影响 |
+|------|------|----------|----------|
+| Observer | 拦截/修改操作 | Region Server | 中 |
+| Endpoint | 自定义计算 | Region Server | 低 |
+
+```java
+// Endpoint Coprocessor 示例
+public class MyEndpoint extends BaseEndpointCoprocessor {
+    @Override
+    publicocoprocessor.Context getContext() {
+        return new coprocessor.SimpleRegionObserverContext();
+    }
+
+    // 自定义聚合方法
+    public Long sum(byte[] family, byte[] qualifier) {
+        long sum = 0;
+        for (Result result : getRegion().getScanner(new Scan())) {
+            byte[] value = result.getValue(family, qualifier);
+            if (value != null) {
+                sum += Bytes.toLong(value);
+            }
+        }
+        return sum;
+    }
+}
+```
+
+## Phoenix 二级索引
+
+### Phoenix 索引类型
+
+| 索引类型 | 语法 | 适用场景 |
+|----------|------|----------|
+| 全局索引 | CREATE INDEX idx ON table(col) | 等值查询 |
+| 覆盖索引 | INCLUDE (col1,col2) | 覆盖查询 |
+| 函数索引 | CREATE INDEX idx ON table(UPPER(name)) | 函数查询 |
+| 本地索引 | CREATE LOCAL INDEX idx ON table(col) | 区域查询 |
+
+```sql
+-- Phoenix 二级索引示例
+CREATE INDEX idx_user_status ON t_user (status) INCLUDE (name, email);
+-- 查询使用索引
+SELECT name, email FROM t_user WHERE status = 'active';
+```
+
+## HBase 数据导入导出工具
+
+| 工具 | 方向 | 格式 | 适用场景 |
+|------|------|------|----------|
+| Import/Export | HBase ↔ HDFS | SequenceFile | 全量备份 |
+| CopyTable | HBase ↔ HBase | HBase 原生 | 跨集群复制 |
+| Snapshot | HBase → HBase | Snapshot | 快速恢复 |
+| BulkLoad | HDFS → HBase | HFile | 大批量导入 |
+| Spark-Connector | Spark ↔ HBase | DataFrame | ETL 场景 |
+
+## HBase 监控与告警
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| RegionServer CPU | > 80% | 负载过高 |
+| BlockCache HitRatio | < 80% | 缓存命中率低 |
+| Compaction Queue | > 10 | 压缩任务堆积 |
+| Split Queue | > 0 | Region 分裂等待 |
+| StoreFile Count | > 10 | Store 文件过多 |
+| Flush Queue | > 5 | 刷新任务堆积 |
+
+## HBase + Kafka + Spark 集成
+
+```mermaid
+graph LR
+    A[MySQL] -->|CDC| B[Kafka]
+    B -->|消费| C[Spark Streaming]
+    C -->|写入| D[HBase]
+    D -->|读取| E[Spark SQL]
+    E -->|分析| F[数据大屏/报表]
+```
+
 > 一句话：**HBase = HDFS 之上 LSM（WAL→MemStore→HFile→Compaction）+ RowKey 字典序 + Region 自动分裂——生产三守则：RowKey 防热点、列族精简、定时 major compaction；选型按能力分（强一致→HBase/跨机房→Cassandra/内存→Redis）**。
 
 ## 二十九、HBase Compaction调优参数详解

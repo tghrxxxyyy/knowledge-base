@@ -755,6 +755,103 @@ K8s 已完全移除 v2 支持
 新项目必须使用 v3
 ```
 
+## etcd MVCC 与版本控制
+
+### revision / compact / defrag
+
+```
+MVCC 机制：
+  每个 key 有递增的 revision
+  revision = (main revision, sub revision)
+  删除 = 创建 tombstone（软删除）
+  历史版本 = 保留所有 revision
+
+compact（压缩）：
+  删除旧版本历史（保留最近 N 个）
+  减少存储空间
+  命令：etcdctl compact <revision>
+
+defrag（碎片整理）：
+  重写数据文件（物理删除）
+  释放磁盘空间
+  命令：etcdctl defrag
+
+自动压缩：
+  --auto-compaction-retention=8h
+  保留 8 小时历史
+  定期自动压缩
+
+监控：
+  etcdctl endpoint status --write-out=table
+  db size：数据库大小
+  db inuse：实际使用空间
+  db fragmented：碎片空间
+```
+
+| 操作 | 命令 | 频率 | 说明 |
+|------|------|------|------|
+| compact | `etcdctl compact REV` | 每天 | 压缩历史 |
+| defrag | `etcdctl defrag` | 每周 | 整理碎片 |
+| status | `etcdctl endpoint status` | 实时监控 | 查看空间 |
+
+## etcd Lease 租约机制
+
+### TTL / KeepAlive / 会话管理
+
+```
+Lease 机制：
+  创建租约（带 TTL）
+  key 绑定到租约
+  定期 KeepAlive（续租）
+  租约过期 → key 自动删除
+
+适用场景：
+  服务注册（心跳续租）
+  分布式锁（Lease 防死锁）
+  配置过期（临时配置）
+
+创建租约：
+  etcdctl lease grant 60 --ttl=60
+  → 创建 60 秒租约
+
+绑定 key：
+  etcdctl put /services/user-123 "..." --lease=LEASE_ID
+
+续租：
+  etcdctl lease keep-alive LEASE_ID
+  → 定期发送 KeepAlive
+  → 停止 KeepAlive → 租约过期 → key 删除
+
+监控：
+  etcdctl lease list
+  etcdctl lease timetolive LEASE_ID
+```
+
+## K8s etcd 故障恢复
+
+### snapshot / restore / 成员替换
+
+```
+etcd 故障恢复流程：
+
+1. 备份（定期做）
+   etcdctl snapshot save /backup/etcd-snapshot.db
+   etcdctl snapshot status /backup/etcd-snapshot.db --write-out=table
+
+2. 恢复（单节点恢复）
+   etcdctl snapshot restore /backup/etcd-snapshot.db \
+     --data-dir=/var/lib/etcd-restored \
+     --name=member1
+
+3. 成员替换（集群恢复）
+   etcdctl member remove MEMBER_ID
+   etcdctl member add NEW_MEMBER --peer-urls="https://..."
+
+4. 验证
+   etcdctl endpoint health --cluster
+   etcdctl endpoint status --cluster --write-out=table
+```
+
 ## 十三、与其他板块的关系
 
 - 和「**基础知识/中间件/ZooKeeper**」：同为 CP 协调服务，etcd 是云原生替代者（对比见上）。

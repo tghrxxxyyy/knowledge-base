@@ -1091,6 +1091,203 @@ ceph auth get-or-create client.glance mon 'allow r' osd 'allow class-read, allow
 ceph auth get-or-create client.cinder mon 'allow r' osd 'allow class-read, allow rwx pool=volumes, allow rwx pool=vms'
 ```
 
+## Ceph CRUSH Map 自定义规则实操
+
+### 故障域层级设计
+
+```
+故障域层级设计原则：
+  层级越深 → 容灾能力越强 → 性能开销越大
+
+推荐层级：
+  root（集群根）
+    └── zone（可用区，跨机房部署）
+        └── rack（机架，电力/网络隔离）
+            └── host（主机）
+                └── osd（磁盘）
+
+设计要点：
+  1. 每层故障域必须有足够数量（如 3 个 rack）
+  2. 副本数 ≤ 故障域数量（3 副本至少 3 个 rack）
+  3. 避免 all-in-one-host：副本不放同一节点
+```
+
+```bash
+# 创建 CRUSH 层级
+ceph osd crush add-bucket zone1 zone
+ceph osd crush add-bucket rack1 rack
+ceph osd crush move rack1 zone=zone1
+ceph osd crush move host1 rack=rack1
+
+# 创建自定义规则（3副本跨机架）
+ceph osd crush rule create-replicated rack_aware default rack
+
+# 验证规则
+ceph osd crush rule dump rack_aware
+```
+
+### CRUSH 规则实操示例
+
+| 场景 | 规则配置 | 说明 |
+|------|----------|------|
+| 跨机架容灾 | `step chooseleaf firstn 3 type rack` | 3副本分别在不同机架 |
+| 跨可用区 | `step chooseleaf firstn 2 type zone` | 2副本跨AZ |
+| 单机架高密 | `step chooseleaf firstn 3 type host` | 3副本跨主机 |
+| 混合故障域 | `step take root` + `step chooseleaf firstn 3 type rack` | 全局选机架 |
+
+## Ceph Pool 配置最佳实践
+
+### PG 数计算与 CRUSH 规则
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| pg_num | OSD × 100 / 副本数 | 向上取 2 的幂 |
+| pgp_num | 等于 pg_num | PGP = PG 的物理映射 |
+| size | 3 | 生产最少 3 副本 |
+| min_size | 2 | 降级运行阈值 |
+| crush_rule | 自定义规则 | 按故障域设计 |
+
+```bash
+# Pool 配置最佳实践
+ceph osd pool create data 1024 1024 replicated rack_aware
+ceph osd pool set data size 3
+ceph osd pool set data min_size 2
+ceph osd pool set data pg_autoscale_mode on
+ceph osd pool set data target_size_ratio 0.8
+
+# EC 策略（归档场景）
+ceph osd pool create archive 128 128 erasure
+ceph osd pool set archive k 8
+ceph osd pool set archive m 3
+```
+
+### EC 策略选择
+
+| 策略 | 空间效率 | 计算开销 | 适用 |
+|------|----------|----------|------|
+| 3 副本 | 33% | 低 | 默认（热数据） |
+| EC 4+2 | 66% | 中 | 温数据 |
+| EC 8+3 | 73% | 高 | 冷数据归档 |
+| EC 12+4 | 75% | 极高 | 超大规模归档 |
+
+## Ceph RBD 缓存配置
+
+### writeback/writethrough/readahead
+
+```
+RBD 缓存模式：
+  writethrough：写操作同时写缓存和磁盘（安全但慢）
+  writeback：写操作先写缓存，异步刷盘（快但有丢数据风险）
+  readahead：预读策略，提升顺序读性能
+
+配置：
+  rbd cache = true              # 启用客户端缓存
+  rbd cache size = 67108864     # 缓存大小 64MB
+  rbd cache max dirty = 33554432  # 脏数据上限 32MB
+  rbd cache target dirty = 16777216  # 脏数据目标 16MB
+  rbd cache writethrough until flush = true  # 首次写用 writethrough
+```
+
+| 模式 | 写性能 | 数据安全 | 适用 |
+|------|--------|----------|------|
+| writethrough | 中 | 高（不丢数据） | 数据库/事务场景 |
+| writeback | 高 | 中（可能丢缓存） | 虚拟机/非关键数据 |
+| disabled | 低 | 最高 | 极端安全要求 |
+
+## CephFS MDS 调优
+
+### mds_cache_memory_limit / mds_log_max_segments
+
+```ini
+# MDS 调优配置
+[mds]
+mds_cache_memory_limit = 4294967296  # 4GB 元数据缓存上限
+mds_log_max_segments = 128           # 日志最大段数
+mds_max_file_renames = 16384         # 最大并行重命名数
+mds_max_bgdcache_ratio = 0.5         # 后台缓存清理比例
+
+# MDS 内存管理
+mds_cache_memory_limit = 数据集大小 × 0.5
+# 如 100GB 文件系统 → 50GB MDS 缓存
+```
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| mds_cache_memory_limit | 1GB | 数据集 50% | 元数据缓存上限 |
+| mds_log_max_segments | 128 | 64~256 | 日志段数 |
+| mds_max_file_renames | 16384 | 按需 | 并发重命名 |
+| mds_max_mds | 1 | 按集群规模 | MDS 实例数 |
+
+## Ceph 监控
+
+### ceph -s / ceph osd perf / ceph df
+
+```bash
+# 集群状态
+ceph -s
+ceph health detail
+
+# OSD 性能
+ceph osd perf
+ceph osd df
+ceph osd df tree
+
+# 容量使用
+ceph df
+ceph df detail
+
+# PG 状态
+ceph pg stat
+ceph pg dump_stuck unclean
+
+# 监控关键指标
+ceph perf dump   # 所有性能计数器
+ceph mgr dump    # MGR 状态
+```
+
+### 监控告警配置
+
+| 指标 | 阈值 | 告警级别 |
+|------|------|----------|
+| OSD down | > 0 | Critical |
+| PG degraded | > 0 | Critical |
+| 磁盘使用率 | > 80% | Warning |
+| OSD 延迟 | > 10ms | Warning |
+| 集群健康 | != HEALTH_OK | Warning |
+
+## Ceph 常见故障排查
+
+### OSD down / PG degraded / slow ops
+
+| 故障 | 现象 | 排查步骤 | 处理 |
+|------|------|----------|------|
+| OSD down | 单 OSD 红 | `ceph osd tree` 看状态 | 检查磁盘 → 重启 OSD |
+| PG degraded | PG 状态降级 | `ceph pg stat` | 等待自动恢复 / 手动修复 |
+| slow ops | 操作延迟高 | `ceph daemon osd.X bench` | 检查磁盘 IO / 网络 |
+| MON 失联 | 多数 MON 不可用 | `ceph mon stat` | 恢复 MON（先恢复多数） |
+| 磁盘满 | OSD 近满告警 | `ceph osd df` | 扩容 / 清理 / 调权重 |
+
+```bash
+# 故障排查 SOP
+# 1. 检查集群状态
+ceph health detail
+ceph -s
+
+# 2. 检查 OSD 状态
+ceph osd tree
+ceph osd perf
+
+# 3. 检查 PG 状态
+ceph pg stat
+ceph pg dump_stuck unclean
+
+# 4. 检查慢操作
+ceph daemon osd.0 dump_ops_in_flight
+
+# 5. 检查网络
+ceph daemon osd.0 bench
+```
+
 ## 与其他板块的关系
 
 - 对象存储对比见「[对象存储 MinIO/OSS](./对象存储MinIO-OSS.md)」；

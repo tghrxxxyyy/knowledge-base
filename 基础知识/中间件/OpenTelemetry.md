@@ -1125,7 +1125,241 @@ function handleUserAction() {
 }
 ```
 
-## 十二、与其他板块的关系
+## OpenTelemetry Collector 配置详解
+
+### receivers / processors / exporters
+
+```yaml
+# Collector 完整配置
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'my-app'
+          static_configs:
+            - targets: ['localhost:8080']
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+  memory_limiter:
+    limit_mib: 512
+    spike_limit_mib: 128
+  attributes:
+    actions:
+      - key: environment
+        value: production
+        action: upsert
+  probabilistic_sampler:
+    sampling_percentage: 10
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: false
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  logging:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [batch]
+      exporters: [prometheus]
+```
+
+## Resource Attributes 资源属性
+
+### service.name / deployment.environment / 公共属性
+
+```
+Resource Attributes：
+  标识产生遥测数据的来源
+  所有信号（traces/metrics/logs）共享
+
+常用属性：
+  service.name = my-service
+  service.version = 1.0.0
+  service.namespace = production
+  deployment.environment = production
+  host.name = server-1
+  k8s.pod.name = my-pod-abc
+  k8s.namespace.name = default
+
+设置方式：
+  1. 环境变量
+    OTEL_RESOURCE_ATTRIBUTES=service.name=my-service,service.version=1.0.0
+
+  2. SDK 配置
+    Resource.getDefault()
+      .merge(Resource.create(Attributes.of(
+        AttributeKey.stringKey("service.name"), "my-service"
+      )))
+
+  3. Collector processor
+    attributes:
+      actions:
+        - key: service.name
+          value: my-service
+          action: insert
+```
+
+## Context Propagation 上下文传播
+
+### W3C TraceContext / B3 / Baggage
+
+```
+W3C TraceContext（推荐）：
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+  格式：version-traceid-spanid-traceflags
+  tracestate: vendor1=value1
+
+B3（Zipkin）：
+  X-B3-TraceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  X-B3-SpanId: 00f067aa0ba902b7
+
+Baggage（键值对传递）：
+  baggage: userId=123, sessionId=abc
+
+配置：
+  # Collector
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          include_metadata: true
+
+  # SDK
+  SdkTracerProvider.builder()
+    .setPropagators(ContextPropagators.create(
+      TextMapPropagator.composite(
+        W3CTraceContextPropagator.getInstance(),
+        W3CBaggagePropagator.getInstance()
+      )
+    ))
+```
+
+## 后端集成配置
+
+### Jaeger / Prometheus / Grafana Tempo
+
+```yaml
+# Jaeger 集成
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger-collector:4317
+    tls:
+      cert_file: /certs/jaeger.crt
+      key_file: /certs/jaeger.key
+
+# Prometheus 集成
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: otel
+    const_labels:
+      env: production
+
+# Grafana Tempo 集成
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+# Loki 集成（日志）
+exporters:
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+```
+
+## SDK Auto-Instrumentation 自动埋点
+
+### Java Agent / Python Agent / 零代码
+
+```
+Java Agent：
+  -javaagent:opentelemetry-javaagent.jar
+  -Dotel.service.name=my-service
+  -Dotel.exporter.otlp.endpoint=http://collector:4317
+
+  支持框架：
+    Spring Boot / WebFlux / gRPC / Kafka
+    HTTP Client / JDBC / Redis
+    零代码自动埋点
+
+Python Agent：
+  pip install opentelemetry-distro
+  opentelemetry-bootstrap -a install
+  opentelemetry-instrument python app.py
+
+  支持框架：
+    Flask / Django / FastAPI
+    Requests / psycopg2 / redis
+
+零代码原理：
+  Agent 修改字节码（Java）或猴子补丁（Python）
+  自动拦截框架调用
+  自动创建 Span（方法入口/出口）
+  自动注入 Context（HTTP Header）
+```
+
+## 采样策略详解
+
+### Head-based / Tail-based / Adaptive
+
+```
+Head-based Sampling（头部采样）：
+  在请求入口决定是否采样
+  优点：简单，低开销
+  缺点：可能丢失异常请求
+
+  配置：
+    probabilistic_sampler:
+      sampling_percentage: 10  # 采样 10%
+
+Tail-based Sampling（尾部采样）：
+  在请求结束后决定是否采样
+  优点：保留异常/慢请求
+  缺点：需要缓存（内存开销大）
+
+  配置：
+    tail_sampling:
+      decision_wait: 5s
+      policies:
+        - name: errors
+          type: status_code
+          status_code: {status_codes: [ERROR]}
+        - name: slow
+          type: latency
+          latency: {threshold_ms: 1000}
+
+Adaptive Sampling（自适应采样）：
+  根据 QPS 动态调整采样率
+  高 QPS → 低采样率
+  低 QPS → 高采样率
+  适用：流量波动大的服务
+```
+
+| 策略 | 内存开销 | 准确性 | 适用 |
+|------|----------|--------|------|
+| Head-based | 低 | 中 | 默认 |
+| Tail-based | 高 | 高 | 核心服务 |
+| Adaptive | 中 | 高 | 流量波动 |
 
 - 链路追踪见「[Jaeger 链路追踪](./Jaeger链路追踪.md)」与「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；
 - 监控指标见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；

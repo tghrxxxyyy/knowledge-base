@@ -1097,6 +1097,234 @@ ES 容量规划公式：
 └──────────────┴────────────────────────────────────────────────┘
 ```
 
+## Index Lifecycle Management (ILM)
+
+### Hot / Warm / Cold / Delete
+
+```
+ILM 阶段：
+  Hot（热数据）：写入节点，SSD，高性能
+  Warm（温数据）：只读，HDD，压缩存储
+  Cold（冷数据）：归档，高密度存储
+  Delete（删除）：自动清理过期数据
+
+Policy 配置示例：
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_size": "50GB",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+| 阶段 | 存储 | 副本 | 说明 |
+|------|------|------|------|
+| Hot | SSD | 1-2 | 写入+查询 |
+| Warm | HDD | 1 | 只读+压缩 |
+| Cold | 归档存储 | 0 | 低频访问 |
+| Delete | - | - | 自动清理 |
+
+## Index Alias 灵活切换
+
+### alias / reindex / zero-downtime migration
+
+```json
+// 创建别名
+PUT /logs-2026-01
+{
+  "aliases": {
+    "logs": {
+      "is_write_index": true
+    },
+    "logs-readonly": {}
+  }
+}
+
+// 零停机迁移：reindex 到新索引 + 切换别名
+POST /_reindex
+{
+  "source": { "index": "logs-2026-01" },
+  "dest": { "index": "logs-2026-02" }
+}
+
+POST /_aliases
+{
+  "actions": [
+    { "remove": { "index": "logs-2026-01", "alias": "logs" } },
+    { "add":    { "index": "logs-2026-02", "alias": "logs" } }
+  ]
+}
+```
+
+## Replica 与 Shard 策略
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| number_of_shards | 主分片数 | 50GB/分片，固定后不可改 |
+| number_of_replicas | 副本数 | 生产至少 1，读多调大 |
+| auto_expand_replicas | 自动扩展副本 | `"0-all"` 跨所有节点 |
+
+```json
+// 动态调整副本（读压力大时）
+PUT /logs/_settings
+{
+  "number_of_replicas": 2
+}
+
+// 自动扩展副本
+PUT /logs/_settings
+{
+  "index.auto_expand_replicas": "1-5"
+}
+```
+
+## Scripted Fields 与 Painless
+
+```json
+// Painless 脚本字段
+PUT /logs/_search
+{
+  "script_fields": {
+    "response_time_ms": {
+      "script": {
+        "source": "doc['response_time'].value * 1000",
+        "lang": "painless"
+      }
+    },
+    "status_category": {
+      "script": {
+        "source": """
+          def code = doc['status_code'].value;
+          if (code < 300) return 'success';
+          else if (code < 500) return 'client_error';
+          else return 'server_error';
+        """,
+        "lang": "painless"
+      }
+    }
+  }
+}
+
+// 运行时字段（不修改 mapping）
+GET /logs/_search
+{
+  "runtime_fields": {
+    "response_time_sec": {
+      "type": "double",
+      "script": {
+        "source": "emit(doc['response_time'].value / 1000.0)"
+      }
+    }
+  }
+}
+```
+
+## Cross-Cluster Replication (CCR)
+
+### 异地容灾 / 读写分离
+
+```
+CCR 架构：
+  Leader 集群：主集群（写入）
+  Follower 集群：备份集群（只读）
+  异步复制（最终一致）
+
+配置步骤：
+  1. Leader 集群配置 remote cluster
+  PUT /_cluster/settings
+  {
+    "persistent": {
+      "cluster.remote.leader_cluster.seed": "leader-node:9300"
+    }
+  }
+
+  2. Follower 集群创建 follower index
+  PUT /logs-follower
+  {
+    "settings": {
+      "index.remote_cluster": "leader_cluster",
+      "index.leader_index": "logs"
+    }
+  }
+
+  3. 检查复制状态
+  GET /_cat/indices/logs-follower?v&h=index,health,prirep,docs.count
+```
+
+## Index Templates 与 Data Streams
+
+```json
+// Index Templates
+PUT /_index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" },
+        "level": { "type": "keyword" }
+      }
+    }
+  },
+  "priority": 100
+}
+
+// Data Streams（推荐日志场景）
+PUT /_index_template/logs-ds-template
+{
+  "index_patterns": ["logs-ds-*"],
+  "data_stream": {},
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "logs-policy"
+    }
+  }
+}
+
+// 使用 Data Stream
+POST /logs-ds-create/_doc
+{
+  "@timestamp": "2026-01-15T10:00:00Z",
+  "message": "User logged in",
+  "level": "INFO"
+}
+```
+
 ## 十三、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
 
 - **集群变红（Red）**：`GET _cluster/health` 看 `status=red`（主分片未分配）。排查：`GET _cat/indices?v&health=red` 定位红索引；`GET _cluster/allocation/explain` 看分片未分配原因（最常见：磁盘水位、节点离线、分片数超限）。红通常意味着有主分片丢失、数据可能已损，优先恢复节点而非强制分配（强制分配空分片会丢数据）。

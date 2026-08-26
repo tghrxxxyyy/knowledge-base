@@ -1123,7 +1123,155 @@ KStream<String, User> stream = builder.stream("users",
 | 类型变更 | 迁移工具 | Connect SMT |
 | 格式切换 | 双写过渡 | 并行生产 |
 
-## 九、与其他板块的关系
+## Schema Registry 集群部署
+
+### 主从同步 / 高可用 / 性能
+
+```
+集群部署模式：
+
+单实例（开发）：
+  一个 Schema Registry 进程
+  无高可用
+  适用：开发/测试
+
+主从集群（生产）：
+  1 主 + N 从
+  主处理写入，从处理读取
+  读写分离，提升性能
+
+KRaft 模式（Confluent 7.0+）：
+  无 ZooKeeper 依赖
+  Schema Registry 自身用 KRaft 选主
+  更轻量/更简单
+
+高可用配置：
+  schema.registry.replication.factor=3
+  → 3 个副本
+  → 主故障时从节点自动提升
+
+性能优化：
+  1. 读缓存：Schema 本地缓存（减少查询延迟）
+  2. 批量查询：批量获取 Schema（减少网络开销）
+  3. 异步注册：异步注册 Schema（减少写入延迟）
+```
+
+## Schema 兼容性规则
+
+### BACKWARD / FORWARD / FULL / NONE
+
+| 兼容性 | 说明 | 允许操作 | 适用 |
+|--------|------|----------|------|
+| BACKWARD | 新消费者读旧数据 | 删除字段/添加可选字段 | 默认推荐 |
+| FORWARD | 旧消费者读新数据 | 添加字段/删除可选字段 | 消费者版本多样 |
+| FULL | 双向兼容 | 添加/删除可选字段 | 严格兼容 |
+| NONE | 不检查 | 任意操作 | 开发/测试 |
+
+```bash
+# 检查兼容性
+curl -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"schema": "..."}' \
+  http://localhost:8081/compatibility/subjects/user-value/versions/latest
+
+# 设置兼容性级别
+curl -X PUT -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"compatibility": "BACKWARD"}' \
+  http://localhost:8081/config/user-value
+
+# 全局兼容性级别
+curl -X PUT -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  --data '{"compatibility": "BACKWARD"}' \
+  http://localhost:8081/config
+```
+
+## Schema 版本管理
+
+### 自动递增 / 手动指定 / 版本回滚
+
+```
+版本管理策略：
+
+自动递增（默认）：
+  每次注册新 Schema → 版本号 +1
+  POST /subjects/user-value/versions
+  → 返回版本号
+
+手动指定：
+  POST /subjects/user-value/versions
+  {"schema": "...", "version": 100}
+  → 用于迁移/特殊场景
+
+版本回滚：
+  PUT /subjects/user-value/versions/latest
+  → 回滚到上一版本
+
+查看历史：
+  GET /subjects/user-value/versions
+  → 返回所有版本列表
+
+删除版本：
+  DELETE /subjects/user-value/versions/2
+  → 删除指定版本（谨慎！）
+```
+
+## Kafka Connect 与 Flink 集成
+
+### Serde / Schema 同步
+
+```
+Kafka Connect 集成：
+  Source Connector：从数据库读取 → 写入 Kafka
+    使用 Schema Registry 自动同步 Schema
+    Debezium：CDC + Schema Registry
+
+  Sink Connector：从 Kafka 读取 → 写入目标
+    自动使用 Schema Registry 解码
+    目标：ES/Redis/HDFS
+
+Flink 集成：
+  Kafka Source/Sink：
+    FlinkKafkaConsumer
+    .setSchemaRegistryConfig(config)
+
+  Avro 序列化：
+    SpecificAvroSerde
+    .registerType(User.class)
+
+  JSON 序列化：
+    JSONSchemaRegistryAvroSerde
+    → 自动注册/获取 Schema
+```
+
+## Schema Evolution 最佳实践
+
+### 字段变更策略 / 兼容性保证
+
+```
+Schema 演进策略：
+
+安全操作（BACKWARD 兼容）：
+  1. 添加可选字段（有默认值）
+  2. 删除字段（有默认值）
+  3. 重命名字段（别名机制）
+
+危险操作（不兼容）：
+  1. 添加必填字段（无默认值）
+  2. 删除字段（无默认值）
+  3. 修改字段类型
+
+最佳实践：
+  1. 所有字段加默认值（Optional）
+  2. 字段只增不删（废弃标记而非删除）
+  3. 类型只升级不降级（int → long）
+  4. 使用 @deprecated 注解标记废弃字段
+  5. 版本间保持兼容（至少 N-1 版本）
+
+迁移流程：
+  1. 新版本 Schema 兼容旧版本
+  2. 部署新版本消费者
+  3. 部署新版本生产者
+  4. 下线旧版本
+```
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；
 - Kafka Streams/ksqlDB（Serde 集成）见「[Kafka Streams 与 ksqlDB](./KafkaStreams与ksqlDB.md)」；
