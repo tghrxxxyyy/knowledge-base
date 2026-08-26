@@ -829,6 +829,295 @@ Prometheus Operator 架构：
                 summary: "高错误率告警"
 ```
 
+## Prometheus 标签最佳实践
+
+### 标签命名规范
+
+| 规则 | 正确示例 | 错误示例 |
+|------|---------|---------|
+| 使用 snake_case | `http_requests_total` | `httpRequestsTotal` |
+| 以 `_total` 结尾（Counter） | `requests_total` | `requests` |
+| 以 `_seconds` 结尾（Duration） | `request_duration_seconds` | `request_duration_ms` |
+| 避免高基数 label | `method="GET"` | `user_id="12345"` |
+| label 值有限枚举 | `status="200"` | `trace_id="abc123"` |
+
+### 高基数标签识别与治理
+
+```text
+高基数标签（High Cardinality）：
+  定义：label 值的可能取值数量过多（> 1000）
+  后果：内存暴涨、查询变慢、TSDB 膨胀
+
+  常见高基数 label：
+    user_id / customer_id / trace_id / request_id
+    session_id / transaction_id / correlation_id
+    原始 URL（含参数）/ User-Agent
+
+  治理方法：
+    1. metric_relabel_configs 丢弃高基数 label
+    2. 使用 label_replace 提取有限枚举
+    3. 将高基数数据存入追踪系统（Jaeger/Zipkin）
+    4. 监控：prometheus_tsdb_head_series 指标
+```
+
+```yaml
+# metric_relabel_configs 丢弃高基数 label
+scrape_configs:
+  - job_name: 'my-app'
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'http_requests_total'
+        target_label: trace_id
+        action: labeldrop
+      - source_labels: [user_id]
+        regex: '.*'
+        action: labeldrop
+```
+
+## Recording Rules 编写模式
+
+### 聚合规则模式
+
+```yaml
+groups:
+  - name: aggregation_rules
+    interval: 30s
+    rules:
+      # 模式1：多维度聚合
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      
+      # 模式2：预计算分位数
+      - record: instance:request_duration:p99
+        expr: |
+          histogram_quantile(0.99, 
+            sum by (instance, le) (rate(http_request_duration_seconds_bucket[5m])))
+      
+      # 模式3：多级录制（依赖其他 recording rule）
+      - record: job:request_duration:p99:rate5m
+        expr: avg by (job) (instance:request_duration:p99)
+```
+
+### 预计算模式对比
+
+| 模式 | 适用场景 | 示例 | 优点 |
+|------|---------|------|------|
+| 聚合预计算 | 高频查询 | `sum by (job) (rate(...))` | 查询快、资源省 |
+| 分位数预计算 | P99/P95 延迟 | `histogram_quantile(0.99, ...)` | 避免重复计算 |
+| 多级录制 | 复杂派生指标 | 依赖其他 recording rule | 模块化、易维护 |
+| 时间窗口预计算 | 多时间窗口查询 | `avg_over_time(...[1h])` | 灵活查询 |
+
+### Recording Rule 最佳实践
+
+```text
+Recording Rule 设计原则：
+  1. 输出非高基数：rule 输出的 series 数量受控
+  2. 命名规范：{输出指标}:{输入指标}:{操作}
+     示例：job:http_requests:rate5m
+  3. 独立 rule group：避免一个 group 太大
+  4. 合理 interval：interval ≥ scrape_interval
+  5. 监控 rule 执行耗时：prometheus_rule_group_duration_seconds
+```
+
+## Alerting Rules 最佳实践
+
+### SLO Burn Rate 告警
+
+```yaml
+# SLO Burn Rate 告警（基于错误预算）
+groups:
+  - name: slo_alerts
+    rules:
+      # 5 分钟窗口，burn rate > 14.4x（1% SLO 的 5 分钟预算）
+      - alert: HighErrorBudgetBurn_5m
+        expr: |
+          (
+            1 - sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m]))
+          ) > 14.4 * 0.01
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "5 分钟窗口错误预算消耗过快"
+      
+      # 1 小时窗口，burn rate > 3x
+      - alert: HighErrorBudgetBurn_1h
+        expr: |
+          (
+            1 - sum(rate(http_requests_total{status=~"5.."}[1h]))
+            / sum(rate(http_requests_total[1h]))
+          ) > 3 * 0.01
+        for: 15m
+        labels:
+          severity: warning
+```
+
+### 多窗口告警策略
+
+```text
+多窗口告警（Multi-Window Alert）：
+  短窗口：快速检测突发问题（5m）
+  长窗口：确认趋势持续（1h）
+  组合条件：短窗口 AND 长窗口 同时触发
+
+  优势：
+    - 减少误报：短窗口告警需长窗口确认
+    - 检测灵敏：短窗口快速发现异常
+    - 趋势确认：长窗口过滤瞬时抖动
+```
+
+```yaml
+# 多窗口告警示例
+groups:
+  - name: multi_window_alerts
+    rules:
+      # 短窗口：5 分钟错误率 > 5%
+      - alert: HighErrorRate_5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(http_requests_total[5m])) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+      
+      # 长窗口：1 小时错误率 > 1%
+      - alert: HighErrorRate_1h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1h]))
+          / sum(rate(http_requests_total[1h])) > 0.01
+        for: 15m
+        labels:
+          severity: critical
+```
+
+## Thanos Store Gateway 内部原理
+
+### Store Gateway 架构
+
+```text
+Thanos Store Gateway 架构：
+┌─────────────────────┐    ┌─────────────────────┐    ┌──────────────┐
+│  对象存储 S3/GCS    │ ←  │  Store Gateway      │ ←  │  Thanos Query│
+│  (长期数据)         │    │  (缓存层)           │    │  (全局查询)  │
+└─────────────────────┘    └─────────────────────┘    └──────────────┘
+                                  │
+                                  ├── Index Cache（索引缓存）
+                                  ├── Chunk Pool（数据块池）
+                                  └── Metadata Cache（元数据缓存）
+```
+
+### 缓存策略
+
+| 缓存类型 | 内容 | 大小建议 | 作用 |
+|---------|------|---------|------|
+| **Index Cache** | 倒排索引 | 500MB-2GB | 加速标签查询 |
+| **Chunk Pool** | 压缩数据块 | 2-8GB | 减少对象存储读取 |
+| **Metadata Cache** | block meta.json | 100-500MB | 减少元数据请求 |
+
+```yaml
+# Store Gateway 配置
+storegateway:
+  - --data-dir=/data
+  - --objstore.config-file=/etc/thanos/s3.yml
+  - --index-cache-size=500MB
+  - --chunk-pool-size=2GB
+  - --sync-interval=3m
+  - --min-time=-2w
+```
+
+## Thanos Compactor 调优
+
+### 降采样策略
+
+```text
+Thanos Compactor 降采样：
+  原始数据：保留 30 天（resolution-raw）
+  5 分钟降采样：保留 90 天（resolution-5m）
+  1 小时降采样：保留 365 天（resolution-1h）
+
+  降采样作用：
+    - 减少存储空间：1h 块比 raw 块小 10-100 倍
+    - 加速长期查询：查询 1 年数据用 1h 块
+    - 降低成本：对象存储费用减少
+```
+
+```yaml
+# Compactor 配置
+compactor:
+  - --data-dir=/data
+  - --objstore.config-file=/etc/thanos/s3.yml
+  - --retention.resolution-raw=30d
+  - --retention.resolution-5m=90d
+  - --retention.resolution-1h=365d
+  - --compact.resolution-interval=1h
+  - --downsample.resolution-interval=1h
+```
+
+### 块合并与资源限制
+
+```text
+Compactor 资源调优：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 参数                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ --compact.concurrency│ 并发合并块数（默认 1）                      │
+│ --downsample.concurrency │ 并发降采样数（默认 1）               │
+│ --compaction-interval │ 合并间隔（默认 30m）                       │
+│ --retention.resolution-raw │ 原始数据保留期                      │
+│ --delete-delay       │ 删除延迟（等待一致性检查）                  │
+└──────────────────────┴────────────────────────────────────────────┘
+
+调优建议：
+  1. 大规模集群：增大 --compact.concurrency=4
+  2. 对象存储限流：降低 --compaction-interval=1h
+  3. 存储成本：缩短 --retention.resolution-raw=15d
+  4. 监控：thanos_compact_group_compactions_total
+```
+
+## Prometheus 容量规划公式
+
+### 容量计算公式
+
+```text
+存储容量计算：
+  每样本大小 = 1-2 字节（压缩后）
+  日写入量 = 活跃 series 数 × 每秒采样点数 × 86400
+  日存储 = 日写入量 × 每样本大小
+  
+  示例：
+    活跃 series = 100 万
+    scrape_interval = 15s → 每秒采样点 = 100万/15 ≈ 66666
+    日写入量 = 66666 × 86400 ≈ 57.6 亿样本
+    日存储 = 57.6亿 × 2B ≈ 11.5 GB/天（压缩后）
+    
+  月存储 = 日存储 × 保留天数
+    = 11.5 GB × 30 天 = 345 GB
+```
+
+### 容量规划对照表
+
+| 活跃 series | scrape_interval | 日写入量 | 日存储 | 月存储（30d） |
+|------------|----------------|---------|-------|--------------|
+| 10 万 | 15s | 5760 万 | 1.15 GB | 34.5 GB |
+| 50 万 | 15s | 2.88 亿 | 5.75 GB | 172.5 GB |
+| 100 万 | 15s | 5.76 亿 | 11.5 GB | 345 GB |
+| 200 万 | 15s | 11.52 亿 | 23 GB | 690 GB |
+| 500 万 | 15s | 28.8 亿 | 57.6 GB | 1.73 TB |
+
+### 容量规划建议
+
+```text
+Prometheus 容量规划 Checklist：
+  1. 计算活跃 series 数（当前 + 预估增长）
+  2. 确定 scrape_interval（15s/30s/60s）
+  3. 计算日存储需求（每样本 1-2 字节）
+  4. 确定保留期（本地 7-15 天，长期外置）
+  5. 预留 30% 冗余（compaction/WAL/索引）
+  6. 监控：prometheus_tsdb_head_series
+  7. 告警：series 数 > 80% 阈值
+```
+
 ## 十二、Prometheus 告警最佳实践
 
 ### 告警规则设计

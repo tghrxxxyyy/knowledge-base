@@ -948,6 +948,355 @@ GraalVM Native Image 最佳实践：
 5. 测试时注意 AOT 编译限制
 ```
 
+## GC 日志分析深度实战
+
+### GC 日志关键指标监控
+
+```text
+GC 日志核心指标：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 指标                  │ 健康基线                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ Young GC 频率         │ < 10次/分钟                                │
+│ Young GC 暂停时间     │ < 50ms                                     │
+│ Full GC 频率          │ < 1次/小时                                 │
+│ Full GC 暂停时间      │ < 200ms                                    │
+│ GC 时间占比           │ < 5%                                       │
+│ 内存回收效率          │ 每次 GC 回收 > 30% 使用空间                │
+│ 晋升速率              │ < 100MB/分钟                               │
+│ Humongous 分配        │ 接近 0                                     │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+### GC 日志分析工具对比
+
+| 工具 | 类型 | 特点 | 适用 |
+|------|------|------|------|
+| GCViewer | 本地 GUI | 免费、可视化好 | 开发环境 |
+| GCEasy | Web | 在线分析、报告详细 | 快速诊断 |
+| HPjmeter | 本地 GUI | IBM 出品、功能全面 | 大型应用 |
+| Garbagecat | 命令行 | 日志解析、批量分析 | 自动化 |
+| JClarity Censum | 本地 GUI | 专注低延迟分析 | ZGC/Shenandoah |
+
+```bash
+# GCViewer 分析 GC 日志
+java -jar gcviewer.jar gc.log gc-report.html
+
+# GCEasy 在线分析
+# 上传 gc.log 到 https://gceasy.io
+# 查看：GC 暂停时间、内存使用趋势、分配速率
+```
+
+## JVM 内存布局深度分析
+
+### 对象内存布局计算
+
+```java
+// 对象大小计算示例
+class User {
+    private long id;          // 8 bytes
+    private int age;          // 4 bytes
+    private boolean active;   // 1 byte
+    private String name;      // 4 bytes (引用)
+}
+
+// 对象头：12 bytes (Mark Word 8 + Klass 4)
+// 实例数据：8 + 4 + 1 + 4 = 17 bytes
+// 对齐填充：补齐到 8 的倍数 → 24 bytes
+
+// 使用 JOL (Java Object Layout) 查看
+// 依赖：org.openjdk.jol:jol-core:0.17
+```
+
+```java
+import org.openjdk.jol.info.ClassLayout;
+
+public class ObjectLayoutExample {
+    public static void main(String[] args) {
+        User user = new User();
+        System.out.println(ClassLayout.parseInstance(user).toPrintable());
+        // 输出：
+        // User object internals:
+        // OFFSET  SIZE   TYPE       DESCRIPTION
+        // 0       4      (mark)     Non-biasable; Lock: 0x00
+        // 4       4      (klass)    Instance of 'User'
+        // 8       8      long       User.id
+        // 16      4      int        User.age
+        // 20      1      boolean    User.active
+        // 21      3      (loss due to alignment)
+        // Total size: 24 bytes
+    }
+}
+```
+
+### TLAB 调优参数
+
+```text
+TLAB（Thread Local Allocation Buffer）调优：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 参数                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ -XX:+UseTLAB         │ 启用 TLAB（默认开启）                       │
+│ -XX:TLABSize         │ 初始 TLAB 大小                              │
+│ -XX:MinTLABSize      │ 最小 TLAB 大小（默认 2KB）                  │
+│ -XX:TLABRefillWasteFraction │ refill 浪费比例（默认 64）           │
+│ -XX:TLABStats        │ 启用 TLAB 统计                             │
+└──────────────────────┴────────────────────────────────────────────┘
+
+TLAB 调优建议：
+  1. 大多数情况不需要调（JVM 自动管理）
+  2. 分配速率高：增大 -XX:TLABSize
+  3. TLAB 浪费多：调整 -XX:TLABRefillWasteFraction
+  4. 监控：-XX:+PrintTLAB 查看 TLAB 使用情况
+```
+
+## JIT 编译优化深入
+
+### C1/C2 编译器对比
+
+```text
+C1（Client Compiler）优化：
+  - 方法内联（Inlining）
+  - 去虚拟化（Devirtualization）
+  - 冗余消除（Dead Code Elimination）
+  - 基本逃逸分析（Escape Analysis）
+
+C2（Server Compiler）优化：
+  - 循环展开（Loop Unrolling）
+  - 标量替换（Scalar Replacement）
+  - 栈上分配（Stack Allocation）
+  - 内存屏障消除（Memory Barrier Elimination）
+  - 向量化（SIMD Vectorization）
+
+Graal JIT 优化（实验性）：
+  - 更激进的内联策略
+  - 更好的逃逸分析
+  - 部分场景超越 C2
+```
+
+```bash
+# 查看 JIT 编译决策
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -jar app.jar
+
+# 查看内联决策
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining -jar app.jar
+
+# 查看生成的汇编代码
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly -jar app.jar
+
+# 使用 JITWatch 可视化
+# 下载 JITWatch，加载 compilation.log
+```
+
+### JIT 编译阈值调优
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-XX:CompileThreshold` | 10000 | 方法调用次数触发编译 |
+| `-XX:OnStackReplacePercentage` | 140 | OSR 触发阈值 |
+| `-XX:+TieredCompilation` | true | 分层编译（推荐开启） |
+| `-XX:TieredStopAtLevel` | 4 | 分层编译层级 |
+
+## JVM Crash 分析步骤
+
+### hs_err_pid.log 解读
+
+```text
+hs_err_pid<>.log 关键部分：
+┌──────────────────────────┬──────────────────────────────────────────┐
+│ 部分                      │ 说明                                     │
+├──────────────────────────┼──────────────────────────────────────────┤
+│ # A fatal error          │ 错误摘要（信号类型、原因）                │
+│ siginfo                  │ 信号详情（SIGSEGV/SIGFPE 等）            │
+│ Registers                │ CPU 寄存器状态                            │
+│ Stack                    │ 栈空间信息（栈大小、剩余空间）            │
+│ Java Threads             │ 所有 Java 线程状态                        │
+│ Memory Map               │ 内存映射（排查 JNI 问题）                │
+│ VM Arguments             │ JVM 启动参数                              │
+└──────────────────────────┴──────────────────────────────────────────┘
+```
+
+```bash
+# JVM Crash 分析步骤
+# 1. 查看信号类型
+grep "siginfo" hs_err_pid*.log
+
+# 2. 检查 JVM 版本已知 Bug
+# https://bugs.openjdk.org/ 搜索 crash 信息
+
+# 3. 检查 JNI 代码问题
+grep -A 5 "Java frames" hs_err_pid*.log
+
+# 4. 检查内存映射
+grep "Memory Map" hs_err_pid*.log
+
+# 5. 升级 JVM 到最新补丁版本
+```
+
+## 容器环境调优最佳实践
+
+### MaxRAMPercentage 使用指南
+
+```bash
+# 容器环境推荐 JVM 参数
+java \
+  -XX:MaxRAMPercentage=75.0 \
+  -XX:InitialRAMPercentage=50.0 \
+  -XX:+UseContainerSupport \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -Xlog:gc*:file=/var/log/gc.log:time,uptime,level,tags:filecount=10,filesize=50m \
+  -jar app.jar
+```
+
+```text
+MaxRAMPercentage 计算：
+  容器 limit = 2GB
+  MaxRAMPercentage = 75%
+  JVM 堆大小 = 2GB × 75% = 1.5GB
+  剩余 = 2GB - 1.5GB = 500MB（用于 Metaspace/线程栈/NIO 堆外内存）
+
+常见错误：
+  - MaxRAMPercentage=90%：OS/page cache 没空间，可能 OOM
+  - MaxRAMPercentage=50%：内存浪费，性能下降
+  - 不设置 MaxRAMPercentage：JVM 默认使用 25%（JDK 8）或 50%（JDK 11+）
+```
+
+### 容器环境 JVM 参数对比
+
+| 参数 | JDK 8 | JDK 11+ | JDK 17+ |
+|------|-------|---------|---------|
+| `-XX:+UseContainerSupport` | 需手动开启 | 默认开启 | 默认开启 |
+| `-XX:MaxRAMPercentage` | 不支持 | 支持 | 支持 |
+| `-XX:InitialRAMPercentage` | 不支持 | 支持 | 支持 |
+| `-XX:+UseG1GC` | 手动开启 | 默认 | 默认 |
+| `-XX:+UseZGC` | 不支持 | 实验性 | 生产可用 |
+
+## ZGC/Shenandoah 调优实战
+
+### ZGC 调优参数详解
+
+```bash
+# ZGC 分代模式（JDK21+ 推荐）
+-XX:+UseZGC
+-XX:+ZGenerational
+
+# ZGC 内存控制
+-XX:SoftMaxHeapSize=N        # 软限制，ZGC 尽量不超过
+-XX:ZAllocationSpikeTolerance=2.0  # 分配尖峰容忍度
+
+# ZGC 并发控制
+-XX:ConcGCThreads=N          # 并发 GC 线程数
+-XX:ZCollectionInterval=5    # 主动 GC 间隔（秒）
+
+# ZGC NUMA 感知（多路 CPU）
+-XX:+UseNUMA
+```
+
+```text
+ZGC 调优要点：
+  1. 不需要调 Region 大小（ZGC 自动管理）
+  2. 不需要调 -Xmn（ZGC 自动分代）
+  3. 重点调 -XX:SoftMaxHeapSize 控制内存使用
+  4. 监控：-Xlog:gc* 查看 GC 日志
+  5. 停顿目标：ZGC 停顿 < 1ms，与堆大小无关
+```
+
+### Shenandoah 调优参数详解
+
+```bash
+# Shenandoah 启发式策略
+-XX:+UseShenandoahGC
+-XX:ShenandoahGCHeuristics=adaptive  # 启发式策略
+-XX:ShenandoahMinFreeThreshold=10    # 最小空闲比例触发 GC
+
+# Shenandoah GC 间隔
+-XX:ShenandoahGuaranteedGCInterval=300000  # 保证 GC 间隔（ms）
+-XX:ShenandoahUncommitDelay=3000     # 内存归还延迟（ms）
+
+# Shenandoah 并发控制
+-XX:ConcGCThreads=N          # 并发 GC 线程数
+```
+
+```text
+ZGC vs Shenandoah 调优对比：
+┌──────────────────────┬──────────────────────┬──────────────────────┐
+│ 维度                  │ ZGC                  │ Shenandoah           │
+├──────────────────────┼──────────────────────┼──────────────────────┤
+│ 停顿时间              │ < 1ms               │ < 10ms               │
+│ 堆大小支持            │ TB 级                │ 数百 GB              │
+│ 分代模型              │ JDK21+ 支持         │ 非分代               │
+│ NUMA 感知            │ 支持                 │ 不支持               │
+│ 调优复杂度            │ 低（自动管理）       │ 中（需调启发式）     │
+│ 生产选择              │ 优先（官方支持）     │ Red Hat 环境         │
+└──────────────────────┴──────────────────────┴──────────────────────┘
+```
+
+## async-profiler/JFR 性能剖析实操
+
+### async-profiler 使用指南
+
+```bash
+# CPU profiling（采样 30 秒）
+./profiler.sh -d 30 -f cpu_profile.html <pid>
+
+# 内存分配 profiling
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# Wall-clock profiling（含阻塞时间）
+./profiler.sh -d 30 -e wall -f wall_profile.html <pid>
+
+# 火焰图分析
+# - 纵轴：调用栈深度
+# - 横轴：采样比例（越宽 = CPU 时间越多）
+# - 找"宽"的帧 = 性能瓶颈
+```
+
+```text
+async-profiler 火焰图解读：
+  纵轴：调用栈深度（从下到上）
+  横轴：采样比例（越宽 = 时间越多）
+  
+  分析要点：
+    1. 找最宽的帧（性能瓶颈）
+    2. 检查是否有不必要的方法调用
+    3. 检查是否有频繁的 GC 暂停
+    4. 检查是否有锁竞争（BLOCKED 状态）
+  
+  常见问题：
+    - 宽帧在 JDK 内部：JVM 配置问题
+    - 宽帧在业务代码：需要优化算法
+    - 宽帧在第三方库：考虑替换或优化
+```
+
+### JFR 深度分析
+
+```bash
+# 持续录制（生产低开销，< 1% CPU）
+jcmd <pid> JFR.start settings=profile duration=0 filename=recording.jfr
+
+# 事件过滤（只录制需要的事件）
+jcmd <pid> JFR.start settings=profile filename=recording.jfr \
+  jdk.GC* \
+  jdk.JavaMonitorWait \
+  jdk.LockContended
+
+# 查看 JFR 事件
+jfr summary recording.jfr
+jfr print --events jdk.GCHeapSummary recording.jfr
+```
+
+| JFR 事件类别 | 事件 | 用途 |
+|-------------|------|------|
+| GC | G1HeapSummary | 堆内存变化 |
+| GC | G1CollectionPause | GC 暂停详情 |
+| JVM | JVMInformation | JVM 版本/参数 |
+| Thread | ThreadStart/End | 线程生命周期 |
+| Method | MethodExecution | 方法执行耗时 |
+| IO | FileRead/Write | 文件 IO |
+| Socket | SocketRead/Write | 网络 IO |
+| Exception | JavaExceptionThrow | 异常统计 |
+
 ## 十七、与其他板块的关联
 
 - JVM 原理见「[Java 虚拟机](../基础知识/Java虚拟机.md)」；
