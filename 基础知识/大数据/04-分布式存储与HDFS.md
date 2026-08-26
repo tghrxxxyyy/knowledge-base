@@ -1142,6 +1142,360 @@ hdfs dfsadmin -printTopology
 </property>
 ```
 
+## 二十七、Erasure Coding 纠删码技术
+
+### 27.1 纠删码原理
+
+```text
+纠删码（Erasure Coding）原理：
+  - 将数据分成 k 个数据块
+  - 编码生成 m 个校验块
+  - 任意 k 个块可恢复原始数据
+  - 存储开销：(k+m)/k 倍（传统副本：3倍）
+
+HDFS 纠删码配置：
+  RS-6-3-1024k：6 数据块 + 3 校验块
+  存储开销：9/6 = 1.5 倍（vs 副本 3 倍）
+  容错能力：任意 3 块丢失可恢复
+```
+
+### 27.2 纠删码 vs 副本对比
+
+| 维度 | 3 副本 | RS-6-3 纠删码 |
+|------|--------|---------------|
+| 存储开销 | 3 倍 | 1.5 倍 |
+| 写入性能 | 高 | 中 |
+| 读取性能 | 高 | 中 |
+| 恢复速度 | 快 | 慢 |
+| 容错能力 | 2 节点 | 3 节点 |
+| 适用场景 | 热数据 | 冷数据/归档 |
+
+---
+
+## 二十八、HDFS 存储策略与生命周期管理
+
+### 28.1 HDFS 存储策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| HOT | 默认策略，3 副本 | 热数据 |
+| WARM | 1 副本 + 2 纠删码 | 温数据 |
+| COLD | 纠删码存储 | 冷数据 |
+| ALL_SSD | 所有副本在 SSD | 低延迟读取 |
+| ONE_SSD | 1 副本 SSD + 2 副本 HDD | 成本优化 |
+| LAZY_PERSIST | 内存写入后异步落盘 | 临时数据 |
+
+### 28.2 自动数据迁移
+
+```bash
+# 设置存储策略
+hdfs storagepolicies -setStoragePolicy -path /data/hot -policy HOT
+hdfs storagepolicies -setStoragePolicy -path /data/warm -policy WARM
+hdfs storagepolicies -setStoragePolicy -path /data/cold -policy COLD
+
+# 执行数据迁移
+hdfs mover -p /data
+
+# 配置自动迁移（hdfs-policy.xml）
+<property>
+  <name>dfs.storagepolicies.move.timeout</name>
+  <value>1800000</value> <!-- 30分钟 -->
+</property>
+```
+
+---
+
+## 二十九、HDFS Balancer 均衡器
+
+### 29.1 Balancer 工作原理
+
+```text
+HDFS Balancer 流程：
+  1. 扫描所有 DataNode 使用率
+  2. 计算集群平均使用率
+  3. 找出使用率高于/低于阈值的节点
+  4. 从高使用率节点迁移数据到低使用率节点
+  5. 重复直到达到阈值范围
+
+关键参数：
+  dfs.datanode.balance.bandwidthPerSec：迁移带宽
+  dfs.balancer.bandwidthPerSec：默认 10MB/s
+  dfs.balancer.max-size-to-move：单次最大迁移量
+```
+
+### 29.2 Balancer 调优
+
+| 参数 | 默认值 | 生产建议 | 说明 |
+|------|--------|----------|------|
+| bandwidthPerSec | 10MB/s | 100MB/s | 迁移带宽 |
+| threshold | 10% | 5% | 均衡阈值 |
+| max-size-to-move | 2GB | 10GB | 单次迁移量 |
+| iterations | 1 | 5 | 执行次数 |
+
+```bash
+# 运行 Balancer
+hdfs balancer -threshold 5 -policy datanode -D dfs.datanode.balance.bandwidthPerSec=104857600
+
+# 监控 Balancer 状态
+hdfs dfsadmin -report | grep "DFS Used%"
+```
+
+---
+
+## 三十、HDFS NameNode RPC 性能优化
+
+### 30.1 NameNode RPC 瓶颈
+
+```text
+NameNode RPC 瓶颈原因：
+  1. 单线程处理所有元数据请求
+  2. FSImage 加载/保存阻塞 RPC
+  3. 大量小文件导致元数据膨胀
+  4. 频繁的 block 操作消耗资源
+```
+
+### 30.2 NameNode 优化配置
+
+| 参数 | 默认值 | 生产建议 | 说明 |
+|------|--------|----------|------|
+| dfs.namenode.handler.count | 10 | 100 | RPC 处理线程数 |
+| dfs.namenode.service.handler.count | 10 | 100 | 服务 RPC 线程数 |
+| dfs.namenode.fs-limits.min-block-size | 1MB | 64MB | 最小块大小 |
+| dfs.namenode.fs-limits.max-blocks-per-file | 1M | 100K | 单文件最大块数 |
+
+### 30.3 NameNode 高可用配置
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.nameservices</name>
+  <value>mycluster</value>
+</property>
+<property>
+  <name>dfs.ha.namenodes.mycluster</name>
+  <value>nn1,nn2</value>
+</property>
+<property>
+  <name>dfs.namenode.rpc-address.mycluster.nn1</name>
+  <value>namenode1:8020</value>
+</property>
+<property>
+  <name>dfs.namenode.rpc-address.mycluster.nn2</name>
+  <value>namenode2:8020</value>
+</property>
+<property>
+  <name>dfs.namenode.shared.edits.dir</name>
+  <value>qjournal://journalnode1:8485;journalnode2:8485;journalnode3:8485/mycluster</value>
+</property>
+```
+
+---
+
+## 三十一、云存储替代 HDFS 方案对比
+
+### 31.1 云存储 vs HDFS
+
+| 维度 | HDFS | S3/OSS | 适用场景 |
+|------|------|--------|----------|
+| 延迟 | 毫秒级 | 十毫秒级 | 热数据用 HDFS |
+| 成本 | 高 | 低 | 冷数据用 S3 |
+| 扩展性 | 有限 | 无限 | 海量数据用 S3 |
+| 一致性 | 强一致 | 最终一致 | 强一致场景用 HDFS |
+| 运维 | 复杂 | 托管 | 运维能力弱用 S3 |
+
+### 31.2 混合存储架构
+
+```mermaid
+graph LR
+    A[应用] --> B[HDFS 热数据]
+    A --> C[S3/OSS 冷数据]
+    B -->|迁移| C
+    C -->|恢复| B
+    D[元数据] --> B
+    D --> C
+```
+
+---
+
+## 三十二、HDFS 数据治理实践
+
+### 32.1 数据治理工具对比
+
+| 工具 | 功能 | 适用场景 |
+|------|------|---------|
+| Apache Atlas | 元数据管理+血缘+分类 | Hadoop 生态 |
+| DataHub | 元数据平台+搜索+血缘 | 现代数据栈 |
+| Amundsen | 元数据搜索+数据发现 | 数据发现 |
+| OpenMetadata | 元数据标准+治理 | 通用 |
+
+### 32.2 数据治理实践
+
+| 治理维度 | 工具 | 实现方式 |
+|----------|------|---------|
+| 元数据管理 | Atlas/DataHub | 自动采集 HDFS 表/列元数据 |
+| 数据血缘 | Atlas | ETL 任务血缘自动关联 |
+| 数据分类 | Atlas | 敏感数据自动分类标签 |
+| 数据质量 | Great Expectations | 数据质量规则校验 |
+| 生命周期 | HDFS 策略 | HOT/WARM/COLD 自动迁移 |
+
+---
+
+## 三十三、HDFS 小文件治理
+
+### 33.1 小文件问题
+
+```text
+小文件问题：
+  1. NameNode 内存膨胀：每个文件/块占 150 bytes
+  2. MapReduce 性能下降：每个文件一个 MapTask
+  3. 磁盘 IO 增加：大量小文件寻址开销
+  4. Compaction 开销：小文件合并消耗资源
+```
+
+### 33.2 小文件解决方案
+
+| 方案 | 说明 | 适用场景 |
+|------|------|----------|
+| HAR（Hadoop Archive） | 归档小文件 | 历史数据 |
+| SequenceFile | 合并为序列文件 | MapReduce 输入 |
+| CombineFileInputFormat | 合并输入分片 | MapReduce |
+| 数据库合并 | HBase Compaction | 列式存储 |
+| 定期清理 | 删除过期小文件 | 临时数据 |
+
+```bash
+# 创建 HAR 归档
+hadoop archive -archiveName data.har -p /data/input /data/output
+
+# 查看 HAR 内容
+hadoop fs -ls har:///data/output/data.har
+```
+
+---
+
+## 三十四、HDFS 快照与备份
+
+### 34.1 HDFS 快照功能
+
+```bash
+# 启用快照
+hdfs dfsadmin -allowSnapshot /data
+
+# 创建快照
+hdfs dfs -createSnapshot /data snapshot-20240101
+
+# 查看快照
+hdfs lsSnapshots /data
+
+# 删除快照
+hdfs dfs -deleteSnapshot /data snapshot-20240101
+
+# 恢复快照
+hdfs dfs -cp har:///data/.snapshot/snapshot-20240101/file /data/file
+```
+
+### 34.2 快照应用场景
+
+| 场景 | 说明 | 命令 |
+|------|------|------|
+| 数据备份 | 定期创建快照 | `hdfs dfs -createSnapshot` |
+| 数据恢复 | 从快照恢复文件 | `hdfs dfs -cp` |
+| 数据对比 | 对比两个快照差异 | `hdfs dfs -diff` |
+| 数据迁移 | 基于快照迁移 | `hdfs distcp` |
+
+---
+
+## 三十五、HDFS 跨集群复制
+
+### 35.1 HDFS DistCp 工具
+
+```bash
+# 跨集群复制
+hadoop distcp hdfs://cluster1/data hdfs://cluster2/data
+
+# 带宽限制
+hadoop distcp -update -bandwidth 100 hdfs://cluster1/data hdfs://cluster2/data
+
+# 断点续传
+hadoop distcp -update -skipcrccheck hdfs://cluster1/data hdfs://cluster2/data
+```
+
+### 35.2 跨集群复制配置
+
+| 参数 | 说明 | 生产建议 |
+|------|------|----------|
+| -update | 增量更新 | 启用 |
+| -delete | 删除目标多余文件 | 谨慎使用 |
+| -bandwidth | 限制带宽 | 按网络能力设置 |
+| -m | 并行度 | 10~20 |
+| -skipcrccheck | 跳过 CRC 检查 | 跨集群启用 |
+
+---
+
+## 三十六、HDFS 安全配置
+
+### 36.1 Kerberos 认证
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>hadoop.security.authentication</name>
+  <value>kerberos</value>
+</property>
+<property>
+  <name>hadoop.security.authorization</name>
+  <value>true</value>
+</property>
+```
+
+### 36.2 HDFS ACL 权限
+
+```bash
+# 设置 ACL
+hdfs dfs -setfacl -m user:hive:rwx /data/hive
+
+# 查看 ACL
+hdfs dfs -getfacl /data/hive
+
+# 移除 ACL
+hdfs dfs -setfacl -b /data/hive
+```
+
+---
+
+## 三十七、HDFS 故障排查指南
+
+### 37.1 常见故障排查
+
+```mermaid
+graph TD
+    A[故障告警] --> B{检查 NameNode 状态}
+    B -->|异常| C[重启 NameNode]
+    B -->|正常| D{检查 DataNode 状态}
+    D -->|DataNode 挂| E[检查日志 + 重启]
+    D -->|读写延迟高| F{检查 IO/网络}
+    F -->|磁盘 IO 高| H[检查 Balancer]
+    F -->|网络抖动| I[检查网络配置]
+    H -->|Balancer 积压| J[调整带宽参数]
+```
+
+### 37.2 常用诊断命令
+
+```bash
+# 集群状态
+hdfs dfsadmin -report
+
+# NameNode 状态
+hdfs haadmin -getServiceState nn1
+
+# 检查文件系统
+hdfs fsck / -files -blocks -locations
+
+# 查看 DataNode 状态
+hdfs dfsadmin -report | grep "Live datanodes"
+```
+
+---
+
 ## 二十六、数据治理工具（Apache Atlas / DataHub）在 HDFS 中的应用
 
 ### 26.1 数据治理工具对比

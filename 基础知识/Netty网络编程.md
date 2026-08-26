@@ -1168,6 +1168,273 @@ IM 系统关键设计：
 └──────────────────────┴────────────────────────────────────────────┘
 ```
 
+## 十六、ByteBuf 深度解析
+
+### ByteBuf 栶心特性
+
+```text
+ByteBuf 核心特性：
+  1. 双指针：readerIndex（读指针） + writerIndex（写指针）
+  2. 零拷贝：slice/composite/duplicate 不复制数据
+  3. 内存池：PooledByteBufAllocator 减少 GC
+  4. 引用计数：ReferenceCounted 管理生命周期
+  5. 扩容：自动扩容，2倍增长到 4MB 后线性增长
+```
+
+### ByteBuf 类型对比
+
+| 类型 | 存储位置 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| HeapByteBuf | JVM 堆 | 分配快，GC 压力 | 一般场景 |
+| DirectByteBuf | 堆外内存 | 零拷贝，分配慢 | 网络IO |
+| PooledByteBuf | 内存池 | 复用，减少分配 | 高并发 |
+| UnpooledByteBuf | 非池化 | 简单，不复用 | 低频场景 |
+
+### ByteBuf 使用示例
+
+```java
+// 创建 ByteBuf
+ByteBuf buf = Unpooled.buffer(1024);
+ByteBuf directBuf = Unpooled.directBuffer(1024);
+ByteBuf pooledBuf = PooledByteBufAllocator.DEFAULT.buffer(1024);
+
+// 写入数据
+buf.writeBytes("hello".getBytes());
+buf.writeInt(123);
+
+// 读取数据
+byte[] data = new byte[buf.readableBytes()];
+buf.readBytes(data);
+
+// 零拷贝：slice
+ByteBuf slice = buf.slice(0, 5);
+
+// 零拷贝：composite
+ByteBuf composite = Unpooled.wrappedHeap(buf1, buf2);
+```
+
+---
+
+## 十七、Pipeline 顺序与事件处理
+
+### Pipeline 处理流程
+
+```text
+Pipeline 处理流程：
+  Inbound（入站）：Head → Tail
+  Outbound（出站）：Tail → Head
+
+入站事件：
+  channelRegistered → channelActive → channelRead → channelReadComplete → channelInactive → channelUnregistered
+
+出站事件：
+  bind → connect → write → flush → close
+```
+
+### Handler 执行顺序
+
+```java
+// 添加 Handler 顺序
+ch.pipeline()
+    .addLast("decoder", new MyDecoder())      // 入站
+    .addLast("encoder", new MyEncoder())      // 出站
+    .addLast("handler", new MyHandler())      // 入站
+    .addLast("business", new BusinessHandler()); // 入站
+
+// 入站：decoder → handler → business
+// 出站：encoder
+```
+
+### Handler 类型对比
+
+| 类型 | 入站 | 出站 | 说明 |
+|------|------|------|------|
+| ChannelInboundHandler | ✅ | ❌ | 处理入站事件 |
+| ChannelOutboundHandler | ❌ | ✅ | 处理出站事件 |
+| ChannelDuplexHandler | ✅ | ✅ | 双向处理 |
+| ChannelInitializer | 初始化 | 初始化 | 添加 Handler |
+
+---
+
+## 十八、心跳机制
+
+### IdleStateHandler 配置
+
+```java
+// 心跳配置
+ch.pipeline().addLast(new IdleStateHandler(
+    60,  // readerIdleTime 读空闲超时
+    30,  // writerIdleTime 写空闲超时
+    0,   // allIdleTime 全空闲超时
+    TimeUnit.SECONDS
+));
+
+// 心跳处理
+public class HeartbeatHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+        if (evt instanceof IdleStateEvent) {
+            IdleStateEvent event = (IdleStateEvent) evt;
+            switch (event.state()) {
+                case READER_IDLE:
+                    // 读空闲：可能对方已断开
+                    ctx.close();
+                    break;
+                case WRITER_IDLE:
+                    // 写空闲：发送心跳包
+                    ctx.writeAndFlush(new PingMessage());
+                    break;
+                case ALL_IDLE:
+                    // 全空闲：发送心跳包
+                    ctx.writeAndFlush(new PingMessage());
+                    break;
+            }
+        } else {
+            super.userEventTriggered(ctx, evt);
+        }
+    }
+}
+```
+
+### 心跳机制设计
+
+| 设计点 | 说明 | 生产建议 |
+|--------|------|----------|
+| 心跳间隔 | Ping 发送频率 | 30s |
+| 超时次数 | 连续未收到 Pong | 3次 |
+| 心跳包大小 | 尽量小 | <100B |
+| 心跳时间 | 避开业务高峰 | 随机偏移 |
+
+---
+
+## 十九、编解码器
+
+### 常用编解码器
+
+| 编解码器 | 说明 | 适用场景 |
+|----------|------|----------|
+| LengthFieldBasedFrameDecoder | 长度字段解码 | 通用 |
+| StringDecoder/StringEncoder | 字符串编解码 | 文本协议 |
+| ProtobufDecoder/Encoder | Protobuf 编解码 | 高性能 |
+| Jackson2JsonDecoder/Encoder | JSON 编解码 | Web API |
+| HttpObjectDecoder/Encoder | HTTP 编解码 | HTTP 服务 |
+
+### LengthFieldBasedFrameDecoder 配置
+
+```java
+// 长度字段解码器配置
+ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(
+    1024,   // maxFrameLength 最大帧长度
+    0,      // lengthFieldOffset 长度字段偏移
+    4,      // lengthFieldLength 长度字段长度
+    0,      // lengthAdjustment 长度调整
+    0       // initialBytesToStrip 初始跳过字节
+));
+
+// 协议：[4字节长度][消息体]
+// 偏移：0，长度：4，调整：0，跳过：0
+```
+
+---
+
+## 二十、零拷贝
+
+### Netty 零拷贝实现
+
+```text
+Netty 零拷贝实现：
+  1. CompositeByteBuf：合并多个 ByteBuf，无需复制
+  2. Slice：切分 ByteBuf，共享底层内存
+  3. DirectByteBuf：堆外内存，避免 JVM 堆复制
+  4. FileRegion：sendfile 系统调用
+
+零拷贝 vs 传统拷贝：
+  传统：4 次拷贝（用户态 2 次 + 内核态 2 次）
+  零拷贝：2 次拷贝（内核态 2 次）
+  sendfile：0 次拷贝（直接从内核到网卡）
+```
+
+### FileRegion 使用
+
+```java
+// 文件传输零拷贝
+FileRegion region = new DefaultFileRegion(
+    fileChannel, 0, fileChannel.size());
+ctx.writeAndFlush(region);
+```
+
+---
+
+## 二十一、调优参数
+
+### Netty 核心参数
+
+| 参数 | 说明 | 生产建议 |
+|------|------|----------|
+| bossGroupThreads | 主线程数 | CPU 核数 |
+| workerGroupThreads | 工作线程数 | CPU 核数 * 2 |
+| soBacklog | 连接队列大小 | 1024 |
+| tcpNoDelay | 禁用 Nagle 算法 | true |
+| soKeepalive | TCP 保活 | true |
+| writeBufferHighWaterMark | 写缓冲高水位 | 64KB |
+| writeBufferLowWaterMark | 写缓冲低水位 | 32KB |
+
+### 内存池配置
+
+```java
+// 内存池配置
+ByteBufAllocator allocator = PooledByteBufAllocator.DEFAULT;
+// 设置每个线程的缓存大小
+allocator.directMemoryCacheAlignment = 64;
+
+// 监控内存使用
+PooledByteBufAllocatorMetric metric = allocator.metric();
+long usedDirectMemory = metric.usedDirectMemory();
+long usedHeapMemory = metric.usedHeapMemory();
+```
+
+---
+
+## 二十二、Netty 高性能实践
+
+### 高性能设计
+
+```text
+Netty 高性能设计：
+  1. 事件驱动：非阻塞 IO
+  2. 单线程无锁：EventLoop 单线程处理
+  3. 内存池：减少对象创建
+  4. 零拷贝：减少数据复制
+  5. 批量处理：减少系统调用
+```
+
+### 性能优化配置
+
+```java
+// 优化配置
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup)
+ .channel(NioServerSocketChannel.class)
+ .option(ChannelOption.SO_BACKLOG, 1024)
+ .childOption(ChannelOption.TCP_NODELAY, true)
+ .childOption(ChannelOption.SO_KEEPALIVE, true)
+ .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, 
+     new WriteBufferWaterMark(32 * 1024, 64 * 1024))
+ .childHandler(new ChannelInitializer<SocketChannel>() {
+     @Override
+     protected void initChannel(SocketChannel ch) {
+         ch.pipeline()
+             .addLast(new IdleStateHandler(60, 30, 0))
+             .addLast(new LengthFieldBasedFrameDecoder(1024, 0, 4, 0, 0))
+             .addLast(new MyDecoder())
+             .addLast(new MyEncoder())
+             .addLast(businessGroup, new BusinessHandler());
+     }
+ });
+```
+
+---
+
 ## 十五、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；

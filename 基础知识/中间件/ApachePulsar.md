@@ -1166,4 +1166,216 @@ flowchart TD
     KAFKA --> KAFKA_DESC[生态丰富,运维简单]
 ```
 
+## 十三、Pulsar IO 连接器
+
+### 13.1 Pulsar IO 架构
+
+```text
+Pulsar IO 架构：
+  Source Connector：从外部系统读取数据 → Pulsar Topic
+  Sink Connector：从 Pulsar Topic 写入外部系统
+  
+优点：
+  - 无需编写代码，配置即可
+  - 与 Pulsar 集成，支持精确一次语义
+  - 支持多种外部系统
+```
+
+### 13.2 Pulsar IO 连接器列表
+
+| 类型 | 连接器 | 说明 |
+|------|--------|------|
+| Source | Kafka Source | 从 Kafka 读取 |
+| Source | JDBC Source | 从数据库读取 |
+| Source | File Source | 从文件读取 |
+| Sink | Kafka Sink | 写入 Kafka |
+| Sink | JDBC Sink | 写入数据库 |
+| Sink | Elasticsearch Sink | 写入 ES |
+| Sink | HDFS Sink | 写入 HDFS |
+
+### 13.3 Pulsar IO 使用示例
+
+```bash
+# 创建 Kafka Source
+pulsar-admin sources create \
+  --source-config-file kafka-source-config.yaml \
+  --name kafka-source
+
+# kafka-source-config.yaml
+configs:
+  bootstrapServers: "kafka1:9092,kafka2:9092"
+  topic: "my-kafka-topic"
+  consumerGroupName: "pulsar-group"
+  ackType: "EXACTLY_ONCE"
+  schemaType: "STRING"
+```
+
+---
+
+## 十四、Pulsar Functions 深度实战
+
+### 14.1 Functions 开发模式
+
+```java
+// 无状态 Function
+public class TransformFunction implements Function<String, String> {
+    @Override
+    public Optional<String> process(String input) {
+        return Optional.of(input.toUpperCase());
+    }
+}
+
+// 有状态 Function
+public class CountFunction implements Function<String, Optional<Long>> {
+    private long count = 0;
+    
+    @Override
+    public Optional<Long> process(String input) {
+        count++;
+        return Optional.of(count);
+    }
+}
+```
+
+### 14.2 Functions vs Kafka Streams vs Flink
+
+| 维度 | Pulsar Functions | Kafka Streams | Flink |
+|------|------------------|---------------|-------|
+| 部署模式 | 内嵌/独立/K8s | 内嵌 | 独立/K8s |
+| 状态管理 | 内置 | 内置 | 内置 |
+| 复杂度 | 低 | 中 | 高 |
+| 功能 | 轻量级 | 中等 | 丰富 |
+| 适用场景 | 简单ETL | 中等复杂 | 复杂流处理 |
+
+---
+
+## 十五、Pulsar 分层存储
+
+### 15.1 分层存储架构
+
+```mermaid
+graph LR
+    A[Broker] --> B[BookKeeper 热数据]
+    B --> C[S3/OSS 冷数据]
+    B -->|自动迁移| C
+    C -->|按需加载| B
+```
+
+### 15.2 分层存储配置
+
+```bash
+# 分层存储配置
+pulsar-admin namespaces set-offload-threshold my-tenant/my-ns \
+  --threshold 10G \
+  --retention 7d
+
+# S3 配置
+broker.conf:
+  managedLedgerOffloadDriver=s3
+  s3ManagedLedgerOffloadRegion=us-east-1
+  s3ManagedLedgerOffloadBucket=pulsar-offload
+```
+
+### 15.3 分层存储优势
+
+| 维度 | 无分层 | 有分层 |
+|------|--------|--------|
+| 存储成本 | 高（BookKeeper） | 低（对象存储） |
+| 查询性能 | 高 | 中（冷数据慢） |
+| 数据保留 | 受限 | 无限 |
+| 运维复杂度 | 低 | 中 |
+
+---
+
+## 十六、Pulsar 功能矩阵对比
+
+### 16.1 Pulsar vs Kafka 功能对比
+
+| 功能 | Pulsar | Kafka |
+|------|--------|-------|
+| 存算分离 | ✅ 原生 | ❌ 需要 KSQL |
+| 多租户 | ✅ 原生 | ❌ 需要 Confluent |
+| 延迟消息 | ✅ 原生 | ❌ 需要插件 |
+| 死信队列 | ✅ 原生 | ❌ 需要开发 |
+| 消息追踪 | ✅ 原生 | ❌ 需要开发 |
+| 跨地域复制 | ✅ 原生 | ❌ 需要 MirrorMaker |
+| 流处理 | Pulsar Functions | Kafka Streams/ksqlDB |
+
+---
+
+## 十七、Pulsar 多租户管理
+
+### 17.1 多租户架构
+
+```text
+Pulsar 多租户层次：
+  Tenant（租户）→ Namespace（命名空间）→ Topic（主题）
+  
+每个租户独立：
+  - 认证授权
+  - 配额管理
+  - 消息保留策略
+  - 访问控制
+```
+
+### 17.2 多租户配置
+
+```bash
+# 创建租户
+pulsar-admin tenants create my-tenant
+
+# 创建命名空间
+pulsar-admin namespaces create my-tenant/my-namespace
+
+# 设置命名空间策略
+pulsar-admin namespaces set-retention my-tenant/my-namespace \
+  --size 10G \
+  --time 7d
+
+# 设置配额
+pulsar-admin namespaces set-dispatch-rate my-tenant/my-namespace \
+  --msg-rate 10000 \
+  --byte-rate 10485760
+```
+
+---
+
+## 十八、Pulsar Geo-Replication 跨地域复制
+
+### 18.1 Geo-Replication 架构
+
+```mermaid
+graph LR
+    subgraph 北京
+        B1[Broker] --> BK1[BookKeeper]
+    end
+    subgraph 上海
+        B2[Broker] --> BK2[BookKeeper]
+    end
+    subgraph 广州
+        B3[Broker] --> BK3[BookKeeper]
+    end
+    B1 <-->|异步复制| B2
+    B2 <-->|异步复制| B3
+    B1 <-->|异步复制| B3
+```
+
+### 18.2 Geo-Replication 配置
+
+```bash
+# 设置集群
+pulsar-admin clusters set my-cluster \
+  --service-url http://cluster1:8080
+
+# 设置租户的集群列表
+pulsar-admin tenants update my-tenant \
+  --allowed-clusters cluster1,cluster2,cluster3
+
+# 设置命名空间的复制集群
+pulsar-admin namespaces set-clusters my-tenant/my-namespace \
+  --clusters cluster1,cluster2,cluster3
+```
+
+---
+
 ## 十二、Pulsar 运维命令

@@ -1170,7 +1170,214 @@ YARN → K8s 迁移路线：
     - 统一调度平台
 ```
 
-### 25.2 共存策略
+## 公平 vs 容量调度器对比
+
+### YARN 调度器对比
+
+| 维度 | FIFO | 容量调度器 | 公平调度器 |
+|------|------|-----------|-----------|
+| 多队列 | ❌ | ✅ | ✅ |
+| 资源隔离 | 无 | 队列隔离 | 队列隔离 |
+| 弹性共享 | 无 | 有限 | 完全 |
+| 公平性 | 无 | 有限 | 完全 |
+| 适用场景 | 简单 | 生产环境 | 多租户 |
+
+### 公平调度器配置
+
+```xml
+<!-- capacity-scheduler.xml -->
+<property>
+  <name>yarn.scheduler.capacity.root.queues</name>
+  <value>default,production</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.default.capacity</name>
+  <value>30</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.production.capacity</name>
+  <value>70</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.default.maximum-capacity</name>
+  <value>50</value>
+</property>
+```
+
+---
+
+## K8s 调度扩展
+
+### K8s 调度器扩展机制
+
+```text
+K8s 调度器扩展：
+  1. SchedulingPolicy：预选+优选
+  2. Scheduler Framework：调度框架扩展
+  3. 自定义调度器：独立调度器
+  4. 调度器配置：SchedulerProfile
+
+调度流程：
+  1. PreFilter：预处理
+  2. Filter：过滤不满足条件的节点
+  3. PostFilter：过滤后处理
+  4. Score：打分
+  5. Reserve：预留资源
+  6. Permit：准入控制
+  7. PreBind：绑定前处理
+  8. Bind：绑定 Pod
+  9. PostBind：绑定后处理
+```
+
+### K8s 调度策略配置
+
+```yaml
+# Pod 调度策略
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  schedulerName: my-scheduler
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: disktype
+            operator: In
+            values:
+            - ssd
+    podAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: security
+              operator: In
+              values:
+              - S1
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+  - key: "key1"
+    operator: "Equal"
+    value: "value1"
+    effect: "NoSchedule"
+```
+
+---
+
+## 资源模型对比
+
+### YARN vs K8s 资源模型
+
+| 维度 | YARN | K8s |
+|------|------|-----|
+| 资源单位 | vcore + MB | CPU + Memory |
+| 资源隔离 | Container | Pod |
+| 弹性伸缩 | 有限 | HPA/VPA |
+| 资源配额 | Queue | Namespace/ResourceQuota |
+| 优先级 | Priority | PriorityClass |
+
+### K8s 资源配置
+
+```yaml
+# Pod 资源配置
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: my-container
+    image: my-image
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+# Namespace 资源配额
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: my-quota
+  namespace: my-namespace
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: "20Gi"
+    limits.cpu: "20"
+    limits.memory: "40Gi"
+    pods: "100"
+```
+
+---
+
+## Pod 优先级与抢占
+
+### PriorityClass 配置
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "高优先级关键服务"
+preemptionPolicy: PreemptLowerPriority
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 100
+globalDefault: true
+description: "低优先级批处理"
+preemptionPolicy: Never
+```
+
+### 抢占策略
+
+| preemptionPolicy | 行为 | 适用场景 |
+|-----------------|------|---------|
+| PreemptLowerPriority | 抢占低优先级 Pod | 关键服务 |
+| Never | 不抢占 | 批处理/非关键 |
+
+---
+
+## YARN → K8s 迁移路线
+
+### 迁移路线图
+
+```text
+YARN → K8s 迁移路线：
+  阶段 1：评估与规划
+    - 盘点现有 YARN 作业
+    - 评估 K8s 集群能力
+    - 制定迁移优先级
+
+  阶段 2：共存期
+    - YARN 运行存量作业
+    - K8s 运行新作业
+    - 统一监控和告警
+
+  阶段 3：渐进迁移
+    - 无状态作业先迁移
+    - 批处理作业迁移（Spark on K8s）
+    - 流处理作业迁移（Flink on K8s）
+
+  阶段 4：全面 K8s
+    - YARN 集群下线
+    - 所有作业运行在 K8s
+    - 统一调度平台
+```
+
+### 共存策略
 
 | 策略 | 做法 | 适用 |
 |------|------|------|

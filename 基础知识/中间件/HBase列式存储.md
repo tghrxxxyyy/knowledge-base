@@ -592,7 +592,616 @@ user_access 'user1'
 
 ---
 
-## 十五、与其他板块的关系
+## 二十一、BloomFilter 深度选型与误判率调优
+
+### 21.1 BloomFilter 数学模型
+
+```
+误判率公式：
+  FP = (1 - e^(-kn/m))^k
+
+  m = 位数组大小（bits）
+  n = 插入元素数量
+  k = 哈希函数数量
+  
+最优哈希函数数量：
+  k_opt = (m/n) * ln(2) ≈ 0.693 * (m/n)
+
+空间效率：
+  每元素所需 bits = -ln(FP) / (ln2)^2 ≈ 1.44 * log2(1/FP)
+  
+示例：1% 误判率 → 每元素约 9.6 bits
+     0.1% 误判率 → 每元素约 14.4 bits
+```
+
+### 21.2 HBase BloomFilter 类型选型矩阵
+
+| 场景 | 推荐类型 | 误判率 | 空间开销 | 理由 |
+|------|----------|--------|----------|------|
+| 单 RowKey Get | ROW | 1% | 低 | 只需判断行是否存在 |
+| RowKey + 列族 Get | ROWCOL | 0.1% | 中 | 精确到列，减少无效磁盘读 |
+| 前缀 Scan | PREFIX | 1% | 低 | 按前缀过滤，缩小扫描范围 |
+| 写密集 + 多列 | ROW | 1% | 低 | ROWCOL 写放大严重 |
+| 读密集 + 少列 | ROWCOL | 0.5% | 中 | 精确过滤提升读性能 |
+
+```bash
+# 创建 BloomFilter 示例
+create 'user_events', {NAME => 'cf', BLOOMFILTER => 'ROW',
+  VERSIONS => 1, TTL => 2592000}
+
+create 'user_profile', {NAME => 'base', BLOOMFILTER => 'ROWCOL',
+  VERSIONS => 3}
+
+create 'log_archive', {NAME => 'raw', BLOOMFILTER => 'PREFIX',
+  PREFIX_LENGTH => 8}
+```
+
+### 21.3 BloomFilter 与 Compaction 的关系
+
+```
+Compaction 时 BloomFilter 的影响：
+  Minor Compaction：保留所有 BloomFilter（合并时保留）
+  Major Compaction：重建 BloomFilter（清理删除标记后）
+
+BloomFilter 失效场景：
+  1. Major Compaction 后文件合并，BloomFilter 重建
+  2. 数据量远超预期 → 位数组过小 → 误判率飙升
+  3. TTL 过期数据清理后 → 实际元素数变化
+
+监控建议：
+  hbase org.apache.hadoop.hbase.io.hfile.HFileMain <hfile>
+  → 查看 BloomFilter 的 entryCount 和 size
+```
+
+---
+
+## 二十二、Compaction 调度参数深度调优
+
+### 22.1 Compaction 触发条件全景
+
+```text
+触发因素：
+  1. HFile 数量：hbase.hstore.compactionThreshold（默认3）
+  2. 单文件大小：hbase.hstore.compaction.max.size（默认 Long.MAX）
+  3. 时间周期：hbase.hstore.majorcompaction.period（默认 7 天）
+  4. 阻塞写入：hbase.hstore.blockingStoreFiles（默认 16）
+
+优先级：
+  阻塞写入 > Major Compaction > Minor Compaction
+```
+
+### 22.2 Compaction 线程池配置
+
+| 参数 | 默认值 | 说明 | 生产建议 |
+|------|--------|------|----------|
+| `hbase.regionserver.thread.compaction.large` | 1 | 大文件 Compaction 线程数 | 2~4 |
+| `hbase.regionserver.thread.compaction.small` | 1 | 小文件 Compaction 线程数 | 3~6 |
+| `hbase.regionserver.thread.compaction.throttle` | 2GB | 大小文件分界线 | 1~2GB |
+| `hbase.regionserver.thread.fifo.compaction` | 0 | FIFO Compaction 限制 | 仅 TTL 表 |
+
+### 22.3 Compaction 限速策略
+
+```java
+// 动态限速：根据 IO 负载调整
+// 低负载期：不限速，尽快完成
+// 高负载期：限制 Compaction 带宽，避免影响在线读写
+
+配置项：
+  hbase.hstore.compaction.throughput.lower.bound: 2MB/s
+  hbase.hstore.compaction.throughput.higher.limit: 200MB/s
+
+生产建议：
+  1. 夜间低峰期：不限速（200MB/s）
+  2. 白天高峰期：限制到 20-50MB/s
+  3. 监控磁盘 IO 使用率 > 70% 时自动降速
+```
+
+---
+
+## 二十三、Coprocessor 端点开发实战
+
+### 23.1 Endpoint 协处理器架构
+
+```mermaid
+graph LR
+    A[客户端] -->|RPC 调用| B[RegionServer]
+    B --> C[Endpoint 协处理器]
+    C --> D[Region 数据]
+    D --> E[聚合结果]
+    E -->|返回| A
+```
+
+### 23.2 自定义聚合 Endpoint
+
+```java
+// 1. 定义协议接口
+public interface AggregateProtocol extends CoprocessorProtocol {
+    long count(byte[] family, byte[] qualifier) throws IOException;
+    double sum(byte[] family, byte[] qualifier) throws IOException;
+}
+
+// 2. 实现 Endpoint
+public class AggregateEndpoint extends BaseEndpointServer
+        implements AggregateProtocol {
+    @Override
+    public long count(byte[] family, byte[] qualifier) throws IOException {
+        Region region = getRegion();
+        long count = 0;
+        // 全表扫描计数
+        try (RegionScanner scanner = region.getScanner(new Scan())) {
+            List<Cell> cells = new ArrayList<>();
+            while (scanner.next(cells)) {
+                count++;
+            }
+        }
+        return count;
+    }
+    
+    @Override
+    public double sum(byte[] family, byte[] qualifier) throws IOException {
+        // 类似实现 sum 逻辑
+        return 0.0;
+    }
+}
+
+// 3. 注册与调用
+// 建表时指定协处理器
+create 't1', {NAME => 'f1', COPROCESSOR =>
+    'com.example.AggregateEndpoint|1001|'}
+
+// 客户端调用
+RegionMetricsClient client = table.coprocessorProxy(
+    AggregateProtocol.class, RowRange.ALL);
+long count = client.count(Bytes.toBytes("f1"), Bytes.toBytes("col"));
+```
+
+### 23.3 Observer 协处理器实战
+
+```java
+// 自动维护二级索引
+public class IndexObserver extends BaseRegionObserver {
+    @Override
+    public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                       Put put, WALEdit edit, Durability durability) {
+        // 获取主表数据
+        byte[] row = put.getRow();
+        byte[] name = put.get(Bytes.toBytes("info"), Bytes.toBytes("name"));
+        
+        // 写入索引表
+        if (name != null) {
+            Put indexPut = new Put(name);
+            indexPut.addColumn(Bytes.toBytes("idx"), Bytes.toBytes("rowkey"), row);
+            Connection conn = ConnectionFactory.createConnection(e.getEnvironment()
+                .getConfiguration());
+            Table indexTable = conn.getTable(TableName.valueOf("t1_idx"));
+            indexTable.put(indexPut);
+            indexTable.close();
+            conn.close();
+        }
+    }
+}
+```
+
+---
+
+## 二十四、Bulk Load 流程深度解析
+
+### 24.1 Bulk Load 完整流程
+
+```mermaid
+graph TD
+    A[外部数据源] --> B[MapReduce/Spark 任务]
+    B --> C[生成 HFile]
+    C --> D[上传到 HDFS]
+    D --> E[LoadIncrementalHFile]
+    E --> F[移动 HFile 到 Region 目录]
+    F --> G[更新 META 表]
+    G --> H[完成导入]
+```
+
+### 24.2 Bulk Load 最佳实践
+
+| 阶段 | 优化点 | 说明 |
+|------|--------|------|
+| 数据准备 | 预分区 | 按 Region 预分配数据 |
+| HFile 生成 | 调整 KeyValue 编码 | 减少存储开销 |
+| HFile 生成 | 合理设置 BLOCK_SIZE | 128KB~256KB |
+| 导入 | 批量加载 | 每次加载不超过 1000 个 HFile |
+| 导入 | 预热 Region | 导入前 split 避免热点 |
+
+### 24.3 Bulk Load vs 正常写入性能对比
+
+| 维度 | 正常写入 | Bulk Load | 提升倍数 |
+|------|----------|-----------|----------|
+| 写入吞吐 | 10K rows/s | 1M rows/s | 100x |
+| RegionServer 负载 | 高（WAL+MemStore） | 无 | — |
+| 网络开销 | 高（RPC） | 低（HDFS 传输） | 10x |
+| 适用数据量 | <100GB | >100GB | — |
+| 时间窗口 | 实时 | 批量 | — |
+
+---
+
+## 二十五、Phoenix 索引深度优化
+
+### 25.1 Phoenix 索引类型对比
+
+| 索引类型 | 存储位置 | 写入开销 | 读取性能 | 适用场景 |
+|----------|----------|----------|----------|----------|
+| Global Index | 独立 HBase 表 | 高（跨 Region） | 高（直接查询） | 读多写少 |
+| Local Index | 与主表同 Region | 低（同 Region） | 中（需过滤） | 写多读少 |
+| Covering Index | 独立表 + INCLUDE | 中 | 最高（避免回表） | 指定列查询 |
+| Functional Index | 独立表 + 函数 | 中 | 中 | 函数查询 |
+
+### 25.2 Phoenix 索引最佳实践
+
+```sql
+-- 1. 全局索引 + 覆盖列（避免回表）
+CREATE INDEX idx_user_name ON users (user_name)
+    INCLUDE (email, phone, age);
+
+-- 2. 本地索引（写密集场景）
+CREATE LOCAL INDEX idx_order_time ON orders (order_time);
+
+-- 3. 函数索引（支持函数查询）
+CREATE INDEX idx_upper_name ON users (UPPER(user_name));
+
+-- 4. 部分索引（只索引满足条件的数据）
+CREATE INDEX idx_active_users ON users (user_name)
+    WHERE status = 'active';
+
+-- 5. 降序索引（支持降序查询）
+CREATE INDEX idx_create_time ON logs (create_time DESC);
+```
+
+### 25.3 Phoenix 查询优化
+
+```sql
+-- 使用 Hint 强制走索引
+SELECT /*+ INDEX(users idx_user_name) */ * FROM users
+    WHERE user_name = '张三';
+
+-- 使用 EXPLAIN 查看执行计划
+EXPLAIN SELECT * FROM users WHERE user_name = '张三';
+
+-- 关键指标：
+-- CLIENT SORT：全表扫描，需优化
+-- PARALLEL 1-WAY：单 Region 扫描
+-- RANGE SCAN：索引范围扫描
+```
+
+---
+
+## 二十六、Region Split 策略与热点预防
+
+### 26.1 Split 策略详细对比
+
+| 策略 | 触发条件 | 分裂点 | 适用场景 |
+|------|----------|--------|----------|
+| ConstantSizeRegionSplitPolicy | 文件大小 > 阈值 | 正中间 | 通用 |
+| IncreasingToUpperBoundRegionSplitPolicy | 文件数 × 阈值 > max | 正中间 | 新表自动分裂 |
+| KeyPrefixRegionSplitPolicy | 前缀相同的数据 | 按前缀边界 | 前缀设计的表 |
+| DelimitedKeyPrefixRegionSplitPolicy | 按分隔符分割 | 按分隔符边界 | 复合 RowKey |
+| DisabledRegionSplitPolicy | 禁用自动分裂 | — | 预分裂表 |
+
+### 26.2 热点诊断与处理流程
+
+```mermaid
+graph TD
+    A[Region 热点告警] --> B{检查 Region 分布}
+    B -->|不均匀| C[手动分裂热点 Region]
+    B -->|均匀| D{检查 RowKey 设计}
+    D -->|单调递增| E[加盐/反转处理]
+    D -->|已散列| F{检查写入模式}
+    F -->|批量写入| G[调整批量大小]
+    F -->|随机写入| H[调整 MemStore 大小]
+    C --> I[监控分裂效果]
+    E --> I
+    G --> I
+    H --> I
+```
+
+### 26.3 RowKey 热点预防方案
+
+```text
+方案一：盐值（Salting）
+  RowKey = random(0-N-1) + "_" + originalRowKey
+  优点：均匀分散
+  缺点：无法做范围查询
+
+方案二：哈希（Hashing）
+  RowKey = md5(originalRowKey).substring(0,4) + originalRowKey
+  优点：均匀分散 + 支持 Get
+  缺点：范围查询效率低
+
+方案三：反转（Reversing）
+  RowKey = reverse(originalRowKey)
+  优点：保持唯一性 + 分散热点
+  缺点：需要知道完整 RowKey
+
+方案四：时间戳反转
+  RowKey = prefix + (Long.MAX_VALUE - timestamp)
+  优点：最新数据在前 + 分散热点
+  缺点：需要定期预分裂
+```
+
+---
+
+## 二十七、HBase 与 Flink 实时集成
+
+### 27.1 Flink 写入 HBase 方案
+
+```java
+// Flink SinkFunction 写入 HBase
+public class HBaseSink extends RichSinkFunction<Row> {
+    private transient Connection connection;
+    private transient BufferedMutator mutator;
+    
+    @Override
+    public void open(Configuration parameters) {
+        Configuration conf = HBaseConfiguration.create();
+        connection = ConnectionFactory.createConnection(conf);
+        BufferedMutatorParams params = new BufferedMutatorParams(TableName.valueOf("t1"));
+        params.writeBufferSize(1024 * 1024 * 4); // 4MB 缓冲
+        mutator = connection.getBufferedMutator(params);
+    }
+    
+    @Override
+    public void invoke(Row row, Context context) {
+        Put put = new Put(row.getFieldAs("rowkey"));
+        put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("col"), 
+                     Bytes.toBytes(row.getFieldAs("value")));
+        mutator.mutate(put);
+    }
+    
+    @Override
+    public void close() {
+        if (mutator != null) mutator.close();
+        if (connection != null) connection.close();
+    }
+}
+```
+
+### 27.2 Flink 读取 HBase 方案
+
+```java
+// Flink SourceFunction 读取 HBase
+public class HBaseSource extends RichParallelSourceFunction<Row> {
+    private volatile boolean running = true;
+    
+    @Override
+    public void run(SourceContext<Row> ctx) throws Exception {
+        Connection conn = ConnectionFactory.createConnection(HBaseConfiguration.create());
+        Table table = conn.getTable(TableName.valueOf("t1"));
+        
+        // 按 Region 并行读取
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+        int totalSubtasks = getRuntimeContext().getNumberOfParallelSubtasks();
+        
+        Scan scan = new Scan();
+        scan.setCaching(1000);
+        scan.setBatch(100);
+        
+        try (ResultScanner scanner = table.getScanner(scan)) {
+            int count = 0;
+            for (Result result : scanner) {
+                if (count % totalSubtasks == subtaskIndex && running) {
+                    // 转换为 Flink Row
+                    ctx.collect(convertToRow(result));
+                }
+                count++;
+            }
+        }
+    }
+}
+```
+
+### 27.3 Flink + HBase 实时同步方案
+
+```mermaid
+graph LR
+    A[数据源] -->|Kafka| B[Flink 消费]
+    B -->|转换| C[HBase Sink]
+    C -->|批量写入| D[HBase 表]
+    B -->|同时| E[Kafka 另一个 Topic]
+    E -->|下游消费| F[其他系统]
+```
+
+---
+
+## 二十八、HBase 容量规划与资源管理
+
+### 28.1 容量评估公式
+
+```text
+存储容量 = 数据量 × 副本数 × (1 + 冗余系数)
+  数据量 = 日增量 × 保留天数
+  副本数 = HDFS 副本因子（默认 3）
+  冗余系数 = Compaction 临时空间（建议 1.3）
+
+示例：
+  日增量：100GB
+  保留天数：30天
+  副本数：3
+  冗余系数：1.3
+  
+  总存储 = 100GB × 30 × 3 × 1.3 = 11.7TB
+```
+
+### 28.2 RegionServer 资源配置
+
+| 资源 | 计算方式 | 生产建议 |
+|------|----------|----------|
+| CPU | 每个 RegionServer 4~8 核 | 8 核（Compaction 密集） |
+| 内存 | Heap = MemStore + BlockCache + 其他 | 32~64GB |
+| MemStore | 全局 Heap × 40% | 12~25GB |
+| BlockCache | 全局 Heap × 40% | 12~25GB |
+| 堆外内存 | RPC/Netty 缓冲 | 4~8GB |
+| 磁盘 | 单节点 4~8 块 SSD | RAID 0 或 JBOD |
+
+### 28.3 集群规模评估
+
+```text
+RegionServer 数量 = 总数据量 / 单 RegionServer 管理数据量
+  单 RS 管理数据量建议：500GB~1TB
+  单 RS 管理 Region 数建议：< 2000
+
+Region 数量 = 表数量 × 平均每表 Region 数
+  单 Region 大小：10GB（默认）
+  
+示例：
+  100 张表，每张平均 100 个 Region
+  总 Region 数：10,000
+  需要 RegionServer：10,000 / 2000 = 5 台（推荐 7 台含冗余）
+```
+
+---
+
+## 二十九、HBase 故障排查与诊断
+
+### 29.1 常见故障排查流程
+
+```mermaid
+graph TD
+    A[故障告警] --> B{检查 HMaster 状态}
+    B -->|异常| C[重启 HMaster]
+    B -->|正常| D{检查 RegionServer 状态}
+    D -->|RegionServer 挂| E[检查日志 + 重启]
+    D -->|Region 不均匀| F[手动 balance]
+    D -->|读写延迟高| G{检查 IO/网络}
+    G -->|磁盘 IO 高| H[检查 Compaction]
+    G -->|网络抖动| I[检查网络配置]
+    H -->|Compaction 积压| J[调整 Compaction 参数]
+```
+
+### 29.2 常用诊断命令
+
+```bash
+# 集群状态
+status 'simple'
+status 'detailed'
+
+# 表状态
+table_description 'table_name'
+table_skipped_rows 'table_name'
+
+# Region 信息
+scan 'hbase:meta', {COLUMNS => ['info:regioninfo', 'info:server']}
+
+# RegionServer 指标
+jstack <pid>  # 查看线程状态
+jmap -heap <pid>  # 查看堆内存
+
+# HBase Shell 诊断
+bloom_filter 'table_name'  # 查看 BloomFilter 状态
+compaction_state 'table_name'  # 查看 Compaction 状态
+```
+
+### 29.3 性能诊断指标
+
+| 指标 | 正常范围 | 告警阈值 | 可能原因 |
+|------|----------|----------|----------|
+| Get 延迟 P99 | < 10ms | > 50ms | Region 热点/BloomFilter 失效 |
+| Put 延迟 P99 | < 5ms | > 20ms | MemStore 满/WAL 慢 |
+| BlockCache 命中率 | > 80% | < 60% | 缓存过小/查询模式变化 |
+| Compaction 队列 | < 5 | > 20 | IO 不足/文件过多 |
+| Region 数 | < 2000/RS | > 3000/RS | 需要 split 或合并 |
+
+---
+
+## 三十、HBase 与云存储集成
+
+### 30.1 HBase on S3/OSS 架构
+
+```mermaid
+graph LR
+    A[Client] --> B[RegionServer]
+    B --> C[WAL]
+    B --> D[MemStore]
+    B --> E[StoreFile/HFile]
+    C --> F[S3/OSS]
+    E --> F
+    D --> G[HDFS/本地]
+    G -->|Flush| E
+```
+
+### 30.2 云存储优劣对比
+
+| 维度 | HDFS | S3/OSS | 建议 |
+|------|------|--------|------|
+| 延迟 | 毫秒级 | 十毫秒级 | 热数据用 HDFS |
+| 成本 | 高 | 低 | 冷数据用 S3 |
+| 扩展性 | 有限 | 无限 | 海量数据用 S3 |
+| 一致性 | 强一致 | 最终一致 | 强一致场景用 HDFS |
+| 运维 | 复杂 | 托管 | 运维能力弱用 S3 |
+
+---
+
+## 三十一、HBase 多租户方案
+
+### 31.1 多租户隔离方案
+
+| 方案 | 隔离级别 | 资源隔离 | 适用场景 |
+|------|----------|----------|----------|
+| Namespace 隔离 | 表级 | 弱 | 轻量级多租户 |
+| RegionServer 分组 | RS 级 | 中 | 中等隔离需求 |
+| 独立集群 | 集群级 | 强 | 强隔离/合规要求 |
+| 队列调度 | 请求级 | 精细 | 混合部署 |
+
+### 31.2 Namespace 多租户配置
+
+```bash
+# 创建 Namespace
+create_namespace 'tenant_a'
+create_namespace 'tenant_b'
+
+# 在 Namespace 下建表
+create 'tenant_a:user_table', 'info'
+create 'tenant_b:order_table', 'detail'
+
+# Namespace 权限控制
+grant 'user_a', 'RWXCA', '@tenant_a'
+grant 'user_b', 'RWXCA', '@tenant_b'
+
+# 配额管理
+set_quota 'TABLE', 'tenant_a:user_table', LIMIT => {'REGION_COUNT' => '100'}
+set_quota 'TABLE', 'tenant_b:order_table', LIMIT => {'REGION_COUNT' => '50'}
+```
+
+---
+
+## 三十二、HBase 审计与安全合规
+
+### 32.1 审计日志配置
+
+```xml
+<!-- 启用审计日志 -->
+<property>
+  <name>hbase.security.audit.log</name>
+  <value>true</value>
+</property>
+
+<!-- 审计日志输出 -->
+<property>
+  <name>hbase.audit.log.output</name>
+  <value>HDFS</value>
+</property>
+```
+
+### 32.2 安全合规检查清单
+
+| 检查项 | 说明 | 状态 |
+|--------|------|------|
+| Kerberos 认证 | 集群认证 | ☐ |
+| ACL 权限控制 | 表级权限 | ☐ |
+| RPC 加密 | 传输加密 | ☐ |
+| 审计日志 | 操作记录 | ☐ |
+| 数据加密 | 敏感字段加密 | ☐ |
+| 网络隔离 | VPC/防火墙 | ☐ |
+| 备份恢复 | 定期备份 | ☐ |
+
+---
+
+## 与其他板块的关系
 
 - 大数据存储见「[基础知识/大数据](../大数据/README.md)」；
 - NoSQL 对比见「[MongoDB](./MongoDB.md)」；

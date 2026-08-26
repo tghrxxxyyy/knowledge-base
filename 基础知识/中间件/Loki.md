@@ -1156,7 +1156,300 @@ Loki vs CloudWatch Logs：
 └──────────────────────┴────────────────────────────────────────────┘
 ```
 
-## 十二、与其他板块的关系
+## 十三、Loki 多租户配置
+
+### 13.1 多租户架构
+
+```text
+Loki 多租户架构：
+  1. 租户隔离：每个租户独立的数据流
+  2. 资源限制：每个租户独立的限流配置
+  3. 数据隔离：每个租户独立的存储路径
+  4. 查询隔离：每个租户独立的查询配额
+
+认证方式：
+  X-Scope-OrgID Header：最简单
+  认证网关：生产推荐
+  OIDC：企业级方案
+```
+
+### 13.2 多租户配置
+
+```yaml
+# loki.yaml 多租户配置
+auth_enabled: true
+
+limits_per_tenant:
+  tenant-a:
+    ingestion_rate_mb: 16
+    ingestion_burst_size_mb: 32
+    max_entries_limit_per_query: 5000
+    max_query_series: 50000
+  tenant-b:
+    ingestion_rate_mb: 8
+    ingestion_burst_size_mb: 16
+    max_entries_limit_per_query: 2000
+    max_query_series: 20000
+
+# 认证网关配置
+server:
+  http_listen_port: 3100
+
+# 使用 nginx 作为认证网关
+# nginx 配置示例：
+# map $http_x_scope_orgid $tenant {
+#   default "unknown";
+#   "team-a" "tenant-a";
+#   "team-b" "tenant-b";
+# }
+```
+
+---
+
+## 十四、LogQL 查询实战
+
+### 14.1 LogQL 查询模式
+
+| 模式 | 语法 | 示例 |
+|------|------|------|
+| 标签选择 | `{app="nginx"}` | 匹配 app=nginx |
+| 正则匹配 | `{app=~"nginx\|apache"}` | 匹配多个值 |
+| 内容过滤 | `{app="nginx"} \| "error"` | 包含 error |
+| 正则过滤 | `{app="nginx"} \|~ "error.*timeout"` | 正则匹配 |
+| JSON 解析 | `{app="nginx"} \| json \| level="error"` | 解析 JSON |
+| 日志指标 | `rate({app="nginx"} [5m])` | 5分钟速率 |
+
+### 14.2 LogQL 高级查询
+
+```logql
+# 统计 error 日志数量
+count_over_time({app="nginx"} | json | level="error" [1h])
+
+# 按状态码分组
+sum by (status_code) (
+  count_over_time({app="nginx"} | json [1h])
+)
+
+# P99 延迟
+histogram_quantile(0.99,
+  sum(rate({app="nginx"} | json | unwrap duration [5m])) by (le)
+)
+
+# 日志模式分析
+{app="nginx"} | pattern "<method> <path> <status>" | status >= 500
+```
+
+### 14.3 LogQL 性能优化
+
+| 优化点 | 说明 | 效果 |
+|--------|------|------|
+| 标签选择 | 尽量使用精确标签 | 减少扫描范围 |
+| 时间范围 | 缩短查询时间窗口 | 减少数据量 |
+| 过滤顺序 | 先标签过滤再内容过滤 | 提前过滤 |
+| 正则优化 | 使用非捕获组 | 减少开销 |
+| 缓存 | 使用查询缓存 | 重复查询加速 |
+
+---
+
+## 十五、Loki 存储后端配置
+
+### 15.1 存储后端对比
+
+| 后端 | 适用场景 | 性能 | 成本 |
+|------|----------|------|------|
+| filesystem | 单机开发 | 高 | 低 |
+| S3 | 云环境 | 中 | 中 |
+| GCS | GCP 环境 | 中 | 中 |
+| Azure Blob | Azure 环境 | 中 | 中 |
+| Swift | OpenStack | 中 | 中 |
+
+### 15.2 S3 存储配置
+
+```yaml
+# loki.yaml S3 配置
+storage_config:
+  aws:
+    s3: s3://us-east-1/loki-logs
+    s3forcepathstyle: true
+  boltdb_shipper:
+    active_index_directory: /data/loki/index
+    cache_location: /data/loki/cache
+    shared_store: s3
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: boltdb-shipper
+      object_store: s3
+      schema: v12
+      index:
+        prefix: index_
+        period: 24h
+```
+
+---
+
+## 十六、Loki 与 Grafana 集成
+
+### 16.1 Grafana 数据源配置
+
+```yaml
+# Grafana 数据源配置
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    url: http://loki:3100
+    access: proxy
+    isDefault: true
+    jsonData:
+      maxLines: 1000
+      timeout: 60
+```
+
+### 16.2 Grafana 告警配置
+
+```yaml
+# Grafana 告警规则
+groups:
+  - name: loki-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate({app="nginx"} |= "error" [5m])) by (app) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate on {{ $labels.app }}"
+          
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, sum(rate({app="nginx"} | json | unwrap duration [5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency on {{ $labels.app }}"
+```
+
+---
+
+## 十七、Loki 性能优化
+
+### 17.1 性能优化策略
+
+| 优化点 | 说明 | 效果 |
+|--------|------|------|
+| 标签设计 | 低基数标签 | 减少索引大小 |
+| Chunk 大小 | 合理设置 chunk 大小 | 平衡压缩和查询 |
+| 缓存配置 | 启用查询缓存 | 加速重复查询 |
+| 并行查询 | 增加查询并行度 | 提升查询速度 |
+| 存储优化 | 使用 SSD 缓存 | 加速查询 |
+
+### 17.2 性能调优配置
+
+```yaml
+# loki.yaml 性能配置
+ingester:
+  chunk_idle_period: 5m
+  chunk_target_size: 1048576  # 1MB
+  chunk_retain_period: 30s
+  max_transfer_retries: 10
+
+query_range:
+  split_queries_by_interval: 15m
+  parallelise_shardable_queries: true
+
+# 缓存配置
+chunk_store_config:
+  chunk_cache_config:
+    embedded_cache:
+      enabled: true
+      max_size_mb: 512
+
+# 查询缓存
+results_cache:
+  cache:
+    embedded_cache:
+      enabled: true
+      max_size_mb: 256
+```
+
+---
+
+## 十八、Loki vs ELK 深度对比
+
+| 维度 | Loki | ELK Stack |
+|------|------|-----------|
+| 索引方式 | 标签索引 | 全文索引 |
+| 存储成本 | 低（对象存储） | 高（Elasticsearch） |
+| 查询语言 | LogQL | KQL |
+| 全文搜索 | 弱 | 强 |
+| 分析能力 | 中 | 强 |
+| 运维复杂度 | 低 | 高 |
+| 云原生 | 原生支持 | 需要适配 |
+| 适用场景 | 云原生日志 | 企业级日志分析 |
+
+### 18.1 选型建议
+
+```text
+选型决策：
+  1. 云原生环境 → Loki（成本低、运维简单）
+  2. 企业级日志分析 → ELK（全文搜索、分析能力强）
+  3. 混合场景 → Loki（日志存储）+ ES（日志分析）
+  4. 预算有限 → Loki（存储成本低）
+
+迁移路径：
+  ELK → Loki：Filebeat → Promtail
+  Loki → ELK：Promtail → Filebeat
+```
+
+---
+
+## 十九、Loki 告警与 Ruler
+
+### 19.1 Ruler 告警配置
+
+```yaml
+# loki.yaml Ruler 配置
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /data/loki/rules
+  rule_path: /data/loki/rules-temp
+  alertmanager_url: http://alertmanager:9093
+  ring:
+    kvstore:
+      store: inmemory
+  enable_api: true
+
+# 告警规则文件
+groups:
+  - name: application-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate({app="nginx"} |= "error" [5m])) by (app) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate on {{ $labels.app }}"
+          description: "Error rate is {{ $value }} per second"
+```
+
+### 19.2 Ruler 告警最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 告警分层 | P0/P1/P2 分级 |
+| 告警去重 | 避免重复告警 |
+| 告警收敛 | 相似告警合并 |
+| 告警恢复 | 自动恢复通知 |
+| 告警历史 | 保留告警历史 |
+
+---
+
+## 与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；
 - 采集传输见「[日志采集与传输](./日志采集与传输.md)」；

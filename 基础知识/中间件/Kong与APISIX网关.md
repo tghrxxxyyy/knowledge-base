@@ -1160,7 +1160,295 @@ proxy_cache_path /tmp/cache levels=1:2
 - 日志：访问日志、审计日志
 ```
 
-## 十二、与其他板块的关系
+## 十三、插件开发实战
+
+### 13.1 APISIX 插件开发
+
+```lua
+-- APISIX 自定义插件示例
+local plugin = require("apisix.plugin")
+
+local _M = {
+    version = 1.0,
+    priority = 1000,
+    schema = {
+        properties = {
+            header_name = {type = "string"},
+            header_value = {type = "string"},
+        },
+        required = {"header_name", "header_value"},
+    },
+}
+
+function _M.access(conf, ctx)
+    -- 添加自定义 header
+    ngx.req.set_header(conf.header_name, conf.header_value)
+end
+
+return _M
+```
+
+### 13.2 Kong 插件开发
+
+```lua
+-- Kong 自定义插件示例
+local kong = kong
+
+local MyPlugin = {
+    PRIORITY = 1000,
+    schema = {
+        fields = {
+            {header_name = {type = "string", required = true}},
+            {header_value = {type = "string", required = true}},
+        },
+    },
+}
+
+function MyPlugin:access(conf)
+    kong.service.request.set_header(conf.header_name, conf.header_value)
+end
+
+return MyPlugin
+```
+
+---
+
+## 十四、认证插件深度配置
+
+### 14.1 JWT 认证配置
+
+```yaml
+# APISIX JWT 认证
+plugins:
+  jwt-auth:
+    secret: "my-secret-key"
+    header: "Authorization"
+    claim_specs:
+      exp:
+        required: true
+      sub:
+        required: true
+
+# 生成 JWT Token
+curl http://apisix:9180/apisix/plugin/jwt/sign \
+  -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' \
+  -d '{"header": {"alg": "HS256"}, "payload": {"sub": "user1", "exp": 1735689600}}'
+```
+
+### 14.2 OAuth2 认证配置
+
+```yaml
+# APISIX OAuth2 配置
+plugins:
+  openid-connect:
+    client_id: "my-client-id"
+    client_secret: "my-client-secret"
+    discovery: "https://auth.example.com/.well-known/openid-configuration"
+    scope: "openid profile email"
+    redirect_uri: "https://my-app.example.com/callback"
+    post_logout_redirect_uri: "https://my-app.example.com/"
+```
+
+### 14.3 认证方式对比
+
+| 认证方式 | 适用场景 | 复杂度 | 安全性 |
+|----------|----------|--------|--------|
+| API Key | 简单场景 | 低 | 中 |
+| JWT | 微服务 | 中 | 高 |
+| OAuth2 | 第三方授权 | 高 | 高 |
+| OIDC | 企业级 | 高 | 高 |
+| mTLS | 服务间认证 | 高 | 最高 |
+
+---
+
+## 十五、K8s Ingress 集成
+
+### 15.1 APISIX Ingress 配置
+
+```yaml
+# APISIX Ingress CRD
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: my-route
+spec:
+  http:
+    - name: my-route
+      match:
+        paths:
+          - /api/*
+      backends:
+        - serviceName: my-service
+          servicePort: 80
+      plugins:
+        - name: jwt-auth
+        - name: limit-req
+          enable: true
+          config:
+            rate: 100
+            burst: 50
+```
+
+### 15.2 Kong Ingress 配置
+
+```yaml
+# Kong Ingress CRD
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    konghq.com/plugins: "jwt-auth,rate-limiting"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+spec:
+  ingressClassName: kong
+  rules:
+    - host: my-app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+```
+
+---
+
+## 十六、APISIX 生态与插件市场
+
+### 16.1 APISIX 插件分类
+
+| 类别 | 插件 | 说明 |
+|------|------|------|
+| 认证 | jwt-auth, key-auth, openid-connect | 身份验证 |
+| 限流 | limit-req, limit-count, limit-conn | 流量控制 |
+| 可观测性 | prometheus, skywalking-logger | 监控日志 |
+| 安全 | cors, ip-restriction, ua-restriction | 安全防护 |
+| 转换 | response-rewrite, grpc-transcode | 协议转换 |
+
+### 16.2 APISIX 插件市场
+
+```text
+APISIX 官方插件：
+  - 核心插件：100+ 官方插件
+  - 社区插件：50+ 社区贡献
+  - 自定义插件：支持 Lua/Java/Go/Python
+
+插件生态优势：
+  - 开源：所有插件开源
+  - 标准化：统一的插件接口
+  - 丰富：覆盖大部分场景
+  - 易开发：简单的插件框架
+```
+
+---
+
+## 十七、性能基准测试
+
+### 17.1 APISIX vs Kong 性能对比
+
+| 指标 | APISIX | Kong |
+|------|--------|------|
+| QPS | 50000+ | 30000+ |
+| 延迟 P99 | <10ms | <15ms |
+| 内存占用 | 低 | 中 |
+| CPU 占用 | 低 | 中 |
+| 冷启动 | 快 | 慢 |
+
+### 17.2 性能测试方法
+
+```bash
+# 使用 wrk 进行性能测试
+wrk -t12 -c400 -d30s http://apisix:9080/api/test
+
+# 使用 hey 进行性能测试
+hey -n 100000 -c 200 -q 10 http://apisix:9080/api/test
+
+# 性能测试指标
+# QPS：每秒请求数
+# P50/P99：延迟分布
+# 错误率：请求成功率
+# 吞吐量：数据传输速率
+```
+
+---
+
+## 十八、监控与告警
+
+### 18.1 APISIX 监控配置
+
+```yaml
+# Prometheus 插件配置
+plugins:
+  prometheus:
+    export_addr:
+      ip: "0.0.0.0"
+      port: 9091
+    export_uri: /apisix/prometheus/metrics
+    export_metric_prefix: apisix_
+    metric_labels:
+      - route_name
+      - service_name
+      - consumer_name
+```
+
+### 18.2 Grafana 监控面板
+
+```yaml
+# Grafana 面板配置
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    access: proxy
+
+# APISIX 关键监控指标
+# apisix_http_requests_total：总请求数
+# apisix_http_request_duration_seconds：请求延迟
+# apisix_http_response_status：响应状态码
+# apisix_upstream_status：上游状态
+```
+
+---
+
+## 十九、网关安全最佳实践
+
+### 19.1 安全配置清单
+
+```text
+安全配置清单：
+  ☐ 启用 HTTPS（TLS 1.2+）
+  ☐ 配置 CORS 策略
+  ☐ 启用认证（JWT/OAuth2）
+  ☐ 配置限流（防 DDoS）
+  ☐ 启用访问日志
+  ☐ 配置 IP 黑白名单
+  ☐ 启用请求验证
+  ☐ 配置响应头安全
+```
+
+### 19.2 安全响应头配置
+
+```yaml
+# APISIX 安全响应头
+plugins:
+  response-rewrite:
+    headers:
+      add:
+        - X-Content-Type-Options: nosniff
+        - X-Frame-Options: DENY
+        - X-XSS-Protection: 1; mode=block
+        - Strict-Transport-Security: max-age=31536000; includeSubDomains
+        - Content-Security-Policy: default-src 'self'
+```
+
+---
+
+## 与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；
 - Spring 生态网关见「[Spring Cloud Gateway](./SpringCloudGateway.md)」；

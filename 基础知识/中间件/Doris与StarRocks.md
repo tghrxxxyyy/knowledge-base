@@ -1172,6 +1172,244 @@ SHOW PROC '/tablet_scheduler';
 
 ---
 
+## 函数下推与计算优化
+
+### 函数下推机制
+
+```text
+函数下推原理：
+  1. SQL 解析：识别可下推的函数
+  2. 计划优化：将函数下推到数据源
+  3. 执行优化：在数据源执行函数
+
+支持下推的函数：
+  - 数学函数：abs, round, floor, ceil
+  - 字符串函数：concat, substr, upper, lower
+  - 日期函数：date_format, datediff
+  - 聚合函数：sum, count, avg, max, min
+  - 窗口函数：row_number, rank, dense_rank
+```
+
+### 函数下推配置
+
+```sql
+-- 启用函数下推
+SET enable_function_pushdown = true;
+
+-- 查看执行计划
+EXPLAIN SELECT * FROM orders WHERE DATE_FORMAT(create_time, '%Y-%m') = '2024-01';
+
+-- 函数下推效果
+-- 优化前：全表扫描 + 过滤
+-- 优化后：分区裁剪 + 过滤
+```
+
+---
+
+## 物化视图深度实战
+
+### 物化视图类型
+
+| 类型 | 说明 | 适用场景 | 刷新方式 |
+|------|------|----------|----------|
+| Rollup | 预聚合 | 多维分析 | 自动 |
+| 物化视图 | SQL 物化 | 复杂查询 | 手动/自动 |
+| 异步物化视图 | 异步刷新 | 近实时 | 定时刷新 |
+
+### 物化视图创建
+
+```sql
+-- Rollup 预聚合
+ALTER TABLE orders ADD ROLLUP rollup_user_time (user_id, create_time, amount);
+
+-- 物化视图
+CREATE MATERIALIZED VIEW mv_user_stats AS
+SELECT 
+    user_id,
+    DATE(create_time) as order_date,
+    SUM(amount) as total_amount,
+    COUNT(*) as order_count
+FROM orders
+GROUP BY user_id, DATE(create_time);
+
+-- 异步物化视图
+CREATE MATERIALIZED VIEW mv_async_stats
+BUILD DEFERRED REFRESH AUTO ON COMMIT
+AS
+SELECT 
+    user_id,
+    DATE(create_time) as order_date,
+    SUM(amount) as total_amount
+FROM orders
+GROUP BY user_id, DATE(create_time);
+
+-- 手动刷新物化视图
+REFRESH MATERIALIZED VIEW mv_user_stats;
+REFRESH MATERIALIZED VIEW mv_async_stats;
+```
+
+---
+
+## Hive Catalog 集成
+
+### Hive Catalog 配置
+
+```sql
+-- 创建 Hive Catalog
+CREATE CATALOG hive_catalog PROPERTIES (
+    'type' = 'hive',
+    'hive.metastore.uri' = 'thrift://metastore:9083',
+    'hive.metastore.warehouse.dir' = '/user/hive/warehouse'
+);
+
+-- 查询 Hive 表
+SELECT * FROM hive_catalog.default.orders;
+
+-- 跨 Catalog 查询
+SELECT 
+    a.user_id,
+    a.total_amount,
+    b.user_name
+FROM hive_catalog.default.user_stats a
+JOIN mysql_catalog.mydb.users b ON a.user_id = b.id;
+```
+
+### Hive Catalog 优化
+
+| 优化点 | 说明 | 效果 |
+|--------|------|------|
+| 谓词下推 | 过滤条件下推到 Hive | 减少数据扫描 |
+| 分区裁剪 | 跳过无关分区 | 减少数据量 |
+| 列式裁剪 | 只读取需要的列 | 减少 IO |
+| 缓存 | 缓存元数据 | 加速查询 |
+| 并行 | 多 BE 并行扫描 | 提升吞吐 |
+
+---
+
+## 存储格式对比
+
+### 存储格式选择
+
+| 格式 | 压缩比 | 读取性能 | 写入性能 | 适用场景 |
+|------|--------|----------|----------|----------|
+| Parquet | 高 | 高 | 中 | OLAP 分析 |
+| ORC | 高 | 高 | 中 | Hive 分析 |
+| Avro | 中 | 中 | 高 | 数据交换 |
+| Text | 低 | 低 | 高 | 日志存储 |
+
+### 存储格式配置
+
+```sql
+-- 建表指定存储格式
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2)
+)
+PROPERTIES (
+    "storage_format" = "PARQUET",
+    "compression_codec" = "ZSTD"
+);
+
+-- 查看表存储信息
+SHOW CREATE TABLE orders;
+SHOW TABLET FROM orders;
+```
+
+---
+
+## 导入实践深度指南
+
+### 导入方式对比
+
+| 方式 | 吞吐量 | 延迟 | 适用场景 |
+|------|--------|------|----------|
+| Stream Load | 100MB/s | 秒级 | 实时数据导入 |
+| Broker Load | 500MB/s | 分钟级 | 批量历史数据 |
+| Routine Load | 20MB/s | 秒级 | Kafka 消费 |
+| INSERT INTO | 10MB/s | 毫秒级 | 小批量/单条 |
+| Multi-Catalog | 200MB/s | 分钟级 | 跨源数据同步 |
+
+### Stream Load 调优
+
+```bash
+# Stream Load 性能调优
+curl -T data.csv \
+  -H "format:csv" \
+  -H "column_separator:," \
+  -H "max_filter_ratio:0.1" \
+  -H "mem_limit:4294967296" \
+  -H "parallel:4" \
+  -H "batch_size:2048" \
+  -H "timeout:300" \
+  http://doris-fe:8030/api/test_db/orders/_stream_load
+
+# Stream Load 最佳实践
+# 1. 批量导入：每次 > 100MB
+# 2. 并行导入：设置 parallel 参数
+# 3. 内存限制：避免 OOM
+# 4. 超时设置：避免长时间阻塞
+```
+
+### 导入问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 导入失败 | 格式错误 | 检查数据格式 |
+| 导入慢 | 数据量大 | 增加并行度 |
+| 内存溢出 | 数据量大 | 增加内存限制 |
+| 过滤率高 | 数据质量差 | 清洗数据 |
+
+---
+
+## 运维深度指南
+
+### 集群运维检查清单
+
+```text
+每日检查：
+  ☐ 检查所有节点状态
+  ☐ 检查磁盘使用率（<85%）
+  ☐ 检查查询延迟（P99 < 10s）
+  ☐ 检查导入任务（无失败）
+  ☐ 检查复制状态（无延迟）
+
+每周检查：
+  ☐ 清理过期数据
+  ☐ 检查 Tablet 均衡
+  ☐ 检查慢查询日志
+  ☐ 更新统计信息
+  ☐ 检查备份状态
+
+每月检查：
+  ☐ 存储容量规划
+  ☐ 性能优化
+  ☐ 架构评估
+  ☐ 成本分析
+```
+
+### 常见问题排查
+
+```bash
+# 查看集群状态
+SHOW PROC '/frontends';
+SHOW PROC '/backends';
+
+# 查看 Tablet 状态
+SHOW TABLET FROM orders;
+
+# 查看慢查询
+SHOW PROC '/current_queries';
+
+# 查看导入任务
+SHOW ROUTINE LOAD;
+
+# 查看复制状态
+SHOW TABLET FROM orders;
+```
+
+---
+
 ## 九、速查表（扩展）
 
 | 项 | 结论 |

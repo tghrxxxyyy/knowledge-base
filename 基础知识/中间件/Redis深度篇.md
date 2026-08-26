@@ -1161,6 +1161,237 @@ redis-cli XAUTOCLAIM mystream mygroup consumer2 3600000 0 COUNT 10
 
 ---
 
+## 二十四、Redis Cluster 故障转移
+
+### 24.1 Cluster 故障转移流程
+
+```text
+Redis Cluster 故障转移流程：
+  1. 主节点心跳超时（cluster-node-timeout）
+  2. 标记主节点为 PFAIL（疑似失败）
+  3. 多数主节点确认为 FAIL（失败）
+  4. 从节点发起选举
+  5. 获得多数投票的从节点成为新主
+  6. 广播新主节点信息
+
+关键参数：
+  cluster-node-timeout: 15000（15秒）
+  cluster-replica-validity-factor: 10
+  cluster-migration-barrier: 1
+```
+
+### 24.2 Cluster 故障转移配置
+
+```bash
+# 查看集群状态
+redis-cli cluster info
+redis-cli cluster nodes
+
+# 手动故障转移
+redis-cli cluster failover
+
+# 设置从节点
+redis-cli cluster replicate <master-node-id>
+
+# 检查集群健康
+redis-cli cluster check
+redis-cli cluster fix
+```
+
+---
+
+## 二十五、Redis 内存淘汰策略
+
+### 25.1 淘汰策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| noeviction | 不淘汰，写入报错 | 数据不能丢 |
+| allkeys-lru | 所有键 LRU | 通用缓存 |
+| volatile-lru | 过期键 LRU | 混合场景 |
+| allkeys-lfu | 所有键 LFU | 热点数据 |
+| volatile-lfu | 过期键 LFU | 混合场景 |
+| allkeys-random | 所有键随机 | 无热点 |
+| volatile-random | 过期键随机 | 混合场景 |
+| volatile-ttl | 过期键 TTL | 有明确过期时间 |
+
+### 25.2 LFU 策略详解
+
+```text
+LFU（Least Frequently Used）原理：
+  使用对数计数器（logarithmic counter）
+  衰减因子：server.lfu-log-factor（默认10）
+  衰减时间：server.lfu-decay-time（默认1分钟）
+  
+  计数器 = counter / (1 + log(10) * elapsed_time / decay_time)
+  
+  优势：
+    - 区分冷热数据
+    - 避免 LRU 的"一次性访问"问题
+    - 更准确的访问频率
+```
+
+---
+
+## 二十六、Redis 事务 vs Lua 脚本
+
+### 26.1 事务 vs Lua 对比
+
+| 维度 | 事务 | Lua 脚本 |
+|------|------|----------|
+| 原子性 | 部分原子 | 完全原子 |
+| 隔离性 | 串行执行 | 单线程串行 |
+| 功能 | 简单事务 | 复杂逻辑 |
+| 性能 | 一般 | 更好（减少网络） |
+| 使用场景 | 简单事务 | 复杂原子操作 |
+
+### 26.2 Lua 脚本示例
+
+```lua
+-- 分布式锁 Lua 脚本
+-- KEYS[1]: lock_key
+-- KEYS[2]: lock_value
+-- ARGV[1]: expire_time
+
+-- 加锁
+if redis.call('setnx', KEYS[1], KEYS[2]) == 1 then
+    redis.call('expire', KEYS[1], ARGV[1])
+    return 1
+else
+    return 0
+end
+
+-- 解锁（只有持有者才能解锁）
+if redis.call('get', KEYS[1]) == KEYS[2] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+```
+
+---
+
+## 二十七、Redis Functions
+
+### 27.1 Functions 简介
+
+```bash
+# Redis Functions（Redis 7.0+）
+# 替代 EVAL，支持持久化和库管理
+
+# 创建 Function
+redis-cli FUNCTION LOAD "#!lua name=mylib
+local function my_command(keys, args)
+    return redis.call('set', keys[1], args[1])
+end
+redis.register_function('my_command', my_command)
+"
+
+# 调用 Function
+redis-cli FCALL my_command 1 mykey myvalue
+
+# 查看 Functions
+redis-cli FUNCTION LIST
+redis-cli FUNCTION DUMP
+```
+
+### 27.2 Functions vs EVAL
+
+| 维度 | EVAL | Functions |
+|------|------|-----------|
+| 持久化 | 不持久化 | 持久化到 AOF |
+| 管理 | 无管理 | 库管理 |
+| 性能 | 一般 | 更好 |
+| 适用场景 | 临时脚本 | 生产环境 |
+
+---
+
+## 二十八、Redis 多数据库陷阱
+
+### 28.1 多数据库问题
+
+```text
+Redis 多数据库陷阱：
+  1. SELECT 切换数据库有性能开销
+  2. 不同数据库之间数据隔离不强
+  3. FLUSHALL 会清空所有数据库
+  4. 多数据库不适合多租户隔离
+  
+生产建议：
+  1. 使用 Key 前缀代替多数据库
+  2. 使用 Redis Cluster 代替多数据库
+  3. 使用 Key 命名规范实现逻辑隔离
+```
+
+### 28.2 Key 命名规范
+
+```text
+Key 命名规范：
+  {业务}:{模块}:{类型}:{ID}
+  
+示例：
+  user:profile:hash:1001
+  order:detail:string:2001
+  cache:session:string:abc123
+  
+优点：
+  1. 清晰的命名空间
+  2. 支持 Hash Tag
+  3. 便于管理和监控
+  4. 避免 Key 冲突
+```
+
+---
+
+## 二十九、Redis 故障案例
+
+### 29.1 常见故障场景
+
+| 故障场景 | 原因 | 解决方案 |
+|----------|------|----------|
+| 大 Key | 单个 Key 过大 | 拆分 Key |
+| 热 Key | 单个 Key 访问过高 | 本地缓存/分片 |
+| 慢命令 | O(N) 命令 | 优化命令/拆分 |
+| 主从延迟 | 网络/同步延迟 | 监控延迟/优化 |
+| 内存溢出 | 内存不足 | 淘汰策略/扩容 |
+
+### 29.2 故障排查流程
+
+```mermaid
+graph TD
+    A[故障告警] --> B{检查 Redis 状态}
+    B -->|连接失败| C[检查网络/端口]
+    B -->|响应慢| D{检查慢日志}
+    D -->|大 Key| E[拆分 Key]
+    D -->|慢命令| F[优化命令]
+    B -->|内存溢出| G{检查内存使用}
+    G -->|大 Key| E
+    G -->|内存不足| H[扩容/调整淘汰策略]
+    B -->|主从延迟| I[检查网络/同步]
+```
+
+### 29.3 故障排查命令
+
+```bash
+# 慢日志
+redis-cli slowlog get 10
+redis-cli slowlog len
+
+# 大 Key 扫描
+redis-cli --bigkeys
+redis-cli --memkeys
+
+# 内存分析
+redis-cli info memory
+redis-cli memory doctor
+
+# 客户端连接
+redis-cli client list
+redis-cli client getname
+```
+
+---
+
 ## 与其他板块的关系
 
 - Redis 基础知识见「[基础知识/redis知识](../redis知识.md)」；

@@ -1014,7 +1014,177 @@ docker_build:
 
 ---
 
-## 十、与其他模块的关联
+## 十八、GitLab CI 变量管理深度指南
+
+### 18.1 变量类型与优先级
+
+| 变量类型 | 优先级 | 作用域 | 配置位置 |
+|----------|--------|--------|----------|
+| Job 变量 | 最高 | 单个 Job | `.gitlab-ci.yml` Job 级 |
+| Pipeline 变量 | 高 | 整个 Pipeline | 触发时指定 |
+| Project 变量 | 中 | 项目内所有 Pipeline | Settings → CI/CD → Variables |
+| Group 变量 | 低 | 组内所有项目 | Group → Settings → CI/CD |
+| Instance 变量 | 最低 | 实例内所有项目 | Admin → CI/CD → Variables |
+| 内置变量 | 固定 | 自动注入 | GitLab 预定义 |
+
+### 18.2 变量保护机制
+
+| 保护机制 | 说明 | 适用场景 |
+|----------|------|----------|
+| Protected | 仅在 protected 分支/标签可用 | 生产密钥 |
+| Masked | 日志中自动遮蔽 | 所有敏感信息 |
+| File 类型 | 以文件形式挂载到 /tmp | 证书/配置文件 |
+| Environment 绑定 | 绑定到特定环境 | 环境级配置 |
+
+### 18.3 OIDC 免密钥部署
+
+```yaml
+deploy:
+  stage: deploy
+  id_tokens:
+    AWS_TOKEN:
+      aud: "https://gitlab.example.com"
+  script:
+    - |
+      AWS_ROLE_ARN="arn:aws:iam::123456789012:role/gitlab-deploy"
+      creds=$(aws sts assume-role-with-web-identity \
+        --role-arn $AWS_ROLE_ARN \
+        --role-session-name gitlab-$CI_PIPELINE_ID \
+        --web-identity-token $AWS_TOKEN)
+      export AWS_ACCESS_KEY_ID=$(echo $creds | jq -r .Credentials.AccessKeyId)
+      export AWS_SECRET_ACCESS_KEY=$(echo $creds | jq -r .Credentials.SecretAccessKey)
+      export AWS_SESSION_TOKEN=$(echo $creds | jq -r .Credentials.SessionToken)
+    - aws s3 sync ./dist s3://my-bucket/
+```
+
+---
+
+## 十九、Runner 选型与运维深度指南
+
+### 19.1 Executor 选型决策树
+
+| 场景 | 推荐 Executor | 理由 |
+|------|---------------|------|
+| 可信代码 + 无需隔离 | shell | 最快 |
+| 可信代码 + 需要隔离 | docker | 干净环境 |
+| 不可信代码 | docker/kubernetes | 强隔离 |
+| 弹性伸缩 | docker+machine/kubernetes | 按需扩缩 |
+| 已有 K8s 集群 | kubernetes | 原生集成 |
+
+### 19.2 Runner 配置优化
+
+```toml
+[[runners]]
+  name = "production-runner"
+  executor = "kubernetes"
+  concurrent = 10
+  check_interval = 3
+  
+  [runners.kubernetes]
+    namespace = "gitlab-ci"
+    cpu_request = "500m"
+    cpu_limit = "2"
+    memory_request = "1Gi"
+    memory_limit = "4Gi"
+    termination_grace_period_seconds = 300
+```
+
+### 19.3 Runner 监控与告警
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| Runner 数量 | 在线 Runner 数 | < 预期值 |
+| Job 队列长度 | 等待执行的 Job 数 | > 10 |
+| Job 失败率 | 失败 Job 占比 | > 5% |
+| Runner 磁盘使用率 | 磁盘使用率 | > 80% |
+
+### 19.4 Runner 安全最佳实践
+
+| 安全措施 | 说明 | 优先级 |
+|----------|------|--------|
+| 受信代码才用 shell | 不可信代码必须用 docker/k8s | 高 |
+| 定期更新 Runner | 保持最新版本 | 高 |
+| 限制 Runner 注册 | Token 管控 | 中 |
+| 网络隔离 | Runner 独立网段 | 中 |
+
+---
+
+## 二十、GitLab Pages 与静态站点部署
+
+### 20.1 Pages 部署配置
+
+```yaml
+pages:
+  stage: deploy
+  script:
+    - mkdocs build -d public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+```
+
+### 20.2 Pages 使用场景
+
+| 场景 | 说明 | 配置要点 |
+|------|------|----------|
+| 项目文档 | MkDocs/Docusaurus | artifacts: public |
+| 博客站点 | Hugo/Jekyll | artifacts: public |
+| 组件库文档 | Storybook | artifacts: storybook-static |
+| API 文档 | Swagger UI | artifacts: dist |
+
+---
+
+## 二十一、GitLab Container Registry
+
+### 21.1 镜像构建与推送
+
+```yaml
+build_image:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+```
+
+### 21.2 镜像标签策略
+
+| 标签类型 | 示例 | 用途 |
+|----------|------|------|
+| Commit SHA | `abc1234` | 精确追踪 |
+| 分支名 | `main` | 开发版本 |
+| 语义版本 | `v1.0.0` | 发布版本 |
+| latest | `latest` | 默认最新 |
+
+---
+
+## 二十二、GitLab CI vs Jenkins 深度对比
+
+| 维度 | GitLab CI | Jenkins |
+|------|-----------|---------|
+| 部署形态 | 平台内置 | 独立服务 |
+| 配置方式 | YAML 声明式 | Groovy Pipeline |
+| 扩展机制 | include 模板 | 插件市场 |
+| 安全扫描 | 官方模板一键启用 | 需要插件拼装 |
+| Runner/Agent | 原生支持 | 需要配置 |
+| 容器支持 | 原生 Docker/K8s | 需要插件 |
+| 审批流程 | Environments + manual | 插件 |
+| 学习曲线 | 低 | 中 |
+| 社区生态 | GitLab 生态 | 插件丰富 |
+| 适用场景 | GitLab 用户 | 已有 Jenkins 的团队 |
+
+---
+
+## 与其他模块的关联
 
 - 流水线总纲与本库术语，见 [01-概述与核心概念](01-概述与核心概念.md)。
 - 构建与制品（Maven/npm 打包、制品仓库）是 CI 中段核心，见 [03-构建与制品管理](03-构建与制品管理.md)。

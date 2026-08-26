@@ -1158,6 +1158,214 @@ flowchart TB
 | 复制失败 | > 0 | 检查网络、重启 Tablet |
 | 磁盘使用 | > 85% | 扩容或迁移数据 |
 
+## 二十九、物化视图深度对比
+
+### 29.1 物化视图实现对比
+
+| 引擎 | 物化视图类型 | 刷新方式 | 适用场景 |
+|------|-------------|----------|----------|
+| ClickHouse | Materialized View | INSERT 触发 | 实时聚合 |
+| Doris | Rollup/物化视图 | 自动/手动 | 预计算 |
+| StarRocks | 物化视图 | 自动 | 多维分析 |
+| Snowflake | 物化视图 | 定时刷新 | 云数仓 |
+| BigQuery | 物化视图 | 自动 | 云数仓 |
+
+### 29.2 物化视图设计原则
+
+```text
+物化视图设计原则：
+  1. 高频查询优先：QPS 高的查询先建物化视图
+  2. 聚合维度固定：避免频繁变化的维度
+  3. 数据量适中：过大的物化视图维护成本高
+  4. 刷新策略：实时/定时/触发 选择合适
+  5. 存储成本：物化视图占用额外存储
+```
+
+---
+
+## 三十、Doris Lakehouse 架构
+
+### 30.1 Doris Lakehouse 架构
+
+```mermaid
+graph TB
+    A[应用] --> B[Doris FE]
+    B --> C[Doris BE]
+    C --> D[Hive Catalog]
+    C --> E[S3 Catalog]
+    C --> F[Iceberg Catalog]
+    D --> G[HDFS 数据湖]
+    E --> H[对象存储]
+    F --> I[Iceberg 表]
+```
+
+### 30.2 Doris 外表查询优化
+
+| 优化点 | 说明 | 效果 |
+|--------|------|------|
+| 谓词下推 | 将过滤条件下推到数据湖 | 减少数据扫描 |
+| 分区裁剪 | 跳过不相关分区 | 减少数据量 |
+| 列式裁剪 | 只读取需要的列 | 减少 IO |
+| 缓存 | 缓存元数据/数据 | 加速查询 |
+| 并行 | 多 BE 并行扫描 | 提升吞吐 |
+
+---
+
+## 三十一、OLAP 引擎选型深度指南
+
+### 31.1 OLAP 选型决策树
+
+```mermaid
+graph TD
+    A[OLAP 选型] --> B{数据规模}
+    B -->|<1TB| C[单机 OLAP]
+    B -->|1-100TB| D[分布式 OLAP]
+    B -->|>100TB| E[云数仓]
+    C --> F[ClickHouse/DuckDB]
+    D --> G{查询模式}
+    G -->|简单查询| H[Doris/StarRocks]
+    G -->|复杂查询| I[Trino/Presto]
+    G -->|实时分析| J[ClickHouse]
+    E --> K[Snowflake/BigQuery]
+```
+
+### 31.2 OLAP 选型对比
+
+| 引擎 | 数据规模 | 查询模式 | 学习成本 | 适用场景 |
+|------|----------|----------|----------|----------|
+| ClickHouse | 单机-中等 | 实时分析 | 中 | 日志/监控 |
+| Doris | 中等-大 | 多维分析 | 低 | 统一分析 |
+| StarRocks | 中等-大 | 多维分析 | 低 | 统一分析 |
+| Trino | 大-超大 | 联邦查询 | 中 | 跨源查询 |
+| DuckDB | 小-中等 | 嵌入式 | 低 | 本地分析 |
+
+---
+
+## 三十二、导入性能深度调优
+
+### 32.1 Doris 导入优化
+
+```bash
+# Stream Load 批量导入
+curl -T data.csv \
+  -H "format:csv" \
+  -H "column_separator:," \
+  -H "max_filter_ratio:0.1" \
+  -H "mem_limit:4294967296" \
+  -H "parallel:4" \
+  -H "batch_size:2048" \
+  http://doris-fe:8030/api/test_db/orders/_stream_load
+
+# Routine Load Kafka 导入
+CREATE ROUTINE LOAD orders_load ON orders
+COLUMNS(k, v)
+PROPERTIES(
+  "format" = "json",
+  "max_batch_interval" = "10",
+  "max_batch_rows" = "200000",
+  "max_batch_size" = "209715200"
+)
+FROM KAFKA(
+  "kafka_broker_list" = "kafka1:9092",
+  "kafka_topic" = "orders",
+  "property.group.id" = "doris_group"
+);
+```
+
+### 32.2 ClickHouse 导入优化
+
+```sql
+-- 批量插入
+INSERT INTO orders FORMAT CSV
+< data.csv
+
+-- 异步插入
+SET async_insert = 1;
+SET wait_for_async_insert = 0;
+INSERT INTO orders VALUES (...);
+
+-- 分布式插入
+INSERT INTO orders_dist SELECT * FROM orders_local;
+```
+
+---
+
+## 三十三、集群运维深度指南
+
+### 33.1 Doris 运维关键指标
+
+| 指标 | 告警阈值 | 处理方案 |
+|------|---------|----------|
+| Query Cost | > 10s | 优化 SQL、增加 BE |
+| Tablet Size | > 500MB | 分裂 Tablet |
+| 复制失败 | > 0 | 检查网络、重启 Tablet |
+| 磁盘使用 | > 85% | 扩容或迁移数据 |
+| Tablet 不均匀 | > 20% | 重新均衡 |
+
+### 33.2 ClickHouse 运维关键指标
+
+| 指标 | 告警阈值 | 处理方案 |
+|------|---------|----------|
+| 队列深度 | > 100 | 检查 Merge 速度 |
+| 内存使用 | > 80% | 调整 max_memory_usage |
+| 磁盘使用 | > 85% | 清理旧数据、扩容 |
+| 复制延迟 | > 30s | 检查网络、ZooKeeper |
+
+### 33.3 集群巡检清单
+
+```text
+每日巡检：
+  ☐ 检查节点状态（所有节点在线）
+  ☐ 检查磁盘使用率（<85%）
+  ☐ 检查查询延迟（P99 < 10s）
+  ☐ 检查导入任务（无失败）
+  ☐ 检查复制状态（无延迟）
+
+每周巡检：
+  ☐ 清理过期数据
+  ☐ 检查 Tablet 均衡
+  ☐ 检查慢查询日志
+  ☐ 更新统计信息
+  ☐ 检查备份状态
+```
+
+---
+
+## 三十四、实时报表架构
+
+### 34.1 实时报表技术栈
+
+```mermaid
+graph LR
+    A[数据源] -->|CDC| B[Kafka]
+    B --> C[Flink 实时计算]
+    C --> D[Doris/StarRocks]
+    D --> E[BI 工具]
+    E --> F[实时大屏]
+```
+
+### 34.2 实时报表优化
+
+| 优化点 | 说明 | 效果 |
+|--------|------|------|
+| 预聚合 | 预计算常用指标 | 查询加速 |
+| 物化视图 | 自动维护聚合结果 | 实时更新 |
+| 缓存 | Redis 缓存热点数据 | 减少查询 |
+| 分区 | 按时间分区 | 减少扫描 |
+| 索引 | 按查询模式建索引 | 加速过滤 |
+
+### 34.3 实时报表性能指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 查询延迟 P50 | <1s | 大部分查询 |
+| 查询延迟 P99 | <5s | 长尾查询 |
+| 数据延迟 | <1min | 从产生到可见 |
+| 并发 QPS | >100 | 同时查询 |
+| 可用性 | >99.9% | 服务可用 |
+
+---
+
 ## 与其他板块的关系
 
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
