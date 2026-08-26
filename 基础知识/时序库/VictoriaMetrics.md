@@ -976,4 +976,250 @@ spec:
     示例：100 / 1000 = 1 节点（+1 副本 = 2 节点）
 ```
 
+---
+
+## VictoriaMetrics 集群架构
+
+### vminsert/vmselect/vmstorage 分离
+
+```text
+VictoriaMetrics 集群架构：
+  vminsert：接收写入请求，路由到 vmstorage
+  vmselect：处理查询请求，从 vmstorage 读取
+  vmstorage：存储数据，执行实际读写
+
+数据流：
+  写入：Prometheus → vminsert → vmstorage
+  查询：Grafana → vmselect → vmstorage
+
+优势：
+  - 计算存储分离，独立扩展
+  - 无状态组件，易于运维
+  - 高可用，自动故障转移
+```
+
+```yaml
+# vminsert 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vminsert
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vminsert
+  template:
+    spec:
+      containers:
+      - name: vminsert
+        image: victoriametrics/vminsert:v1.100.0
+        args:
+        - --storageNode=vmstorage-0.vmstorage:8400
+        - --storageNode=vmstorage-1.vmstorage:8400
+
+# vmstorage 部署
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vmstorage
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vmstorage
+  template:
+    spec:
+      containers:
+      - name: vmstorage
+        image: victoriametrics/vmstorage:v1.100.0
+        args:
+        - --retentionPeriod=90d
+        - --storageDataPath=/data
+        volumeClaimTemplates:
+        - metadata:
+            name: data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 100Gi
+```
+
+## 去重策略
+
+### dedup.minScrapeInterval 配置
+
+```yaml
+# 去重配置
+# vminsert 配置
+--dedup.minScrapeInterval=10s
+
+# 去重原理：
+# 1. 相同时间戳的多个样本
+# 2. 保留最新写入的样本
+# 3. 去重窗口：minScrapeInterval
+
+# 配置建议：
+# - 与 Prometheus scrape_interval 匹配
+# - 通常设置为 scrape_interval 的 2 倍
+# - 示例：scrape_interval=15s → dedup.minScrapeInterval=30s
+
+# 去重效果：
+# - 减少存储空间（30-50%）
+# - 提升查询性能
+# - 减少内存占用
+```
+
+## 降采样
+
+### retentionFilter / downsampling 规则
+
+```yaml
+# 降采样配置
+--retentionFilter="1d:5m,7d:1h,30d:1h"
+
+# 降采样规则说明：
+# 格式：保留期限:采样间隔
+# - 1d:5m → 1天内数据保留5分钟粒度
+# - 7d:1h → 7天内数据保留1小时粒度
+# - 30d:1h → 30天内数据保留1小时粒度
+
+# 降采样优势：
+# - 减少存储空间（90%+）
+# - 提升查询性能
+# - 延长数据保留期
+
+# 配置示例：
+# 原始数据：15秒粒度，保留90天
+# 降采样后：
+#   0-1天：15秒粒度（原始）
+#   1-7天：5分钟粒度
+#   7-30天：1小时粒度
+#   30-90天：1小时粒度
+```
+
+## 多租户隔离
+
+### accountID/projectID
+
+```yaml
+# 多租户配置
+# vminsert 配置
+--cluster.tls=false
+
+# 多租户使用方式：
+# 通过 URL 参数指定租户
+# http://vminsert:8480/insert/1/prometheus/api/v1/write
+#                         ^ accountID
+# http://vminsert:8480/insert/1/2/prometheus/api/v1/write
+#                         ^ accountID ^ projectID
+
+# 隔离级别：
+# - accountID：租户级别隔离
+# - projectID：项目级别隔离
+# - 数据完全隔离
+# - 配额独立管理
+
+# 配额管理：
+# --storage.maxDiskUsagePerTenant=10GB
+# --memory.allowedPercent=80
+```
+
+## Prometheus remote write 集成配置
+
+### 集成配置
+
+```yaml
+# prometheus.yml 配置
+remote_write:
+  - url: "http://vminsert:8480/insert/0/prometheus/api/v1/write"
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      max_shards: 20
+      capacity: 10000
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: "node_.*"
+        action: keep
+
+# 重试配置
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      max_shards: 20
+      capacity: 10000
+      min_backoff: 30s
+      max_backoff: 5m
+```
+
+## K8s 部署
+
+### vm-operator vs 手动
+
+```yaml
+# vm-operator 部署
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMSingle
+metadata:
+  name: vmsingle
+spec:
+  retentionPeriod: "90d"
+  removeExpandedClusterScrapes: true
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "1"
+  storage:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: "50Gi"
+
+# 手动部署优势：
+# - 更灵活的配置
+# - 更好的性能调优
+# - 更细粒度的监控
+
+# vm-operator 优势：
+# - 快速部署
+# - 自动运维
+# - 生命周期管理
+```
+
+## 容量规划公式
+
+### 每样本内存×时间序列数×保留期
+
+```text
+容量规划公式：
+
+存储空间：
+  原始数据 = 时间序列数 × 采样间隔 × 单样本大小 × 保留天数
+  
+  示例计算：
+    时间序列数：100万
+    采样间隔：15秒
+    单样本大小：1.5字节
+    保留天数：90天
+  
+    原始数据 = 100万 × (86400/15) × 1.5 × 90
+            = 100万 × 5760 × 1.5 × 90
+            ≈ 780 GB
+
+内存需求：
+  每时间序列内存 ≈ 2-4 字节
+  
+  示例计算：
+    时间序列数：100万
+    每序列内存：3字节
+  
+    内存需求 = 100万 × 3 = 3MB
+
+  查询缓存：建议 10-20% 内存
+  总内存 = 3MB + 查询缓存
+```
+
 ## 二十一、与其他板块的关系

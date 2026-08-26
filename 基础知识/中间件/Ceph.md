@@ -872,6 +872,225 @@ rados bench -p <pool> 30 rand       # 随机读测试
 | CRUSH 优化 | 均衡 PG 分布 | 避免热点 |
 | 后台任务 | scrub/compact 限速 | 减少 IO 干扰 |
 
+## Ceph CRUSH 规则自定义
+
+### host/rack/region 层级
+
+```text
+CRUSH 层级结构：
+  region（区域）
+    └── rack（机架）
+        └── host（主机）
+            └── osd（磁盘）
+
+自定义 CRUSH 规则：
+  1. 创建 CRUSH Rule
+  2. 设置故障域（failure domain）
+  3. 定义副本放置策略
+
+示例：机架感知规则
+  fail_domain = rack（故障域为机架）
+  min_size = 3（最少 3 副本）
+  约束：每个副本必须在不同机架
+```
+
+```bash
+# 创建 CRUSH 规则
+ceph osd crush rule create-replicated rack_rule rack host
+
+# 查看 CRUSH 规则
+ceph osd crush rule dump
+
+# 设置存储池使用自定义规则
+ceph osd pool set mypool crush_rule rack_rule
+```
+
+## Pool 与 Placement Group 数量计算
+
+### PG 计算公式
+
+```text
+PG 数量 = (OSD 数 × 100) / 副本数
+
+计算示例：
+  OSD 数：100
+  副本数：3
+  PG 数 = (100 × 100) / 3 ≈ 3333
+
+  取最近的 2 的幂：4096
+
+调整规则：
+  - PG 数必须是 2 的幂
+  - 每个 OSD 的 PG 数建议在 100-200 之间
+  - 太多 PG → 内存和 CPU 开销大
+  - 太少 PG → 负载不均衡
+```
+
+```bash
+# 计算建议 PG 数
+ceph osd pool get mypool pg_num --format json
+
+# 查看 PG 分布
+ceph osd df tree
+
+# 调整 PG 数
+ceph osd pool set mypool pg_num 4096
+ceph osd pool set mypool pgs_per_osd 100
+```
+
+## Ceph RBD Thin Provisioning
+
+### COW（Copy-on-Write）原理
+
+```text
+Thin Provisioning 原理：
+  1. 创建镜像时不分配实际空间
+  2. 写入时按需分配块（COW）
+  3. 未使用的块不占用物理空间
+
+COW 流程：
+  客户端写入新块 → RBD 查找空闲块 → 分配并写入
+  客户端读取旧块 → RBD 直接返回数据
+  客户端读取新块 → RBD 返回新分配的块
+
+优势：
+  - 快速创建镜像（秒级）
+  - 节省存储空间（按需分配）
+  - 快照高效（只记录变更）
+  - 克隆快速（只复制元数据）
+```
+
+```bash
+# 创建 thin provisioning 镜像
+rbd create mypool/myimage --size 1TB --thick-provision=false
+
+# 查看实际使用
+rbd du mypool/myimage
+# PROVISIONED: 1TB  USED: 10GB（实际使用）
+
+# 创建快照
+rbd snap create mypool/myimage@snap1
+
+# 克隆（COW）
+rbd clone mypool/myimage@snap1 mypool/myclone
+```
+
+## CephFS 目录子树分片
+
+### dir fragment 原理
+
+```text
+目录分片机制：
+  单个目录元数据过多 → 拆分为多个 fragment
+  每个 fragment 独立管理 → 提升并发性能
+
+分片策略：
+  1. 默认不分片（dir_layout 默认）
+  2. 手动设置分片数
+  3. 自动分片（基于目录大小）
+
+限制：
+  - 每个目录最多 2^24 个 fragment
+  - fragment 不可合并（需重建目录）
+  - 小目录不建议分片（增加开销）
+```
+
+```bash
+# 查看目录分片信息
+getfattr -n ceph.dir.layout.myfrag /mnt/cephfs/largedir
+
+# 设置目录分片
+setfattr -n ceph.dir.layout.myfrag -v 8 /mnt/cephfs/largedir
+# 分片数 = 8
+
+# 查看 fragment 信息
+ls /mnt/cephfs/largedir/.frag/
+# 00000000  00000001  ...  00000007
+```
+
+## Ceph BlueStore 性能调优
+
+### db/wal/ssd 缓存层
+
+```text
+BlueStore 三级缓存：
+  WAL（Write-Ahead Log）→ 元数据写入
+  DB（Database）→ 元数据存储
+  Block Device → 数据存储
+
+性能层次：
+  WAL: SSD (NVMe最佳) → 最快
+  DB: SSD → 快
+  Block: HDD/SSD → 按需
+
+调优参数：
+  osd bluefs_buffered_io = true  → 启用缓冲 IO
+  osd bluefs_sequential_concurrent = true → 顺序读写并发
+  bdev_enable_discard = true → 启用 TRIM（SSD）
+  bluestore_compression_mode = aggressive → 启用压缩
+```
+
+```bash
+# 查看 BlueStore 状态
+ceph osd perf
+
+# 查看 BlueStore 配置
+ceph config dump | grep blue
+
+# 优化 WAL/DB 位置（SSD 挂载点）
+ceph config set osd.0 bluefs_block_size 1M
+ceph config set osd.0 bluestore_cache_size_ssd 2GB
+```
+
+## Ceph 与 OpenStack 集成
+
+### Cinder/Glance/RBD 集成方式
+
+| 服务 | 集成方式 | 用途 |
+|------|----------|------|
+| Cinder | ceph driver | 块存储服务 |
+| Glance | rbd backend | 镜像存储 |
+| Nova | rbd 虚拟机磁盘 | 虚拟机启动盘 |
+| Manila | cephfs driver | 共享文件系统 |
+
+```ini
+# Cinder 配置（/etc/cinder/cinder.conf）
+[DEFAULT]
+enabled_backends = ceph
+
+[ceph]
+volume_driver = cinder.volume.drivers.rbd.RBDDriver
+rbd_pool = volumes
+rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_flatten_volume_from_snapshot = false
+rbd_max_clone_depth = 5
+rbd_store_chunk_size = 4
+rados_connect_timeout = -1
+
+# Glance 配置（/etc/glance/glance-api.conf）
+[DEFAULT]
+show_image_direct_url = True
+
+[glance_store]
+default_store = rbd
+rbd_store_pool = images
+rbd_store_user = glance
+rbd_store_ceph_conf = /etc/ceph/ceph.conf
+rbd_store_pool_chunk_size = 4
+rbd_store_pool_replication_pool = 3
+```
+
+```bash
+# 创建 OpenStack 专用存储池
+ceph osd pool create volumes 128
+ceph osd pool create images 128
+ceph osd pool create vms 128
+
+# 设置 OpenStack 用户
+ceph auth get-or-create client.glance mon 'allow r' osd 'allow class-read, allow rwx pool=images'
+ceph auth get-or-create client.cinder mon 'allow r' osd 'allow class-read, allow rwx pool=volumes, allow rwx pool=vms'
+```
+
 ## 与其他板块的关系
 
 - 对象存储对比见「[对象存储 MinIO/OSS](./对象存储MinIO-OSS.md)」；

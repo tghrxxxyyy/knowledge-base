@@ -816,6 +816,308 @@ action.destructive_requires_name: true
 | JVM OOM | 堆过大/内存泄漏 | 减小堆/查泄漏 |
 | 磁盘满 | 未及时清理 | 删除索引/调整水位线 |
 
+## 七、ILM 生命周期策略完整配置
+
+### 7.1 hot→warm→cold→delete 四阶段
+
+```json
+PUT _ilm/policy/logs_policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "allocate": {
+            "require": { "data": "warm" }
+          },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "allocate": {
+            "require": { "data": "cold" }
+          },
+          "freeze": {},
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### 7.2 ILM 关键参数
+
+| 阶段 | 关键动作 | 说明 |
+|------|----------|------|
+| hot | rollover | 按大小/时间滚动索引 |
+| warm | forcemerge | 合并段提升查询性能 |
+| warm | shrink | 减少分片数降低资源占用 |
+| cold | freeze | 冻结索引，降低内存占用 |
+| delete | delete | 自动清理过期数据 |
+
+## 八、CCR 跨集群复制
+
+### 8.1 配置步骤
+
+```text
+Step 1：配置远程集群（Leader 集群）
+  PUT _cluster/settings
+  {
+    "persistent": {
+      "cluster.remote.leader_cluster": {
+        "seeds": ["leader-node1:9300"]
+      }
+    }
+  }
+
+Step 2：创建跟随索引（Follower 集群）
+  PUT /follower-index/_ccr/follow
+  {
+    "remote_cluster": "leader_cluster",
+    "leader_index": "leader-index"
+  }
+
+Step 3：查看复制状态
+  GET /follower-index/_ccr/stats
+```
+
+### 8.2 CCR 监控指标
+
+```text
+关键监控项：
+  ccr.lag.rows                  → 落后行数
+  ccr.lag.time_millis           → 落后时间(ms)
+  ccr.sync.stats.fetched_bytes  → 同步字节数
+  ccr.internal.read_exceptions  → 读取异常
+
+告警规则：
+  lag.rows > 10000 持续 5min → 告警
+  lag.time_millis > 60000 → 严重告警
+```
+
+## 九、可搜索快照（Searchable Snapshots）
+
+### 9.1 原理与使用
+
+```text
+传统快照：只能整体恢复，恢复时间长
+可搜索快照：快照中的数据可直接查询，按需加载
+
+工作机制：
+  1. 数据快照存储在对象存储（S3/GCS）
+  2. 查询时按需加载到本地缓存（shared cache）
+  3. 未命中缓存的查询直接从快照读取
+
+配置示例：
+  PUT _snapshot/my_repository
+  PUT my_index/_snapshot/my_repository/my_snapshot?wait_for_completion=true
+  POST _snapshot/my_repository/my_snapshot/_mount
+  {
+    "index": "my_index",
+    "snapshot": "my_snapshot",
+    "storage": {
+      "shared_cache": { "size": "10gb" }
+    }
+  }
+```
+
+### 9.2 性能影响
+
+| 场景 | 性能影响 | 建议 |
+|------|----------|------|
+| 热数据查询 | 接近本地索引（缓存命中） | 保持足够缓存大小 |
+| 冷数据查询 | 有网络延迟（~50-200ms） | 使用 frozen 层 |
+| 写入 | 不支持写入（只读） | 配合 ILM 使用 |
+| 成本 | 存储成本降低 50-70% | 冷数据首选方案 |
+
+## 十、ECK Operator 部署架构
+
+### 10.1 核心组件
+
+```yaml
+# ECK Operator 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elastic-operator
+  namespace: elastic-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: elastic-operator
+  template:
+    spec:
+      containers:
+      - name: manager
+        image: docker.elastic.co/eck/eck-operator:2.10.0
+        args: ["--log-verbosity=0"]
+        resources:
+          limits:
+            memory: 512Mi
+            cpu: 500m
+
+# Elasticsearch 集群
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: production
+spec:
+  version: 8.12.0
+  nodeSets:
+  - name: master
+    count: 3
+    config:
+      node.roles: ["master"]
+  - name: data
+    count: 5
+    config:
+      node.roles: ["data_hot", "data_content"]
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+### 10.2 ECK 架构优势
+
+```text
+传统部署：
+  手动安装 ES + 手动配置集群 + 手动管理证书
+
+ECK 部署：
+  Operator 自动管理：
+    - 集群拓扑自动编排
+    - 证书自动签发（cert-manager 集成）
+    - 滚动升级（零停机）
+    - 自动故障转移
+    - 存储自动扩缩容
+```
+
+## 十一、Doc Values vs Fielddata 存储机制
+
+### 11.1 内存模型对比
+
+| 特性 | Doc Values | Fielddata |
+|------|------------|-----------|
+| 加载时机 | 索引时构建 | 查询时加载 |
+| 存储位置 | 堆外内存（off-heap） | 堆内内存（on-heap） |
+| 默认开启 | text 字段默认关闭，其他开启 | 默认关闭 |
+| 排序聚合 | 高效（列式存储） | 低效（加载全部） |
+| 内存占用 | 可控（可配置） | 不可控（OOM 风险） |
+| 建议 | 生产环境首选 | 避免使用 |
+
+```yaml
+# 禁用 Doc Values
+PUT my_index
+{
+  "mappings": {
+    "properties": {
+      "message": {
+        "type": "text",
+        "doc_values": false
+      }
+    }
+  }
+}
+```
+
+## 十二、批量索引最佳实践
+
+### 12.1 bulk sizing
+
+```text
+推荐配置：
+  bulk size：5-15 MB（权衡吞吐量和内存）
+  单文档大小：<100 KB
+  并发 bulk 请求数：CPU 核数 × 2
+
+最佳实践：
+  1. 使用 _bulk API，不要逐条 index
+  2. 每个 bulk 请求控制在 5-15MB
+  3. 使用异步 bulk（BulkProcessor）
+  4. 配置重试和背压
+```
+
+### 12.2 Backpressure 与 Retry
+
+```java
+// BulkProcessor 配置
+BulkProcessor bulkProcessor = BulkProcessor.builder(
+    client::bulkAsync, new BulkProcessor.Listener() { ... })
+    .setBulkRequests(1000)           // 最大请求数
+    .setBulkSize(5, SizeUnit.MB)     // 最大大小
+    .setFlushInterval(TimeValue.timeValueSeconds(5))
+    .setBackoffPolicy(BackoffPolicy.exponentialBackoff(
+        TimeValue.timeValueMillis(100), 8))  // 指数退避
+    .build();
+```
+
+## 十三、ES 监控关键指标
+
+### 13.1 核心监控维度
+
+| 维度 | 指标 | 告警阈值 |
+|------|------|----------|
+| 索引 | indexing_success_rate | <99% |
+| 索引 | indexing_latency_avg | >200ms |
+| 查询 | search_query_rate | 基线对比 |
+| 查询 | search_query_latency_p99 | >500ms |
+| 拒绝 | thread_pool_rejected_count | >0 |
+| 待办 | pending_tasks | >100 |
+| JVM | jvm_mem_heap_used_percent | >70% |
+| 磁盘 | disk_usage_percent | >80% |
+
+### 13.2 监控告警配置
+
+```text
+Prometheus 告警规则示例：
+  groups:
+  - name: es-alerts
+    rules:
+    - alert: ESHighIndexingLatency
+      expr: elasticsearch_indexing_latency_seconds > 0.2
+      for: 5m
+      labels:
+        severity: warning
+    - alert: ESRejectedThreads
+      expr: increase(elasticsearch_thread_pool_rejected_count[5m]) > 0
+      for: 1m
+      labels:
+        severity: critical
+    - alert: ESDiskHigh
+      expr: elasticsearch_disk_usage_percent > 80
+      for: 10m
+      labels:
+        severity: critical
+```
+
 ---
 
 > 一句话：**ES 调优 = 分片（10~30GB/分片，别太多）+ JVM（堆 ≤31GB，留一半给 OS 缓存）+ 查询（filter 替代 query，避免深分页 wildcard）+ 集群（监控 health/水位线/线程池）**。

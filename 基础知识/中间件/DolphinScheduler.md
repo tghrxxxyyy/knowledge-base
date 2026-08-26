@@ -952,6 +952,254 @@ DolphinScheduler 生产 HA 架构：
     database.url=jdbc:mysql://mysql:3306/dolphinscheduler
 ```
 
+---
+
+## master 任务分配算法
+
+### round-robin / 资源感知 / 故障转移
+
+```text
+任务分配策略：
+
+1. Round-Robin（轮询）
+   - 按顺序分配任务到 Worker
+   - 简单公平
+   - 不考虑资源负载
+
+2. 资源感知（Resource-Aware）
+   - 根据 Worker 资源使用情况分配
+   - CPU/内存/磁盘 权重
+   - 避免资源过载
+
+3. 故障转移（Failover）
+   - 检测 Worker 故障
+   - 自动重新分配任务
+   - 支持任务重试
+```
+
+```yaml
+# 任务分配配置
+# master.properties
+master.task.assign.strategy=resource_aware
+master.resource.audit.log.enable=true
+
+# Worker 资源配置
+worker.resource.cpu.usage.max=0.8
+worker.resource.memory.usage.max=0.8
+worker.resource.disk.usage.max=0.9
+```
+
+```java
+// 任务分配算法实现
+public class ResourceAwareStrategy implements TaskAssignStrategy {
+    @Override
+    public Worker selectWorker(List<Worker> workers, Task task) {
+        return workers.stream()
+            .filter(w -> w.getCpuUsage() < 0.8)
+            .filter(w -> w.getMemoryUsage() < 0.8)
+            .filter(w -> w.getDiskUsage() < 0.9)
+            .min(Comparator.comparingDouble(Worker::getTotalUsage))
+            .orElseThrow(() -> new NoAvailableWorkerException());
+    }
+}
+```
+
+## worker 分组与任务隔离
+
+### 租户→项目→工作流→任务四级
+
+```text
+隔离层级：
+  租户（Tenant）：资源隔离
+    └── 项目（Project）：权限隔离
+        └── 工作流（Workflow）：调度隔离
+            └── 任务（Task）：执行隔离
+
+资源隔离：
+  - 租户级别：CPU/内存配额
+  - 项目级别：Worker 分组
+  - 工作流级别：优先级
+  - 任务级别：超时控制
+```
+
+```yaml
+# Worker 分组配置
+# worker.properties
+worker.groups=group1,group2,group3
+
+# 任务指定 Worker 分组
+# 任务属性
+worker.group=group1
+
+# 租户资源配额
+tenant.resource.quota:
+  cpu: 8核
+  memory: 16GB
+  disk: 100GB
+```
+
+## 自定义告警插件开发
+
+### 实现 AlertPlugin 接口
+
+```java
+// 自定义告警插件
+public class DingTalkAlertPlugin implements AlertPlugin {
+    @Override
+    public String getName() {
+        return "DingTalk";
+    }
+
+    @Override
+    public List<String> getParams() {
+        return Arrays.asList("webhook", "secret");
+    }
+
+    @Override
+    public AlertResult send(Map<String, String> params, String content) {
+        String webhook = params.get("webhook");
+        String secret = params.get("secret");
+
+        // 构建钉钉消息
+        DingTalkMessage message = new DingTalkMessage();
+        message.setText(content);
+        message.setAtAll(true);
+
+        // 发送请求
+        HttpResponse response = HttpRequest.post(webhook)
+            .header("Content-Type", "application/json")
+            .body(JSON.toJSONString(message))
+            .execute();
+
+        return new AlertResult(response.isSuccessful());
+    }
+}
+
+// 注册插件
+@AlertPlugin(name = "DingTalk")
+public class DingTalkAlertPlugin implements AlertPlugin { ... }
+```
+
+## 任务依赖关系
+
+### workflow vs task 级别依赖
+
+```text
+依赖类型：
+  1. 工作流依赖（Workflow Dependency）
+     - 整个工作流完成后触发下一个
+     - 粗粒度
+  
+  2. 任务依赖（Task Dependency）
+     - 具体任务完成后触发下一个
+     - 细粒度
+
+依赖配置：
+  - 上游任务完成 → 下游任务开始
+  - 上游任务成功 → 下游任务开始
+  - 上游任务失败 → 下游任务跳过/重试
+```
+
+```yaml
+# 工作流依赖
+workflow:
+  name: daily_etl
+  tasks:
+    - name: extract
+      type: shell
+      command: "python extract.py"
+    - name: transform
+      type: shell
+      command: "python transform.py"
+      dependencies: ["extract"]
+    - name: load
+      type: shell
+      command: "python load.py"
+      dependencies: ["transform"]
+
+# 任务依赖（跨工作流）
+task:
+  name: notify
+  dependencies:
+    - workflow: daily_etl
+      task: load
+      state: success
+```
+
+## DS vs Airflow 核心差异对比
+
+### 架构/调度/API/DAG定义
+
+| 维度 | DolphinScheduler | Airflow |
+|------|------------------|---------|
+| 架构 | Master-Worker（中心化） | Scheduler-Worker（分布式） |
+| 调度 | 支持多种调度器 | 原生调度器 |
+| API | REST API | REST API + CLI |
+| DAG 定义 | 可视化 + YAML | Python 脚本 |
+| 任务类型 | 丰富（100+） | 丰富（100+） |
+| 监控 | 内置 UI | 内置 UI |
+| 运维 | 简单（K8s） | 复杂（需运维） |
+| 适用场景 | 大数据调度 | 通用调度 |
+
+```text
+选择建议：
+  - 大数据场景 → DolphinScheduler
+  - 通用调度 → Airflow
+  - K8s 部署 → DolphinScheduler
+  - Python 生态 → Airflow
+  - 运维简单 → DolphinScheduler
+```
+
+## 生产 HA 部署架构
+
+### master HA + worker 多实例 + ZK 锁
+
+```yaml
+# 生产环境部署
+version: '3'
+services:
+  master-1:
+    image: apache/dolphinscheduler:3.2.0
+    container_name: ds-master-1
+    environment:
+      - MASTER_HOST=master-1
+      - ZK_SERVERS=zk1:2181,zk2:2181,zk3:2181
+    volumes:
+      - ./conf/master.properties:/opt/dolphinscheduler/conf/master.properties
+
+  master-2:
+    image: apache/dolphinscheduler:3.2.0
+    container_name: ds-master-2
+    environment:
+      - MASTER_HOST=master-2
+      - ZK_SERVERS=zk1:2181,zk2:2181,zk3:2181
+
+  worker-1:
+    image: apache/dolphinscheduler:3.2.0
+    container_name: ds-worker-1
+    environment:
+      - WORKER_HOST=worker-1
+      - WORKER_GROUP=group1
+      - ZK_SERVERS=zk1:2181,zk2:2181,zk3:2181
+
+  worker-2:
+    image: apache/dolphinscheduler:3.2.0
+    container_name: ds-worker-2
+    environment:
+      - WORKER_HOST=worker-2
+      - WORKER_GROUP=group2
+      - ZK_SERVERS=zk1:2181,zk2:2181,zk3:2181
+```
+
+```text
+HA 架构要点：
+  - Master HA：ZK 选主，自动故障转移
+  - Worker HA：多实例，任务自动重试
+  - ZK 锁：分布式锁，防止任务重复执行
+  - 元数据：MySQL 主从
+  - 缓存：Redis 集群
+```
+
 ## 十九、与其他板块的关系
 
 - 定时任务对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；

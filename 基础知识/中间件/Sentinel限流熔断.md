@@ -895,4 +895,263 @@ Grafana Dashboard 推荐：
 
 ---
 
+## Sentinel 滑动窗口计数器实现原理
+
+### LeapArray / SimpleUpdateLeapArray
+
+```text
+LeapArray 核心结构：
+  - 时间窗口长度：默认 1s
+  - 窗口个数：默认 2（每 500ms 一个窗口）
+  - 每个窗口：AtomicLong 计数器
+
+滑动窗口算法：
+  1. 获取当前时间对应的窗口
+  2. 如果窗口过期，重置并切换
+  3. 原子更新计数器
+  4. 聚合多个窗口统计
+
+优势：
+  - 内存占用小（固定窗口数）
+  - 并发安全（CAS 操作）
+  - 精确计数（非近似）
+```
+
+```java
+// LeapArray 源码核心
+public class LeapArray<T> {
+    private final int windowLengthInMs;  // 窗口长度
+    private final int sampleCount;       // 窗口个数
+    private final AtomicReferenceArray<WindowWrap<MetricBucket>> array;
+
+    public MetricBucket currentWindow() {
+        long timeId = TimeUtil.currentTimeMillis() / windowLengthInMs;
+        int idx = (int)(timeId % sampleCount);
+        WindowWrap<MetricBucket> old = array.get(idx);
+
+        if (old.windowStart() + windowLengthInMs < TimeUtil.currentTimeMillis()) {
+            // 窗口过期，重置
+            synchronized (old) {
+                if (old.windowStart() + windowLengthInMs < TimeUtil.currentTimeMillis()) {
+                    old.resetTo(TimeUtil.currentTimeMillis());
+                }
+            }
+        }
+        return old.value();
+    }
+}
+```
+
+## 热点参数限流（ParamFlowThrottling）配置实战
+
+### 配置示例
+
+```java
+// 热点参数限流规则
+ParamFlowRule rule = new ParamFlowRule("queryResource")
+    .setParamIdx(0)  // 第 0 个参数
+    .setGrade(RuleConstant.FLOW_GRADE_QPS)
+    .setCount(100)   // 默认 QPS 阈值
+    .setParamFlowItemList(
+        Arrays.asList(
+            // 特定参数值配置
+            new ParamFlowItem().setObject(String.valueOf(1))
+                .setClassType(int.class.getName())
+                .setCount(50),  // 参数值为 1 时，QPS 限制 50
+            new ParamFlowItem().setObject(String.valueOf(2))
+                .setClassType(int.class.getName())
+                .setCount(200)  // 参数值为 2 时，QPS 限制 200
+        )
+    );
+ParamFlowRuleManager.loadRules(Collections.singletonList(rule));
+
+// 使用
+@SentinelResource(value = "queryResource",
+    blockHandler = "queryBlockHandler")
+public Result queryResource(int param) {
+    return service.query(param);
+}
+
+public Result queryBlockHandler(int param, BlockException ex) {
+    return Result.fail("Rate limited: " + param);
+}
+```
+
+## 系统自适应保护（CPU/Load/RT 阈值联动机制）
+
+### 系统保护规则配置
+
+```java
+// 系统自适应保护规则
+SystemRule rule = new SystemRule();
+rule.setHighestSystemLoad(3.0);        // 最高系统负载
+rule.setHighestCpuUsage(0.8);          // 最高 CPU 使用率
+rule.setAvgRt(200);                    // 平均 RT（ms）
+rule.setMaxRt(1000);                   // 最大 RT（ms）
+rule.setQps(1000);                     // 入口 QPS
+rule.setHighestNetworkFlow(1024 * 1024); // 最高网络流量（1MB/s）
+
+SystemRuleManager.loadRules(Collections.singletonList(rule));
+
+// 联动机制：
+// CPU > 80% → 自动降低 QPS 阈值
+// Load > 3.0 → 自动降低 QPS 阈值
+// RT > 200ms → 自动降低 QPS 阈值
+// 多个条件同时触发时，取最严格的阈值
+```
+
+## Sentinel 与 OpenTelemetry 联动上报
+
+### Sentinel Metrics Export
+
+```yaml
+# 配置 Sentinel OTel Exporter
+# application.yml
+sentinel:
+  metrics:
+    exporter:
+      enabled: true
+      interval: 10s
+      otel:
+        enabled: true
+        endpoint: http://otel-collector:4318
+```
+
+```java
+// 自定义 MetricExporter
+public class SentinelOtelExporter implements MetricExporter {
+    @Override
+    public void export(List<Metric> metrics) {
+        for (Metric metric : metrics) {
+            Span span = tracer.spanBuilder("sentinel.metric")
+                .setAttribute("resource", metric.getResource())
+                .setAttribute("metric.type", metric.getType())
+                .setAttribute("metric.value", metric.getValue())
+                .startSpan();
+            span.end();
+        }
+    }
+}
+```
+
+## Dashboard 自定义集群流控规则
+
+### ClusterFlowRuleManager
+
+```java
+// 集群流控规则
+ClusterFlowRule rule = new ClusterFlowRule("cluster-resource")
+    .setClusterMode(ClusterFlowRule.CLUSTER_MODE_FIXED)
+    .setFlowId(1001)
+    .setGrade(RuleConstant.FLOW_GRADE_QPS)
+    .setCount(1000)
+    .setSampleCount(10)
+    .setIntervalMs(1000);
+
+// 设置集群模式
+rule.setClusterMode(ClusterFlowRule.CLUSTER_MODE_FIXED);
+// FIXED：固定阈值
+// DYNAMIC：动态调整（基于实时负载）
+
+// 加载规则
+ClusterFlowRuleManager.loadRules(Collections.singletonList(rule));
+
+// Dashboard 配置步骤：
+// 1. 进入 Sentinel Dashboard
+// 2. 选择「集群流控」菜单
+// 3. 创建流控规则
+// 4. 选择集群模式（FIXED/DYNAMIC）
+// 5. 设置阈值和 Token Server
+// 6. 应用规则
+```
+
+## 客户端限流规则持久化三方案
+
+### ZK/Nacos/Apollo push vs pull
+
+| 方案 | 模式 | 一致性 | 复杂度 | 适用场景 |
+|------|------|--------|--------|----------|
+| ZK | Push | 强一致 | 高 | 已有 ZK 集群 |
+| Nacos | Push | 最终一致 | 中 | 已有 Nacos |
+| Apollo | Push | 最终一致 | 中 | 已有 Apollo |
+| Pull | Pull | 最终一致 | 低 | 简单场景 |
+
+```java
+// ZK Push 模式
+ZookeeperDataSource<String> dataSource = new ZookeeperDataSource<>(
+    zkAddress,
+    "/sentinel/rules/flow",
+    source -> {
+        List<FlowRule> rules = FlowRuleUtil.fromConfig(source);
+        FlowRuleManager.loadRules(rules);
+    }
+);
+
+// Nacos Push 模式
+NacosConfigCenter configCenter = new NacosConfigCenter(nacosServerAddr);
+configCenter.addListener("sentinel-flow-rules", group, new Listener() {
+    @Override
+    public void receiveConfigInfo(String configInfo) {
+        List<FlowRule> rules = FlowRuleUtil.fromConfig(configInfo);
+        FlowRuleManager.loadRules(rules);
+    }
+});
+
+// Pull 模式（定时拉取）
+ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+scheduler.scheduleAtFixedRate(() -> {
+    String config = httpClient.get(CONFIG_URL);
+    List<FlowRule> rules = FlowRuleUtil.fromConfig(config);
+    FlowRuleManager.loadRules(rules);
+}, 0, 30, TimeUnit.SECONDS);
+```
+
+## Sentinel block 日志分析与限流原因定位
+
+### 日志分析
+
+```bash
+# Sentinel 日志路径
+${LOG_PATH}/sentinel/block/${resource}.log
+
+# 日志格式
+2024-01-01 10:00:00|2|FlowException|origin=default|resource=queryResource|
+    limitQps=100|currentQps=150
+
+# 字段说明
+# 时间|日志类型|异常类型|来源|资源名|限制QPS|当前QPS
+```
+
+```java
+// 日志分析工具
+public class SentinelLogAnalyzer {
+    public void analyzeLog(String logPath) {
+        List<BlockLog> logs = parseLog(logPath);
+
+        // 统计各类型异常
+        Map<String, Long> exceptionCount = logs.stream()
+            .collect(Collectors.groupingBy(
+                BlockLog::getExceptionType,
+                Collectors.counting()));
+
+        // 统计各资源限流次数
+        Map<String, Long> resourceCount = logs.stream()
+            .filter(l -> "FlowException".equals(l.getExceptionType()))
+            .collect(Collectors.groupingBy(
+                BlockLog::getResource,
+                Collectors.counting()));
+
+        // 分析限流原因
+        logs.stream()
+            .filter(l -> "FlowException".equals(l.getExceptionType()))
+            .forEach(l -> {
+                if (l.getCurrentQps() > l.getLimitQps() * 1.5) {
+                    log.warn("资源 {} 严重超限: 当前={}, 限制={}",
+                        l.getResource(), l.getCurrentQps(), l.getLimitQps());
+                }
+            });
+    }
+}
+```
+
 > 一句话：**Sentinel = 限流（QPS/线程/匀速/WarmUp）+ 熔断（慢调用/异常）+ 热点参数 + 系统保护 + 授权 + 控制台动态规则；选型先看「生态（Spring Cloud Alibaba → Sentinel）」，再定「规则持久化（Nacos）」，最后配「控制台监控」**。

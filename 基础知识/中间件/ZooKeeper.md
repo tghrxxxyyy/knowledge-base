@@ -929,4 +929,225 @@ setAcl /secure/data world:anyone:r
 | 客户端 | Curator（推荐，封装锁/选举/缓存） |
 | 局限 | 吞吐不高、不存大数据、分区时不可写 |
 | 许可证 | Apache 2.0 |
+
+## ZAB 协议消息广播与崩溃恢复两阶段详解
+
+### 消息广播阶段
+
+```text
+ZAB 消息广播流程：
+  1. Leader 接收写请求
+  2. Leader 生成 Proposal（zxid + 数据）
+  3. Leader 发送 Proposal 给所有 Follower
+  4. Follower 收到 Proposal 后写入本地事务日志
+  5. Follower 发送 ACK 给 Leader
+  6. Leader 收到过半 ACK 后，发送 Commit
+  7. Follower 收到 Commit 后应用到内存
+
+zxid 结构：
+  64 位 = epoch（32位）+ counter（32位）
+  epoch：Leader 选举周期，每次选主 +1
+  counter：事务计数器，每次写入 +1
+
+优势：
+  - 保证消息顺序（zxid 单调递增）
+  - 过半提交保证一致性
+  - 事务日志保证持久性
+```
+
+### 崩溃恢复阶段
+
+```text
+ZAB 崩溃恢复流程：
+  1. Leader 宕机，Follower 检测到连接断开
+  2. Follower 切换到 LOOKING 状态
+  3. 触发 Leader 选举（FastLeaderElection）
+  4. 选举规则：
+     - 优先选 zxid 最大的 Follower
+     - zxid 相同选 myid 最大的
+  5. 新 Leader 产生后，与 Follower 同步数据
+  6. 同步完成后，切换到正常广播模式
+
+数据同步规则：
+  - 新 Leader 的 zxid 必须 >= 所有 Follower 的 zxid
+  - 不一致的数据会被截断（回滚到 Leader 的 zxid）
+```
+
+## Watcher 事件类型与一次性语义
+
+### 持久/递归/非递归
+
+| Watcher 类型 | 说明 | 适用场景 |
+|--------------|------|----------|
+| 默认（OneShot） | 触发一次后失效 | 一次性通知 |
+| 持久（Persistent） | 触发后继续有效 | 持续监听 |
+| 递归（Recursive） | 监听子节点变更 | 目录监听 |
+
+```java
+// 默认 Watcher（一次性）
+zk.getData("/mynode", event -> {
+    System.out.println("Node changed: " + event.getType());
+    // 需要重新注册 Watcher
+}, null);
+
+// 持久 Watcher（Curator）
+PathChildrenCache cache = new PathChildrenCache(client, "/mynode", true);
+cache.getListenable().addListener((curatorFramework, event) -> {
+    System.out.println("Event: " + event.getType());
+});
+cache.start();
+
+// 递归 Watcher
+TreeCache treeCache = new TreeCache(client, "/mynode");
+treeCache.getListenable().addListener((curatorFramework, event) -> {
+    System.out.println("Event: " + event.getType() + " Path: " + event.getData().getPath());
+});
+treeCache.start();
+```
+
+## Curator InterProcessMutex 可重入锁实现原理
+
+### 可重入锁机制
+
+```text
+Curator InterProcessMutex 原理：
+  1. 创建临时顺序节点：/locks/resource/_c_0000000001
+  2. 获取所有子节点，排序
+  3. 如果当前节点是最小的，获取锁成功
+  4. 否则，监听前一个节点
+  5. 前一个节点删除后，尝试获取锁
+
+可重入机制：
+  - 使用 threadData Map 存储锁信息
+  - 同一线程多次获取同一锁，计数 +1
+  - 释放时计数 -1，减到 0 才真正释放
+
+公平性：
+  - 严格按请求顺序获取锁
+  - 避免饥饿
+```
+
+```java
+// 可重入锁使用
+InterProcessMutex lock = new InterProcessMutex(client, "/locks/resource");
+
+// 获取锁（可重入）
+if (lock.acquire(10, TimeUnit.SECONDS)) {
+    try {
+        // 业务逻辑
+        lock.acquire();  // 可重入，计数 +1
+        // 业务逻辑
+    } finally {
+        lock.release();  // 计数 -1
+        lock.release();  // 计数 -1，真正释放
+    }
+}
+```
+
+## ZK 配置中心设计模式
+
+### Watch + 长轮询
+
+```text
+ZK 配置中心设计：
+  1. 配置存储在 ZNode 中
+  2. 客户端读取配置 + 注册 Watcher
+  3. 配置变更时 ZK 通知客户端
+  4. 客户端重新读取配置
+
+长轮询优化：
+  - 客户端 Watcher 触发后立即重新读取
+  - 避免频繁轮询
+  - ZK 通知延迟约 1-2ms
+
+配置分层：
+  /config
+    /app1
+      /db
+      /cache
+    /app2
+      /db
+```
+
+```java
+// ZK 配置监听
+String configPath = "/config/app1/db";
+byte[] config = zk.getData(configPath, event -> {
+    // 配置变更回调
+    if (event.getType() == Watcher.Event.EventType.NodeDataChanged) {
+        // 重新读取配置
+        byte[] newConfig = zk.getData(configPath, false, null);
+        refreshConfig(newConfig);
+    }
+}, null);
+```
+
+## ZK 集群扩容滚动操作步骤
+
+### 扩容注意事项
+
+```text
+ZK 集群扩容步骤：
+  1. 准备新节点（与现有节点相同配置）
+  2. 配置新节点（zoo.cfg + myid）
+  3. 逐个启动新节点
+  4. 更新所有节点的 zoo.cfg（添加新节点）
+  5. 滚动重启所有节点
+
+注意事项：
+  - 不能一次性重启所有节点（会导致选举）
+  - 建议逐个重启，每次等待选举完成
+  - 扩容前备份数据
+  - 监控集群状态
+
+扩容后验证：
+  - 检查 Leader/Follower 状态
+  - 验证数据同步
+  - 测试读写功能
+```
+
+```bash
+# 1. 添加新节点配置
+# zoo.cfg
+server.4=new-node:2888:3888
+
+# 2. 设置新节点 myid
+echo "4" > /var/lib/zookeeper/myid
+
+# 3. 启动新节点
+zkServer.sh start
+
+# 4. 重启现有节点（逐个）
+zkServer.sh stop
+zkServer.sh start
+
+# 5. 验证集群状态
+echo stat | nc localhost 2181
+```
+
+## ZK → K8s ConfigMap/etcd 迁移评估维度
+
+### 迁移评估
+
+| 维度 | ZK | K8s ConfigMap | K8s etcd |
+|------|-----|----------------|----------|
+| 数据模型 | 树形结构 | 键值对 | 键值对 |
+| Watch | 事件驱动 | HTTP 长轮询 | 事件驱动 |
+| 一致性 | 强一致（ZAB） | 最终一致 | 强一致（Raft） |
+| 性能 | 低（写入） | 中 | 高 |
+| 运维 | 复杂 | 简单（K8s） | 复杂 |
+
+```text
+迁移决策：
+  1. 已有 K8s 集群 → ConfigMap（简单场景）
+  2. 需要强一致 → etcd（K8s 内置）
+  3. 复杂协调需求 → 保持 ZK 或迁移到 etcd
+  4. 配置管理 → ConfigMap + Secret
+
+迁移步骤：
+  1. 数据迁移（ZK → ConfigMap/etcd）
+  2. 客户端改造（ZK API → K8s API）
+  3. 测试验证
+  4. 灰度切换
+```
 | 一句话 | 「分布式协调的老牌地基」——强一致的锁与选举，云原生时代让位于 etcd |

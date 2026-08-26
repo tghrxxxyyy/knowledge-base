@@ -872,4 +872,229 @@ let id = "1234567890123456789"; // 字符串接收
 | 机器ID | 花名册动态分配（ZK/etcd 临时节点） |
 | 前端精度 | 64 位 ID 转字符串 |
 | 选型 | 趋势有序→雪花，严格递增→号段，客户端→UUID v7 |
+
+## Snowflake 时钟回拨三种处理方案
+
+### 方案对比
+
+| 方案 | 实现 | 恢复时间 | 数据安全 | 适用场景 |
+|------|------|----------|----------|----------|
+| 等待恢复 | 自旋等待时钟追上 | 取决于回拨时间 | 安全 | 短暂回拨（<1s） |
+| 扩展位 | 预留扩展位记录回拨 | 即时恢复 | 较安全 | 中等回拨（<5s） |
+| 抛异常 | 直接报错拒绝生成 | 不恢复 | 最安全 | 严重回拨（>5s） |
+
+```java
+// 方案1：自旋等待
+if (timestamp < lastTimestamp) {
+    long offset = lastTimestamp - timestamp;
+    if (offset <= 5) {
+        Thread.sleep(offset << 1);  // 等待并重试
+        timestamp = System.currentTimeMillis();
+    } else {
+        throw new RuntimeException("Clock moved backwards");
+    }
+}
+
+// 方案2：扩展位（3位）
+private long sequenceBits = 12;
+private long extensionBits = 3;
+private long extensionMask = (1L << extensionBits) - 1;
+
+if (timestamp < lastTimestamp) {
+    extension = (extension + 1) & extensionMask;
+    if (extension == 0) {
+        throw new RuntimeException("Extension overflow");
+    }
+    timestamp = lastTimestamp;  // 使用上次时间戳
+}
+
+// 方案3：抛异常 + 降级到号段模式
+if (timestamp < lastTimestamp) {
+    log.error("Clock moved backwards, fallback to segment mode");
+    return segmentIdGenerator.nextId();
+}
+```
+
+## Leaf segment 模式双 buffer 预分配原理
+
+### 双 Buffer 机制
+
+```text
+双 Buffer 流程：
+  1. 启动时加载两个 Buffer（A 和 B）
+  2. 当前使用 Buffer A
+  3. 当 Buffer A 使用到 10% 时，异步加载 Buffer B
+  4. Buffer A 用完后切换到 Buffer B
+  5. 重复上述流程
+
+优势：
+  - 避免数据库访问延迟
+  - 支持高并发（无锁切换）
+  - 容错：一个 Buffer 失败，另一个可用
+
+实现要点：
+  - 每个 Buffer 包含 [min, max] 范围
+  - 使用 CAS 原子更新当前指针
+  - 异步线程预加载下一个 Buffer
+```
+
+```java
+// 双 Buffer 核心实现
+public class SegmentIdGenerator {
+    private AtomicReference<Buffer> currentBuffer = new AtomicReference<>();
+    private ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    public long nextId() {
+        Buffer buffer = currentBuffer.get();
+        long id = buffer.next();
+        if (buffer.remaining() < buffer.total() * 0.1) {
+            // 到达阈值，异步加载下一个 Buffer
+            executor.submit(this::loadNextBuffer);
+        }
+        return id;
+    }
+
+    private void loadNextBuffer() {
+        Buffer newBuffer = loadFromDB();
+        currentBuffer.set(newBuffer);
+    }
+}
+```
+
+## Leaf snowflake 美团生产环境调优参数
+
+```text
+生产环境关键参数：
+  - 时间戳位数：41 位（支持 69 年）
+  - 机器 ID 位数：10 位（支持 1024 个节点）
+  - 序列号位数：12 位（支持 4096 个 ID/ms）
+  - 时钟回拨容忍：5 秒（超过则降级到号段模式）
+  - Worker ID 分配：ZK 临时节点 + 自增序列
+  - 启动预热：加载最近 10 分钟的时间戳
+
+监控指标：
+  - ID 生成 QPS
+  - 时钟回拨次数
+  - 降级到号段模式次数
+  - Worker ID 分配成功率
+```
+
+## UUID v7 时间排序优势
+
+### MySQL InnoDB 聚簇索引友好性
+
+```text
+UUID v4（随机）：
+  插入位置随机 → 页分裂频繁
+  索引碎片化严重
+  写入性能下降 50%+
+
+UUID v7（时间排序）：
+  时间前缀 → 顺序插入
+  页分裂减少 90%+
+  写入性能提升 30%+
+
+UUID v7 结构：
+  时间戳(48位) + 随机数(74位) + 版本(4位)
+
+MySQL InnoDB 影响：
+  聚簇索引按主键顺序存储
+  UUID v4 → 随机插入 → 大量页分裂
+  UUID v7 → 顺序插入 → 减少页分裂
+```
+
+```java
+// Java UUID v7 生成
+UUID uuid = UUIDv7.randomUUID();
+String id = uuid.toString();  // 时间有序
+
+// MySQL 表设计
+CREATE TABLE orders (
+    id BINARY(16) PRIMARY KEY,  -- UUID v7
+    order_no VARCHAR(32),
+    INDEX idx_id (id)
+) ENGINE=InnoDB;
+```
+
+## 分布式 ID 在分库分表路由中的使用陷阱
+
+### 常见陷阱与解决
+
+| 陷阱 | 问题 | 解决方案 |
+|------|------|----------|
+| ID 与分片不匹配 | 雪花 ID 无法直接路由 | ID 中嵌入分片键 |
+| 序列号溢出 | 单毫秒内 4096 个 ID 不够 | 扩展序列号位数 |
+| 时钟回拨导致重复 | 回拨期间可能生成重复 ID | 降级到号段模式 |
+| 跨库 ID 冲突 | 多库使用相同 Worker ID | 分配不同 Worker ID 范围 |
+
+```java
+// ID 嵌入分片键示例
+public long generateShardedId(int shardKey) {
+    long timestamp = System.currentTimeMillis();
+    long workerId = getWorkerId();
+    long sequence = getSequence();
+    long shardBits = (shardKey & 0x3FF) << 22;  // 10位分片键
+    return (timestamp << 22) | (workerId << 12) | sequence | shardBits;
+}
+
+// 路由计算
+int shard = (int) (id >> 22) & 0x3FF;
+String targetTable = "orders_" + (shard % TABLE_COUNT);
+```
+
+## ID 生成器高可用设计
+
+### 主备切换 + 降级到本地
+
+```text
+高可用架构：
+  主节点：接收所有写请求
+  备节点：实时同步状态，准备接管
+  本地降级：主备都不可用时，本地生成临时 ID
+
+主备切换条件：
+  1. 主节点心跳超时（>30s）
+  2. 主节点响应延迟（>1s 持续 5min）
+  3. 主节点 CPU/内存 >90%
+
+降级策略：
+  Level 1：主→备（自动切换，<1s）
+  Level 2：备→本地（降级，ID 不连续）
+  Level 3：本地生成（UUID v7，保证唯一性）
+```
+
+```java
+// 主备切换实现
+public class IdGeneratorHA {
+    private AtomicReference<String> currentMode = new AtomicReference<>("primary");
+    private IdGenerator primary;
+    private IdGenerator backup;
+    private LocalIdGenerator local;
+
+    public long nextId() {
+        try {
+            switch (currentMode.get()) {
+                case "primary":
+                    return primary.nextId();
+                case "backup":
+                    return backup.nextId();
+                case "local":
+                    return local.nextId();
+            }
+        } catch (Exception e) {
+            failover();
+            return nextId();
+        }
+        throw new RuntimeException("No available generator");
+    }
+
+    private void failover() {
+        if (currentMode.compareAndSet("primary", "backup")) {
+            log.warn("Failing over to backup");
+        } else if (currentMode.compareAndSet("backup", "local")) {
+            log.warn("Failing over to local");
+        }
+    }
+}
+```
 | 一句话 | 「分布式系统的地基——唯一+有序+高性能的本地生成」 |

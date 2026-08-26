@@ -786,6 +786,232 @@ mvn -Pnative native:compile
 - **健康探针**：K8s 用 `readiness`（就绪：能接流量，依赖就绪才 true）与 `liveness`（存活：崩了才重启）分开，避免依赖慢导致误重启。生产务必开 `management.endpoint.health.probes.enabled=true`。
 - **安全**：`/actuator` 别公网暴露，配 `management.endpoint.health.show-details=when_authorized` + Spring Security 限制内网/鉴权访问。
 
+## 七、Spring Bean 生命周期完整流程
+
+### 7.1 四大阶段详解
+
+```text
+实例化 → 属性注入 → 初始化 → 销毁
+
+1. 实例化（Instantiation）
+   - 通过构造函数或工厂方法创建 Bean 实例
+   - @Autowired 构造函数注入在此阶段完成
+   - InstantiationAwareBeanPostProcessor.postProcessBeforeInstantiation()
+
+2. 属性注入（Populate）
+   - setter/field 注入 @Value、@Autowired
+   - BeanFactoryAware、ApplicationContextAware 回调
+   - InstantiationAwareBeanPostProcessor.postProcessAfterInstantiation()
+
+3. 初始化（Initialize）
+   - Aware 回调：BeanNameAware → BeanFactoryAware → ApplicationContextAware
+   - BeanPostProcessor.postProcessBeforeInitialization()
+   - @PostConstruct → InitializingBean.afterPropertiesSet() → init-method
+   - BeanPostProcessor.postProcessAfterInitialization()（AOP 代理在此生成）
+
+4. 销毁（Destroy）
+   - @PreDestroy → DisposableBean.destroy() → destroy-method
+   - 容器关闭时触发
+```
+
+### 7.2 BeanPostProcessor 扩展点
+
+| 处理器 | 作用 | 典型使用 |
+|--------|------|----------|
+| InstantiationAwareBeanPostProcessor | 实例化前后拦截 | @Autowired 注入 |
+| DestructionAwareBeanPostProcessor | 销毁前后拦截 | 资源释放 |
+| AbstractAutoProxyCreator | AOP 自动代理 | @Transactional/@Cacheable |
+| CommonAnnotationBeanPostProcessor | JSR-250 注解 | @PostConstruct/@PreDestroy |
+| AutowiredAnnotationBeanPostProcessor | 自动注入 | @Autowired/@Value |
+
+## 八、Spring AOP 代理机制
+
+### 8.1 CGLIB vs JDK 动态代理选择
+
+```text
+选择条件（Spring Boot 默认策略）：
+  1. 目标类实现了接口 → 默认 JDK 动态代理
+  2. 目标类没有接口 → 强制 CGLIB
+  3. Spring Boot 2.x+ → 默认 CGLIB（spring.aop.proxy-target-class=true）
+
+性能对比：
+  JDK 代理：基于接口，反射调用，启动快，调用略慢
+  CGLIB：基于继承（生成子类），字节码生成，启动慢，调用快
+
+局限性：
+  JDK：目标类必须实现接口
+  CGLIB：不能代理 final 类/方法，不能代理自身方法调用
+```
+
+```java
+// 强制使用 CGLIB
+@EnableAspectJAutoProxy(proxyTargetClass = true)
+
+// 代理检查
+AopUtils.isAopProxy(bean)        // 是否代理
+AopUtils.isCglibProxy(bean)      // 是否 CGLIB
+AopUtils.isJdkDynamicProxy(bean) // 是否 JDK
+```
+
+### 8.2 AOP 执行顺序
+
+```text
+多个切面执行顺序（环绕通知包裹）：
+  Aspect1 @Around → Aspect2 @Around → 目标方法 → Aspect2 @AfterReturning → Aspect1 @AfterReturning
+
+代理创建时机：
+  早期代理：BeanFactory.getBean() 时（默认）
+  延迟代理：getBean() 返回原始对象，首次调用时创建（proxyBeanMethods=false）
+```
+
+## 九、Spring 事件机制
+
+### 9.1 核心组件
+
+```java
+// 1. 定义事件
+public class OrderCreatedEvent extends ApplicationEvent {
+    private final Order order;
+    public OrderCreatedEvent(Object source, Order order) {
+        super(source);
+        this.order = order;
+    }
+}
+
+// 2. 发布事件
+@Service
+public class OrderService {
+    @Autowired private ApplicationEventPublisher publisher;
+    public void createOrder(Order order) {
+        // 业务逻辑
+        publisher.publishEvent(new OrderCreatedEvent(this, order));
+    }
+}
+
+// 3. 监听事件
+@Component
+public class OrderEventHandler {
+    @EventListener
+    @Async  // 异步监听
+    public void handleOrderCreated(OrderCreatedEvent event) { ... }
+
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void afterOrderCommitted(OrderCreatedEvent event) { ... }
+}
+```
+
+### 9.2 使用场景
+
+| 场景 | 说明 | 示例 |
+|------|------|------|
+| 解耦模块 | 发布者不感知消费者 | 订单创建→通知/积分/库存 |
+| 跨上下文 | 不同 ApplicationContext 事件传递 | Web 层→Service 层 |
+| 事务绑定 | 事务提交后才触发 | 订单落库后发通知 |
+| 审计日志 | 记录关键操作 | 用户登录/数据变更 |
+| 缓存刷新 | 数据变更后失效缓存 | @CacheEvict 的手动替代 |
+
+## 十、Spring @Conditional 注解族
+
+### 10.1 常用条件注解
+
+```java
+@ConditionalOnClass(DataSource.class)        // classpath 有指定类
+@ConditionalOnMissingBean(DataSource.class)  // 容器无指定 Bean
+@ConditionalOnProperty(prefix="app", name="enabled", havingValue="true")
+@ConditionalOnWebApplication                 // Web 应用环境
+@ConditionalOnExpression("${app.feature:true}")
+
+// 自定义条件
+@Conditional(MyCustomCondition.class)
+public class MyCustomCondition implements Condition {
+    @Override
+    public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
+        String env = context.getEnvironment().getProperty("app.env");
+        return "production".equals(env);
+    }
+}
+```
+
+### 10.2 自动配置中的典型组合
+
+```java
+@Configuration
+@ConditionalOnClass(RedisOperations.class)
+@ConditionalOnProperty(prefix = "spring.redis", name = "host")
+public class RedisAutoConfiguration {
+    @Bean
+    @ConditionalOnMissingBean
+    public RedisConnectionFactory redisConnectionFactory() { ... }
+}
+```
+
+## 十一、Spring Boot 自动配置原理
+
+### 11.1 spring.factories → AutoConfiguration.imports 演进
+
+```text
+Spring Boot 2.7 之前：
+  META-INF/spring.factories
+  org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+    com.example.RedisAutoConfiguration
+
+Spring Boot 2.7+ / 3.x：
+  META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+  com.example.RedisAutoConfiguration
+
+优势：
+  - 按序加载，替代 @AutoConfigureOrder
+  - 支持条件过滤（AutoConfigurationImportFilter）
+  - 避免扫描整个 jar
+```
+
+### 11.2 自动配置加载流程
+
+```text
+SpringApplication.run()
+  → SpringFactoriesLoader.loadFactoryNames()
+    → 读取 META-INF/spring.factories 或 AutoConfiguration.imports
+  → @Conditional 条件过滤（OnClass/OnBean/OnProperty）
+  → 排序（@AutoConfigureBefore/After）
+  → 注册 BeanDefinition
+```
+
+## 十二、Spring 与 GraalVM 原生镜像集成
+
+### 12.1 核心挑战与解决方案
+
+| 挑战 | 原因 | 解决方案 |
+|------|------|----------|
+| 反射不可见 | 原生镜像需显式声明 | @RegisterReflectionForBinding / @Reflective |
+| 动态代理 | 运行时生成类 | @RegisterReflection + proxy-config.json |
+| 资源加载 | Classpath 资源不可见 | @RegisterReflection + resource-config.json |
+| 自动配置 | 运行时条件判断失效 | spring-native 自动检测 + AOT 编译 |
+| AOT | 运行时字节码生成受限 | Spring Boot 3.2+ 内置 AOT 处理 |
+
+```text
+Spring Boot 3.2+ 原生镜像支持：
+  1. AOT 处理：编译时生成 GraalVM 配置
+  2. 运行时提示：@RegisterForReflection 注解
+  3. Native Image 兼容库：Spring Data / Security / Web MVC
+  4. 构建工具：mvn -Pnative native:compile
+```
+
+### 12.2 注意事项
+
+```text
+不支持/需注意：
+  - Spring Data JPA 动态查询（Criteria API 部分受限）
+  - Bean Validation 动态代理
+  - JMX 远程访问
+  - 条件化 Bean 注册（需 AOT 提前确定）
+
+最佳实践：
+  - 使用 Spring Boot 3.2+ 官方支持
+  - 避免运行时反射，用构造函数注入
+  - 测试原生镜像：nativeTest
+  - 监控启动时间（目标 <100ms）和内存占用（目标 <50MB）
+```
+
 ## 七、生产就绪检查清单（Spring 视角）
 
 上线前逐项核对，把个人经验变团队流程：

@@ -853,4 +853,188 @@ public CacheManager cacheManager() {
 | 缓存穿透 | 查不存在的 key | 布隆过滤器/空值缓存 |
 | 缓存击穿 | 热点 key 过期 | 互斥锁/永不过期 |
 | 缓存雪崩 | 大批 key 同时过期 | 随机过期时间 |
+
+## Caffeine W-TinyLFU 与 LFU 近似算法详解
+
+### CountMinSketch 近似计数
+
+```text
+W-TinyLFU 三层架构：
+  1. Window Cache（窗口缓存）：1% 容量，LRU 策略
+  2. Small LFU：1% 容量，LFU 策略
+  3. Main Cache（主缓存）：98% 容量，LRU 策略
+
+CountMinSketch 机制：
+  - 4 个独立的哈希函数
+  - 4 行计数器（每行 16KB）
+  - 通过 4 次哈希取最小值估算频率
+  - 支持增量更新和周期性衰减
+
+近似精度：
+  误判率 ≈ 1/(2^counter_bits) × 2
+  实际测试：80%+ 命中率场景下，频率估算误差 <5%
+```
+
+```java
+// Caffeine W-TinyLFU 配置
+Cache<String, Object> cache = Caffeine.newBuilder()
+    .maximumSize(10_000)
+    .recordStats()  // 启用统计
+    .build();
+
+// 查看命中率
+cache.stats().hitRate();     // 命中率
+cache.stats().evictionCount(); // 淘汰次数
+```
+
+## expireAfterWrite vs expireAfterAccess 选择决策树
+
+```text
+选择决策树：
+  
+  数据会频繁更新吗？
+    ├─ 是 → expireAfterWrite（写入后过期）
+    │    └─ 更新频率决定过期时间
+    │        快速变化 → 短过期（10-60s）
+    │        缓慢变化 → 长过期（5-30min）
+    └─ 否 → expireAfterAccess（访问后过期）
+         └─ 访问频率决定过期时间
+             高频访问 → 长过期（5-30min）
+             低频访问 → 短过期（1-5min）
+
+典型场景：
+  expireAfterWrite：
+    - 配置信息（5min 过期）
+    - 用户信息（10min 过期）
+    - 热点商品（30s 过期）
+  
+  expireAfterAccess：
+    - 用户会话（30min 过期）
+    - 浏览记录（1h 过期）
+    - 购物车（2h 过期）
+```
+
+## Guava Cache removalListener 异步通知配置
+
+```java
+// 异步通知配置
+CacheBuilder.newBuilder()
+    .removalListener(notification -> {
+        // 异步通知，不影响主逻辑
+        log.info("key={} evicted, cause={}",
+            notification.getKey(),
+            notification.getCause());
+        // 发送告警/统计
+        metricsService.recordEviction(notification.getCause().name());
+    })
+    .build();
+
+// 批量异步通知（更高效）
+ListeningExecutorService executor = MoreExecutors.newFixedThreadPool(4);
+CacheBuilder.newBuilder()
+    .removalListenerWithExecutor(executor, notification -> {
+        asyncHandleEviction(notification);
+    })
+    .build();
+```
+
+## 本地缓存分布式一致性问题
+
+### 缓存更新策略对比
+
+| 策略 | 实现 | 一致性 | 复杂度 | 适用场景 |
+|------|------|--------|--------|----------|
+| 延迟双删 | 删除→更新→延迟删除 | 最终一致 | 低 | 简单场景 |
+| Canal 监听 | 监听 binlog 删除 | 最终一致 | 中 | 数据库变更 |
+| MQ 广播 | 更新后发 MQ 删除 | 最终一致 | 中 | 多实例 |
+| Redis Pub/Sub | 更新后广播删除 | 最终一致 | 低 | 轻量级 |
+
+```java
+// 延迟双删示例
+public void updateWithDoubleDelete(String key, Object value) {
+    cache.delete(key);           // 1. 先删缓存
+    db.update(value);            // 2. 更新数据库
+    Thread.sleep(500);           // 3. 延迟（等待读请求完成）
+    cache.delete(key);           // 4. 再删缓存（兜底）
+}
+```
+
+## Redis 与本地缓存双写一致性方案
+
+### 最终一致 vs 强一致
+
+```text
+最终一致方案（推荐）：
+  写入流程：DB → 删除 Redis → 删除本地缓存
+  读取流程：本地缓存 → Redis → DB
+  一致性保证：通过延迟删除 + TTL 兜底
+
+强一致方案（复杂）：
+  写入流程：DB → 删除 Redis → 广播删除本地缓存
+  读取流程：本地缓存 → Redis → DB
+  一致性保证：通过消息广播 + 版本号
+
+实现对比：
+  最终一致：延迟双删 + Canal 监听 + TTL 兜底
+  强一致：Redis 订阅 + 本地缓存版本号 + CAS 更新
+```
+
+## 缓存穿透/击穿/雪崩三件套完整代码
+
+```java
+// 1. 布隆过滤器防穿透
+BloomFilter<String> bloomFilter = BloomFilter.create(
+    Funnels.stringFunnel(Charset.defaultCharset()),
+    1000000,  // 预期元素数
+    0.01      // 误判率
+);
+
+public Object getDataWithBloomFilter(String key) {
+    if (!bloomFilter.mightContain(key)) {
+        return null;  // 一定不存在
+    }
+    Object value = cache.getIfPresent(key);
+    if (value != null) {
+        return value;
+    }
+    value = db.query(key);
+    if (value == null) {
+        cache.put(key, NULL_VALUE);  // 空值缓存（短 TTL）
+    } else {
+        bloomFilter.put(key);        // 动态添加
+        cache.put(key, value);
+    }
+    return value;
+}
+
+// 2. 互斥锁防击穿
+public Object getDataWithMutex(String key) {
+    Object value = cache.getIfPresent(key);
+    if (value != null) {
+        return value;
+    }
+    String lockKey = "lock:" + key;
+    try {
+        if (redis.setnx(lockKey, "1", 10, TimeUnit.SECONDS)) {
+            value = db.query(key);
+            cache.put(key, value);
+            redis.del(lockKey);
+            return value;
+        } else {
+            Thread.sleep(100);  // 等待
+            return cache.getIfPresent(key);
+        }
+    } finally {
+        redis.del(lockKey);
+    }
+}
+
+// 3. 随机过期防雪崩
+public void setWithRandomExpire(String key, Object value) {
+    int baseExpire = 300;  // 5 分钟基础过期
+    int randomExpire = ThreadLocalRandom.current().nextInt(0, 60);
+    cache.policy().expireAfterWrite().put(key, value,
+        baseExpire + randomExpire, TimeUnit.SECONDS);
+}
+```
 | 数据不一致 | 缓存与 DB 不同步 | 延迟双删/Canal |

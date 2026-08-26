@@ -875,6 +875,268 @@ end
   复杂网关 → OpenResty + Kong/APISIX
 ```
 
+## lua-resty-limit-traffic 令牌桶与漏桶配置实例
+
+### 令牌桶（Token Bucket）
+
+```lua
+-- 令牌桶配置
+local limit_req = require "resty.limit.req"
+
+-- 参数：rate（每秒令牌数）、burst（突发容量）、delay（延迟阈值）
+local lim, err = limit_req.new("my_limit_store", 100, 50, 100)
+if not lim then
+    ngx.log(ngx.ERR, "failed to instantiate limiter: ", err)
+    return ngx.exit(500)
+end
+
+local key = ngx.var.remote_addr
+local delay, err = lim:incoming(key, true)
+if not delay then
+    if err == "rejected" then
+        ngx.log(ngx.WARN, "rate limit exceeded for: ", key)
+        return ngx.exit(429)
+    end
+    ngx.log(ngx.ERR, "failed to limit req: ", err)
+    return ngx.exit(500)
+end
+
+if delay >= 0.001 then
+    ngx.sleep(delay)  -- 延迟处理
+end
+```
+
+### 漏桶（Leaky Bucket）
+
+```lua
+-- 漏桶配置
+local limit_traffic = require "resty.limit.traffic"
+
+local lim, err = limit_traffic.new("my_limit_store", 100, 200)  -- rate, burst
+if not lim then
+    ngx.log(ngx.ERR, "failed to instantiate limiter: ", err)
+    return ngx.exit(500)
+end
+
+local key = ngx.var.remote_addr
+local delay, err = lim:incoming(key, true)
+if not delay then
+    if err == "rejected" then
+        return ngx.exit(429)
+    end
+    ngx.log(ngx.ERR, "failed to limit traffic: ", err)
+    return ngx.exit(500)
+end
+
+if delay > 0 then
+    ngx.sleep(delay)  -- 漏桶延迟
+end
+```
+
+## lua-resty-http 非阻塞 HTTP 客户端
+
+### 连接池管理
+
+```lua
+local http = require "resty.http"
+local httpc = http.new()
+
+-- 连接池配置
+httpc:set_timeouts(1000, 1000, 1000)  -- connect, send, read timeout
+
+-- 复用连接（连接池）
+local res, err = httpc:request_uri("http://backend-service/api/data", {
+    method = "GET",
+    headers = {
+        ["Content-Type"] = "application/json",
+    },
+    keepalive_timeout = 60000,  -- 60s 保活
+    pool_size = 10,              -- 连接池大小
+})
+
+if not res then
+    ngx.log(ngx.ERR, "request failed: ", err)
+    return ngx.exit(500)
+end
+
+-- 手动关闭连接（可选）
+httpc:close()
+```
+
+## lua-resty-jwt 验证实战
+
+### RS256/HS256
+
+```lua
+local jwt = require "resty.jwt"
+
+-- HS256 验证
+local jwt_obj = jwt:verify("your-secret-key", token)
+if not jwt_obj.verified then
+    ngx.log(ngx.WARN, "JWT verification failed: ", jwt_obj.reason)
+    return ngx.exit(401)
+end
+
+-- RS256 验证（公钥）
+local public_key = [[-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...
+-----END PUBLIC KEY-----]]
+
+local jwt_obj = jwt:verify(public_key, token, {
+    lifetime_grace_period = 300  -- 5 分钟 grace period
+})
+
+-- JWT Payload 提取
+local user_id = jwt_obj.payload.user_id
+local exp = jwt_obj.payload.exp
+
+-- 生成 JWT
+local payload = {
+    user_id = 12345,
+    exp = ngx.time() + 3600,  -- 1 小时过期
+    iss = "my-service"
+}
+local token = jwt:sign("secret", {
+    header = {alg = "HS256", typ = "JWT"},
+    payload = payload
+})
+```
+
+## OpenResty 日志格式化
+
+### access_log 指令 + JSON 格式
+
+```nginx
+# JSON 格式日志
+log_format json_log escape=json
+    '{'
+        '"time":"$time_iso8601",'
+        '"remote_addr":"$remote_addr",'
+        '"request":"$request",'
+        '"status":$status,'
+        '"body_bytes_sent":$body_bytes_sent,'
+        '"request_time":$request_time,'
+        '"upstream_response_time":"$upstream_response_time",'
+        '"http_referer":"$http_referer",'
+        '"http_user_agent":"$http_user_agent",'
+        '"request_id":"$request_id",'
+        '"trace_id":"$opentracing_trace_id"'
+    '}';
+
+access_log /var/log/nginx/access.log json_log;
+
+# 自定义日志（Lua）
+lua_need_request_body on;
+
+access_by_lua_block {
+    ngx.var.request_body = ngx.req.get_body_data()
+}
+
+log_by_lua_block {
+    local cjson = require "cjson"
+    local log_entry = {
+        timestamp = ngx.now(),
+        request_id = ngx.var.request_id,
+        method = ngx.req.get_method(),
+        path = ngx.var.uri,
+        status = ngx.status,
+        latency = ngx.now() - ngx.req.start_time(),
+        upstream_latency = ngx.var.upstream_response_time,
+        client_ip = ngx.var.remote_addr,
+        user_agent = ngx.var.http_user_agent
+    }
+    ngx.log(ngx.INFO, cjson.encode(log_entry))
+}
+```
+
+## OpenResty 在 WAF 中的规则匹配模式
+
+### WAF 规则引擎
+
+```lua
+-- SQL 注入检测规则
+local sql_patterns = {
+    "union.*select",
+    "select.*from",
+    "insert.*into",
+    "delete.*from",
+    "drop.*table",
+    "or.*1=1",
+    "and.*1=1"
+}
+
+-- XSS 检测规则
+local xss_patterns = {
+    "<script>",
+    "javascript:",
+    "onload=",
+    "onerror=",
+    "eval\\(",
+    "alert\\("
+}
+
+-- 路径遍历检测
+local traversal_patterns = {
+    "%2e%2e%2f",
+    "%2e%2e/",
+    "\\.\\./"
+}
+
+function waf_check()
+    local args = ngx.req.get_uri_args()
+    local body = ngx.req.get_body_data()
+
+    -- 检查 URI
+    for _, pattern in ipairs(sql_patterns) do
+        if ngx.re.match(ngx.var.uri, pattern, "i") then
+            ngx.log(ngx.WARN, "WAF: SQL injection detected")
+            return ngx.exit(403)
+        end
+    end
+
+    -- 检查请求参数
+    for key, val in pairs(args) do
+        for _, pattern in ipairs(sql_patterns) do
+            if ngx.re.match(val, pattern, "i") then
+                ngx.log(ngx.WARN, "WAF: SQL injection in args")
+                return ngx.exit(403)
+            end
+        end
+    end
+
+    return ngx.exit(200)
+end
+
+access_by_lua_block {
+    waf_check()
+}
+```
+
+## OpenResty 与 Nginx 原生性能基准对比
+
+### QPS/延迟/内存
+
+| 指标 | Nginx 原生 | OpenResty | 说明 |
+|------|------------|-----------|------|
+| QPS（静态） | 100% | 95-98% | 接近原生 |
+| QPS（Lua 逻辑） | N/A | 80-95% | 取决于 Lua 复杂度 |
+| P99 延迟 | 100% | 100-105% | 基本持平 |
+| 内存占用 | 100% | 110-120% | Lua VM 开销 |
+| 启动时间 | 100% | 120-150% | Lua 预编译 |
+
+```text
+性能对比结论：
+  1. 纯转发场景：OpenResty 性能接近原生 Nginx（<5% 损耗）
+  2. 含 Lua 逻辑：OpenResty 性能取决于 Lua 代码复杂度
+  3. 共享内存：频繁读写共享字典有锁竞争（<1% 损耗）
+  4. cosocket：异步 IO 不阻塞事件循环（零损耗）
+
+选择建议：
+  纯静态/简单代理 → Nginx 原生
+  需要动态逻辑 → OpenResty
+  复杂网关 → OpenResty + Kong/APISIX
+```
+
 ## 九、与其他板块的关系
 
 - 网关体系见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」与「[Spring Cloud Gateway](./SpringCloudGateway.md)」；

@@ -826,4 +826,183 @@ SELECT name, email FROM users WHERE name = 'John';
 
 ---
 
+## HBase BloomFilter 三种类型
+
+### ROW / ROWCOL / PREFIX 误判率对比
+
+| 类型 | 过滤粒度 | 存储开销 | 误判率建议 | 适用场景 |
+|------|----------|----------|------------|----------|
+| ROW | RowKey | 低 | 1% | 精确 RowKey 查询 |
+| ROWCOL | RowKey + Column | 中 | 0.1% | RowKey + 列族查询 |
+| PREFIX | RowKey 前缀 | 低 | 1% | 前缀匹配查询 |
+
+```xml
+<!-- 在 HBase Shell 中设置 -->
+create 't1', {NAME => 'f1', BLOOMFILTER => 'ROW'}
+create 't1', {NAME => 'f1', BLOOMFILTER => 'ROWCOL'}
+create 't1', {NAME => 'f1', BLOOMFILTER => 'PREFIX', PREFIX_LENGTH => 8}
+```
+
+```text
+选择决策：
+  1. 单 RowKey Get 查询 → ROW（默认最佳）
+  2. RowKey + 列族 Get 查询 → ROWCOL（减少不必要的磁盘 IO）
+  3. RowKey 前缀 Scan → PREFIX（减少扫描范围）
+  4. 写密集场景 → 慎用 ROWCOL（每个列都会写布隆过滤器）
+```
+
+## Compaction 调度器参数详解
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| hbase.hstore.compactionThreshold | 3 | 触发 minor compaction 的最小文件数 |
+| hbase.hstore.compactionMax | 10 | 单次 minor compaction 最大文件数 |
+| hbase.hstore.compaction.maxSize | Long.MAX_VALUE | 不参与 compaction 的最大文件大小 |
+| hbase.hstore.compaction.minSize | 2MB | 参与 compaction 的最小文件大小 |
+| hbase.hstore.majorcompaction.period | 7天 | major compaction 周期 |
+| hbase.hstore.blockingStoreFiles | 16 | 阻塞写入的文件数阈值 |
+
+```text
+Compaction 策略：
+  Minor：合并小文件，不清除删除标记，不回收空间
+  Major：全量合并，清除删除/过期数据，回收空间
+
+生产建议：
+  - Major Compaction 设在低峰期（凌晨2-4点）
+  - 合理设置 hbase.hstore.compactionThreshold 避免频繁触发
+  - 监控 StoreFile 数量，>10 需关注
+```
+
+## Coprocessor 触发类型
+
+### Observer（观察者）
+
+```java
+// 代码示例：RegionObserver
+public class AccessObserver extends BaseRegionObserver {
+    @Override
+    public void preGetOp(Region region, Get get, List<Cell> results)
+            throws IOException {
+        // 在 Get 操作前执行
+        // 可用于权限校验、日志记录
+    }
+}
+
+// 协处理器加载
+alter 't1', {NAME => 'f1', COPROCESSOR =>
+    'com.example.AccessObserver|1001|'}
+```
+
+### Endpoint（端点）
+
+```java
+// 代码示例：协处理器接口
+public interface CounterProtocol extends CoprocessorProtocol {
+    long incrementCounter(byte[] row, byte[] family, byte[] qualifier)
+            throws IOException;
+}
+
+// 服务端实现
+public class CounterEndpoint extends BaseEndpointServer
+        implements CounterProtocol {
+    @Override
+    public long incrementCounter(byte[] row, byte[] family,
+            byte[] qualifier) throws IOException {
+        // 在 Region 服务器上执行聚合逻辑
+        return 0;
+    }
+}
+
+// 客户端调用
+RegionMetricsClient client = table.coprocessorProxy(
+    CounterProtocol.class, Bytes.toBytes("row"));
+long count = client.incrementCounter(row, family, qualifier);
+```
+
+## Bulk Load 流程
+
+### GenerateHFile + CompleteBulkLoad
+
+```text
+流程：
+  1. 生成 HFile：
+     将数据转换为 HFile 格式（不经过 RegionServer）
+     使用 MapReduce/Spark 生成 HFiles
+  
+  2. 完成导入：
+     将 HFiles 移动到 HBase 表的 Region 目录
+     通过 CompleteBulkLoad API 完成
+
+性能优势：
+  - 不经过 RegionServer，不占用 Region 资源
+  - 写入吞吐量提升 10-100 倍
+  - 适合大批量数据导入
+  - 不影响在线读写
+```
+
+```java
+// MapReduce 生成 HFile
+Job job = Job.getInstance(conf);
+job.setMapperClass(ImportMapper.class);
+job.setOutputKeyClass(ImmutableBytesWritable.class);
+job.setOutputValueClass(KeyValue.class);
+job.setOutputFormatClass(HFileOutputFormat2.class);
+HFileOutputFormat2.configureIncrementalLoad(job, table);
+
+// CompleteBulkLoad 导入
+HFileOutputFormat2.configureIncrementalLoad(job, table);
+BulkLoadHFiles loader = new BulkLoadHFiles(conf);
+loader.bulkLoad(table.getName(), outputDir);
+```
+
+## Phoenix 二级索引
+
+### Global Index vs Local Index
+
+| 特性 | Global Index | Local Index |
+|------|--------------|-------------|
+| 存储位置 | 独立 HBase 表 | 与主表同 Region |
+| 写入开销 | 高（需要跨 Region 更新） | 低（同 Region 更新） |
+| 读取性能 | 高（直接查询索引表） | 中（需要过滤） |
+| 适用场景 | 读多写少 | 写多读少 |
+| 事务支持 | 支持 | 支持 |
+
+```sql
+-- Global Index
+CREATE INDEX idx_user_name ON users (user_name)
+    INCLUDE (email, phone);
+
+-- Local Index
+CREATE LOCAL INDEX idx_order_time ON orders (order_time);
+
+-- 覆盖索引
+CREATE INDEX idx_product ON orders (product_id)
+    INCLUDE (amount, quantity);
+```
+
+## HBase Region Split 策略与热点预防
+
+### Split 策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| ConstantSizeRegionSplitPolicy | 固定大小触发分裂 | 通用 |
+| DelimitedKeyPrefixRegionSplitPolicy | 按前缀分裂 | 避免热点 |
+| KeyPrefixRegionSplitPolicy | 按 KeyPrefix 分裂 | 前缀明确的场景 |
+| DisableSplitPolicy | 禁用自动分裂 | 手动管理 |
+
+### 热点预防
+
+```text
+RowKey 设计原则：
+  1. 避免单调递增（时间戳开头）→ 加盐/反转
+  2. 散列前缀：MD5(rowkey).substring(0, 4) + rowkey
+  3. 反转时间戳：Long.MAX_VALUE - timestamp
+  4. 盐值：rowkey + random(0-9)
+
+示例：
+  原始：20240101000001 → 单 Region 热点
+  加盐：3_20240101000001 → 分散到 10 个 Region
+```
+
 > 一句话：**HBase = HDFS 上的 Bigtable + LSM 树写优化 + 列族存储 + 强一致；选型先看「生态（Hadoop→HBase，独立→Cassandra）」，再定「RowKey 设计（散列/有序/短）」，最后调「内存/Compaction/BloomFilter」**。

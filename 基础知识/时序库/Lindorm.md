@@ -974,3 +974,227 @@ Lindorm Search 引擎在时序场景的应用：
   冷 OSS 约 ¥0.08/GB·月（1/10）
   若 80% 数据为冷，整体存储成本可降 ~70%
 ```
+
+## Lindorm 时序数据模型
+
+### metric/tags/fields 详解
+
+```sql
+-- 时序表结构
+CREATE TABLE device_metrics (
+    time        TIMESTAMP,           -- 时间戳（必填）
+    device_id   VARCHAR(32),         -- 设备ID（标签）
+    region      VARCHAR(16),         -- 地区（标签）
+    temperature DOUBLE,              -- 温度（字段）
+    humidity    DOUBLE,              -- 湿度（字段）
+    battery     INT,                 -- 电量（字段）
+    PRIMARY KEY (time, device_id, region)
+);
+
+-- 标签（Tags）：用于过滤和分组
+-- 字段（Fields）：存储实际测量值
+-- 时间戳：数据的时间维度
+
+-- 查询示例
+SELECT device_id, AVG(temperature)
+FROM device_metrics
+WHERE region = 'shanghai'
+  AND time >= '2024-01-01'
+GROUP BY device_id;
+```
+
+```text
+数据模型最佳实践：
+  - 标签选择：高基数（如 device_id）+ 低基数（如 region）
+  - 字段选择：数值类型优先，避免字符串字段
+  - 时间精度：根据业务需求选择（毫秒/秒/分钟）
+  - 主键设计：time + 高基数标签 + 低基数标签
+```
+
+## 宽表引擎与 HBase 兼容操作对比
+
+| 特性 | Lindorm 宽表引擎 | HBase | 说明 |
+|------|------------------|-------|------|
+| API 兼容 | 100% 兼容 | 原生 | Lindorm 支持 HBase API |
+| 数据模型 | 列族/列 | 列族/列 | 相同 |
+| 协处理器 | 支持 | 支持 | Lindorm 支持 HBase 协处理器 |
+| Bulk Load | 支持 | 支持 | Lindorm 优化了 Bulk Load |
+| 性能 | 更高（云原生优化） | 基准 | Lindorm 有性能优势 |
+| 运维 | 托管服务 | 需自运维 | Lindorm 省运维 |
+
+```java
+// Lindorm 宽表引擎使用 HBase API
+Configuration config = HBaseConfiguration.create();
+config.set("hbase.zookeeper.quorum", "ld-xxx Lindorm访问地址");
+Connection connection = ConnectionFactory.createConnection(config);
+Table table = connection.getTable(TableName.valueOf("device_metrics"));
+
+// PUT 操作
+Put put = new Put(Bytes.toBytes("row1"));
+put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("temperature"), Bytes.toBytes(25.5));
+put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("humidity"), Bytes.toBytes(60.0));
+table.put(put);
+
+// GET 操作
+Get get = new Get(Bytes.toBytes("row1"));
+Result result = table.get(get);
+double temperature = Bytes.toDouble(result.getValue(
+    Bytes.toBytes("cf"), Bytes.toBytes("temperature")));
+```
+
+## 搜索引擎在时序数据中的应用
+
+### 全文+时序联合查询
+
+```sql
+-- 全文搜索 + 时序查询
+SELECT * FROM device_metrics
+WHERE time >= '2024-01-01'
+  AND device_id LIKE 'sensor-%'
+  AND MATCH(description) AGAINST ('温度异常');
+
+-- 使用 Lindorm 搜索引擎
+-- 1. 创建搜索索引
+CREATE SEARCH INDEX idx_description ON device_metrics (description);
+
+-- 2. 全文搜索
+SELECT * FROM device_metrics
+WHERE SEARCH(description, '温度异常')
+  AND time >= '2024-01-01';
+
+-- 3. 混合查询（全文 + 时序 + SQL）
+SELECT device_id, AVG(temperature)
+FROM device_metrics
+WHERE SEARCH(description, '温度异常')
+  AND time >= '2024-01-01'
+GROUP BY device_id
+HAVING AVG(temperature) > 30;
+```
+
+```text
+应用场景：
+  - 设备日志搜索：搜索包含特定关键词的日志
+  - 告警信息检索：搜索特定类型的告警
+  - 传感器数据：搜索传感器描述信息
+  - 混合分析：全文搜索 + 时序聚合
+```
+
+## 云原生存算分离架构详解
+
+### 存算分离优势
+
+```text
+传统架构：
+  计算 + 存储 在同一节点
+  扩容时需要同时扩容
+  资源利用率低
+
+存算分离：
+  计算节点：无状态，可独立扩容
+  存储节点：有状态，可独立扩容
+  优势：
+    - 资源独立扩展
+    - 成本优化
+    - 弹性伸缩
+
+Lindorm 存算分离：
+  计算层：Lindorm Compute Engine
+  存储层：Lindorm Storage Engine (LSM-Tree)
+  缓存层：Lindorm Cache Engine (SSD)
+```
+
+```sql
+-- Lindorm 存算分离配置
+-- 1. 创建表时指定存储类型
+CREATE TABLE device_metrics (
+    time TIMESTAMP,
+    device_id VARCHAR(32),
+    temperature DOUBLE,
+    PRIMARY KEY (time, device_id)
+) WITH (
+    storage_type = 'columnar',  -- 列式存储
+    compression = 'zstd',       -- 压缩算法
+    ttl = 2592000              -- 30天过期
+);
+
+-- 2. 存储分层
+ALTER TABLE device_metrics SET (
+    hot_storage = '7d',         -- 热数据保留7天
+    warm_storage = '30d',       -- 温数据保留30天
+    cold_storage = '365d'       -- 冷数据保留365天
+);
+```
+
+## 在工业物联网中的应用案例
+
+### 设备监控/预测性维护
+
+```text
+工业 IoT 场景：
+  1. 设备监控
+     - 实时采集传感器数据
+     - 监控设备状态
+     - 告警推送
+  
+  2. 预测性维护
+     - 历史数据分析
+     - 故障预测
+     - 维护计划
+
+技术架构：
+  设备 → 边缘网关 → Lindorm 时序表
+  → Flink 实时计算 → 告警服务
+  → Spark 离线分析 → 预测模型
+```
+
+```sql
+-- 设备监控表
+CREATE TABLE device_monitoring (
+    time TIMESTAMP,
+    device_id VARCHAR(32),
+    metric_type VARCHAR(16),  -- temperature/vibration/current
+    metric_value DOUBLE,
+    status VARCHAR(8),        -- normal/warning/alarm
+    PRIMARY KEY (time, device_id, metric_type)
+);
+
+-- 预测性维护查询
+SELECT device_id,
+       AVG(metric_value) as avg_value,
+       MAX(metric_value) as max_value,
+       STDDEV(metric_value) as std_value
+FROM device_monitoring
+WHERE metric_type = 'vibration'
+  AND time >= NOW() - INTERVAL '1 hour'
+GROUP BY device_id
+HAVING STDDEV(metric_value) > 0.5;  -- 振动标准差过大，需要维护
+```
+
+## 成本优化
+
+### 冷热分离+自动缩容+压缩策略
+
+```text
+成本优化策略：
+  1. 冷热分离
+     - 热数据：ESSD（高性能）
+     - 冷数据：OSS（低成本）
+     - 自动分层：基于 TTL
+  
+  2. 自动缩容
+     - 非高峰时段自动缩减计算资源
+     - 按需扩缩容
+     - 成本降低 30-50%
+  
+  3. 压缩策略
+     - 列式存储 + ZSTD 压缩
+     - 压缩比：10:1 ~ 20:1
+     - 节省存储成本 90%+
+
+成本计算示例：
+  原始数据：1TB/月
+  压缩后：100GB/月
+  冷存储：OSS $0.023/GB = $2.3/月
+  热存储：ESSD $0.1/GB = $10/月（10%热数据）
+  总成本：$12.3/月 vs $100/月（传统方案）
+```

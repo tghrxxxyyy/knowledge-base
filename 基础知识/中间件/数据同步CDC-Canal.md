@@ -966,4 +966,281 @@ groups:
       summary: "Canal 消息堆积 > 10000"
 ```
 
+---
+
+## Canal vs Debezium vs Maxwell 架构差异图
+
+```text
+Canal：
+  架构：Canal Server → Canal Client
+  协议：自定义 TCP 协议
+  数据格式：Raw SQL / FlatMessage / Protobuf
+  特点：纯增量同步，支持 HA
+
+Debezium：
+  架构：Kafka Connect + Debezium Connector
+  协议：Kafka Connect API
+  数据格式：JSON / Avro / Protobuf
+  特点：支持全量+增量，CDC 标准
+
+Maxwell：
+  架构：Maxwell Daemon → Kafka
+  协议：HTTP / Kafka Producer
+  数据格式：JSON
+  特点：轻量级，纯增量同步
+
+选择建议：
+  - Kafka 生态 → Debezium（Kafka Connect）
+  - 轻量级 → Maxwell
+  - 自定义分发 → Canal
+```
+
+```mermaid
+graph LR
+    subgraph Canal
+        A1[Canal Server] --> A2[Canal Client]
+    end
+    subgraph Debezium
+        B1[Debezium Connector] --> B2[Kafka Connect]
+    end
+    subgraph Maxwell
+        C1[Maxwell Daemon] --> C2[Kafka]
+    end
+```
+
+## Canal HA + ZK 选主配置
+
+### ZK 选主配置
+
+```properties
+# canal.properties
+canal.zk.servers = zk1:2181,zk2:2181,zk3:2181
+canal.instance.global.mode = spring
+canal.instance.global.spring.xml = classpath:spring/file-instance.xml
+
+# HA 模式
+canal.instance.global.spring.xml = classpath:spring/default-instance.xml
+
+# 站点模式（多实例部署）
+canal.instance.rawSubcription = true
+```
+
+```yaml
+# Docker Compose HA 部署
+version: '3'
+services:
+  canal-server-1:
+    image: canal/canal-server:latest
+    container_name: canal-server-1
+    ports:
+      - "11110:11110"
+      - "11111:11111"
+    environment:
+      - ZK_SERVERS=zk1:2181,zk2:2181,zk3:2181
+      - CANAL_ID=1
+    volumes:
+      - ./canal.properties:/home/admin/canal-server/conf/canal.properties
+      - ./instance.properties:/home/admin/canal-server/conf/example/instance.properties
+
+  canal-server-2:
+    image: canal/canal-server:latest
+    container_name: canal-server-2
+    ports:
+      - "21110:11110"
+      - "21111:11111"
+    environment:
+      - ZK_SERVERS=zk1:2181,zk2:2181,zk3:2181
+      - CANAL_ID=2
+    volumes:
+      - ./canal.properties:/home/admin/canal-server/conf/canal.properties
+      - ./instance.properties:/home/admin/canal-server/conf/example/instance.properties
+```
+
+## Canal 消息格式
+
+### FlatMessage vs Protobuf
+
+```json
+// FlatMessage 格式
+{
+    "database": "test",
+    "table": "user",
+    "type": "UPDATE",
+    "ts": 1640995200000,
+    "id": 1,
+    "data": [
+        {
+            "id": "1",
+            "name": "John",
+            "age": "25"
+        }
+    ],
+    "old": [
+        {
+            "age": "24"
+        }
+    ]
+}
+
+// Protobuf 格式（更高效）
+message Entry {
+    string database = 1;
+    string table = 2;
+    EntryType type = 3;
+    int64 ts = 4;
+    repeated RowData data = 5;
+    repeated RowData old = 6;
+}
+```
+
+```text
+格式选择：
+  FlatMessage：
+    - 可读性好，调试方便
+    - JSON 格式，传输开销大
+    - 适合开发测试
+  
+  Protobuf：
+    - 二进制格式，传输高效
+    - 需要 Schema 定义
+    - 适合生产环境
+    - 性能提升 30-50%
+```
+
+## Canal 过滤规则正则实战
+
+### 过滤规则配置
+
+```properties
+# canal.instance.filter.regex
+# 匹配所有表
+canal.instance.filter.regex = .*
+
+# 匹配指定数据库的所有表
+canal.instance.filter.regex = test\\..*
+
+# 匹配指定表
+canal.instance.filter.regex = test\\.user,test\\.order
+
+# 排除系统表
+canal.instance.filter.regex = test\\..*,mysql\\..*
+
+# 使用正则表达式
+canal.instance.filter.regex = test\\.user_\\d{4}
+```
+
+```bash
+# 过滤规则测试
+# 测试正则匹配
+echo "test.user" | grep -P "test\\.user"
+echo "test.order" | grep -P "test\\.user"
+echo "mysql.user" | grep -P "test\\..*"
+```
+
+## Canal + Kafka + Flink 完整实时链路图
+
+```mermaid
+graph TB
+    A[MySQL] --> B[Canal Server]
+    B --> C[Kafka]
+    C --> D[Flink]
+    D --> E{处理逻辑}
+    E --> F[Redis 缓存]
+    E --> G[ES 搜索]
+    E --> H[HBase 存储]
+    E --> I[Doris 分析]
+    
+    subgraph 实时链路
+        A --> B --> C --> D
+    end
+    
+    subgraph 消费链路
+        D --> F
+        D --> G
+        D --> H
+        D --> I
+    end
+```
+
+```text
+链路配置要点：
+  1. Canal：增量同步，过滤规则精确
+  2. Kafka：分区数与 Flink 并行度匹配
+  3. Flink：Exactly-Once 语义，Checkpoint 启用
+  4. Sink：批量写入，异步提交
+
+性能指标：
+  - 端到端延迟：<1s（P99）
+  - 吞吐量：10万+ TPS
+  - 可用性：99.99%
+```
+
+## Canal 监控指标与告警配置
+
+### 监控指标
+
+```text
+Canal 核心指标：
+  canal_instance_delay：同步延迟（秒）
+  canal_instance_rows_insert：插入行数
+  canal_instance_rows_update：更新行数
+  canal_instance_rows_delete：删除行数
+  canal_instance_status：实例状态（0=正常，1=异常）
+  canal_instance_connection：连接数
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+- name: canal-alerts
+  rules:
+  - alert: CanalInstanceDown
+    expr: canal_instance_status == 1
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Canal 实例停止"
+
+  - alert: CanalSyncDelay
+    expr: canal_instance_delay > 60
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Canal 同步延迟 > 60 秒"
+
+  - alert: CanalMessageLag
+    expr: kafka_consumergroup_lag > 10000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Canal 消息堆积 > 10000"
+```
+
+## Canal 在实时特征存储中的应用
+
+### 特征计算架构
+
+```text
+实时特征计算流程：
+  1. Canal 监听 MySQL 变更
+  2. Kafka 缓存变更事件
+  3. Flink 实时计算特征
+  4. Redis/HBase 存储特征
+  5. 模型服务读取特征
+
+典型特征：
+  - 用户最近 1 小时订单数
+  - 商品最近 24 小时销量
+  - 用户最近 7 天浏览品类
+  - 设备最近 1 小时操作频率
+
+存储选择：
+  - 热特征：Redis（毫秒级读取）
+  - 温特征：HBase（秒级读取）
+  - 冷特征：ClickHouse（分析查询）
+```
+
 ## 十九、与其他板块的关系

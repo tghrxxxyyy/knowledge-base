@@ -892,4 +892,233 @@ etcdctl endpoint status --write-out=json | jq '.leader'
 | 调优 | heartbeat/election/quota/compaction |
 | 局限 | 内存 KV 容量有限、写吞吐受磁盘限制 |
 | 许可证 | Apache 2.0 |
+
+## etcd MVCC 原理
+
+### revision + tree index 实现
+
+```text
+MVCC 核心概念：
+  revision：全局递增的版本号（每次事务 +1）
+  tree index：内存中的 B+ 树索引，key → revision 映射
+  boltdb：磁盘存储，revision → value
+
+数据写入流程：
+  1. 分配全局 revision（原子递增）
+  2. 在 tree index 中插入 key → revision 映射
+  3. 将 (revision, value) 写入 boltdb
+  4. 返回新 revision
+
+数据读取流程：
+  1. 在 tree index 中查找 key 的最新 revision
+  2. 从 boltdb 中读取 revision 对应的 value
+  3. 如果是删除标记，返回 nil
+
+历史版本查询：
+  指定 revision 读取 → 从 tree index 找该 revision 的映射
+  范围查询 → 遍历 tree index，逐个读取
+```
+
+```bash
+# 查看 key 的所有历史版本
+etcdctl get --prefix --keys-only /mykey
+
+# 按 revision 读取
+etcdctl get --revision=100 /mykey
+
+# 按 revision 范围读取
+etcdctl get --revision=100:200 /mykey
+```
+
+## compact/defrag 周期性维护操作与影响
+
+### compact 操作
+
+```bash
+# 手动 compact（删除指定 revision 之前的历史数据）
+etcdctl compact $(etcdctl endpoint status --write-out=json | jq -r '.header.revision')
+
+# 自动 compact（推荐）
+# etcd.conf.yml 配置
+auto-compaction-mode: periodic
+auto-compaction-retention: "1h"  # 每小时 compact 一次
+
+# 影响：
+# - 减少存储空间
+# - 提升查询性能（历史数据减少）
+# - 不影响当前版本数据
+```
+
+### defrag 操作
+
+```bash
+# 手动 defrag（压缩磁盘空间）
+etcdctl defrag --endpoints=http://127.0.0.1:2379
+
+# 自动 defrag（需配置）
+# etcd.conf.yml
+quota-backend-bytes: 8589934592  # 8GB
+auto-compaction-retention: "1h"
+
+# 影响：
+# - 回收磁盘空间
+# - 短暂影响性能（期间无法写入）
+# - 建议在低峰期执行
+# - 建议先 compact 再 defrag
+```
+
+## etcd lease 租约续期与自动回收
+
+### KeepAlive 与 TTL
+
+```bash
+# 创建租约（TTL 30 秒）
+etcdctl lease grant 30
+
+# KeepAlive 续期
+etcdctl lease keep-alix <lease-id>
+
+# 撤销租约
+etcdctl lease revoke <lease-id>
+
+# 查看租约信息
+etcdctl lease timetolive <lease-id>
+```
+
+```java
+// Java 续期示例
+Lease lease = client.getLeaseClient();
+CompletableFuture<LeaseGrantResponse> grantFuture =
+    lease.grant(30);  // 30 秒 TTL
+
+// 自动续期
+lease.keepAlive(grantFuture.get().getID(),
+    new StreamObserver<LeaseKeepAliveResponse>() {
+        @Override
+        public void onNext(LeaseKeepAliveResponse response) {
+            // 续期成功
+        }
+
+        @Override
+        public void onError(Throwable t) {
+            // 续期失败，需重新注册
+        }
+
+        @Override
+        public void onCompleted() {}
+    });
+
+// 绑定租约
+PutOption option = PutOption.newBuilder()
+    .withLeaseId(grantFuture.get().getID())
+    .build();
+client.getKVClient().put(
+    ByteString.fromUtf8("/services/my-service"),
+    ByteString.fromUtf8("instance-1"),
+    option
+);
+```
+
+## K8s etcd 故障恢复
+
+### etcdctl snapshot restore 操作步骤
+
+```bash
+# 1. 备份
+etcdctl snapshot save /backup/etcd-snapshot-$(date +%Y%m%d).db
+
+# 2. 验证备份
+etcdctl snapshot status /backup/etcd-snapshot.db --write-out=table
+
+# 3. 恢复（单节点）
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --data-dir=/var/lib/etcd-restored \
+  --name=etcd-0 \
+  --initial-cluster=etcd-0=http://etcd-0:2380 \
+  --initial-advertise-peer-urls=http://etcd-0:2380 \
+  --listen-peer-urls=http://etcd-0:2380
+
+# 4. 替换数据目录
+mv /var/lib/etcd /var/lib/etcd-old
+mv /var/lib/etcd-restored /var/lib/etcd
+
+# 5. 重启 etcd
+systemctl restart etcd
+```
+
+```text
+故障恢复注意事项：
+  - 恢复前必须备份
+  - 恢复会覆盖现有数据
+  - 多节点集群需逐个恢复
+  - 恢复后检查集群状态
+  - K8s 场景需重启所有 API Server
+```
+
+## etcd 网络分区与 leader election 行为
+
+### 网络分区后自动选主
+
+```text
+etcd 网络分区行为：
+  1. Leader 与多数节点失去连接
+  2. 少数派节点无法选举新 Leader
+  3. 多数派节点选举新 Leader
+  4. 分区恢复后，旧 Leader 降级为 Follower
+
+故障切换时间：
+  - 选举超时：默认 1000ms
+  - 心跳超时：默认 100ms
+  - 故障检测：3-5 倍心跳超时
+  - 总切换时间：约 3-5 秒
+
+分区期间：
+  - 少数派：无法写入，可读取
+  - 多数派：可正常读写
+```
+
+```bash
+# 监控选举事件
+etcdctl watch --prefix /0 --  # 观察选举事件
+
+# 查看 Leader 信息
+etcdctl endpoint status --write-out=json | jq '.[].leader'
+
+# 模拟网络分区（iptables）
+iptables -A INPUT -s <node-ip> -j DROP
+iptables -A OUTPUT -d <node-ip> -j DROP
+
+# 恢复网络
+iptables -D INPUT -s <node-ip> -j DROP
+iptables -D OUTPUT -d <node-ip> -j DROP
+```
+
+## etcd v2 vs v3 API 本质差异
+
+### HTTP REST vs gRPC
+
+| 特性 | v2 API | v3 API |
+|------|--------|--------|
+| 协议 | HTTP REST | gRPC |
+| 传输效率 | 低（JSON） | 高（Protocol Buffers） |
+| 连接方式 | 短连接 | 长连接（HTTP/2） |
+| Watch | 轮询 | 流式推送 |
+| 事务 | 不支持 | 支持（Txn） |
+| Lease | 无 | 支持（TTL） |
+| 性能 | 低 | 高（10x+） |
+| 状态 | 废弃 | 推荐 |
+
+```bash
+# v2 API（已废弃）
+curl http://localhost:2379/v2/keys/mykey
+curl http://localhost:2379/v2/keys/mykey -X PUT -d value="hello"
+
+# v3 API（推荐）
+etcdctl put mykey hello
+etcdctl get mykey
+
+# gRPC 端口
+# 默认端口：2379（HTTP）+ 2380（peer）
+# v3 API 使用同一个端口（2379）
+```
 | 一句话 | 「K8s 的大脑」——云原生协调的事实标准，Raft 工程范式 |

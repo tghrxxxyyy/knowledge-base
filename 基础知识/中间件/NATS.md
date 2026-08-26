@@ -864,6 +864,247 @@ authorization {
   安全控制：敏感 Topic 只允许特定 Account 访问
 ```
 
+## JetStream stream 配置
+
+### retention/purge/max-bytes
+
+```bash
+# 创建 Stream
+nats stream add EVENTS \
+  --subjects="events.>" \
+  --storage=file \
+  --retention=limits \
+  --max-msgs=1000000 \
+  --max-bytes=10GB \
+  --max-age=72h \
+  --max-msg-size=1MB \
+  --discard=old \
+  --replicas=3
+
+# 查看 Stream 信息
+nats stream info EVENTS
+
+# 手动清除过期消息
+nats stream purge EVENTS --subject events.old
+```
+
+```text
+Retention 策略：
+  Limits：保留所有消息直到达到限制
+  Interest：保留直到所有消费者确认
+  WorkQueue：消息被消费后立即删除
+
+Purge 模式：
+  Age：按时间清除
+  Size：按大小清除
+  Count：按数量清除
+  Subject：按主题清除
+```
+
+## 消费者 AckPolicy 选择与使用场景
+
+| AckPolicy | 说明 | 适用场景 | 消息重复风险 |
+|-----------|------|----------|--------------|
+| Explicit | 显式确认 | 精确一次处理 | 低（需手动确认） |
+| All | 启动时自动确认所有 | 批量消费 | 高（重启丢失） |
+| None | 不确认 | 日志收集 | 无（投递即删除） |
+
+```bash
+# 创建消费者（Explicit）
+nats consumer add EVENTS order-processor \
+  --subject="events.order.>" \
+  --ack-explicit \
+  --max-deliver=5 \
+  --ack-wait=30s \
+  --backoff=1s,5s,30s
+
+# 创建消费者（All）
+nats consumer add EVENTS log-processor \
+  --subject="events.>" \
+  --ack-all
+
+# 创建消费者（None）
+nats consumer add EVENTS metrics-processor \
+  --subject="events.>" \
+  --ack-none
+```
+
+## request-reply 超时与重试模式配置
+
+```bash
+# 发送请求（带超时）
+nats request "orders.get" '{"order_id":"123"}' --timeout=5s
+
+# 发布+订阅模式（reply）
+nats reply "orders.get" --command="echo '{\"status\":\"ok\"}'"
+
+# 重试配置
+nats request "orders.get" '{"order_id":"123"}' \
+  --timeout=5s \
+  --count=3 \
+  --delay=1s
+```
+
+```java
+// Java request-reply 实现
+Message reply = nc.request("orders.get",
+    "{\"order_id\":\"123\"}".getBytes(),
+    Duration.ofSeconds(5));
+
+// 重试逻辑
+for (int i = 0; i < 3; i++) {
+    try {
+        Message reply = nc.request("orders.get", data, Duration.ofSeconds(5));
+        return parseResponse(reply);
+    } catch (TimeoutException e) {
+        Thread.sleep(1000 * (i + 1));
+    }
+}
+throw new RuntimeException("Request failed after 3 retries");
+```
+
+## leaf node 网络拓扑设计
+
+### hub-spoke / mesh 模式
+
+```text
+Hub-Spoke 模式（星型）：
+  Hub 节点（中心）：
+    - 接收所有消息
+    - 路由到 Spoke 节点
+  
+  Spoke 节点（边缘）：
+    - 连接到 Hub
+    - 本地发布/订阅
+  
+  优点：简单、易于管理
+  缺点：Hub 单点故障
+
+Mesh 模式（网状）：
+  所有节点相互连接：
+    - 每个节点都与所有其他节点连接
+    - 消息自动路由
+  
+  优点：无单点故障、高可用
+  缺点：连接数多、配置复杂
+```
+
+```bash
+# 配置 Leaf Node
+nats-server -c leaf-node.conf
+
+# leaf-node.conf 示例
+listen: 0.0.0.0:4222
+leafnodes {
+  remotes [
+    { url: "nats://hub1:7422" }
+    { url: "nats://hub2:7422" }
+  ]
+}
+accounts: {
+  A: { users: [{user: leaf1, password: pass}] }
+}
+```
+
+## NATS 在 K8s 上部署
+
+### nats-operator Helm chart
+
+```bash
+# 添加 Helm 仓库
+helm repo add nats https://nats-io.github.io/k8s/helm/charts
+helm repo update
+
+# 安装 NATS Operator
+helm install nats nats/nats \
+  --namespace nats-system \
+  --create-namespace \
+  --set cluster.enabled=true \
+  --set cluster.replicas=3 \
+  --set nats.streaming.enabled=true
+
+# 部署 NATS Cluster
+kubectl apply -f - <<EOF
+apiVersion: nats.io/v1beta2
+kind: NatsCluster
+metadata:
+  name: nats-cluster
+  namespace: nats-system
+spec:
+  size: 3
+  version: "2.10.0"
+  serverConfig:
+    websocket:
+      noTLS: true
+  pod:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+EOF
+
+# 验证部署
+kubectl get pods -n nats-system
+kubectl logs nats-cluster-0 -n nats-system
+```
+
+## NATS 账号隔离实战配置
+
+### account/user/permission
+
+```bash
+# 创建配置文件 nats-auth.conf
+accounts: {
+  # Account A（订单服务）
+  orders: {
+    users: [
+      {user: order-writer, password: pass1, permissions: {
+        publish: {allow: ["orders.>"]},
+        subscribe: {deny: ["orders.internal.>"]}
+      }},
+      {user: order-reader, password: pass2, permissions: {
+        publish: {deny: ["orders.>"]},
+        subscribe: {allow: ["orders.>"]}
+      }}
+    ]
+  }
+
+  # Account B（库存服务）
+  inventory: {
+    users: [
+      {user: inv-writer, password: pass3, permissions: {
+        publish: {allow: ["inventory.>"]},
+        subscribe: {deny: ["inventory.internal.>"]}
+      }}
+    ]
+  }
+
+  # 跨 Account 通信
+  system: {
+    users: [{user: sys-admin, password: pass4}]
+    imports: [
+      {stream: {account: orders, subject: "orders.public.>"}},
+      {stream: {account: inventory, subject: "inventory.public.>"}}
+    ]
+  }
+}
+```
+
+```text
+隔离规则：
+  1. 默认：Account 间完全隔离
+  2. 显式导出/导入：跨 Account 通信
+  3. 权限最小化：publish/subscribe 白名单
+
+实战场景：
+  团队隔离：每个业务线一个 Account
+  环境隔离：dev/staging/prod 各一个 Account
+  安全控制：敏感 Topic 只允许特定 Account 访问
+```
+
 ## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；

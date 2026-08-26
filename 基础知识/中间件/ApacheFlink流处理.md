@@ -830,4 +830,246 @@ PatternStream<Event> patternStream = CEP.pattern(dataStream, pattern);
 
 ---
 
+## Flink 水位线三种策略
+
+### 水位线（Watermark）生成器
+
+| 策略 | API | 说明 | 适用场景 |
+|------|-----|------|----------|
+| 周期性 Assigner | assignTimestampsAndWatermarks(WatermarkStrategy) | 固定间隔生成 | 通用场景 |
+| 对齐水位线 | BoundedOutOfOrderness | 允许固定延迟 | 有界乱序 |
+| 自定义 | WatermarkStrategy | 自定义逻辑 | 复杂场景 |
+
+```java
+// 策略1：周期性 Assigner（推荐）
+dataStream.assignTimestampsAndWatermarks(
+    WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+        .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+);
+
+// 策略2：自定义水位线
+dataStream.assignTimestampsAndWatermarks(
+    WatermarkStrategy.forCustomWatermark((event, timestamp) -> {
+        if (event.isLate()) {
+            return Watermark.now();
+        }
+        return new Watermark(event.getTimestamp() - 1000);
+    })
+);
+```
+
+### 乱序处理机制
+
+```text
+Flink 处理乱序的三种方式：
+  1. 水位线延迟：允许一定延迟（5s-30s）
+  2. 允许延迟（Allowed Lateness）：窗口关闭后继续等待
+  3. 侧输出（Side Output）：收集超时数据
+
+执行顺序：
+  Watermark >= 窗口结束时间 → 触发窗口计算
+  Allowed Lateness 期间 → 允许迟到数据触发更新
+  超过 Allowed Lateness → 侧输出收集
+```
+
+## Side Output 使用场景与完整代码
+
+### 分流 + 延迟数据处理
+
+```java
+// 定义侧输出标签
+OutputTag<Event> highPriorityTag = new OutputTag<Event>("high-priority"){};
+OutputTag<Event> lowPriorityTag = new OutputTag<Event>("low-priority"){};
+OutputTag<Event> lateTag = new OutputTag<Event>("late-data"){};
+
+SingleOutputStreamOperator<Event> result = dataStream
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(1))
+    .sideOutputLateData(lateTag)
+    .process(new ProcessWindowFunction<Event, Result, String, TimeWindow>() {
+        @Override
+        public void process(String key, Context context,
+                Iterable<Event> elements, Collector<Result> out) {
+            for (Event event : elements) {
+                if (event.getPriority().equals("high")) {
+                    context.output(highPriorityTag, event);
+                } else {
+                    context.output(lowPriorityTag, event);
+                }
+            }
+        }
+    });
+
+// 获取侧输出
+DataStream<Event> highPriority = result.getSideOutput(highPriorityTag);
+DataStream<Event> lateData = result.getSideOutput(lateTag);
+lateData.addSink(new LateDataSink());  // 存储或重试
+```
+
+## Flink Async I/O 原理
+
+### 异步请求 + 状态管理 + 超时处理
+
+```java
+// 异步函数实现
+public class AsyncDatabaseRequest extends RichAsyncFunction<Event, Result> {
+    private transient Connection connection;
+
+    @Override
+    public void open(Configuration parameters) {
+        connection = DriverManager.getConnection(DB_URL);
+    }
+
+    @Override
+    public void asyncInvoke(Event input, ResultFuture<Result> resultFuture) {
+        CompletableFuture.supplyAsync(() -> {
+            return queryFromDB(input.getId());
+        }).whenComplete((result, throwable) -> {
+            if (throwable != null) {
+                resultFuture.completeExceptionally(throwable);
+            } else {
+                resultFuture.complete(Collections.singleton(result));
+            }
+        });
+    }
+
+    @Override
+    public void timeout(Event input, ResultFuture<Result> resultFuture) {
+        // 超时处理：发送侧输出或重试
+        resultFuture.complete(Collections.singleton(defaultResult));
+    }
+}
+
+// 使用
+AsyncDataStream.unorderedWait(dataStream,
+    new AsyncDatabaseRequest(), 30, TimeUnit.SECONDS, 100);
+```
+
+## Flink exactly-once Sink 两阶段提交
+
+### TwoPhaseCommitSinkFunction
+
+```text
+两阶段提交流程：
+  1. 预提交（Pre-Commit）：
+     - 写入数据到外部存储（未提交）
+     - 记录事务ID到 Flink 状态
+  
+  2. 提交（Commit）：
+     - Checkpoint 完成后触发
+     - 调用外部存储的 commit 方法
+  
+  3. 回滚（Rollback）：
+     - Checkpoint 失败时
+     - 调用外部存储的 rollback 方法
+
+支持两阶段提交的 Sink：
+  - Kafka Producer（Transactional Kafka）
+  - JDBC（支持 XA 事务）
+  - 文件系统（HDFS/S3 写入临时目录）
+```
+
+```java
+public class TwoPhaseCommitKafkaSink
+        extends TwoPhaseCommitSinkFunction<String, ProducerRecord<String, String>, Void> {
+    
+    @Override
+    protected void invoke(ProducerRecord<String, String> transaction,
+            String value, Context context) throws Exception {
+        producer.send(transaction);
+    }
+
+    @Override
+    protected void preCommit(Void transactionId) throws Exception {
+        producer.flush();
+    }
+
+    @Override
+    protected void commit(Void transactionId) {
+        producer.commitTransaction();
+    }
+
+    @Override
+    protected void abort(Void transactionId) {
+        producer.abortTransaction();
+    }
+}
+```
+
+## Flink on K8s 三种部署模式对比
+
+| 特性 | Session Mode | Per-Job Mode | Application Mode |
+|------|--------------|--------------|------------------|
+| 资源隔离 | 共享 | 独立 | 独立 |
+| 资源利用率 | 高（共享） | 中（独占） | 高（共享） |
+| 故障影响 | 全局 | 单作业 | 单作业 |
+| 资源申请 | 启动时一次性 | 运行时按需 | 运行时按需 |
+| 适用场景 | 测试/开发 | 生产环境 | 生产环境（推荐） |
+| JobManager | 共享 | 独立 | 独立 |
+
+```yaml
+# Application Mode 示例
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: word-count
+spec:
+  image: flink:1.17
+  flinkVersion: v1_17
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+  jobManager:
+    replicas: 1
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    replicas: 2
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/examples/batch/WordCount.jar
+    entryClass: org.apache.flink.examples.java.wordcount.WordCount
+    parallelism: 8
+```
+
+## Flink SQL 窗口 Join 语义
+
+### Interval Join
+
+```sql
+-- Interval Join：基于时间区间的 Join
+SELECT *
+FROM Orders o
+JOIN Payments p ON o.order_id = p.order_id
+WHERE p.payment_time BETWEEN o.order_time
+    AND o.order_time + INTERVAL '24' HOUR;
+
+-- 语义：Orders 的 order_time 到 order_time+24h 内
+-- 支持的 Payments 记录
+```
+
+### Temporal Table Join
+
+```sql
+-- Temporal Table Join：基于版本化表的 Join
+SELECT
+    o.order_id,
+    o.amount,
+    r.currency,
+    o.amount * r.rate AS amount_usd
+FROM Orders o
+JOIN LATERAL (
+    SELECT rate, currency
+    FROM ExchangeRates
+    FOR SYSTEM_TIME AS OF o.order_time
+) r ON o.currency = r.currency;
+
+-- 语义：使用订单发生时的汇率进行转换
+-- 支持历史时间点查询
+```
+
 > 一句话：**Flink = 流批一体 + Event Time/Watermark + Checkpoint Exactly-once + 丰富窗口；选型先看「延迟要求（毫秒/秒级）」，再定「状态大小（内存/RocksDB）」，最后定「部署模式（K8s/托管）」**。
