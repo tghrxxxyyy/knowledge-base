@@ -938,6 +938,218 @@ CacheBuilder.newBuilder()
     .build();
 ```
 
+## 本地缓存热点 Key 识别与治理
+
+### 热点 Key 检测方案
+
+```text
+热点 Key 识别流程：
+  1. 客户端采样：记录每个 Key 的访问频次（LocalHashMap + 滑动窗口）
+  2. Proxy 层聚合：汇总各节点采样数据，识别 Top-K 热点
+  3. 实时告警：超过阈值（如 10万次/秒）触发告警
+  4. 自动处理：本地缓存优先承载，回源加随机延迟
+```
+
+| 检测层级 | 实现方式 | 优点 | 缺点 |
+|---------|---------|------|------|
+| 客户端 | Guava StatisticsCounter | 无额外组件 | 仅本节点视角 |
+| 代理层 | Twemproxy/Codis 统计 | 全局视角 | 增加代理开销 |
+| Redis 监控 | MONITOR + 离线分析 | 精确 | 生产禁用 |
+| 应用 APM | SkyWalking/Jaeger 采样 | 集成度高 | 采样率影响精度 |
+
+### 热点 Key 治理策略
+
+```java
+// 本地缓存热点 Key 自动检测 + 随机过期防雪崩
+public class HotKeyDetector<K, V> {
+    private final Cache<K, V> localCache;
+    private final AtomicLongMap<K> accessCount = AtomicLongMap.create();
+    private final long hotThreshold = 10000; // 1万次/秒
+
+    public V get(K key, Function<K, V> loader) {
+        long count = accessCount.incrementAndGet(key);
+        V value = localCache.getIfPresent(key);
+        if (value != null) {
+            return value;
+        }
+        // 热点 Key 加随机过期防雪崩
+        long expireSeconds = count > hotThreshold
+            ? 30 + ThreadLocalRandom.current().nextInt(60) // 30-90秒
+            : 300; // 正常5分钟
+        value = loader.apply(key);
+        localCache.policy().expireAfterWrite().put(key, value,
+            expireSeconds, TimeUnit.SECONDS);
+        return value;
+    }
+
+    // 定期清零计数器（每分钟）
+    @Scheduled(fixedRate = 60000)
+    public void resetCounts() {
+        accessCount.asMap().clear();
+    }
+}
+```
+
+## 本地缓存预热策略
+
+### 预热时机与方式
+
+```mermaid
+flowchart TD
+    A[应用启动] --> B{预热策略}
+    B -->|启动时全量加载| C[适合小数据量 <10K]
+    B -->|定时增量加载| D[适合中等数据量 <100K]
+    B -->|访问时懒加载+TTL| E[适合大数据量]
+    B -->|消息驱动预热| F[适合热点数据]
+    C --> G[启动耗时增加]
+    D --> H[定时任务开销]
+    E --> I[首次访问延迟]
+    F --> J[依赖消息中间件]
+```
+
+| 预热方式 | 触发时机 | 适用场景 | 实现复杂度 |
+|---------|---------|---------|-----------|
+| 启动加载 | 应用启动 | 配置数据、字典表 | 低 |
+| 定时刷新 | Cron 触发 | 准实时数据（分钟级） | 低 |
+| 懒加载 + 空值缓存 | 首次访问 | 大部分场景 | 中 |
+| 消息驱动 | MQ 通知 | 实时性要求高 | 高 |
+| 预测性预热 | 基于历史流量模型 | 电商大促、秒杀 | 高 |
+
+```java
+// 启动预热示例
+@PostConstruct
+public void warmUp() {
+    log.info("开始本地缓存预热...");
+    long start = System.currentTimeMillis();
+    
+    // 加载热点数据
+    List<String> hotKeys = redis.zrevrange("hot_keys", 0, 999);
+    Map<String, Object> batchValues = redis.mget(hotKeys);
+    
+    batchValues.forEach((key, value) -> {
+        if (value != null) {
+            localCache.put(key, value);
+        }
+    });
+    
+    log.info("预热完成，加载 {} 条数据，耗时 {}ms",
+        batchValues.size(), System.currentTimeMillis() - start);
+}
+```
+
+## 本地缓存降级与容错
+
+### 降级策略
+
+```text
+缓存降级优先级：
+  L0：本地缓存命中 → 直接返回
+  L1：Redis 命中 → 写入本地缓存 → 返回
+  L2：Redis 失败 → 本地缓存旧值 → 返回（标记降级）
+  L3：全部失败 → 返回默认值 / 熔断拒绝
+
+触发条件：
+  Redis 连续失败 N 次 → 自动切换到 L2
+  Redis 超时率 > 阈值 → 本地缓存延长过期
+  系统负载 > 阈值 → 关闭非核心缓存刷新
+```
+
+| 降级级别 | 触发条件 | 数据来源 | 用户感知 |
+|---------|---------|---------|---------|
+| 正常 | 无故障 | 本地 → Redis → DB | 无 |
+| 轻度 | Redis 偶发超时 | 本地 → 旧值 | 数据略有延迟 |
+| 中度 | Redis 不可用 | 本地 → 默认值 | 数据明显滞后 |
+| 重度 | DB 也不可用 | 默认值 / 拒绝服务 | 功能受限 |
+
+```java
+// 缓存降级处理器
+public class CacheFallbackHandler<K, V> {
+    private final Cache<K, V> localCache;
+    private final RedisClient redis;
+    private final AtomicBoolean degraded = new AtomicBoolean(false);
+    private volatile long degradeStartTime;
+
+    public V getWithFallback(K key, Function<K, V> dbLoader) {
+        // L0: 本地缓存
+        V value = localCache.getIfPresent(key);
+        if (value != null) return value;
+
+        // L1: Redis（降级期间跳过）
+        if (!degraded.get()) {
+            try {
+                value = redis.get(key);
+                if (value != null) {
+                    localCache.put(key, value);
+                    return value;
+                }
+            } catch (Exception e) {
+                if (isCircuitBreakerTriggered(e)) {
+                    triggerDegradation();
+                }
+            }
+        }
+
+        // L2: DB + 降级标记
+        value = dbLoader.apply(key);
+        if (value != null) {
+            long ttl = degraded.get() ? 600 : 300; // 降级时延长本地缓存
+            localCache.policy().expireAfterWrite().put(key, value,
+                ttl, TimeUnit.SECONDS);
+        }
+        return value;
+    }
+
+    private void triggerDegradation() {
+        if (degraded.compareAndSet(false, true)) {
+            degradeStartTime = System.currentTimeMillis();
+            // 30秒后自动尝试恢复
+            scheduledExecutor.schedule(this::tryRecover, 30, TimeUnit.SECONDS);
+        }
+    }
+}
+```
+
+## 本地缓存监控指标
+
+### 核心监控指标
+
+| 指标名称 | 类型 | 说明 | 告警阈值 |
+|---------|------|------|---------|
+| hit_rate | Gauge | 命中率 | < 80% |
+| miss_rate | Gauge | 失效率 | > 20% |
+| eviction_count | Counter | 淘汰次数 | 增速过快 |
+| size | Gauge | 当前缓存条目数 | 接近 maximumSize |
+| load_count | Counter | 加载次数 | 异常增长 |
+| average_load_penalty | Gauge | 平均加载耗时 | > 100ms |
+| eviction_weight | Gauge | 淘汰权重 | 异常波动 |
+
+```java
+// Prometheus 指标导出
+@Bean
+public MeterBinder cacheMetrics(CaffeineCacheManager cacheManager) {
+    return registry -> {
+        cacheManager.getCacheNames().forEach(name -> {
+            Cache<Object, Object> cache = cacheManager.getCache(name).getNativeCache();
+            if (cache instanceof Caffeine) {
+                Caffeine<Object, Object> caffeine = (Caffeine<Object, Object>) cache;
+                Stats stats = caffeine.stats();
+
+                Gauge.builder("cache_hit_rate", stats, s -> s.hitRate())
+                    .tag("cache", name)
+                    .register(registry);
+                Gauge.builder("cache_eviction_count", stats, s -> s.evictionCount())
+                    .tag("cache", name)
+                    .register(registry);
+                Gauge.builder("cache_load_duration_ms", stats,
+                    s -> s.averageLoadPenalty() / 1_000_000)
+                    .tag("cache", name)
+                    .register(registry);
+            }
+        });
+    };
+}
+```
+
 ## 本地缓存分布式一致性问题
 
 ### 缓存更新策略对比

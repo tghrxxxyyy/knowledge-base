@@ -1023,6 +1023,213 @@ flowchart TD
 | 扩展性 | 联邦/Thanos | 单机/集群 | 原生集群 |
 | 适用场景 | K8s监控 | IoT/DevOps | 大规模IoT |
 
+## InfluxDB TSM 引擎深度优化
+
+### TSM 存储结构
+
+```text
+TSM（Time-Structured Merge Tree）存储结构：
+  写入路径：
+    Point → WAL（预写日志）→ Cache（内存缓存）
+    Cache 满/定时刷盘 → TSM 文件（磁盘）
+
+  TSM 文件结构：
+    ┌─────────────────────────────────┐
+    │ Header（魔数+版本）              │
+    ├─────────────────────────────────┤
+    │ Block 1: 时间序列 A 数据块       │
+    │ Block 2: 时间序列 B 数据块       │
+    │ ...                              │
+    │ Block N: 时间序列 N 数据块       │
+    ├─────────────────────────────────┤
+    │ Index（稀疏索引）               │
+    ├─────────────────────────────────┤
+    │ Footer（索引偏移量）             │
+    └─────────────────────────────────┘
+
+  Compaction 流程：
+    Level 0: 小 TSM 文件 → 合并 → Level 1
+    Level 1: 中等文件 → 合并 → Level 2
+    Level 2: 大文件 → 合并 → Level 3（最终形态）
+```
+
+### TSM 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| cache-snapshot-memory-size | 25MB | 64MB | Cache 快照内存大小 |
+| cache-snapshot-write-cold-duration | 10m | 5m | 冷数据刷盘间隔 |
+| compact-throughput | 48MB/s | 64MB/s | Compaction 吞吐限制 |
+| compact-throughput-burst | 48MB/s | 128MB/s | Compaction 突发吞吐 |
+| max-concurrent-compactions | 0 | 2 | 最大并发 Compaction 数 |
+| tsm1-wal-fsync-delay | 0s | 100ms | WAL fsync 延迟 |
+
+```toml
+# influxdb.conf 调优配置
+[data]
+  cache-snapshot-memory-size = "64m"
+  cache-snapshot-write-cold-duration = "5m"
+  compact-throughput = "64m"
+  compact-throughput-burst = "128m"
+  max-concurrent-compactions = 2
+  max-index-log-file-size = "1m"
+  series-id-set-cache-size = 100
+```
+
+## Continuous Query 与 Task 对比
+
+### CQ（1.x）vs Task（2.x）
+
+| 维度 | Continuous Query | Task |
+|------|-----------------|------|
+| 版本 | InfluxDB 1.x | InfluxDB 2.x |
+| 语法 | InfluxQL | Flux |
+| 调度 | 自动 | Cron 表达式 |
+| 灵活性 | 低（仅聚合） | 高（任意 Flux 脚本） |
+| 监控 | 有限 | 内置任务日志 |
+| 资源控制 | 无 | 可限制执行时间 |
+
+```flux
+// Flux Task 示例：每 5 分钟聚合一次 CPU 使用率
+option task = {name: "cpu_5m_avg", every: 5m}
+
+from(bucket: "metrics")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r._measurement == "cpu" and r._field == "usage_user")
+  |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+  |> to(bucket: "metrics_agg", org: "myorg")
+```
+
+```sql
+-- InfluxQL Continuous Query 示例（1.x）
+CREATE CONTINUOUS QUERY "cq_cpu_5m" ON "metrics"
+BEGIN
+  SELECT mean("usage_user") INTO "cpu_5m" FROM "cpu"
+  GROUP BY time(5m), *
+END
+```
+
+## InfluxDB 高可用与集群方案
+
+### HA 部署架构
+
+```mermaid
+flowchart TB
+    subgraph 写入层
+        A1[Telegraf/Client] --> B1[InfluxDB 1]
+        A1 --> B2[InfluxDB 2]
+        A1 --> B3[InfluxDB 3]
+    end
+    subgraph 查询层
+        C1[InfluxDB Enterprise] --> D1[Meta Node]
+        C1 --> D2[Data Node 1]
+        C1 --> D3[Data Node 2]
+    end
+    subgraph 长期存储
+        E1[InfluxDB Cloud] --> F1[S3/GCS]
+        E2[Thanos/Mimir] --> F1
+    end
+```
+
+| 方案 | 版本 | 扩展方式 | 适用场景 |
+|------|------|---------|---------|
+| 单机 + 副本 | OSS | 无 | 开发测试 |
+| Enterprise 集群 | Enterprise | 水平扩展 | 生产中等规模 |
+| InfluxDB Cloud | Cloud | 自动扩展 | 大规模云部署 |
+| InfluxDB + Thanos | OSS + Thanos | 对象存储 | 长期存储 |
+
+### Kubernetes Operator 部署
+
+```yaml
+# influxdb-cluster Helm values
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: influxdb-config
+data:
+  influxdb.conf: |
+    [data]
+      cache-max-memory-size = "1g"
+      cache-snapshot-memory-size = "256m"
+      max-concurrent-compactions = 4
+    [coordinator]
+      max-concurrent-queries = 20
+      query-timeout = "30s"
+    [retention]
+      enabled = true
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: influxdb
+spec:
+  replicas: 3
+  serviceName: influxdb
+  selector:
+    matchLabels:
+      app: influxdb
+  template:
+    spec:
+      containers:
+      - name: influxdb
+        image: influxdb:2.7
+        ports:
+        - containerPort: 8086
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/influxdb2
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 50Gi
+```
+
+## InfluxDB 数据导入导出
+
+### 大批量数据迁移
+
+```bash
+# influx CLI 导出
+influx backup /backup/path --host http://localhost:8086 --org myorg --bucket mybucket
+
+# influx CLI 导入
+influx restore /backup/path --host http://localhost:8086 --org myorg --bucket mybucket
+
+# Line Protocol 批量导入
+cat data.lp | influx write --bucket mybucket --precision ns
+
+# 文件格式（Line Protocol）
+# measurement,tag1=val1,tag2=val2 field1=123,field2="abc" 1640995200000000000
+```
+
+```python
+# Python 批量导入示例
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+client = InfluxDBClient(url="http://localhost:8086", token="my-token", org="myorg")
+write_api = client.write_api(write_options=SYNCHRONOUS)
+
+points = []
+for i in range(100000):
+    point = Point("sensor") \
+        .tag("device", f"device_{i % 100}") \
+        .field("temperature", 20 + i * 0.01) \
+        .field("humidity", 50 + i * 0.005) \
+        .time(i, WritePrecision.MS)
+    points.append(point)
+
+# 分批写入（每批 5000 条）
+for batch_start in range(0, len(points), 5000):
+    batch = points[batch_start:batch_start + 5000]
+    write_api.write(bucket="mybucket", record=batch)
+```
+
 ## 三十四、InfluxDB 性能优化（Retention Policy / Shard Duration）
 
 ### 34.1 性能优化策略

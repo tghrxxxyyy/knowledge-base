@@ -1051,3 +1051,336 @@ services:
 ```
 
 > 一句话：**Prometheus + Grafana = Pull + 多维时序 + PromQL + 服务发现 + Alertmanager（分组/抑制/路由）；选型先看「环境（K8s/传统/云）」，再定「规模（本地 TSDB/Thanos 长期存储）」，最后配「Exporter 生态」**。
+
+## Remote Write 与远程存储
+
+### Remote Write 架构
+
+```mermaid
+flowchart LR
+    A[Prometheus Server] -->|Remote Write| B[Remote Storage]
+    B --> C[Thanos Sidecar]
+    B --> D[Cortex]
+    B --> E[Mimir]
+    B --> F[VictoriaMetrics]
+    C --> G[对象存储 S3/GCS]
+    D --> G
+    E --> G
+    F --> G
+    H[Thanos Query] --> C
+    H --> D
+    H --> E
+    H --> F
+    I[Grafana] --> H
+```
+
+### Remote Write 配置
+
+```yaml
+# prometheus.yml：Remote Write 配置
+remote_write:
+- url: "http://thanos-receive:19291/api/v1/receive"
+  queue_config:
+    max_samples_per_send: 10000      # 每次发送最大样本数
+    batch_send_deadline: 5s          # 批量发送超时
+    max_shards: 30                   # 最大并发分片数
+    min_shards: 5                    # 最小并发分片数
+    capacity: 10000                  # 队列容量
+  write_relabel_configs:
+  - source_labels: [__name__]
+    regex: 'go_.*'                   # 过滤掉 go_ 指标
+    action: drop
+  send_sample_timeout: 30s           # 发送超时
+  max_retries: 5                     # 最大重试次数
+```
+
+### 各远程存储方案对比
+
+| 方案 | 数据模型 | 扩展性 | 查询语言 | 成本 |
+|------|---------|--------|---------|------|
+| Thanos | 标签 | 对象存储 | PromQL | 低 |
+| Cortex | 标签 | 对象存储 | PromQL | 中 |
+| Mimir | 标签 | 对象存储 | PromQL | 中 |
+| VictoriaMetrics | 标签 | 自带集群 | PromQL | 低 |
+| ClickHouse | 标签 | 列式存储 | PromQL+SQL | 中 |
+
+## 服务发现深度配置
+
+### 多种服务发现方式对比
+
+| 发现方式 | 适用环境 | 配置复杂度 | 动态性 |
+|---------|---------|-----------|--------|
+| static_configs | 测试/简单环境 | 低 | 低 |
+| file_sd | 文件管理目标 | 中 | 中 |
+| consul_sd | Consul 注册中心 | 中 | 高 |
+| kubernetes_sd | Kubernetes | 中 | 高 |
+| ec2_sd | AWS EC2 | 低 | 高 |
+| dns_sd | DNS 记录 | 低 | 中 |
+
+### Kubernetes 服务发现详解
+
+```yaml
+# prometheus.yml：Kubernetes 服务发现
+scrape_configs:
+- job_name: 'kubernetes-pods'
+  kubernetes_sd_configs:
+  - role: pod
+    namespaces:
+      names: ['monitoring', 'production']
+  relabel_configs:
+  # 仅抓取带 prometheus.io/scrape: "true" 注解的 Pod
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+    action: keep
+    regex: true
+  # 使用注解中的端口
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+    action: replace
+    target_label: __address__
+    regex: (.+)
+    replacement: $1
+  # 添加 namespace 标签
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  # 添加 pod 名称标签
+  - source_labels: [__meta_kubernetes_pod_name]
+    target_label: pod
+  # 添加节点标签
+  - source_labels: [__meta_kubernetes_pod_node_name]
+    target_label: node
+```
+
+```yaml
+# Consul 服务发现配置
+scrape_configs:
+- job_name: 'consul-services'
+  consul_sd_configs:
+  - server: 'consul:8500'
+    services: []  # 空表示发现所有服务
+    tags: ['production']
+  relabel_configs:
+  - source_labels: [__meta_consul_service]
+    target_label: service
+  - source_labels: [__meta_consul_tags]
+    regex: '.*,prometheus-port=(\d+),.*'
+    target_label: __address__
+```
+
+## Grafana 最佳实践
+
+### Dashboard 设计原则
+
+```text
+Grafana Dashboard 设计四原则：
+  1. 层次化：Overview → 区域 → 服务 → 实例
+  2. 命名规范：{{namespace}}/{{service}}/{{metric}}
+  3. 变量化：使用模板变量实现多环境切换
+  4. 面板分组：业务指标 | 系统指标 | 中间件指标
+
+Dashboard 变量模板：
+  $environment：prod / staging / dev
+  $namespace：所有 namespace（下拉选择）
+  $service：基于 namespace 筛选的服务列表
+  $instance：基于 service 筛选的实例列表
+```
+
+### 常用 Dashboard 模板
+
+| 模板 ID | 名称 | 适用场景 |
+|---------|------|---------|
+| 1860 | Node Exporter Full | 服务器监控 |
+| 6417 | Kafka Overview | Kafka 集群 |
+| 11835 | Redis Dashboard | Redis 监控 |
+| 15661 | Kubernetes Cluster | K8s 集群 |
+| 12006 | MySQL Overview | MySQL 监控 |
+
+```json
+// Dashboard 变量配置示例
+{
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "type": "custom",
+        "query": "prod,staging,dev",
+        "current": {"text": "prod", "value": "prod"}
+      },
+      {
+        "name": "namespace",
+        "type": "query",
+        "query": "label_values(kube_pod_info, namespace)",
+        "datasource": "Prometheus",
+        "refresh": 2
+      },
+      {
+        "name": "service",
+        "type": "query",
+        "query": "label_values(kube_pod_info{namespace=~\"$namespace\"}, app)",
+        "datasource": "Prometheus",
+        "refresh": 2
+      }
+    ]
+  }
+}
+```
+
+## 告警规则最佳实践
+
+### 告警规则分层
+
+| 层级 | 服务级别 | 通知方式 | 恢复时间要求 |
+|------|---------|---------|------------|
+| P0-致命 | 核心服务不可用 | 电话 + 短信 + 钉钉 | < 5 分钟 |
+| P1-严重 | 核心服务性能下降 | 短信 + 钉钉 | < 15 分钟 |
+| P2-一般 | 非核心服务异常 | 钉钉 + 邮件 | < 1 小时 |
+| P3-低优 | 资源使用率告警 | 邮件 | 下一工作日 |
+
+### 常用告警规则示例
+
+```yaml
+# alert_rules.yml
+groups:
+- name: infrastructure
+  rules:
+  # 实例宕机
+  - alert: InstanceDown
+    expr: up == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "实例 {{ $labels.instance }} 宕机"
+      description: "{{ $labels.job }} 的实例 {{ $labels.instance }} 已超过 2 分钟不可达"
+
+  # CPU 使用率过高
+  - alert: HighCpuUsage
+    expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "CPU 使用率过高 {{ $labels.instance }}"
+      description: "实例 {{ $labels.instance }} CPU 使用率超过 85%，当前值 {{ $value }}%"
+
+  # 磁盘空间不足
+  - alert: DiskSpaceLow
+    expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "磁盘空间不足 {{ $labels.instance }}"
+      description: "实例 {{ $labels.instance }} 根分区剩余空间不足 15%"
+
+- name: application
+  rules:
+  # 请求延迟过高
+  - alert: HighRequestLatency
+    expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 2
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "请求延迟过高 {{ $labels.service }}"
+      description: "{{ $labels.service }} P99 延迟超过 2 秒"
+
+  # 错误率过高
+  - alert: HighErrorRate
+    expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "错误率过高 {{ $labels.service }}"
+      description: "{{ $labels.service }} 5xx 错误率超过 5%"
+```
+
+## 长期存储方案
+
+### Thanos 部署架构
+
+```mermaid
+flowchart TB
+    subgraph 数据采集
+        A1[Prometheus 1] --> B1[Thanos Sidecar]
+        A2[Prometheus 2] --> B2[Thanos Sidecar]
+    end
+    subgraph 查询层
+        B1 --> C1[Thanos Query]
+        B2 --> C1
+        C1 --> D1[Thanos Store Gateway]
+    end
+    subgraph 存储层
+        D1 --> E1[对象存储 S3]
+        B1 -->|上传块| E1
+        B2 -->|上传块| E1
+    end
+    subgraph 降采样
+        E1 --> F1[Thanos Compactor]
+        F1 -->|5m 降采样| E1
+        F1 -->|1h 降采样| E1
+    end
+    G[Grafana] --> C1
+```
+
+```yaml
+# Thanos Query 配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thanos-query
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: thanos-query
+  template:
+    spec:
+      containers:
+      - name: query
+        image: thanosio/thanos:v0.32.0
+        args:
+        - query
+        - --log.level=info
+        - --query.auto-downsampling
+        - --store=dnssrv+_grpc._tcp.thanos-sidecar.monitoring.svc
+        - --store=dnssrv+_grpc._tcp.thanos-store-gateway.monitoring.svc
+```
+
+## 监控方法论
+
+### RED 方法
+
+```text
+RED 方法（微服务监控）：
+  Rate：请求速率（QPS）
+  Errors：错误率
+  Duration：请求延迟（P50/P95/P99）
+
+  适用场景：面向请求的服务
+  指标来源：应用层 HTTP/gRPC 中间件
+```
+
+### USE 方法
+
+```text
+USE 方法（基础设施监控）：
+  Utilization：资源使用率（CPU/内存/磁盘/网络）
+  Saturation：资源饱和度（队列长度/等待数）
+  Errors：错误数（硬件错误/软件错误）
+
+  适用场景：基础设施、中间件
+  指标来源：Node Exporter、系统指标
+```
+
+### 四个黄金信号
+
+```text
+Google 四个黄金信号：
+  Latency：延迟（请求处理时间）
+  Traffic：流量（QPS/带宽）
+  Errors：错误（错误率/错误数）
+  Saturation：饱和度（资源使用程度）
+
+  适用场景：Google SRE 方法论
+  落地方式：Prometheus + Grafana
+```

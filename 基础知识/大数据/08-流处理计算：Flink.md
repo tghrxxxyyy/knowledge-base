@@ -1048,6 +1048,272 @@ KafkaSink.builder()
 ```
 
 - 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；
+
+## Flink Watermark 深度调优
+
+### Watermark 生成策略对比
+
+| 策略 | 适用场景 | 延迟 | 准确性 |
+|------|---------|------|--------|
+| 固定延迟（BoundedOutOfOrderness） | 已知最大延迟 | 高 | 高 |
+| 递增时间戳（AscendingTimestamps） | 有序数据 | 低 | 高 |
+| 自定义（Punctuated） | 事件驱动 | 不定 | 取决于实现 |
+
+### Watermark 调优参数
+
+```java
+// Watermark 策略配置
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((event, timestamp) -> event.getEventTime())
+    .withIdleness(Duration.ofMinutes(1));  // 空闲流超时
+
+// 并行度与 Watermark 对齐
+env.getConfig().setAutoWatermarkInterval(200);  // Watermark 生成间隔 200ms
+
+// 多输入流 Watermark 对齐
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.getCheckpointConfig().setAlignmentTimeout(Duration.ofSeconds(30));
+```
+
+```text
+Watermark 调优决策树：
+  Q1：数据是否有序？
+    是 → AscendingTimestamps（延迟最低）
+    否 → Q2
+  Q2：最大延迟是否可预估？
+    是 → BoundedOutOfOrderness（设为 P99 延迟 + 10% buffer）
+    否 → Q3
+  Q3：是否有特殊事件标记？
+    是 → Punctuated Watermark
+    否 → 使用较大 BoundedOutOfOrderness + Side Output 捕获迟到数据
+```
+
+## RocksDB 状态后端调优
+
+### RocksDB 配置参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| block_cache_size | 8MB | 64-256MB | 块缓存大小 |
+| write_buffer_size | 64MB | 128MB | MemTable 大小 |
+| max_write_buffer_number | 3 | 5 | 最大 MemTable 数量 |
+| level0_file_num_compaction_trigger | 4 | 8 | L0 触发 Compaction 的文件数 |
+| max_bytes_for_level_base | 256MB | 512MB | L1 大小限制 |
+| target_file_size_base | 64MB | 128MB | 单个 SST 文件大小 |
+| max_background_compactions | 1 | 4 | 后台 Compaction 线程数 |
+
+### RocksDB 调优配置
+
+```java
+// Flink RocksDB 状态后端调优
+RocksDBStateBackend rocksDBBackend = new RocksDBStateBackend(
+    "hdfs:///flink/checkpoints", true);
+
+// 自定义 RocksDB 选项
+RocksDBOptionsFactory optionsFactory = (columnFamilyOptions, existingOptions) -> {
+    return existingOptions
+        .setTableFormatConfig(
+            BlockBasedTableConfigBuilder.create()
+                .setBlockCacheSize(256 * 1024 * 1024)  // 256MB
+                .setFilter(new BloomFilter(10, false))
+                .setCacheIndexAndFilterBlocks(true)
+                .setCacheIndexAndFilterBlocksWithHighPriority(true)
+                .build())
+        .setWriteBufferSize(128 * 1024 * 1024)  // 128MB
+        .setMaxWriteBufferNumber(5)
+        .setLevelCompactionDynamicLevelBytes(true)
+        .setMinWriteBufferNumberToMerge(2);
+};
+
+rocksDBBackend.setOptionsFactory(optionsFactory);
+env.setStateBackend(rocksDBBackend);
+```
+
+## Flink CDC 最佳实践
+
+### CDC 数据同步模式
+
+```mermaid
+flowchart TD
+    subgraph 全量+增量
+        A[MySQL] -->|binlog| B[Flink CDC]
+        B --> C{初始化阶段}
+        C -->|全量读取| D[历史数据]
+        C -->|增量读取| E[实时变更]
+        D --> F[目标表]
+        E --> F
+    end
+    subgraph 同步模式
+        G[Full Snapshot] --> H[Snapshot + Binlog]
+        H --> I[Binlog Only]
+    end
+```
+
+| 模式 | 适用场景 | 数据一致性 | 性能 |
+|------|---------|-----------|------|
+| Snapshot | 小表首次同步 | 强一致 | 中 |
+| Snapshot + Binlog | 大表全量+增量 | 强一致 | 高 |
+| Binlog Only | 已有全量数据 | 强一致 | 最高 |
+| 全量校验 | 数据核对 | 最终一致 | 低 |
+
+### Flink CDC 生产配置
+
+```sql
+-- Flink CDC 3.0 配置
+CREATE TABLE mysql_cdc (
+  id BIGINT,
+  name STRING,
+  update_time TIMESTAMP(3),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'mysql-cdc',
+  'hostname' = 'mysql-host',
+  'port' = '3306',
+  'database-name' = 'shop',
+  'table-name' = 'orders',
+  'username' = 'cdc_user',
+  'password' = 'cdc_pass',
+  'scan.startup.mode' = 'initial',
+  'scan.startup.timestamp' = '2024-01-01 00:00:00',
+  'debezium.snapshot.mode' = 'initial',
+  'debezium.max.batch.size' = '2048',
+  'debezium.poll.interval.ms' = '500',
+  'heartbeat.interval.ms' = '10000'
+);
+```
+
+## Flink SQL 性能调优
+
+### SQL 优化技巧
+
+| 技巧 | 方法 | 效果 |
+|------|------|------|
+| 谓词下推 | WHERE 条件尽早过滤 | 减少数据量 |
+| 字段裁剪 | SELECT 仅选需要的字段 | 减少序列化开销 |
+| JOIN 优化 | Broadcast JOIN 小表 | 避免 Shuffle |
+| 窗口优化 | 合并相邻窗口 | 减少状态大小 |
+| 状态 TTL | 合理设置 TTL | 控制状态大小 |
+
+```sql
+-- Flink SQL 调优示例
+SET 'table.exec.mini-batch.enabled' = 'true';
+SET 'table.exec.mini-batch.allow-latency' = '5s';
+SET 'table.exec.mini-batch.size' = '5000';
+SET 'table.optimizer.join-reorder.enabled' = 'true';
+SET 'table.optimizer.bushy-join.enabled' = 'true';
+SET 'state.backend.rocksdb.timer-service.factory' = 'rocksdb';
+
+-- JOIN 优化：小表广播
+SELECT /*+ BROADCAST(b) */ a.*, b.name
+FROM orders a
+JOIN products b ON a.product_id = b.id;
+
+-- 窗口聚合优化
+SELECT
+  window_start,
+  window_end,
+  product_id,
+  SUM(amount) AS total_amount,
+  COUNT(*) AS order_count
+FROM TABLE(
+  TUMBLE(TABLE orders, DESCRIPTOR(create_time), INTERVAL '1' HOUR)
+)
+GROUP BY window_start, window_end, product_id;
+```
+
+## Flink on K8s 部署模式对比
+
+### 三种部署模式
+
+| 模式 | 架构 | 适用场景 | 伸缩性 |
+|------|------|---------|--------|
+| Session | 共享 JobManager | 开发测试 | 有限 |
+| Per-Job | 独立 JobManager | 生产单作业 | 好 |
+| Application | 应用级 JobManager | 生产多作业 | 最好 |
+
+```yaml
+# Flink on K8s Application 模式
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-flink-job
+spec:
+  image: flink:1.18-java11
+  flinkVersion: v1_18
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend: rocksdb
+    state.checkpoints.dir: s3://my-bucket/checkpoints
+    state.savepoints.dir: s3://my-bucket/savepoints
+    execution.target: kubernetes-application
+  serviceAccount: flink
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+    replicas: 3
+  job:
+    jarURI: local:///opt/flink/usrlib/my-job.jar
+    entryClass: com.example.MyJob
+    parallelism: 8
+    upgradeMode: last-state
+```
+
+## Flink 监控与运维
+
+### 关键监控指标
+
+| 指标 | 类型 | 说明 | 告警阈值 |
+|------|------|------|---------|
+| job_uptime | Gauge | 作业运行时长 | 频繁重启 |
+| checkpoint_duration | Gauge | Checkpoint 耗时 | > 10min |
+| checkpoint_size | Gauge | Checkpoint 大小 | 持续增长 |
+| num_restarts | Counter | 重启次数 | > 3次/小时 |
+| busy_time_ms_per_sec | Gauge | 算子繁忙度 | > 80% |
+| backpressure_time_ratio | Gauge | 反压比例 | > 50% |
+
+```bash
+# Flink REST API 监控
+# 查看作业状态
+curl -s http://jobmanager:8081/jobs | jq '.jobs[] | {id, name, state}'
+
+# 查看 Checkpoint 信息
+curl -s http://jobmanager:8081/jobs/{job_id}/checkpoints | jq '.summary'
+
+# 查看算子指标
+curl -s http://jobmanager:8081/jobs/{job_id}/vertices/{vertex_id}/subtasks/metrics | jq '.[] | {id, value}'
+```
+
+```java
+// Flink 自定义监控指标
+public class MyMetric extends RichMapFunction<Event, Event> {
+    private transient Counter processedCount;
+    private transient Histogram latency;
+
+    @Override
+    public void open(Configuration parameters) {
+        this.processedCount = getRuntimeContext()
+            .getMetricGroup()
+            .counter("processedCount");
+        this.latency = getRuntimeContext()
+            .getMetricGroup()
+            .histogram("latency", new DescriptiveStatisticsHistogram(1000));
+    }
+
+    @Override
+    public Event map(Event event) {
+        processedCount.inc();
+        latency.update(System.currentTimeMillis() - event.getTimestamp());
+        return event;
+    }
+}
+```
+
 - 批处理对比见「[07-批处理计算：MapReduce与Spark](07-批处理计算：MapReduce与Spark.md)」；
 - 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；
 - Flink 中间件深挖见「[中间件/ApacheFlink流处理](../中间件/ApacheFlink流处理.md)」；
