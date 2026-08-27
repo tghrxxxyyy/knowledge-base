@@ -1387,6 +1387,186 @@ tail -f /var/log/gateway/gateway.log
   需要稳定性 → Spring Cloud Gateway 3.x
 ```
 
+## 八、API网关缓存策略详解
+
+### 8.1 缓存策略对比
+
+| 策略 | 说明 | 适用场景 | 缓存粒度 |
+|------|------|---------|---------|
+| 响应缓存 | 缓存完整响应 | 静态/半静态API | 整个响应 |
+| 数据缓存 | 缓存后端数据 | 频繁查询API | 数据级别 |
+| 查询缓存 | 缓存查询结果 | 复杂查询 | 查询级别 |
+| 边缘缓存 | CDN缓存 | 公开API | 地理级别 |
+
+### 8.2 缓存配置示例
+
+```yaml
+# Spring Cloud Gateway缓存
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-api
+          uri: lb://user-service
+          predicates:
+            - Path=/api/users/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+            - name: CircuitBreaker
+              args:
+                name: user-circuit
+                fallbackUri: forward:/fallback/users
+```
+
+## 九、API网关限流策略详解
+
+### 9.1 限流算法对比
+
+| 算法 | 原理 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|---------|
+| 固定窗口 | 固定时间窗口计数 | 简单 | 窗口边界突发 | 通用 |
+| 滑动窗口 | 滑动时间窗口计数 | 平滑 | 实现复杂 | 高精度 |
+| 漏桶 | 固定速率处理 | 平滑 | 突发处理差 | 流量整形 |
+| 令牌桶 | 固定速率生成令牌 | 灵活 | 实现复杂 | 突发流量 |
+
+### 9.2 限流配置示例
+
+```yaml
+# Kong限流配置
+plugins:
+  - name: rate-limiting
+    config:
+      minute: 100
+      policy: redis
+      redis_host: redis
+      redis_port: 6379
+
+# APISIX限流配置
+plugins:
+  - name: limit-count
+    config:
+      count: 100
+      time_window: 60
+      policy: redis
+      redis_host: redis
+```
+
+## 十、API网关版本管理详解
+
+### 10.1 版本管理策略
+
+| 策略 | 做法 | 优点 | 缺点 |
+|------|------|------|------|
+| URL路径 | /v1/api, /v2/api | 简单直观 | URL混乱 |
+| 请求头 | Accept: application/vnd.api.v1+json | URL干净 | 调试复杂 |
+| 查询参数 | ?version=1 | 灵活 | 不规范 |
+| Host | v1.api.example.com | 隔离好 | DNS管理复杂 |
+
+### 10.2 版本管理配置
+
+```yaml
+# URL路径版本
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-api-v1
+          uri: lb://user-service-v1
+          predicates:
+            - Path=/v1/api/users/**
+        - id: user-api-v2
+          uri: lb://user-service-v2
+          predicates:
+            - Path=/v2/api/users/**
+```
+
+## 十一、API网关高可用详解
+
+### 11.1 高可用架构
+
+```
+API网关高可用：
+  多实例部署：
+    至少3个实例
+    跨可用区部署
+    负载均衡分发
+
+  故障转移：
+    健康检查
+    自动摘除
+    快速恢复
+
+  降级策略：
+    限流降级
+    熔断降级
+    缓存降级
+```
+
+### 11.2 高可用配置
+
+```yaml
+# 多实例部署
+apiGateway:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  
+  healthCheck:
+    path: /actuator/health
+    interval: 10s
+    timeout: 5s
+  
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+```
+
+## 十二、API网关对比详解
+
+### 12.1 网关对比表
+
+| 特性 | Spring Cloud Gateway | Kong | APISIX | Nginx |
+|------|---------------------|------|--------|-------|
+| 语言 | Java | Lua | Lua | C |
+| 性能 | 高 | 极高 | 极高 | 极高 |
+| 插件 | Java | Lua | Lua | C |
+| 动态 | 是 | 是 | 是 | 否 |
+| 学习曲线 | 中 | 中 | 中 | 低 |
+| 社区 | 活跃 | 活跃 | 活跃 | 活跃 |
+| 许可证 | Apache 2.0 | Apache 2.0 | Apache 2.0 | BSD |
+
+### 12.2 选型决策树
+
+```
+选型决策树：
+  Q1：技术栈？
+    Java/Spring → Spring Cloud Gateway
+    Lua/OpenResty → Kong/APISIX
+    C/Nginx → Nginx
+
+  Q2：性能要求？
+    极高 → Kong/APISIX/Nginx
+    高 → Spring Cloud Gateway
+
+  Q3：动态配置？
+    需要 → Kong/APISIX/Spring Cloud Gateway
+    不需要 → Nginx
+
+  Q4：云原生？
+    是 → APISIX
+    否 → Kong/Spring Cloud Gateway
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

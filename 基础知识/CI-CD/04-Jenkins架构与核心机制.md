@@ -1410,3 +1410,255 @@ stage('Publish') {
 | Artifactory | 多格式支持 | 商业 | 大型团队 |
 | Harbor | 镜像仓库 | 开源 | K8s 环境 |
 | GitHub Packages | 集成 GitHub | 按量付费 | GitHub 用户 |
+
+## 三十、Jenkins Agent扩缩容详解
+
+### 30.1 Agent扩缩容策略
+
+```
+Agent扩缩容策略：
+  固定Agent：
+    优点：稳定，无启动开销
+    缺点：资源浪费
+    适用：稳定负载
+
+  动态Agent（K8s Pod Template）：
+    优点：按需创建，资源优化
+    缺点：启动开销
+    适用：变化负载
+
+  混合策略：
+    核心Agent：固定（保证基础能力）
+    弹性Agent：动态（应对峰值）
+```
+
+### 30.2 K8s Pod Template配置
+
+```yaml
+# Jenkins K8s Pod Template
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: agent
+spec:
+  containers:
+  - name: jnlp
+    image: jenkins/inbound-agent:latest
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+  - name: maven
+    image: maven:3.8-openjdk-11
+    command:
+    - cat
+    tty: true
+```
+
+## 三十一、共享库详解
+
+### 31.1 共享库目录结构
+
+```
+shared-library/
+├── vars/
+│   ├── buildMaven.groovy
+│   ├── runTests.groovy
+│   └── deployToK8s.groovy
+├── src/
+│   └── com/
+│       └── example/
+│           └── PipelineUtils.groovy
+└── resources/
+    └── templates/
+        └── deployment.yaml
+```
+
+### 31.2 共享库使用示例
+
+```groovy
+// 使用共享库
+@Library('my-shared-library') _
+
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                buildMaven(version: '3.8')
+            }
+        }
+        stage('Test') {
+            steps {
+                runTests(type: 'unit')
+            }
+        }
+        stage('Deploy') {
+            steps {
+                deployToK8s(
+                    namespace: 'production',
+                    replicas: 3
+                )
+            }
+        }
+    }
+}
+```
+
+## 三十二、凭据绑定详解
+
+### 32.1 凭据绑定最佳实践
+
+```
+凭据绑定原则：
+  1. 最小权限原则
+     → 只绑定需要的凭据
+     → 限定使用范围
+
+  2. 作用域最小化
+     → 使用withCredentials块
+     → 避免全局暴露
+
+  3. 凭据类型选择
+     → Secret Text：通用密钥
+     → Username/Password：用户名密码
+     → SSH Key：SSH密钥
+     → Certificate：证书
+```
+
+### 32.2 凭据绑定示例
+
+```groovy
+// 凭据绑定示例
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'nexus-credentials',
+                        usernameVariable: 'NEXUS_USER',
+                        passwordVariable: 'NEXUS_PASS'
+                    )
+                ]) {
+                    sh 'mvn deploy -Dusername=$NEXUS_USER -Dpassword=$NEXUS_PASS'
+                }
+            }
+        }
+    }
+}
+```
+
+## 三十三、Fingerprint制品追溯详解
+
+### 33.1 Fingerprint原理
+
+```
+Fingerprint原理：
+  基于MD5哈希的制品追溯
+  记录制品的依赖关系
+  支持制品版本追溯
+
+应用场景：
+  1. 制品版本追溯
+  2. 依赖关系分析
+  3. 影响范围评估
+  4. 安全漏洞追踪
+```
+
+### 33.2 Fingerprint使用示例
+
+```groovy
+// Fingerprint配置
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                // 归档制品并计算指纹
+                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+            }
+        }
+        stage('Verify') {
+            steps {
+                // 验证指纹
+                fingerprint 'target/*.jar'
+            }
+        }
+    }
+}
+```
+
+## 三十四、Jenkins性能调优详解
+
+### 34.1 性能瓶颈三大件
+
+| 瓶颈 | 症状 | 优化方案 |
+|------|------|---------|
+| GC | 构建卡顿，响应慢 | 调整GC参数，增加内存 |
+| UI | Dashboard加载慢 | 禁用不必要插件 |
+| WebSocket | Agent连接不稳定 | 升级WebSocket插件 |
+
+### 34.2 性能调优配置
+
+```bash
+# Jenkins JVM调优
+JAVA_OPTS="-Xmx4g -Xms2g"
+JAVA_OPTS="$JAVA_OPTS -XX:+UseG1GC"
+JAVA_OPTS="$JAVA_OPTS -XX:MaxGCPauseMillis=200"
+
+# 插件管理
+# 禁用不必要插件
+# 定期更新插件
+# 清理旧构建
+```
+
+## 三十五、JCasC配置即代码详解
+
+### 35.1 JCasC配置示例
+
+```yaml
+# JCasC配置文件
+jenkins:
+  systemMessage: "Jenkins Configuration as Code"
+  securityRealm:
+    ldap:
+      configurations:
+        - server: "ldap.example.com"
+          rootDN: "dc=example,dc=com"
+          userSearchBase: "ou=users"
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            permissions: ["Overall/Administer"]
+            entries:
+              - group: "admins"
+```
+
+### 35.2 灾难恢复备份
+
+```
+灾难恢复策略：
+  1. 定期备份
+     → 备份JENKINS_HOME
+     → 备份JCasC配置
+     → 备份共享库
+
+  2. 恢复流程
+     → 恢复JENKINS_HOME
+     → 应用JCasC配置
+     → 恢复共享库
+     → 验证功能
+
+  3. 测试恢复
+     → 定期测试恢复流程
+     → 验证数据完整性
+     → 文档化恢复步骤
+```

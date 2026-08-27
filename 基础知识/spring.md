@@ -1386,6 +1386,570 @@ spring:
 | 重试 | 请求重试 | Retry |
 | 超时 | 请求超时 | Timeout |
 
+## 三十二、Spring 事务传播行为深度实战
+
+### 传播行为对比表
+
+| 传播行为 | 外部事务存在时 | 外部事务不存在时 | 典型场景 |
+|----------|----------------|------------------|----------|
+| REQUIRED（默认） | 加入外部事务 | 新建事务 | 大多数业务方法 |
+| REQUIRES_NEW | 挂起外部，新建独立事务 | 新建事务 | 日志记录/审计（不受回滚影响） |
+| SUPPORTS | 加入外部事务 | 非事务运行 | 查询方法（有事务则用） |
+| NOT_SUPPORTED | 挂起外部事务 | 非事务运行 | 大批量操作（避免长事务） |
+| MANDATORY | 加入外部事务 | 抛异常 | 必须在事务内调用的方法 |
+| NEVER | 抛异常 | 非事务运行 | 禁止事务的方法（如读操作） |
+| NESTED | 创建保存点嵌套事务 | 新建事务 | 子操作可独立回滚 |
+
+### 传播行为实战示例
+
+```java
+@Service
+public class OrderService {
+    
+    @Autowired private PaymentService paymentService;
+    @Autowired private LogService logService;
+    
+    @Transactional(REQUIRED)
+    public void createOrder(Order order) {
+        orderRepository.save(order);
+        // 支付：REQUIRES_NEW（独立事务，支付失败不影响订单回滚）
+        paymentService.processPayment(order);
+        // 日志：NOT_SUPPORTED（非事务，避免长事务）
+        logService.record("order created");
+    }
+}
+
+@Service
+public class PaymentService {
+    
+    @Transactional(REQUIRES_NEW)
+    public void processPayment(Order order) {
+        // 独立事务：即使外部事务回滚，支付记录仍保留
+        paymentRepository.save(new Payment(order.getId(), order.getAmount()));
+        // 如果这里抛异常，只回滚支付事务，订单事务不受影响
+    }
+}
+
+@Service
+public class LogService {
+    
+    @Transactional(NOT_SUPPORTED)
+    public void record(String message) {
+        // 非事务运行：不参与外部事务，避免长事务
+        logRepository.save(new Log(message, LocalDateTime.now()));
+    }
+}
+```
+
+### 嵌套事务（NESTED）详解
+
+```java
+@Service
+public class BatchService {
+    
+    @Transactional(REQUIRED)
+    public void processBatch(List<Item> items) {
+        for (Item item : items) {
+            try {
+                processItem(item);  // NESTED：子操作可独立回滚
+            } catch (Exception e) {
+                // 单个失败不影响其他，回滚到保存点
+                log.error("Failed: " + item.getId(), e);
+            }
+        }
+        // 全部处理完后统一提交
+    }
+    
+    @Transactional(NESTED)
+    public void processItem(Item item) {
+        // 创建保存点
+        itemRepository.save(item);
+        // 如果这里抛异常，只回滚到保存点，不影响外部事务
+        if (item.getPrice() < 0) {
+            throw new IllegalArgumentException("Invalid price");
+        }
+    }
+}
+```
+
+## 三十三、@Cacheable 缓存抽象深度
+
+### Cache 注解对比
+
+| 注解 | 行为 | 说明 |
+|------|------|------|
+| @Cacheable | 有缓存返回，无缓存执行后缓存 | 查询方法 |
+| @CachePut | 总是执行，更新缓存 | 更新方法 |
+| @CacheEvict | 删除缓存 | 删除方法 |
+| @Caching | 组合多个缓存操作 | 复杂场景 |
+
+### @Cacheable 高级配置
+
+```java
+@Service
+public class UserService {
+    
+    // 条件缓存：只缓存 VIP 用户
+    @Cacheable(value = "users", key = "#id", 
+               condition = "#user.vip == true",
+               unless = "#result == null")
+    public User getUserById(Long id, User user) {
+        return userRepository.findById(id).orElse(null);
+    }
+    
+    // 自定义 KeyGenerator
+    @Cacheable(value = "users", keyGenerator = "customKeyGenerator")
+    public User findByEmail(String email) {
+        return userRepository.findByEmail(email);
+    }
+    
+    // 缓存同步：多实例同时更新时，一个实例更新后通知其他实例失效
+    @CachePut(value = "users", key = "#user.id", sync = true)
+    public User updateUser(User user) {
+        return userRepository.save(user);
+    }
+    
+    // 缓存清理：操作后清空整个缓存区域
+    @CacheEvict(value = "users", allEntries = true)
+    public void clearCache() {
+        // 清空 users 缓存区域
+    }
+}
+```
+
+### Cache 实现对比与选型
+
+| 实现 | 特点 | 适用场景 | 配置 |
+|------|------|----------|------|
+| ConcurrentMapCache | JVM 内存，无持久化 | 开发测试 | 默认 |
+| RedisCache | 分布式，支持持久化 | 生产环境 | spring-boot-starter-data-redis |
+| CaffeineCache | 高性能本地缓存 | 热点数据 | spring-boot-starter-cache |
+| EhCacheCache | 支持磁盘持久化 | 大本地缓存 | spring-boot-starter-cache |
+| CompositeCache | 组合多级缓存 | L1+L2 缓存 | 自定义配置 |
+
+### 多级缓存实战
+
+```java
+@Configuration
+@EnableCaching
+public class CacheConfig {
+    
+    @Bean
+    public CacheManager cacheManager() {
+        // L1: Caffeine 本地缓存（10秒过期）
+        CaffeineCacheManager caffeineManager = new CaffeineCacheManager();
+        caffeineManager.setCaffeine(Caffeine.newBuilder()
+            .expireAfterWrite(10, TimeUnit.SECONDS)
+            .maximumSize(1000));
+        
+        // L2: Redis 分布式缓存（5分钟过期）
+        RedisCacheManager redisManager = RedisCacheManager.builder(redisConnectionFactory())
+            .cacheDefaults(RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(5)))
+            .build();
+        
+        // 组合：L1 + L2
+        CompositeCacheManager compositeManager = new CompositeCacheManager();
+        compositeManager.setCacheManagers(List.of(caffeineManager, redisManager));
+        compositeManager.setFallbackToNoOpCache(false);
+        
+        return compositeManager;
+    }
+}
+```
+
+## 三十四、Spring AutoConfiguration 自定义 Starter
+
+### Starter 开发规范
+
+```
+Starter 目录结构：
+  spring-boot-starter-xxx/
+    ├── src/main/java
+    │   └── com/example/autoconfigure/
+    │       ├── XxxAutoConfiguration.java
+    │       └── XxxProperties.java
+    └── src/main/resources
+        └── META-INF/
+            └── spring/
+                └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+```
+
+### 自定义 Starter 示例
+
+```java
+// 1. 配置属性类
+@ConfigurationProperties(prefix = "app.email")
+public class EmailProperties {
+    private String host = "smtp.gmail.com";
+    private int port = 587;
+    private String username;
+    private String password;
+    // getters/setters
+}
+
+// 2. 自动配置类
+@Configuration
+@EnableConfigurationProperties(EmailProperties.class)
+@ConditionalOnClass(JavaMailSender.class)
+@ConditionalOnProperty(prefix = "app.email", name = "enabled", havingValue = "true", matchIfMissing = true)
+public class EmailAutoConfiguration {
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public JavaMailSender emailSender(EmailProperties properties) {
+        JavaMailSenderImpl mailSender = new JavaMailSenderImpl();
+        mailSender.setHost(properties.getHost());
+        mailSender.setPort(properties.getPort());
+        mailSender.setUsername(properties.getUsername());
+        mailSender.setPassword(properties.getPassword());
+        return mailSender;
+    }
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public EmailService emailService(JavaMailSender mailSender) {
+        return new EmailService(mailSender);
+    }
+}
+
+// 3. 注册自动配置
+// META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+com.example.autoconfigure.EmailAutoConfiguration
+```
+
+### AutoConfiguration 加载流程
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 读取 imports 文件 | 获取所有候选自动配置类 |
+| 2 | @Conditional 过滤 | 按条件决定是否加载 |
+| 3 | @Order 排序 | 控制加载顺序 |
+| 4 | 注册 BeanDefinition | 注册到容器 |
+| 5 | 用户 Bean 覆盖 | @ConditionalOnMissingBean 机制 |
+
+## 三十五、WebFlux vs MVC 选型指南
+
+### 对比表
+
+| 维度 | Spring MVC | Spring WebFlux |
+|------|------------|----------------|
+| 编程模型 | 同步阻塞 | 响应式非阻塞 |
+| 底层容器 | Tomcat/Jetty/Undertow | Netty（也可 Servlet 3.1+） |
+| 并发模型 | 一请求一线程 | 少量线程处理海量 IO |
+| 数据库访问 | JDBC/MyBatis（阻塞） | R2DBC（响应式） |
+| 适用场景 | 多数业务 CRUD | 高并发 IO 密集/网关 |
+| 团队要求 | 熟悉 Spring MVC | 需学习 Reactor/Mono/Flux |
+| 调试难度 | 低（同步栈） | 高（异步栈） |
+
+### 选型决策流程
+
+```mermaid
+flowchart TD
+    A[新项目选型] --> B{是否需要高并发 IO?}
+    B -->|否| C[Spring MVC]
+    B -->|是| D{是否有阻塞调用?}
+    D -->|是| E{能否改造为非阻塞?}
+    E -->|否| C
+    E -->|是| F{团队是否熟悉响应式?}
+    F -->|否| C
+    F -->|是| G[Spring WebFlux]
+    D -->|否| G
+```
+
+### 混合使用方案
+
+```java
+// MVC 主应用 + WebFlux 做网关
+@SpringBootApplication
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
+
+// WebFlux 网关（独立端口）
+@Configuration
+public class GatewayConfig {
+    @Bean
+    public RouterFunction<ServerResponse> gatewayRoutes() {
+        return RouterFunctions.route()
+            .path("/api", builder -> builder
+                .GET("/users/{id}", req -> {
+                    // 调用 MVC 服务（HTTP 转发）
+                    WebClient client = WebClient.create("http://localhost:8080");
+                    Mono<User> user = client.get()
+                        .uri("/users/{id}", req.pathVariable("id"))
+                        .retrieve()
+                        .bodyToMono(User.class);
+                    return ServerResponse.ok().body(user, User.class);
+                }))
+            .build();
+    }
+}
+```
+
+## 三十六、Spring Security Filter Chain
+
+### 过滤器链执行流程
+
+```mermaid
+graph TD
+    A[请求进入] --> B[SecurityFilterChain]
+    B --> C[SecurityContextPersistenceFilter]
+    C --> D[UsernamePasswordAuthenticationFilter]
+    D --> E[BasicAuthenticationFilter]
+    E --> F[ExceptionTranslationFilter]
+    F --> G[FilterSecurityInterceptor]
+    G --> H[Controller]
+```
+
+### 自定义安全配置
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .requestMatchers("/api/user/**").hasAnyRole("USER", "ADMIN")
+                .anyRequest().authenticated()
+            )
+            .formLogin(form -> form
+                .loginPage("/login")
+                .defaultSuccessUrl("/dashboard")
+                .permitAll()
+            )
+            .logout(logout -> logout
+                .logoutUrl("/logout")
+                .logoutSuccessUrl("/login?logout")
+                .permitAll()
+            )
+            .csrf(csrf -> csrf
+                .ignoringRequestMatchers("/api/public/**")
+            )
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()));
+        
+        return http.build();
+    }
+    
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of("http://localhost:3000"));
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+}
+```
+
+### JWT 认证过滤器
+
+```java
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    
+    @Autowired private JwtTokenProvider tokenProvider;
+    @Autowired private UserDetailsService userDetailsService;
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response, 
+                                    FilterChain filterChain) throws ServletException, IOException {
+        String jwt = getJwtFromRequest(request);
+        
+        if (StringUtils.hasText(jwt) && tokenProvider.validateToken(jwt)) {
+            String username = tokenProvider.getUsernameFromToken(jwt);
+            UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+            
+            UsernamePasswordAuthenticationToken authentication = 
+                new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+            authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+            
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+        }
+        
+        filterChain.doFilter(request, response);
+    }
+    
+    private String getJwtFromRequest(HttpServletRequest request) {
+        String bearerToken = request.getHeader("Authorization");
+        if (StringUtils.hasText(bearerToken) && bearerToken.startsWith("Bearer ")) {
+            return bearerToken.substring(7);
+        }
+        return null;
+    }
+}
+```
+
+## 三十七、Spring @Scheduled 定时任务
+
+### 定时任务配置
+
+```java
+@Configuration
+@EnableScheduling
+public class SchedulerConfig {
+    
+    @Bean
+    public TaskScheduler taskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(5);
+        scheduler.setThreadNamePrefix("scheduled-");
+        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        scheduler.setAwaitTerminationSeconds(60);
+        return scheduler;
+    }
+}
+
+@Component
+public class ScheduledTasks {
+    
+    // 固定频率：每5秒执行一次
+    @Scheduled(fixedRate = 5000)
+    public void fixedRateTask() {
+        log.info("Fixed rate task: {}", LocalDateTime.now());
+    }
+    
+    // 固定延迟：上次执行完成后等5秒再执行
+    @Scheduled(fixedDelay = 5000)
+    public void fixedDelayTask() {
+        log.info("Fixed delay task: {}", LocalDateTime.now());
+    }
+    
+    // Cron 表达式：每天凌晨2点执行
+    @Scheduled(cron = "0 0 2 * * ?")
+    public void cronTask() {
+        log.info("Cron task: {}", LocalDateTime.now());
+    }
+    
+    // 初始延迟：启动后等10秒再执行
+    @Scheduled(fixedRate = 5000, initialDelay = 10000)
+    public void initialDelayTask() {
+        log.info("Initial delay task: {}", LocalDateTime.now());
+    }
+    
+    // 动态 Cron：从配置中心读取
+    @Scheduled(cron = "${app.schedule.export-cron:0 0 2 * * ?}")
+    public void dynamicCronTask() {
+        log.info("Dynamic cron task: {}", LocalDateTime.now());
+    }
+}
+```
+
+### 分布式定时任务方案
+
+| 方案 | 说明 | 适用场景 |
+|------|------|----------|
+| 单机 @Scheduled | 简单，无分布式协调 | 单实例应用 |
+| ShedLock | 数据库/Redis 锁，防止并发执行 | 多实例但只需一个执行 |
+| XXL-Job | 分片、失败重试、日志 | 大规模定时任务 |
+| Spring Cloud Task | 一次性任务，K8s CronJob | 云原生环境 |
+
+```java
+// ShedLock 配置
+@Configuration
+@EnableSchedulerLock(defaultLockAtMostFor = "10m")
+public class ShedLockConfig {
+    
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcLockProvider(dataSource);
+    }
+}
+
+@Component
+public class ScheduledTasks {
+    
+    @SchedulerLock(name = "dailyReport", 
+                   lockAtLeastFor = "5m", 
+                   lockAtMostFor = "10m")
+    @Scheduled(cron = "0 0 2 * * ?")
+    public void generateDailyReport() {
+        // 只有一个实例执行
+    }
+}
+```
+
+## 三十八、Spring Boot 3.x 核心新特性
+
+### 新特性对比
+
+| 特性 | Spring Boot 2.x | Spring Boot 3.x |
+|------|-----------------|-----------------|
+| Java 版本 | Java 8+ | Java 17+ |
+| 命名空间 | javax.* | jakarta.* |
+| GraalVM | 实验性 | 正式支持 |
+| 虚拟线程 | 不支持 | 支持（预览） |
+| AOT 处理 | 不支持 | 支持 |
+| 依赖管理 | spring-boot-dependencies | spring-boot-dependencies + BOM |
+| 配置文件 | spring.factories | AutoConfiguration.imports |
+| 最低 Spring | 5.x | 6.x |
+
+### 迁移关键点
+
+```text
+Spring Boot 2.x → 3.x 迁移清单：
+  1. Java 版本：升级到 Java 17+
+  2. 命名空间：javax.* → jakarta.*（如 javax.persistence → jakarta.persistence）
+  3. 配置文件：spring.factories → AutoConfiguration.imports
+  4. Security：调整 SecurityFilterChain 配置方式
+  5. Actuator：端点路径从 /actuator/* 调整
+  6. 数据库：检查 JPA/Hibernate 版本兼容性
+  7. 第三方库：确认版本兼容性
+```
+
+### 虚拟线程配置
+
+```yaml
+# application.yml
+spring:
+  threads:
+    virtual:
+      enabled: true  # 启用虚拟线程
+
+# 效果：
+# - 请求处理使用虚拟线程
+# - 不再需要线程池配置
+# - 并发能力大幅提升
+
+# 注意：
+# - 阻塞操作会阻塞虚拟线程
+# - 传统 JDBC 驱动可能不兼容
+# - 需要测试验证
+```
+
+### GraalVM 原生镜像支持
+
+```bash
+# 构建原生镜像
+mvn -Pnative native:compile
+
+# 运行
+./target/myapp
+
+# 测试
+mvn -PnativeTest native:test
+
+# 效果：
+# - 启动时间：2~5s → <100ms
+# - 内存占用：200~500MB → <50MB
+# - 无 JIT 预热
+# - 适合 Serverless/容器
+```
+
+---
+
 ## Spring 故障排查
 
 ### 常见故障处理

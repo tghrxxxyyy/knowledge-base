@@ -902,6 +902,209 @@ Pull Query 限制：
 
 ---
 
+## 窗口操作详解
+
+### 四种窗口类型
+
+| 窗口类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| Tumbling | 固定大小不重叠 | 每分钟聚合 |
+| Hopping | 固定大小可重叠 | 滑动平均 |
+| Sliding | 基于事件时间滑动 | 连续事件检测 |
+| Session | 基于活跃会话 | 用户行为分析 |
+
+### 窗口操作示例
+
+```java
+// 滚动窗口：每5分钟统计一次
+KTable<Windowed<String>, Long> counts = orders
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+    .count();
+
+// 滑动窗口：每1分钟滑动，窗口大小5分钟
+KTable<Windowed<String>, Double> slidingAvg = orders
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5))
+        .advanceBy(Duration.ofMinutes(1)))
+    .aggregate(
+        () -> new AvgInitializer(),
+        (key, value, agg) -> agg.add(value),
+        Materialized.as("sliding-avg-store")
+    );
+
+// 会话窗口：30分钟超时
+KTable<Windowed<String>, Long> sessions = orders
+    .groupByKey()
+    .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(Duration.ofMinutes(30)))
+    .count();
+```
+
+## Join 操作详解
+
+### 三种 Join 类型
+
+```mermaid
+flowchart LR
+    KStream1[KStream A] --> JOIN[Join]
+    KStream2[KStream B] --> JOIN
+    KTable1[KTable A] --> JOIN
+    KTable2[KTable B] --> JOIN
+    JOIN --> RESULT[结果]
+```
+
+```java
+// KStream-KStream Join（窗口内关联）
+KStream<String, Order> orders = ...;
+KStream<String, Payment> payments = ...;
+
+KStream<String, OrderWithPayment> joined = orders.join(
+    payments,
+    (order, payment) -> new OrderWithPayment(order, payment),
+    JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofMinutes(5)),
+    StreamJoined.with(Serdes.String(), orderSerde, paymentSerde)
+);
+
+// KTable-KTable Join（维度关联）
+KTable<String, Order> orders = ...;
+KTable<String, Customer> customers = ...;
+
+KTable<String, OrderWithCustomer> enriched = orders.join(
+    customers,
+    (order, customer) -> new OrderWithCustomer(order, customer)
+);
+
+// KStream-KTable Join（流与维度表关联）
+KStream<String, Order> orderStream = ...;
+KTable<String, Product> productTable = ...;
+
+KStream<String, OrderWithProduct> enrichedStream = orderStream.join(
+    productTable,
+    (order, product) -> new OrderWithProduct(order, product)
+);
+```
+
+| Join 类型 | 缓存要求 | 窗口要求 | 适用场景 |
+|-----------|----------|----------|----------|
+| KStream-KStream | 需要 | 必须 | 事件关联 |
+| KTable-KTable | 需要 | 不需要 | 维度关联 |
+| KStream-KTable | 不需要 | 不需要 | 流与维度表 |
+
+## State Store 详解
+
+### State Store 类型
+
+| 类型 | 存储位置 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| RocksDB | 本地磁盘 | 持久化、大容量 | 有状态计算 |
+| In-Memory | 内存 | 快速、易失 | 临时计算 |
+| Queryable | 可查询 | 支持交互查询 | 实时服务 |
+
+### Changelog 与容错
+
+```mermaid
+flowchart TB
+    STREAM[流处理] --> STATE[State Store]
+    STATE --> CHANGELOG[Changelog Topic]
+    CHANGELOG --> KAFKA[Kafka]
+    KAFKA --> RECOVERY[故障恢复]
+    RECOVERY --> STATE
+```
+
+```java
+// 自定义 State Store
+StateStoreSupplier<String, String> storeSupplier = Stores.keyValueStoreBuilder(
+    Stores.persistentKeyValueStore("my-store"),
+    Serdes.String(),
+    Serdes.String()
+).withLoggingEnabled(changelogConfig)  // 启用 changelog
+ .withCachingEnabled()  // 启用缓存
+ .build();
+```
+
+## Exactly-Once 语义（EOS）
+
+### EOS 实现原理
+
+```text
+Kafka Streams EOS 流程：
+  1. 开启事务（beginTransaction）
+  2. 读取输入消息（consume）
+  3. 处理消息（process）
+  4. 写入输出（produce）
+  5. 写入 State Store（commit）
+  6. 提交事务（commitTransaction）
+
+保证：
+  - 输入-处理-输出原子性
+  - 无重复消费
+  - 无数据丢失
+```
+
+```java
+// EOS 配置
+Properties props = new Properties();
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, 
+    StreamsConfig.EXACTLY_ONCE_V2);  // 推荐
+props.put(StreamsConfig.producerPrefix(ProducerConfig.TRANSACTIONAL_ID_CONFIG), 
+    "streams-app-1");
+```
+
+| 语义级别 | 说明 | 性能 | 适用场景 |
+|----------|------|------|----------|
+| AT_LEAST_ONCE | 可能重复 | 高 | 一般场景 |
+| EXACTLY_ONCE | 无重复 | 中 | 关键业务 |
+| EXACTLY_ONCE_V2 | 优化版EOS | 中高 | 推荐生产 |
+
+## ksqlDB 实战
+
+### ksqlDB 常用 SQL
+
+```sql
+-- 创建流
+CREATE STREAM orders_stream (
+    order_id VARCHAR KEY,
+    user_id VARCHAR,
+    amount DOUBLE,
+    event_time TIMESTAMP
+) WITH (
+    KAFKA_TOPIC = 'orders',
+    VALUE_FORMAT = 'JSON',
+    TIMESTAMP = 'event_time'
+);
+
+-- 创建表（聚合）
+CREATE TABLE order_counts AS
+    SELECT user_id, COUNT(*) AS order_count
+    FROM orders_stream
+    WINDOW TUMBLING (SIZE 5 MINUTES)
+    GROUP BY user_id
+    EMIT CHANGES;
+
+-- 连接流和表
+CREATE STREAM enriched_orders AS
+    SELECT o.user_id, o.amount, u.user_name
+    FROM orders_stream o
+    JOIN users_table u ON o.user_id = u.user_id
+    EMIT CHANGES;
+
+-- 创建推送查询
+CREATE PUSH QUERY AS
+    SELECT * FROM order_counts
+    WHERE order_count > 10
+    EMIT CHANGES;
+```
+
+### ksqlDB vs Kafka Streams
+
+| 维度 | ksqlDB | Kafka Streams |
+|------|--------|---------------|
+| 语言 | SQL | Java/Scala |
+| 部署 | 独立集群 | 嵌入应用 |
+| 学习曲线 | 低 | 中 |
+| 灵活性 | 中 | 高 |
+| 适用 | 非Java团队 | Java团队 |
+
 ## 与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；

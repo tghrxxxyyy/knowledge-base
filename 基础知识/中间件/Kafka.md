@@ -194,7 +194,122 @@ flowchart LR
 
 22. **分区数怎么定？** 按目标吞吐 ÷ 单分区吞吐；同时考虑消费者并行度上限、rebalance 开销、文件句柄数量，一般 3~10 起步，可后扩不可随意缩。
 
----
+## Replication 与 ISR 详解
+
+### 副本同步机制
+
+```mermaid
+flowchart LR
+    PRODUCER[生产者] --> LEADER[Leader]
+    LEADER --> FOLLOWER1[Follower1]
+    LEADER --> FOLLOWER2[Follower2]
+    FOLLOWER1 -->|同步| LEADER
+    FOLLOWER2 -->|同步| LEADER
+```
+
+### ISR（In-Sync Replicas）
+
+| 概念 | 说明 |
+|------|------|
+| Leader | 处理所有读写请求 |
+| Follower | 复制 Leader 数据 |
+| ISR | 与 Leader 保持同步的副本集 |
+| LEO | Log End Offset，最后一条消息位置 |
+| HW | High Watermark，所有 ISR 同步的位置 |
+
+```java
+// ISR 配置
+props.put("replication.factor", 3);           // 副本数
+props.put("min.insync.replicas", 2);          // 最小同步副本
+props.put("acks", "all");                     // 确认所有ISR
+props.put("unclean.leader.election.enable", false); // 禁止非ISR选举
+```
+
+## 批量调优参数
+
+### Producer 批量配置
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| batch.size | 16384 | 32768-65536 | 批次大小(bytes) |
+| linger.ms | 0 | 5-100 | 等待时间(ms) |
+| buffer.memory | 33554432 | 67108864 | 缓冲区大小 |
+| compression.type | none | lz4/snappy | 压缩算法 |
+| max.request.size | 1048576 | 10485760 | 最大请求大小 |
+
+### Consumer 批量配置
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| fetch.min.bytes | 1 | 1024 | 最小拉取字节 |
+| fetch.max.wait.ms | 500 | 500-1000 | 最大等待时间 |
+| max.partition.fetch.bytes | 1048576 | 10485760 | 分区最大拉取 |
+| max.poll.records | 500 | 1000-5000 | 最大拉取记录数 |
+
+## 限流与背压
+
+### 限流配置
+
+```java
+// Producer 限流
+props.put("max.in.flight.requests.per.connection", 5);  // 单连接最大请求数
+props.put("max.in.flight.requests.per.connection", 1);  // 严格顺序
+
+// Consumer 限流
+props.put("max.poll.records", 500);  // 每次拉取记录数
+props.put("max.poll.interval.ms", 300000);  // 拉取间隔
+```
+
+### 背压处理
+
+```mermaid
+flowchart TB
+    PRODUCER[生产者] -->|发送| KAFKA[Kafka]
+    KAFKA -->|消费| CONSUMER[消费者]
+    CONSUMER -->|处理慢| BACKPRESSURE[背压]
+    BACKPRESSURE -->|减慢| PRODUCER
+```
+
+## 监控指标
+
+### 关键监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| UnderReplicatedPartitions | 副本不足分区数 | > 0 |
+| ActiveControllerCount | 活跃控制器数 | != 1 |
+| OfflinePartitionsCount | 离线分区数 | > 0 |
+| Consumer Lag | 消费延迟 | 持续增长 |
+| Producer Request Rate | 生产请求速率 | 突增/突降 |
+| ISR Shrink Rate | ISR 收缩速率 | > 0 |
+
+### 监控工具
+
+| 工具 | 说明 | 适用场景 |
+|------|------|----------|
+| Kafka Exporter | Prometheus 指标 | 监控集成 |
+| Burrow | Consumer Lag 监控 | 消费延迟 |
+| Confluent Control Center | 商业监控 | 全功能 |
+| Kafdrop | Web UI | 轻量管理 |
+
+## 跨数据中心部署
+
+### 部署架构
+
+```mermaid
+flowchart LR
+    DC1[数据中心1] -->|MirrorMaker2| DC2[数据中心2]
+    DC2 -->|MirrorMaker2| DC1
+    DC1 --> CLUSTER1[Kafka Cluster1]
+    DC2 --> CLUSTER2[Kafka Cluster2]
+```
+
+| 方案 | 说明 | 适用场景 |
+|------|------|----------|
+| MirrorMaker | 单向复制 | 灾备 |
+| MirrorMaker2 | 双向复制 | 多活 |
+| Confluent Replicator | 商业方案 | 企业级 |
+| Cruise Control | 自动均衡 | 大规模 |
 
 ## 六、与其他板块的关系
 

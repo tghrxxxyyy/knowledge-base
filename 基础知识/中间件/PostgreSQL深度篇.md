@@ -1406,6 +1406,237 @@ FROM pg_stat_user_tables;
 
 ---
 
+## PostgreSQL 深度调优实战
+
+### 查询优化深度
+
+```sql
+-- EXPLAIN ANALYZE 详解
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders WHERE user_id = 123 AND status = 'paid';
+
+-- 输出解读
+-- Seq Scan on orders  (cost=0.00..1234.56 rows=10 width=128) (actual time=0.015..12.345 rows=10 loops=1)
+--   Filter: (user_id = 123 AND status = 'paid')
+--   Rows Removed by Filter: 99990
+--   Buffers: shared hit=1000
+-- Planning Time: 0.1 ms
+-- Execution Time: 12.5 ms
+
+-- 关键指标解释：
+-- cost：启动代价..总代价（估算值）
+-- rows：估算返回行数
+-- actual time：实际执行时间（毫秒）
+-- Buffers：共享缓冲区命中/读取
+-- Rows Removed by Filter：被过滤掉的行数
+```
+
+### 执行计划类型对比
+
+```text
+执行计划策略选择：
+
+┌─────────────────┬─────────────────┬─────────────────┬─────────────────┐
+│ 策略            │ 说明            │ 适用场景        │ 性能特点        │
+├─────────────────┼─────────────────┼─────────────────┼─────────────────┤
+│ Seq Scan        │ 全表顺序扫描    │ 小表/无索引     │ IO 密集         │
+│ Index Scan      │ 索引扫描+回表   │ 等值/范围查询   │ 索引命中高时快  │
+│ Index Only Scan │ 纯索引扫描      │ 覆盖索引        │ 最快（无需回表）│
+│ Bitmap Index    │ 位图索引扫描    │ 多条件过滤      │ 中等            │
+│ Nested Loop     │ 嵌套循环连接    │ 小结果集+索引   │ 连接字段有索引时│
+│ Hash Join       │ 哈希连接        │ 大结果集+等值   │ 内存充足时最快  │
+│ Merge Join      │ 归并连接        │ 已排序数据      │ 数据已排序时快  │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────┘
+```
+
+### 统计信息与调优
+
+```sql
+-- 查看统计信息
+SELECT * FROM pg_stats WHERE tablename = 'orders';
+
+-- 手动更新统计
+ANALYZE orders;
+
+-- 调整统计采样精度
+ALTER TABLE orders ALTER COLUMN user_id SET STATISTICS 1000;
+
+-- 查看索引使用情况
+SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+ORDER BY idx_scan DESC;
+
+-- 查看未使用的索引（可考虑删除）
+SELECT indexrelname, idx_scan
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+### 分区表深度实战
+
+```sql
+-- 范围分区（按时间）
+CREATE TABLE orders (
+    id BIGSERIAL,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at TIMESTAMPTZ
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE orders_2026_01 PARTITION OF orders
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE orders_2026_02 PARTITION OF orders
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+-- 哈希分区（均匀分布）
+CREATE TABLE users (
+    id BIGSERIAL,
+    username VARCHAR(50),
+    email VARCHAR(100)
+) PARTITION BY HASH (id);
+
+CREATE TABLE users_p0 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE users_p1 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE users_p2 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE users_p3 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+-- 默认分区（兜底）
+CREATE TABLE users_default PARTITION OF users DEFAULT;
+
+-- 分区裁剪（Partition Pruning）
+EXPLAIN SELECT * FROM orders WHERE created_at >= '2026-02-01';
+-- → 只扫描 orders_2026_02 分区
+
+-- 手动设置
+SET enable_partition_pruning = on;
+```
+
+### 分区管理自动化
+
+```sql
+-- pg_partman 自动创建分区
+CREATE EXTENSION pg_partman;
+SELECT partman.create_parent('public.orders', 'created_at', 'native', 'monthly');
+
+-- 分区数据迁移（冷热分离）
+ALTER TABLE orders DETACH PARTITION orders_2025_01 CONCURRENTLY;
+-- 导出到冷存储
+COPY orders_2025_01 TO '/cold_storage/orders_2025_01.csv';
+-- 删除旧分区
+DROP TABLE orders_2025_01;
+```
+
+### 逻辑复制高级用法
+
+```sql
+-- 发布端配置
+ALTER SYSTEM SET wal_level = logical;
+CREATE PUBLICATION my_pub FOR TABLE orders, users
+  WITH (publish = 'insert,update');
+
+-- 选择性复制（只复制特定列）
+CREATE PUBLICATION my_pub FOR TABLE orders
+  (order_id, user_id, amount);
+
+-- 订阅端配置
+CREATE SUBSCRIPTION my_sub
+    CONNECTION 'host=master dbname=mydb user=replicator'
+    PUBLICATION my_pub;
+
+-- 跨版本迁移（PG 14 → PG 16）
+-- 1. 目标库安装新版本 PG
+-- 2. pg_dumpall --binary-upgrade 旧库
+-- 3. 逻辑复制同步增量数据
+-- 4. 切流到新库
+
+-- 逻辑复制监控
+SELECT * FROM pg_stat_replication;
+SELECT * FROM pg_stat_subscription;
+SELECT pg_size_bytes(pg_wal_lsn_diff(
+  pg_current_wal_lsn(), replay_lsn
+)) AS replication_lag;
+```
+
+### 扩展生态深度
+
+```sql
+-- TimescaleDB（时序扩展）
+CREATE EXTENSION timescaledb;
+SELECT create_hypertable('sensor_data', 'time');
+
+-- 自动压缩
+ALTER TABLE sensor_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id'
+);
+
+-- 连续聚合
+CREATE MATERIALIZED VIEW hourly_stats WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket, device_id, AVG(value)
+FROM sensor_data GROUP BY bucket, device_id;
+
+-- Citus（分布式扩展）
+CREATE EXTENSION citus;
+SELECT create_distributed_table('orders', 'user_id');
+
+-- 创建引用表（小表广播到所有节点）
+SELECT create_reference_table('regions');
+
+-- pgvector（向量检索）
+CREATE EXTENSION vector;
+ALTER TABLE products ADD COLUMN embedding vector(1536);
+
+-- 创建 HNSW 索引
+CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops);
+
+-- 语义搜索
+SELECT * FROM products
+ORDER BY embedding <=> '[0.1, 0.2, ..., 0.1536]'
+LIMIT 10;
+```
+
+### 监控查询大全
+
+```sql
+-- 连接数监控
+SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+SELECT pid, usename, application_name, state, query_start, query
+  FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start;
+
+-- 慢查询（pg_stat_statements）
+SELECT query, calls, total_exec_time, mean_exec_time, rows
+  FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;
+
+-- 缓存命中率
+SELECT sum(blks_hit) / (sum(blks_hit) + sum(blks_read)) AS hit_ratio
+  FROM pg_stat_database;
+
+-- 表膨胀检测
+SELECT schemaname, relname, n_dead_tup, n_live_tup,
+  round(n_dead_tup::numeric / (n_live_tup + 1) * 100, 2) AS dead_ratio
+  FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;
+
+-- 复制延迟
+SELECT client_addr, state, sync_state,
+  pg_size_bytes(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS lag
+  FROM pg_stat_replication;
+
+-- 锁等待
+SELECT blocked.pid AS blocked_pid, blocked.query AS blocked_query,
+  blocking.pid AS blocking_pid, blocking.query AS blocking_query
+  FROM pg_stat_activity blocked
+  JOIN pg_locks bl ON blocked.pid = bl.pid AND NOT bl.granted
+  JOIN pg_locks gl ON bl.locktype = gl.locktype
+    AND bl.database IS NOT DISTINCT FROM gl.database
+    AND bl.relation IS NOT DISTINCT FROM gl.relation
+    AND bl.page IS NOT DISTINCT FROM gl.page
+    AND bl.tuple IS NOT DISTINCT FROM gl.tuple
+    AND bl.transactionid IS NOT DISTINCT FROM gl.transactionid
+    AND bl.pid != gl.pid AND gl.granted
+  JOIN pg_stat_activity blocking ON gl.pid = blocking.pid;
+```
+
 ## 十五、速查表（扩展）
 
 | 项 | 结论 |

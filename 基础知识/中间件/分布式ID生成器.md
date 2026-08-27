@@ -1410,3 +1410,213 @@ groups:
     annotations:
       summary: "ID 生成器出现重复 ID"
 ```
+
+## 十二、UUID v7时间排序优势详解
+
+### 12.1 UUID v7特性
+
+```
+UUID v7特性：
+  格式：时间戳(48bit) + 随机数(74bit)
+  时间排序：基于毫秒时间戳排序
+  MySQL友好：顺序插入，索引紧凑
+  全局唯一：随机数保证唯一性
+
+UUID v7 vs UUID v4：
+  v4：完全随机，无排序
+  v7：时间排序，MySQL友好
+
+UUID v7优势：
+  1. 时间排序（范围查询友好）
+  2. 顺序插入（索引紧凑）
+  3. 全局唯一（分布式安全）
+  4. 兼容UUID格式（迁移成本低）
+```
+
+### 12.2 UUID v7使用示例
+
+```java
+// Java UUID v7生成
+import java.time.Instant;
+
+public class UUIDv7Generator {
+    public static UUID generate() {
+        long timeMs = Instant.now().toEpochMilli();
+        long random = new SecureRandom().nextLong();
+        
+        // 时间戳(48bit) + 版本(4bit) + 随机(60bit)
+        long mostSigBits = (timeMs << 16) | 0x7000L;
+        long leastSigBits = random & 0x3FFFFFFFFFFFFFFFL;
+        
+        return new UUID(mostSigBits, leastSigBits);
+    }
+}
+```
+
+## 十三、分库分表路由中的ID陷阱详解
+
+### 13.1 常见陷阱
+
+| 陷阱 | 说明 | 后果 | 解决方案 |
+|------|------|------|---------|
+| UUID随机 | 路由不均匀 | 数据倾斜 | 使用UUID v7或雪花ID |
+| 雪花ID时钟回拨 | ID重复 | 数据冲突 | 时钟回拨检测 |
+| 自增ID单点 | 扩展困难 | 单点瓶颈 | 分布式ID |
+| 组合ID | 路由规则复杂 | 维护困难 | 简化路由规则 |
+
+### 13.2 路由最佳实践
+
+```
+分库分表路由最佳实践：
+  1. 选择合适的ID
+     → 雪花ID（时间排序）
+     → UUID v7（时间排序）
+     → 自增ID（单库场景）
+
+  2. 路由规则设计
+     → 一致性哈希（均匀分布）
+     → 范围路由（时间序列）
+     → 哈希取模（简单场景）
+
+  3. 扩容考虑
+     → 预分片（提前扩容）
+     → 在线迁移（平滑扩容）
+     → 双写（过渡期）
+```
+
+## 十四、ID生成器高可用设计详解
+
+### 14.1 高可用架构
+
+```
+ID生成器高可用：
+  主备切换：
+    主节点故障 → 备节点接管
+    需要：故障检测 + 自动切换
+
+  降级策略：
+    服务降级 → 本地ID生成
+    需要：本地缓存 + 序列号
+
+  多活部署：
+    多机房部署 → 各机房独立生成
+    需要：号段分配 + 冲突检测
+```
+
+### 14.2 高可用配置
+
+```yaml
+# 高可用配置
+id-generator:
+  mode: cluster
+  cluster:
+    nodes:
+      - host: node1
+        port: 8080
+        role: master
+      - host: node2
+        port: 8080
+        role: slave
+    failover:
+      enabled: true
+      timeout: 5000
+      retry: 3
+    degradation:
+      enabled: true
+      local-cache: 10000
+```
+
+## 十五、ID长度对性能影响详解
+
+### 15.1 ID长度对比
+
+| ID类型 | 长度 | 存储空间 | 索引效率 | 适用场景 |
+|--------|------|---------|---------|---------|
+| UUID v4 | 128bit | 16字节 | 低 | 分布式唯一 |
+| UUID v7 | 128bit | 16字节 | 中 | 分布式+排序 |
+| 雪花ID | 64bit | 8字节 | 高 | 分布式+排序 |
+| 自增ID | 64bit | 8字节 | 最高 | 单库场景 |
+
+### 15.2 性能影响分析
+
+```
+ID长度性能影响：
+  存储空间：
+    UUID v4：16字节 × 1亿 = 1.6GB
+    雪花ID：8字节 × 1亿 = 800MB
+    自增ID：8字节 × 1亿 = 800MB
+
+  索引开销：
+    UUID v4：B+树节点分裂频繁，索引膨胀
+    雪花ID：顺序插入，索引紧凑
+    自增ID：顺序插入，索引最紧凑
+
+  查询性能：
+    UUID v4：范围查询差
+    雪花ID：范围查询好
+    自增ID：范围查询最好
+```
+
+## 十六、时钟回拨检测详解
+
+### 16.1 时钟回拨问题
+
+```
+时钟回拨问题：
+  原因：
+    NTP时间同步
+    人工调整时间
+    虚拟机时钟漂移
+
+  后果：
+    ID重复
+    数据冲突
+    业务异常
+
+  检测方法：
+    记录上次生成时间
+    比较当前时间
+    发现回拨告警
+```
+
+### 16.2 时钟回拨解决方案
+
+| 方案 | 做法 | 优点 | 缺点 |
+|------|------|------|------|
+| 等待 | 等待时钟追上 | 简单 | 阻塞 |
+| 报错 | 直接报错 | 安全 | 不友好 |
+| 降级 | 使用本地ID | 可用 | 可能冲突 |
+| 预分配 | 预先分配号段 | 高可用 | 复杂 |
+
+## 十七、ID生成器监控详解
+
+### 17.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| QPS | 每秒生成ID数 | 超过容量80% |
+| 时钟偏差 | 本地时钟与NTP时钟偏差 | > 100ms |
+| 重复率 | 重复ID出现概率 | > 0 |
+| 延迟 | ID生成耗时 | > 10ms |
+
+### 17.2 监控实现
+
+```java
+// ID生成器监控
+@Component
+public class IdGeneratorMetrics {
+    private final MeterRegistry registry;
+    private final AtomicLong qpsCounter = new AtomicLong();
+    private final AtomicLong duplicateCounter = new AtomicLong();
+    
+    @Scheduled(fixedRate = 1000)
+    public void reportMetrics() {
+        registry.gauge("id.generator.qps", qpsCounter.getAndSet(0));
+        registry.gauge("id.generator.duplicates", duplicateCounter.get());
+    }
+    
+    public void recordDuplicate() {
+        duplicateCounter.incrementAndGet();
+    }
+}
+```

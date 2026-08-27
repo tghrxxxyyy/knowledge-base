@@ -1409,3 +1409,211 @@ SELECT * FROM information_schema.slow_query ORDER BY query_time DESC LIMIT 10;
   需要高可用 → 企业版或旗舰版
   需要全功能 → 旗舰版
 ```
+
+## 十、Lindorm时序数据模型详解
+
+### 10.1 时序数据模型设计
+
+```
+Lindorm时序数据模型：
+  核心概念：
+    度量（Metric）：数据采集点
+    标签（Tag）：数据维度
+    时间戳（Timestamp）：数据时间
+    字段（Field）：数据值
+
+  数据模型设计原则：
+    1. 高基维度放Tag
+    2. 低基维度放Field
+    3. 时间戳自动索引
+    4. 合理使用分区键
+```
+
+### 10.2 数据模型示例
+
+```sql
+-- 时序表设计
+CREATE TABLE sensor_data (
+  device_id VARCHAR(64) NOT NULL,
+  metric_name VARCHAR(128) NOT NULL,
+  ts TIMESTAMP NOT NULL,
+  value DOUBLE,
+  quality INT,
+  PRIMARY KEY (device_id, metric_name, ts)
+) ENGINE= Lindorm
+
+-- 查询示例
+SELECT ts, value
+FROM sensor_data
+WHERE device_id = 'device_001'
+  AND metric_name = 'temperature'
+  AND ts >= '2024-01-01'
+  AND ts < '2024-01-02'
+ORDER BY ts;
+```
+
+## 十一、Lindorm宽表引擎详解
+
+### 11.1 宽表引擎特性
+
+| 特性 | 说明 | 适用场景 |
+|------|------|---------|
+| 列式存储 | 高压缩比 | 分析查询 |
+| 稀疏存储 | 空值不占空间 | 稀疏数据 |
+| 多版本 | 支持数据版本 | 时序数据 |
+| TTL | 自动过期删除 | 数据生命周期 |
+
+### 11.2 宽表引擎使用
+
+```sql
+-- 宽表设计
+CREATE TABLE user_behavior (
+  user_id BIGINT NOT NULL,
+  event_time TIMESTAMP NOT NULL,
+  event_type VARCHAR(64),
+  page_id VARCHAR(128),
+  device_type VARCHAR(32),
+  ip_address VARCHAR(64),
+  user_agent TEXT,
+  PRIMARY KEY (user_id, event_time)
+) ENGINE= Lindorm
+
+-- 查询用户行为
+SELECT event_time, event_type, page_id
+FROM user_behavior
+WHERE user_id = 12345
+  AND event_time >= '2024-01-01'
+ORDER BY event_time DESC;
+```
+
+## 十二、Lindorm搜索引擎详解
+
+### 12.1 搜索引擎特性
+
+| 特性 | 说明 | 适用场景 |
+|------|------|---------|
+| 全文检索 | 倒排索引 | 日志搜索 |
+| 模糊匹配 | 支持通配符 | 模糊查询 |
+| 聚合分析 | 支持聚合 | 数据分析 |
+| 地理位置 | 支持GIS | 位置服务 |
+
+### 12.2 搜索引擎使用
+
+```sql
+-- 全文检索
+SELECT * FROM logs
+WHERE message MATCH 'ERROR'
+
+-- 模糊匹配
+SELECT * FROM logs
+WHERE message LIKE '%timeout%'
+
+-- 聚合分析
+SELECT event_type, COUNT(*) as cnt
+FROM logs
+WHERE ts >= '2024-01-01'
+GROUP BY event_type
+ORDER BY cnt DESC;
+```
+
+## 十三、Lindorm存算分离架构详解
+
+### 13.1 存算分离原理
+
+```
+存算分离架构：
+  计算层：无状态，水平扩展
+  存储层：有状态，分布式存储
+  元数据：分布式协调
+
+  优势：
+    计算资源独立扩展
+    存储资源独立扩展
+    成本优化（按需付费）
+    高可用（数据多副本）
+
+  挑战：
+    网络延迟（同机架优化）
+    数据一致性（强一致读写）
+    故障恢复（快速恢复）
+```
+
+### 13.2 存算分离配置
+
+```yaml
+# Lindorm存算分离配置
+storage:
+  type: distributed
+  replication: 3
+  strategy: rack-aware
+
+compute:
+  type: serverless
+  min_instances: 2
+  max_instances: 10
+  scale_policy: auto
+
+metadata:
+  type: distributed
+  replication: 3
+  strategy: majority
+```
+
+## 十四、Lindorm在IoT中的应用详解
+
+### 14.1 IoT应用场景
+
+| 场景 | 数据量 | 延迟要求 | 查询模式 |
+|------|--------|---------|---------|
+| 设备监控 | 大 | 实时 | 时间范围查询 |
+| 告警检测 | 大 | 实时 | 阈值检测 |
+| 历史分析 | 超大 | 批量 | 聚合分析 |
+| 预测维护 | 大 | 准实时 | 模式匹配 |
+
+### 14.2 IoT应用架构
+
+```
+IoT应用架构：
+  设备层 → MQTT Broker → Lindorm
+  
+  数据采集：
+    设备上报 → MQTT → 规则引擎 → Lindorm
+  
+  数据查询：
+    实时查询：设备状态查询
+    历史查询：时间范围查询
+    分析查询：聚合统计查询
+  
+  告警处理：
+    实时告警：阈值检测
+    趋势告警：异常检测
+    预测告警：机器学习
+```
+
+## 十五、Lindorm成本优化详解
+
+### 15.1 成本优化策略
+
+| 策略 | 做法 | 节省比例 | 实施难度 |
+|------|------|---------|---------|
+| 存储分层 | 热→温→冷自动迁移 | 30~50% | 中 |
+| 数据压缩 | 列式压缩 | 40~60% | 低 |
+| 数据过期 | TTL自动删除 | 20~30% | 低 |
+| 资源隔离 | 队列/命名空间隔离 | 15~25% | 中 |
+
+### 15.2 成本监控指标
+
+```
+成本监控指标：
+  存储成本：$/GB/月
+  计算成本：$/CU/小时
+  网络成本：$/GB出流量
+  API调用成本：$/1000次
+
+优化建议：
+  1. 定期清理过期数据（TTL策略）
+  2. 启用压缩（列式压缩率高）
+  3. 使用存算分离（按需付费）
+  4. 监控资源使用率（避免过度配置）
+  5. 使用冷存储（降低存储成本）
+```

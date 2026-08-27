@@ -1411,3 +1411,287 @@ ZooKeeper 性能调优：
   需要新特性 → ZooKeeper 3.8.x
   需要稳定性 → ZooKeeper 3.7.x
 ```
+
+## 十、ZAB协议详解
+
+### 10.1 ZAB协议核心
+
+```
+ZAB协议（ZooKeeper Atomic Broadcast）：
+  核心思想：主从架构 + 原子广播
+  
+  角色：
+    Leader：处理写请求，广播事务
+    Follower：处理读请求，参与投票
+    Observer：处理读请求，不参与投票
+
+  流程：
+    1. Leader选举
+    2. 数据同步
+    3. 原子广播
+    4. 故障恢复
+
+  保证：
+    顺序一致性
+    原子性
+    单一视图
+    持久性
+```
+
+### 10.2 ZAB vs Raft对比
+
+| 特性 | ZAB | Raft |
+|------|-----|------|
+| 选举 | 快速选举 | 随机超时 |
+| 日志复制 | 原子广播 | AppendEntries |
+| 成员变更 | 动态 | 静态 |
+| 适用场景 | 大数据生态 | 云原生 |
+| 实现复杂度 | 高 | 中 |
+
+## 十一、Watcher类型详解
+
+### 11.1 Watcher类型对比
+
+| Watcher类型 | 触发条件 | 一次性 | 适用场景 |
+|-------------|---------|--------|---------|
+| NodeCreated | 节点创建 | 是 | 监听节点创建 |
+| NodeDeleted | 节点删除 | 是 | 监听节点删除 |
+| NodeDataChanged | 节点数据变更 | 是 | 监听数据变更 |
+| NodeChildrenChanged | 子节点变更 | 是 | 监听子节点 |
+
+### 11.2 Watcher使用示例
+
+```java
+// Java Watcher使用
+zk.getData("/myNode", event -> {
+    if (event.getType() == Watcher.Event.EventType.NodeDataChanged) {
+        // 处理数据变更
+        byte[] data = zk.getData("/myNode", false, null);
+    }
+}, null);
+
+// Curator Watcher
+NodeCache nodeCache = new NodeCache(zk, "/myNode");
+nodeCache.getListenable().addListener(() -> {
+    // 处理节点变更
+});
+nodeCache.start();
+```
+
+## 十二、Curator框架详解
+
+### 12.1 Curator核心功能
+
+| 功能 | 说明 | 适用场景 |
+|------|------|---------|
+| 分布式锁 | InterProcessMutex | 分布式互斥 |
+| 分布式队列 | DistributedQueue | 任务调度 |
+| 分布式计数器 | DistributedAtomicLong | 分布式计数 |
+| 服务发现 | ServiceDiscovery | 微服务注册 |
+| 配置管理 | SharedConfig | 配置中心 |
+
+### 12.2 Curator使用示例
+
+```java
+// 分布式锁
+InterProcessMutex lock = new InterProcessMutex(client, "/locks/myLock");
+if (lock.acquire(10, TimeUnit.SECONDS)) {
+    try {
+        // 处理业务逻辑
+    } finally {
+        lock.release();
+    }
+}
+
+// 服务发现
+ServiceDiscovery<String> discovery = ServiceDiscoveryBuilder.builder(String.class)
+    .client(client)
+    .basePath("/services")
+    .build();
+discovery.start();
+
+ServiceInstance<String> instance = ServiceInstance.builder(String.class)
+    .name("myService")
+    .address("localhost:8080")
+    .build();
+discovery.registerService(instance);
+```
+
+## 十三、ZooKeeper配置中心设计详解
+
+### 13.1 配置中心架构
+
+```
+ZooKeeper配置中心：
+  数据模型：
+    /config
+      /app1
+        /database
+        /cache
+        /feature
+      /app2
+        /database
+        /cache
+
+  配置存储：
+    节点：配置路径
+    数据：配置内容（JSON/Properties）
+    版本：自动版本管理
+
+  配置推送：
+    Watcher机制：配置变更通知
+    增量推送：只推送变更配置
+    全量推送：初始化时全量获取
+```
+
+### 13.2 配置中心最佳实践
+
+```
+配置中心最佳实践：
+  1. 配置分层
+     → 基础配置：数据库/缓存
+     → 业务配置：功能开关
+     → 环境配置：开发/测试/生产
+
+  2. 配置版本
+     → 版本号管理
+     → 回滚支持
+     → 审计日志
+
+  3. 配置安全
+     → 敏感配置加密
+     → 权限控制
+     → 审计日志
+```
+
+## 十四、ZooKeeper集群扩容详解
+
+### 14.1 扩容步骤
+
+```bash
+# 1. 添加新节点
+# 修改zoo.cfg
+server.4=new-host:2888:3888
+
+# 2. 同步数据
+# 从现有节点同步数据到新节点
+rsync -avz /data/zookeeper/ new-host:/data/zookeeper/
+
+# 3. 更新myid
+echo "4" > /data/zookeeper/myid
+
+# 4. 启动新节点
+zkServer.sh start
+
+# 5. 更新所有节点配置
+# 在所有节点更新zoo.cfg
+
+# 6. 重启所有节点
+zkServer.sh restart
+```
+
+### 14.2 扩容注意事项
+
+```
+扩容注意事项：
+  1. 一次只添加一个节点
+  2. 等待数据同步完成
+  3. 验证集群状态
+  4. 监控性能变化
+
+  常见问题：
+    数据不一致：等待同步完成
+    选举失败：检查节点配置
+    性能下降：监控QPS/延迟
+```
+
+## 十五、ZK到etcd迁移详解
+
+### 15.1 迁移评估维度
+
+| 维度 | 评估内容 | 迁移难度 |
+|------|---------|---------|
+| 数据模型 | 树形→KV | 高 |
+| Watcher | 子节点→前缀 | 中 |
+| 一致性 | ZAB→Raft | 低 |
+| 客户端 | Java→Go/多语言 | 中 |
+| 运维 | 独立→K8s集成 | 低 |
+
+### 15.2 迁移方案
+
+```
+迁移方案：
+  阶段1：评估与设计
+    → 数据模型转换
+    → 客户端改造
+    → 测试方案
+
+  阶段2：并行运行
+    → ZK和etcd并行
+    → 数据双向同步
+    → 灰度切换
+
+  阶段3：切换完成
+    → 停止ZK
+    → 清理旧数据
+    → 监控稳定性
+```
+
+## 十六、ZooKeeper运维排障详解
+
+### 16.1 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 选举失败 | 检查网络/配置 | 修复网络/配置 |
+| 数据不一致 | 检查同步状态 | 手动同步数据 |
+| 性能下降 | 检查JVM/磁盘 | 调优/扩容 |
+| 连接数满 | 检查客户端 | 优化连接池 |
+
+### 16.2 运维SOP
+
+```bash
+# 日常检查
+echo ruok | nc localhost 2181
+echo stat | nc localhost 2181
+echo mntr | nc localhost 2181
+
+# 故障排查
+zkServer.sh start-foreground
+zkCli.sh -server localhost:2181
+
+# 数据修复
+zkCli.sh -server localhost:2181
+ls /
+get /myNode
+delete /myNode
+```
+
+## 十七、ZooKeeper安全加固详解
+
+### 17.1 安全加固措施
+
+| 措施 | 做法 | 目的 |
+|------|------|------|
+| 认证 | SASL/Kerberos | 身份验证 |
+| 授权 | ACL | 权限控制 |
+| 加密 | TLS | 传输加密 |
+| 审计 | 日志审计 | 操作追踪 |
+
+### 17.2 安全配置示例
+
+```bash
+# SASL认证配置
+zoo.cfg:
+  authProvider.1=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
+  jaasLoginRenew=3600000
+
+# JAAS配置
+ZooKeeperServer {
+    org.apache.zookeeper.server.auth.SASLAuthenticationProvider required
+    user_admin="password";
+};
+
+# ACL配置
+setAcl /myNode sasl:admin:rw
+```

@@ -1228,6 +1228,227 @@ shardingsphere:
 | max-connections-size-per-query | 1 | 1-3 | 连接数 |
 | check-table-metadata-enabled | true | false（生产） | 元数据检查 |
 
+## 分片算法详解
+
+### Standard 精确分片
+
+```java
+// 自定义标准分片算法
+public class UserShardingAlgorithm implements StandardShardingAlgorithm<String> {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, ShardingValue<String> shardingValue) {
+        String value = shardingValue.getValue();
+        int hash = value.hashCode() % availableTargetNames.size();
+        return availableTargetNames.stream().sorted().skip(hash).findFirst().orElse(null);
+    }
+}
+```
+
+### Range 范围分片
+
+```java
+// 范围分片算法
+public class OrderRangeShardingAlgorithm implements RangeShardingAlgorithm<String> {
+    @Override
+    public Collection<String> doSharding(Collection<String> availableTargetNames, RangeShardingValue<String> shardingValue) {
+        Range<Integer> range = shardingValue.getValueRange();
+        return availableTargetNames.stream()
+            .filter(name -> {
+                int shard = Integer.parseInt(name.replaceAll("\\D", ""));
+                return range.lowerEndpoint() <= shard && shard < range.upperEndpoint();
+            })
+            .collect(Collectors.toList());
+    }
+}
+```
+
+| 算法类型 | 适用场景 | 优点 | 缺点 |
+|----------|----------|------|------|
+| Hash 取模 | 均匀分布 | 数据均匀 | 扩容需迁移 |
+| Range 范围 | 按时间/ID范围查询 | 范围查询高效 | 热点风险 |
+| 自定义 | 复杂业务规则 | 灵活 | 开发成本高 |
+
+## 读写分离原理
+
+### 主从复制架构
+
+```mermaid
+flowchart LR
+    APP[应用] --> SHARDING[ShardingSphere]
+    SHARDING -->|写| MASTER[主库]
+    MASTER -->|复制| SLAVE1[从库1]
+    MASTER -->|复制| SLAVE2[从库2]
+    SHARDING -->|读| SLAVE1
+    SHARDING -->|读| SLAVE2
+```
+
+### 读写分离配置
+
+```yaml
+rules:
+  - !READWRITE_SPLITTING
+    dataSources:
+      ds_0:
+        writeDataSourceName: write_ds
+        readDataSourceNames:
+          - read_ds_0
+          - read_ds_1
+        loadBalancerName: round_robin
+    loadBalancers:
+      round_robin:
+        type: ROUND_ROBIN
+      random:
+        type: RANDOM
+      weight:
+        type: WEIGHT
+        props:
+          read_ds_0: 1
+          read_ds_1: 2
+```
+
+| 负载均衡策略 | 说明 | 适用场景 |
+|-------------|------|----------|
+| ROUND_ROBIN | 轮询 | 均衡负载 |
+| RANDOM | 随机 | 简单场景 |
+| WEIGHT | 权重 | 主从性能不同 |
+
+## 分布式事务（XA/Seata）
+
+### XA 模式
+
+```yaml
+rules:
+  - !TRANSACTION
+    default: XA
+    providerType: Atomikos
+```
+
+```java
+// XA 事务流程
+// 1. 开启 XA 事务
+connection.setAutoCommit(false);
+String xid = connectionNative.xaStart();
+
+// 2. 执行 SQL
+connection.prepareStatement("INSERT INTO orders...").execute();
+
+// 3. 准备阶段
+connectionNative.xaEnd(xid);
+connectionNative.xaPrepare(xid);
+
+// 4. 提交阶段（两阶段提交）
+connectionNative.xaCommit(xid);
+```
+
+### Seata AT 模式
+
+```mermaid
+flowchart TB
+    A[一阶段] --> B[解析SQL]
+    B --> C[生成前镜像]
+    C --> D[执行SQL]
+    D --> E[生成后镜像]
+    E --> F[提交本地事务]
+    F --> G[上报TC]
+    H[二阶段-提交] --> I[删除镜像]
+    H[二阶段-回滚] --> J[对比镜像]
+    J --> K[生成补偿SQL]
+```
+
+| 模式 | 性能 | 一致性 | 侵入性 | 适用场景 |
+|------|------|--------|--------|----------|
+| XA | 低 | 强 | 低 | 金融核心 |
+| Seata AT | 高 | 最终 | 低 | 业务系统 |
+| Seata TCC | 高 | 最终 | 高 | 高性能 |
+
+## 分布式 ID 生成
+
+### 雪花算法原理
+
+```text
+Snowflake ID 结构（64 位）：
+  0 | 41 位时间戳 | 10 位机器ID | 12 位序列号
+
+  时间戳：毫秒级，可用 69 年
+  机器ID：支持 1024 个节点
+  序列号：每毫秒 4096 个 ID
+```
+
+### 各方案对比
+
+| 方案 | 性能 | 有序性 | 依赖 | 适用场景 |
+|------|------|--------|------|----------|
+| UUID | 极高 | 无序 | 无 | 测试/日志 |
+| 雪花算法 | 高 | 递增 | 时钟 | 通用业务 |
+| Leaf（美团） | 高 | 递增 | MySQL/号段 | 大规模 |
+| 自增长 | 中 | 严格递增 | MySQL | 单库 |
+
+## ShardingSphere-JDBC vs ShardingSphere-Proxy
+
+| 维度 | Sharding-JDBC | Sharding-Proxy |
+|------|---------------|----------------|
+| 架构 | 客户端嵌入 | 独立代理 |
+| 性能 | 高（无网络开销） | 中（多一跳） |
+| 语言 | Java only | 任意语言 |
+| 运维 | 需改应用配置 | 独立管理 |
+| 适用 | Java 微服务 | 异构系统 |
+
+## 数据加密
+
+```yaml
+# 透明加密配置
+rules:
+  - !ENCRYPT
+    tables:
+      t_user:
+        columns:
+          phone:
+            cipher:
+              type: AES
+              props:
+                aes.key: 1234567890abcdef
+            plain:
+              type: PLAIN
+              props:
+                plain.value: 1234567890abcdef
+```
+
+| 加密算法 | 密钥长度 | 安全性 | 性能 |
+|----------|----------|--------|------|
+| AES | 128/256位 | 高 | 高 |
+| RSA | 2048位 | 高 | 中 |
+| SM4 | 128位 | 国密 | 中 |
+
+## 影子库压测
+
+```yaml
+# 影子库配置
+rules:
+  - !SHADOW
+    dataSources:
+      shadow_ds:
+        sourceDataSourceName: ds
+        shadowDataSourceName: shadow_ds
+    tables:
+      t_order:
+        dataSources:
+          shadow_ds:
+            sourceAlgorithmName: simple_match
+    shadowAlgorithms:
+      simple_match:
+        type: REGEX_MATCH
+        props:
+          operation: insert|update|delete
+          column: user_id
+          regex: "^[1-9]\\d*$"
+```
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| sourceAlgorithmName | 流量匹配算法 | REGEX_MATCH |
+| shadowDataSourceName | 影子库 | shadow_ds |
+| operation | SQL 类型匹配 | insert/update/delete |
+
 ## 十九、与其他板块的关系
 
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。

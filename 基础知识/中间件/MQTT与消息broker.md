@@ -1385,6 +1385,204 @@ MQTT 安全加固清单：
      └── [ ] 定期安全扫描
 ```
 
+## 八、MQTT 5.0新特性详解
+
+### 8.1 MQTT 5.0 vs 3.1.1对比
+
+| 特性 | MQTT 3.1.1 | MQTT 5.0 |
+|------|------------|----------|
+| 协议版本号 | 4字节 | 5字节 |
+| 可变头 | 无Properties | Properties |
+| 订阅确认 | SUBACK | SUBACK + Properties |
+| 取消订阅 | UNSUBSCRIBE | UNSUBSCRIBE + Properties |
+| 断开连接 | DISCONNECT | DISCONNECT + Properties |
+| 共享订阅 | 不支持 | 支持 |
+| 响应信息 | 不支持 | 支持 |
+| 会话过期 | 无 | 支持 |
+| 消息过期 | 无 | 支持 |
+| 流控 | 无 | 支持 |
+
+### 8.2 MQTT 5.0核心特性
+
+```
+MQTT 5.0核心特性：
+  1. Properties
+     → 用户属性（User Properties）
+     → 内容类型（Content Type）
+     → 响应主题（Response Topic）
+     → 关联数据（Correlation Data）
+
+  2. 共享订阅
+     → $share/group/topic
+     → 负载均衡
+     → 故障转移
+
+  3. 消息过期
+     → Message Expiry Interval
+     → 自动删除过期消息
+     → 避免消息堆积
+
+  4. 流控
+     → Receive Maximum
+     → Maximum Packet Size
+     → 防止Broker过载
+
+  5. 响应信息
+     → Response Information
+     → 请求-响应模式
+     → 异步响应
+
+  6. 会话过期
+     → Session Expiry Interval
+     → 自动清理会话
+     → 资源释放
+```
+
+## 九、MQTT认证与授权深度对比
+
+### 9.1 认证方式对比
+
+| 认证方式 | 安全性 | 性能 | 实现复杂度 | 适用场景 |
+|---------|--------|------|-----------|---------|
+| 用户名密码 | 中 | 高 | 低 | 通用 |
+| 客户端证书 | 高 | 中 | 高 | 高安全要求 |
+| JWT Token | 中 | 高 | 中 | OAuth2集成 |
+| OAuth2 | 高 | 中 | 高 | 企业集成 |
+| LDAP | 高 | 中 | 高 | 企业目录集成 |
+
+### 9.2 ACL授权策略
+
+```
+MQTT ACL策略：
+  基于客户端ID：
+    clientid=device_001 → topic=device/001/#
+
+  基于用户名：
+    username=admin → topic=#
+    username=device → topic=device/{username}/#
+
+  基于IP：
+    ip=192.168.1.* → topic=local/#
+
+  基于认证方式：
+    cert → topic=secure/#
+    password → topic=standard/#
+
+ACL规则示例：
+  # EMQX ACL配置
+  {allow, {user, "device"}, subscribe, ["device/#"]}.
+  {allow, {user, "admin"}, publish, ["device/#"]}.
+  {allow, {ipaddr, "192.168.1.0/24"}, subscribe, ["local/#"]}.
+  {deny, all}.
+```
+
+## 十、MQTT与Kafka集成详解
+
+### 10.1 MQTT-Kafka桥接架构
+
+```
+MQTT-Kafka桥接：
+  MQTT Broker → Kafka Connect → Kafka Topic
+
+  架构选择：
+    方案1：MQTT Broker自带Kafka插件
+    方案2：Kafka Connect MQTT Source
+    方案3：自定义桥接服务
+
+  数据格式：
+    MQTT消息 → JSON/Avro → Kafka消息
+
+  主题映射：
+    MQTT: device/{device_id}/data
+    Kafka: device-data-{device_id}
+```
+
+### 10.2 集成配置示例
+
+```yaml
+# Kafka Connect MQTT Source
+name: mqtt-source-connector
+config:
+  tasks.max: 1
+  kafka.topic: device-data
+  mqtt.server.uri: tcp://broker:1883
+  mqtt.topics: device/+/data
+  mqtt.qos: 1
+  key.converter: org.apache.kafka.connect.storage.StringConverter
+  value.converter: org.apache.kafka.connect.json.JsonConverter
+  value.converter.schemas.enable: false
+```
+
+## 十一、IoT消息模式详解
+
+### 11.1 IoT消息模式
+
+| 模式 | 描述 | 适用场景 | QoS要求 |
+|------|------|---------|---------|
+| 遥测上报 | 设备→云端 | 状态监控 | QoS 0/1 |
+| 命令下发 | 云端→设备 | 远程控制 | QoS 1/2 |
+| 双向通信 | 设备↔云端 | 交互控制 | QoS 1 |
+| 广播 | 云端→多设备 | 固件升级 | QoS 0 |
+| 组播 | 云端→设备组 | 分组控制 | QoS 1 |
+
+### 11.2 IoT消息模式实现
+
+```
+遥测上报模式：
+  Topic: device/{device_id}/telemetry
+  QoS: 0（允许丢失）或 1（保证到达）
+  Payload: JSON（温度/湿度/位置）
+
+命令下发模式：
+  Topic: device/{device_id}/command
+  QoS: 2（保证一次到达）
+  Payload: JSON（命令+参数）
+
+双向通信模式：
+  Topic: device/{device_id}/request
+  Topic: device/{device_id}/response
+  QoS: 1（保证到达）
+  Payload: JSON（请求ID+数据）
+```
+
+## 十二、EMQX vs Mosquitto对比详解
+
+### 12.1 功能对比
+
+| 特性 | EMQX | Mosquitto |
+|------|------|-----------|
+| 协议支持 | MQTT 3.1.1/5.0/WebSocket | MQTT 3.1.1/5.0 |
+| 集群 | 原生支持 | 需要插件 |
+| 桥接 | 内置支持 | 插件支持 |
+| 规则引擎 | 内置 | 无 |
+| HTTP API | 内置 | 无 |
+| 认证 | 多种 | 基础 |
+| ACL | 灵活 | 基础 |
+| 监控 | 内置Dashboard | 无 |
+| 性能 | 高 | 中 |
+| 扩展性 | 高（插件/模块） | 低 |
+| 社区 | 活跃 | 活跃 |
+| 商业版 | 有 | 无 |
+
+### 12.2 选型建议
+
+```
+选择EMQX：
+  1. 需要集群部署
+  2. 需要规则引擎
+  3. 需要HTTP API集成
+  4. 需要高级认证/ACL
+  5. 需要监控Dashboard
+  6. 大规模IoT部署
+
+选择Mosquitto：
+  1. 简单MQTT Broker
+  2. 资源受限环境
+  3. 单机部署
+  4. 快速原型开发
+  5. 学习MQTT协议
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

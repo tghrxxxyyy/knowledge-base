@@ -1394,6 +1394,283 @@ from(bucket: "telegraf")
 | 存储满 | 检查保留策略/清理 | 扩容/清理 |
 | 高可用故障 | 检查节点状态 | 重启/恢复 |
 
+---
+
+## InfluxDB 深度调优实战
+
+### 写入性能优化
+
+```bash
+# InfluxDB 写入调优参数
+[data]
+  # Cache 配置
+  cache-max-memory-size = "1g"           # Cache 最大内存
+  cache-snapshot-memory-size = "256m"    # Cache 快照内存
+  cache-snapshot-write-cold-duration = "5m"  # 冷数据刷盘间隔
+
+  # WAL 配置
+  wal-dir = "/var/lib/influxdb/wal"
+  wal-fsync-delay = "100ms"              # WAL fsync 延迟
+
+  # Compaction 配置
+  compact-throughput = "64m"             # Compaction 吞吐
+  compact-throughput-burst = "128m"      # Compaction 突发吞吐
+  max-concurrent-compactions = 2         # 最大并发 Compaction
+
+  # 并发配置
+  max-insert-cpu = 4                     # 写入并发 CPU
+  max-insert-memory = "2g"               # 写入内存限制
+```
+
+```python
+# Python 批量写入示例（优化版）
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import ASYNCHRONOUS
+import time
+
+client = InfluxDBClient(url="http://localhost:8086", token="my-token", org="myorg")
+write_api = client.write_api(write_options=ASYNCHRONOUS)
+
+def batch_write_optimized(points, batch_size=5000):
+    """优化批量写入"""
+    for i in range(0, len(points), batch_size):
+        batch = points[i:i + batch_size]
+        write_api.write(bucket="metrics", record=batch)
+        # 控制写入速率，避免压垮数据库
+        time.sleep(0.1)
+
+# 生成测试数据
+points = []
+for i in range(100000):
+    point = Point("sensor") \
+        .tag("device", f"device_{i % 100}") \
+        .field("temperature", 20 + i * 0.01) \
+        .field("humidity", 50 + i * 0.005) \
+        .time(i, WritePrecision.MS)
+    points.append(point)
+
+batch_write_optimized(points)
+```
+
+### 查询性能优化
+
+```sql
+-- 查询优化技巧
+
+-- 1. 始终带时间下界（避免全量扫描）
+SELECT mean("usage") FROM "cpu" WHERE time >= now() - 1h GROUP BY time(5m)
+
+-- 2. 使用 tag 过滤（索引查询，高效）
+SELECT mean("usage") FROM "cpu" WHERE "host" = 'web-01' AND time >= now() - 1h
+
+-- 3. 避免 SELECT *（只查询需要的字段）
+SELECT "usage", "load" FROM "cpu" WHERE time >= now() - 1h
+
+-- 4. 使用连续查询预计算（降采样）
+CREATE CONTINUOUS QUERY "cq_cpu_5m" ON "metrics"
+BEGIN
+  SELECT mean("usage") INTO "metrics"."rp_warm"."cpu_5m"
+  FROM "metrics"."rp_hot"."cpu"
+  GROUP BY time(5m), *
+END;
+
+-- 5. 查询降采样后的数据（更快）
+SELECT mean("usage") FROM "metrics"."rp_warm"."cpu_5m" WHERE time >= now() - 1d
+
+-- 6. 使用 EXPLAIN 查看查询计划
+EXPLAIN SELECT mean("usage") FROM "cpu" WHERE time >= now() - 1h
+```
+
+### 存储优化
+
+```sql
+-- 多层保留策略（冷热分层）
+-- 热数据：7天，shard 1天
+CREATE RETENTION POLICY "rp_hot" ON "metrics"
+DURATION 7d REPLICATION 1 SHARD DURATION 1d DEFAULT;
+
+-- 温数据：30天，shard 7天
+CREATE RETENTION POLICY "rp_warm" ON "metrics"
+DURATION 30d REPLICATION 1 SHARD DURATION 7d;
+
+-- 冷数据：90天，shard 7天
+CREATE RETENTION POLICY "rp_cold" ON "metrics"
+DURATION 90d REPLICATION 1 SHARD DURATION 7d;
+
+-- 归档数据：365天，shard 7天
+CREATE RETENTION POLICY "rp_archive" ON "metrics"
+DURATION 365d REPLICATION 1 SHARD DURATION 7d;
+
+-- 降采样任务：热 → 温
+CREATE CONTINUOUS QUERY "cq_5m" ON "metrics"
+BEGIN
+  SELECT mean("usage") INTO "metrics"."rp_warm"."cpu_5m"
+  FROM "metrics"."rp_hot"."cpu"
+  GROUP BY time(5m), *
+END;
+
+-- 降采样任务：温 → 冷
+CREATE CONTINUOUS QUERY "cq_1h" ON "metrics"
+BEGIN
+  SELECT mean("usage") INTO "metrics"."rp_cold"."cpu_1h"
+  FROM "metrics"."rp_warm"."cpu_5m"
+  GROUP BY time(1h), *
+END;
+```
+
+### 高可用架构设计
+
+```mermaid
+flowchart TB
+    subgraph 写入层
+        A1[Telegraf] --> B1[InfluxDB 1\n写入节点]
+        A1 --> B2[InfluxDB 2\n写入节点]
+        A1 --> B3[InfluxDB 3\n写入节点]
+    end
+    
+    subgraph 存储层
+        B1 --> C1[本地磁盘\n+ WAL]
+        B2 --> C1
+        B3 --> C1
+        C1 --> D1[对象存储\nS3/OSS]
+    end
+    
+    subgraph 查询层
+        E1[Grafana] --> F1[InfluxDB Enterprise\n查询节点]
+        E1 --> F2[InfluxDB Enterprise\n查询节点]
+        F1 --> C1
+        F2 --> C1
+    end
+    
+    subgraph 元数据
+        G1[Meta Node 1] --> G2[Meta Node 2]
+        G1 --> G3[Meta Node 3]
+    end
+```
+
+### Kubernetes 部署配置
+
+```yaml
+# InfluxDB StatefulSet 配置
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: influxdb
+spec:
+  replicas: 3
+  serviceName: influxdb
+  selector:
+    matchLabels:
+      app: influxdb
+  template:
+    metadata:
+      labels:
+        app: influxdb
+    spec:
+      containers:
+      - name: influxdb
+        image: influxdb:2.7
+        ports:
+        - containerPort: 8086
+          name: api
+        - containerPort: 8088
+          name: backup
+        env:
+        - name: INFLUXD_DB
+          value: "metrics"
+        - name: INFLUXD_HTTP_AUTH_ENABLED
+          value: "true"
+        - name: INFLUXD_ADMIN_USER
+          valueFrom:
+            secretKeyRef:
+              name: influxdb-secrets
+              key: admin-user
+        - name: INFLUXD_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: influxdb-secrets
+              key: admin-password
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/influxdb2
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8086
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8086
+          initialDelaySeconds: 5
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 100Gi
+```
+
+### 监控与告警配置
+
+```yaml
+# Prometheus 监控 InfluxDB
+groups:
+  - name: influxdb_alerts
+    rules:
+      # 写入延迟告警
+      - alert: InfluxDB_WriteLatencyHigh
+        expr: influxdb_write_requests_duration_seconds{quantile="0.99"} > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InfluxDB 写入延迟过高"
+          description: "P99 写入延迟: {{ $value }}s"
+      
+      # 查询延迟告警
+      - alert: InfluxDB_QueryLatencyHigh
+        expr: influxdb_query_requests_duration_seconds{quantile="0.99"} > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InfluxDB 查询延迟过高"
+          description: "P99 查询延迟: {{ $value }}s"
+      
+      # 磁盘使用率告警
+      - alert: InfluxDB_DiskUsageHigh
+        expr: (1 - influxdb_data_disk_free_bytes / influxdb_data_disk_total_bytes) > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "InfluxDB 磁盘使用率过高"
+          description: "磁盘使用率: {{ $value | humanizePercentage }}"
+      
+      # Series 基数告警
+      - alert: InfluxDB_SeriesCardinalityHigh
+        expr: influxdb_series_cardinality > 1000000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InfluxDB Series 基数过高"
+          description: "当前 Series 数: {{ $value }}"
+```
+
 ## InfluxDB 资源规划
 
 ### 资源规划建议

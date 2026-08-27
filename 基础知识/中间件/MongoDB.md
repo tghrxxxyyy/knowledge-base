@@ -1443,4 +1443,146 @@ PITR（Point-in-Time Recovery）：
   保留策略：至少保留 7 天
 ```
 
+## 分片键选择深度
+
+### 分片键选择原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 高基数 | 唯一值足够多 | user_id 而非 status |
+| 写分布均匀 | 避免热点 | hash(user_id) |
+| 查询常用 | 支持常见查询 | 包含在查询条件中 |
+| 非单调递增 | 避免写热点 | 避免自增 _id |
+
+### 分片键示例
+
+```javascript
+// 好的分片键：高基数 + 写均匀
+sh.shardCollection("db.orders", { user_id: "hashed" })
+
+// 好的分片键：复合分片
+sh.shardCollection("db.orders", { user_id: 1, order_date: -1 })
+
+// 差的分片键：单调递增（写热点）
+sh.shardCollection("db.logs", { _id: 1 })
+```
+
+## Change Streams 实战
+
+### Change Streams 配置
+
+```javascript
+// 监听集合变更
+const changeStream = db.orders.watch();
+changeStream.on("change", (change) => {
+    console.log("操作类型:", change.operationType);
+    console.log("文档:", change.fullDocument);
+    console.log("变更字段:", change.updateDescription);
+});
+
+// 带过滤的 Change Streams
+const pipeline = [
+    { $match: { "operationType": "insert" } },
+    { $match: { "fullDocument.status": "pending" } }
+];
+const changeStream = db.orders.watch(pipeline);
+```
+
+| 特性 | 说明 |
+|------|------|
+| 实时性 | 毫秒级延迟 |
+| 持久化 | 基于 oplog |
+| 过滤 | 支持管道过滤 |
+| 重放 | 支持 resume token |
+
+## Atlas Search 全文搜索
+
+### 搜索索引配置
+
+```javascript
+// 创建搜索索引
+db.orders.createSearchIndex({
+    name: "order_search",
+    definition: {
+        mappings: {
+            dynamic: false,
+            fields: {
+                product_name: { type: "string" },
+                description: { type: "string" },
+                price: { type: "number" }
+            }
+        }
+    }
+});
+
+// 全文搜索查询
+db.orders.aggregate([
+    {
+        $search: {
+            text: {
+                query: "wireless headphones",
+                path: "product_name"
+            }
+        }
+    },
+    { $limit: 10 }
+]);
+```
+
+## 聚合管道优化
+
+### 聚合性能优化
+
+| 优化策略 | 说明 | 示例 |
+|----------|------|------|
+| $match 前置 | 尽早过滤数据 | 放在管道开头 |
+| $project 裁剪 | 减少传输字段 | 只选需要的字段 |
+| 索引利用 | 支持管道索引 | 与 $match 配合 |
+| $limit 前置 | 减少处理量 | 尽早限制数量 |
+
+```javascript
+// 优化后的聚合管道
+db.orders.aggregate([
+    { $match: { status: "active", date: { $gte: ISODate("2025-01-01") } } },
+    { $project: { user_id: 1, amount: 1, date: 1 } },
+    { $group: { _id: "$user_id", total: { $sum: "$amount" } } },
+    { $sort: { total: -1 } },
+    { $limit: 10 }
+]);
+```
+
+## 事务限制与最佳实践
+
+### 事务限制
+
+| 限制 | 说明 |
+|------|------|
+| 操作数 | 单事务最多 1000 个操作 |
+| 文档大小 | 单文档 16MB |
+| oplog 大小 | 事务日志不能超过 16MB |
+| 副本集 | 必须是副本集 |
+| 存储引擎 | 必须是 WiredTiger |
+
+### 事务最佳实践
+
+```javascript
+// 事务使用模式
+const session = client.startSession();
+try {
+    session.startTransaction({
+        readConcern: { level: "snapshot" },
+        writeConcern: { w: "majority" }
+    });
+    
+    db.orders.insertOne({ ... }, { session });
+    db.inventory.updateOne({ ... }, { session });
+    
+    session.commitTransaction();
+} catch (error) {
+    session.abortTransaction();
+} finally {
+    session.endSession();
+}
+```
+
 ## 二十六、与其他板块的关系

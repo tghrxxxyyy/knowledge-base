@@ -1395,6 +1395,472 @@ Status s = txn->Commit();
 delete txn;
 ```
 
+## RocksDB 深度调优实战
+
+### Write Buffer Manager 实战
+
+```cpp
+// 场景：多Column Family共享内存限制
+// 防止单个CF独占内存导致OOM
+
+class MemoryBoundedDB {
+public:
+    MemoryBoundedDB(size_t total_memory_budget) {
+        // 1. 创建Write Buffer Manager，限制总MemTable内存
+        write_buffer_manager_ = std::make_shared<WriteBufferManager>(
+            total_memory_budget * 0.4  // 40%给MemTable
+        );
+        
+        // 2. 创建Block Cache，共享剩余内存
+        block_cache_ = NewLRUCache(total_memory_budget * 0.6);  // 60%给BlockCache
+        
+        // 3. 配置每个CF
+        ColumnFamilyOptions cf_options;
+        cf_options.write_buffer_manager = write_buffer_manager_;
+        
+        BlockBasedTableOptions table_options;
+        table_options.block_cache = block_cache_;
+        table_options.cache_index_and_filter_blocks = true;
+        cf_options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+        
+        // 4. 创建多个CF
+        std::vector<ColumnFamilyDescriptor> cf_descriptors = {
+            {"default", cf_options},
+            {"metadata", cf_options},
+            {"logs", cf_options}
+        };
+    }
+    
+    void MonitorMemory() {
+        // 监控内存使用
+        size_t memtable_usage = write_buffer_manager_->memory_usage();
+        size_t block_cache_usage = block_cache_->GetUsage();
+        
+        std::cout << "MemTable 使用: " << memtable_usage / 1024 / 1024 << "MB" << std::endl;
+        std::cout << "BlockCache 使用: " << block_cache_usage / 1024 / 1024 << "MB" << std::endl;
+        
+        // 检查是否接近限制
+        if (memtable_usage > write_buffer_manager_->buffer_limit() * 0.9) {
+            std::cerr << "警告：MemTable 使用率超过 90%" << std::endl;
+        }
+    }
+
+private:
+    std::shared_ptr<WriteBufferManager> write_buffer_manager_;
+    std::shared_ptr<Cache> block_cache_;
+};
+```
+
+### Compaction 策略深度对比
+
+```text
+Leveled vs Universal vs FIFO 选型决策：
+
+┌─────────────────┬─────────────────┬─────────────────┬─────────────────┐
+│ 场景            │ 推荐策略        │ 原因            │ 关键参数        │
+├─────────────────┼─────────────────┼─────────────────┼─────────────────┤
+│ 通用OLTP        │ Leveled         │ 读放大低        │ L1=256MB        │
+│ 写密集日志      │ Universal       │ 写放大低        │ size_ratio=1    │
+│ 时序数据        │ FIFO            │ 简单高效        │ max_table=1GB   │
+│ 大Value存储     │ Leveled+BlobDB  │ 减少写放大      │ min_blob=1KB    │
+│ 读写均衡        │ Leveled         │ 综合最优        │ 动态层级        │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────┘
+```
+
+```cpp
+// Universal Compaction 优化配置（写密集场景）
+options.compaction_style = kCompactionStyleUniversal;
+
+// 关键参数调优
+options.compaction_options_universal.size_ratio = 1;        // 相邻文件大小比阈值
+options.compaction_options_universal.min_merge_width = 2;   // 最小合并文件数
+options.compaction_options_universal.max_merge_width = UINT_MAX;  // 最大合并文件数
+options.compaction_options_universal.max_size_amplification_percent = 200;  // 空间放大上限
+
+// 启用 incremental compaction（减少写放大）
+options.compaction_options_universal.allow_trivial_move = true;
+```
+
+### FIFO Compaction 实战
+
+```cpp
+// FIFO Compaction：时序数据最佳选择
+options.compaction_style = kCompactionStyleFIFO;
+
+// 配置：只保留最近的数据
+options.compaction_options_fifo.max_table_files_size = 10ULL * 1024 * 1024 * 1024;  // 10GB
+options.compaction_options_fifo.allow_compaction = false;  // 不做合并，只删除最老文件
+
+// 适用场景：
+// - IoT传感器数据
+// - 日志存储
+// - 监控指标
+// - 任何只追加、不需要更新的时序数据
+
+// 优势：
+// - 写放大接近 1x（几乎无Compaction）
+// - 空间放大接近 1x（无冗余）
+// - 写入性能极高
+```
+
+### TTL数据自动清理实现
+
+```cpp
+// 完整的TTL自动清理实现
+class TTLCompactionFilter : public CompactionFilter {
+public:
+    TTLCompactionFilter(uint64_t ttl_seconds, const std::string& ts_field)
+        : ttl_seconds_(ttl_seconds), ts_field_(ts_field) {}
+
+    Decision FilterV2(int level, const Slice& key,
+                      ValueType value_type, const Slice& value,
+                      std::string* new_value,
+                      std::string* skip_until) override {
+        if (value_type != ValueType::kValue) {
+            return Decision::kKeep;
+        }
+
+        // 解析JSON value，获取时间戳字段
+        std::string json_str(value.data(), value.size());
+        // 假设value是JSON格式，包含时间戳字段
+        // 实际项目中需要使用JSON解析库
+        
+        // 简化示例：假设前8字节是时间戳
+        if (value.size() < 8) {
+            return Decision::kKeep;
+        }
+
+        uint64_t timestamp = DecodeFixed64(value.data());
+        uint64_t now = GetCurrentTimestamp();
+
+        if (now - timestamp > ttl_seconds_) {
+            return Decision::kRemove;  // 超过TTL，删除
+        }
+
+        // 可选：返回修改后的value（如移除过期字段）
+        if (new_value) {
+            new_value->assign(value.data(), value.size());
+        }
+        return Decision::kKeep;
+    }
+
+    const char* Name() const override {
+        return "TTLCompactionFilter";
+    }
+
+private:
+    uint64_t ttl_seconds_;
+    std::string ts_field_;
+    
+    uint64_t GetCurrentTimestamp() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+    }
+};
+
+// 注册Filter
+class TTLCompactionFilterFactory : public CompactionFilterFactory {
+public:
+    TTLCompactionFilterFactory(uint64_t default_ttl, const std::string& ts_field)
+        : default_ttl_(default_ttl), ts_field_(ts_field) {}
+
+    std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+        const CompactionFilter::Context& context) override {
+        return std::unique_ptr<CompactionFilter>(
+            new TTLCompactionFilter(default_ttl_, ts_field_)
+        );
+    }
+
+    const char* Name() const override {
+        return "TTLCompactionFilterFactory";
+    }
+
+private:
+    uint64_t default_ttl_;
+    std::string ts_field_;
+};
+
+// 配置使用
+options.compaction_filter_factory = std::make_shared<TTLCompactionFilterFactory>(
+    86400 * 7,  // 默认7天TTL
+    "created_at"  // 时间戳字段名
+);
+```
+
+### RocksDB监控与告警
+
+```yaml
+# Prometheus监控RocksDB指标
+groups:
+  - name: rocksdb_alerts
+    rules:
+      # L0文件数过多告警
+      - alert: RocksDB_L0FilesHigh
+        expr: rocksdb_num_files_at_level0 > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RocksDB L0文件数过多"
+          description: "L0文件数: {{ $value }}，可能导致写入停滞"
+      
+      # Compaction堆积告警
+      - alert: RocksDB_CompactionPending
+        expr: rocksdb_compaction_pending > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RocksDB Compaction堆积"
+          description: "待Compaction数: {{ $value }}"
+      
+      # BlockCache命中率低
+      - alert: RocksDB_CacheHitRateLow
+        expr: rocksdb_block_cache_hit_rate < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RocksDB BlockCache命中率低"
+          description: "命中率: {{ $value }}，建议增大BlockCache"
+      
+      # 写放大过高
+      - alert: RocksDB_WriteAmplificationHigh
+        expr: rocksdb_write_amplification > 20
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RocksDB写放大过高"
+          description: "写放大: {{ $value }}x，建议优化Compaction策略"
+      
+      # 磁盘空间不足
+      - alert: RocksDB_DiskSpaceLow
+        expr: rocksdb_total_sst_files_size / node_filesystem_size_bytes > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RocksDB磁盘空间不足"
+          description: "磁盘使用率: {{ $value | humanizePercentage }}"
+```
+
+### RocksDB备份与恢复最佳实践
+
+```bash
+#!/bin/bash
+# RocksDB备份脚本
+
+DB_PATH="/data/rocksdb"
+BACKUP_PATH="/backup/rocksdb"
+RETENTION_DAYS=7
+
+# 1. 创建Checkpoint（秒级）
+create_checkpoint() {
+    local checkpoint_dir="${BACKUP_PATH}/checkpoint_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$checkpoint_dir"
+    
+    # 使用RocksDB工具创建Checkpoint
+    ./rocksdb_checkpoint --checkpoint_dir="$checkpoint_dir" --db_path="$DB_PATH"
+    
+    echo "Checkpoint创建成功: $checkpoint_dir"
+}
+
+# 2. 增量备份到S3
+backup_to_s3() {
+    local checkpoint_dir=$1
+    local s3_bucket="s3://my-rocksdb-backup"
+    
+    # 使用AWS CLI上传
+    aws s3 sync "$checkpoint_dir" "${s3_bucket}/$(basename $checkpoint_dir)" \
+        --storage-class STANDARD_IA \
+        --sse AES256
+    
+    echo "备份上传到S3: ${s3_bucket}/$(basename $checkpoint_dir)"
+}
+
+# 3. 清理过期备份
+cleanup_old_backups() {
+    find "$BACKUP_PATH" -name "checkpoint_*" -mtime +$RETENTION_DAYS -exec rm -rf {} \;
+    echo "清理${RETENTION_DAYS}天前的备份"
+}
+
+# 4. 验证备份完整性
+verify_backup() {
+    local backup_dir=$1
+    
+    # 检查关键文件是否存在
+    if [ -f "${backup_dir}/CURRENT" ] && [ -f "${backup_dir}/MANIFEST-000001" ]; then
+        echo "备份验证通过"
+        return 0
+    else
+        echo "备份验证失败"
+        return 1
+    fi
+}
+
+# 主流程
+main() {
+    echo "开始RocksDB备份..."
+    
+    # 创建Checkpoint
+    checkpoint_dir=$(create_checkpoint)
+    
+    # 验证备份
+    if verify_backup "$checkpoint_dir"; then
+        # 上传到S3
+        backup_to_s3 "$checkpoint_dir"
+        
+        # 清理旧备份
+        cleanup_old_backups
+        
+        echo "备份完成"
+    else
+        echo "备份失败"
+        exit 1
+    fi
+}
+
+main
+```
+
+### RocksDB性能基准测试
+
+```cpp
+// RocksDB基准测试工具
+#include "include/rocksdb/db.h"
+#include "include/rocksdb/write_batch.h"
+#include <chrono>
+#include <random>
+#include <iostream>
+
+class RocksDBBenchmark {
+public:
+    RocksDBBenchmark(const std::string& db_path) {
+        rocksdb::Options options;
+        options.create_if_not_found = true;
+        options.compression = rocksdb::kLZ4Compression;
+        options.write_buffer_size = 64 * 1024 * 1024;  // 64MB
+        options.max_write_buffer_number = 3;
+        options.level0_file_num_compaction_trigger = 4;
+        options.max_bytes_for_level_base = 256 * 1024 * 1024;  // 256MB
+        options.target_file_size_base = 64 * 1024 * 1024;  // 64MB
+        
+        rocksdb::DB* db;
+        rocksdb::DB::Open(options, db_path, &db);
+        db_.reset(db);
+    }
+    
+    void BenchmarkRandomWrite(int num_keys, int value_size) {
+        std::cout << "=== 随机写入基准测试 ===" << std::endl;
+        std::cout << "键数量: " << num_keys << std::endl;
+        std::cout << "Value大小: " << value_size << " bytes" << std::endl;
+        
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, num_keys - 1);
+        
+        std::string value(value_size, 'v');
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        for (int i = 0; i < num_keys; i++) {
+            std::string key = "key_" + std::to_string(dis(gen));
+            db_->Put(rocksdb::WriteOptions(), key, value);
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        
+        double ops_per_sec = num_keys * 1000.0 / duration.count();
+        std::cout << "耗时: " << duration.count() << "ms" << std::endl;
+        std::cout << "吞吐: " << ops_per_sec << " ops/sec" << std::endl;
+        std::cout << std::endl;
+    }
+    
+    void BenchmarkRandomRead(int num_keys, int read_count) {
+        std::cout << "=== 随机读取基准测试 ===" << std::endl;
+        std::cout << "键数量: " << num_keys << std::endl;
+        std::cout << "读取次数: " << read_count << std::endl;
+        
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, num_keys - 1);
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        for (int i = 0; i < read_count; i++) {
+            std::string key = "key_" + std::to_string(dis(gen));
+            std::string value;
+            db_->Get(rocksdb::ReadOptions(), key, &value);
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        
+        double ops_per_sec = read_count * 1000.0 / duration.count();
+        std::cout << "耗时: " << duration.count() << "ms" << std::endl;
+        std::cout << "吞吐: " << ops_per_sec << " ops/sec" << std::endl;
+        std::cout << std::endl;
+    }
+    
+    void BenchmarkScan(int num_keys, int scan_count) {
+        std::cout << "=== 范围扫描基准测试 ===" << std::endl;
+        std::cout << "键数量: " << num_keys << std::endl;
+        std::cout << "扫描次数: " << scan_count << std::endl;
+        
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, num_keys - 100);
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        for (int i = 0; i < scan_count; i++) {
+            std::string start_key = "key_" + std::to_string(dis(gen));
+            std::string end_key = "key_" + std::to_string(dis(gen) + 100);
+            
+            auto it = db_->NewIterator(rocksdb::ReadOptions());
+            it->Seek(start_key);
+            
+            int count = 0;
+            while (it->Valid() && it->key().ToString() <= end_key) {
+                count++;
+                it->Next();
+            }
+            delete it;
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        
+        double ops_per_sec = scan_count * 1000.0 / duration.count();
+        std::cout << "耗时: " << duration.count() << "ms" << std::endl;
+        std::cout << "吞吐: " << ops_per_sec << " scans/sec" << std::endl;
+        std::cout << std::endl;
+    }
+
+private:
+    std::unique_ptr<rocksdb::DB> db_;
+};
+
+// 使用示例
+int main() {
+    RocksDBBenchmark benchmark("/tmp/rocksdb_benchmark");
+    
+    // 写入测试
+    benchmark.BenchmarkRandomWrite(1000000, 100);  // 100万次写入，100字节Value
+    
+    // 读取测试
+    benchmark.BenchmarkRandomRead(1000000, 1000000);  // 100万次读取
+    
+    // 扫描测试
+    benchmark.BenchmarkScan(1000000, 10000);  // 1万次范围扫描
+    
+    return 0;
+}
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

@@ -1492,4 +1492,271 @@ KubernetesExecutor(
 
 ---
 
+## 十二、Airflow vs Dagster vs Prefect 深度对比
+
+### 12.1 架构对比
+
+| 维度 | Airflow | Dagster | Prefect |
+|------|---------|---------|---------|
+| 核心思想 | DAG 即代码 | 资产即代码 | 流程即代码 |
+| 定义方式 | Python 文件 | Python 装饰器 | Python 装饰器 |
+| 调度模型 | 时间驱动 | 事件驱动 | 事件驱动 |
+| 资源管理 | Pool | IO Manager | Work Queue |
+| 测试能力 | 有限 | 强（本地测试） | 强（本地测试） |
+| UI | Web UI | Dagit | Orion UI |
+| 生态 | 最大（Operator 无数） | 中等 | 中等 |
+| 学习曲线 | 中等 | 较高 | 中等 |
+
+### 12.2 选型决策树
+
+```mermaid
+flowchart TD
+    A[工作流编排选型] --> B{团队技能?}
+    B -->|Python 数据工程| C{需求?}
+    B -->|可视化需求| D[DolphinScheduler]
+    C -->|传统 ETL| E[Airflow]
+    C -->|数据管道+数据质量| F[Dagster]
+    C -->|微服务编排| G[Prefect/Temporal]
+    E --> H[最大生态+成熟稳定]
+    F --> I[现代架构+强测试]
+    G --> J[云原生+强类型]
+```
+
+### 12.3 代码对比
+
+```python
+# Airflow DAG
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+with DAG("etl", schedule="0 2 * * *") as dag:
+    extract = PythonOperator(task_id="extract", python_callable=extract_fn)
+    transform = PythonOperator(task_id="transform", python_callable=transform_fn)
+    load = PythonOperator(task_id="load", python_callable=load_fn)
+    extract >> transform >> load
+
+# Dagster Asset
+from dagster import asset, Definitions
+
+@asset
+def extracted():
+    return extract_data()
+
+@asset
+def transformed(extracted):
+    return transform_data(extracted)
+
+@asset
+def loaded(transformed):
+    load_data(transformed)
+
+defs = Definitions(assets=[extracted, transformed, loaded])
+
+# Prefect Flow
+from prefect import flow, task
+
+@task
+def extract():
+    return extract_data()
+
+@task
+def transform(data):
+    return transform_data(data)
+
+@task
+def load(data):
+    load_data(data)
+
+@flow
+def etl_flow():
+    data = extract()
+    transformed = transform(data)
+    load(transformed)
+```
+
+---
+
+## 十三、depends_on_past 高级用法
+
+### 13.1 depends_on_past 配置
+
+```python
+# depends_on_past 配置
+with DAG("etl_pipeline", 
+         schedule="0 2 * * *",
+         depends_on_past=True,  # 依赖上一次运行
+         max_active_runs=1) as dag:
+    
+    task1 = PythonOperator(task_id="task1", python_callable=task1_fn)
+    task2 = PythonOperator(task_id="task2", python_callable=task2_fn)
+    task1 >> task2
+```
+
+### 13.2 depends_on_past 使用场景
+
+| 场景 | 说明 | 配置 |
+|------|------|------|
+| 数据修复 | 修复完昨天才能修今天 | depends_on_past=True |
+| 顺序处理 | 按顺序处理数据 | depends_on_past=True |
+| 状态保持 | 维护运行状态 | depends_on_past=True |
+| 并行处理 | 独立处理每天数据 | depends_on_past=False |
+
+---
+
+## 十四、Airflow K8s 部署深入
+
+### 14.1 Helm Chart 部署架构
+
+```
+Airflow K8s 部署架构：
+  Helm Chart: airflow
+  
+  组件：
+    Webserver: UI 服务
+    Scheduler: 调度器
+    Worker: Celery Worker
+    Triggerer: 异步触发器
+    Redis: Celery 消息队列
+    PostgreSQL: 元数据数据库
+  
+  配置：
+    executor: KubernetesExecutor
+    worker.replicas: 3
+    scheduler.resources: 2 CPU, 4GB
+    webserver.resources: 1 CPU, 2GB
+```
+
+### 14.2 KubernetesExecutor 配置
+
+```yaml
+# values.yaml
+executor: "KubernetesExecutor"
+
+kubernetes:
+  worker:
+    replicas: 3
+    resources:
+      requests:
+        cpu: 1
+        memory: 2Gi
+      limits:
+        cpu: 2
+        memory: 4Gi
+    image:
+      repository: apache/airflow
+      tag: "2.8.0"
+  
+  podTemplate:
+    metadata:
+      labels:
+        app: airflow-worker
+    spec:
+      containers:
+        - name: base
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+      volumes:
+        - name: dags
+          persistentVolumeClaim:
+            claimName: airflow-dags
+```
+
+---
+
+## 十五、Airflow 调度器高可用
+
+### 15.1 调度器高可用配置
+
+```
+调度器高可用原理：
+  ① 多调度器实例
+  ② 数据库锁竞争
+  ③ 只有一个调度器执行
+
+  配置方式：
+    airflow.cfg:
+      [core]
+      executor = CeleryExecutor
+      sql_alchemy_conn = postgresql://...
+      
+      [scheduler]
+      num_runs = -1  # 无限运行
+      scheduler_heartbeat_sec = 5
+      
+  部署方式：
+    多副本部署
+    数据库锁保证唯一执行
+    故障自动切换
+```
+
+### 15.2 调度器监控
+
+| 监控指标 | 说明 | 阈值 |
+|----------|------|------|
+| 调度延迟 | DAG 解析到任务执行延迟 | <1min |
+| 任务积压 | 待执行任务数 | <100 |
+| 调度器心跳 | 调度器存活状态 | 每5秒 |
+| DAG 解析时间 | DAG 文件解析耗时 | <10s |
+
+---
+
+## 十六、Airflow 测试最佳实践
+
+### 16.1 测试类型
+
+| 测试类型 | 说明 | 工具 |
+|----------|------|------|
+| 单元测试 | 测试单个任务 | pytest |
+| 集成测试 | 测试 DAG 结构 | airflow TEST |
+| 端到端测试 | 测试完整流程 | airflow backfill |
+| 性能测试 | 测试执行性能 | locust |
+
+### 16.2 测试代码示例
+
+```python
+# 测试 DAG 结构
+def test_dag_import():
+    from airflow.models import DagBag
+    dag_bag = DagBag(dag_folder="/opt/airflow/dags")
+    assert "etl_pipeline" in dag_bag.dags
+
+def test_dag_structure():
+    from airflow.models import DagBag
+    dag_bag = DagBag(dag_folder="/opt/airflow/dags")
+    dag = dag_bag.dags["etl_pipeline"]
+    assert len(dag.tasks) == 3
+    assert dag.tasks[0].task_id == "extract"
+```
+
+---
+
+## 十七、Airflow 生产运维最佳实践
+
+### 17.1 运维检查清单
+
+```
+日常运维检查：
+  ① 调度器状态：心跳是否正常
+  ② Worker 状态：是否有卡住的任务
+  ③ 任务积压：是否有大量待执行任务
+  ④ 日志查看：是否有错误日志
+  ⑤ 资源使用：CPU/内存/磁盘
+
+  告警配置：
+    调度器心跳丢失
+    任务失败率 > 5%
+    任务执行时间 > 阈值
+    资源使用 > 80%
+```
+
+### 17.2 性能优化
+
+| 优化项 | 方法 | 效果 |
+|--------|------|------|
+| DAG 解析 | 异步解析 + 缓存 | 解析速度提升 10x |
+| 任务执行 | 并行执行 + 资源池 | 吞吐量提升 5x |
+| 数据库 | 连接池 + 索引优化 | 查询性能提升 3x |
+| 日志 | 异步日志 + 压缩 | IO 减少 50% |
+
 > 一句话：**Airflow = DAG 即代码（Python）+ Scheduler 调度 + Executor 执行（Celery/K8s）+ 回填/传感器/Dataset 触发——数据工程编排事实标准；选型先看「团队（Python/数据工程→Airflow，可视化中文→DS）」，再定「执行器（K8s 动态→KubernetesExecutor）」，最后配「幂等任务 + 调度器高可用 + 监控告警」**。

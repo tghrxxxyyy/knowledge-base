@@ -1460,6 +1460,190 @@ public class SnowflakeIdGenerator {
     容错处理：时钟回拨处理
 ```
 
+---
+
+## 二十二、Vitess Tablet 类型详解
+
+### 22.1 Tablet 类型与角色
+
+```
+Vitess Tablet 类型：
+  ① PRIMARY（主节点）
+    - 处理写请求
+    - 复制源
+    - 高可用：故障时自动提升 replica
+
+  ② REPLICA（副本节点）
+    - 处理读请求
+    - 异步复制自 primary
+    - 提升读吞吐
+
+  ③ RDONLY（只读节点）
+    - 处理批量查询/分析查询
+    - 不参与复制
+    - 可用于备份/数据导出
+
+  ④ SPARE（备用节点）
+    - 预留节点
+    - 可快速提升为其他角色
+    - 用于滚动升级
+```
+
+### 22.2 Tablet 状态管理
+
+```bash
+# 查看 tablet 状态
+vtctlclient ListTablets
+
+# tablet 状态：
+# - SERVING：正常服务
+# - NOT_SERVING：不服务（维护/故障）
+# - SHUTDOWN：正在关闭
+
+# 手动切换 tablet 角色
+vtctlclient PlannedReparentShard -keyspace=commerce -shard=0 -new_master=tablet-2
+
+# tablet 健康检查
+vtctlclient HealthCheck -tablet=tablet-1
+```
+
+---
+
+## 二十三、ShardingSphere-JDBC vs MyCat 深度对比
+
+### 23.1 架构对比
+
+| 维度 | ShardingSphere-JDBC | MyCat |
+|------|---------------------|-------|
+| 部署模式 | SDK 内嵌（应用进程内） | 独立代理进程 |
+| 性能 | 无网络开销（进程内调用） | 有网络开销（代理层） |
+| 连接数 | 应用直连数据库 | 应用连代理，代理连数据库 |
+| 事务 | 本地事务（单分片） | 分布式事务（XA/Seata） |
+| 运维 | 需重新部署应用 | 独立运维，应用无感知 |
+| 语言支持 | Java（JDBC） | 多语言（MySQL 协议） |
+| 功能丰富度 | 高（影子库/加密/读写分离） | 中（基础分片） |
+
+### 23.2 选型决策树
+
+```mermaid
+flowchart TD
+    A[分库分表需求] --> B{语言?}
+    B -->|Java| C{性能要求?}
+    B -->|非 Java| D[MyCat]
+    C -->|极致性能| E[ShardingSphere-JDBC]
+    C -->|一般性能| F{运维能力?}
+    F -->|强| G[MyCat]
+    F -->|弱| E
+    E --> H[应用内嵌，无代理开销]
+    D --> I[独立代理，多语言支持]
+```
+
+---
+
+## 二十四、MyCat 读写分离高级配置
+
+### 24.1 读写分离策略
+
+```xml
+<!-- schema.xml 配置 -->
+<schema name="testdb" checkSQLschema="false">
+  <table name="orders" dataNode="dn$1-4" rule="mod-order-id">
+    <!-- 读写分离 -->
+    <writeHost host="write" url="master:3306" user="root">
+      <readHost host="read1" url="slave1:3306" user="root" />
+      <readHost host="read2" url="slave2:3306" user="root" />
+    </writeHost>
+  </table>
+</schema>
+```
+
+### 24.2 负载均衡策略
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| 轮询 | Round-Robin | 从节点性能一致 |
+| 权重 | 按权重分配 | 从节点性能不同 |
+| 随机 | 随机选择 | 简单场景 |
+| 主从延迟 | 优先选延迟低的从 | 对一致性要求高 |
+
+```xml
+<!-- rule.xml 负载均衡配置 -->
+<loadBalance name="lb" class="io.mycat.loadbalance.RoundRobinLoadBalance">
+  <property name="weights">1,1,1</property>
+</loadBalance>
+```
+
+---
+
+## 二十五、全局 ID 方案详细对比
+
+### 25.1 方案对比
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| UUID | 随机生成 | 简单、无依赖 | 无序、索引性能差 |
+| 数据库自增 | 单点生成 | 简单、有序 | 单点瓶颈 |
+| 号段模式 | 批量获取 ID | 高性能、有序 | 需要部署服务 |
+| 雪花算法 | 时间戳+机器ID+序列号 | 高性能、有序、去中心化 | 时钟回拨问题 |
+| Redis INCR | 原子自增 | 高性能、有序 | 依赖 Redis |
+| Leaf | 美团开源，双 Buffer | 高性能、有序、容错 | 需要部署服务 |
+
+### 25.2 雪花算法实现
+
+```java
+// 雪花算法实现
+public class SnowflakeIdGenerator {
+    private long workerId;
+    private long datacenterId;
+    private long sequence = 0L;
+    private long workerIdBits = 5L;
+    private long datacenterIdBits = 5L;
+    private long sequenceBits = 12L;
+    
+    private long maxWorkerId = ~(-1L << workerIdBits);
+    private long maxDatacenterId = ~(-1L << datacenterIdBits);
+    
+    private long workerIdShift = sequenceBits;
+    private long datacenterIdShift = sequenceBits + workerIdBits;
+    private long timestampLeftShift = sequenceBits + workerIdBits + datacenterIdBits;
+    private long sequenceMask = ~(-1L << sequenceBits);
+    
+    private long lastTimestamp = -1L;
+    
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+        
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("Clock moved backwards");
+        }
+        
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        return ((timestamp - epoch) << timestampLeftShift) |
+               (datacenterId << datacenterIdShift) |
+               (workerId << workerIdShift) |
+               sequence;
+    }
+    
+    private long tilNextMillis(long lastTimestamp) {
+        long timestamp = System.currentTimeMillis();
+        while (timestamp <= lastTimestamp) {
+            timestamp = System.currentTimeMillis();
+        }
+        return timestamp;
+    }
+}
+```
+
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - TiDB（NewSQL）见「[TiDB 与 NewSQL](./TiDB与NewSQL.md)」；
 - 分布式事务见「[分布式事务 Seata](./分布式事务Seata.md)」；

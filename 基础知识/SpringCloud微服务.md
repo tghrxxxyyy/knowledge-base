@@ -1403,7 +1403,204 @@ curl -s http://localhost:8848/nacos/v1/cs/configs?dataId=myconfig&group=DEFAULT_
 tail -f /var/log/myservice/myservice.log
 ```
 
-## 十八、与其他板块的关系
+## 二十四、Spring Cloud配置中心详解
+
+### 24.1 配置中心对比
+
+| 特性 | Spring Cloud Config | Nacos | Apollo | Consul |
+|------|-------------------|-------|--------|--------|
+| 配置格式 | Properties/YAML | 多格式 | 多格式 | KV |
+| 动态刷新 | @RefreshScope | 监听推送 | 监听推送 | 轮询 |
+| 版本管理 | Git | 本地 | 本地 | 无 |
+| 权限控制 | Git权限 | 命名空间 | 环境/权限 | ACL |
+| 监控审计 | Git历史 | 控制台 | 控制台 | 日志 |
+| 高可用 | Git高可用 | 集群 | 集群 | 集群 |
+
+### 24.2 配置中心选择
+
+```
+配置中心选择：
+  Spring Cloud Config：
+    优点：Git集成，版本管理好
+    缺点：动态刷新弱，高可用依赖Git
+    适用：已有Git基础设施
+
+  Nacos：
+    优点：动态推送，控制台好用
+    缺点：与Spring Cloud绑定
+    适用：Spring Cloud Alibaba
+
+  Apollo：
+    优点：功能全，权限细粒度
+    缺点：部署复杂，资源消耗大
+    适用：大型企业
+
+  Consul：
+    优点：服务发现+配置一体
+    缺点：配置功能弱
+    适用：Consul生态
+```
+
+## 二十五、OpenFeign详解
+
+### 25.1 OpenFeign vs RestTemplate
+
+| 特性 | OpenFeign | RestTemplate |
+|------|-----------|--------------|
+| 声明式 | 是 | 否 |
+| 负载均衡 | 集成Ribbon | 需手动 |
+| 熔断降级 | 集成Hystrix/Sentinel | 需手动 |
+| 请求拦截 | 支持 | 不支持 |
+| 日志 | 支持 | 基础 |
+| 学习曲线 | 低 | 中 |
+
+### 25.2 OpenFeign使用示例
+
+```java
+// OpenFeign客户端定义
+@FeignClient(
+    name = "user-service",
+    fallback = UserServiceFallback.class,
+    configuration = FeignConfig.class
+)
+public interface UserServiceClient {
+    @GetMapping("/users/{id}")
+    User getUser(@PathVariable("id") Long id);
+    
+    @PostMapping("/users")
+    User createUser(@RequestBody User user);
+}
+
+// 降级实现
+@Component
+public class UserServiceFallback implements UserServiceClient {
+    @Override
+    public User getUser(Long id) {
+        return new User(id, "默认用户", "默认邮箱");
+    }
+    
+    @Override
+    public User createUser(User user) {
+        throw new RuntimeException("服务不可用");
+    }
+}
+```
+
+## 二十六、Spring Cloud Stream详解
+
+### 26.1 Stream核心概念
+
+```
+Spring Cloud Stream核心概念：
+  Binder：消息中间件抽象层
+  Input/Channel：消息输入通道
+  Output/Channel：消息输出通道
+  Source：消息生产者
+  Sink：消息消费者
+
+支持的Binder：
+  Kafka
+  RabbitMQ
+  RocketMQ
+  Redis
+  JMS
+```
+
+### 26.2 Stream使用示例
+
+```java
+// 定义Output通道
+@EnableBinding(Source.class)
+public class MessageProducer {
+    @Autowired
+    private Source source;
+    
+    public void sendMessage(String message) {
+        source.output().send(MessageBuilder.withPayload(message).build());
+    }
+}
+
+// 定义Input通道
+@EnableBinding(Sink.class)
+public class MessageConsumer {
+    @StreamListener(Sink.INPUT)
+    public void handleMessage(String message) {
+        // 处理消息
+    }
+}
+```
+
+## 二十七、微服务熔断降级详解
+
+### 27.1 熔断降级对比
+
+| 特性 | Hystrix | Sentinel | Resilience4j |
+|------|---------|----------|--------------|
+| 状态 | 维护模式 | 活跃 | 活跃 |
+| 熔断 | 支持 | 支持 | 支持 |
+| 限流 | 线程池隔离 | 信号量隔离 | 信号量隔离 |
+| 降级 | 支持 | 支持 | 支持 |
+| 监控 | Dashboard | Dashboard | Micrometer |
+| 配置 | 动态 | 动态 | 动态 |
+
+### 27.2 熔断降级配置
+
+```yaml
+# Sentinel熔断降级配置
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        ds1:
+          file:
+            file: classpath:degrade-rule.json
+            dataType: json
+            ruleType: DEGRADE
+
+# degrade-rule.json
+[
+  {
+    "resource": "user-service",
+    "grade": 0,
+    "count": 100,
+    "timeWindow": 10,
+    "minRequestAmount": 5,
+    "statIntervalMs": 1000
+  }
+]
+```
+
+## 二十八、微服务通信模式详解
+
+### 28.1 通信模式对比
+
+| 模式 | 说明 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|---------|
+| 同步调用 | HTTP/gRPC | 简单 | 耦合高 | 简单场景 |
+| 异步消息 | MQ | 解耦 | 一致性弱 | 事件驱动 |
+| 事件驱动 | Event | 松耦合 | 复杂 | 复杂业务 |
+| 响应式 | WebFlux | 高性能 | 学习曲线陡 | 高并发 |
+
+### 28.2 通信模式选择
+
+```
+通信模式选择：
+  同步调用：
+    适用：查询操作，简单场景
+    技术：OpenFeign/RestTemplate/gRPC
+
+  异步消息：
+    适用：写操作，解耦场景
+    技术：Kafka/RabbitMQ/RocketMQ
+
+  事件驱动：
+    适用：复杂业务，事件溯源
+    技术：EventStore/Kafka
+
+  响应式：
+    适用：高并发，实时系统
+    技术：WebFlux/R2DBC
+```
 
 - Spring Cloud Gateway 见「[Spring Cloud Gateway](../基础知识/中间件/SpringCloudGateway.md)」；
 - Nacos 源码见「[源码系列/Nacos](../源码系列/Nacos.md)」；

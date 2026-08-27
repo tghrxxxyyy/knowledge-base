@@ -1494,4 +1494,247 @@ queue_size > 100 → 排队严重，需扩容
 active > thread_pool_size → 线程池满载
 ```
 
+---
+
+## 十八、ILM 完整配置示例
+
+### 18.1 ILM 策略配置
+
+```json
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "warm": {
+        "min_age": "3d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          },
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "set_priority": {
+            "priority": 50
+          }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": {
+            "priority": 0
+          }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### 18.2 索引模板配置
+
+```json
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" },
+        "service": { "type": "keyword" },
+        "level": { "type": "keyword" }
+      }
+    }
+  }
+}
+```
+
+---
+
+## 十九、可搜索快照深入
+
+### 19.1 可搜索快照原理
+
+```
+可搜索快照原理：
+  ① 冷数据迁移到对象存储（S3/MinIO）
+  ② 本地缓存热点数据（Page Cache）
+  ③ 查询时按需加载（Lazy Loading）
+
+  优势：
+    存储成本降低 90%（对象存储 vs 本地磁盘）
+    查询性能接近本地（本地缓存）
+    自动管理（ILM 自动迁移）
+
+  配置：
+    index.search.snowball.enabled: true
+    index.search.snowball.remote仓库: my-s3-repo
+```
+
+### 19.2 可搜索快照配置
+
+```json
+# 注册快照仓库
+PUT _snapshot/my-s3-repo
+{
+  "type": "s3",
+  "settings": {
+    "bucket": "my-es-bucket",
+    "region": "us-east-1"
+  }
+}
+
+# 创建可搜索快照索引
+PUT /my-index-snapshot
+{
+  "settings": {
+    "index.search.snowball.enabled": true,
+    "index.search.snowball.repository": "my-s3-repo",
+    "index.search.snowball.snapshot_name": "my-snapshot"
+  }
+}
+```
+
+---
+
+## 二十、Doc Values vs Fielddata 深入对比
+
+### 20.1 内存模型对比
+
+| 维度 | Doc Values | Fielddata |
+|------|------------|-----------|
+| 存储位置 | 磁盘（列式存储） | 堆内存 |
+| 加载时机 | 查询时加载 | 首次查询时加载 |
+| 内存占用 | 低（磁盘缓存） | 高（全量加载） |
+| 性能 | 中等（磁盘 IO） | 快（内存） |
+| 适用场景 | 聚合/排序/脚本 | 复杂脚本/高基数字段 |
+
+### 20.2 使用建议
+
+```
+Doc Values 使用建议：
+  默认启用：大多数字段默认启用
+  聚合字段：必须启用
+  排序字段：必须启用
+  脚本字段：建议启用
+
+  关闭场景：
+    不需要聚合/排序的大文本字段
+    临时计算的字段
+
+  配置方式：
+    "doc_values": true
+    "doc_values": false
+```
+
+---
+
+## 二十一、Bulk 操作最佳实践
+
+### 21.1 Bulk Sizing 计算
+
+```
+Bulk Sizing 计算：
+  单个文档大小：1KB
+  推荐 bulk 大小：5-15MB
+  文档数量：5000-15000 个
+
+  计算公式：
+    bulk_size = 单文档大小 × 文档数量
+    示例：1KB × 10000 = 10MB
+
+  注意事项：
+    不要超过 100MB（单次请求过大）
+    不要小于 1MB（请求过小，效率低）
+    监控 bulk 队列深度
+```
+
+### 21.2 Bulk 最佳实践
+
+```java
+// Java Bulk 最佳实践
+BulkRequest bulkRequest = new BulkRequest();
+bulkRequest.timeout("10s");
+
+for (Document doc : documents) {
+    bulkRequest.add(new IndexRequest("my-index")
+        .id(doc.getId())
+        .source(doc.toJson()));
+}
+
+// 批量执行
+BulkResponse response = client.bulk(bulkRequest, RequestOptions.DEFAULT);
+
+// 处理响应
+if (response.hasFailures()) {
+    // 处理失败
+    for (BulkItemResponse item : response.getItems()) {
+        if (item.isFailed()) {
+            System.out.println("Failed: " + item.getFailureMessage());
+        }
+    }
+}
+```
+
+---
+
+## 二十二、JVM 堆内存调优深入
+
+### 22.1 堆内存配置原则
+
+```
+JVM 堆内存配置原则：
+  ① 堆大小：物理内存的 50%，最大 31GB
+  ② Xms = Xmx：避免动态调整
+  ③ 留一半给 OS：Lucene 依赖 OS 文件缓存
+  ④ 不要超过 31GB：指针压缩失效
+
+  配置示例：
+    64GB 内存：堆 31GB，OS 33GB
+    128GB 内存：堆 31GB，OS 97GB
+    256GB 内存：堆 31GB，OS 225GB
+```
+
+### 22.2 GC 调优参数
+
+```
+GC 调优参数：
+  -XX:+UseG1GC：使用 G1 GC
+  -XX:MaxGCPauseMillis=50：目标停顿时间 50ms
+  -XX:G1HeapRegionSize=4m：Region 大小 4MB
+  -XX:InitiatingHeapOccupancyPercent=45：触发 GC 的堆占用率
+  -XX:G1ReservePercent=10：预留空间
+
+  监控 GC：
+    jstat -gc <pid> 1000
+    jmap -heap <pid>
+    jstack <pid>
+```
+
 > 一句话：**ES 调优 = 分片（10~30GB/分片，别太多）+ JVM（堆 ≤31GB，留一半给 OS 缓存）+ 查询（filter 替代 query，避免深分页 wildcard）+ 集群（监控 health/水位线/线程池）**。

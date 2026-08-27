@@ -930,6 +930,373 @@ kafka:
   - 吞吐量提升 3x
 ```
 
+---
+
+## 八、采样策略深度解析
+
+### 8.1 Head-based vs Tail-based 采样
+
+```
+Head-based 采样（头部采样）：
+  在请求入口（第一个 Span）决定是否采样
+  整条链路采样决策一致
+
+  优点：
+    实现简单、开销低
+    决策在入口完成、无需全局协调
+  
+  缺点：
+    无法根据链路结果决定采样
+    慢请求/错误请求可能被采样掉
+
+  适用：
+    高吞吐场景（QPS > 10000）
+    调试期全量采样
+
+Tail-based 采样（尾部采样）：
+  等整条链路完成后，根据结果决定是否保留
+  需要 Collector 缓存完整链路
+
+  优点：
+    慢请求/错误请求 100% 采样
+    节省存储（只保留有价值的链路）
+  
+  缺点：
+    需要 Collector 缓存（内存开销大）
+    需要协调多个 Collector（链路可能分散）
+    实现复杂
+
+  适用：
+    生产环境找慢请求
+    错误追踪（必须保留错误链路）
+```
+
+### 8.2 采样率计算公式
+
+```
+采样率计算：
+  目标：控制存储成本，同时保留有价值的链路
+
+  公式：
+    采样率 = 目标存储量 / (QPS × 平均 Span 数 × Span 大小 × 时间窗口)
+
+  示例：
+    QPS = 10000
+    平均 Span 数 = 50（每次请求 50 个 Span）
+    Span 大小 = 500 bytes
+    时间窗口 = 86400s（1 天）
+    目标存储 = 100GB
+
+    采样率 = 100GB / (10000 × 50 × 500B × 86400)
+           = 100 × 10^9 / (10000 × 50 × 500 × 86400)
+           = 100 × 10^9 / (2.16 × 10^14)
+           ≈ 0.00046 = 0.046%
+
+  实际调整：
+    高流量服务：0.1-1%
+    低流量服务：10-100%
+    错误链路：100%
+```
+
+### 8.3 采样策略配置示例
+
+```yaml
+# Jaeger 采样策略配置
+{
+  "default_strategy": {
+    "type": "probabilistic",
+    "param": 0.01
+  },
+  "service-specific": {
+    "payment-service": {
+      "type": "probabilistic",
+      "param": 0.1
+    },
+    "user-service": {
+      "type": "ratelimiting",
+      "param": 100
+    }
+  }
+}
+
+# OpenTelemetry SDK 采样配置
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.01
+```
+
+---
+
+## 九、Span 数据模型深入
+
+### 9.1 Span 结构
+
+```
+Span 数据模型：
+  traceId: 128-bit（全局唯一）
+  spanId: 64-bit（Span 唯一）
+  parentSpanId: 64-bit（父 Span）
+  operationName: "HTTP GET /api/users"
+  startTime: 微秒级时间戳
+  duration: 微秒
+  tags: KV 对（查询条件）
+  logs: 时间线事件
+  references: Span 间关系（ChildOf/FollowsFrom）
+
+  关键字段：
+    traceId: 链路追踪的核心标识
+    spanId: 单个 Span 的唯一标识
+    parentSpanId: 构建调用树
+    operationName: 操作名称（用于聚合分析）
+    tags: 用于过滤和查询（如 http.status_code=200）
+    logs: 调试信息（如 error stacktrace）
+```
+
+### 9.2 Span 类型对比
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| SERVER | 服务端 Span | HTTP 请求处理 |
+| CLIENT | 客户端 Span | HTTP/gRPC 调用 |
+| PRODUCER | 消息生产者 | Kafka/RocketMQ 发送 |
+| CONSUMER | 消息消费者 | Kafka/RocketMQ 接收 |
+| INTERNAL | 内部 Span | 方法调用、数据库查询 |
+
+### 9.3 Span 关系类型
+
+```
+Span 关系：
+  ChildOf：父子关系（最常见）
+    服务端收到请求 → 创建 SERVER Span
+    调用下游服务 → 创建 CLIENT Span（child of SERVER）
+
+  FollowsFrom：因果关系（不依赖父完成）
+    异步任务：父任务创建子任务后继续执行
+    消息队列：生产者发送后不等消费者
+
+  关系图示：
+    SERVER Span (root)
+      ├── CLIENT Span A (ChildOf)
+      │     └── SERVER Span B (ChildOf)
+      │           └── DB Span C (ChildOf)
+      └── CLIENT Span D (ChildOf)
+            └── MQ Span E (FollowsFrom)
+```
+
+---
+
+## 十、存储后端深度对比
+
+### 10.1 Elasticsearch vs Cassandra vs ClickHouse
+
+| 维度 | Elasticsearch | Cassandra | ClickHouse |
+|------|---------------|-----------|------------|
+| 数据模型 | 文档（JSON） | 宽列 | 列式表 |
+| 写入性能 | 中等 | 高（顺序写） | 极高（列式压缩） |
+| 查询性能 | 中等（全文搜索强） | 中等（等值查询强） | 高（聚合分析强） |
+| 存储成本 | 高（倒排索引） | 中等（压缩） | 低（高压缩比） |
+| 运维复杂度 | 中等 | 高 | 中等 |
+| 生态成熟度 | 高（ELK） | 中等 | 中等 |
+| 适用场景 | 日志联动、全文搜索 | 大规模写入 | 高性能分析 |
+
+### 10.2 存储选型决策树
+
+```mermaid
+flowchart TD
+    A[存储选型] --> B{规模?}
+    B -->|小规模 <100GB| C[内存/SQLite]
+    B -->|中等 100GB-1TB| D{需求?}
+    B -->|大规模 >1TB| E{需求?}
+    D -->|日志联动| F[Elasticsearch]
+    D -->|简单查询| G[Cassandra]
+    E -->|高性能分析| H[ClickHouse]
+    E -->|大规模写入| I[Cassandra + Kafka]
+    F --> J[监控索引大小]
+    G --> J
+    H --> J
+    I --> J
+```
+
+### 10.3 存储配置优化
+
+```yaml
+# Elasticsearch 优化配置
+ES_INDEX_SHARDS=3          # 分片数（按数据量调整）
+ES_INDEX_REPLICAS=1        # 副本数（高可用）
+ES_INDEX_REFRESH_INTERVAL=30s  # 刷新间隔（降低索引压力）
+ES_SPAN_CLEANER_ENABLED=true   # 启用清理器
+
+# ClickHouse 配置
+clickhouse:
+  cluster: jaeger-cluster
+  layouts:
+    - index: jaeger-span
+      replicas: 2
+      shards: 3
+```
+
+---
+
+## 十一、OpenTelemetry 集成深入
+
+### 11.1 OTel SDK 配置
+
+```java
+// Java OTel SDK 配置
+SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+    .setResource(Resource.getDefault().merge(
+        Resource.builder()
+            .put("service.name", "my-service")
+            .put("service.version", "1.0.0")
+            .build()))
+    .addSpanProcessor(BatchSpanProcessor.builder(
+        OtlpGrpcSpanExporter.builder()
+            .setEndpoint("http://jaeger-collector:4317")
+            .build())
+        .setScheduleDelay(5, TimeUnit.SECONDS)
+        .setMaxQueueSize(2048)
+        .setMaxExportBatchSize(512)
+        .build())
+    .setSampler(Sampler.parentBased(
+        Sampler.traceIdRatioBased(0.01)))
+    .build();
+```
+
+### 11.2 OTel Collector 配置
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+  memory_limiter:
+    limit_mib: 2000
+    spike_limit_mib: 400
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    policies:
+      - name: error-policy
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: latency-policy
+        type: latency
+        latency: {threshold_ms: 1000}
+
+exporters:
+  jaeger:
+    endpoint: jaeger-collector:14250
+    tls:
+      cert_file: /certs/client.crt
+      key_file: /certs/client.key
+```
+
+---
+
+## 十二、依赖图生成原理
+
+### 12.1 依赖图构建
+
+```
+依赖图生成流程：
+  1. 收集所有 Span（traceID + spanID + parentSpanID）
+  2. 构建调用树（Span 间父子关系）
+  3. 提取服务间调用（CLIENT → SERVER）
+  4. 聚合统计（调用次数、延迟、错误率）
+  5. 可视化（节点=服务，边=调用关系）
+
+  数据结构：
+    节点：服务名（如 user-service）
+    边：调用关系（source → target）
+    边属性：
+      - 调用次数（requests_total）
+      - 平均延迟（latency_avg）
+      - 错误率（error_rate）
+
+  查询示例：
+    SELECT 
+      parent.service_name as source,
+      service_name as target,
+      COUNT(*) as requests,
+      AVG(duration) as latency
+    FROM spans
+    WHERE parent.service_name != service_name
+    GROUP BY source, target
+```
+
+### 12.2 依赖图可视化
+
+```mermaid
+flowchart LR
+    A[API Gateway] -->|HTTP| B[User Service]
+    A -->|HTTP| C[Order Service]
+    B -->|gRPC| D[User DB]
+    C -->|gRPC| E[Order DB]
+    C -->|Kafka| F[Notification Service]
+    F -->|SMTP| G[Email Service]
+```
+
+---
+
+## 十三、部署架构深入
+
+### 13.1 生产部署架构
+
+```
+生产部署架构：
+  ┌─────────────────────────────────────────┐
+  │                Kubernetes                │
+  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  │
+  │  │ App Pod │  │ App Pod │  │ App Pod │  │
+  │  │ + OTel  │  │ + OTel  │  │ + OTel  │  │
+  │  └────┬────┘  └────┬────┘  └────┬────┘  │
+  │       │            │            │        │
+  │  ┌────┴────────────┴────────────┴────┐   │
+  │  │         OTel Collector            │   │
+  │  │    (接收/处理/采样/批量导出)       │   │
+  │  └───────────────┬───────────────────┘   │
+  │                  │                       │
+  │  ┌───────────────┴───────────────────┐   │
+  │  │           Kafka Cluster           │   │
+  │  │        (缓冲/削峰/异步)           │   │
+  │  └───────────────┬───────────────────┘   │
+  │                  │                       │
+  │  ┌───────────────┴───────────────────┐   │
+  │  │      Jaeger Collector            │   │
+  │  │    (消费/处理/写入存储)           │   │
+  │  └───────────────┬───────────────────┘   │
+  │                  │                       │
+  │  ┌───────────────┴───────────────────┐   │
+  │  │      Elasticsearch Cluster       │   │
+  │  │        (存储/查询)               │   │
+  │  └───────────────┬───────────────────┘   │
+  │                  │                       │
+  │  ┌───────────────┴───────────────────┐   │
+  │  │        Jaeger Query + UI          │   │
+  │  │       (查询/可视化)               │   │
+  │  └───────────────────────────────────┘   │
+  └─────────────────────────────────────────┘
+```
+
+### 13.2 组件职责
+
+| 组件 | 职责 | 扩展方式 |
+|------|------|---------|
+| OTel SDK | 埋点、采样决策 | 随应用部署 |
+| OTel Collector | 接收、处理、导出 | 水平扩展 |
+| Kafka | 缓冲、削峰 | 增加 Broker |
+| Jaeger Collector | 消费、写入存储 | 水平扩展 |
+| Elasticsearch | 存储、查询 | 增加节点 |
+| Jaeger Query | 查询、可视化 | 水平扩展 |
+
 ## 七、与其他板块的关系
 
 - 链路追踪原理（SkyWalking）见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；

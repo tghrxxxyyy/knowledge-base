@@ -1409,3 +1409,190 @@ curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
 # 检查配置
 curl -s http://localhost:8081/config
 ```
+
+## 六、Schema Registry集群部署详解
+
+### 6.1 集群架构
+
+```
+Schema Registry集群：
+  Master-Follower架构
+  Master处理写请求
+  Follower处理读请求
+  Master故障时Follower晋升
+
+集群部署：
+  至少3个节点（奇数）
+  同机架部署（低延迟）
+  独立部署（不与其他服务共享）
+  持久化存储（配置/日志）
+```
+
+### 6.2 集群配置示例
+
+```properties
+# Schema Registry集群配置
+# 节点1
+listeners=http://0.0.0.0:8081
+kafkastore.connection.url=zk1:2181,zk2:2181,zk3:2181
+kafkastore.topic=_schemas
+master.eligibility=true
+
+# 节点2
+listeners=http://0.0.0.0:8081
+kafkastore.connection.url=zk1:2181,zk2:2181,zk3:2181
+kafkastore.topic=_schemas
+master.eligibility=false
+
+# 节点3
+listeners=http://0.0.0.0:8081
+kafkastore.connection.url=zk1:2181,zk2:2181,zk3:2181
+kafkastore.topic=_schemas
+master.eligibility=false
+```
+
+## 七、Schema兼容性规则详解
+
+### 7.1 兼容性模式对比
+
+| 兼容性模式 | 规则 | 适用场景 | 风险 |
+|-----------|------|---------|------|
+| BACKWARD | 新Schema兼容旧数据 | 消费者兼容 | 中 |
+| FORWARD | 旧Schema兼容新数据 | 生产者兼容 | 中 |
+| FULL | 双向兼容 | 严格兼容 | 高 |
+| NONE | 不检查兼容性 | 开发环境 | 高 |
+
+### 7.2 兼容性检查规则
+
+```
+BACKWARD兼容性规则：
+  1. 新字段必须有默认值
+  2. 不能删除必需字段
+  3. 不能修改字段类型
+  4. 可以添加可选字段
+  5. 可以删除有默认值的字段
+
+FORWARD兼容性规则：
+  1. 必须能读取旧数据
+  2. 不能添加必需字段
+  3. 不能修改字段类型
+  4. 可以添加可选字段
+  5. 可以删除有默认值的字段
+
+FULL兼容性规则：
+  1. 同时满足BACKWARD和FORWARD
+  2. 双向兼容
+  3. 最安全但最严格
+```
+
+## 八、Schema版本管理详解
+
+### 8.1 版本管理策略
+
+| 策略 | 说明 | 适用场景 | 优缺点 |
+|------|------|---------|--------|
+| 语义版本 | 1.0.0/1.0.1/1.1.0 | 生产环境 | 清晰但复杂 |
+| 递增版本 | 1/2/3 | 开发环境 | 简单但不直观 |
+| 时间戳 | 20240101 | 审计 | 精确但难读 |
+
+### 8.2 版本管理最佳实践
+
+```
+版本管理最佳实践：
+  1. 使用语义版本号
+     MAJOR：不兼容变更
+     MINOR：向后兼容新增
+     PATCH：向后兼容修复
+
+  2. 版本发布流程
+     1. 开发新Schema
+     2. 兼容性检查
+     3. 注册新版本
+     4. 测试验证
+     5. 生产发布
+
+  3. 版本回滚
+     保留所有历史版本
+     支持快速回滚到旧版本
+     记录回滚原因
+
+  4. 版本文档
+     变更日志
+     影响范围
+     迁移指南
+```
+
+## 九、Kafka Connect与Flink集成详解
+
+### 9.1 Kafka Connect集成
+
+```json
+{
+  "name": "avro-source-connector",
+  "config": {
+    "connector.class": "io.confluent.connect.avro.AvroConverter",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "schema.registry.url": "http://schema-registry:8081",
+    "tasks.max": "1",
+    "kafka.topic": "my-topic",
+    "schema.registry.topic": "_schemas"
+  }
+}
+```
+
+### 9.2 Flink SQL集成
+
+```sql
+-- Flink SQL使用Avro格式
+CREATE TABLE kafka_table (
+  user_id BIGINT,
+  event_type STRING,
+  payload STRING
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'user-events',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'format' = 'avro',
+  'avro.schema-registry.url' = 'http://schema-registry:8081',
+  'avro.record.level.schema' = 'true'
+);
+```
+
+## 十、Schema Evolution最佳实践详解
+
+### 10.1 Evolution策略
+
+| 策略 | 规则 | 适用场景 | 风险 |
+|------|------|---------|------|
+| 只添加 | 只添加可选字段 | 简单变更 | 低 |
+| 向后兼容 | 新Schema兼容旧数据 | 消费者兼容 | 中 |
+| 向前兼容 | 旧Schema兼容新数据 | 生产者兼容 | 中 |
+| 双向兼容 | 双向兼容 | 严格兼容 | 高 |
+
+### 10.2 Evolution最佳实践
+
+```
+Schema Evolution最佳实践：
+  1. 设计时考虑未来
+     使用灵活的数据结构
+     预留扩展字段
+     避免破坏性变更
+
+  2. 变更流程
+     1. 设计新Schema
+     2. 兼容性检查
+     3. 测试验证
+     4. 滚动发布
+     5. 监控告警
+
+  3. 回滚策略
+     保留所有版本
+     支持快速回滚
+     监控兼容性
+
+  4. 文档管理
+     变更日志
+     影响分析
+     迁移指南
+```

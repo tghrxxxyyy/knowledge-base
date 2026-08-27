@@ -1449,6 +1449,199 @@ groups:
 
 ---
 
+## 多租户设计
+
+### 多租户隔离
+
+```yaml
+# Loki 多租户配置
+auth_enabled: true
+
+limits_config:
+  enforce_metric_name: false
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  per_stream_rate_limit: 5MB
+  per_stream_rate_limit_burst: 15MB
+
+# 每个租户独立配置
+tenant_configs:
+  - tenant: "team-a"
+    configs:
+      - ingestion_rate_mb: 8
+        ingestion_burst_size_mb: 16
+  - tenant: "team-b"
+    configs:
+      - ingestion_rate_mb: 16
+        ingestion_burst_size_mb: 32
+```
+
+### 多租户隔离策略
+
+| 维度 | 说明 | 配置 |
+|------|------|------|
+| 写入隔离 | 按租户限流 | ingestion_rate_mb |
+| 存储隔离 | 按租户分桶 | bucket_configs |
+| 查询隔离 | 按租户限制 | max_query_length |
+| 告警隔离 | 按租户分组 | ruler_tenant_id |
+
+## LogQL 实战
+
+### LogQL 查询语法
+
+```logql
+# 标签选择器
+{job="nginx"}
+{job="nginx", env="prod"}
+
+# 日志过滤
+{job="nginx"} |= "error"
+{job="nginx"} !~ "debug"
+{job="nginx"} | json | status >= 500
+
+# 日志解析
+{job="nginx"} | json | line_format "{{.status}} {{.method}} {{.path}}"
+
+# 聚合查询
+sum(rate({job="nginx"} |= "error" [5m])) by (status)
+count_over_time({job="nginx"}[1h])
+```
+
+### LogQL 常用操作
+
+| 操作 | 说明 | 示例 |
+|------|------|------|
+| \| json | JSON解析 | \| json \| level="error" |
+| \| logfmt | logfmt解析 | \| logfmt \| err!="nil" |
+| \| regexp | 正则提取 | \| regexp `status=(\d+)` |
+| \| pattern | 模式提取 | \| pattern `<method> <path> <status>` |
+| \| line_format | 行格式化 | \| line_format "{{.method}} {{.path}}" |
+| \| label_format | 标签名重命名 | \| label_format new_name="old_name" |
+
+### LogQL 聚合示例
+
+```logql
+# 错误率统计
+sum(rate({job="nginx"} |= "error" [5m])) by (host)
+
+# P99延迟（需要结构化日志）
+quantile_over_time(0.99, {job="nginx"} | json | unwrap duration [5m])
+
+# 状态码分布
+sum(count_over_time({job="nginx"} | json [1h])) by (status)
+
+# 每分钟错误数
+sum(rate({job="nginx"} |= "error" [1m])) * 60
+```
+
+## 存储后端对比
+
+| 后端 | 说明 | 适用场景 |
+|------|------|----------|
+| 本地文件系统 | 简单 | 单机开发 |
+| S3/Azure Blob/GCS | 对象存储 | 生产环境 |
+| DynamoDB/BigTable | NoSQL | 大规模 |
+| Cassandra | 分布式 | 超大规模 |
+
+### 存储配置示例
+
+```yaml
+# S3 存储配置
+storage_config:
+  aws:
+    s3: s3://us-east-1/loki-logs
+    s3forcepathstyle: true
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+
+# 本地存储配置
+storage_config:
+  filesystem:
+    directory: /loki/chunks
+  boltdb_shipper:
+    active_index_directory: /loki/index
+```
+
+## Grafana 集成
+
+### 数据源配置
+
+```yaml
+# Grafana Loki 数据源
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+    jsonData:
+      maxLines: 1000
+      timeout: 60
+```
+
+### Dashboard 配置
+
+```json
+{
+  "panels": [
+    {
+      "title": "日志率",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate({job=\"nginx\"}[5m]))",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## 性能优化
+
+### 查询优化
+
+| 优化策略 | 说明 | 效果 |
+|----------|------|------|
+| 标签优化 | 低基数标签 | 减少索引 |
+| 时间范围 | 缩短查询范围 | 减少扫描 |
+| 聚合下推 | 尽可能早聚合 | 减少传输 |
+| 缓存利用 | 结果缓存 | 重复查询加速 |
+
+### 写入优化
+
+| 优化策略 | 说明 | 效果 |
+|----------|------|------|
+| 批量写入 | 减少请求数 | 降低开销 |
+| 压缩配置 | 选择合适压缩 | 减少存储 |
+| 流控制 | 限流保护 | 避免过载 |
+
+### 资源配置
+
+```yaml
+# Loki 资源配置
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+```
+
+## vs ELK 对比
+
+| 维度 | Loki | ELK |
+|------|------|-----|
+| 索引 | 只索引标签 | 全文索引 |
+| 存储成本 | 低（对象存储） | 高（ES集群） |
+| 查询能力 | LogQL | KQL |
+| 部署复杂度 | 低 | 高 |
+| 适用场景 | 日志聚合 | 全文搜索 |
+
 ## 与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；

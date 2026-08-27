@@ -1448,6 +1448,202 @@ plugins:
 
 ---
 
+## 插件开发实战
+
+### Kong 插件开发
+
+```lua
+-- Kong 插件示例
+local BasePlugin = require "kong.plugins.base_plugin"
+local MyPlugin = BasePlugin:extend()
+
+function MyPlugin:new()
+    MyPlugin.super.new(self, "my-plugin")
+end
+
+function MyPlugin:access(conf)
+    MyPlugin.super.access(self)
+    -- 添加自定义头
+    kong.response.set_header("X-Custom-Header", "my-value")
+end
+
+return MyPlugin
+```
+
+### APISIX 插件开发
+
+```lua
+-- APISIX Lua 插件
+local _M = {
+    version = 1.0,
+    type = 'auth',
+    name = "my-auth-plugin",
+    schema = {
+        type = "object",
+        properties = {
+            token = {type = "string"}
+        }
+    }
+}
+
+function _M.check_schema(conf)
+    return true
+end
+
+function _M.rewrite(conf, ctx)
+    -- 验证 token
+    local token = core.request.header(ctx, "Authorization")
+    if token ~= conf.token then
+        return 401, {message = "Unauthorized"}
+    end
+end
+
+return _M
+```
+
+## 认证插件对比
+
+| 插件 | 说明 | 适用场景 |
+|------|------|----------|
+| JWT | JSON Web Token | API认证 |
+| OAuth2 | OAuth 2.0 | 第三方登录 |
+| Key-Auth | API Key | 简单认证 |
+| Basic-Auth | HTTP Basic | 内部服务 |
+| HMAC | 哈希消息认证 | 签名验证 |
+
+### JWT 插件配置
+
+```yaml
+# Kong JWT 配置
+plugins:
+- name: jwt
+  config:
+    claims_to_verify:
+    - exp
+    - nbf
+    key_claim_name: iss
+    secret_is_base64: false
+
+# APISIX JWT 配置
+plugins:
+  jwt-auth:
+    header: Authorization
+    query: token
+    cookie: token
+```
+
+## K8s Ingress 集成
+
+### Kong Ingress 配置
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    konghq.com/strip-path: "true"
+    konghq.com/plugins: "rate-limiting"
+spec:
+  ingressClassName: kong
+  rules:
+  - host: my.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: my-service
+            port:
+              number: 80
+```
+
+### APISIX Ingress 配置
+
+```yaml
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: my-route
+spec:
+  http:
+  - name: my-route
+    match:
+      paths:
+      - /api
+      hosts:
+      - my.example.com
+    backends:
+    - serviceName: my-service
+      servicePort: 80
+    plugins:
+    - name: rate-limiting
+      config:
+        count: 100
+        time_window: 60
+```
+
+## 插件生态对比
+
+| 插件类型 | Kong 插件数 | APISIX 插件数 |
+|----------|-------------|---------------|
+| 认证 | 10+ | 15+ |
+| 限流 | 5+ | 8+ |
+| 日志 | 15+ | 12+ |
+| 监控 | 10+ | 8+ |
+| 转换 | 10+ | 6+ |
+
+## 性能基准测试
+
+### 延迟对比
+
+| 场景 | Kong | APISIX |
+|------|------|--------|
+| 空转（无插件） | ~1ms | ~0.5ms |
+| JWT 认证 | ~2ms | ~1.5ms |
+| 限流 | ~1.5ms | ~1ms |
+| 日志记录 | ~2ms | ~1.5ms |
+
+### 吞吐对比
+
+| 并发数 | Kong QPS | APISIX QPS |
+|--------|----------|------------|
+| 100 | 15,000 | 25,000 |
+| 500 | 12,000 | 20,000 |
+| 1000 | 10,000 | 18,000 |
+
+## 监控与告警
+
+### Prometheus 集成
+
+```yaml
+# Kong 监控
+plugins:
+- name: prometheus
+  config:
+    per_consumer: true
+    status_code_metrics: true
+    latency_metrics: true
+    bandwidth_metrics: true
+
+# APISIX 监控
+plugins:
+  prometheus:
+    prefer_name: true
+    export_addr:
+      ip: "0.0.0.0"
+      port: 9091
+```
+
+### 告警规则
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| 请求延迟P99 | > 1s | 延迟过高 |
+| 错误率 | > 5% | 错误过多 |
+| 限流次数 | > 100/min | 流量过大 |
+
 ## 与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；

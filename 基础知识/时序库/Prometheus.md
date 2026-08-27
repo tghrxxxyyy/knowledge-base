@@ -1393,6 +1393,211 @@ Thanos Compactor：
     --retention.resolution-5m=365d
 ```
 
+## Prometheus 告警最佳实践详解
+
+### 告警规则设计
+
+```yaml
+# 告警规则模板
+groups:
+  - name: infrastructure
+    rules:
+      # 实例宕机
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "实例宕机"
+          description: "实例 {{ $labels.instance }} 已宕机超过 1 分钟"
+
+      # CPU 使用率过高
+      - alert: HighCpuUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率过高"
+          description: "实例 {{ $labels.instance }} CPU 使用率超过 80%"
+
+      # 内存使用率过高
+      - alert: HighMemoryUsage
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "实例 {{ $labels.instance }} 内存使用率超过 85%"
+
+      # 磁盘使用率过高
+      - alert: HighDiskUsage
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|fuse.lxcfs"} / node_filesystem_size_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "磁盘使用率过高"
+          description: "实例 {{ $labels.instance }} 磁盘使用率超过 85%"
+
+  - name: application
+    rules:
+      # HTTP 错误率过高
+      - alert: HighHttpErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP 错误率过高"
+          description: "HTTP 5xx 错误率超过 5%"
+
+      # 响应时间过长
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "响应时间过长"
+          description: "P95 响应时间超过 1 秒"
+```
+
+### 告警路由与通知
+
+```yaml
+# Alertmanager 配置
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager@example.com'
+  smtp_auth_password: 'password'
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      receiver: 'critical'
+      group_wait: 10s
+    - match:
+        severity: warning
+      receiver: 'warning'
+
+receivers:
+  - name: 'default'
+    email_configs:
+      - to: 'team@example.com'
+
+  - name: 'critical'
+    webhook_configs:
+      - url: 'http://alert-handler:8080/critical'
+        send_resolved: true
+
+  - name: 'warning'
+    email_configs:
+      - to: 'team@example.com'
+        send_resolved: true
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+```
+
+## Thanos Store Gateway 详解
+
+### Store Gateway 架构
+
+```text
+Thanos Store Gateway 架构：
+┌─────────────────────┐    ┌─────────────────────┐    ┌──────────────┐
+│  对象存储 S3/GCS    │ ←  │  Store Gateway      │ ←  │  Thanos Query│
+│  (长期数据)         │    │  (缓存层)           │    │  (全局查询)  │
+└─────────────────────┘    └─────────────────────┘    └──────────────┘
+                                  │
+                                  ├── Index Cache（索引缓存）
+                                  ├── Chunk Pool（数据块池）
+                                  └── Metadata Cache（元数据缓存）
+```
+
+### 缓存策略
+
+| 缓存类型 | 内容 | 大小建议 | 作用 |
+|---------|------|---------|------|
+| **Index Cache** | 倒排索引 | 500MB-2GB | 加速标签查询 |
+| **Chunk Pool** | 压缩数据块 | 2-8GB | 减少对象存储读取 |
+| **Metadata Cache** | block meta.json | 100-500MB | 减少元数据请求 |
+
+```yaml
+# Store Gateway 配置
+storegateway:
+  - --data-dir=/data
+  - --objstore.config-file=/etc/thanos/s3.yml
+  - --index-cache-size=500MB
+  - --chunk-pool-size=2GB
+  - --sync-interval=3m
+  - --min-time=-2w
+```
+
+## Thanos Compactor 详解
+
+### 降采样策略
+
+```text
+Thanos Compactor 降采样：
+  原始数据：保留 30 天（resolution-raw）
+  5 分钟降采样：保留 90 天（resolution-5m）
+  1 小时降采样：保留 365 天（resolution-1h）
+
+  降采样作用：
+    - 减少存储空间：1h 块比 raw 块小 10-100 倍
+    - 加速长期查询：查询 1 年数据用 1h 块
+    - 降低成本：对象存储费用减少
+```
+
+```yaml
+# Compactor 配置
+compactor:
+  - --data-dir=/data
+  - --objstore.config-file=/etc/thanos/s3.yml
+  - --retention.resolution-raw=30d
+  - --retention.resolution-5m=90d
+  - --retention.resolution-1h=365d
+  - --compact.resolution-interval=1h
+  - --downsample.resolution-interval=1h
+```
+
+### 块合并与资源限制
+
+```text
+Compactor 资源调优：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 参数                  │ 说明                                        │
+├──────────────────────┼────────────────────────────────────────────┤
+│ --compact.concurrency│ 并发合并块数（默认 1）                      │
+│ --downsample.concurrency │ 并发降采样数（默认 1）               │
+│ --compaction-interval │ 合并间隔（默认 30m）                       │
+│ --retention.resolution-raw │ 原始数据保留期                      │
+│ --delete-delay       │ 删除延迟（等待一致性检查）                  │
+└──────────────────────┴────────────────────────────────────────────┘
+
+调优建议：
+  1. 大规模集群：增大 --compact.concurrency=4
+  2. 对象存储限流：降低 --compaction-interval=1h
+  3. 存储成本：缩短 --retention.resolution-raw=15d
+  4. 监控：thanos_compact_group_compactions_total
+```
+
 ## Prometheus 容量规划公式
 
 ```

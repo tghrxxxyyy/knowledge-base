@@ -1355,6 +1355,372 @@ Redis 运维清单：
 | 网络分区 | 自动故障转移 | 秒级 |
 | 内存溢出 | 扩容或清理数据 | 分钟级 |
 
+## 二十五、Redis 持久化方案深度对比
+
+### RDB vs AOF vs 混合持久化
+
+| 维度 | RDB | AOF | 混合持久化 |
+|------|-----|-----|------------|
+| 触发方式 | `SAVE`/`BGSAVE`/自动 | `appendfsync` everysec/always/no | AOF 重写时先写 RDB 再追加增量 AOF |
+| 恢复速度 | 快（直接加载二进制） | 慢（重放所有写命令） | 快（RDB 部分 + 增量 AOF） |
+| 数据安全性 | 可能丢最后一次快照后的数据 | 最多丢 1 秒（everysec） | 最多丢 1 秒（增量 AOF 部分） |
+| 文件大小 | 小（压缩二进制） | 大（文本命令，含冗余） | 中等（RDB 头 + 增量 AOF） |
+| fork 开销 | 每次全量 fork | 重写时 fork | 重写时 fork（更频繁） |
+| 适用场景 | 备份、主从全量同步 | 数据安全性要求高 | 生产环境推荐（兼顾速度与安全） |
+
+### 持久化最佳实践
+
+```
+生产环境配置：
+  # 混合持久化（推荐）
+  aof-use-rdb-preamble yes
+  appendonly yes
+  appendfsync everysec
+
+  # AOF 自动重写触发条件
+  auto-aof-rewrite-percentage 100
+  auto-aof-rewrite-min-size 64mb
+
+  # RDB 快照（备份用）
+  save 900 1
+  save 300 10
+  save 60 10000
+
+  # fork 限制（防 OOM）
+  activedefrag yes
+```
+
+### fork 阻塞问题与解决方案
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| fork 耗时长 | 大实例（>10GB）页表拷贝慢 | 控制单实例内存 ≤10GB，低峰期做 RDB |
+| COW 内存暴涨 | fork 后大量写操作触发页复制 | 监控 `used_memory_rss`，设 `maxmemory` |
+| 子进程 CPU 高 | 后台 AOF 重写消耗资源 | 调整 `io-threads`，限制后台线程优先级 |
+
+## 二十六、Redis 内存优化与 Key 设计
+
+### Key 设计原则
+
+| 原则 | 示例 | 说明 |
+|------|------|------|
+| 短 Key | `u:1001:n` 而非 `user:1001:name` | 减少内存开销（每个 key 节省几十字节） |
+| 避免大 Key | String < 10KB，Hash/Set < 5000 元素 | 大 key 阻塞、迁移慢、网络传输大 |
+| 业务前缀 | `order:detail:12345` | 避免 key 冲突，便于 SCAN 扫描 |
+| 避免特殊字符 | 用 `:` 分隔，不用空格/换行 | 避免解析问题 |
+| 合理过期 | 写入时设 TTL，避免永不过期 | 节省内存，避免 OOM |
+
+### 底层编码优化
+
+| 数据类型 | 小对象编码 | 大对象编码 | 切换阈值 |
+|----------|------------|------------|----------|
+| Hash | listpack（ziplist） | hashtable | `hash-max-listpack-entries 128`，`hash-max-listpack-value 64` |
+| List | listpack | quicklist | `list-max-listpack-size -2` |
+| Set | intset（纯整数） | hashtable | `set-max-intset-entries 512` |
+| ZSet | listpack | skiplist + hashtable | `zset-max-listpack-entries 128`，`zset-max-listpack-value 64` |
+
+### 内存优化技巧
+
+```bash
+# 查看 key 的内存占用
+MEMORY USAGE <key>
+
+# 查看对象编码
+OBJECT ENCODING <key>
+
+# 查看内存统计
+INFO memory
+
+# 关键指标：
+# used_memory：Redis 分配的内存总量
+# used_memory_rss：操作系统分配的内存（含碎片）
+# mem_fragmentation_ratio：碎片率（>1.5 需优化）
+# mem_allocator：内存分配器（jemalloc 推荐）
+```
+
+### 内存碎片处理
+
+| 策略 | 方法 | 适用场景 |
+|------|------|----------|
+| 在线整理 | `activedefrag yes`（Redis 4.0+） | 生产环境自动整理 |
+| 重启整理 | 重启 Redis 从 RDB 加载 | 碎片率 >2 时使用 |
+| 避免碎片 | 合理设置 key 过期、避免频繁更新大 value | 预防为主 |
+| 监控告警 | `mem_fragmentation_ratio` 阈值告警 | 持续监控 |
+
+## 二十七、Redis 事务与 Lua 脚本对比
+
+### 事务 vs Lua 脚本
+
+| 维度 | MULTI/EXEC 事务 | Lua 脚本 |
+|------|-----------------|----------|
+| 原子性 | 非原子（单条失败不影响其他） | 原子（脚本执行期间不被打断） |
+| 隔离性 | 事务内命令排队执行 | 脚本内命令串行执行 |
+| 回滚 | 不支持（仅语法错误回滚） | 不支持（脚本错误需手动处理） |
+| 乐观锁 | `WATCH` + `MULTI` | `SETNX` + Lua 释放 |
+| 复杂逻辑 | 不支持条件判断 | 支持 if/else/循环 |
+| 性能 | 网络 RTT 少（批量提交） | 一次执行多条命令，RTT 最少 |
+| 集群支持 | 不支持跨 slot | 脚本内所有 key 必须在同一 slot |
+
+### Lua 脚本实战
+
+```lua
+-- 分布式锁释放（原子操作）
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+
+-- 限流器（滑动窗口）
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+redis.call("ZREMRANGEBYSCORE", key, 0, now - window)
+local count = redis.call("ZCARD", key)
+if count < limit then
+    redis.call("ZADD", key, now, now)
+    redis.call("EXPIRE", key, window)
+    return 1
+else
+    return 0
+end
+```
+
+### Lua 脚本管理
+
+```bash
+# 加载脚本
+EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 mykey myvalue
+
+# 脚本缓存（推荐）
+SCRIPT LOAD "脚本内容"  # 返回 SHA1
+EVALSHA "SHA1" 1 mykey myvalue
+
+# Redis 7+ Function（推荐）
+FUNCTION LOAD "#!lua name=mylib
+local function my_set(keys, args)
+    return redis.call('SET', keys[1], args[1])
+end
+redis.register_function('my_set', my_set)
+"
+FCALL my_set 1 mykey myvalue
+
+# 脚本超时控制
+lua-time-limit 5000  # 5秒超时
+```
+
+## 二十八、Redis PubSub vs Streams 深度对比
+
+### PubSub vs Streams vs List vs ZSet 消息队列
+
+| 维度 | PubSub | Streams | List | ZSet |
+|------|--------|---------|------|------|
+| 消息持久化 | ❌ 不支持 | ✅ 支持（AOF/RDB） | ✅ 支持 | ✅ 支持 |
+| 消费组 | ❌ 不支持 | ✅ 支持（类似 Kafka） | ❌ 不支持 | ❌ 不支持 |
+| 消息确认 | ❌ 不支持 | ✅ XACK | ❌ 不支持 | ❌ 不支持 |
+| 消息回溯 | ❌ 不支持 | ✅ 按 ID 重读 | ❌ 不支持 | ✅ 按 score 查询 |
+| 消费者负载均衡 | ❌ 广播 | ✅ 消费组内竞争 | ✅ BRPOP | ❌ ZPOPMIN |
+| 消息积压 | 32MB/60s 限制 | 无限制 | 无限制 | 无限制 |
+| 阻塞读取 | SUBSCRIBE 阻塞 | XREAD BLOCK | BRPOP | BZPOPMIN |
+| 适用场景 | 实时通知/广播 | 轻量级 MQ/事件驱动 | 简单队列 | 延迟队列/优先级队列 |
+
+### Streams 详细用法
+
+```bash
+# 创建 Stream
+XADD mystream * field1 value1 field2 value2
+
+# 读取消息
+XREAD COUNT 10 BLOCK 5000 STREAMS mystream 0
+
+# 创建消费组
+XGROUP CREATE mystream mygroup 0
+
+# 消费组读取
+XREADGROUP GROUP mygroup consumer1 COUNT 10 BLOCK 5000 STREAMS mystream >
+
+# 确认消息
+XACK mystream mygroup 1526569495631-0
+
+# 查看待处理消息
+XPENDING mystream mygroup
+
+# 转移消息（消费者故障）
+XCLAIM mystream mygroup consumer2 3600000 1526569495631-0
+
+# 删除消息
+XDEL mystream 1526569495631-0
+
+# 裁剪 Stream
+XTRIM mystream MAXLEN 1000
+```
+
+### Streams 消费组架构
+
+```mermaid
+graph TD
+    A[生产者] -->|XADD| B[Stream]
+    B -->|XREADGROUP| C[消费者组 Consumer Group]
+    C --> D[消费者1]
+    C --> E[消费者2]
+    C --> F[消费者3]
+    D -->|XACK| B
+    E -->|XACK| B
+    F -->|XACK| B
+    G[监控] -->|XPENDING| C
+```
+
+### 消息积压处理
+
+| 场景 | 处理方式 |
+|------|----------|
+| 消费者故障 | `XCLAIM` 转移消息给其他消费者 |
+| 消息积压 | 增加消费者数量，扩容消费组 |
+| 消息丢失 | 未 XACK 的消息不会丢失，重启后自动恢复 |
+| 历史消息 | `XRANGE` 按 ID 范围查询 |
+| 消息归档 | `XTRIM` 裁剪旧消息，归档到冷存储 |
+
+## 二十九、Redis 安全加固
+
+### 安全配置清单
+
+| 配置项 | 推荐值 | 说明 |
+|--------|--------|------|
+| `requirepass` | 强密码（≥16位） | 密码认证 |
+| `bind` | `127.0.0.1` 或内网 IP | 限制监听地址 |
+| `protected-mode` | `yes` | 非绑定地址 + 无密码时拒绝连接 |
+| `rename-command FLUSHALL` | `""` 或随机字符串 | 禁用危险命令 |
+| `rename-command FLUSHDB` | `""` 或随机字符串 | 禁用危险命令 |
+| `rename-command CONFIG` | `""` 或随机字符串 | 禁用危险命令 |
+| `maxmemory` | 物理内存 70%~80% | 防止 OOM |
+| `maxclients` | 10000 | 最大连接数 |
+| `timeout` | 300 | 空闲连接超时 |
+| `tcp-keepalive` | 60 | TCP 保活探测 |
+
+### ACL 权限控制（Redis 6+）
+
+```bash
+# 创建用户
+ACL SETUSER alice on >password123 ~cache:* +get +set +del
+
+# 用户权限说明：
+# on：启用用户
+# >password123：设置密码
+# ~cache:*：允许访问 cache: 前缀的 key
+# +get +set +del：允许 GET/SET/DEL 命令
+
+# 查看用户
+ACL LIST
+ACL GETUSER alice
+
+# 切换用户
+AUTH alice password123
+
+# 查看命令权限
+ACL CAT read  # 查看所有读命令
+ACL CAT write # 查看所有写命令
+
+# 持久化 ACL
+ACL SAVE  # 保存到 aclfile
+ACL LOAD  # 从 aclfile 加载
+```
+
+### 网络隔离方案
+
+| 层级 | 措施 | 说明 |
+|------|------|------|
+| OS 层 | 防火墙限制端口 | 仅允许应用服务器访问 |
+| Redis 层 | bind + protected-mode | 限制监听地址 |
+| 应用层 | 连接池 + 认证 | 客户端统一管理连接 |
+| 容器层 | K8s NetworkPolicy | Pod 级别网络隔离 |
+| 监控层 | 异常连接告警 | 监控非授权访问尝试 |
+
+### 安全审计
+
+```bash
+# 开启慢查询日志
+slowlog-log-slower-than 10000  # 10ms
+slowlog-max-len 128
+
+# 监控命令执行
+MONITOR  # 实时监控（影响性能，仅调试用）
+
+# 查看客户端连接
+CLIENT LIST
+
+# 查看慢查询
+SLOWLOG GET 10
+
+# 查看统计信息
+INFO stats
+# rejected_connections：拒绝的连接数
+# expired_keys：过期的 key 数量
+# evicted_keys：淘汰的 key 数量
+```
+
+## 三十、Redis 7.x 新特性与生产实践
+
+### Redis 7.x 核心新特性
+
+| 特性 | 说明 | 生产价值 |
+|------|------|----------|
+| Functions | 替代 Lua 脚本管理，注册为命名函数 | 避免每次 EVAL 传脚本体，集群传播一致 |
+| ACL v2 | 更细粒度权限（key 级 + 命令级） | 多租户安全隔离 |
+| Multi-part AOF | AOF 按类型拆文件，重写更平滑 | 崩溃恢复更快，重写不阻塞 |
+| Client-side Caching 增强 | 推送更稳定，支持更多失效模式 | 零 RTT 读 + 一致性保证 |
+| Sharded Pub/Sub | `SSUBSCRIBE` 按 slot 分片 | 突破单节点 pub/sub 瓶颈 |
+| Listpack 优化 | 内存更紧凑的紧凑列表 | 内存节省 10%~20% |
+| Waitaof | AOF 同步写等待，可配置副本确认 | 数据安全性可调 |
+
+### Functions 使用示例
+
+```bash
+# 注册函数
+FUNCTION LOAD "#!lua name=mylib
+local function get_user(keys, args)
+    local user = redis.call('HGETALL', keys[1])
+    return user
+end
+redis.register_function('get_user', my_set)
+"
+
+# 调用函数
+FCALL get_user 1 user:1001
+
+# 查看已注册函数
+FUNCTION LIST
+
+# 删除函数
+FUNCTION DELETE mylib
+```
+
+### Multi-part AOF 配置
+
+```bash
+# AOF 拆文件配置（Redis 7+）
+aof-use-rdb-preamble yes
+aof-timestamp-enabled yes
+
+# AOF 文件命名：
+# appendonly.aof.1.base.rdb    # 基础 RDB
+# appendonly.aof.1.incr.aof    # 增量 AOF
+# appendonly.aof.manifest      # 清单文件
+```
+
+### Redis 7.x 迁移注意事项
+
+| 注意项 | 说明 | 处理方式 |
+|--------|------|----------|
+| AOF 格式变化 | 多文件格式，旧工具不兼容 | 升级 rdbtools 等分析工具 |
+| 命令变更 | 部分命令参数调整 | 测试现有命令兼容性 |
+| 配置项变更 | 新增配置项，旧配置可能废弃 | 参考官方迁移指南 |
+| Lua 脚本迁移 | EVAL → FUNCTION LOAD | 逐步迁移，保持兼容 |
+| 集群升级 | 滚动升级，逐节点重启 | 先升级从节点，再升主节点 |
+
+---
+
 ## Redis 故障排查
 
 ### 常见故障处理

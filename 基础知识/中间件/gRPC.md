@@ -1468,6 +1468,380 @@ go run gateway.go -grpc-server=localhost:8080 -http-server=:8081
 });
 ```
 
+---
+
+## 十三、四种调用模式代码示例
+
+### 13.1 Unary RPC 示例
+
+```java
+// 服务端
+public class UserServiceImpl extends UserServiceGrpc.UserServiceImplBase {
+    @Override
+    public void getUser(GetUserRequest request, StreamObserver<User> responseObserver) {
+        User user = User.newBuilder()
+            .setId(request.getId())
+            .setName("张三")
+            .build();
+        responseObserver.onNext(user);
+        responseObserver.onCompleted();
+    }
+}
+
+// 客户端
+User user = blockingStub.getUser(GetUserRequest.newBuilder().setId(1).build());
+```
+
+### 13.2 Server Streaming RPC 示例
+
+```java
+// 服务端
+@Override
+public void listUsers(ListUsersRequest request, StreamObserver<User> responseObserver) {
+    for (int i = 0; i < 10; i++) {
+        User user = User.newBuilder()
+            .setId(i)
+            .setName("User " + i)
+            .build();
+        responseObserver.onNext(user);
+    }
+    responseObserver.onCompleted();
+}
+
+// 客户端
+Iterator<User> users = blockingStub.listUsers(ListUsersRequest.newBuilder().build());
+while (users.hasNext()) {
+    User user = users.next();
+    System.out.println(user.getName());
+}
+```
+
+### 13.3 Client Streaming RPC 示例
+
+```java
+// 服务端
+@Override
+public StreamObserver<Chunk> uploadAvatar(StreamObserver<UploadReply> responseObserver) {
+    return new StreamObserver<Chunk>() {
+        @Override
+        public void onNext(Chunk chunk) {
+            // 处理文件块
+        }
+        
+        @Override
+        public void onError(Throwable t) {
+            // 错误处理
+        }
+        
+        @Override
+        public void onCompleted() {
+            responseObserver.onNext(UploadReply.newBuilder().setSuccess(true).build());
+            responseObserver.onCompleted();
+        }
+    };
+}
+
+// 客户端
+StreamObserver<Chunk> uploadObserver = asyncStub.uploadAvatar(new StreamObserver<UploadReply>() {
+    @Override
+    public void onNext(UploadReply reply) {
+        System.out.println("Upload success: " + reply.getSuccess());
+    }
+    
+    @Override
+    public void onError(Throwable t) {}
+    
+    @Override
+    public void onCompleted() {}
+});
+
+// 发送文件块
+uploadObserver.onNext(Chunk.newBuilder().setData(ByteString.copyFrom(data)).build());
+uploadObserver.onCompleted();
+```
+
+### 13.4 Bidirectional Streaming RPC 示例
+
+```java
+// 服务端
+@Override
+public StreamObserver<Message> chat(StreamObserver<Message> responseObserver) {
+    return new StreamObserver<Message>() {
+        @Override
+        public void onNext(Message message) {
+            // 收到消息后回复
+            Message reply = Message.newBuilder()
+                .setUser("Server")
+                .setText("Echo: " + message.getText())
+                .build();
+            responseObserver.onNext(reply);
+        }
+        
+        @Override
+        public void onError(Throwable t) {}
+        
+        @Override
+        public void onCompleted() {
+            responseObserver.onCompleted();
+        }
+    };
+}
+
+// 客户端
+StreamObserver<Message> chatObserver = asyncStub.chat(new StreamObserver<Message>() {
+    @Override
+    public void onNext(Message message) {
+        System.out.println(message.getUser() + ": " + message.getText());
+    }
+    
+    @Override
+    public void onError(Throwable t) {}
+    
+    @Override
+    public void onCompleted() {}
+});
+
+chatObserver.onNext(Message.newBuilder().setUser("Client").setText("Hello").build());
+chatObserver.onCompleted();
+```
+
+---
+
+## 十四、拦截器深入
+
+### 14.1 Unary Interceptor 示例
+
+```java
+// 服务端拦截器
+public class LoggingInterceptor implements ServerInterceptor {
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+        
+        long start = System.currentTimeMillis();
+        String method = call.getMethodDescriptor().getFullMethodName();
+        
+        return new ServerCall.Listener<ReqT>() {
+            @Override
+            public void onMessage(ReqT message) {
+                System.out.println("Received message for " + method);
+            }
+            
+            @Override
+            public void onHalfClose() {
+                next.startCall(call, headers);
+            }
+            
+            @Override
+            public void onComplete() {
+                long duration = System.currentTimeMillis() - start;
+                System.out.println("Call " + method + " completed in " + duration + "ms");
+            }
+        };
+    }
+}
+
+// 注册拦截器
+ServerServiceDefinition serviceDef = ServerInterceptors.intercept(
+    new UserServiceImpl(),
+    new LoggingInterceptor()
+);
+```
+
+### 14.2 Client Interceptor 示例
+
+```java
+// 客户端拦截器
+public class AuthInterceptor implements ClientInterceptor {
+    @Override
+    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+            MethodDescriptor<ReqT, RespT> method,
+            CallOptions options,
+            Channel next) {
+        
+        return new ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(
+            next.newCall(method, options)) {
+            
+            @Override
+            public void start(Listener<RespT> responseListener, Metadata headers) {
+                headers.put(AUTH_TOKEN_KEY, "Bearer " + getToken());
+                super.start(responseListener, headers);
+            }
+        };
+    }
+}
+
+// 使用拦截器
+ManagedChannel channel = ManagedChannelBuilder.forTarget("localhost:8080")
+    .intercept(new AuthInterceptor())
+    .build();
+```
+
+---
+
+## 十五、负载均衡深入
+
+### 15.1 负载均衡策略对比
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| pick_first | 选择第一个可用连接 | 简单场景 |
+| round_robin | 轮询所有连接 | 通用场景 |
+| weighted_round_robin | 加权轮询 | 节点性能不同 |
+| least_connections | 最少连接 | 长连接场景 |
+| custom | 自定义策略 | 特殊需求 |
+
+### 15.2 负载均衡配置
+
+```java
+// 客户端负载均衡配置
+ManagedChannel channel = ManagedChannelBuilder.forTarget("dns:///my-service:8080")
+    .defaultLoadBalancingPolicy("round_robin")
+    .build();
+
+// 服务端负载均衡配置
+Server server = ServerBuilder.forPort(8080)
+    .addService(new UserServiceImpl())
+    .loadBalancerFactory(RoundRobinLoadBalancerFactory.getInstance())
+    .build();
+```
+
+---
+
+## 十六、健康检查深入
+
+### 16.1 健康检查协议
+
+```java
+// 服务端健康检查实现
+public class HealthServiceImpl extends HealthGrpc.HealthImplBase {
+    @Override
+    public void check(HealthCheckRequest request, StreamObserver<HealthCheckResponse> responseObserver) {
+        String service = request.getService();
+        if ("grpc.health.v1.Health".equals(service) || "".equals(service)) {
+            responseObserver.onNext(HealthCheckResponse.newBuilder()
+                .setStatus(HealthCheckResponse.ServingStatus.SERVING)
+                .build());
+        } else {
+            responseObserver.onNext(HealthCheckResponse.newBuilder()
+                .setStatus(HealthCheckResponse.ServingStatus.NOT_FOUND)
+                .build());
+        }
+        responseObserver.onCompleted();
+    }
+}
+```
+
+### 16.2 健康检查配置
+
+```yaml
+# K8s 健康检查配置
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: grpc-server
+      livenessProbe:
+        grpc:
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 10
+      readinessProbe:
+        grpc:
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 5
+```
+
+---
+
+## 十七、错误处理深入
+
+### 17.1 gRPC 状态码
+
+| 状态码 | 说明 | 适用 |
+|--------|------|------|
+| OK | 成功 | 正常响应 |
+| CANCELLED | 被取消 | 客户端取消 |
+| UNKNOWN | 未知错误 | 通用错误 |
+| INVALID_ARGUMENT | 参数无效 | 参数校验 |
+| NOT_FOUND | 资源不存在 | 资源查询 |
+| ALREADY_EXISTS | 资源已存在 | 资源创建 |
+| PERMISSION_DENIED | 权限不足 | 鉴权失败 |
+| UNAUTHENTICATED | 未认证 | 未登录 |
+| RESOURCE_EXHAUSTED | 资源耗尽 | 限流 |
+| FAILED_PRECONDITION | 前置条件失败 | 业务约束 |
+| ABORTED | 被中止 | 重试场景 |
+| OUT_OF_RANGE | 超出范围 | 分页查询 |
+| UNIMPLEMENTED | 未实现 | 功能缺失 |
+| INTERNAL | 内部错误 | 服务端异常 |
+| UNAVAILABLE | 服务不可用 | 服务降级 |
+| DATA_LOSS | 数据丢失 | 数据损坏 |
+| DEADLINE_EXCEEDED | 超时 | 超时处理 |
+
+### 17.2 重试策略配置
+
+```java
+// 客户端重试配置
+ManagedChannel channel = ManagedChannelBuilder.forTarget("localhost:8080")
+    .defaultServiceConfig(ServiceConfig.newBuilder()
+        .addMethodConfig(MethodConfig.newBuilder()
+            .addNames(MethodDescriptor.newBuilder().setService("UserService").build())
+            .setRetryPolicy(RetryPolicy.newBuilder()
+                .setMaxAttempts(3)
+                .setInitialBackoff("0.1s")
+                .setMaxBackoff("1s")
+                .setBackoffMultiplier(2)
+                .addRetryableStatusCodes(Status.Code.UNAVAILABLE)
+                .build())
+            .build())
+        .build())
+    .build();
+```
+
+---
+
+## 十八、gRPC-Gateway REST 共存
+
+### 18.1 Gateway 配置
+
+```protobuf
+// user.proto
+syntax = "proto3";
+package user;
+
+import "google/api/annotations.proto";
+
+service UserService {
+  rpc GetUser (GetUserRequest) returns (User) {
+    option (google.api.http) = {
+      get: "/v1/users/{id}"
+    };
+  }
+  
+  rpc CreateUser (CreateUserRequest) returns (User) {
+    option (google.api.http) = {
+      post: "/v1/users"
+      body: "*"
+    };
+  }
+}
+```
+
+### 18.2 Gateway 生成
+
+```bash
+# 生成 Gateway 代码
+protoc --grpc-gateway_out=. \
+  --grpc-gateway_opt=paths=source_relative \
+  user.proto
+
+# 启动 Gateway
+go run main.go --grpc-server-endpoint=localhost:8080 --http-server-port=8081
+```
+
 ## 十二、与其他板块的关系（扩展）
 
 - Dubbo 对比见「[Apache Dubbo RPC 框架](./ApacheDubboRPC框架.md)」；

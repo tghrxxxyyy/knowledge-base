@@ -1415,6 +1415,439 @@ element.textContent = userInput;
 element.innerHTML = DOMPurify.sanitize(userInput);
 ```
 
+---
+
+## Web 安全深度实战
+
+### 安全编码规范详解
+
+```java
+// 安全编码规范示例
+
+// 1. 输入验证（白名单）
+public class InputValidator {
+    // 邮箱验证
+    public static boolean isValidEmail(String email) {
+        String regex = "^[A-Za-z0-9+_.-]+@(.+)$";
+        return Pattern.matches(regex, email);
+    }
+    
+    // 手机号验证
+    public static boolean isValidPhone(String phone) {
+        String regex = "^1[3-9]\\d{9}$";
+        return Pattern.matches(regex, phone);
+    }
+    
+    // 文件名验证（防路径穿越）
+    public static boolean isValidFilename(String filename) {
+        return filename != null 
+            && !filename.contains("..")
+            && !filename.contains("/")
+            && !filename.contains("\\")
+            && filename.matches("^[a-zA-Z0-9._-]+$");
+    }
+}
+
+// 2. SQL 注入防御
+public class SqlSafety {
+    // 安全：参数化查询
+    public User findById(Connection conn, Long id) throws SQLException {
+        String sql = "SELECT * FROM users WHERE id = ?";
+        PreparedStatement stmt = conn.prepareStatement(sql);
+        stmt.setLong(1, id);
+        ResultSet rs = stmt.executeQuery();
+        if (rs.next()) {
+            return mapUser(rs);
+        }
+        return null;
+    }
+    
+    // 安全：MyBatis #{} 预编译
+    // @Select("SELECT * FROM users WHERE id = #{id}")
+    // User findById(@Param("id") Long id);
+    
+    // 危险：字符串拼接（必须用白名单校验）
+    // @Select("SELECT * FROM users ORDER BY ${column}")
+    // List<User> findAll(@Param("column") String column);
+}
+
+// 3. XSS 防御
+public class XssSafety {
+    // HTML 编码
+    public static String escapeHtml(String input) {
+        if (input == null) return null;
+        return input
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#x27;");
+    }
+    
+    // JavaScript 编码
+    public static String escapeJs(String input) {
+        if (input == null) return null;
+        return input
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("<", "\\x3c")
+            .replace(">", "\\x3e");
+    }
+    
+    // URL 编码
+    public static String escapeUrl(String input) {
+        if (input == null) return null;
+        try {
+            return URLEncoder.encode(input, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            return input;
+        }
+    }
+}
+```
+
+### CSP 配置详解
+
+```html
+<!-- CSP nonce 方式（推荐） -->
+<meta http-equiv="Content-Security-Policy" 
+      content="default-src 'self'; 
+               script-src 'self' 'nonce-abc123'; 
+               style-src 'self' 'nonce-abc123';
+               img-src 'self' data: https:;
+               font-src 'self' https://fonts.gstatic.com;
+               connect-src 'self' https://api.example.com;
+               frame-ancestors 'none';
+               form-action 'self';
+               base-uri 'self';">
+
+<!-- CSP 完整配置示例 -->
+Content-Security-Policy:
+  default-src 'none';
+  script-src 'self' 'nonce-abc123' https://cdn.example.com;
+  style-src 'self' 'nonce-abc123' https://fonts.googleapis.com;
+  img-src 'self' data: https:;
+  font-src 'self' https://fonts.gstatic.com;
+  connect-src 'self' https://api.example.com wss://ws.example.com;
+  media-src 'self' https://media.example.com;
+  object-src 'none';
+  frame-src 'none';
+  frame-ancestors 'none';
+  form-action 'self';
+  base-uri 'self';
+  manifest-src 'self';
+  worker-src 'self';
+  report-uri /csp-report;
+  report-to csp-endpoint;
+```
+
+```nginx
+# Nginx CSP 配置
+add_header Content-Security-Policy "
+  default-src 'self';
+  script-src 'self' 'nonce-$request_id' https://cdn.example.com;
+  style-src 'self' 'nonce-$request_id' https://fonts.googleapis.com;
+  img-src 'self' data: https:;
+  font-src 'self' https://fonts.gstatic.com;
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  form-action 'self';
+  base-uri 'self';
+  report-uri /csp-report;
+" always;
+```
+
+### CSRF 防御深入
+
+```java
+// CSRF Token 生成与验证
+@Controller
+public class CsrfController {
+    
+    @GetMapping("/form")
+    public String form(HttpServletRequest request, Model model) {
+        CsrfToken token = (CsrfToken) request.getAttribute(CsrfToken.class.getName());
+        model.addAttribute("_csrf", token);
+        return "form";
+    }
+    
+    @PostMapping("/submit")
+    public String submit(@RequestBody String data) {
+        // Spring Security 自动验证 CSRF Token
+        return "success";
+    }
+}
+
+// 自定义 CSRF Token 验证
+@Component
+public class CustomCsrfFilter implements OncePerRequestFilter {
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response, 
+                                    FilterChain filterChain) throws ServletException, IOException {
+        
+        // 只对修改操作验证 CSRF
+        if (isMutatingMethod(request.getMethod())) {
+            String token = request.getHeader("X-CSRF-TOKEN");
+            String sessionToken = (String) request.getSession().getAttribute("CSRF_TOKEN");
+            
+            if (token == null || !token.equals(sessionToken)) {
+                response.sendError(HttpServletResponse.SC_FORBIDDEN, "CSRF token invalid");
+                return;
+            }
+        }
+        
+        filterChain.doFilter(request, response);
+    }
+    
+    private boolean isMutatingMethod(String method) {
+        return "POST".equals(method) || "PUT".equals(method) || 
+               "DELETE".equals(method) || "PATCH".equals(method);
+    }
+}
+```
+
+### JWT 安全最佳实践
+
+```java
+// JWT 安全配置
+public class JwtSecurity {
+    
+    // 生成安全 JWT
+    public String generateToken(UserDetails userDetails) {
+        return Jwts.builder()
+            .setIssuer("https://auth.example.com")      // 签发者
+            .setAudience("https://api.example.com")     // 受众
+            .setSubject(userDetails.getUsername())        // 用户标识
+            .setIssuedAt(new Date())                     // 签发时间
+            .setExpiration(new Date(System.currentTimeMillis() + 900_000)) // 15分钟
+            .setId(UUID.randomUUID().toString())         // 唯一ID（用于吊销）
+            .claim("roles", userDetails.getAuthorities())
+            .signWith(privateKey, SignatureAlgorithm.RS256)  // 非对称签名
+            .compact();
+    }
+    
+    // 安全验证 JWT
+    public Claims verifyToken(String token) {
+        // 1. 强制指定签名算法（不从 Header 读取）
+        Claims claims = Jwts.parserBuilder()
+            .setSigningKey(publicKey)
+            .requireIssuer("https://auth.example.com")
+            .requireAudience("https://api.example.com")
+            .build()
+            .parseClaimsJws(token)
+            .getBody();
+        
+        // 2. 校验 alg 是否合法
+        String algorithm = Jwts.parserBuilder()
+            .build()
+            .parseHeaderUnsecured(token).get("alg", String.class);
+        if (!"RS256".equals(algorithm) && !"ES256".equals(algorithm)) {
+            throw new SecurityException("非法签名算法: " + algorithm);
+        }
+        
+        return claims;
+    }
+    
+    // Token 吊销检查
+    public boolean isTokenRevoked(String tokenId) {
+        // 检查 Redis 黑名单
+        return redisTemplate.hasKey("token:blacklist:" + tokenId);
+    }
+}
+```
+
+### API 速率限制实现
+
+```lua
+-- Redis Lua 脚本：滑动窗口限流
+local key = KEYS[1]
+local window = tonumber(ARGV[1])  -- 窗口大小（秒）
+local limit = tonumber(ARGV[2])   -- 窗口内最大请求数
+local now = tonumber(ARGV[3])     -- 当前时间戳（毫秒）
+
+-- 移除窗口外的请求记录
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window * 1000)
+
+-- 统计窗口内请求数
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+    -- 未超限，记录本次请求
+    redis.call('ZADD', key, now, now .. math.random())
+    redis.call('EXPIRE', key, window)
+    return 1  -- 允许
+else
+    return 0  -- 拒绝
+end
+```
+
+```java
+// Java 调用 Lua 脚本
+@Component
+public class RateLimiter {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    private static final DefaultRedisScript<Long> RATE_LIMIT_SCRIPT;
+    
+    static {
+        RATE_LIMIT_SCRIPT = new DefaultRedisScript<>();
+        RATE_LIMIT_SCRIPT.setLocation(new ClassPathResource("scripts/rate_limit.lua"));
+        RATE_LIMIT_SCRIPT.setResultType(Long.class);
+    }
+    
+    public boolean isAllowed(String userId, int limit, int windowSeconds) {
+        String key = "rate:" + userId;
+        Long now = System.currentTimeMillis();
+        Long result = redisTemplate.execute(
+            RATE_LIMIT_SCRIPT,
+            List.of(key),
+            windowSeconds, limit, now
+        );
+        return result != null && result == 1L;
+    }
+}
+
+// Spring AOP 限流注解
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface RateLimit {
+    int limit() default 100;        // 窗口内最大请求数
+    int window() default 60;        // 窗口大小（秒）
+    String key() default "";        // 限流 key（默认用方法名）
+}
+
+@Aspect
+@Component
+public class RateLimitAspect {
+    
+    @Autowired
+    private RateLimiter rateLimiter;
+    
+    @Around("@annotation(rateLimit)")
+    public Object around(ProceedingJoinPoint point, RateLimit rateLimit) throws Throwable {
+        String key = rateLimit.key().isEmpty() ? 
+            point.getSignature().getName() : rateLimit.key();
+        
+        if (!rateLimiter.isAllowed(key, rateLimit.limit(), rateLimit.window())) {
+            throw new RuntimeException("请求过于频繁，请稍后再试");
+        }
+        
+        return point.proceed();
+    }
+}
+```
+
+### 安全 Headers 完整配置
+
+```yaml
+# Nginx 安全 Headers 一键配置
+server {
+    # 传输安全
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # 内容安全
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+
+    # 缓存安全
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    add_header Pragma "no-cache" always;
+
+    # CORS 安全
+    add_header Access-Control-Allow-Origin "https://trusted.com" always;
+
+    # 其他安全
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header X-XSS-Protection "0" always;
+}
+```
+
+```java
+// Spring Security 安全 Headers 一键配置
+http.headers(headers -> headers
+    .httpStrictTransportSecurity(hsts -> hsts
+        .includeSubDomains(true)
+        .maxAgeInSeconds(31536000)
+        .preload(true)
+    )
+    .contentSecurityPolicy(csp -> csp
+        .policyDirectives("default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'")
+    )
+    .frameOptions(frame -> frame.deny())
+    .contentTypeOptions(Customizer.withDefaults())
+    .referrerPolicy(referrer -> referrer
+        .policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN)
+    )
+    .permissionsPolicy(permissions -> permissions
+        .policy("camera=(), microphone=(), geolocation=()")
+    )
+);
+```
+
+### 安全测试检查清单
+
+```text
+Web 安全测试清单：
+
+1. 认证测试
+   - 密码强度策略验证
+   - 暴力破解防护（限流/锁定）
+   - MFA 双因素认证
+   - Session 固定攻击
+   - JWT 安全（alg:none/混淆攻击）
+
+2. 授权测试
+   - 水平越权（A 访问 B 数据）
+   - 垂直越权（普通用户访问管理员功能）
+   - 对象级别越权（多租户隔离）
+   - 功能级别越权（未授权功能访问）
+
+3. 注入测试
+   - SQL 注入（参数化查询验证）
+   - 命令注入（系统命令调用）
+   - XXE（XML 外部实体）
+   - SpEL/OGNL 表达式注入
+   - LDAP 注入
+
+4. XSS 测试
+   - 存储型 XSS（数据库存储）
+   - 反射型 XSS（URL 参数）
+   - DOM 型 XSS（前端操作）
+   - CSP 配置验证
+
+5. CSRF 测试
+   - Token 验证
+   - SameSite Cookie 配置
+   - Referer/Origin 校验
+
+6. SSRF 测试
+   - 协议限制（http/https）
+   - 内网 IP 禁止
+   - DNS 重绑定防护
+   - 云元数据访问
+
+7. 文件上传测试
+   - 类型白名单
+   - 文件头校验
+   - 存储隔离
+   - 大小限制
+
+8. 安全配置测试
+   - 默认密码
+   - 调试模式
+   - 目录浏览
+   - 错误信息泄露
+```
+
 ## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；

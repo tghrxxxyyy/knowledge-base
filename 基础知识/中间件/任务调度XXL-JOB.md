@@ -1421,7 +1421,160 @@ extract_task >> transform_task >> load_task >> check_task
 | 适用场景 | Java 微服务 | 数据工程 |
 | 部署 | 简单 | 复杂（K8s） |
 
----
+## 分片广播模式详解
+
+### 分片广播原理
+
+```mermaid
+flowchart TB
+    SCHEDULER[调度中心] -->|分片广播| EXECUTOR1[执行器-0]
+    SCHEDULER -->|分片广播| EXECUTOR2[执行器-1]
+    SCHEDULER -->|分片广播| EXECUTOR3[执行器-2]
+    EXECUTOR1 -->|处理分片0| DB[(数据库)]
+    EXECUTOR2 -->|处理分片1| DB
+    EXECUTOR3 -->|处理分片2| DB
+```
+
+### 分片参数获取
+
+```java
+// 获取分片参数
+XxlJobHelper.setShardIndex(0);  // 当前分片索引
+XxlJobHelper.setShardTotal(3);  // 总分片数
+
+// 分片执行逻辑
+int shardIndex = XxlJobHelper.getShardIndex();
+int shardTotal = XxlJobHelper.getShardTotal();
+
+// 按分片查询数据
+String sql = "SELECT * FROM orders WHERE id % " + shardTotal + " = " + shardIndex;
+```
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| shardIndex | 当前分片索引 | 0,1,2 |
+| shardTotal | 总分片数 | 3 |
+| 分片键 | 用于分片的字段 | id, user_id |
+
+## 任务依赖与 DAG
+
+### 依赖配置
+
+```java
+// 父子任务依赖
+@XxlJob("parentJob")
+public void parentJob() {
+    // 父任务完成后触发子任务
+    XxlJobHelper.log("父任务执行完成");
+}
+
+// 子任务配置
+@XxlJob("childJob")
+public void childJob() {
+    // 依赖父任务
+}
+```
+
+### DAG 编排
+
+```mermaid
+flowchart LR
+    A[任务A] --> B[任务B]
+    A --> C[任务C]
+    B --> D[任务D]
+    C --> D
+```
+
+| 依赖类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| 串行依赖 | A完成后执行B | 线性流程 |
+| 并行依赖 | A完成后执行B和C | 并行处理 |
+| 汇聚依赖 | B和C都完成后执行D | 汇总处理 |
+
+## 日志架构详解
+
+### 日志收集流程
+
+```mermaid
+flowchart LR
+    EXECUTOR[执行器] -->|实时日志| LOG_API[日志API]
+    LOG_API -->|WebSocket| ADMIN[调度中心]
+    ADMIN -->|推送| WEB[Web UI]
+```
+
+### 日志配置
+
+```java
+// 执行日志
+XxlJobHelper.log("任务开始执行");
+XxlJobHelper.log("处理数据量: {}", count);
+XxlJobHelper.log("任务执行完成，耗时: {}ms", costTime);
+
+// 错误日志
+XxlJobHelper.log("任务执行失败: {}", error.getMessage());
+```
+
+| 日志类型 | 说明 | 保留时间 |
+|----------|------|----------|
+| 执行日志 | 任务执行记录 | 30天 |
+| 调度日志 | 调度触发记录 | 30天 |
+| 错误日志 | 异常信息 | 90天 |
+
+## 执行器弹性伸缩
+
+### 动态扩缩容
+
+```mermaid
+flowchart TB
+    MONITOR[监控指标] --> DECISION{是否扩容?}
+    DECISION -->|CPU>80%| SCALE_UP[扩容执行器]
+    DECISION -->|CPU<30%| SCALE_DOWN[缩容执行器]
+    SCALE_UP --> REGISTER[自动注册]
+    SCALE_DOWN --> DEREGISTER[自动注销]
+```
+
+### 弹性配置
+
+```yaml
+# K8s HPA 配置
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: xxl-job-executor
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: xxl-job-executor
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+## 安全与权限
+
+### 权限控制
+
+| 维度 | 说明 | 配置 |
+|------|------|------|
+| 用户管理 | 多用户隔离 | 用户-任务绑定 |
+| 任务权限 | 按角色分配 | 查看/执行/管理 |
+| 操作审计 | 记录操作日志 | 调度/执行/配置 |
+| Token 认证 | API 调用认证 | 任务回调 Token |
+
+```java
+// Token 认证配置
+XxlJobHelper.log("Token 验证通过");
+if (!token.equals(expectedToken)) {
+    throw new RuntimeException("Token 验证失败");
+}
+```
 
 ## 与其他板块的关系
 

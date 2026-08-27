@@ -1483,6 +1483,183 @@ K8s部署最佳实践：
     追踪：分布式追踪
 ```
 
+---
+
+## 十九、超时与重试嵌套陷阱
+
+### 19.1 嵌套超时问题
+
+```
+超时嵌套陷阱：
+  场景：A → B → C
+  A 配置 timeout=1000ms
+  B 配置 timeout=500ms
+  C 配置 timeout=300ms
+
+  问题：
+    A 调用 B，B 调用 C
+    C 执行 300ms，B 执行 500ms，A 执行 1000ms
+    看似合理，但有嵌套开销
+
+  实际执行时间：
+    C 执行时间：300ms
+    B 执行时间：300ms + 网络开销 + B 处理时间
+    A 执行时间：B 执行时间 + 网络开销 + A 处理时间
+
+  优化：
+    超时时间 = 上游超时 - 下游超时 - 网络开销
+    A timeout = B timeout + B 处理时间 + 网络开销
+```
+
+### 19.2 重试与超时配合
+
+```
+重试与超时配合：
+  场景：A 调用 B，B 调用 C
+  A 配置 timeout=1000ms, retries=2
+  B 配置 timeout=500ms, retries=1
+
+  问题：
+    A 第一次调用 B，B 调用 C 超时
+    A 第二次调用 B，B 调用 C 又超时
+    A 第三次调用 B，A 超时了
+
+  实际执行时间：
+    第一次：500ms（C 超时）
+    第二次：500ms（C 超时）
+    第三次：未执行（A 已超时）
+
+  优化：
+    重试次数 = 上游超时 / 下游超时
+    A retries = A timeout / B timeout
+```
+
+---
+
+## 二十、路由规则深入
+
+### 20.1 条件路由规则
+
+```yaml
+# 条件路由规则
+conditions:
+  - name: gray-release
+    match:
+      arguments:
+        - name: version
+          value: "1.0.0"
+    actions:
+      - name: route
+        value: "version=1.1.0"
+
+# 使用场景
+# 灰度发布：只路由到指定版本
+# 流量染色：根据标签路由
+# 故障隔离：屏蔽故障节点
+```
+
+### 20.2 标签路由规则
+
+```yaml
+# 标签路由规则
+tags:
+  - name: gray
+    match:
+      arguments:
+        - name: tag
+          value: "gray"
+    actions:
+      - name: route
+        value: "tag=gray"
+
+# 使用场景
+# 灰度发布：根据标签路由
+# A/B 测试：根据用户特征路由
+# 故障演练：根据流量类型路由
+```
+
+---
+
+## 二十一、Triple 协议深入
+
+### 21.1 Triple 协议特性
+
+```
+Triple 协议特性：
+  ① 基于 HTTP/2：兼容 gRPC 生态
+  ② Protobuf 序列化：跨语言支持
+  ③ 服务治理：保留 Dubbo 治理能力
+  ④ 流式通信：支持四种调用模式
+  ⑤ 网关穿透：HTTP/2 直接穿透网关
+
+  vs Dubbo 协议：
+    Dubbo 协议：TCP 长连接，性能高，但网关穿透难
+    Triple 协议：HTTP/2，网关穿透好，但性能略低
+```
+
+### 21.2 Triple 协议配置
+
+```yaml
+# Triple 协议配置
+dubbo:
+  protocol:
+    name: tri
+    port: 20880
+  
+  consumer:
+    timeout: 1000
+    retries: 2
+  
+  provider:
+    timeout: 500
+    retries: 1
+```
+
+---
+
+## 二十二、K8s 注册中心深入
+
+### 22.1 K8s 注册中心原理
+
+```
+K8s 注册中心原理：
+  ① 服务注册：Pod 启动时创建 EndpointSlice
+  ② 服务发现：通过 EndpointSlice 获取服务列表
+  ③ 健康检查：通过 Readiness Probe 判断健康
+  ④ 故障转移：Pod 故障时自动剔除
+
+  vs Nacos/ZK：
+    Nacos/ZK：独立注册中心，需要部署维护
+    K8s：原生支持，无需额外组件
+```
+
+### 22.2 K8s 注册中心配置
+
+```yaml
+# K8s 注册中心配置
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  selector:
+    app: my-app
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: my-service
+  labels:
+    kubernetes.io/service-name: my-service
+addressType: IPv4
+ports:
+  - port: 8080
+    protocol: TCP
+```
+
 | 项 | 结论 |
 |----|------|
 | 类型 | 高性能 RPC 框架 + 服务治理 |

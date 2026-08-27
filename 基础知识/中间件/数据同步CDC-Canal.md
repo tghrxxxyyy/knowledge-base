@@ -1473,4 +1473,195 @@ flowchart TB
     I -->|否| K[正常]
 ```
 
+---
+
+## 二十三、Canal vs Debezium vs Maxwell 深度对比
+
+### 23.1 架构差异
+
+| 维度 | Canal | Debezium | Maxwell |
+|------|-------|----------|---------|
+| 语言 | Java | Java | Java |
+| 数据库 | MySQL | MySQL/PostgreSQL/MongoDB | MySQL |
+| 协议 | 伪装 Slave | binlog/WAL | binlog |
+| 部署模式 | 独立 Server | Kafka Connect/独立 | 独立进程 |
+| 消息格式 | 自定义 | Kafka Connect/Avro | JSON |
+| 全量同步 | 支持（adapter） | 不支持（需其他工具） | 不支持 |
+| 事务消息 | 支持 | 支持 | 支持 |
+| DDL 同步 | 支持 | 支持 | 支持 |
+
+### 23.2 功能矩阵对比
+
+| 功能 | Canal | Debezium | Maxwell |
+|------|-------|----------|---------|
+| 增量同步 | ✅ | ✅ | ✅ |
+| 全量同步 | ✅ | ❌ | ❌ |
+| DDL 同步 | ✅ | ✅ | ✅ |
+| 事务消息 | ✅ | ✅ | ✅ |
+| 消息过滤 | ✅ | ✅ | ✅ |
+| 消息转换 | ✅ | ✅ | ✅ |
+| HA 支持 | ✅ (ZK) | ✅ (Kafka) | ❌ |
+| 监控告警 | ✅ | ✅ | ❌ |
+| 多语言客户端 | ✅ | ✅ | ❌ |
+
+### 23.3 选型决策树
+
+```mermaid
+flowchart TD
+    A[CDC 选型] --> B{数据库类型?}
+    B -->|MySQL| C{需要全量同步?}
+    B -->|PostgreSQL| D[Debezium]
+    B -->|MongoDB| E[Debezium]
+    C -->|是| F[Canal]
+    C -->|否| G{需要 HA?}
+    G -->|是| H[Canal + ZK]
+    G -->|否| I[Maxwell]
+```
+
+---
+
+## 二十四、Canal HA + ZK 选主配置
+
+### 24.1 ZK 选主原理
+
+```
+Canal HA 架构：
+  ① Canal Server 启动时向 ZK 注册临时节点
+  ② 选主：最先创建 / canal/cluster/instances/instance_0000000000 节点的成为 Master
+  ③ 其他 Server 成为 Standby
+  ④ Master 故障：临时节点消失，Standby 重新选主
+  ⑤ 客户端只连 Master，故障切换时重新连接
+
+  关键配置：
+    canal.zk.servers=zk1:2181,zk2:2181,zk3:2181
+    canal.instance.global.mode=spring
+    canal.instance.global.spring.xml=classpath:spring/file-instance.xml
+```
+
+### 24.2 ZK 选主配置示例
+
+```properties
+# canal.properties
+canal.zk.servers=zk1:2181,zk2:2181,zk3:2181
+canal.instance.global.mode=spring
+canal.instance.global.spring.xml=classpath:spring/file-instance.xml
+
+# instance.properties
+canal.instance.mysql.slaveId=0  # 0 表示自动分配
+canal.instance.master.journal.name=
+canal.instance.master.tsbinlog.position=
+canal.instance.master.gtid=
+```
+
+---
+
+## 二十五、Canal 消息格式详解
+
+### 25.1 消息结构
+
+```json
+{
+  "id": 1,
+  "database": "test",
+  "table": "users",
+  "pkNames": ["id"],
+  "binlogType": "ROW",
+  "eventType": "UPDATE",
+  "executeTime": 1705312800000,
+  "threadId": 123,
+  "postHousekeeping": false,
+  "data": [
+    {
+      "id": 1,
+      "name": "张三",
+      "email": "zhangsan@example.com"
+    }
+  ],
+  "old": [
+    {
+      "name": "张三旧"
+    }
+  ]
+}
+```
+
+### 25.2 事件类型
+
+| 事件类型 | 说明 | data | old |
+|----------|------|------|-----|
+| INSERT | 插入 | 新数据 | 空 |
+| UPDATE | 更新 | 新数据 | 旧数据（变化字段） |
+| DELETE | 删除 | 空 | 旧数据 |
+| DDL | 结构变更 | SQL 语句 | 空 |
+
+### 25.3 消息解析代码
+
+```java
+// 解析 Canal 消息
+public void parseMessage(CanalEntry entry) {
+    for (RowChange rowChange : entry.getRowChangesList()) {
+        RowData rowData = rowChange.getRowData();
+        
+        switch (rowChange.getEventType()) {
+            case INSERT:
+                Map<String, String> afterColumns = getColumns(rowData.getAfterColumnsList());
+                // 处理插入
+                break;
+            case UPDATE:
+                Map<String, String> beforeColumns = getColumns(rowData.getBeforeColumnsList());
+                Map<String, String> afterColumns = getColumns(rowData.getAfterColumnsList());
+                // 处理更新
+                break;
+            case DELETE:
+                Map<String, String> beforeColumns = getColumns(rowData.getBeforeColumnsList());
+                // 处理删除
+                break;
+        }
+    }
+}
+```
+
+---
+
+## 二十六、Canal 过滤规则正则实战
+
+### 26.1 过滤规则配置
+
+```properties
+# 过滤规则（正则表达式）
+canal.instance.filter.regex=.*\\..*
+canal.instance.filter.black.regex=.*\\.binlog.*
+
+# 表过滤
+canal.instance.filter.regex=test\\.users,test\\.orders
+
+# 库过滤
+canal.instance.filter.regex=test\\..*
+```
+
+### 26.2 正则表达式示例
+
+| 规则 | 说明 |
+|------|------|
+| `.*\\..*` | 所有库所有表 |
+| `test\\..*` | test 库所有表 |
+| `.*\\.users` | 所有库的 users 表 |
+| `test\\.users,test\\.orders` | test 库的 users 和 orders 表 |
+| `.*\\.log_.*` | 所有 log_ 开头的表 |
+| `.*\\..*_bin` | 排除 bin 结尾的表 |
+
+### 26.3 过滤规则调试
+
+```bash
+# 测试正则表达式
+echo "test.users" | grep -E ".*\\..*"
+# 输出：test.users
+
+# 查看 Canal 日志
+tail -f logs/canal/canal.log | grep -i "filter"
+
+# 查看 instance 日志
+tail -f logs/canal/instance.log | grep -i "filter"
+```
+
 ## 二十二、与其他板块的关系

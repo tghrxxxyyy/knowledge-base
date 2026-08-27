@@ -893,6 +893,181 @@ spec:
 | 内存 | 128Mi | 512Mi | 根据连接数调整 |
 | 启动超时 | - | 60s | 避免启动失败 |
 
+## Filters 架构详解
+
+### 过滤器类型
+
+| 过滤器类型 | 说明 | 适用场景 |
+|------------|------|----------|
+| Network Filter | L4 过滤器 | TCP/UDP 处理 |
+| HTTP Filter | L7 过滤器 | HTTP/gRPC 处理 |
+| Listener Filter | 监听器过滤器 | 连接预处理 |
+| Access Log Filter | 访问日志过滤 | 日志记录 |
+
+### 过滤器链执行顺序
+
+```mermaid
+flowchart LR
+    LISTENER[Listener] --> NETWORK[Network Filter]
+    NETWORK --> HTTP[HTTP Filter]
+    HTTP --> ROUTE[路由]
+    ROUTE --> UPSTREAM[上游服务]
+```
+
+## xDS 协议详解
+
+### xDS 服务类型
+
+| xDS 类型 | 说明 | 动态配置 |
+|----------|------|----------|
+| LDS | Listener Discovery | 监听器配置 |
+| RDS | Route Discovery | 路由配置 |
+| CDS | Cluster Discovery | 集群配置 |
+| EDS | Endpoint Discovery | 端点配置 |
+| SDS | Secret Discovery | 证书配置 |
+
+### xDS 配置示例
+
+```yaml
+# Listener 配置
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          route_config:
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: local_service_cluster
+```
+
+## 熔断与重试
+
+### 熔断配置
+
+```yaml
+# 熔断配置
+circuit_breakers:
+  thresholds:
+  - priority: DEFAULT
+    max_connections: 1024
+    max_pending_requests: 1024
+    max_requests: 1024
+    max_retries: 3
+    retry_budget:
+      budget_percent:
+        value: 20.0
+      min_retry_concurrency: 3
+```
+
+### 重试配置
+
+```yaml
+# 重试配置
+route:
+  retry_policy:
+    retry_on: "5xx,reset,connect-failure"
+    num_retries: 3
+    per_try_timeout: 2s
+    retry_back_off:
+      base_interval: 0.1s
+      max_interval: 1s
+```
+
+## 访问日志详解
+
+### 访问日志格式
+
+```yaml
+# 访问日志配置
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+    path: /var/log/envoy/access.log
+    log_format:
+      json_format:
+        protocol: "%PROTOCOL%"
+        duration: "%DURATION%"
+        response_flags: "%RESPONSE_FLAGS%"
+        upstream_cluster: "%UPSTREAM_CLUSTER%"
+        upstream_host: "%UPSTREAM_HOST%"
+```
+
+### 访问日志字段
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| %PROTOCOL% | 协议版本 | HTTP/1.1 |
+| %DURATION% | 请求耗时(ms) | 123 |
+| %RESPONSE_FLAGS% | 响应标志 | - |
+| %UPSTREAM_CLUSTER% | 上游集群 | local_service |
+| %UPSTREAM_HOST% | 上游地址 | 10.0.0.1:8080 |
+
+## OpenTelemetry 集成
+
+### 链路追踪配置
+
+```yaml
+# OpenTelemetry 配置
+tracing:
+  provider:
+    name: envoy.tracers.opentelemetry
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+      collector_endpoint: "otel-collector:4318"
+      collector_cluster: "otel_cluster"
+      resource_attributes:
+        service.name: "my-service"
+```
+
+## Sidecar 部署模式
+
+### Sidecar 注入配置
+
+```yaml
+# Istio Sidecar 注入
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "true"
+spec:
+  containers:
+  - name: app
+    image: my-app:latest
+  - name: envoy-sidecar
+    image: envoyproxy/envoy:v1.28.0
+    ports:
+    - containerPort: 10000
+```
+
+### 资源配置
+
+```yaml
+# Sidecar 资源配置
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+```
+
 ## 十七、与其他板块的关系
 
 - 服务网格（Istio + Envoy）见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；

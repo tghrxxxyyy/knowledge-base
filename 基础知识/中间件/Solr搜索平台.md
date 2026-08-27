@@ -1394,12 +1394,249 @@ client.deleteById("1");
 client.commit();
 ```
 
-## Solr 与 Elasticsearch 对比
+## 十四、Solr分词器详解
+
+### 14.1 分词器对比
+
+| 分词器 | 特点 | 适用场景 | 中文支持 |
+|--------|------|---------|---------|
+| StandardTokenizer | 按空格/标点分词 | 英文 | 差 |
+| CJKAnalyzer | 中日韩二元分词 | 中文 | 中 |
+| SmartChineseAnalyzer | 智能中文分词 | 中文 | 好 |
+| IKAnalyzer | 中文词典分词 | 中文 | 好 |
+| jieba | jieba分词移植 | 中文 | 好 |
+
+### 14.2 分词器配置示例
+
+```xml
+<!-- schema.xml分词器配置 -->
+<fieldType name="text_smart" class="solr.TextField">
+  <analyzer type="index">
+    <tokenizer class="solr.SmartChineseSentenceTokenizerFactory"/>
+    <filter class="solr.StopFilterFactory" words="stopwords.txt"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <filter class="solr.SnowballPorterFilterFactory" language="English"/>
+  </analyzer>
+  <analyzer type="query">
+    <tokenizer class="solr.SmartChineseSentenceTokenizerFactory"/>
+    <filter class="solr.StopFilterFactory" words="stopwords.txt"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+  </analyzer>
+</fieldType>
+```
+
+## 十五、Solr评分算法详解
+
+### 15.1 TF-IDF vs BM25
+
+| 算法 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| TF-IDF | 词频×逆文档频率 | 简单 | 长文档偏差 |
+| BM25 | TF-IDF改进版 | 鲁棒 | 参数调优 |
+| DFR | 基于概率模型 | 理论严谨 | 复杂 |
+
+### 15.2 BM25参数调优
+
+```
+BM25参数调优：
+  k1：词频饱和度
+    范围：1.2~2.0
+    默认：1.2
+    值越大：词频影响越大
+
+  b：文档长度归一化
+    范围：0~1
+    默认：0.75
+    值越大：长文档惩罚越大
+
+  调优建议：
+    短文档：k1=1.2, b=0.75
+    长文档：k1=1.5, b=0.8
+    日志搜索：k1=1.2, b=0.5
+```
+
+## 十六、Solr Faceted搜索详解
+
+### 16.1 Faceted搜索类型
+
+| Facet类型 | 说明 | 适用场景 |
+|-----------|------|---------|
+| Field Facet | 字段分面 | 分类统计 |
+| Query Facet | 查询分面 | 范围统计 |
+| Date Facet | 日期分面 | 时间统计 |
+| Range Facet | 范围分面 | 区间统计 |
+| Pivot Facet | 多级分面 | 多维度统计 |
+
+### 16.2 Faceted搜索示例
+
+```json
+// Faceted搜索查询
+{
+  "query": "*:*",
+  "facet": {
+    "category": {
+      "type": "terms",
+      "field": "category",
+      "limit": 10
+    },
+    "price_range": {
+      "type": "range",
+      "field": "price",
+      "start": 0,
+      "end": 1000,
+      "gap": 100
+    },
+    "date": {
+      "type": "date",
+      "field": "created_at",
+      "start": "2024-01-01T00:00:00Z",
+      "end": "2024-12-31T23:59:59Z",
+      "gap": "+1MONTH"
+    }
+  }
+}
+```
+
+## 十七、Solr高亮详解
+
+### 17.1 高亮方式对比
+
+| 高亮方式 | 原理 | 优点 | 缺点 |
+|---------|------|------|------|
+| Original | 原始高亮 | 简单 | 效果差 |
+| FastVector | 向量高亮 | 效果好 | 资源消耗大 |
+| postings | 倒排索引高亮 | 效果好 | 需要配置 |
+| Regex | 正则高亮 | 灵活 | 性能差 |
+
+### 17.2 高亮配置示例
+
+```json
+// 高亮查询
+{
+  "query": "solr search",
+  "highlight": {
+    "fields": {
+      "content": {
+        "hl.fl": "content",
+        "hl.snippets": 3,
+        "hl.fragsize": 100,
+        "hl.method": "fastVector",
+        "hl.simple.pre": "<b>",
+        "hl.simple.post": "</b>"
+      }
+    }
+  }
+}
+```
+
+## 十八、Solr实时搜索详解
+
+### 18.1 实时搜索实现
+
+```
+实时搜索实现：
+  Near Real-Time (NRT) 搜索：
+    原子更新 + 软提交 + commit
+
+  实现方式：
+    1. 原子更新（Atomic Update）
+       → 使用SolrJ的SolrInputDocument
+       → 支持部分字段更新
+
+    2. 软提交（Soft Commit）
+       → 立即可搜索
+       → 不写入磁盘
+
+    3. 硬提交（Hard Commit）
+       → 写入磁盘
+       → 持久化
+
+  配置：
+    autoSoftCommitMaxTime：软提交间隔
+    autoCommitMaxTime：硬提交间隔
+```
+
+### 18.2 实时搜索配置
+
+```xml
+<!-- solrconfig.xml配置 -->
+<updateHandler class="solr.DirectUpdateHandler2">
+  <updateLog>
+    <str name="dir">${solr.ulog.dir:}</str>
+  </updateLog>
+  <autoCommit>
+    <maxTime>${solr.autoCommit.maxTime:15000}</maxTime>
+    <openSearcher>false</openSearcher>
+  </autoCommit>
+  <autoSoftCommit>
+    <maxTime>${solr.autoSoftCommit.maxTime:1000}</maxTime>
+  </autoSoftCommit>
+</updateHandler>
+```
+
+## 十九、Solr与电商搜索集成详解
+
+### 19.1 电商搜索架构
+
+```
+电商搜索架构：
+  数据采集：
+    商品数据 → DataImportHandler → Solr
+  
+  搜索流程：
+    用户查询 → Solr查询 → 结果处理 → 返回
+  
+  功能模块：
+    全文搜索：商品名称/描述搜索
+    分类筛选：商品分类/品牌筛选
+    价格筛选：价格区间筛选
+    排序：销量/价格/评分排序
+    高亮：搜索词高亮
+    拼写检查：搜索建议
+```
+
+### 19.2 电商搜索优化
+
+| 优化方向 | 做法 | 效果 |
+|---------|------|------|
+| 索引优化 | 字段优化/分词优化 | 查询加速 |
+| 查询优化 | 缓存/预热 | 响应加速 |
+| 结果优化 | 分页/高亮 | 体验优化 |
+| 个性化 | 用户画像 | 转化率提升 |
+
+## 二十、Solr与Elasticsearch对比详解
+
+### 20.1 详细对比
 
 | 维度 | Solr | Elasticsearch |
 |------|------|---------------|
-| 架构 | SolrCloud | 分布式 |
-| 查询语法 | SolrQL | DSL |
-| 适用场景 | 企业搜索 | 日志/全文搜索 |
-| 运维复杂度 | 中 | 中 |
+| 架构 | SolrCloud（ZooKeeper） | 分布式（内置） |
+| 查询语法 | SolrQL（类SQL） | DSL（JSON） |
+| 适用场景 | 企业搜索/电商 | 日志/全文搜索 |
+| 运维复杂度 | 中（依赖ZK） | 中（内置） |
 | 许可证 | Apache 2.0 | SSPL |
+| 生态 | 成熟 | 活跃 |
+| 性能 | 高 | 高 |
+| 学习曲线 | 中 | 中 |
+
+### 20.2 选型建议
+
+```
+选择Solr：
+  1. 企业搜索场景
+  2. 电商搜索
+  3. 需要SolrQL
+  4. 已有ZooKeeper基础设施
+  5. 团队熟悉Solr
+
+选择Elasticsearch：
+  1. 日志分析场景
+  2. 全文搜索
+  3. 需要DSL查询
+  4. 需要内置分布式
+  5. 团队熟悉ES
+
+混合使用：
+  Solr：企业搜索/电商
+  Elasticsearch：日志分析/全文搜索
+```

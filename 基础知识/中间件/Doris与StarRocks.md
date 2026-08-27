@@ -1410,6 +1410,247 @@ SHOW TABLET FROM orders;
 
 ---
 
+---
+
+## Doris/StarRocks 深度实战补充
+
+### 物化视图增量刷新机制
+
+```text
+异步物化视图增量刷新原理：
+
+1. 变更检测：
+   ├── Base 表 Partition 级别变更追踪
+   ├── WAL（Write-Ahead Log）记录数据变更
+   └── FE 定时检查 Base 表版本号
+
+2. 增量计算：
+   ├── 只处理变化的 Partition
+   ├── 对比新旧版本数据差异
+   └── 计算增量聚合结果
+
+3. 刷新执行：
+   ├── 并行刷新多个 Partition
+   ├── 原子提交（保证一致性）
+   └── 失败自动重试
+
+刷新策略对比：
+  ON COMMIT：数据导入即刷新（实时性最高，写性能影响大）
+  ON SCHEDULE：定时刷新（CRON 表达式，平衡实时性与性能）
+  ON DEMAND：手动刷新（按需触发）
+```
+
+```sql
+-- 增量刷新物化视图配置
+CREATE MATERIALIZED VIEW mv_incremental
+BUILD IMMEDIATE REFRESH AUTO ON SCHEDULE
+EVERY 30 MINUTE
+PROPERTIES (
+    "partition_refresh_number" = "3",  -- 每次刷新分区数
+    "max_refresh_interval" = "3600",   -- 最大刷新间隔（秒）
+    "refresh_partition_num" = "10"     -- 每次刷新分区数
+)
+AS SELECT 
+    DATE(create_time) as dt,
+    user_id,
+    SUM(amount) as total_amount,
+    COUNT(*) as order_count
+FROM orders
+GROUP BY DATE(create_time), user_id;
+```
+
+### 查询优化器深度调优
+
+```text
+CBO 优化器调优流程：
+
+1. 统计信息收集
+   ANALYZE TABLE orders UPDATE HISTOGRAM;
+   → 收集列分布、NDV（不同值数量）、空值率
+   
+2. Join 重排优化
+   多表 Join → CBO 估算所有 Join 顺序
+   → 选择代价最小的 Join 顺序
+   
+3. 分区裁剪
+   WHERE date >= '2024-01-01'
+   → 跳过 2024 年前所有分区
+   
+4. 谓词下推
+   过滤条件 → 下推到存储层
+   → 减少 I/O 和网络传输
+   
+5. 物化视图匹配
+   查询 → 自动匹配最优物化视图
+   → 走预聚合结果
+
+Runtime Filter 优化：
+  Join 时动态生成 Bloom Filter
+  → 下推到 Scan 算子
+  → 减少扫描数据量（10x+ 加速）
+```
+
+```sql
+-- CBO 调优配置
+SET cbo_enable = true;
+SET cbo_use_node_stats_for_distributed = true;
+SET enable_pipeline_engine = true;
+SET parallel_fragment_exec_instance_num = 8;
+
+-- 统计信息更新
+ANALYZE TABLE orders UPDATE HISTOGRAM WITH 256 BUCKETS;
+
+-- 查看查询计划
+EXPLAIN SELECT * FROM orders 
+WHERE date = '2024-01-01' AND user_id = 12345;
+
+-- 查看 Runtime Filter
+EXPLAIN SELECT * FROM orders o 
+JOIN users u ON o.user_id = u.user_id;
+```
+
+### 多源导入实战配置
+
+```sql
+-- Stream Load（实时导入）
+curl -T data.csv \
+  -H "format:csv" \
+  -H "column_separator:," \
+  -H "max_filter_ratio:0.1" \
+  -H "mem_limit:4294967296" \
+  http://doris-fe:8030/api/db1/orders/_stream_load
+
+-- Broker Load（离线批量导入）
+LOAD LABEL db1.batch_load_001
+(
+    DATA INFILE("hdfs://namenode/data/orders/*")
+    INTO TABLE orders
+    FORMAT AS CSV
+    COLUMNS TERMINATED BY ","
+    (user_id, order_id, amount, dt)
+)
+BROKER broker1
+PROPERTIES (
+    "timeout" = "3600",
+    "max_filter_ratio" = "0.1",
+    "load_parallelism" = "4"
+);
+
+-- Routine Load（Kafka 实时导入）
+CREATE ROUTINE LOAD orders_kafka ON orders
+COLUMNS(kafka_topic, kafka_partitions, kafka_offsets)
+PROPERTIES (
+    "format" = "json",
+    "max_batch_interval" = "10",
+    "max_batch_rows" = "200000",
+    "max_batch_interval_bytes" = "104857600"
+)
+FROM KAFKA (
+    "kafka_broker_list" = "kafka:9092",
+    "kafka_topic" = "orders",
+    "kafka_partitions" = "0,1,2,3",
+    "kafka_offsets" = "0,0,0,0"
+);
+
+-- Multi-Catalog（联邦查询）
+CREATE CATALOG mysql_catalog PROPERTIES (
+    "type" = "jdbc",
+    "jdbc.driver_url" = "mysql-connector-java.jar",
+    "jdbc.url" = "jdbc:mysql://mysql:3306/mydb",
+    "jdbc.user" = "root",
+    "jdbc.password" = "password"
+);
+
+-- 跨 Catalog 查询
+SELECT a.user_id, a.total_amount, b.user_name
+FROM hive_catalog.default.user_stats a
+JOIN mysql_catalog.mydb.users b ON a.user_id = b.id;
+```
+
+### 生产部署最佳实践
+
+```text
+集群规模规划：
+
+1. 小规模（<1TB 数据）
+   FE: 3 节点（1 Leader + 2 Follower）
+   BE: 3 节点（3 副本）
+   内存: 32GB/节点
+   磁盘: 1TB SSD/节点
+
+2. 中规模（1-10TB 数据）
+   FE: 3 节点
+   BE: 6-9 节点（3 副本）
+   内存: 64GB/节点
+   磁盘: 2TB SSD/节点
+
+3. 大规模（>10TB 数据）
+   FE: 3 节点
+   BE: 12+ 节点（3 副本）
+   内存: 128GB/节点
+   磁盘: 4TB SSD/节点 + S3 冷存储
+
+副本策略：
+  3 副本：默认生产配置
+  2 副本：读多写少场景（节省存储）
+  1 副本：测试/开发环境
+```
+
+### 冷热分层实现
+
+```text
+冷热分层架构：
+
+热数据层（SSD）：
+  ├── 最近 7 天数据
+  ├── 高频查询数据
+  ├── 响应时间 < 100ms
+  └── 存储成本：$0.20/GB/月
+
+温数据层（HDD）：
+  ├── 7-30 天数据
+  ├── 中频查询数据
+  ├── 响应时间 < 1s
+  └── 存储成本：$0.05/GB/月
+
+冷数据层（S3/OSS）：
+  ├── 30 天以上数据
+  ├── 低频查询数据
+  ├── 响应时间 < 5s（冷启动）
+  └── 存储成本：$0.01/GB/月
+
+迁移策略：
+  自动迁移：按 Partition 时间自动迁移
+  手动迁移：ALTER TABLE MODIFY PARTITION 手动触发
+  回迁策略：冷数据被频繁查询时自动回迁到热层
+```
+
+```sql
+-- 冷热分层配置
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    create_time DATETIME
+)
+PARTITION BY RANGE(create_time) (
+    PARTITION p202401 VALUES [("2024-01-01"), ("2024-02-01")),
+    PARTITION p202402 VALUES [("2024-02-01"), ("2024-03-01"))
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16
+PROPERTIES (
+    "replication_num" = "3",
+    "storage_cooldown_time" = "2592000",  -- 30天后迁移到冷存储
+    "storage_medium" = "SSD"              -- 默认存储介质
+);
+
+-- 查看分区存储信息
+SHOW PARTITIONS FROM orders;
+
+-- 手动迁移分区
+ALTER TABLE orders MODIFY PARTITION p202401 SET ("storage_medium" = "HDD");
+```
+
 ## 九、速查表（扩展）
 
 | 项 | 结论 |

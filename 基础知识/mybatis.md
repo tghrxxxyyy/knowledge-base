@@ -1446,3 +1446,189 @@ public class DataSourceInterceptor implements MethodInterceptor {
     }
 }
 ```
+
+## PageHelper 分页原理
+
+### 分页拦截器实现
+
+```java
+// PageHelper 分页原理
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "prepare", 
+        args = {Connection.class, Integer.class})
+})
+public class PageInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        StatementHandler handler = (StatementHandler) invocation.getTarget();
+        MetaObject metaObject = SystemMetaObject.forObject(handler);
+        
+        // 获取原始 SQL
+        String originalSql = (String) metaObject.getValue("delegate.boundSql.sql");
+        
+        // 获取分页参数
+        Page<?> page = PageHelper.getLocalPage();
+        if (page != null) {
+            // 改写 SQL 为分页 SQL
+            String pageSql = originalSql + " LIMIT " + page.getStartRow() + ", " + page.getPageSize();
+            metaObject.setValue("delegate.boundSql.sql", pageSql);
+        }
+        
+        return invocation.proceed();
+    }
+}
+```
+
+### 分页参数配置
+
+```yaml
+# PageHelper 配置
+pagehelper:
+  helperDialect: mysql
+  reasonable: true
+  supportMethodsArguments: true
+  params: count=countSql
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| helperDialect | 数据库方言 | mysql |
+| reasonable | 合理化参数 | true |
+| supportMethodsArguments | 支持通过Mapper接口参数来分页 | false |
+| params | 用于countSql | count=countSql |
+
+## MyBatis 拦截器链
+
+### 拦截器执行顺序
+
+```mermaid
+flowchart TB
+    EXECUTOR[Executor] --> PARAMETER[ParameterHandler]
+    PARAMETER --> STATEMENT[StatementHandler]
+    STATEMENT --> RESULTSET[ResultSetHandler]
+```
+
+### 自定义拦截器
+
+```java
+// 拦截器示例
+@Intercepts({
+    @Signature(type = Executor.class, method = "update", 
+        args = {MappedStatement.class, Object.class})
+})
+public class UpdateInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        MappedStatement ms = (MappedStatement) invocation.getArgs()[0];
+        Object parameter = invocation.getArgs()[1];
+        
+        // 记录更新操作
+        log.info("执行更新操作: {}", ms.getId());
+        
+        long start = System.currentTimeMillis();
+        Object result = invocation.proceed();
+        long cost = System.currentTimeMillis() - start;
+        
+        log.info("更新耗时: {}ms", cost);
+        return result;
+    }
+}
+```
+
+## MyBatis-Plus 条件构造器
+
+### 条件构造器使用
+
+```java
+// QueryWrapper 使用
+QueryWrapper<User> wrapper = new QueryWrapper<>();
+wrapper.eq("age", 25)
+       .like("name", "张")
+       .orderByDesc("create_time");
+
+List<User> users = userMapper.selectList(wrapper);
+
+// LambdaQueryWrapper 使用
+LambdaQueryWrapper<User> lambdaWrapper = new LambdaQueryWrapper<>();
+lambdaWrapper.eq(User::getAge, 25)
+             .like(User::getName, "张")
+             .orderByDesc(User::getCreateTime);
+
+List<User> users = userMapper.selectList(lambdaWrapper);
+```
+
+### 条件构造器对比
+
+| 构造器 | 特点 | 适用场景 |
+|--------|------|----------|
+| QueryWrapper | 字符串字段名 | 简单查询 |
+| LambdaQueryWrapper | Lambda 表达式 | 类型安全 |
+| UpdateWrapper | 更新条件 | 更新操作 |
+| LambdaUpdateWrapper | Lambda 更新 | 类型安全更新 |
+
+## N+1 查询问题
+
+### N+1 问题示例
+
+```java
+// N+1 问题
+// 1. 查询所有用户（1 次查询）
+List<User> users = userMapper.selectAll();
+
+// 2. 遍历用户查询订单（N 次查询）
+for (User user : users) {
+    List<Order> orders = orderMapper.selectByUserId(user.getId());
+}
+```
+
+### 解决方案
+
+```xml
+<!-- 方案1：使用 JOIN 查询 -->
+<select id="selectUserWithOrders" resultMap="userOrderMap">
+    SELECT u.*, o.* 
+    FROM user u 
+    LEFT JOIN orders o ON u.id = o.user_id
+</select>
+
+<!-- 方案2：使用延迟加载 -->
+<resultMap id="userMap" type="User">
+    <id property="id" column="id"/>
+    <collection property="orders" ofType="Order" 
+        select="selectByUserId" column="id"/>
+</resultMap>
+```
+
+## 动态 SQL
+
+### 动态 SQL 标签
+
+| 标签 | 说明 | 适用场景 |
+|------|------|----------|
+| `<if>` | 条件判断 | 动态条件 |
+| `<choose>` | 多条件选择 | 多条件互斥 |
+| `<where>` | 自动添加 WHERE | 动态查询条件 |
+| `<set>` | 自动添加 SET | 动态更新字段 |
+| `<foreach>` | 循环 | IN 查询、批量操作 |
+| `<trim>` | 自定义前缀/后缀 | 灵活控制 |
+
+```xml
+<!-- 动态 SQL 示例 -->
+<select id="selectByCondition" resultType="User">
+    SELECT * FROM user
+    <where>
+        <if test="name != null">
+            AND name = #{name}
+        </if>
+        <if test="age != null">
+            AND age = #{age}
+        </if>
+        <if test="ids != null and ids.size() > 0">
+            AND id IN
+            <foreach collection="ids" item="id" open="(" separator="," close=")">
+                #{id}
+            </foreach>
+        </if>
+    </where>
+</select>
+```

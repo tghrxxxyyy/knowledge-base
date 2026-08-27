@@ -1410,3 +1410,215 @@ groups:
         annotations:
           summary: "TiDB存储使用率过高"
 ```
+
+## 十二、Placement Rules深度详解
+
+### 12.1 Placement Rules概念
+
+```
+Placement Rules：
+  控制数据副本的放置位置
+  实现跨机架/跨地域部署
+  满足数据本地性要求
+  支持混合部署模式
+
+规则类型：
+  leader：指定Leader副本位置
+  follower：指定Follower副本位置
+  learner：指定Learner副本位置
+  leader-and-follower：指定Leader和Follower位置
+```
+
+### 12.2 Placement Rules配置示例
+
+```sql
+-- 创建Placement Policy
+CREATE PLACEMENT POLICY my_policy
+  PRIMARY_REGION="us-east-1"
+  REGIONS="us-east-1,us-west-2,eu-west-1"
+  FOLLOWERS=2
+  SCHEDULE='EVEN';
+
+-- 应用到表
+CREATE TABLE users (
+  id BIGINT PRIMARY KEY,
+  name VARCHAR(100)
+) PLACEMENT POLICY=my_policy;
+
+-- 查看Placement Policy
+SHOW PLACEMENT POLICY my_policy;
+```
+
+## 十三、TiFlash引擎详解
+
+### 13.1 TiFlash特性
+
+| 特性 | 说明 | 适用场景 |
+|------|------|---------|
+| 列式存储 | 列式存储格式 | 分析查询 |
+| 实时同步 | 异步复制 | 实时分析 |
+| 混合负载 | OLTP+OLAP混合 | HTAP场景 |
+| MPP引擎 | 分布式并行处理 | 大数据分析 |
+
+### 13.2 TiFlash使用场景
+
+```
+TiFlash使用场景：
+  1. 实时报表
+     → 实时同步TiKV数据
+     → 列式存储加速查询
+     → 支持复杂聚合分析
+
+  2. 数据仓库
+     → 替代传统数仓
+     → 支持SQL标准
+     → 实时数据更新
+
+  3. 混合负载
+     → OLTP处理事务
+     → OLAP处理分析
+     → 统一平台
+
+  4. 数据探索
+     → 交互式查询
+     → 即席分析
+     → 数据可视化
+```
+
+## 十四、TiDB运维工具详解
+
+### 14.1 运维工具对比
+
+| 工具 | 功能 | 适用场景 |
+|------|------|---------|
+| TiUP | 集群部署/升级/管理 | 日常运维 |
+| TiDB Data Migration | 数据迁移 | MySQL迁移 |
+| TiDB Backup & Backup | 备份恢复 | 数据备份 |
+| TiDB Lightning | 高速导入 | 大数据导入 |
+| TiDB DM | 分库分表迁移 | 复杂迁移 |
+
+### 14.2 TiUP常用命令
+
+```bash
+# 集群部署
+tiup cluster deploy my-cluster v7.0.0 topology.yaml
+
+# 集群启动
+tiup cluster start my-cluster
+
+# 集群升级
+tiup cluster upgrade my-cluster v7.1.0
+
+# 集群扩容
+tiup cluster scale-out my-cluster scale-out.yaml
+
+# 集群缩容
+tiup cluster scale-in my-cluster --node node1:2379
+
+# 集群备份
+tiup backup full my-cluster --backpath /backup
+
+# 集群恢复
+tiup restore full my-cluster --backpath /backup
+```
+
+## 十五、TiDB大事务处理详解
+
+### 15.1 大事务限制
+
+```
+TiDB大事务限制：
+  单个事务大小限制：100MB
+  单个KV条目大小：6MB
+  事务持有锁时间：默认10s
+  并发事务数：受TiKV节点数限制
+
+大事务问题：
+  1. 事务超时
+  2. 锁冲突严重
+  3. GC压力大
+  4. 网络带宽消耗
+```
+
+### 15.2 大事务解决方案
+
+| 方案 | 做法 | 适用场景 | 优缺点 |
+|------|------|---------|--------|
+| 事务拆批 | 分批提交 | 批量操作 | 复杂度高 |
+| 异步处理 | 消息队列异步 | 非实时场景 | 一致性弱 |
+| 预处理 | 预计算结果 | 复杂计算 | 开发成本高 |
+| 限流 | 控制事务频率 | 高并发场景 | 降低吞吐 |
+
+## 十六、TiDB金融级应用案例详解
+
+### 16.1 金融级场景
+
+```
+金融级场景：
+  1. 账户系统
+     → 高一致性要求
+     → 资金安全
+     → 审计追踪
+
+  2. 支付系统
+     → 高可用要求
+     → 低延迟要求
+     → 高并发处理
+
+  3. 风控系统
+     → 实时计算
+     → 规则引擎
+     → 告警通知
+
+  4. 报表系统
+     → 实时数据
+     → 复杂查询
+     → 多维度分析
+```
+
+### 16.2 金融级最佳实践
+
+| 实践 | 做法 | 目的 |
+|------|------|------|
+| 数据一致性 | 强一致性读 | 资金安全 |
+| 事务隔离 | RC隔离级别 | 性能优化 |
+| 监控告警 | 全链路监控 | 故障快速发现 |
+| 审计日志 | 操作审计 | 合规要求 |
+| 灾备方案 | 同城双活/异地多活 | 业务连续性 |
+
+## 十七、TiDB选型对比详解
+
+### 17.1 选型对比表
+
+| 场景 | 推荐数据库 | 理由 |
+|------|-----------|------|
+| 高并发OLTP | TiDB | 分布式架构，水平扩展 |
+| HTAP混合负载 | TiDB | OLTP+OLAP一体化 |
+| 大数据分析 | TiDB + TiFlash | 列式存储，分析加速 |
+| 数据迁移 | TiDB | MySQL兼容，迁移成本低 |
+| 金融级应用 | TiDB | 强一致性，高可用 |
+
+### 17.2 选型决策树
+
+```
+选型决策树：
+  Q1：需要HTAP吗？
+    是 → TiDB
+    否 → Q2
+
+  Q2：需要水平扩展吗？
+    是 → TiDB/CockroachDB
+    否 → Q3
+
+  Q3：需要强一致性吗？
+    是 → TiDB/CockroachDB
+    否 → MySQL/PostgreSQL
+
+  Q4：团队熟悉MySQL吗？
+    是 → TiDB
+    否 → CockroachDB
+
+  Q5：预算充足吗？
+    是 → TiDB（推荐）
+    否 → MySQL分库分表
+```

@@ -1435,6 +1435,186 @@ b.group(bossGroup, workerGroup)
 
 ---
 
+## ByteBuf 深入理解
+
+### ByteBuf 内存模型
+
+```mermaid
+flowchart TB
+    BYTEBUF[ByteBuf] --> READER[读索引 readerIndex]
+    BYTEBUF --> WRITER[写索引 writerIndex]
+    BYTEBUF --> CAPACITY[容量 capacity]
+    READER --> READABLE[可读区域]
+    WRITER --> WRITABLE[可写区域]
+```
+
+### ByteBuf 类型对比
+
+| 类型 | 内存位置 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| HeapByteBuf | JVM 堆 | GC 友好、分配快 | 一般场景 |
+| DirectByteBuf | 堆外内存 | 零拷贝、减少复制 | 高性能 |
+| PooledByteBuf | 内存池 | 复用、减少分配 | 高并发 |
+| UnpooledByteBuf | 非池化 | 简单、无池化 | 测试/低频 |
+
+### ByteBuf 使用示例
+
+```java
+// 创建 ByteBuf
+ByteBuf buf = Unpooled.buffer(1024);
+
+// 写入数据
+buf.writeBytes("hello".getBytes());
+
+// 读取数据（自增 readerIndex）
+byte[] data = new byte[buf.readableBytes()];
+buf.readBytes(data);
+
+// 标记与重置
+buf.markReaderIndex();
+buf.readByte();
+buf.resetReaderIndex(); // 回到标记位置
+
+// 复制 ByteBuf
+ByteBuf copy = buf.copy();
+```
+
+## Pipeline 链式处理
+
+### Pipeline 处理流程
+
+```mermaid
+flowchart LR
+    INBOUND[入站事件] --> DECODER[解码器]
+    DECODER --> HANDLER[业务处理器]
+    HANDLER --> ENCODER[编码器]
+    ENCODER --> OUTBOUND[出站事件]
+```
+
+### Handler 类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| ChannelInboundHandler | 处理入站 | 解码、业务逻辑 |
+| ChannelOutboundHandler | 处理出站 | 编码、压缩 |
+| ChannelDuplexHandler | 双向处理 | 统计、日志 |
+
+```java
+// 自定义 Handler
+public class MyHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf in = (ByteBuf) msg;
+        // 处理业务逻辑
+        ctx.writeAndFlush("response");
+    }
+    
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        ctx.close();
+    }
+}
+```
+
+## 心跳机制
+
+### IdleStateHandler 配置
+
+```java
+// 心跳配置
+pipeline.addLast(new IdleStateHandler(
+    60,    // 读空闲超时（秒）
+    30,    // 写空闲超时（秒）
+    0      // 全部空闲超时（秒）
+));
+
+// 心跳处理
+public class HeartbeatHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+        if (evt instanceof IdleStateEvent) {
+            IdleStateEvent event = (IdleStateEvent) evt;
+            if (event.state() == IdleState.READER_IDLE) {
+                ctx.close(); // 读空闲超时，关闭连接
+            } else if (event.state() == IdleState.WRITER_IDLE) {
+                ctx.writeAndFlush(Heartbeat.PING); // 发送心跳
+            }
+        }
+    }
+}
+```
+
+| 心跳类型 | 说明 | 默认超时 |
+|----------|------|----------|
+| READER_IDLE | 读空闲 | 60s |
+| WRITER_IDLE | 写空闲 | 30s |
+| ALL_IDLE | 全部空闲 | - |
+
+## 编解码器
+
+### 常用编解码器
+
+| 编码器 | 说明 | 适用场景 |
+|--------|------|----------|
+| LengthFieldBasedFrameDecoder | 基于长度字段 | 自定义协议 |
+| StringDecoder/StringEncoder | 字符串编解码 | 文本协议 |
+| ProtobufDecoder/Encoder | Protobuf | 高性能 |
+| HttpRequestDecoder | HTTP 协议 | Web 服务 |
+
+```java
+// 基于长度字段的解码器
+pipeline.addLast(new LengthFieldBasedFrameDecoder(
+    1024,    // 最大帧长度
+    0,       // 长度字段偏移
+    4,       // 长度字段长度
+    0,       // 长度调整值
+    4        // 跳过的字节数
+));
+```
+
+## 零拷贝机制
+
+### 零拷贝实现方式
+
+| 方式 | 说明 | 性能提升 |
+|------|------|----------|
+| FileRegion | sendfile 系统调用 | 减少用户态拷贝 |
+| CompositeByteBuf | 合并多个 ByteBuf | 减少内存拷贝 |
+| Slice | 切割 ByteBuf | 零拷贝视图 |
+| WrappedByteBuf | 包装 ByteBuf | 零拷贝包装 |
+
+```java
+// CompositeByteBuf 合并
+CompositeByteBuf composite = Unpooled.compositeBuffer();
+composite.addComponents(true, buf1, buf2, buf3);
+
+// Slice 切割
+ByteBuf slice = buf.slice(readerIndex, readableBytes);
+```
+
+## 生产调优核心
+
+### 性能调优参数
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| bossGroup 线程数 | 1 | 主 Reactor |
+| workerGroup 线程数 | CPU核数×2 | 从 Reactor |
+| SO_BACKLOG | 1024 | 连接队列 |
+| TCP_NODELAY | true | 禁用 Nagle |
+| SO_KEEPALIVE | true | TCP 保活 |
+| WRITE_BUFFER_WATER_MARK | 32K/64K | 写缓冲区 |
+
+### 内存泄漏检测
+
+```java
+// 开启内存泄漏检测
+-Dio.netty.leakDetection.level=PARANOID  // 最严格
+-Dio.netty.leakDetection.level=ADVANCED  // 高级
+-Dio.netty.leakDetection.level=SIMPLE    // 简单
+-Dio.netty.leakDetection.level=DISABLED  // 关闭（生产）
+```
+
 ## 十五、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；

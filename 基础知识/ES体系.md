@@ -1459,6 +1459,346 @@ flowchart LR
 | 延迟 | - | 通常<1s |
 | 用途 | 生产写入 | 灾备/读多写少 |
 
+---
+
+## 十七、ILM 策略完整配置示例
+
+### 17.1 ILM 策略配置
+
+```json
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "warm": {
+        "min_age": "3d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          },
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "set_priority": {
+            "priority": 50
+          }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": {
+            "priority": 0
+          }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### 17.2 ILM 状态监控
+
+```bash
+# 查看 ILM 状态
+GET _ilm/explain
+# 或查看特定索引
+GET my-index/_ilm/explain
+
+# 查看 ILM 步骤
+# status: RUNNING/STOPPED
+# step: check-rollover-ready/complete
+# step_info: 错误信息
+
+# 手动触发 ILM
+POST my-index/_ilm/move
+{
+  "current_step": {
+    "phase": "hot",
+    "action": "rollover",
+    "name": "check-rollover-ready"
+  },
+  "next_step": {
+    "phase": "warm",
+    "action": "shrink",
+    "name": "shrink"
+  }
+}
+```
+
+---
+
+## 十八、索引别名高级用法
+
+### 18.1 零停机迁移
+
+```bash
+# 创建新索引
+PUT logs-2024.01.01
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1
+  }
+}
+
+# 切换别名（原子操作）
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "logs-2023.12.31", "alias": "logs" } },
+    { "add": { "index": "logs-2024.01.01", "alias": "logs" } }
+  ]
+}
+
+# 应用无感知切换
+# 之前：GET logs/_search
+# 之后：GET logs/_search（别名不变）
+```
+
+### 18.2 多别名查询
+
+```bash
+# 创建多个别名
+POST _aliases
+{
+  "actions": [
+    { "add": { "index": "logs-2024.01", "alias": "logs" } },
+    { "add": { "index": "logs-2024.01", "alias": "logs-2024" } },
+    { "add": { "index": "logs-2024.01", "alias": "logs-2024-01" } }
+  ]
+}
+
+# 查询多个别名
+GET logs-*,logs-2024*/_search
+{
+  "query": {
+    "match_all": {}
+  }
+}
+```
+
+---
+
+## 十九、副本与分片策略深度优化
+
+### 19.1 分片分配策略
+
+```
+分片分配决策：
+  ① 磁盘水位：low(85%) → 停止分配；high(90%) → 迁移；flood(95%) → 只读
+  ② 节点负载：均衡分配到所有数据节点
+  ③ 分片大小：单个分片建议 10-50GB
+  ④ 分片数：一旦创建不可修改（需 reindex）
+
+  分片数计算：
+    分片数 = 预估数据量 / 单分片大小
+    示例：100GB 数据 / 30GB 每分片 ≈ 4 个分片
+
+  副本数建议：
+    生产环境：至少 1 副本（高可用）
+    读多写少：2-3 副本（提升读性能）
+    写密集：1 副本（减少写放大）
+```
+
+### 19.2 分片调优参数
+
+```yaml
+# 分片分配过滤
+index.routing.allocation.require.node_role: data_hot
+index.routing.allocation.require.zone: zone-a
+
+# 分片重平衡
+cluster.routing.rebalance.enable: all
+cluster.routing.allocation.balance.shard: 0.45
+cluster.routing.allocation.balance.index: 0.55
+
+# 分片恢复
+cluster.routing.allocation.node_concurrent_recoveries: 2
+cluster.routing.allocation.node_concurrent_incoming_recoveries: 1
+cluster.routing.allocation.node_concurrent_outgoing_recoveries: 1
+```
+
+---
+
+## 二十、Painless 脚本实战
+
+### 20.1 更新脚本
+
+```bash
+# 使用脚本更新文档
+POST my-index/_update/1
+{
+  "script": {
+    "source": "ctx._source.views += params.count",
+    "lang": "painless",
+    "params": {
+      "count": 1
+    }
+  }
+}
+
+# 条件更新
+POST my-index/_update_by_query
+{
+  "script": {
+    "source": "ctx._source.status = 'inactive'",
+    "lang": "painless"
+  },
+  "query": {
+    "range": {
+      "last_login": {
+        "lt": "now-30d"
+      }
+    }
+  }
+}
+```
+
+### 20.2 聚合脚本
+
+```bash
+# 脚本聚合
+GET my-index/_search
+{
+  "size": 0,
+  "aggs": {
+    "profit": {
+      "sum": {
+        "script": {
+          "source": "doc['price'].value * doc['quantity'].value",
+          "lang": "painless"
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+## 二十一、Data Stream 设计最佳实践
+
+### 21.1 Data Stream 配置
+
+```json
+# 创建索引模板
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "data_stream": {},
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" },
+        "service": { "type": "keyword" },
+        "level": { "type": "keyword" }
+      }
+    }
+  }
+}
+
+# 写入数据
+POST logs-myapp/_doc
+{
+  "@timestamp": "2024-01-15T10:30:00Z",
+  "message": "User logged in",
+  "service": "user-service",
+  "level": "INFO"
+}
+
+# 查询数据
+GET logs-myapp/_search
+{
+  "query": {
+    "range": {
+      "@timestamp": {
+        "gte": "now-1h"
+      }
+    }
+  }
+}
+```
+
+### 21.2 Data Stream 生命周期
+
+```
+Data Stream 生命周期：
+  1. 写入：数据写入当前写索引（backing index）
+  2. Rollover：当索引达到阈值时，创建新写索引
+  3. Warm：旧索引迁移到 warm 节点
+  4. Cold：更旧索引迁移到 cold 节点
+  5. Delete：超过保留期的索引自动删除
+
+  监控命令：
+    GET _data_stream/logs-*
+    GET _ilm/explain/logs-*
+```
+
+---
+
+## 二十二、文档大小对索引性能影响
+
+### 22.1 文档大小与性能关系
+
+```
+文档大小影响：
+  小文档（<1KB）：
+    优点：索引快、查询快、存储省
+    缺点：文档数多、分片元数据大
+    建议：合并小文档、批量写入
+
+  中等文档（1-10KB）：
+    优点：平衡性能
+    缺点：无
+    建议：最佳实践
+
+  大文档（>10MB）：
+    优点：文档数少
+    缺点：索引慢、查询慢、内存压力大
+    建议：拆分大文档、使用附件存储
+
+  批量写入建议：
+    单次批量：5-15MB 或 1000-5000 文档
+    批量间隔：1-10 秒
+    线程数：CPU 核心数 × 1-2
+```
+
+### 22.2 性能测试数据
+
+| 文档大小 | 写入 QPS | 索引大小 | 查询延迟 |
+|----------|----------|----------|----------|
+| 100B | 50,000 | 5GB | 5ms |
+| 1KB | 30,000 | 30GB | 10ms |
+| 10KB | 10,000 | 300GB | 50ms |
+| 100KB | 2,000 | 3TB | 200ms |
+| 1MB | 500 | 30TB | 500ms |
+
 ## 十六、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
 
 - **集群变红（Red）**：`GET _cluster/health` 看 `status=red`（主分片未分配）。排查：`GET _cat/indices?v&health=red` 定位红索引；`GET _cluster/allocation/explain` 看分片未分配原因（最常见：磁盘水位、节点离线、分片数超限）。红通常意味着有主分片丢失、数据可能已损，优先恢复节点而非强制分配（强制分配空分片会丢数据）。

@@ -1419,6 +1419,276 @@ SET max_memory_usage_for_all_queries = 50000000000;  -- 50GB 全局限制
 | 写入密集 | 增加 max_insert_block_size |
 | 分析密集 | 增加 max_threads，启用并行查询 |
 
+---
+
+## 二十八、MergeTree 排序键深入
+
+### 28.1 排序键设计原则
+
+```
+排序键设计原则：
+  ① 高基数列在前：先放区分度高的列
+  ② 查询模式匹配：按查询 WHERE/ORDER BY 设计
+  ③ 时间列靠前：按时间范围查询时性能好
+  ④ 避免过多列：排序键列数过多会增加索引大小
+
+  示例：
+    -- 用户行为分析表
+    CREATE TABLE user_actions (
+        user_id UInt64,
+        action String,
+        timestamp DateTime,
+        properties String
+    ) ENGINE = MergeTree()
+    ORDER BY (user_id, timestamp)  -- 先用户再时间
+    PARTITION BY toYYYYMM(timestamp);
+
+    -- 日志分析表
+    CREATE TABLE logs (
+        service String,
+        level String,
+        timestamp DateTime,
+        message String
+    ) ENGINE = MergeTree()
+    ORDER BY (service, level, timestamp)  -- 先服务再级别再时间
+    PARTITION BY toYYYYMM(timestamp);
+```
+
+### 28.2 排序键 vs 主键
+
+| 维度 | 排序键（ORDER BY） | 主键（PRIMARY KEY） |
+|------|-------------------|---------------------|
+| 作用 | 决定数据物理排序 | 稀疏索引（每 N 行一个索引） |
+| 唯一性 | 不保证唯一 | 不保证唯一 |
+| 性能 | 影响查询性能 | 影响索引大小和查询性能 |
+| 建议 | 按查询模式设计 | 通常与排序键相同 |
+
+---
+
+## 二十九、ReplicatedMergeTree 副本同步深入
+
+### 29.1 副本同步原理
+
+```
+ReplicatedMergeTree 副本同步原理：
+  ① 数据写入：写入本地表（Leader）
+  ② 日志复制：ZK/ClickHouse Keeper 同步操作日志
+  ③ 异步拉取：Follower 从 ZK 拉取操作日志
+  ④ 重放执行：Follower 重放日志，保持同步
+
+  同步模式：
+    同步：写操作在所有副本确认后返回
+    异步：写操作在 Leader 确认后返回，Follower 异步同步
+
+  监控命令：
+    SELECT * FROM system.replicas;  -- 查看副本状态
+    SELECT * FROM system.replication_queue;  -- 查看复制队列
+```
+
+### 29.2 副本同步配置
+
+```sql
+-- 创建带副本的表
+CREATE TABLE user_actions_replicated ON CLUSTER '{cluster}'
+(
+    user_id UInt64,
+    action String,
+    timestamp DateTime
+) ENGINE = ReplicatedMergeTree('/clickhouse/{cluster}/tables/{shard}/user_actions', '{replica}')
+ORDER BY (user_id, timestamp)
+PARTITION BY toYYYYMM(timestamp);
+
+-- 副本状态监控
+SELECT 
+    database,
+    table,
+    is_leader,
+    is_readonly,
+    absolute_delay,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue
+FROM system.replicas;
+```
+
+---
+
+## 三十、物化视图深入
+
+### 30.1 物化视图原理
+
+```
+物化视图原理：
+  ① 数据写入：写入源表
+  ② 触发转换：物化视图触发器执行
+  ③ 写入目标：转换后的数据写入目标表
+
+  特点：
+    异步执行：写入源表后立即返回
+    实时更新：数据实时同步到目标表
+    预聚合：支持 SUM/COUNT/AVG 等聚合
+
+  适用场景：
+    实时指标统计
+    数据清洗转换
+    数据分发
+```
+
+### 30.2 物化视图配置
+
+```sql
+-- 创建物化视图（实时统计每分钟用户行为）
+CREATE MATERIALIZED VIEW user_actions_minute
+ENGINE = AggregatingMergeTree()
+ORDER BY (user_id, action, timestamp)
+AS SELECT
+    user_id,
+    action,
+    toStartOfMinute(timestamp) AS minute,
+    countState() AS action_count,
+    uniqState(user_id) AS unique_users
+FROM user_actions
+GROUP BY user_id, action, minute;
+
+-- 查询物化视图
+SELECT 
+    user_id,
+    action,
+    minute,
+    countMerge(action_count) AS total_count,
+    uniqMerge(unique_users) AS unique_count
+FROM user_actions_minute
+GROUP BY user_id, action, minute;
+```
+
+---
+
+## 三十一、Kafka Engine 深入
+
+### 31.1 Kafka Engine 配置
+
+```sql
+-- 创建 Kafka Engine 表
+CREATE TABLE kafka_queue (
+    user_id UInt64,
+    action String,
+    timestamp DateTime
+) ENGINE = Kafka()
+SETTINGS
+    kafka_broker_list = 'kafka1:9092,kafka2:9092',
+    kafka_topic_list = 'user_actions',
+    kafka_group_name = 'clickhouse_consumer',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 3,
+    kafka_max_block_size = 1048576;
+
+-- 创建目标表
+CREATE TABLE user_actions (
+    user_id UInt64,
+    action String,
+    timestamp DateTime
+) ENGINE = MergeTree()
+ORDER BY (user_id, timestamp);
+
+-- 创建物化视图（从 Kafka 到目标表）
+CREATE MATERIALIZED VIEW user_actions_mv TO user_actions AS
+SELECT * FROM kafka_queue;
+```
+
+### 31.2 Kafka 集成最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 消费组 | 多个消费者共享消费组 |
+| 批量写入 | 设置 kafka_max_block_size 控制批量大小 |
+| 错误处理 | 配置 kafka_skip_broken_messages 跳过错误消息 |
+| 监控 | 监控消费延迟和写入延迟 |
+
+---
+
+## 三十二、分布式表深入
+
+### 32.1 分布式表架构
+
+```
+分布式表架构：
+  ① 本地表：每个节点创建本地表
+  ② 分布式表：创建分布式表，指定集群配置
+  ③ 查询路由：分布式表自动路由查询到各节点
+  ④ 结果合并：各节点返回结果，分布式表合并
+
+  路由策略：
+    随机：随机选择节点
+    复制：查询所有节点
+    分片：按分片键路由
+
+  配置示例：
+    <remote_servers>
+        <my_cluster>
+            <shard>
+                <replica>
+                    <host>node1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </my_cluster>
+    </remote_servers>
+```
+
+### 32.2 本地表路由配置
+
+```sql
+-- 创建分布式表
+CREATE TABLE user_actions_distributed ON CLUSTER '{cluster}'
+(
+    user_id UInt64,
+    action String,
+    timestamp DateTime
+) ENGINE = Distributed('{cluster}', 'default', 'user_actions', xxHash64(user_id));
+
+-- 查询分布式表
+SELECT * FROM user_actions_distributed
+WHERE user_id = 12345;
+
+-- 路由到特定分片
+SELECT * FROM user_actions_distributed
+WHERE _shard_num = 1;
+```
+
+---
+
+## 三十三、内存管理深入
+
+### 33.1 内存管理参数
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| max_memory_usage | 10GB | 单查询最大内存 | 按查询复杂度调整 |
+| max_threads | CPU核心数 | 最大并行线程数 | 通常保持默认 |
+| max_insert_block_size | 1048576 | 插入块大小 | 按数据量调整 |
+| merge_tree_max_rows_to_use_cache | 1048576 | 合并缓存行数 | 按内存调整 |
+
+### 33.2 内存管理最佳实践
+
+```
+内存管理最佳实践：
+  ① 监控内存使用：
+    SELECT * FROM system.processes;  -- 查看查询内存使用
+    SELECT * FROM system.merges;  -- 查看合并内存使用
+
+  ② 限制查询内存：
+    SET max_memory_usage = 10000000000;  -- 10GB
+
+  ③ 优化查询：
+    减少 JOIN 表数量
+    使用近似算法（uniqCombined）
+    避免 SELECT *
+
+  ④ 调整配置：
+    增加 max_threads 提升并行度
+    调整 max_memory_usage 限制内存
+```
+
 ## 与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。

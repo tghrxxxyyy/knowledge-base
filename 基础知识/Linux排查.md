@@ -1410,3 +1410,222 @@ difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
     Off-CPU 火焰图：分析阻塞等待
     内存火焰图：分析内存分配
 ```
+
+## 二十六、CPU高完整定位链路详解
+
+### 26.1 CPU定位五步法
+
+```
+CPU高定位链路：
+  第一步：top查看整体CPU使用率
+    → 找到CPU高的进程（%CPU列）
+
+  第二步：top -Hp <pid>查看线程
+    → 找到CPU高的线程（%CPU列）
+
+  第三步：printf "%x" <tid>转换线程ID
+    → 将十进制转换为十六进制
+
+  第四步：jstack <pid> | grep <tid十六进制>查看线程堆栈
+    → 找到具体代码位置
+
+  第五步：jstack <pid> > thread_dump.txt保存完整堆栈
+    → 分析调用链
+```
+
+### 26.2 CPU定位工具对比
+
+| 工具 | 用途 | 精度 | 性能影响 |
+|------|------|------|---------|
+| top | 整体CPU | 低 | 低 |
+| top -Hp | 线程CPU | 高 | 低 |
+| pidstat | 线程CPU | 高 | 低 |
+| jstack | 线程堆栈 | 高 | 中 |
+| async-profiler | 火焰图 | 极高 | 低 |
+
+## 二十七、内存泄漏vs内存溢出判别详解
+
+### 27.1 判别方法
+
+```
+内存泄漏vs内存溢出：
+  内存泄漏：
+    定义：对象未被使用但未被回收
+    表现：内存使用持续增长
+    后果：最终导致内存溢出
+    工具：jmap/jhat/MAT分析堆
+
+  内存溢出：
+    定义：内存不足无法分配新对象
+    表现：OOM异常
+    后程：进程崩溃
+    工具：jmap/jstat/GC日志
+
+  判别流程：
+    1. 查看GC日志（Full GC频率）
+    2. 查看堆内存趋势（jstat -gcutil）
+    3. 分析堆转储（jmap -dump）
+    4. 使用MAT分析泄漏点
+```
+
+### 27.2 内存问题排查工具
+
+| 工具 | 用途 | 命令 |
+|------|------|------|
+| jstat | GC统计 | jstat -gcutil <pid> 1000 |
+| jmap | 堆转储 | jmap -dump:format=b,file=heap.bin <pid> |
+| jhat | 堆分析 | jhat heap.bin |
+| MAT | 堆分析 | 导入heap.bin分析 |
+| jstack | 线程堆栈 | jstack <pid> |
+
+## 二十八、io_wait高定位详解
+
+### 28.1 io_wait定位流程
+
+```
+io_wait定位流程：
+  第一步：top查看%Cpu行的wa值
+    → wa值高表示IO等待高
+
+  第二步：iostat -x 1查看磁盘IO
+    → %util：磁盘使用率
+    → await：IO平均等待时间
+    → svctm：IO平均服务时间
+
+  第三步：pidstat -d 1查看进程IO
+    → 找到IO高的进程
+
+  第四步：iotop查看线程IO
+    → 找到IO高的线程
+
+  第五步：strace -p <pid> -e trace=file
+    → 查看具体IO操作
+```
+
+### 28.2 io_wait优化策略
+
+| 优化策略 | 做法 | 效果 |
+|---------|------|------|
+| 增加内存 | 减少swap使用 | 降低IO |
+| SSD替换HDD | 提升IO性能 | 降低延迟 |
+| 调整IO调度 | deadline/noop | 提升性能 |
+| 优化文件系统 | ext4/xfs选择 | 提升性能 |
+| 减少IO操作 | 合并写入/缓存 | 降低IO |
+
+## 二十九、网络丢包排查详解
+
+### 29.1 网络丢包排查路径
+
+```
+网络丢包排查路径：
+  第一步：ethtool -S eth0查看网卡统计
+    → rx_dropped：接收丢包
+    → tx_dropped：发送丢包
+    → rx_crc_errors：CRC错误
+
+  第二步：netstat -s查看网络统计
+    → TcpExtRetransSegs：TCP重传
+    → TcpExtTCPTimeouts：TCP超时
+
+  第三步：dropwatch查看丢包位置
+    → 定位内核丢包点
+
+  第四步：tcpdump抓包分析
+    → 分析丢包原因
+
+  第五步：iperf3测试网络性能
+    → 测试带宽/延迟/丢包
+```
+
+### 29.2 网络丢包原因分析
+
+| 原因 | 表现 | 解决方案 |
+|------|------|---------|
+| 网卡队列满 | rx_dropped增加 | 调整ring buffer |
+| 带宽不足 | 延迟高/丢包 | 升级带宽 |
+| 网络拥塞 | 重传增加 | QoS/流量控制 |
+| MTU不匹配 | 分片丢包 | 调整MTU |
+| 防火墙规则 | 连接被拒 | 调整iptables |
+
+## 三十、dmesg OOM Killer详解
+
+### 30.1 OOM Killer日志解读
+
+```
+OOM Killer日志解读：
+  日志格式：
+    [xxx.xxx] Out of memory: Kill process 12345 (java) score 800 or sacrifice child
+    [xxx.xxx] Killed process 12345 (java) total-vm:4096000kB, anon-rss:2048000kB
+
+  关键字段：
+    process：被杀进程名
+    score：OOM分数（越高越可能被杀）
+    total-vm：虚拟内存大小
+    anon-rss：实际物理内存大小
+
+  OOM分数计算：
+    基础分 = 进程RSS / 总内存 × 1000
+    调整分 = oom_score_adj
+    最终分 = 基础分 + 调整分
+```
+
+### 30.2 OOM防护策略
+
+```bash
+# 查看OOM分数
+cat /proc/<pid>/oom_score
+cat /proc/<pid>/oom_score_adj
+
+# 设置OOM分数调整（不被杀）
+echo -1000 > /proc/<pid>/oom_score_adj
+
+# cgroup内存限制
+cat /sys/fs/cgroup/memory/<cgroup>/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/<cgroup>/memory.usage_in_bytes
+```
+
+## 三十一、perf火焰图生成详解
+
+### 31.1 火焰图完整流程
+
+```bash
+# 1. 安装工具
+apt install linux-tools-common linux-tools-$(uname -r)
+pip install perf-flamegraph
+
+# 2. 采集数据
+perf record -g -p <pid> -- sleep 30
+# 或
+perf record -g -F 99 -p <pid> -- sleep 30
+
+# 3. 生成火焰图
+perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+# 4. 差异火焰图（优化前后）
+difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
+```
+
+### 31.2 火焰图分析技巧
+
+```
+火焰图分析技巧：
+  1. 找最宽顶帧
+     → 自身耗CPU多的函数
+
+  2. 看调用链
+     → 优化热点函数
+
+  3. 对比优化前后
+     → 验证优化效果
+
+  4. 关注颜色
+     → 颜色无特殊含义
+
+  5. 关注宽度
+     → 宽度=采样比例
+
+  火焰图类型：
+    CPU火焰图：分析CPU热点
+    Off-CPU火焰图：分析阻塞等待
+    内存火焰图：分析内存分配
+```

@@ -1461,6 +1461,232 @@ mc pipe myminio/my-bucket/large-file.bin < large-file.bin
     告警配置：配置性能告警
 ```
 
+---
+
+## 十七、Erasure Coding 原理深入
+
+### 17.1 纠删码算法原理
+
+```
+Erasure Coding（纠删码）原理：
+  将数据分成 k 个数据块，生成 m 个校验块
+  总块数 = k + m
+  容错能力：最多容忍 m 个块丢失
+
+  示例：
+    k=4, m=2
+    数据块：D1, D2, D3, D4
+    校验块：P1, P2
+    
+    丢失任意 2 个块，都能恢复数据
+    存储开销：(k+m)/k = 6/4 = 1.5x
+    vs 3 副本：3x
+
+  常用配置：
+    4+2：容错 2 块，存储开销 1.5x
+    8+4：容错 4 块，存储开销 1.5x
+    10+4：容错 4 块，存储开销 1.4x
+```
+
+### 17.2 纠删码 vs 副本对比
+
+| 维度 | 副本（3x） | 纠删码（4+2） |
+|------|-----------|--------------|
+| 存储开销 | 3x | 1.5x |
+| 容错能力 | 丢失 2 副本 | 丢失 2 块 |
+| 写性能 | 高（简单复制） | 中（计算校验） |
+| 读性能 | 高（任一副本） | 中（可能需重建） |
+| CPU 开销 | 低 | 中（编解码） |
+| 适用场景 | 热数据/频繁访问 | 冷数据/归档 |
+
+### 17.3 MinIO 纠删码配置
+
+```bash
+# MinIO 纠删码配置
+# 启动时指定数据盘和校验盘
+minio server /data1 /data2 /data3 /data4 /data5 /data6
+
+# 等效于 4+2 纠删码
+# /data1 /data2 /data3 /data4 = 数据盘
+# /data5 /data6 = 校验盘
+
+# 查看纠删码状态
+mc admin info local
+```
+
+---
+
+## 十八、多站点复制深入
+
+### 18.1 复制模式对比
+
+| 模式 | 说明 | RPO | RTO | 适用 |
+|------|------|-----|-----|------|
+| 同步复制 | 写操作在所有站点确认 | 0 | 秒级 | 金融/支付 |
+| 异步复制 | 写操作在主站点确认 | 秒~分钟 | 分钟级 | 一般业务 |
+| 批量复制 | 定期批量复制 | 小时级 | 小时级 | 归档/备份 |
+
+### 18.2 复制架构设计
+
+```
+多站点复制架构：
+  主站点（Primary）
+    ├── 同步复制 → 灾备站点（DR）
+    └── 异步复制 → 分析站点（Analytics）
+
+  复制策略：
+    ① 同步复制：金融核心数据（RPO=0）
+    ② 异步复制：一般业务数据（RPO=分钟级）
+    ③ 批量复制：归档数据（RPO=小时级）
+
+  故障切换：
+    自动切换：检测主站点故障，自动提升灾备站点
+    手动切换：计划内维护，手动切换
+```
+
+---
+
+## 十九、生命周期管理最佳实践
+
+### 19.1 生命周期规则配置
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "Transition to IA",
+      "Status": "Enabled",
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "STANDARD_IA"
+        },
+        {
+          "Days": 90,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
+      }
+    }
+  ]
+}
+```
+
+### 19.2 生命周期管理策略
+
+| 数据类型 | 热数据期 | 温数据期 | 冷数据期 | 归档期 |
+|----------|---------|---------|---------|--------|
+| 日志 | 7天 | 30天 | 90天 | 365天删除 |
+| 用户上传 | 30天 | 90天 | 180天 | 365天删除 |
+| 备份 | 7天 | 30天 | 90天 | 永久保留 |
+| 临时文件 | 1天 | 删除 | - | - |
+
+---
+
+## 二十、安全配置深入
+
+### 20.1 IAM 策略配置
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-bucket/*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:ExistingObjectTag/retention": "delete"
+        }
+      }
+    }
+  ]
+}
+```
+
+### 20.2 加密配置
+
+| 加密方式 | 说明 | 适用 |
+|----------|------|------|
+| SSE-S3 | 服务端加密（S3管理密钥） | 简单场景 |
+| SSE-C | 客户端提供密钥 | 高安全要求 |
+| SSE-KMS | KMS管理密钥 | 企业级 |
+| 客户端加密 | 客户端加密后上传 | 最高安全 |
+
+---
+
+## 二十一、性能调优深入
+
+### 21.1 小文件合并策略
+
+```
+小文件合并优化：
+  问题：大量小文件导致存储效率低、性能差
+  
+  解决方案：
+    ① 应用层合并：批量上传小文件
+    ② 存储层合并：MinIO 批量删除 + 合并
+    ③ 客户端缓存：本地缓存后批量上传
+
+  最佳实践：
+    单个对象大小：1MB-5GB
+    批量上传：每次 100-1000 个对象
+    分片上传：大文件分片 5MB-5GB
+```
+
+### 21.2 并行多部分上传
+
+```java
+// 并行多部分上传
+public void parallelUpload(S3Client s3, String bucket, String key, 
+                           InputStream data, long contentLength) {
+    int partSize = 10 * 1024 * 1024; // 10MB
+    int partCount = (int) Math.ceil(contentLength / (double) partSize);
+    
+    // 并行上传分片
+    List<CompletableFuture<CompletedPart>> futures = new ArrayList<>();
+    for (int i = 0; i < partCount; i++) {
+        long offset = (long) i * partSize;
+        int size = (int) Math.min(partSize, contentLength - offset);
+        
+        futures.add(CompletableFuture.supplyAsync(() -> {
+            // 上传分片
+            return uploadPart(s3, bucket, key, i + 1, data, offset, size);
+        }));
+    }
+    
+    // 等待所有分片完成
+    List<CompletedPart> parts = futures.stream()
+        .map(CompletableFuture::join)
+        .collect(Collectors.toList());
+    
+    // 完成上传
+    s3.completeMultipartUpload(bucket, key, parts);
+}
+```
+
+### 21.3 性能监控指标
+
+| 指标 | 目标 | 监控方式 |
+|------|------|---------|
+| 吞吐量 | >1GB/s | MinIO Metrics |
+| 延迟 P99 | <100ms | MinIO Metrics |
+| 并发连接 | >1000 | 网络监控 |
+| 磁盘 IOPS | >10000 | 系统监控 |
+| CPU 使用率 | <70% | 系统监控 |
+| 内存使用率 | <80% | 系统监控 |
+
 ## 十六、MinIO vs AWS S3功能对比矩阵
 
 | 功能 | MinIO | AWS S3 | 说明 |

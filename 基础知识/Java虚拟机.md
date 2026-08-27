@@ -1430,6 +1430,293 @@ int sum = x + y;
 -XX:+PrintEscapeAnalysis   # 打印逃逸分析结果
 ```
 
+## JMM（Java Memory Model）happens-before 完整规则
+
+### happens-before 八大规则
+
+| 规则 | 说明 | 示例 |
+|------|------|------|
+| 程序顺序规则 | 同一线程中，前面的操作 happens-before 后面的操作 | `a=1; b=a;` 保证 b 看到 a 的值 |
+| 监视器锁规则 | unlock happens-before lock | `synchronized` 块内的写对后续加锁线程可见 |
+| volatile 变量规则 | 写 happens-before 读 | `volatile int x;` 写 x 对读 x 的线程可见 |
+| 线程启动规则 | `start()` happens-before 该线程的每个操作 | 子线程能看到主线程启动前的操作 |
+| 线程终止规则 | `join()` 返回 happens-before 调用线程的后续操作 | 主线程能看到子线程终止前的操作 |
+| 线程中断规则 | `interrupt()` happens-before 检测到中断 | `Thread.interrupted()` 能看到中断 |
+| 对象终结规则 | `finalize()` happens-before 对象被回收 | finalize 中的操作对回收线程可见 |
+| 传递性规则 | A hb B, B hb C → A hb C | 规则组合推导 |
+
+### volatile 与 synchronized 的内存语义
+
+```java
+// volatile 写 = storeStore 屏障 + volatile 写 + storeLoad 屏障
+volatile boolean flag = true;
+
+// volatile 读 = volatile 读 + loadLoad 屏障 + loadStore 屏障
+if (flag) { /* 看到最新值 */ }
+
+// synchronized 释放锁 = unlock + 将本地内存变量刷新到主内存
+// synchronized 获取锁 = lock + 从主内存读取变量到本地内存
+```
+
+## 类加载器层次与双亲委派
+
+### 类加载器层次
+
+```mermaid
+flowchart TB
+    BCL[Bootstrap ClassLoader<br/>加载 rt.jar] --> EXT[Extension ClassLoader<br/>加载 ext/*.jar]
+    EXT --> APP[Application ClassLoader<br/>加载 classpath]
+    APP --> CUSTOM[自定义 ClassLoader<br/>加载自定义路径]
+```
+
+### 双亲委派模型
+
+```java
+// 双亲委派源码（ClassLoader.loadClass）
+protected Class<?> loadClass(String name, boolean resolve) {
+    // 1. 检查是否已加载
+    Class<?> c = findLoadedClass(name);
+    if (c == null) {
+        try {
+            // 2. 委派给父加载器
+            if (parent != null) {
+                c = parent.loadClass(name, false);
+            } else {
+                c = findBootstrapClassOrNull(name);
+            }
+        } catch (ClassNotFoundException e) {
+            // 父加载器无法加载
+        }
+        if (c == null) {
+            // 3. 父加载器无法加载时，自己加载
+            c = findClass(name);
+        }
+    }
+    return c;
+}
+```
+
+### 破坏双亲委派的三种场景
+
+| 场景 | 原因 | 案例 |
+|------|------|------|
+| SPI 机制 | 父加载器需要加载子加载器的类 | JDBC Driver（Bootstrap 加载 DriverManager，但 Driver 在 classpath） |
+| OSGi 模块化 | 每个模块有自己的类加载器 | 网热部署、模块隔离 |
+| Tomcat 类隔离 | 不同 webapp 需要类隔离 | Servlet 容器类加载 |
+
+## GC 日志分析实战
+
+### JDK 11+ GC 日志配置
+
+```bash
+# 统一日志框架（JDK 9+）
+-Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=50m
+
+# G1 GC 日志
+-Xlog:gc*=debug:file=g1gc.log:time,uptime,level,tags
+
+# ZGC 日志
+-Xlog:gc*:file=zgc.log:time,uptime,level,tags
+```
+
+### GC 日志关键指标
+
+| 指标 | 说明 | 优化目标 |
+|------|------|----------|
+| GC Pause | STW 停顿时间 | G1 < 200ms, ZGC < 1ms |
+| GC Throughput | GC 时间占比 | > 95%（GC 时间 < 5%） |
+| Allocation Rate | 对象分配速率 | 稳定，无突增 |
+| Promotion Rate | 晋升老年代速率 | 低，避免 Full GC |
+| Heap After GC | GC 后堆占用 | 稳定，无持续增长 |
+
+### GC 日志分析工具
+
+| 工具 | 特点 | 适用 |
+|------|------|------|
+| GCEasy | 在线分析，可视化 | 快速分析 |
+| GCViewer | 本地 GUI | 详细分析 |
+| JClarity Censum | 商业工具 | 低延迟分析 |
+| Unified Logging Viewer | 官方工具 | JDK 9+ 日志 |
+
+## JVM Crash 分析
+
+### Crash 日志结构
+
+```text
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  SIGSEGV (0xb) at pc=0x00007f..., pid=12345, tid=0x00007f...
+#
+# JRE version: Java(TM) SE Runtime Environment (17.0.2+8)
+# Java VM: Java HotSpot(TM) 64-Bit Server VM (17.0.2+8)
+#
+# Problematic frame:
+# V  [libjvm.so+0x123456]
+#
+# Core dump will be written...
+```
+
+### Crash 常见原因
+
+| 原因 | 现象 | 排查 |
+|------|------|------|
+| JNI 调用 | SIGSEGV in libjvm | 检查 native 代码 |
+| 栈溢出 | StackOverflowError | 增大 -Xss 或优化递归 |
+| 内存损坏 | SIGBUS/SIGSEGV | 检查堆外内存 |
+| JIT 编译 bug | 编译后代码崩溃 | -XX:-CompileCommand 排除方法 |
+| 类加载冲突 | VerifyError | 检查类路径冲突 |
+
+## 容器环境调优最佳实践
+
+### 内存配置
+
+```bash
+# 容器内存 limit = 4GB
+# JVM 堆 = 70%~80% = 2.8GB~3.2GB
+java -Xmx3g -Xms3g \
+     -XX:MaxMetaspaceSize=512m \
+     -XX:ReservedCodeCacheSize=256m \
+     -XX:MaxDirectMemorySize=512m \
+     -jar app.jar
+```
+
+### CPU 配置
+
+```bash
+# 容器 CPU limit = 2 核
+# GC 线程数 = min(8, CPU核数/4)
+java -XX:ActiveProcessorCount=2 \
+     -XX:ParallelGCThreads=2 \
+     -XX:ConcGCThreads=1 \
+     -jar app.jar
+```
+
+### K8s 探针配置
+
+```yaml
+# JVM 启动慢，探针超时要长
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 60
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 5
+  timeoutSeconds: 3
+```
+
+## ZGC/Shenandoah 调优实战
+
+### ZGC 核心特性
+
+| 特性 | ZGC | Shenandoah |
+|------|-----|-----------|
+| 停顿时间 | < 1ms | < 10ms |
+| 并发标记 | ✅ | ✅ |
+| 并发压缩 | ✅ | ✅ |
+| 分代模型 | JDK 21+ | ❌ |
+| 支持堆大小 | TB 级 | 数十 GB |
+| NUMA 感知 | ✅ | 部分 |
+
+### ZGC 调优参数
+
+```bash
+# ZGC 分代模式（JDK21+ 推荐）
+-XX:+UseZGC
+-XX:+ZGenerational
+
+# ZGC 内存控制
+-XX:SoftMaxHeapSize=N        # 软限制，ZGC 尽量不超过
+-XX:ZAllocationSpikeTolerance=N  # 分配尖峰容忍度
+
+# ZGC 并发控制
+-XX:ZCollectionInterval=N    # 主动 GC 间隔（秒）
+
+# ZGC NUMA 感知
+-XX:+UseNUMA
+```
+
+### Shenandoah 调优参数
+
+```bash
+-XX:+UseShenandoahGC
+-XX:ShenandoahGCHeuristics=adaptive  # 启发式策略
+-XX:ShenandoahMinFreeThreshold=10    # 最小空闲比例
+-XX:ShenandoahGuaranteedGCInterval=300000  # 保证 GC 间隔（ms）
+-XX:ShenandoahUncommitDelay=3000     # 内存归还延迟（ms）
+```
+
+## async-profiler/JFR 性能剖析实操
+
+### async-profiler 使用
+
+```bash
+# CPU 采样（30 秒）
+./profiler.sh -d 30 -f cpu_profile.html -o flamegraph <pid>
+
+# 内存分配分析
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# 锁竞争分析
+./profiler.sh -d 30 -e lock -f lock_profile.html <pid>
+
+# Wall-clock 分析（包含阻塞时间）
+./profiler.sh -d 30 -e wall -f wall_profile.html <pid>
+```
+
+### JFR（Java Flight Recorder）
+
+```bash
+# 启动 JFR 记录
+jcmd <pid> JFR.start duration=60s filename=recording.jfr
+
+# 持续记录（手动停止）
+jcmd <pid> JFR.start settings=profile filename=continuous.jfr
+jcmd <pid> JFR.stop
+
+# 查看 JFR 事件
+jfr summary recording.jfr
+jfr print --events GC pause recording.jfr
+```
+
+### 火焰图解读要点
+
+| 区域 | 含义 | 优化方向 |
+|------|------|----------|
+| 宽帧 | CPU 热点 | 重点优化 |
+| 深帧 | 调用链深 | 考虑异步化 |
+| 平顶 | CPU 密集 | 算法优化 |
+| 碎片帧 | 间接调用 | 减少虚函数/反射 |
+
+## GC 选型决策树
+
+```mermaid
+flowchart TD
+    Q1{停顿要求?}
+    Q1 -->|< 10ms| Q2{堆大小?}
+    Q1 -->|< 200ms| G1[G1 GC]
+    Q1 -->|无要求| PAR[Parallel GC]
+    Q2 -->|> 64GB| ZGC[ZGC]
+    Q2 -->|< 64GB| SHEN[Shenandoah]
+    Q2 -->|JDK 21+| ZGC_GEN[ZGC 分代模式]
+```
+
+| 场景 | 推荐 GC | 理由 |
+|------|---------|------|
+| 后端微服务 | G1 | 平衡停顿与吞吐 |
+| 金融交易 | ZGC | 亚毫秒停顿 |
+| 大数据处理 | Parallel | 高吞吐 |
+| 大堆低延迟 | ZGC/Shenandoah | 并发压缩 |
+| 容器环境 | ZGC | 内存敏感 |
+
 ### 12.5 容器环境 JVM 内存 / CPU 感知陷阱
 
 - **内存陷阱**：JDK 8u191 之前不识 cgroup，读到**宿主机**内存设堆 → 堆远超容器 limit → 被 cgroup OOMKill。务必 JDK 8u191+ 或 11+，且 `-XX:+UseContainerSupport`（默认开）。**正确做法**：`-Xmx` 设为容器内存 limit 的 70%~80%（留堆外 / metaspace / 线程栈 / native 空间）。

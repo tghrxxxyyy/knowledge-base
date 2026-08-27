@@ -1486,4 +1486,210 @@ scrape_configs:
     错误日志：记录所有错误
     审计日志：记录所有操作
 ```
+
+---
+
+## 十八、惰性队列 vs 经典队列
+
+### 18.1 队列类型对比
+
+| 维度 | 经典队列 | 惰性队列（Lazy Queue） |
+|------|---------|----------------------|
+| 存储方式 | 内存优先 | 磁盘优先 |
+| 消息堆积 | 内存压力大 | 支持海量堆积 |
+| 消费速度 | 快（内存读取） | 中（磁盘读取） |
+| 适用场景 | 消费快、堆积少 | 消费慢、堆积多 |
+| 内存占用 | 高 | 低 |
+| 重启恢复 | 快（内存恢复） | 慢（从磁盘加载） |
+
+### 18.2 惰性队列配置
+
+```java
+// 声明惰性队列
+Map<String, Object> args = new HashMap<>();
+args.put("x-queue-mode", "lazy");
+channel.queueDeclare("lazy-queue", true, false, false, args);
+```
+
+---
+
+## 十九、Blocked Connections 与 Consumer Timeout
+
+### 19.1 Blocked Connections
+
+```
+Blocked Connections 原因：
+  ① 内存警报：内存使用超过水位线
+  ② 磁盘警报：磁盘空间不足
+  ③ 消息堆积：队列深度过大
+
+  处理方式：
+    监控 blocked 连接数
+    清理堆积消息
+    扩容节点
+    调整内存/磁盘水位线
+
+  告警配置：
+    blocked_connections > 10 持续 5 分钟
+```
+
+### 19.2 Consumer Timeout
+
+```
+Consumer Timeout 配置：
+  消费者超时时间：默认 30 分钟
+  配置方式：
+    spring.rabbitmq.listener.simple.consumer-timeout=300000
+
+  超时原因：
+    ① 消费逻辑耗时过长
+    ② 消费者卡死（死锁/阻塞）
+    ③ 网络问题
+
+  处理方式：
+    优化消费逻辑
+    增加消费者数量
+    调整超时时间
+    监控消费耗时
+```
+
+---
+
+## 二十、优先级队列
+
+### 20.1 优先级队列配置
+
+```java
+// 声明优先级队列
+Map<String, Object> args = new HashMap<>();
+args.put("x-max-priority", 10);  // 最大优先级 10
+channel.queueDeclare("priority-queue", true, false, false, args);
+
+// 发送带优先级的消息
+AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+    .priority(5)  // 优先级 5
+    .build();
+channel.basicPublish("", "priority-queue", props, message.getBytes());
+```
+
+### 20.2 优先级队列使用场景
+
+| 场景 | 优先级设置 | 说明 |
+|------|-----------|------|
+| 订单处理 | VIP > 普通 | VIP 订单优先处理 |
+| 任务调度 | 紧急 > 普通 | 紧急任务优先执行 |
+| 消息消费 | 高优先级先消费 | 确保重要消息优先处理 |
+
+---
+
+## 二十一、Federation 插件
+
+### 21.1 Federation 架构
+
+```
+Federation 架构：
+  本地 RabbitMQ → Federation → 远程 RabbitMQ
+  
+  工作原理：
+    ① Federation 从上游拉取消息
+    ② 消息投递到下游队列
+    ③ 支持多级 Federation 链
+
+  适用场景：
+    跨数据中心消息同步
+    多集群消息分发
+    灾备切换
+```
+
+### 21.2 Federation 配置
+
+```bash
+# 启用 Federation 插件
+rabbitmq-plugins enable rabbitmq_federation
+
+# 配置 Federation 连接
+rabbitmqctl set_parameter federation-upstream my-upstream \
+  '{"uri":"amqp://remote-host","prefetch-count":1000}'
+```
+
+---
+
+## 二十二、Prometheus 告警规则
+
+### 22.1 告警规则配置
+
+```yaml
+# prometheus-rabbitmq-alerts.yml
+groups:
+  - name: rabbitmq
+    rules:
+      - alert: RabbitMQHighMemory
+        expr: rabbitmq_process_resident_memory_bytes > 1e9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 内存使用过高"
+          
+      - alert: RabbitMQQueueDepth
+        expr: rabbitmq_queue_messages > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 队列深度过大"
+          
+      - alert: RabbitMQConsumerLag
+        expr: rabbitmq_queue_messages_ready > rabbitmq_queue_messages_consumed
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ 消费者延迟过大"
+```
+
+### 22.2 关键告警指标
+
+| 指标 | 阈值 | 说明 |
+|------|------|------|
+| 内存使用 | >80% | 内存压力大 |
+| 磁盘使用 | >80% | 磁盘空间不足 |
+| 队列深度 | >10000 | 消息堆积 |
+| 消费速率 | <生产速率 | 消费延迟 |
+| 连接数 | >1000 | 连接过多 |
+| 通道数 | >10000 | 通道过多 |
+
+---
+
+## 二十三、Stream Queue 深入
+
+### 23.1 Stream Queue 特性
+
+```
+Stream Queue 特性：
+  ① 只追加（Append-only）
+  ② 多消费者同时消费
+  ③ 支持回放
+  ④ 磁盘存储
+  ⑤ 高吞吐（100万+ msg/s）
+
+  vs 经典队列：
+    经典队列：消息消费后删除
+    Stream Queue：消息保留，支持回放
+
+  适用场景：
+    事件溯源
+    日志流
+    审计追踪
+```
+
+### 23.2 Stream Queue 配置
+
+```java
+// 声明 Stream Queue
+Map<String, Object> args = new HashMap<>();
+args.put("x-queue-type", "stream");
+args.put("x-max-length-bytes", 1073741824);  // 1GB
+args.put("x-stream-max-segment-size-bytes", 104857600);  // 100MB
+channel.queueDeclare("stream-queue", true, false, false, args);
 ```

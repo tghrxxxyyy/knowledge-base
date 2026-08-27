@@ -1368,6 +1368,276 @@ func printAny(v interface{}) {
 }
 ```
 
+---
+
+## Go 语言深度实战补充
+
+### GC 调优实战
+
+```go
+// GOGC 控制 GC 频率
+// GOGC=100（默认）：新分配内存达到当前存活内存的 100% 时触发 GC
+// GOGC=200：新分配内存达到 200% 时触发 GC（GC 频率降低，内存使用增加）
+// GOGC=50：新分配内存达到 50% 时触发 GC（GC 频率增加，内存使用减少）
+
+// GOMEMLIMIT 设置内存上限（Go 1.19+）
+// export GOMEMLIMIT=1GiB  // 设置内存上限为 1GB
+// 当内存接近上限时，GC 会更积极地回收
+
+// 查看 GC 统计
+import "runtime/debug"
+
+func printGCStats() {
+    var stats debug.GCStats
+    debug.ReadGCStats(&stats)
+    fmt.Printf("GC次数: %d\n", stats.NumGC)
+    fmt.Printf("暂停总时间: %v\n", stats.PauseTotal)
+    fmt.Printf("最近暂停: %v\n", stats.Pause[0])
+}
+
+// 手动触发 GC（谨慎使用）
+runtime.GC()
+
+// 关闭 GC（仅用于测试）
+debug.SetGCPercent(-1)  // 禁用 GC
+debug.SetMemoryLimit(0)  // 无内存限制
+```
+
+### Goroutine 泄漏检测
+
+```go
+// goroutine 泄漏检测
+func detectGoroutineLeak() {
+    // 方法 1：runtime.NumGoroutine()
+    fmt.Printf("当前 goroutine 数量: %d\n", runtime.NumGoroutine())
+    
+    // 方法 2：pprof 查看 goroutine
+    // import _ "net/http/pprof"
+    // go http.ListenAndServe(":6060", nil)
+    // 访问 http://localhost:6060/debug/pprof/goroutine?debug=1
+}
+
+// 常见 goroutine 泄漏场景
+func leakyFunction() {
+    ch := make(chan int)
+    
+    // 泄漏：goroutine 阻塞，永远无法退出
+    go func() {
+        result := <-ch  // 阻塞等待 channel
+        fmt.Println(result)
+    }()
+    
+    // 如果 ch 没有发送数据，goroutine 会永远阻塞
+}
+
+// 修复：使用 context 取消
+func safeFunction(ctx context.Context) {
+    ch := make(chan int)
+    
+    go func() {
+        select {
+        case result := <-ch:
+            fmt.Println(result)
+        case <-ctx.Done():  // 支持取消
+            return
+        }
+    }()
+}
+```
+
+### Channel 最佳实践
+
+```go
+// 1. 带缓冲的 channel 用于生产者-消费者
+func producerConsumer() {
+    ch := make(chan int, 100)  // 缓冲大小 100
+    
+    // 生产者
+    go func() {
+        for i := 0; i < 1000; i++ {
+            ch <- i
+        }
+        close(ch)
+    }()
+    
+    // 消费者
+    for v := range ch {
+        fmt.Println(v)
+    }
+}
+
+// 2. 用 channel 控制并发数
+func limitConcurrency(urls []string, maxWorkers int) {
+    ch := make(chan struct{}, maxWorkers)
+    var wg sync.WaitGroup
+    
+    for _, url := range urls {
+        wg.Add(1)
+        ch <- struct{}{}  // 获取令牌
+        
+        go func(u string) {
+            defer wg.Done()
+            defer func() { <-ch }()  // 释放令牌
+            
+            // 处理请求
+            http.Get(u)
+        }(url)
+    }
+    
+    wg.Wait()
+}
+
+// 3. 用 channel 实现超时
+func withTimeout(ctx context.Context, timeout time.Duration) (string, error) {
+    ch := make(chan string, 1)
+    
+    go func() {
+        result := slowOperation()
+        ch <- result
+    }()
+    
+    select {
+    case result := <-ch:
+        return result, nil
+    case <-time.After(timeout):
+        return "", errors.New("timeout")
+    case <-ctx.Done():
+        return "", ctx.Err()
+    }
+}
+```
+
+### Context 使用模式
+
+```go
+// 1. 传递请求作用域的值
+type contextKey string
+
+const (
+    requestIDKey contextKey = "requestID"
+    userIDKey    contextKey = "userID"
+)
+
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+    return context.WithValue(ctx, requestIDKey, requestID)
+}
+
+func GetRequestID(ctx context.Context) string {
+    if v, ok := ctx.Value(requestIDKey).(string); ok {
+        return v
+    }
+    return ""
+}
+
+// 2. 超时控制
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+    defer cancel()
+    
+    result, err := fetchData(ctx)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    
+    fmt.Fprintf(w, result)
+}
+
+// 3. 取消传播
+func worker(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            fmt.Println("收到取消信号，退出")
+            return
+        default:
+            doWork()
+        }
+    }
+}
+```
+
+### 接口设计原则
+
+```go
+// 1. 接口应该小而精
+// 好的设计
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+
+// 不好的设计（接口太大）
+type DataProcessor interface {
+    Read(p []byte) (n int, err error)
+    Write(p []byte) (n int, err error)
+    Seek(offset int64, whence int) (int64, error)
+    Close() error
+    Validate() error
+    Transform() error
+}
+
+// 2. 使用组合实现大接口
+type ReadWriteCloser interface {
+    io.Reader
+    io.Writer
+    io.Closer
+}
+
+// 3. 接口断言检查
+var _ io.Reader = (*MyReader)(nil)  // 编译时检查
+```
+
+### 错误处理模式
+
+```go
+// 1. 自定义错误类型
+type NotFoundError struct {
+    Resource string
+    ID       int
+}
+
+func (e *NotFoundError) Error() string {
+    return fmt.Sprintf("%s with ID %d not found", e.Resource, e.ID)
+}
+
+// 2. 错误包装
+func getUser(id int) (*User, error) {
+    user, err := db.GetUser(id)
+    if err != nil {
+        return nil, fmt.Errorf("get user %d: %w", id, err)  // 包装错误
+    }
+    return user, nil
+}
+
+// 3. 错误检查
+func handleUser(id int) {
+    user, err := getUser(id)
+    if err != nil {
+        var notFound *NotFoundError
+        if errors.As(err, &notFound) {
+            // 处理 NotFoundError
+            fmt.Println("用户不存在:", notFound.ID)
+        } else {
+            // 处理其他错误
+            fmt.Println("未知错误:", err)
+        }
+    }
+}
+
+// 4. 多错误聚合
+type MultiError struct {
+    Errors []error
+}
+
+func (e *MultiError) Error() string {
+    var msgs []string
+    for _, err := range e.Errors {
+        msgs = append(msgs, err.Error())
+    }
+    return strings.Join(msgs, "; ")
+}
+```
+
 ## 二十四、Go 测试最佳实践（Table-driven Test/Mock/Testify）
 
 ### 24.1 Table-driven Test
