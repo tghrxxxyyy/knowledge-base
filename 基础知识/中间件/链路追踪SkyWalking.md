@@ -192,6 +192,326 @@ flowchart LR
 
 ---
 
+## 八、SkyWalking 高级特性与生产实践
+
+### 8.1 OAP 集群高级部署
+
+```yaml
+# OAP 集群高级配置（Kubernetes）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skywalking-oap
+  namespace: skywalking
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: skywalking-oap
+  template:
+    metadata:
+      labels:
+        app: skywalking-oap
+    spec:
+      containers:
+      - name: oap
+        image: apache/skywalking-oap-server:10.0.0
+        ports:
+        - containerPort: 11800  # gRPC
+        - containerPort: 12800  # HTTP
+        env:
+        - name: SW_CLUSTER
+          value: "kubernetes"
+        - name: SW_STORAGE
+          value: "elasticsearch"
+        - name: SW_STORAGE_ES_CLUSTER_NODES
+          value: "elasticsearch:9200"
+        - name: SW_STORAGE_ES_INDEX_SHARDS_NUMBER
+          value: "2"
+        - name: SW_STORAGE_ES_INDEX_REPLICAS_NUMBER
+          value: "1"
+        - name: SW_RETENTION
+          value: "30"
+        resources:
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 12800
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 12800
+          initialDelaySeconds: 30
+          periodSeconds: 30
+```
+
+| 集群模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| Standalone | 单节点 | 开发/测试 |
+| Mixed | 混合模式（接收+处理） | 中小规模 |
+| Receiver/Aggregator | 分离模式 | 大规模生产 |
+| Kubernetes | Operator管理 | 云原生环境 |
+
+### 8.2 Trace 分析指标深度
+
+```java
+// 自定义Trace指标收集
+public class CustomTraceMetrics {
+    private final MeterRegistry registry;
+    
+    public void recordTraceMetrics(Trace trace) {
+        // 1. 基础指标
+        registry.timer("trace.duration", 
+            "service", trace.getServiceName(),
+            "endpoint", trace.getEndpoint())
+            .record(trace.getDuration(), TimeUnit.MILLISECONDS);
+        
+        // 2. Span级指标
+        trace.getSpans().forEach(span -> {
+            registry.timer("span.duration",
+                "service", span.getServiceName(),
+                "operation", span.getOperationName(),
+                "status", span.getStatus())
+                .record(span.getDuration(), TimeUnit.MILLISECONDS);
+            
+            // 3. 错误率统计
+            if (span.getStatus() == SpanStatus.ERROR) {
+                registry.counter("span.errors",
+                    "service", span.getServiceName(),
+                    "operation", span.getOperationName())
+                    .increment();
+            }
+        });
+        
+        // 4. 拓扑指标
+        trace.getServiceCalls().forEach(call -> {
+            registry.timer("service.call.duration",
+                "source", call.getSource(),
+                "target", call.getTarget())
+                .record(call.getDuration(), TimeUnit.MILLISECONDS);
+        });
+    }
+}
+```
+
+| 指标维度 | 指标名称 | 说明 | 告警阈值 |
+|----------|----------|------|----------|
+| 服务级 | service_resp_time | 服务响应时间 | P99 > 1s |
+| 服务级 | service_sla | 服务可用性 | < 99% |
+| 端点级 | endpoint_resp_time | 端点响应时间 | P99 > 2s |
+| 实例级 | instance_jvm_gc_time | GC时间 | > 1s |
+| 拓扑级 | service_call_duration | 服务调用延迟 | P99 > 500ms |
+
+### 8.3 告警规则高级配置
+
+```yaml
+# 高级告警规则配置
+rules:
+  # 多条件联合告警
+  - name: service_anomaly_rule
+    metrics-name: service_resp_time
+    op: ">"
+    threshold: 1000
+    period: 5
+    count: 3
+    message: "服务 {name} 响应时间异常"
+    
+  # 基于基线的动态阈值
+  - name: service_baseline_rule
+    metrics-name: service_resp_time
+    op: ">"
+    threshold: 1.5  # 超过基线1.5倍
+    period: 10
+    count: 2
+    message: "服务 {name} 响应时间超过基线"
+    
+  # 多指标关联告警
+  - name: service_degradation_rule
+    condition: "service_resp_time > 1000 AND service_sla < 95"
+    period: 5
+    count: 2
+    message: "服务 {name} 出现性能降级"
+    
+  # 告警升级策略
+  escalation:
+    - level: warning
+      threshold: 1000
+      duration: 5m
+      notify: ["dingtalk-webhook"]
+    - level: critical
+      threshold: 2000
+      duration: 2m
+      notify: ["dingtalk-webhook", "phone-call"]
+```
+
+| 告警级别 | 条件 | 通知方式 | 响应时间 |
+|----------|------|----------|----------|
+| Info | P99 > 500ms | 邮件 | 24h |
+| Warning | P99 > 1s | 钉钉/企微 | 4h |
+| Critical | P99 > 2s | 电话/短信 | 1h |
+| Fatal | SLA < 90% | 全渠道 | 15min |
+
+### 8.4 日志关联高级实践
+
+```yaml
+# 日志-链路-指标三支柱联动配置
+logging:
+  pattern: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{SW_CTX:-}] [%X{traceId:-}] %msg%n"
+  
+# ELK集成配置
+elk:
+  host: elasticsearch:9200
+  index: skywalking-logs-%{+YYYY.MM.dd}
+  fields:
+    - traceId: "%X{traceId}"
+    - spanId: "%X{spanId}"
+    - service: "${spring.application.name}"
+    - endpoint: "%X{endpoint}"
+    
+# 日志采样策略
+sampling:
+  # 错误日志全量采集
+  error:
+    enabled: true
+    level: ERROR
+  # 慢查询日志采集
+  slow_query:
+    enabled: true
+    threshold: 1000ms
+  # 采样率
+  rate: 0.1  # 10%采样
+```
+
+```mermaid
+flowchart LR
+    A[应用日志] --> B[日志采集器]
+    B --> C{日志类型}
+    C -->|错误日志| D[全量采集]
+    C -->|慢查询| E[阈值采集]
+    C -->|普通日志| F[采样采集]
+    D --> G[ELK/Loki]
+    E --> G
+    F --> G
+    G --> H[链路关联]
+    H --> I[告警联动]
+```
+
+### 8.5 Istio 集成高级配置
+
+```yaml
+# Istio + SkyWalking 高级集成
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: skywalking-tracing
+  namespace: istio-system
+spec:
+  workloadSelector:
+    labels:
+      app: myapp
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+    patch:
+      operation: INSERT
+      value:
+        name: envoy.filters.http.skywalking
+        typed_config:
+          "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+          type_url: type.googleapis.com/envoy.extensions.filters.http.skywalking.v3.SkyWalking
+          value:
+            provider:
+              cluster: skywalking-oap
+              timeout: 5s
+              grpc:
+                envoy_grpc:
+                  cluster_name: skywalking-oap
+                initial_metadata:
+                - key: sw_service_name
+                  value: myapp
+```
+
+| 集成模式 | 说明 | 优缺点 |
+|----------|------|--------|
+| Sidecar注入 | 每个Pod注入Agent | 性能开销，但隔离性好 |
+| 集中式Agent | DaemonSet部署Agent | 性能好，但资源竞争 |
+| Envoy Filter | 通过Envoy扩展 | 灵活，但配置复杂 |
+| 原生SDK | 应用内集成 | 控制精细，但侵入性高 |
+
+### 8.6 Agent 性能开销深度分析
+
+```java
+// Agent性能监控
+public class AgentPerformanceMonitor {
+    private final MeterRegistry registry;
+    private final AtomicLong cpuUsage = new AtomicLong();
+    private final AtomicLong memoryUsage = new AtomicLong();
+    
+    @Scheduled(fixedRate = 1000)
+    public void collectMetrics() {
+        // 1. CPU使用率
+        double cpu = ManagementFactory.getThreadMXBean()
+            .getThreadCpuTime(Thread.currentThread().getId()) / 1e9;
+        registry.gauge("agent.cpu.usage", cpu);
+        
+        // 2. 内存使用
+        long memory = ManagementFactory.getMemoryMXBean()
+            .getHeapMemoryUsage().getUsed() / 1024 / 1024;
+        registry.gauge("agent.memory.usage_mb", memory);
+        
+        // 3. 线程数
+        int threads = Thread.activeCount();
+        registry.gauge("agent.thread.count", threads);
+        
+        // 4. GC压力
+        long gcTime = 0;
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            gcTime += gc.getCollectionTime();
+        }
+        registry.gauge("agent.gc.time_ms", gcTime);
+    }
+}
+```
+
+| 性能指标 | 开销范围 | 优化建议 |
+|----------|----------|----------|
+| CPU | 1~5% | 异步上报，批量发送 |
+| 内存 | 50~200MB | 调整缓冲区大小 |
+| 网络 | <1%带宽 | 采样率调整，压缩传输 |
+| 启动时间 | 100~300ms | 预编译Agent |
+| GC | 轻微 | 减少对象分配 |
+
+### 8.7 生产故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 链路断在异步 | 上下文未传递 | 检查@Async/线程池 | 显式传递Context |
+| 数据上报失败 | Agent版本不兼容 | 检查Agent与OAP版本 | 统一版本 |
+| 存储爆炸 | 采样率过高 | 检查采样配置 | 降低采样率+保留期 |
+| 拓扑图缺失 | 服务未接入 | 检查Agent注入 | 确保所有服务接入 |
+| 告警不触发 | 规则配置错误 | 检查告警规则 | 验证规则语法 |
+| 性能下降 | Agent开销过大 | 性能剖析 | 优化Agent配置 |
+
+> 核心原则：**监控先行，采样适中，存储可控，告警精准，故障可追溯**。
+
 ## 七、与其他板块的关系
 
 - 和「**基础知识/中间件/ELK日志体系**」：链路 + 日志双剑合璧（traceId 关联），排障黄金组合。

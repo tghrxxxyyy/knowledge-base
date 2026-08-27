@@ -1329,4 +1329,103 @@ remote_write:
   CPU：查询 QPS × 查询复杂度
 ```
 
-## 二十二、与其他板块的关系
+## 二十二、VictoriaMetrics 集群架构深度解析
+
+### 组件交互流程
+
+```mermaid
+flowchart TB
+    subgraph 数据写入
+        A[Prometheus/Agent] -->|remote_write| B[vminsert]
+        B -->|按accountID路由| C[vmstorage-1]
+        B -->|按accountID路由| D[vmstorage-2]
+        B -->|按accountID路由| E[vmstorage-3]
+    end
+    subgraph 数据查询
+        F[Grafana/API] --> G[vmselect]
+        G -->|并行查询| C
+        G -->|并行查询| D
+        G -->|并行查询| E
+    end
+    subgraph 数据存储
+        C -->|WAL+Block| H[本地磁盘]
+        D -->|WAL+Block| H
+        E -->|WAL+Block| H
+    end
+```
+
+### 去重策略对比
+
+| 策略 | 配置参数 | 行为 | 适用场景 |
+|------|---------|------|---------|
+| 默认去重 | `-dedup.minScrapeInterval=30s` | 相同时间序列合并 | 多Prometheus写入 |
+| 无去重 | 不设置 | 保留所有数据点 | 调试/精确审计 |
+| 精确去重 | `-dedup.minScrapeInterval=1s` | 高精度合并 | 高频采集 |
+
+```
+去重原理：
+  1. 相同 label 组合 + 时间戳差 < minScrapeInterval
+  2. 保留第一个数据点（或最新，取决于配置）
+  3. 去重发生在查询时，不影响存储
+
+  时间线去重：
+    {job="api",instance="a"} t=100 v=1.0
+    {job="api",instance="a"} t=100 v=1.5  → 保留 v=1.0（先到先得）
+```
+
+### 降采样配置
+
+```yaml
+# 降采样策略（retention配置）
+retentionPeriod:
+  raw: 30d        # 原始数据保留30天
+  5m: 90d         # 5分钟聚合保留90天
+  1h: 365d        # 1小时聚合保留1年
+
+# 降采样原理：
+#   第0-30天：保留所有原始数据点
+#   第31-90天：每5分钟取一个聚合点（avg/max/min）
+#   第91-365天：每1小时取一个聚合点
+#   >365天：数据删除
+```
+
+| 降采样间隔 | 存储节省 | 精度损失 | 适用查询 |
+|-----------|---------|---------|---------|
+| 5m | ~50% | 低 | 实时监控 |
+| 1h | ~95% | 中 | 日/周报表 |
+| 1d | ~99% | 高 | 月/年趋势 |
+
+### 多租户资源配额
+
+| 配额项 | 参数 | 默认值 | 说明 |
+|--------|------|--------|------|
+| 写入QPS | `insert.maxDailyPoints` | 10M/天 | 超限拒绝写入 |
+| 查询并发 | `search.maxConcurrentRequests` | 16 | 超限排队 |
+| 存储空间 | `storage.maxDiskUsagePercent` | 80% | 超限停止接收 |
+| 内存限制 | `memory.allowedPercent` | 60% | OOM保护 |
+
+## 二十三、VM 与 Prometheus + Thanos 选型对比
+
+| 维度 | VictoriaMetrics | Prometheus + Thanos |
+|------|----------------|---------------------|
+| 部署复杂度 | 低（单二进制） | 高（多组件） |
+| 查询性能 | 快（倒排索引） | 中（原始扫描） |
+| 存储效率 | 高（10:1压缩） | 中（Parquet） |
+| 高可用 | 原生集群 | Sidecar+Store |
+| 多租户 | 原生支持 | 需额外开发 |
+| 运维成本 | 低 | 中（组件多） |
+| 社区生态 | 增长中 | 成熟 |
+| 适用规模 | 中小→大型 | 中型 |
+
+```mermaid
+flowchart TD
+    A{规模?} -->|<100K时间序列| B[单机VM]
+    A -->|100K-1M| C{运维能力?}
+    C -->|强| D[Prometheus+Thanos]
+    C -->|弱| E[VM集群]
+    A -->|>1M| F{多租户?}
+    F -->|是| G[VM集群]
+    F -->|否| H[Thanos+多Prometheus]
+```
+
+## 二十四、与其他板块的关系

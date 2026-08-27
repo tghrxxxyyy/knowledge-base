@@ -728,6 +728,436 @@ Nacos 持久化流程：
   - 规则格式需统一（JSON）
 ```
 
+## 十五-2、Sentinel 高级特性与最佳实践
+
+### 15.2.1 LeapArray 滑动窗口调优
+
+```yaml
+# 自定义滑动窗口参数
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        ds1:
+          nacos:
+            data-id: ${spring.application.name}-flow-rules
+            rule-type: flow
+            # 调整窗口大小（默认1s）
+            window-interval-ms: 2000
+            # 调整桶数（默认2）
+            sample-count: 4
+```
+
+| 参数 | 默认值 | 调优建议 | 影响 |
+|------|--------|----------|------|
+| windowIntervalMs | 1000ms | 高并发场景可增至2000ms | 统计更平滑，但响应变慢 |
+| sampleCount | 2 | 增加到4~8 | 统计更精确，内存略增 |
+| 桶粒度 | 500ms | =windowIntervalMs/sampleCount | 影响统计精度 |
+
+```
+LeapArray 性能优化：
+  1. 使用 ThreadLocal 缓存当前桶（避免重复计算）
+  2. CAS 更新计数器（无锁设计）
+  3. 异步清理过期桶（减少锁竞争）
+  4. 监控桶重置频率（过高说明窗口太小）
+```
+
+### 15.2.2 热点参数限流高级配置
+
+```java
+// 热点参数限流高级配置
+ParamFlowRule rule = new ParamFlowRule("queryResource")
+    .setParamIdx(0)
+    .setGrade(RuleConstant.FLOW_GRADE_QPS)
+    .setCount(100)
+    .setDurationSec(10)  // 统计窗口（秒）
+    .setParamFlowItemList(Arrays.asList(
+        // 特定参数值配置
+        new ParamFlowItem()
+            .setObject("user_123")
+            .setClassType(String.class.getName())
+            .setCount(50)
+            .setDurationSec(10),
+        // 参数值模式匹配
+        new ParamFlowItem()
+            .setObject("vip_*")
+            .setClassType(String.class.getName())
+            .setCount(200)
+            .setDurationSec(10)
+    ));
+```
+
+```mermaid
+graph TD
+    A[请求进入] --> B{提取参数值}
+    B --> C{参数值匹配规则?}
+    C -->|是| D[使用特定阈值]
+    C -->|否| E[使用默认阈值]
+    D --> F{超过阈值?}
+    E --> F
+    F -->|是| G[拒绝请求]
+    F -->|否| H[放行请求]
+```
+
+| 高级特性 | 说明 | 配置示例 |
+|----------|------|----------|
+| 参数值模式匹配 | 支持通配符 * 和正则 | `vip_*` |
+| 统计窗口调整 | 默认10秒，可自定义 | `durationSec=30` |
+| 参数类型转换 | 支持String/int/long等 | `classType=int.class.getName()` |
+| 热点参数降级 | 超阈值后返回默认值 | `fallback="defaultHandler"` |
+
+### 15.2.3 系统自适应保护高级配置
+
+```java
+// 系统自适应保护高级配置
+SystemRule rule = new SystemRule();
+rule.setHighestSystemLoad(3.0);
+rule.setHighestCpuUsage(0.8);
+rule.setAvgRt(200);
+rule.setMaxRt(1000);
+rule.setMaxThread(100);
+rule.setQps(1000);
+// 新增：网络流量保护
+rule.setHighestNetworkFlow(1024 * 1024); // 1MB/s
+// 新增：内存使用率保护
+rule.setHighestMemoryUsage(0.85); // 85%
+```
+
+```yaml
+# 系统指标采集配置
+management:
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: prometheus,health,info
+  health:
+    diskspace:
+      enabled: true
+      threshold: 1GB
+```
+
+| 系统指标 | 采集方式 | 阈值建议 | 联动策略 |
+|----------|----------|----------|----------|
+| CPU使用率 | /proc/stat | 0.7~0.85 | 动态降低QPS |
+| 系统负载 | /proc/loadavg | CPU核数×2 | 动态降低QPS |
+| 内存使用率 | /proc/meminfo | 0.8~0.9 | 触发GC或降级 |
+| 网络流量 | /proc/net/dev | 带宽×0.8 | 限流+告警 |
+| 磁盘IO | /proc/diskstats | IOPS×0.7 | 降级+告警 |
+
+### 15.2.4 OpenTelemetry 联动深度集成
+
+```yaml
+# OTel Collector 配置（完整版）
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    send_batch_size: 1000
+    timeout: 5s
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  jaeger:
+    endpoint: jaeger:14250
+  logging:
+    loglevel: debug
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch, memory_limiter]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [batch, memory_limiter]
+      exporters: [jaeger]
+```
+
+```java
+// 自定义 Span 属性
+public class SentinelOtelInterceptor {
+    public void intercept(Span span, BlockException ex) {
+        span.setAttribute("sentinel.blocked", true);
+        span.setAttribute("sentinel.exception", ex.getClass().getSimpleName());
+        span.setAttribute("sentinel.rule.type", getRuleType(ex));
+        span.setAttribute("sentinel.threshold", getThreshold(ex));
+    }
+}
+```
+
+| OTel指标 | 类型 | 说明 | 告警阈值 |
+|----------|------|------|----------|
+| sentinel_block_total | Counter | 被拒绝请求总数 | >100/min |
+| sentinel_pass_total | Counter | 通过请求总数 | 监控趋势 |
+| sentinel_exception_total | Counter | 异常总数 | >10/min |
+| sentinel_thread_count | Gauge | 当前线程数 | >80%线程池 |
+| sentinel_rt | Histogram | 响应时间分布 | P99>1s |
+
+### 15.2.5 集群流控生产部署
+
+```yaml
+# Token Server 部署配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-token-server
+spec:
+  replicas: 3  # 高可用部署
+  template:
+    spec:
+      containers:
+      - name: token-server
+        image: sentinel/token-server:1.8.6
+        ports:
+        - containerPort: 8719
+        env:
+        - name: SENTINEL_CLUSTER_SERVER_PORT
+          value: "8719"
+        - name: SENTINEL_CLUSTER_REQUEST_TIMEOUT
+          value: "2000"
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+```
+
+```java
+// 集群流控客户端配置
+ClusterClientConfig clientConfig = new ClusterClientConfig();
+clientConfig.setServerAddr("token-server:8719");
+clientConfig.setRequestTimeout(2000);
+clientConfig.setLoadBalanceType(LoadBalanceType.ROUND_ROBIN);
+
+ClusterFlowRule rule = new ClusterFlowRule("cluster-resource")
+    .setClusterMode(ClusterFlowRule.CLUSTER_MODE_FIXED)
+    .setFlowId(1001)
+    .setGrade(RuleConstant.FLOW_GRADE_QPS)
+    .setCount(1000)
+    .setSampleCount(10)
+    .setIntervalMs(1000);
+```
+
+| 集群模式 | 说明 | 适用场景 | 优缺点 |
+|----------|------|----------|--------|
+| FIXED | 固定阈值 | 稳定流量 | 简单，但不灵活 |
+| DYNAMIC | 动态调整 | 波动流量 | 复杂，但自适应 |
+| LINKED | 联动限流 | 多服务联动 | 最灵活，实现复杂 |
+
+### 15.2.6 规则持久化高级方案
+
+```java
+// 混合持久化方案（Nacos + DB）
+@Component
+public class HybridRulePersistence {
+    @Autowired
+    private NacosConfigCenter nacosConfigCenter;
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    public void persistRules(String app, List<FlowRule> rules) {
+        // 1. 写入DB（持久化）
+        String sql = "INSERT INTO sentinel_flow_rules (app_name, rules_json) VALUES (?, ?)";
+        jdbcTemplate.update(sql, app, JSON.toJSONString(rules));
+        
+        // 2. 推送到Nacos（动态生效）
+        nacosConfigCenter.publish(
+            app + "-flow-rules",
+            "SENTINEL_GROUP",
+            JSON.toJSONString(rules)
+        );
+    }
+}
+```
+
+```sql
+-- 规则版本管理表
+CREATE TABLE sentinel_rule_versions (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    app_name VARCHAR(100) NOT NULL,
+    rule_type VARCHAR(20) NOT NULL,
+    rules_json TEXT NOT NULL,
+    version INT NOT NULL,
+    created_by VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_app_type (app_name, rule_type)
+);
+```
+
+### 15.2.7 Block 日志分析高级实践
+
+```java
+// Block 日志实时分析
+@Component
+public class BlockLogAnalyzer {
+    @Scheduled(fixedRate = 60000)  // 每分钟分析一次
+    public void analyzeBlockLogs() {
+        List<BlockLogEntry> logs = readBlockLogs();
+        
+        // 1. 按资源分组统计
+        Map<String, Long> resourceStats = logs.stream()
+            .collect(Collectors.groupingBy(
+                BlockLogEntry::getResource,
+                Collectors.counting()));
+        
+        // 2. 按异常类型分组
+        Map<String, Long> exceptionStats = logs.stream()
+            .collect(Collectors.groupingBy(
+                BlockLogEntry::getExceptionType,
+                Collectors.counting()));
+        
+        // 3. 分析限流原因
+        logs.stream()
+            .filter(l -> "FlowException".equals(l.getExceptionType()))
+            .forEach(this::analyzeFlowException);
+        
+        // 4. 生成告警
+        if (resourceStats.values().stream().anyMatch(count -> count > 100)) {
+            alertService.send("Sentinel限流告警", resourceStats);
+        }
+    }
+    
+    private void analyzeFlowException(BlockLogEntry log) {
+        double currentQps = log.getCurrentQps();
+        double limitQps = log.getLimitQps();
+        
+        if (currentQps > limitQps * 2) {
+            log.warn("严重超限: 资源={}, 当前QPS={}, 限制QPS={}",
+                log.getResource(), currentQps, limitQps);
+        } else if (currentQps > limitQps * 1.5) {
+            log.info("轻度超限: 资源={}, 当前QPS={}, 限制QPS={}",
+                log.getResource(), currentQps, limitQps);
+        }
+    }
+}
+```
+
+| 日志字段 | 说明 | 分析维度 |
+|----------|------|----------|
+| timestamp | 时间戳 | 时间趋势分析 |
+| resource | 资源名 | 资源维度统计 |
+| exceptionType | 异常类型 | 异常分布分析 |
+| origin | 来源 | 调用方分析 |
+| limitQps | 限制QPS | 阈值合理性 |
+| currentQps | 当前QPS | 流量峰值分析 |
+| count | 请求数 | 并发度分析 |
+
+### 15.2.8 性能调优最佳实践
+
+```yaml
+# Sentinel 性能配置
+spring:
+  cloud:
+    sentinel:
+      # 关闭不需要的 Slot
+      filter:
+        enabled: false
+      # 优化统计窗口
+      stat:
+        window-interval-ms: 2000
+        sample-count: 4
+      # 异步统计
+      async:
+        enabled: true
+        thread-pool-size: 4
+```
+
+| 调优项 | 默认值 | 优化值 | 效果 |
+|--------|--------|--------|------|
+| Slot链 | 全部启用 | 按需启用 | 减少开销 |
+| 窗口大小 | 1000ms | 2000ms | 统计更平滑 |
+| 桶数 | 2 | 4 | 统计更精确 |
+| 异步统计 | 关闭 | 开启 | 提升吞吐 |
+| 线程池 | 无 | 4~8线程 | 并发处理 |
+
+### 15.2.9 常见问题与解决方案
+
+| 问题 | 原因 | 解决方案 | 预防措施 |
+|------|------|----------|----------|
+| 误限流 | 阈值设置过低 | 调整阈值+监控 | 压测确定合理阈值 |
+| 熔断不生效 | 规则未持久化 | 配置Nacos持久化 | 规则版本管理 |
+| 性能下降 | Slot链过长 | 精简Slot配置 | 性能测试 |
+| Dashboard无数据 | Agent未连接 | 检查Agent配置 | 健康检查 |
+| 内存溢出 | 统计数据过多 | 调整窗口参数 | 内存监控 |
+| 规则冲突 | 多数据源冲突 | 统一规则源 | 规则优先级 |
+
+### 15.2.10 监控与告警最佳实践
+
+```yaml
+# Prometheus 告警规则（完整版）
+groups:
+  - name: sentinel-alerts
+    rules:
+      - alert: SentinelBlockHigh
+        expr: sum(rate(sentinel_block_total[5m])) by (resource) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sentinel限流告警: {{ $labels.resource }}"
+          description: "资源 {{ $labels.resource }} 限流次数过多"
+      
+      - alert: SentinelExceptionHigh
+        expr: sum(rate(sentinel_exception_total[5m])) by (resource) > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sentinel异常告警: {{ $labels.resource }}"
+          description: "资源 {{ $labels.resource }} 异常率过高"
+      
+      - alert: SentinelRtHigh
+        expr: histogram_quantile(0.99, rate(sentinel_rt_bucket[5m])) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sentinel响应时间告警"
+          description: "P99响应时间超过1秒"
+```
+
+```java
+// 自定义监控指标
+@Component
+public class SentinelMetricsExporter {
+    @Scheduled(fixedRate = 10000)
+    public void exportMetrics() {
+        // 1. 采集限流指标
+        long blockCount = getBlockCount();
+        gauge.set("sentinel.block.count", blockCount);
+        
+        // 2. 采集熔断指标
+        long circuitBreakCount = getCircuitBreakCount();
+        gauge.set("sentinel.circuitbreak.count", circuitBreakCount);
+        
+        // 3. 采集响应时间
+        double avgRt = getAverageRt();
+        gauge.set("sentinel.rt.avg", avgRt);
+        
+        // 4. 采集线程数
+        int threadCount = getThreadCount();
+        gauge.set("sentinel.thread.count", threadCount);
+    }
+}
+```
+
+> 核心原则：**监控先行，规则适中，日志分析，持续优化**。
+
 ## 十五、与其他板块的关系
 
 - 限流原理（令牌桶/漏桶/滑动窗口）见「[场景设计/稳定性三板斧](../../场景设计/稳定性三板斧：限流-熔断-降级.md)」；

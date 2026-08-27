@@ -536,6 +536,496 @@ spec:
 - [ ] 可视化用 Stage View / Graph View，勿再依赖即将弃用的 Blue Ocean。
 - [ ] `post` 统一清理 `cleanWs()` + 通知，保障 Agent 不残留。
 
+## 二十七、Jenkins Pipeline 高级实践与故障排查
+
+### 27.1 共享库高级开发
+
+```groovy
+// vars/parallelBuild.groovy - 高级并行构建
+def call(Map config = [:]) {
+    def modules = config.modules ?: ['backend', 'frontend']
+    def parallelStages = [:]
+    
+    modules.each { module ->
+        parallelStages["Build ${module}"] = {
+            stage("Build ${module}") {
+                sh "mvn clean package -pl ${module}"
+            }
+        }
+    }
+    
+    parallel parallelStages
+}
+
+// vars/dockerPipeline.groovy - 完整Docker流水线
+def call(Map config = [:]) {
+    def image = config.image ?: error("image required")
+    def registry = config.registry ?: "registry.example.com"
+    
+    pipeline {
+        agent any
+        stages {
+            stage('Build') {
+                steps {
+                    sh "docker build -t ${registry}/${image}:${env.BUILD_NUMBER} ."
+                }
+            }
+            stage('Push') {
+                steps {
+                    withCredentials([usernamePassword(credentialsId: 'docker-creds', 
+                        usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                        sh "echo $PASS | docker login ${registry} -u $USER --password-stdin"
+                        sh "docker push ${registry}/${image}:${env.BUILD_NUMBER}"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+| 共享库最佳实践 | 说明 | 收益 |
+|----------------|------|------|
+| 版本锁定 | `@Library('lib@v1.2.3')` | 避免漂移 |
+| 单元测试 | JenkinsPipelineUnit框架 | 质量保障 |
+| 沙箱友好 | 避免危险Groovy调用 | 安全性 |
+| 文档化 | vars/目录函数文档 | 可维护性 |
+
+### 27.2 错误处理高级模式
+
+```groovy
+// 高级错误处理模式
+pipeline {
+    agent any
+    stages {
+        stage('Deploy') {
+            steps {
+                script {
+                    // 1. 条件重试
+                    retry(3) {
+                        sh './deploy.sh'
+                    }
+                    
+                    // 2. 超时控制
+                    timeout(time: 30, unit: 'MINUTES') {
+                        sh './health-check.sh'
+                    }
+                    
+                    // 3. 异常捕获与恢复
+                    try {
+                        sh './risky-operation.sh'
+                    } catch (Exception e) {
+                        echo "Operation failed: ${e.message}"
+                        currentBuild.result = 'UNSTABLE'
+                        // 发送告警但不中断流水线
+                        notifySlack channel: '#ci-alerts', 
+                                   message: "⚠️ 非关键操作失败: ${e.message}"
+                    }
+                    
+                    // 4. 成本感知的重试
+                    def maxRetries = 3
+                    def attempt = 0
+                    while (attempt < maxRetries) {
+                        try {
+                            sh './flaky-command.sh'
+                            break
+                        } catch (Exception e) {
+                            attempt++
+                            if (attempt >= maxRetries) {
+                                throw e
+                            }
+                            sleep(time: attempt * 10, unit: 'SECONDS')
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 5. 并行阶段错误隔离
+        stage('Parallel Tests') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh 'mvn test -pl unit'
+                        }
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh 'mvn test -pl integration'
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+| 错误处理策略 | 适用场景 | 实现方式 |
+|--------------|----------|----------|
+| 条件重试 | 网络抖动 | `retry(N) { ... }` |
+| 超时控制 | 长时间任务 | `timeout(time: N) { ... }` |
+| 异常捕获 | 非关键操作 | `try-catch` + `currentBuild.result` |
+| 成本感知重试 | 资源敏感操作 | `while` + `sleep` |
+| 错误隔离 | 并行测试 | `catchError(buildResult: 'UNSTABLE')` |
+
+### 27.3 凭证管理高级实践
+
+```groovy
+// 凭据管理高级模式
+pipeline {
+    agent any
+    environment {
+        // 1. 动态凭据选择
+        CREDS = credentials("${params.ENV}-docker-creds")
+        
+        // 2. 凭据作用域控制
+        GLOBAL_CREDS = credentials('global-api-key')
+    }
+    stages {
+        stage('Deploy') {
+            steps {
+                script {
+                    // 3. 凭据安全使用
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: "${params.ENV}-db-creds",
+                            usernameVariable: 'DB_USER',
+                            passwordVariable: 'DB_PASS'
+                        ),
+                        file(
+                            credentialsId: "${params.ENV}-kubeconfig",
+                            variable: 'KUBECONFIG'
+                        )
+                    ]) {
+                        // 4. 凭据验证
+                        sh '''
+                            echo "Validating credentials..."
+                            mysql -u$DB_USER -p$DB_PASS -e "SELECT 1" || exit 1
+                            kubectl --kubeconfig=$KUBECONFIG get pods || exit 1
+                        '''
+                        
+                        // 5. 业务操作
+                        sh './deploy.sh'
+                    }
+                    // 离开withCredentials块后，凭据变量失效
+                }
+            }
+        }
+        
+        stage('Rotate Credentials') {
+            when {
+                branch 'main'
+                expression { return params.ROTATE_CREDS }
+            }
+            steps {
+                // 6. 凭据轮换
+                withCredentials([string(credentialsId: 'admin-token', variable: 'TOKEN')]) {
+                    sh '''
+                        # 轮换数据库密码
+                        NEW_PASS=$(openssl rand -base64 32)
+                        curl -H "Authorization: Bearer $TOKEN" \
+                             -X POST https://vault.example.com/v1/secret/data/db \
+                             -d '{"data": {"password": "'$NEW_PASS'"}}'
+                    '''
+                }
+            }
+        }
+    }
+}
+```
+
+| 凭据安全措施 | 说明 | 最佳实践 |
+|--------------|------|----------|
+| 最小权限 | 只授予必要权限 | 按环境/项目隔离 |
+| 定期轮换 | 自动更换凭证 | 集成Vault/Secrets Manager |
+| 审计日志 | 记录使用情况 | 集成SIEM系统 |
+| 加密存储 | Jenkins内置加密 | 避免明文存储 |
+| 作用域控制 | 限制可见范围 | `withCredentials` 块内使用 |
+
+### 27.4 Pipeline 测试高级策略
+
+```groovy
+// Pipeline 单元测试
+import com.lesfurets.jenkins.unit.BasePipelineTest
+import org.junit.Before
+import org.junit.Test
+import static org.junit.Assert.*
+
+class AdvancedPipelineTest extends BasePipelineTest {
+    @Override
+    @Before
+    void setUp() throws Exception {
+        super.setUp()
+        
+        // Mock 外部依赖
+        helper.registerAllowedMethod("sh", [String.class], { cmd ->
+            echo "Mock: ${cmd}"
+            return "mock output"
+        })
+        
+        helper.registerAllowedMethod("withCredentials", [List.class, Closure.class], { creds, body ->
+            // Mock 凭据注入
+            env[creds[0].variable] = "mock-value"
+            body()
+        })
+    }
+    
+    @Test
+    void testDeployPipeline() {
+        // 1. 加载流水线
+        def pipeline = loadScript("Jenkinsfile")
+        
+        // 2. 设置环境变量
+        env.BRANCH_NAME = 'main'
+        env.BUILD_NUMBER = '123'
+        
+        // 3. 执行流水线
+        pipeline.call()
+        
+        // 4. 验证结果
+        assertJobStatusSuccess()
+        
+        // 5. 验证stage执行
+        assertCallStackContains("sh", "mvn clean package")
+        assertCallStackContains("sh", "docker build")
+    }
+    
+    @Test
+    void testErrorHandling() {
+        // 测试错误处理逻辑
+        helper.registerAllowedMethod("sh", [String.class], { cmd ->
+            if (cmd.contains("fail")) {
+                throw new RuntimeException("Simulated failure")
+            }
+            return "success"
+        })
+        
+        def pipeline = loadScript("Jenkinsfile")
+        pipeline.call()
+        
+        // 验证错误处理
+        assertCallStackContains("echo", "Operation failed")
+    }
+}
+```
+
+| 测试类型 | 工具 | 覆盖范围 |
+|----------|------|----------|
+| 单元测试 | JenkinsPipelineUnit | Groovy逻辑、共享库函数 |
+| 集成测试 | Jenkins Test Framework | 完整流水线执行 |
+| 端到端测试 | Selenium + Jenkins | Web UI、用户交互 |
+| 性能测试 | JMeter + Jenkins | 构建性能、资源使用 |
+| 安全测试 | OWASP ZAP + Jenkins | 安全漏洞、凭据泄露 |
+
+### 27.5 Pipeline 优化高级策略
+
+```groovy
+// 高级优化策略
+pipeline {
+    agent any
+    stages {
+        // 1. 智能缓存
+        stage('Build') {
+            steps {
+                script {
+                    // 基于依赖变化决定是否缓存
+                    def depsChanged = sh(script: 'git diff --name-only HEAD~1 | grep -E "pom.xml|package.json"', 
+                                        returnStdout: true).trim()
+                    
+                    if (!depsChanged) {
+                        echo "No dependency changes, using cache"
+                        sh 'mvn clean package -DskipTests -o'  // 离线模式
+                    } else {
+                        sh 'mvn clean package -DskipTests'
+                    }
+                }
+            }
+        }
+        
+        // 2. 增量构建
+        stage('Incremental Build') {
+            steps {
+                script {
+                    def changed = sh(script: 'git diff --name-only HEAD~1', 
+                                    returnStdout: true).trim().split('\n')
+                    
+                    def modules = changed.collect { it.split('/')[0] }.unique()
+                    
+                    modules.each { module ->
+                        if (fileExists("${module}/pom.xml")) {
+                            sh "mvn clean package -pl ${module}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 3. 并行优化
+        stage('Parallel Optimization') {
+            parallel {
+                stage('Build Backend') {
+                    steps {
+                        sh 'mvn clean package -pl backend -T 4'  // 4线程并行
+                    }
+                }
+                stage('Build Frontend') {
+                    steps {
+                        sh 'npm ci && npm run build'
+                    }
+                }
+            }
+        }
+        
+        // 4. 资源感知调度
+        stage('Resource Aware') {
+            agent { label 'high-memory' }
+            steps {
+                sh './memory-intensive-task.sh'
+            }
+        }
+    }
+}
+```
+
+| 优化策略 | 实现方式 | 预期效果 |
+|----------|----------|----------|
+| 智能缓存 | 基于依赖变化决策 | 构建时间减少30-50% |
+| 增量构建 | 只构建变更模块 | 构建时间减少50-70% |
+| 并行优化 | 多线程/多模块并行 | 构建时间减少40-60% |
+| 资源感知 | 按需求选择Agent | 资源利用率提升 |
+| 浅克隆 | `git clone --depth 1` | 拉取时间减少50-80% |
+
+### 27.6 Docker Pipeline 高级实践
+
+```groovy
+// Docker 高级实践
+pipeline {
+    agent any
+    environment {
+        REGISTRY = 'registry.example.com'
+        IMAGE = "${REGISTRY}/myapp"
+    }
+    stages {
+        // 1. 多阶段构建
+        stage('Multi-Stage Build') {
+            steps {
+                script {
+                    // 构建阶段
+                    docker.build("${IMAGE}:build", '--target builder -f Dockerfile .')
+                    
+                    // 运行阶段
+                    docker.build("${IMAGE}:${env.BUILD_NUMBER}", '--target runtime -f Dockerfile .')
+                }
+            }
+        }
+        
+        // 2. 安全扫描
+        stage('Security Scan') {
+            steps {
+                script {
+                    def image = docker.image("${IMAGE}:${env.BUILD_NUMBER}")
+                    image.withRun {
+                        sh "trivy image --severity HIGH,CRITICAL ${IMAGE}:${env.BUILD_NUMBER}"
+                    }
+                }
+            }
+        }
+        
+        // 3. 推送多标签
+        stage('Push Tags') {
+            steps {
+                script {
+                    def image = docker.image("${IMAGE}:${env.BUILD_NUMBER}")
+                    image.push()
+                    image.push('latest')
+                    image.push('v${env.BUILD_NUMBER}')
+                }
+            }
+        }
+        
+        // 4. 清理本地镜像
+        stage('Cleanup') {
+            steps {
+                sh "docker rmi ${IMAGE}:${env.BUILD_NUMBER} || true"
+            }
+        }
+    }
+}
+```
+
+| Docker实践 | 说明 | 收益 |
+|------------|------|------|
+| 多阶段构建 | 分离构建和运行环境 | 镜像体积减小60-80% |
+| 安全扫描 | 漏洞检测 | 安全风险降低 |
+| 多标签推送 | 版本管理 | 部署灵活性 |
+| 镜像清理 | 释放磁盘空间 | 资源优化 |
+| 缓存优化 | `--cache-from` | 构建时间减少30-50% |
+
+### 27.7 Pipeline 故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 构建失败 | 依赖缺失 | 检查依赖版本 | 锁定依赖版本 |
+| 凭据错误 | 权限不足 | 检查凭据配置 | 最小权限原则 |
+| 超时 | 任务过长 | 分析任务耗时 | 优化或拆分任务 |
+| Agent不可用 | 资源不足 | 检查Agent状态 | 扩容或优化调度 |
+| 共享库加载失败 | 版本不兼容 | 检查库版本 | 锁定版本号 |
+| Docker构建失败 | 镜像拉取慢 | 检查网络/缓存 | 配置镜像缓存 |
+| 并行阶段冲突 | 资源竞争 | 分析资源使用 | 资源隔离/调度优化 |
+
+### 27.8 Pipeline 监控与度量
+
+```yaml
+# Pipeline 监控配置
+monitoring:
+  # 1. 构建指标
+  metrics:
+    - build_duration
+    - build_success_rate
+    - stage_duration
+    - queue_time
+  
+  # 2. 告警规则
+  alerts:
+    - name: build_failure_rate_high
+      condition: build_success_rate < 0.9
+      duration: 1h
+      severity: warning
+    
+    - name: build_duration_long
+      condition: build_duration > 30m
+      duration: 30m
+      severity: info
+  
+  # 3. 仪表盘
+  dashboards:
+    - name: Jenkins Pipeline Overview
+      panels:
+        - title: Build Success Rate
+          type: graph
+          targets:
+            - expr: jenkins_builds_success_total / jenkins_builds_total
+        
+        - title: Average Build Duration
+          type: graph
+          targets:
+            - expr: rate(jenkins_build_duration_seconds_sum[5m]) / rate(jenkins_build_duration_seconds_count[5m])
+```
+
+| 监控维度 | 指标 | 告警阈值 |
+|----------|------|----------|
+| 构建成功率 | 成功/总构建数 | <90% |
+| 构建耗时 | 平均构建时间 | >30分钟 |
+| 队列等待 | 平均等待时间 | >10分钟 |
+| Agent使用率 | Agent忙碌比例 | >80% |
+| 失败率趋势 | 失败率变化 | 环比增长>10% |
+
+> 核心原则：**测试先行，错误可控，凭据安全，性能优化，监控到位**。
+
 ## 与其他模块的关联
 
 - [04-Jenkins架构与核心机制](04-Jenkins架构与核心机制.md)：本文 `agent{}`、label、K8s Pod 的底层就是 Controller/Agent 架构与 Remoting 通信。

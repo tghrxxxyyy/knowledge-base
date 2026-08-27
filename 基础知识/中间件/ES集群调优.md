@@ -1330,4 +1330,168 @@ Prometheus 告警规则示例：
 
 ---
 
+## 十四、ILM 策略与索引模板实战
+
+### ILM 完整配置示例
+
+```json
+PUT _ilm/policy/es-production-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d",
+            "max_docs": 100000000
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "3d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {},
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+| ILM阶段 | 存储介质 | 分片策略 | 副本数 | 查询性能 | 成本 |
+|---------|---------|---------|--------|---------|------|
+| Hot | NVMe SSD | 多分片(3-5) | 1 | 极高 | 高 |
+| Warm | SATA SSD | 单分片(shrink) | 0-1 | 中 | 中 |
+| Cold | 对象存储 | 单分片 | 0 | 低 | 低 |
+| Delete | - | - | - | 不可查 | 零 |
+
+### 搜索快照（Searchable Snapshots）
+
+```json
+// 从快照恢复为可搜索索引
+POST /_snapshot/my_repository/my_snapshot/_restore
+{
+  "indices": "logs-*",
+  "index_settings": {
+    "index.searchable_s snapshots.frozen": false
+  }
+}
+
+// 挂载快照为只读索引
+POST /_snapshot/my_repository/logs-daily/_mount
+{
+  "index": "logs-2026.01.15",
+  "rewritten_destination_name": "logs-mount-2026.01.15"
+}
+```
+
+| 特性 | 本地索引 | 可搜索快照 | 冷索引 |
+|------|---------|-----------|--------|
+| 存储位置 | 本地磁盘 | 对象存储 | 本地/对象 |
+| 查询延迟 | <100ms | 200-500ms | 1-5s |
+| 成本 | $$$$ | $ | $$ |
+| 缓存 | 无 | 自动缓存热点 | 无 |
+| 适用 | 热数据 | 温数据 | 冷数据 |
+
+## 十五、Doc Values vs Fielddata 深度对比
+
+| 维度 | Doc Values | Fielddata |
+|------|-----------|-----------|
+| 存储时机 | 索引时构建 | 查询时加载 |
+| 存储介质 | 磁盘(列式) | 堆内存 |
+| 内存占用 | 低 | 高(可能OOM) |
+| 适用字段 | keyword/数值/date | text(聚合需开启) |
+| 性能 | 快(磁盘预加载) | 慢(堆GC压力) |
+| 启用方式 | 默认启用 | 需显式mapping |
+
+```json
+// 不要在text字段上开启fielddata
+PUT /my-index/_mapping
+{
+  "properties": {
+    "message": {
+      "type": "text",
+      "fielddata": false  // 显式禁用，防止OOM
+    },
+    "status": {
+      "type": "keyword"  // 自动使用doc_values
+    }
+  }
+}
+```
+
+## 十六、Bulk 操作最佳实践与大小控制
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| bulk大小 | 5-15MB | 过大占用带宽，过小增加请求开销 |
+| 单文档大小 | <100KB | 超大文档单独处理 |
+| 并发bulk数 | CPU核数×1-2 | 避免过度并发 |
+| 重试次数 | 3次 | 指数退避 |
+| 刷新间隔 | 30s-5s | bulk期间可适当放宽 |
+
+```java
+// BulkProcessor 最优配置
+BulkProcessor bulkProcessor = BulkProcessor.builder(
+    client::bulkAsync, new BulkProcessor.Listener() {
+        @Override
+        public void afterBulk(long requestId, BulkResponse response) {
+            if (response.hasFailures()) {
+                log.error("Bulk失败: {}", response.buildFailureMessage());
+            }
+        }
+        @Override
+        public void afterBulk(long requestId, long elapsedMs, BulkResponse response) {
+            log.info("Bulk耗时: {}ms, 索引数: {}", elapsedMs, response.getItems().length);
+        }
+    })
+    .setBulkRequests(5000)           // 单次最大请求数
+    .setBulkSize(10, SizeUnit.MB)    // 单次最大10MB
+    .setFlushInterval(TimeValue.timeValueSeconds(5))
+    .setBackoffPolicy(BackoffPolicy.exponentialBackoff(
+        TimeValue.timeValueMillis(50), 5))
+    .build();
+```
+
+## 十七、线程池监控与调优
+
+### 关键线程池
+
+| 线程池 | 用途 | 告警阈值 | 处理方案 |
+|--------|------|---------|---------|
+| write | 写入/更新 | rejected>0 | 扩容节点 |
+| search | 查询搜索 | rejected>0 | 优化查询/扩容 |
+| get | 文档获取 | rejected>0 | 检查热点 |
+| bulk | 批量操作 | rejected>0 | 降低bulk大小 |
+| merge | 段合并 | rejected>0 | 增加IO |
+| fetch | 查询结果拉取 | rejected>0 | 优化scroll |
+
+```bash
+# 查看线程池状态
+GET /_cat/thread_pool?v&h=node_name,name,active,queue,rejected,completed
+
+# 关键告警规则
+rejected_count > 0 → 检查对应操作
+queue_size > 100 → 排队严重，需扩容
+active > thread_pool_size → 线程池满载
+```
+
 > 一句话：**ES 调优 = 分片（10~30GB/分片，别太多）+ JVM（堆 ≤31GB，留一半给 OS 缓存）+ 查询（filter 替代 query，避免深分页 wildcard）+ 集群（监控 health/水位线/线程池）**。

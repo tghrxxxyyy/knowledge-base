@@ -1347,6 +1347,155 @@ roleRef:
 - [ ] RBAC 最小权限原则
 - [ ] 容器运行时选型考虑安全需求
 
+## Helm Chart 开发最佳实践
+
+### Chart 目录结构
+
+```
+my-chart/
+├── Chart.yaml          # 元数据
+├── values.yaml         # 默认配置
+├── values-dev.yaml     # 开发环境覆盖
+├── values-prod.yaml    # 生产环境覆盖
+├── templates/
+│   ├── _helpers.tpl    # 公共模板
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   ├── hpa.yaml
+│   ├── pdb.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml
+│   └── tests/
+│       └── test-connection.yaml
+└── .helmignore
+```
+
+### helpers.tpl 公共模板
+
+```yaml
+{{/* 公共标签 */}}
+{{- define "my-chart.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end }}
+
+{{/* Selector标签 */}}
+{{- define "my-chart.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+```
+
+### HPA 自动扩缩容
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "my-chart.fullname" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "my-chart.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPU }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemory }}
+```
+
+## Argo CD GitOps 工作流
+
+```mermaid
+flowchart LR
+    A[开发者] -->|git push| B[Git仓库]
+    B -->|webhook| C[Argo CD]
+    C -->|检测变更| D[同步策略]
+    D -->|自动| E[自动部署]
+    D -->|手动| F[人工审批]
+    E --> G[K8s集群]
+    F --> G
+    G --> H[健康检查]
+    H -->|失败| I[自动回滚]
+    H -->|成功| J[部署完成]
+```
+
+| Argo CD配置 | 推荐值 | 说明 |
+|-------------|--------|------|
+| auto-sync | true | 自动同步 |
+| selfHeal | true | 自动修复漂移 |
+| prune | false | 不自动删除资源 |
+| retry | 3次 | 重试次数 |
+| timeout | 5min | 同步超时 |
+
+## 镜像扫描集成
+
+```yaml
+# GitLab CI 镜像扫描
+trivy-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  allow_failure: false
+
+# 扫描结果报告
+trivy-report:
+  stage: security
+  script:
+    - trivy image --format json --output trivy-report.json $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  artifacts:
+    reports:
+      container_scanning: trivy-report.json
+```
+
+## 准入控制（OPA/Gatekeeper）
+
+```yaml
+# 禁止 privileged 容器
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSPPrivilegedContainer
+metadata:
+  name: deny-privileged
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces: ["production"]
+---
+# 强制资源限制
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sContainerLimits
+metadata:
+  name: container-limits
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    cpu: "2"
+    memory: "4Gi"
+```
+
 ## 本篇补充 Checklist
 
 - [ ] 免 daemon 构建用 Kaniko / BuildKit，不挂 docker.sock，secret 用 mount。

@@ -1332,7 +1332,152 @@ delete_worker_pods_on_failure = True
 
 ---
 
-## 九、Airflow 2.x 与 1.x 差异
+## 九、Sensor vs Deferrable 深度对比
+
+| 维度 | Sensor | Deferrable |
+|------|--------|-----------|
+| 资源占用 | 占用Worker槽位 | 不占用Worker |
+| 实现方式 | 轮询等待 | 异步回调 |
+| 资源效率 | 低（持续运行） | 高（按需唤醒） |
+| 适用场景 | 简单条件检查 | 外部系统等待 |
+| Airflow版本 | 1.x+ | 2.2+ |
+| 代码复杂度 | 低 | 中 |
+
+```python
+# Sensor 示例：轮询等待
+class ExternalSensor(BaseSensorOperator):
+    def poke(self, context):
+        # 每 poke_interval 调用一次
+        # 占用 Worker 槽位直到成功
+        return check_external_system()
+
+# Deferrable 示例：异步等待
+class ExternalTaskSensor(BaseSensorOperator):
+    def execute(self, context):
+        # 触发后立即释放 Worker
+        # 外部系统回调触发后续任务
+        yield TriggerEvent({"task_id": "external_task"})
+```
+
+### Variable 加密配置
+
+```python
+from airflow.models import Variable
+from cryptography.fernet import Fernet
+
+# 方式1：Fernet加密（推荐）
+# 在 airflow.cfg 配置：
+# [core]
+# fernet_key = YOUR_FERNET_KEY
+
+# 方式2：Secret Backend（生产推荐）
+# 在 airflow.cfg 配置：
+# [secrets]
+# backend = airflow.providers.hashicorp.secrets.vault.VaultBackend
+# backend_kwargs = {"connections_path": "connections", "variables_path": "variables"}
+
+# 使用示例
+api_key = Variable.get("api_key", deserialize_json=False)
+```
+
+### Pool 资源管理
+
+```python
+# 创建资源池
+from airflow.models import Pool
+
+# 数据库连接池
+Pool(
+    pool_name="db_connections",
+    slots=10,  # 最大并发
+    description="数据库连接池"
+)
+
+# API调用池
+Pool(
+    pool_name="external_api",
+    slots=5,
+    description="外部API调用限流池"
+)
+
+# 在DAG中使用
+with DAG("my_dag") as dag:
+    task = PythonOperator(
+        python_callable=my_func,
+        pool="db_connections",  # 使用指定池
+        pool_slots=1,           # 占用1个槽位
+        task_id="my_task"
+    )
+```
+
+### Trigger Rule 高级用法
+
+| 规则 | 说明 | 适用场景 |
+|------|------|---------|
+| all_success | 所有上游成功（默认） | 正常流程 |
+| all_failed | 所有上游失败 | 错误处理 |
+| all_done | 所有上游完成（不论结果） | 清理任务 |
+| one_success | 至少一个成功 | 备选路径 |
+| one_failed | 至少一个失败 | 告警触发 |
+| none_failed | 无失败即可 | 宽松条件 |
+| none_failed_min_one_success | 至少一个成功且无失败 | 严格条件 |
+
+```python
+with DAG("multi_branch_dag") as dag:
+    # 无论如何都会执行的清理任务
+    cleanup = PythonOperator(
+        python_callable=cleanup_func,
+        trigger_rule="all_done",
+        task_id="cleanup"
+    )
+```
+
+### dbt 集成模式
+
+```python
+# dbt + Airflow 集成
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+
+# 方式1：调用dbt Cloud Job
+dbt_task = DbtCloudRunJobOperator(
+    task_id="dbt_transform",
+    job_id=12345,
+    trigger_rule="all_success"
+)
+
+# 方式2：本地dbt执行
+from airflow.operators.bash import BashOperator
+
+dbt_local = BashOperator(
+    task_id="dbt_run",
+    bash_command="dbt run --models tag:incremental"
+)
+```
+
+## 十、KubernetesExecutor 最佳实践
+
+| 配置项 | 推荐值 | 说明 |
+|--------|--------|------|
+| worker_image | 自定义镜像 | 包含依赖 |
+| worker_queue | 核心队列 | 按业务划分 |
+| worker_resources | cpu=1, memory=2G | 按需调整 |
+| pod_template | 复用模板 | 减少创建开销 |
+| delete_worker_pods | True | 完成后清理 |
+| worker_pods_pending_timeout | 600s | 超时清理 |
+
+```python
+# KubernetesExecutor 配置
+KubernetesExecutor(
+    image="my-airflow-worker:latest",
+    worker_queue="default",
+    worker_resources={"cpu": "1", "memory": "2Gi"},
+    delete_worker_pods=True,
+    delete_worker_pods_on_failure=True,
+    worker_pods_pending_timeout_seconds=600
+)
+```
+
+## 十一、Airflow 2.x 与 1.x 差异
 
 | 维度 | Airflow 1.x | Airflow 2.x |
 |------|-------------|-------------|

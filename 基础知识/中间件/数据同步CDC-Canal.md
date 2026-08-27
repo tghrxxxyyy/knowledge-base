@@ -1346,4 +1346,131 @@ graph LR
     - 冷特征：ClickHouse（分析查询）
 ```
 
-## 二十、与其他板块的关系
+## 二十、Canal vs Debezium vs Maxwell 功能矩阵对比
+
+| 维度 | Canal | Debezium | Maxwell |
+|------|-------|----------|---------|
+| 开发语言 | Java | Java | Java |
+| 数据库支持 | MySQL | MySQL/PG/Mongo/Oracle | MySQL |
+| 输出格式 | Canal Message/Kafka/ES | Kafka/ES/S3 | Kafka/HTTP |
+| HA方案 | ZooKeeper选主 | Kafka Connect集群 | 单节点 |
+| 消息格式 | 自定义 | Connect JSON | JSON |
+| 快照支持 | 全量+增量 | 全量+增量 | 仅增量 |
+| DDL同步 | 支持 | 支持 | 支持 |
+| 数据过滤 | 正则过滤 | SMT转换 | WHERE过滤 |
+| 社区活跃度 | 中(阿里维护) | 高(Apache) | 低 |
+| 运维复杂度 | 中 | 高 | 低 |
+
+```mermaid
+flowchart TD
+    A{选型因素?} -->|纯MySQL| B{需要HA?}
+    B -->|是| C[Canal集群]
+    B -->|否| D[Maxwell]
+    A -->|多数据库| E[Debezium]
+    A -->|简单场景| D
+    A -->|企业级| F{团队能力?}
+    F -->|Java强| C
+    F -->|Kafka生态| E
+```
+
+### HA 选主与故障切换
+
+```
+Canal HA 选主流程（基于ZooKeeper）：
+
+  1. 启动时注册临时节点
+     /canal/cluster/instances/order-replication/owner
+     → 内容为 CanalServer 名称
+
+  2. 所有节点监听 owner 节点
+     - 当前无 owner → 竞争创建
+     - 当前有 owner → 监听删除事件
+
+  3. 主节点故障
+     - 临时节点自动删除
+     - 其他节点竞争创建新 owner
+     - 新 owner 启动实例消费 binlog
+
+  4. 故障恢复
+     - 原主节点恢复后成为从节点
+     - 等待下次 owner 释放再竞争
+```
+
+| 切换场景 | RTO | 数据影响 | 处理方案 |
+|----------|-----|---------|---------|
+| 主节点宕机 | <30s | 无丢失 | ZK自动切换 |
+| 网络分区 | <60s | 可能重复 | 消费端幂等 |
+| Canal进程重启 | <10s | 无丢失 | 从binlog断点续传 |
+| MySQL主从切换 | 手动 | 需重新指向 | 更新连接配置 |
+
+### 消息格式深度对比
+
+| 字段 | Canal格式 | Debezium格式 | Maxwell格式 |
+|------|----------|-------------|------------|
+| 事件类型 | INSERT/UPDATE/DELETE | c/u/d | insert/update/delete |
+| 表信息 | schema+table | database+table | database+table |
+| 字段值 | 原始值 | before+after | data+old |
+| 时间戳 | 执行时间 | connector时间 | 执行时间 |
+| 事务ID | transactionId | txId | xid |
+
+```json
+// Canal 消息格式
+{
+  "data": [{"id": "1", "name": "Alice"}],
+  "database": "test",
+  "es": 1679900000000,
+  "id": 1,
+  "table": "t_user",
+  "type": "INSERT",
+  "ts": 1679900000000,
+  "transaction": false
+}
+
+// Debezium 消息格式
+{
+  "before": null,
+  "after": {"id": 1, "name": "Alice"},
+  "source": {"db": "test", "table": "t_user"},
+  "op": "c",
+  "ts_ms": 1679900000000
+}
+
+// Maxwell 消息格式
+{
+  "database": "test",
+  "table": "t_user",
+  "type": "insert",
+  "ts": 1679900000,
+  "data": {"id": 1, "name": "Alice"},
+  "old": null
+}
+```
+
+## 二十一、生产链路监控与告警
+
+| 监控维度 | 具体指标 | 采集方式 | 告警阈值 |
+|----------|---------|---------|---------|
+| 同步延迟 | binlog消费lag | Canal metrics | >10s |
+| 吞吐量 | events/sec | Canal metrics | 基线±50% |
+| 错误率 | 失败事件数 | 日志统计 | >0 |
+| Kafka堆积 | Consumer lag | Kafka metrics | >10000 |
+| 数据一致性 | 源端vs目标端 | 定时校验 | 差异>0 |
+
+```mermaid
+flowchart TB
+    A[Canal采集] --> B[Kafka缓冲]
+    B --> C[Flink消费]
+    C --> D[Sink写入]
+    A --> E[延迟监控]
+    B --> F[堆积监控]
+    C --> G[吞吐监控]
+    D --> H[一致性监控]
+    E --> I{是否告警?}
+    F --> I
+    G --> I
+    H --> I
+    I -->|是| J[告警通知]
+    I -->|否| K[正常]
+```
+
+## 二十二、与其他板块的关系

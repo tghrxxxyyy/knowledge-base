@@ -1325,7 +1325,141 @@ POST /logs-ds-create/_doc
 }
 ```
 
-## 十三、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
+## 十三、ILM 索引生命周期管理策略
+
+### ILM 阶段配置
+
+```json
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {},
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+| 阶段 | 存储介质 | 副本数 | 分片数 | 查询性能 |
+|------|---------|--------|--------|---------|
+| Hot | SSD | 1 | 3-5 | 极高 |
+| Warm | HDD | 0 | 1 | 中 |
+| Cold | 对象存储 | 0 | 1 | 低 |
+| Delete | - | - | - | 不可查 |
+
+### Index Alias 别名管理
+
+```json
+// 创建别名
+POST _aliases
+{
+  "actions": [
+    { "add": { "index": "logs-2026.01.15", "alias": "logs-write" } },
+    { "add": { "index": "logs-*", "alias": "logs-read" } }
+  ]
+}
+
+// 别名切换（零停机）
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "logs-2026.01.14", "alias": "logs-write" } },
+    { "add": { "index": "logs-2026.01.15", "alias": "logs-write" } }
+  ]
+}
+```
+
+| 别名类型 | 用途 | 示例 |
+|----------|------|------|
+| 写入别名 | 应用写入固定别名 | `logs-write` |
+| 读取别名 | 查询跨多个索引 | `logs-read` |
+| 时间别名 | 按时间范围查询 | `logs-2026.01.*` |
+
+## 十四、副本与分片策略深度解析
+
+### 分片分配策略
+
+| 策略 | 配置 | 行为 | 适用场景 |
+|------|------|------|---------|
+| 轮询 | `round_robin` | 均匀分配 | 通用 |
+| 磁盘水位 | `disk watermark` | 避免热点 | 磁盘不均 |
+| 感知路由 | `aware` | 跨可用区 | 高可用 |
+| 强制感知 | `force_aware` | 必须跨区 | 金融级 |
+
+```
+分片数计算公式：
+  分片数 = 数据量 / 单分片大小(30-50GB)
+  副本数 = 可用区数 - 1（至少1个副本）
+
+  示例：
+    日志量 500GB/天，保留7天 = 3.5TB
+    单分片 50GB → 需 70 个分片
+    3个可用区 → 副本数 = 2
+    总分片 = 70 × (1+2) = 210
+```
+
+### 脚本使用场景
+
+| 场景 | 脚本类型 | 示例 |
+|------|---------|------|
+| 更新字段 | Painless | `ctx._source.views += 1` |
+| 条件更新 | Painless | `if (ctx._source.status == 'new') { ctx._source.status = 'updated' }` |
+| 聚合计算 | Painless | 脚本聚合自定义指标 |
+| 排序 | Painless | 基于计算值排序 |
+
+## 十五、CCR 跨集群复制与灾备
+
+### CCR 架构
+
+```mermaid
+flowchart LR
+    subgraph 主集群
+        A[Primary Cluster] --> B[Index: logs-primary]
+    end
+    subgraph 从集群
+        C[Follower Cluster] --> D[Index: logs-follower]
+    end
+    B -->|Follow| D
+    D -->|拉取变更| B
+```
+
+| 特性 | 主集群 | 从集群 |
+|------|--------|--------|
+| 写入 | 可读写 | 只读 |
+| 查询 | 可查询 | 可查询 |
+| 延迟 | - | 通常<1s |
+| 用途 | 生产写入 | 灾备/读多写少 |
+
+## 十六、生产故障排查 SOP（集群变红 / 脑裂 / 磁盘水位）
 
 - **集群变红（Red）**：`GET _cluster/health` 看 `status=red`（主分片未分配）。排查：`GET _cat/indices?v&health=red` 定位红索引；`GET _cluster/allocation/explain` 看分片未分配原因（最常见：磁盘水位、节点离线、分片数超限）。红通常意味着有主分片丢失、数据可能已损，优先恢复节点而非强制分配（强制分配空分片会丢数据）。
 - **脑裂（Split-Brain）**：两主并存、元数据冲突。成因：网络分区 + `minimum_master_nodes` 配错（7.x 后由奇数节点 + `cluster.initial_master_nodes` 自动仲裁，但仍需节点数为奇数）。SOP：① 确认真正的主（看 `_cat/nodes?v&h=node,node.role,master` 中 `*` 标记）；② 隔离/重启"假主"节点让其重新加入；③ 网络恢复后 `GET _cluster/health` 回到 green；④ 长期：节点数奇数、跨可用区部署 `discovery.seed_hosts`、加 `cluster.fault_detection.*` 调优心跳。

@@ -1323,7 +1323,186 @@ spec:
   □ 告警规则配置
 ```
 
-## 十九、与其他板块的关系
+## 十九、多阶段构建与镜像安全
+
+### 多阶段构建最佳实践
+
+```dockerfile
+# 构建阶段：编译依赖
+FROM maven:3.9-eclipse-temurin-21 AS builder
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:go-offline -B
+COPY src ./src
+RUN mvn package -DskipTests -B
+
+# 运行阶段：最小化镜像
+FROM eclipse-temurin:21-jre-jammy
+RUN groupadd -r app && useradd -r -g app app
+WORKDIR /app
+COPY --from=builder /app/target/*.jar app.jar
+USER app
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+| 构建策略 | 镜像大小 | 构建速度 | 适用场景 |
+|----------|---------|---------|---------|
+| 单阶段 | 大(800MB+) | 快 | 开发环境 |
+| 多阶段 | 小(200MB) | 中 | 生产环境 |
+| distroless | 极小(50MB) | 慢 | 安全敏感 |
+| scratch | 最小(10MB) | 慢 | 纯静态二进制 |
+
+### Pod 生命周期详解
+
+```mermaid
+flowchart TD
+    A[Pod创建] --> B[Init容器执行]
+    B --> C{Init成功?}
+    C -->|否| D[Pod失败]
+    C -->|是| E[主容器启动]
+    E --> F[postStart钩子]
+    F --> G[Readiness探针]
+    G --> H{健康?}
+    H -->|是| I[加入Service端点]
+    H -->|否| J[从Service移除]
+    I --> K[持续运行]
+    K --> L[preStop钩子]
+    L --> M[terminationGracePeriod]
+    M --> N[容器终止]
+```
+
+| 探针类型 | 用途 | 失败后果 | 调用时机 |
+|----------|------|---------|---------|
+| liveness | 检测容器是否存活 | 重启容器 | 周期性 |
+| readiness | 检测是否就绪接收流量 | 从Service移除 | 周期性 |
+| startup | 检测启动是否完成 | 阻止后续探针 | 启动时 |
+
+### Helm Chart 最佳实践
+
+```yaml
+# Chart.yaml 语义化版本
+apiVersion: v2
+name: my-app
+version: 1.2.3        # Chart版本
+appVersion: "2.1.0"   # 应用版本
+
+# values.yaml 分层配置
+replicaCount: 2
+
+image:
+  repository: my-app
+  tag: "2.1.0"
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+```
+
+| Helm实践 | 做法 | 原因 |
+|----------|------|------|
+| helpers.tpl | 提取公共模板 | 减少重复 |
+| values分层 | base/prod/dev | 环境差异 |
+| 资源限制 | 必须设置 | 防止资源争抢 |
+| 副本数 | ≥2+PDB | 高可用 |
+| 更新策略 | maxUnavailable:0 | 零停机 |
+| 健康检查 | 三类探针全配 | 故障自动恢复 |
+
+## 二十、Service 类型与 Ingress 对比
+
+| Service类型 | 用途 | 暴露方式 | 适用场景 |
+|-------------|------|---------|---------|
+| ClusterIP | 集群内部 | Pod IP | 内部服务 |
+| NodePort | 开发测试 | 节点IP:端口 | 临时暴露 |
+| LoadBalancer | 云环境 | 云LB | 生产入口 |
+| ExternalName | DNS别名 | CNAME | 外部服务引用 |
+
+```yaml
+# Service 配置示例
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+  labels:
+    app: my-app
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: my-app
+---
+# Ingress 配置
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  tls:
+    - hosts: [app.example.com]
+      secretName: app-tls
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app
+                port:
+                  number: 80
+```
+
+## 二十一、NetworkPolicy 网络策略
+
+```yaml
+# 默认拒绝所有入站
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# 允许前端访问后端
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8080
+```
+
+## 二十二、与其他板块的关系
 
 ```text
 Docker/K8s ↔ 知识库：
