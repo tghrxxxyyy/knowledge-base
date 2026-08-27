@@ -1512,6 +1512,547 @@ SMT最佳实践：
 
 
 
+## 二十、Debezium Schema Evolution（DDL 变更处理）
+
+### Schema 变更类型与处理
+
+```
+DDL 变更类型：
+  ADD COLUMN：新增列 → 事件结构变化
+  DROP COLUMN：删除列 → 旧数据无该字段
+  MODIFY COLUMN：修改列类型 → 数据格式变化
+  RENAME COLUMN：重命名列 → 字段映射变化
+
+处理策略：
+  兼容模式（默认）：
+    ADD COLUMN → 新字段出现在 after 中
+    DROP COLUMN → 旧数据保留该字段，新数据无
+    MODIFY COLUMN → 保持旧类型，新类型需重启 Connector
+
+  破坏性变更：
+    DROP COLUMN + 有数据 → 需要重启 Connector
+    MODIFY COLUMN 类型不兼容 → 需要重新快照
+```
+
+### Schema Registry 集成
+
+```json
+{
+  "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+  "key.converter": "io.confluent.connect.avro.AvroConverter",
+  "key.converter.schema.registry.url": "http://schema-registry:8081",
+  "value.converter": "io.confluent.connect.avro.AvroConverter",
+  "value.converter.schema.registry.url": "http://schema-registry:8081",
+  "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+  "schema.history.internal.kafka.topic": "schema-changes"
+}
+```
+
+## 二十一、Debezium 大表全量+增量同步最佳实践
+
+### 全量+增量分阶段方案
+
+```
+阶段一：全量快照（Snapshot）
+  1. 创建 Connector（snapshot.mode=initial）
+  2. 增量快照（大表分块，chunk=16384）
+  3. 监控快照进度（JMX 指标）
+  4. 等待快照完成
+
+阶段二：追赶 binlog（Catch-up）
+  1. 监控 Connector lag（源端延迟）
+  2. 等待消费到最新 binlog 位点
+  3. 确认无积压
+
+阶段三：增量同步（Streaming）
+  1. 切换为 snapshot.mode=never
+  2. 正常消费 binlog 变更
+  3. 监控 lag 指标
+```
+
+### 大表同步优化
+
+| 优化项 | 配置 | 效果 |
+|--------|------|------|
+| 增量快照 | incremental.snapshot.enabled=true | 大表不阻塞业务 |
+| 并行读取 | snapshot.max.threads=4 | 加速全量快照 |
+| 读从库 | database.hostname=slave-host | 减少主库压力 |
+| 低峰执行 | 安排在业务低峰期 | 减少 IO 影响 |
+| 监控 lag | 源端延迟告警 | 及时发现问题 |
+
+## 二十二、Debezium vs Maxwell vs Canal 对比矩阵
+
+### 核心差异对比
+
+| 维度 | Debezium | Maxwell | Canal |
+|------|----------|---------|-------|
+| 支持数据库 | 8+（MySQL/PG/Oracle/SQL Server/MongoDB） | 仅 MySQL | 仅 MySQL |
+| 架构 | Kafka Connect | 独立进程 | 独立进程 |
+| 输出 | Kafka（多格式） | JSON（Kafka） | Kafka/数据库/自定义 |
+| 快照能力 | 强（增量快照） | 有 | 有 |
+| Schema 变更 | 支持（自动同步） | 有限 | 支持 |
+| 事件格式 | 标准（before/after/op） | JSON | 自定义 |
+| 运维成本 | 中（Connect） | 低 | 中 |
+| 生态 | Kafka Connect 生态 | 简单 | 阿里生态 |
+| 社区 | Red Hat 主导 | 社区维护 | 阿里主导 |
+| 适用场景 | 多数据库+Kafka | 简单 MySQL+JSON | 纯 MySQL+阿里系 |
+
+### 选型决策
+
+```
+数据库种类？
+  ├── 多种数据库 → Debezium（唯一选择）
+  └── 仅 MySQL
+      ├── 需要 Kafka 生态 → Debezium / Canal
+      ├── 需要简单 JSON → Maxwell
+      ├── 需要实时数仓 SQL → Flink CDC
+      └── 阿里云环境 → Canal / DTS
+```
+
+## 二十三、Debezium 监控（JMX 指标/连接器状态）
+
+### 关键 JMX 指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| debezium_source_connector_lag | 源端延迟（秒） | > 10s |
+| debezium_sink_connector_lag | 目标端延迟（秒） | > 30s |
+| kafka_connect_connector_status | 连接器状态 | FAILED |
+| debezium_snapshot_completed | 快照完成状态 | 未完成 |
+| debezium_event_count | 事件处理量 | 异常波动 |
+| debezium_error_count | 错误数量 | > 0 |
+
+### Prometheus 告警规则
+
+```yaml
+groups:
+  - name: debezium_alerts
+    rules:
+      - alert: DebeziumConnectorDown
+        expr: kafka_connect_connector_status{state="FAILED"} > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Debezium 连接器故障"
+
+      - alert: DebeziumReplicationLag
+        expr: debezium_source_connector_lag > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC 复制延迟过高"
+```
+
+## 二十四、Eventuate Tram 集成（CDC 事务事件）
+
+### Eventuate Tram 架构
+
+```
+Eventuate Tram 核心组件：
+  EventuateTramMessageProducer：消息生产者
+  EventuateTramTransactionalEventListener：消息监听器
+  EventuateTramOutboxTransactionalRepository：Outbox 仓库
+
+工作流程：
+  1. 业务操作
+  2. 保存业务数据
+  3. 保存消息到 Outbox（同一事务）
+  4. 发送消息到消息队列
+  5. 消费者处理消息
+
+优势：
+  事务性：业务操作和消息发送原子性
+  幂等性：消息消费幂等性
+  可靠性：消息不丢失
+```
+
+### Spring 集成代码
+
+```java
+@Service
+public class OrderService {
+    @Autowired
+    private EventuateTramMessageProducerInMemory messageProducer;
+
+    @Transactional
+    public void createOrder(Order order) {
+        orderRepository.save(order);
+        Message message = MessageBuilder
+            .withPayload(new OrderCreatedEvent(order.getId()))
+            .setHeader("aggregateId", order.getId())
+            .build();
+        messageProducer.send("order.events", message);
+    }
+}
+```
+
+## 二十五、SMT 单消息转换（路由/过滤/字段映射）
+
+### SMT 组合实战
+
+```json
+{
+  "transforms": "route,mask,dedupe,timestamp",
+  "transforms.route.type": "io.debezium.transforms.Router",
+  "transforms.route.topic.expression": "cdc.${rdbms}.${database}.${table}",
+  "transforms.mask.type": "io.debezium.transforms.masking.MaskField$Value",
+  "transforms.mask.fields": "card_no,id_card,phone",
+  "transforms.mask.replacement": "******",
+  "transforms.dedupe.type": "io.debezium.transforms.deduplicate.DeduplicateFields$Value",
+  "transforms.dedupe.fields": "id",
+  "transforms.timestamp.type": "org.apache.kafka.connect.transforms.TimestampConverter$Value",
+  "transforms.timestamp.target.type": "Timestamp",
+  "transforms.timestamp.field": "event_time",
+  "transforms.timestamp.format": "yyyy-MM-dd HH:mm:ss"
+}
+```
+
+### SMT 执行顺序最佳实践
+
+| 顺序 | SMT | 理由 |
+|------|-----|------|
+| 1 | TopicRouting | 先路由再处理 |
+| 2 | InsertField | 插入元数据字段 |
+| 3 | RenameField | 统一字段名 |
+| 4 | MaskField | 脱敏（在字段名统一后） |
+| 5 | ExtractNewRecordState | 简化事件 |
+| 6 | TimestampConverter | 时间格式统一 |
+
+## 二十六、MySQL GTID 配置注意事项
+
+### GTID 配置要点
+
+```
+GTID 配置前提：
+  1. 启用 GTID：SET GLOBAL gtid_mode = ON
+  2. 强制一致性：SET GLOBAL enforce_gtid_consistency = ON
+  3. binlog 格式：ROW（必须）
+
+GTID 配置参数：
+  gtid.source.includes：指定 GTID 源
+  gtid.source.excludes：排除 GTID 源
+  snapshot.gtid.mode：启用 GTID 快照
+
+注意事项：
+  1. GTID 不支持 CREATE TABLE ... SELECT（已废弃）
+  2. GTID 不支持事务中混合事务和非事务语句
+  3. GTID 主从切换时需注意位点对齐
+  4. GTID 复制延迟需监控
+```
+
+### GTID 监控
+
+```sql
+-- 查看 GTID 状态
+SHOW MASTER STATUS;
+SHOW VARIABLES LIKE 'gtid_mode';
+
+-- 查看 GTID 执行记录
+SELECT * FROM mysql.gtid_executed;
+
+-- 查看复制状态
+SHOW SLAVE STATUS\G
+```
+
+## 二十七、SQL Server Connector 配置（变更表/最大 LSN）
+
+### SQL Server CDC 配置
+
+```sql
+-- 步骤 1：启用数据库 CDC
+USE mydatabase;
+EXEC sys.sp_cdc_enable_db;
+
+-- 步骤 2：启用表 CDC
+EXEC sys.sp_cdc_enable_table
+    @source_schema = N'dbo',
+    @source_name = N'orders',
+    @role_name = NULL,
+    @supports_net_changes = 1;
+
+-- 步骤 3：查看 CDC 配置
+SELECT name, is_cdc_enabled FROM sys.databases WHERE name = 'mydatabase';
+SELECT name, is_tracked_by_cdc FROM sys.tables WHERE name = 'orders';
+```
+
+### SQL Server Connector 配置示例
+
+```json
+{
+  "name": "sqlserver-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+    "database.hostname": "sqlserver-host",
+    "database.port": "1433",
+    "database.user": "sa",
+    "database.password": "password",
+    "database.names": "mydatabase",
+    "topic.prefix": "sqlserver",
+    "database.encrypt": "false",
+    "snapshot.mode": "initial",
+    "snapshot.isolation.mode": "snapshot",
+    "poll.interval.ms": "500",
+    "max.batch.size": "1024",
+    "tombstones.on.delete": "true",
+    "column.include.list": "dbo\\.orders\\(.+\\)",
+    "table.include.list": "dbo\\.orders,dbo\\.customers"
+  }
+}
+```
+
+## 二十八、MongoDB Connector 配置（Change Stream 集成）
+
+### MongoDB Change Streams 配置
+
+```javascript
+// 步骤 1：创建复制集
+rs.initiate({
+  _id: "myreplicaset",
+  members: [
+    { _id: 0, host: "mongo1:27017" },
+    { _id: 1, host: "mongo2:27017" },
+    { _id: 2, host: "mongo3:27017" }
+  ]
+});
+
+// 步骤 2：创建用户
+use admin;
+db.createUser({
+  user: "debezium",
+  pwd: "password",
+  roles: [
+    { role: "read", db: "admin" },
+    { role: "read", db: "mydatabase" },
+    { role: "clusterMonitor", db: "admin" }
+  ]
+});
+
+// 步骤 3：查询 Change Streams
+db.orders.watch().on("change", (change) => {
+  printjson(change);
+});
+```
+
+### MongoDB Connector 配置
+
+```json
+{
+  "name": "mongodb-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
+    "mongodb.connection.mode": "replica_set",
+    "mongodb.connection.hosts": "mongo1:27017,mongo2:27017,mongo3:27017",
+    "mongodb.user": "debezium",
+    "mongodb.password": "password",
+    "mongodb.database": "mydatabase",
+    "topic.prefix": "mongodb",
+    "collection.include.list": "mydatabase\\.orders\\(.+\\)",
+    "snapshot.mode": "initial",
+    "poll.interval.ms": "1000",
+    "max.batch.size": "1024",
+    "tombstones.on.delete": "true"
+  }
+}
+```
+
+## 二十九、MySQL GTID 模式配置
+
+### GTID 配置示例
+
+```json
+{
+  "name": "mysql-gtid-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql-host",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "password",
+    "database.server.id": "1",
+    "database.server.name": "mysql-gtid",
+    "database.include.list": "mydatabase",
+    "gtid.source.includes": "uuid:1-100",
+    "gtid.source.excludes": "uuid:200-300",
+    "snapshot.mode": "initial",
+    "snapshot.gtid.mode": "true",
+    "binlog.format": "ROW",
+    "binlog.row.image": "FULL",
+    "poll.interval.ms": "500",
+    "max.batch.size": "1024",
+    "tombstones.on.delete": "true"
+  }
+}
+```
+
+### GTID 最佳实践
+
+```
+GTID 最佳实践：
+  1. 启用 GTID：高可用集群必须
+  2. 并行复制：配置并行复制提升性能
+  3. 日志管理：定期清理 binlog
+  4. 监控告警：监控 GTID 延迟
+  5. 故障处理：GTID 冲突重新初始化
+```
+
+## 三十、Debezium 错误处理策略
+
+### 常见错误类型
+
+| 错误类型 | 原因 | 处理 |
+|----------|------|------|
+| 连接失败 | 数据库不可达 | 重试 + 告警 |
+| binlog 位点丢失 | binlog 被清理 | 重新快照 |
+| Schema 变更 | 表结构变化 | 兼容处理 |
+| 数据解析失败 | 数据类型不匹配 | Dead Letter Queue |
+| 磁盘写满 | Kafka 磁盘满 | 扩容/清理 |
+
+### 错误处理配置
+
+```json
+{
+  "errors.log.enable": true,
+  "errors.log.include.messages": true,
+  "errors.tolerance": "all",
+  "errors.deadletterqueue.topic.name": "dlq-debezium",
+  "errors.deadletterqueue.topic.replication.factor": 3,
+  "errors.deadletterqueue.context.headers.enable": true
+}
+```
+
+### 重试策略
+
+```
+Debezium 重试机制：
+  连接重试：exponential backoff（指数退避）
+  Task 重试：Kafka Connect 自动重启
+  消息重试：消费端幂等 + 死信队列
+
+最佳实践：
+  配置 dead-letter queue（死信队列）
+  监控 DLQ 消息数量
+  定期人工处理 DLQ 消息
+```
+
+## 三十一、Debezium 在数据湖入湖
+
+### 入湖架构
+
+```mermaid
+graph LR
+    A[MySQL/PG] -->|CDC| B[Debezium]
+    B --> C[Kafka]
+    C --> D[Flink/Spark]
+    D --> E[数据湖 Delta/Iceberg]
+    D --> F[实时数仓 ClickHouse]
+    D --> G[搜索引擎 ES]
+```
+
+### 入湖配置示例
+
+```python
+# Flink + Delta Lake 入湖
+CREATE TABLE delta_sink (
+  id BIGINT,
+  amount DECIMAL(10,2),
+  ts TIMESTAMP(3)
+) WITH (
+  'connector' = 'delta',
+  'table-path' = 's3://lake/orders'
+);
+
+INSERT INTO delta_sink SELECT * FROM cdc_source;
+```
+
+## 三十二、PostgreSQL WAL 槽管理
+
+### WAL 槽监控
+
+```sql
+-- 查看 slot 状态
+SELECT slot_name, active, restart_lsn, confirmed_flush_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
+FROM pg_replication_slots;
+
+-- 查看 WAL 文件数量
+SELECT count(*) FROM pg_ls_waldir();
+
+-- 查看复制状态
+SELECT * FROM pg_stat_replication;
+```
+
+### WAL 堆积处理
+
+| 场景 | 处理 |
+|------|------|
+| 消费者慢 | 增加消费者并发/优化消费逻辑 |
+| 消费者挂了 | 重启消费者（slot 未丢） |
+| 需要丢弃积压 | 丢弃旧 slot + 重新快照 |
+| 磁盘紧急 | `SELECT pg_drop_replication_slot('slot_name')` |
+
+> **警告**：丢弃 slot 后需重新快照，否则数据不一致。
+
+## 三十三、Debezium 性能调优
+
+### 源端调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `snapshot.chunk.size` | 快照分块大小 | 4096~16384 |
+| `max.batch.size` | 单次批量大小 | 2048 |
+| `poll.interval.ms` | 轮询间隔 | 500 |
+| `snapshot.fetch.size` | 快照读取行数 | 1000 |
+
+### Kafka Connect 调优
+
+| 参数 | 说明 | 建议 |
+|------|------|------|
+| `tasks.max` | 任务数 | 按表数量 |
+| `batch.size` | Kafka 批量大小 | 16384 |
+| `linger.ms` | 发送延迟 | 10~100 |
+| `buffer.memory` | 缓冲区大小 | 32MB |
+
+### 性能基准
+
+| 指标 | 典型值 |
+|------|--------|
+| MySQL binlog 吞吐 | 10~50 万事件/秒 |
+| Kafka 写入吞吐 | 50~100 万事件/秒 |
+| 端到端延迟 | 100ms~1s |
+| 快照速度 | 1~5 万行/秒 |
+
+## 三十四、Debezium 常见问题排查
+
+### 故障恢复流程
+
+```mermaid
+flowchart TD
+    A[发现故障] --> B{故障类型}
+    B -->|连接失败| C[检查网络/认证]
+    B -->|位点丢失| D[重新快照]
+    B -->|内存溢出| E[调整配置]
+    C --> F[重启 Connector]
+    D --> F
+    E --> F
+    F --> G[验证数据一致性]
+    G --> H{恢复成功?}
+    H -->|是| I[记录故障报告]
+    H -->|否| J[升级处理]
+```
+
+### 问题排查清单
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| binlog 位点丢失 | binlog 被清理 | 重新做快照 |
+| 内存溢出 | 快照数据量过大 | 启用增量快照 |
+| 连接超时 | 网络/防火墙 | 检查网络和端口 |
+| 表结构不一致 | DDL 变更 | 重启 connector |
+| 数据重复 | 位点回退 | 检查位点提交逻辑 |
+| 高延迟 | 消费能力不足 | 增加 task 数量 |
+
 - Canal 对比见「[数据同步 CDC（Canal）](./数据同步CDC-Canal.md)」；
 - Kafka（事件落点）见「[Kafka](./Kafka.md)」；
 - Flink（实时数仓消费 CDC）见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；

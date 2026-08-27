@@ -1502,6 +1502,367 @@ spec:
         - port: 8080
 ```
 
+## Docker 多阶段构建缓存优化
+
+### 缓存优化策略
+
+```dockerfile
+# 优化1：利用构建缓存
+FROM node:18-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --only=production
+
+# 优化2：分层构建
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# 优化3：生产镜像
+FROM node:18-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=deps /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+```
+
+### 缓存优化原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 依赖缓存 | 先复制依赖文件 | package.json |
+| 变更隔离 | 频繁变更的放后面 | 源代码 |
+| 多阶段构建 | 构建与运行分离 | builder + runner |
+| 选择性复制 | 只复制必要文件 | COPY --from |
+
+## K8s Pod 生命周期
+
+### Pod 生命周期阶段
+
+```
+Pod 生命周期：
+  Pending：等待调度
+  Running：容器运行中
+  Succeeded：正常退出
+  Failed：异常退出
+  Unknown：状态未知
+
+容器生命周期：
+  Waiting：等待启动
+  Running：运行中
+  Terminating：终止中
+```
+
+### Init Container
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+spec:
+  initContainers:
+    - name: init-db
+      image: busybox
+      command: ['sh', '-c', 'until nslookup mysql-service; do sleep 2; done']
+    - name: init-config
+      image: busybox
+      command: ['sh', '-c', 'cp /config/* /app/config/']
+  containers:
+    - name: app
+      image: my-app:latest
+```
+
+### Sidecar Container
+
+```yaml
+# Sidecar 日志收集
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+spec:
+  containers:
+    - name: app
+      image: my-app:latest
+    - name: log-collector
+      image: fluentbit:latest
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/app
+  volumes:
+    - name: logs
+      emptyDir: {}
+```
+
+## Helm Chart 最佳实践
+
+### Chart 目录结构
+
+```
+my-chart/
+├── Chart.yaml          # 元数据
+├── values.yaml         # 默认配置
+├── values-dev.yaml     # 开发环境
+├── values-prod.yaml    # 生产环境
+├── templates/
+│   ├── _helpers.tpl    # 公共模板
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   ├── hpa.yaml
+│   ├── pdb.yaml
+│   └── configmap.yaml
+└── .helmignore
+```
+
+### Helm Hooks
+
+```yaml
+# Pre-install/upgrade Hook
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: app-migrator:latest
+      restartPolicy: Never
+```
+
+## K8s Service 类型
+
+### Service 类型对比
+
+| 类型 | 说明 | 适用场景 |
+|------|------|---------|
+| ClusterIP | 集群内访问 | 内部服务 |
+| NodePort | 节点端口暴露 | 开发测试 |
+| LoadBalancer | 云负载均衡 | 生产环境 |
+| ExternalName | DNS别名 | 外部服务 |
+
+### Service 配置示例
+
+```yaml
+# ClusterIP
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  type: ClusterIP
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+# NodePort
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080
+
+---
+# LoadBalancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service-lb
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+## PV/PVC/StorageClass
+
+### 存储架构
+
+```
+K8s 存储架构：
+  PV（Persistent Volume）：集群级存储资源
+  PVC（Persistent Volume Claim）：存储请求
+  StorageClass：存储类定义
+
+动态供给流程：
+  PVC → StorageClass → 自动创建 PV → 绑定
+```
+
+### StorageClass 配置
+
+```yaml
+# StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp3
+  fsType: ext4
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+
+---
+# PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+## 网络策略
+
+### NetworkPolicy 配置
+
+```yaml
+# 默认拒绝所有入站
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# 允许前端访问后端
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8080
+```
+
+### 网络策略最佳实践
+
+```
+网络策略最佳实践：
+  1. 默认拒绝所有入站（default-deny-ingress）
+  2. 显式允许必要的流量
+  3. 按命名空间隔离
+  4. 使用标签选择器（而非IP）
+  5. 测试环境验证后再上线
+```
+
+## HPA 自动扩缩
+
+### HPA 配置
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+```
+
+### HPA 最佳实践
+
+```
+HPA 最佳实践：
+  1. 设置合理的资源 requests/limits
+  2. 使用 stabilizationWindowSeconds 防抖
+  3. scaleDown 设置较长窗口，避免频繁缩容
+  4. 监控 HPA 状态，确保扩缩正常
+  5. 考虑使用 KEDA 处理复杂扩缩场景
+```
+
+## PDB（Pod Disruption Budget）
+
+### PDB 配置
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 2  # 或 maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+### PDB 策略对比
+
+| 策略 | 配置 | 说明 |
+|------|------|------|
+| minAvailable | 2 | 最少保留 2 个 Pod |
+| maxUnavailable | 1 | 最多允许 1 个 Pod 不可用 |
+
 ## 二十二、与其他板块的关系
 
 ```text

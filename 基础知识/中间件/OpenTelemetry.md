@@ -1454,6 +1454,405 @@ service:
     4. Span通过ParentID关联
 ```
 
+## 二十、OTel Collector 部署模式详解
+
+### Agent 模式 vs Gateway 模式
+
+| 维度 | Agent 模式 | Gateway 模式 | 组合模式 |
+|------|-----------|-------------|----------|
+| 部署位置 | 与应用同节点/Pod | 独立部署 | Agent→Gateway |
+| 资源消耗 | 共享节点资源 | 独立资源 | 分层消耗 |
+| 网络 | 本地通信 | 远程通信 | 本地+远程 |
+| 扩展性 | 水平扩展差 | 水平扩展好 | 分层扩展 |
+| 可用性 | 单点故障 | 高可用 | 高可用 |
+| 适用场景 | 小规模/开发环境 | 生产环境 | 推荐架构 |
+
+```
+组合模式架构：
+  应用 Pod → Agent（本地采集+批处理）
+    → Gateway 集群（Tail 采样+脱敏+路由）
+      → 多后端（Jaeger/Prometheus/Loki）
+
+优势：
+  Agent：低延迟本地采集，减少网络开销
+  Gateway：集中处理（采样/脱敏/路由），统一管控
+  组合：兼顾本地性能与集中管控
+```
+
+### Gateway 模式 K8s 部署
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: otel-collector-gateway
+  template:
+    spec:
+      containers:
+      - name: collector
+        image: otel/opentelemetry-collector-contrib:0.88.0
+        args: ["--config=/etc/otelcol/config.yaml"]
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+          requests:
+            cpu: "1"
+            memory: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-collector-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: otel-collector-gateway
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+## 二十一、OTel Metrics 类型深入
+
+### 四种 Metric 类型
+
+| 类型 | 语义 | 使用场景 | 示例 |
+|------|------|----------|------|
+| Counter | 单调递增计数 | 请求数、错误数 | http_requests_total |
+| UpDownCounter | 可增减计数 | 队列长度、在线用户 | active_connections |
+| Histogram | 分布统计 | 延迟、请求大小 | http_request_duration |
+| Gauge | 当前值 | CPU、内存使用率 | cpu_usage_percent |
+
+### Metric API 使用示例
+
+```java
+// Counter 示例
+Meter meter = otel.getMeter("my-service");
+LongCounter counter = meter.counterBuilder("http.requests.total")
+    .setDescription("Total HTTP requests")
+    .setUnit("1")
+    .build();
+counter.add(1, Attributes.of(
+    AttributeKey.stringKey("method"), "GET",
+    AttributeKey.stringKey("status"), "200"
+));
+
+// Histogram 示例
+DoubleHistogram histogram = meter.histogramBuilder("http.request.duration")
+    .setDescription("HTTP request duration")
+    .setUnit("ms")
+    .build();
+histogram.record(duration, Attributes.of(
+    AttributeKey.stringKey("method"), "GET"
+));
+
+// Observable Gauge 示例
+meter.gaugeBuilder("cpu.usage")
+    .setDescription("CPU usage percentage")
+    .setUnit("%")
+    .buildWithCallback(obs -> {
+        obs.observe(getCpuUsage());
+    });
+```
+
+## 二十二、OTel Logs（Bridge to Existing Logs）
+
+### 日志桥接架构
+
+```
+现有日志框架（Log4j2/Logback/SLF4J）
+  → OTel Log Bridge Appender
+    → OTel Collector（日志管道）
+      → Loki / Elasticsearch / 云日志服务
+
+工作流程：
+  1. 应用使用现有日志框架（Log4j2/Logback）
+  2. OTel Log Bridge Appender 拦截日志
+  3. 转换为 OTel LogRecord 格式
+  4. 关联 traceID/spanID（如果存在）
+  5. 发送到 OTel Collector
+  6. Collector 路由到后端存储
+```
+
+### Log4j2 集成配置
+
+```xml
+<!-- log4j2.xml -->
+<Configuration>
+  <Appenders>
+    <OpenTelemetry name="otel">
+      <Endpoint>http://collector:4317</Endpoint>
+      <Protocol>grpc</Protocol>
+      <ResourceAttributes>
+        <Attribute key="service.name" value="my-service"/>
+      </ResourceAttributes>
+    </OpenTelemetry>
+  </Appenders>
+  <Loggers>
+    <Root level="info">
+      <AppenderRef ref="otel"/>
+    </Root>
+  </Loggers>
+</Configuration>
+```
+
+## 二十三、OTel 与 Jaeger/Prometheus/Grafana 集成
+
+### 集成架构
+
+```mermaid
+flowchart LR
+    APP[应用] -->|OTLP| COL[OTel Collector]
+    COL -->|OTLP| JAEGER[Jaeger]
+    COL -->|Prometheus| PROM[Prometheus]
+    COL -->|Loki| LOKI[Loki]
+    PROM --> GRAFANA[Grafana]
+    JAEGER --> GRAFANA
+    LOKI --> GRAFANA
+```
+
+### Jaeger 集成配置
+
+```yaml
+# Collector 配置
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger-collector:4317
+    tls:
+      cert_file: /certs/jaeger.crt
+      key_file: /certs/jaeger.key
+
+# Jaeger 部署
+docker run -d --name jaeger \
+  -e COLLECTOR_OTLP_ENABLED=true \
+  -p 16686:16686 \
+  -p 4317:4317 \
+  jaegertracing/all-in-one:latest
+```
+
+### Prometheus 集成配置
+
+```yaml
+# Collector 配置
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: otel
+    const_labels:
+      env: production
+
+# Prometheus scrape 配置
+scrape_configs:
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8889']
+```
+
+### Grafana 集成
+
+```yaml
+# Grafana 数据源配置
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+  - name: Jaeger
+    type: jaeger
+    url: http://jaeger:16686
+  - name: Loki
+    type: loki
+    url: http://loki:3100
+```
+
+## 二十四、OTel 采样策略配置详解
+
+### AlwaysOn / AlwaysOff / Probabilistic
+
+| 策略 | 配置参数 | 内存开销 | 准确性 | 适用场景 |
+|------|---------|---------|--------|---------|
+| AlwaysOn | sampling_percentage=100 | 高 | 100% | 开发测试 |
+| AlwaysOff | sampling_percentage=0 | 低 | 0% | 不采集 |
+| Probabilistic | sampling_percentage=N | 中 | N% | 生产默认 |
+| RateLimiting | max_spans_per_second | 低 | 限流 | 高流量 |
+| ParentBased | 根采样+继承 | 低 | 中 | 分布式 |
+
+### Tail-based 采样策略
+
+```yaml
+tail_sampling:
+  decision_wait: 5s
+  num_traces: 100000
+  expected_new_traces_per_sec: 1000
+  policies:
+    - name: errors
+      type: status_code
+      status_code: {status_codes: [ERROR]}
+    - name: slow
+      type: latency
+      latency: {threshold_ms: 1000}
+    - name: probabilistic
+      type: probabilistic
+      probabilistic: {sampling_percentage: 10}
+```
+
+## 二十五、OTel 语义约定（Semantic Conventions）
+
+### 资源属性规范
+
+| 属性 | 说明 | 示例 |
+|------|------|------|
+| service.name | 服务名 | order-service |
+| service.version | 服务版本 | 1.2.3 |
+| deployment.environment | 部署环境 | production |
+| host.name | 主机名 | pod-abc-123 |
+| k8s.namespace.name | K8s 命名空间 | default |
+| k8s.pod.name | K8s Pod 名 | order-abc-123 |
+
+### Span 属性规范
+
+| 属性 | 说明 | 示例 |
+|------|------|------|
+| http.method | HTTP 方法 | GET |
+| http.url | 请求 URL | /api/orders |
+| http.status_code | 状态码 | 200 |
+| db.system | 数据库类型 | mysql |
+| db.statement | SQL 语句 | SELECT * FROM orders |
+| messaging.system | 消息系统 | kafka |
+| messaging.destination | 目标 topic | orders |
+
+### 语义约定最佳实践
+
+```
+遵循语义约定的好处：
+  1. 工具自动识别（Grafana/Jaeger 自动展示）
+  2. 跨团队统一（相同属性名）
+  3. 采样规则可基于属性（如 http.status_code=500）
+
+自定义属性前缀：
+  业务属性：myapp.order_id
+  避免与标准属性冲突
+```
+
+## 二十六、OTel 上下文传播深入
+
+### W3C TraceContext / B3 / Baggage
+
+```
+W3C TraceContext（推荐）：
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+  格式：version-traceid-spanid-traceflags
+  tracestate: vendor1=value1
+
+B3（Zipkin）：
+  X-B3-TraceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  X-B3-SpanId: 00f067aa0ba902b7
+
+Baggage（键值对传递）：
+  baggage: userId=123, sessionId=abc
+```
+
+### 传播器配置
+
+```java
+// Java OTel SDK 配置
+OpenTelemetry otel = OpenTelemetrySdk.builder()
+    .setPropagators(ContextPropagators.create(
+        TextMapPropagator.composite(
+            W3CTraceContextPropagator.getInstance(),
+            W3CBaggagePropagator.getInstance()
+        )
+    ))
+    .build();
+```
+
+## 二十七、OTel 前端追踪（Browser）
+
+### Browser SDK 配置
+
+```javascript
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-web';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
+
+const exporter = new OTLPTraceExporter({
+  url: 'http://otel-collector:4318/v1/traces'
+});
+
+const provider = new WebTracerProvider({
+  instrumentations: [
+    new FetchInstrumentation(),
+  ]
+});
+
+provider.addSpanProcessor(new BatchSpanProcessor(exporter));
+provider.register();
+
+// 自动追踪页面加载
+import { DocumentLoadInstrumentation } from '@opentelemetry/instrumentation-document-load';
+provider.register({
+  instrumentations: [new DocumentLoadInstrumentation()]
+});
+```
+
+## 二十八、OTel Profiling
+
+### Profiling 数据类型
+
+```
+OTel Profiling 采集内容：
+  CPU Profile：CPU 使用热点
+  Memory Profile：内存分配热点
+  Wall Clock Profile：代码执行时间
+  Contention Profile：锁竞争热点
+
+导出格式：
+  pprof（Go 生态常用）
+  JFR（Java 生态）
+  Chrome Trace Format（可视化）
+```
+
+### Profiling Collector 配置
+
+```yaml
+receivers:
+  otlp/profiles:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+exporters:
+  otlp/profiler:
+    endpoint: "profiler:4317"
+
+service:
+  pipelines:
+    profiles:
+      receivers: [otlp/profiles]
+      processors: [batch]
+      exporters: [otlp/profiler]
+```
+
 ## 与其他板块的关系
 - 监控指标见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；
 - 日志体系见「[ELK 日志体系](./ELK日志体系.md)」与「[Loki](./Loki.md)」；

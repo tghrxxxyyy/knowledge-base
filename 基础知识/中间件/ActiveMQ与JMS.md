@@ -1520,6 +1520,241 @@ public class OrderListener {
     错误率：failed messages/sec
 ```
 
+## 三十一、ActiveMQ Artemis vs Classic 对比
+
+### 核心差异
+
+| 维度 | Artemis（新一代） | Classic（传统） |
+|------|-------------------|----------------|
+| 架构 | Netty + Chronicle Queue | MBean + KahaDB |
+| 协议 | AMQP 1.0 / STOMP / OpenWire / MQTT | OpenWire / STOMP / AMQP（需插件） |
+| 消息存储 | Chronicle Queue / JDBC | KahaDB / JDBC / LevelDB |
+| 性能 | 高（异步 I/O + 零拷贝） | 中 |
+| 镜像队列 | 原生支持 | 需插件 |
+| WebSocket | 原生支持 | 需插件 |
+| AMQP | 原生支持（标准） | 需插件（非标准） |
+| 管理界面 | Web Console（Vue.js） | Hawtio / ActiveMQ Web Console |
+| 集群 | In-VM / Discovery / Static | 网络连接器（Network Connector） |
+
+### 选型建议
+
+```
+新项目选型：
+  ├── 需要 AMQP 1.0 标准 → Artemis
+  ├── 需要高吞吐 → Artemis（Chronicle Queue）
+  ├── 需要简单部署 → Classic（成熟稳定）
+  └── 需要 Spring Boot 集成 → Artemis（spring-boot-starter-artemis）
+
+迁移建议：
+  Classic → Artemis（ActiveMQ Artemis 提供迁移工具）
+  注意协议兼容性（OpenWire → AMQP）
+```
+
+## 三十二、ActiveMQ Network Connector 深入
+
+### 网络连接器配置
+
+```xml
+<!-- broker-a.xml -->
+<networkConnectors>
+  <networkConnector
+    name="network-to-b"
+    uri="static:(tcp://broker-b:61616)"
+    duplex="true"
+    decreaseNetworkConsumerPriority="true"
+    networkTTL="2"
+    dynamicOnly="true"
+    excludedDestinations=">
+    <excludedDestination>
+      <queue physicalName="audit.*"/>
+    </excludedDestination>
+  </networkConnector>
+</networkConnectors>
+```
+
+### 网络拓扑
+
+| 拓扑 | 配置 | 适用场景 |
+|------|------|---------|
+| 单向桥 | duplex=false | 生产→消费 |
+| 双向桥 | duplex=true | 集群互备 |
+| 链式 | A→B→C | 多机房 |
+| 环形 | A→B→C→A | 高可用（慎用） |
+
+## 三十三、ActiveMQ 慢消费者处理
+
+### 慢消费者检测与处理
+
+```xml
+<!-- broker.xml 慢消费者配置 -->
+<destinationPolicy>
+  <destination>
+    <policy>
+      <slowConsumerStrategy>
+        <vmCursor strategy="WARNING" cursorTimeout="1000"/>
+      </slowConsumerStrategy>
+    </policy>
+  </destination>
+</destinationPolicy>
+```
+
+### 处理策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| VM Cursor | 内存队列，满则丢弃 | 不可靠场景 |
+| Store Cursor | 磁盘持久化 | 可靠场景 |
+| 分页 | 将消息分页到磁盘 | 内存不足 |
+| 限流 | 降低消费速度 | 保护下游 |
+| 断开连接 | 强制断开慢消费者 | 保护队列 |
+
+## 三十四、ActiveMQ 交付确认（Delivery Acknowledgment）
+
+### 确认模式
+
+| 模式 | 说明 | 性能 | 可靠性 |
+|------|------|------|--------|
+| AUTO_ACKNOWLEDGE | 自动确认 | 高 | 中 |
+| CLIENT_ACKNOWLEDGE | 客户端确认 | 中 | 高 |
+| DUPS_OK_ACKNOWLEDGE | 可重复确认 | 高 | 中 |
+| SESSION_TRANSACTED | 会话事务 | 低 | 最高 |
+
+### 确认最佳实践
+
+```
+确认策略选择：
+  1. 消息必须处理 → CLIENT_ACKNOWLEDGE + 手动确认
+  2. 消息可以重复 → AUTO_ACKNOWLEDGE
+  3. 消息重要但不需要事务 → DUPS_OK_ACKNOWLEDGE
+  4. 消息和业务原子性 → SESSION_TRANSACTED
+```
+
+## 三十五、ActiveMQ 监控指标
+
+### JMX 指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| broker.Broker.TotalMessageCount | 消息总数 | 持续增长 |
+| broker.Broker.TotalEnqueueCount | 入队速率 | 异常波动 |
+| broker.Broker.TotalDequeueCount | 出队速率 | 异常波动 |
+| broker.Broker.TotalConsumerCount | 消费者数 | 骤降 |
+| broker.Destination.InFlightCount | 待处理消息数 | > 10000 |
+| broker.Destination.QueueSize | 队列大小 | 持续增长 |
+
+### 监控告警配置
+
+```yaml
+# Prometheus JMX Exporter
+rules:
+  - pattern: "activemq<name=(.*), destinationType=Queue, destinationName=(.*)><>([a-zA-Z]+)"
+    name: activemq_queue_$3
+    labels:
+      queue: $2
+    help: "ActiveMQ queue metric: $3"
+```
+
+## 三十六、Spring JMS 集成
+
+### Spring Boot 集成示例
+
+```java
+// 消息生产者
+@Service
+public class OrderProducer {
+    @Autowired
+    private JmsTemplate jmsTemplate;
+
+    public void sendOrder(Order order) {
+        jmsTemplate.convertAndSend("order-queue", order);
+    }
+}
+
+// 消息消费者
+@Component
+public class OrderConsumer {
+    @JmsListener(destination = "order-queue")
+    public void receiveOrder(Order order) {
+        processOrder(order);
+    }
+}
+
+// 配置
+spring:
+  activemq:
+    broker-url: tcp://localhost:61616
+    user: admin
+    password: admin
+  jms:
+    template:
+      delivery-mode: PERSISTENT
+      time-to-live: 86400000  # 24 小时
+      priority: 4
+```
+
+## 三十七、ActiveMQ 与 RabbitMQ vs Kafka 对比
+
+| 维度 | ActiveMQ | RabbitMQ | Kafka |
+|------|----------|----------|-------|
+| 架构 | 传统消息代理 | AMQP 消息代理 | 分布式日志 |
+| 协议 | JMS/OpenWire/AMQP | AMQP/STOMP/MQTT | 私有协议 |
+| 消息模型 | Queue/Topic | Exchange/Queue | Topic/Partition |
+| 消息顺序 | Queue 内有序 | 单队列有序 | Partition 内有序 |
+| 持久化 | KahaDB/JDBC | Mnesia/Erlang | 日志文件 |
+| 吞吐量 | 万级/秒 | 万级/秒 | 百万级/秒 |
+| 延迟 | 毫秒级 | 微秒级 | 毫秒级 |
+| 适用场景 | 企业消息 | 微服务消息 | 流处理/日志 |
+| 学习曲线 | 中 | 中 | 高 |
+
+### 选型决策树
+
+```
+需要流处理/日志 → Kafka
+需要复杂路由 → RabbitMQ
+需要 JMS 兼容 → ActiveMQ
+需要极高吞吐 → Kafka
+需要简单消息 → RabbitMQ
+企业环境 JMS → ActiveMQ
+```
+
+## 三十八、ActiveMQ 消息持久化策略
+
+### 持久化方案对比
+
+| 方案 | 说明 | 性能 | 可靠性 |
+|------|------|------|--------|
+| KahaDB | 默认文件系统 | 高 | 中 |
+| JDBC | 数据库存储 | 中 | 高 |
+| LevelDB | KV 存储 | 高 | 中 |
+| 文件存储 | 自定义目录 | 中 | 中 |
+
+### KahaDB 配置优化
+
+```xml
+<persistenceAdapter>
+  <kahaDB
+    directory="${activemq.data}/kahadb"
+    journalMaxFileLength="32mb"
+    enableJournalDiskSyncs="true"
+    checksumEnabled="true"
+    indexCacheSize="10000"
+    cleanupInterval="30000"
+    journalMaxFiles="100"
+  />
+</kahaDB>
+```
+
+## 三十九、ActiveMQ 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 消息堆积 | 消费者慢/挂了 | 增加消费者/优化处理 |
+| 消息丢失 | 未持久化/未确认 | 启用持久化+CLIENT_ACK |
+| 内存溢出 | 消息堆积过多 | 配置内存限制+告警 |
+| 连接超时 | 网络/负载过高 | 检查网络+调整超时 |
+| 重复消费 | ACK 未正确处理 | 幂等处理+事务 |
+| 磁盘满 | 持久化消息堆积 | 监控磁盘+清理策略 |
+
 ## 三十、与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；

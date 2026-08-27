@@ -1496,6 +1496,495 @@ spec:
     memory: "4Gi"
 ```
 
+## Helm Chart 开发深度实践
+
+### Chart 目录结构最佳实践
+
+```
+my-chart/
+├── Chart.yaml              # 元数据 + 依赖声明
+├── values.yaml             # 默认配置
+├── values-dev.yaml         # 开发环境覆盖
+├── values-staging.yaml     # 预发环境覆盖
+├── values-prod.yaml        # 生产环境覆盖
+├── templates/
+│   ├── _helpers.tpl        # 公共模板函数
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   ├── hpa.yaml
+│   ├── pdb.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml
+│   ├── serviceaccount.yaml
+│   ├── networkpolicy.yaml
+│   └── tests/
+│       └── test-connection.yaml
+├── charts/                 # 依赖子 Chart
+├── .helmignore
+└── README.md
+```
+
+### values.yaml 验证与必填项
+
+```yaml
+# 使用 required 强制必填
+image:
+  repository: {{ required "image.repository is required" .Values.image.repository }}
+  tag: {{ .Values.image.tag | default "latest" }}
+
+# 使用 fail 条件校验
+{{- if and .Values.ingress.enabled (not .Values.ingress.host) }}
+{{- fail "ingress.host is required when ingress.enabled is true" }}
+{{- end }}
+
+# 数值范围校验
+{{- if or (lt .Values.replicaCount 1) (gt .Values.replicaCount 100) }}
+{{- fail "replicaCount must be between 1 and 100" }}
+{{- end }}
+```
+
+### Subcharts 依赖管理
+
+```yaml
+# Chart.yaml 声明依赖
+dependencies:
+  - name: redis
+    version: "17.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled
+  - name: postgresql
+    version: "12.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+
+# values.yaml 控制依赖
+redis:
+  enabled: true
+  auth:
+    enabled: true
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: "changeme"
+```
+
+### Helm Hooks 生命周期
+
+```yaml
+# Pre-install: 首次安装前执行
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"  # 执行顺序
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: app-migrator:latest
+      restartPolicy: Never
+---
+# Post-install: 安装完成后执行
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: smoke-test
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": hook-succeeded
+```
+
+| Hook 类型 | 用途 | 典型场景 |
+|-----------|------|---------|
+| pre-install | 安装前 | 数据库迁移、依赖服务检查 |
+| post-install | 安装后 | 冒烟测试、数据初始化 |
+| pre-upgrade | 升级前 | 数据库迁移、配置验证 |
+| post-upgrade | 升级后 | 健康检查、通知 |
+| pre-delete | 删除前 | 资源清理、数据备份 |
+| post-delete | 删除后 | 清理完成通知 |
+
+## Argo CD syncPolicy 深度配置
+
+### 自动同步策略
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/org/charts
+    targetRevision: main
+    path: apps/my-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true              # 自动删除 Git 中已移除的资源
+      selfHeal: true           # 自动修复手动修改（Git 为准）
+      allowEmpty: false        # 不允许删除所有资源（安全防护）
+    syncOptions:
+      - CreateNamespace=true          # 自动创建命名空间
+      - PrunePropagationPolicy=foreground  # 前台删除策略
+      - PruneLast=true                # 最后删除资源
+      - ApplyOutOfSyncOnly=true       # 只同步 OutOfSync 资源
+      - ServerSideApply=true          # 服务端 Apply
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### 忽略差异配置
+
+```yaml
+spec:
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # 忽略 HPA 管理的副本数
+    - kind: MutatingWebhookConfiguration
+      jqPathExpressions:
+        - '.webhooks[]?.clientConfig.caBundle'
+```
+
+### 同步策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| automated.prune | 自动删除 Git 中已移除的资源 | 生产环境（谨慎） |
+| automated.selfHeal | 自动修复手动修改 | 生产环境（推荐） |
+| manual | 手动触发同步 | 审批严格环境 |
+| retry | 同步失败自动重试 | 网络不稳定环境 |
+
+## Trivy 镜像扫描集成（CI/CD）
+
+### 扫描模式对比
+
+| 模式 | 命令 | 输出格式 | 适用场景 |
+|------|------|---------|---------|
+| Exit Code 阻断 | `trivy image --exit-code 1` | 纯文本 | CI 门禁阻断 |
+| SARIF 上传 | `trivy image --format sarif` | SARIF | GitHub Security 面板 |
+| JSON 报告 | `trivy image --format json` | JSON | 自定义分析 |
+| CycloneDX SBOM | `trivy image --format cyclonedx` | CDX JSON | SBOM 合规 |
+| Table 展示 | `trivy image --format table` | 表格 | 人工查看 |
+
+### GitLab CI 集成
+
+```yaml
+trivy-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - trivy image --format sarif --output trivy.sarif $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  artifacts:
+    paths: [trivy.sarif]
+    when: always
+
+trivy-report:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --format json --output trivy-report.json $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - trivy image --format cyclonedx --output sbom.cdx.json $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  artifacts:
+    reports:
+      container_scanning: trivy-report.json
+    paths: [sbom.cdx.json]
+```
+
+### GitHub Actions 集成
+
+```yaml
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: my-app:${{ github.sha }}
+    format: 'sarif'
+    output: 'trivy-results.sarif'
+    severity: 'CRITICAL,HIGH'
+    exit-code: '1'
+
+- name: Upload Trivy scan results
+  uses: github/codeql-action/upload-sarif@v2
+  with:
+    sarif_file: 'trivy-results.sarif'
+```
+
+## K8s RBAC 权限模型
+
+### Role / ClusterRole / Binding 关系
+
+```mermaid
+flowchart LR
+    User[用户/ServiceAccount] -->|绑定| RoleBinding[RoleBinding]
+    User -->|绑定| ClusterRoleBinding[ClusterRoleBinding]
+    RoleBinding -->|引用| Role[Role]
+    ClusterRoleBinding -->|引用| ClusterRole[ClusterRole]
+    Role -->|权限| NS[命名空间资源]
+    ClusterRole -->|权限| Cluster[集群资源]
+```
+
+### 最小权限原则配置
+
+```yaml
+# CI/CD ServiceAccount 权限（仅部署所需）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["services", "configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployer-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: deployer-sa
+  namespace: argocd
+roleRef:
+  kind: Role
+  name: deployer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### RBAC 权限对照表
+
+| 资源 | 作用域 | 说明 |
+|------|--------|------|
+| Role | 命名空间 | 命名空间内权限 |
+| ClusterRole | 集群 | 集群级权限（Nodes/PersistentVolumes等） |
+| RoleBinding | 命名空间 | 绑定用户到 Role |
+| ClusterRoleBinding | 集群 | 绑定用户到 ClusterRole |
+
+## 容器运行时对比（containerd vs CRI-O vs gVisor）
+
+| 维度 | containerd | CRI-O | gVisor |
+|------|-----------|-------|--------|
+| 语言 | Go | Go | Go |
+| CNCF 状态 | 毕业项目 | 毕业项目 | 沙箱项目 |
+| 支持运行时 | Docker 镜像 | Docker 镜像 | Docker 镜像 |
+| OCI 兼容 | 完全兼容 | 完全兼容 | 部分兼容 |
+| 资源占用 | 中 | 低 | 高（用户态内核） |
+| 安全隔离 | 内核级 | 内核级 | 用户态内核（强隔离） |
+| 适用场景 | K8s 默认 | OpenShift | 多租户/安全敏感 |
+| 性能损耗 | 无 | 无 | 5-15%（系统调用拦截） |
+
+### 运行时选型决策
+
+```
+容器运行时选型：
+  标准 K8s 集群 → containerd（主流）
+  OpenShift 环境 → CRI-O（原生支持）
+  多租户/安全隔离 → gVisor（用户态内核）
+  强安全合规 → Kata Containers（轻量 VM）
+  开发测试 → Docker（便捷）
+```
+
+## 镜像签名（Cosign / Notary v2）
+
+### Cosign Keyless 签名
+
+```bash
+# 使用 Fulcio 临时证书签名（推荐）
+COSIGN_EXPERIMENTAL=1 cosign sign $IMAGE
+
+# 验证签名
+cosign verify \
+  --certificate-identity "https://github.com/myorg/myrepo/.github/workflows/ci.yml@refs/heads/main" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  $IMAGE
+
+# 附加 SBOM
+cosign attest --predicate sbom.cdx.json --type cyclonedx $IMAGE
+
+# 验证 SBOM
+cosign verify-attestation --type cyclonedx $IMAGE
+```
+
+### Kyverno 强制签名验证
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: check-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.example.com/*"]
+          attestors:
+            - entries:
+                - keyless:
+                    identities:
+                      - issuer: "https://token.actions.githubusercontent.com"
+                        subject: "https://github.com/myorg/myrepo/.github/workflows/*"
+```
+
+### Notary v2 签名
+
+```bash
+# 使用 Notary v2 签名
+notation sign --signature-format cosign $IMAGE
+
+# 验证签名
+notation verify $IMAGE
+
+# 列出信任策略
+notation trustpolicy-list
+```
+
+| 签名工具 | 证书管理 | 签名格式 | 集成生态 |
+|---------|---------|---------|---------|
+| Cosign | Fulcio（临时）/ 自定义 CA | JWS | Kyverno/OPA |
+| Notary v2 | Notation CA | COSE/COSign | Kyverno/OPA |
+
+## Helm vs Kustomize 深度对比
+
+| 维度 | Helm | Kustomize |
+|------|------|-----------|
+| 配置方式 | Go 模板渲染 | YAML 补丁叠加 |
+| 版本控制 | Chart.yaml SemVer | Git 标签 |
+| 学习曲线 | 中（模板语法） | 低（纯 YAML） |
+| 依赖管理 | Chart 依赖 | 无原生支持 |
+| 环境差异 | values-{env}.yaml | overlays/{env}/ |
+| 复用性 | Subcharts/OCI 仓库 | base 复用 |
+| 渲染时机 | 客户端渲染 | 客户端/服务端 |
+| 适用场景 | 复杂应用/多环境 | 简单差异/纯 YAML |
+| 生态工具 | Helm Hub/OCI 仓库 | kubectl apply |
+| 团队协作 | Chart 仓库 + 版本管理 | Git 仓库 + PR |
+
+### 选型决策树
+
+```
+配置管理选型：
+  应用复杂（多组件/条件逻辑）？→ Helm
+  配置简单（仅副本数/资源差异）？→ Kustomize
+  需要版本管理？→ Helm（Chart.yaml）
+  纯 GitOps？→ Kustomize（声明式）
+  多团队共享？→ Helm（Chart 仓库）
+  渐进式迁移？→ Kustomize（补丁叠加）
+```
+
+## GitOps 工作流最佳实践
+
+### 分支策略
+
+```
+GitOps 分支模型：
+  main      → 生产环境（Argo CD 监控）
+  staging   → 预发环境（Argo CD 监控）
+  dev       → 开发环境（Argo CD 监控）
+  feature/* → 功能分支（PR 合并后自动同步）
+```
+
+### 仓库结构
+
+```
+gitops-repo/
+├── apps/                    # 应用配置
+│   ├── app-a/
+│   │   ├── base/           # 基础配置
+│   │   └── overlays/       # 环境覆盖
+│   │       ├── dev/
+│   │       ├── staging/
+│   │       └── production/
+│   └── app-b/
+├── infrastructure/          # 基础设施配置
+│   ├── monitoring/
+│   ├── ingress/
+│   └── cert-manager/
+├── clusters/                # 集群配置
+│   ├── cluster-dev/
+│   └── cluster-prod/
+└── README.md
+```
+
+### Argo CD 多集群管理
+
+```yaml
+# 集群注册
+argocd cluster add dev-context --name dev
+argocd cluster add prod-context --name prod
+
+# ApplicationSet 跨集群部署
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: my-app
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            env: production
+  template:
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/org/charts
+        targetRevision: main
+        path: apps/my-app
+      destination:
+        server: "{{server}}"
+        namespace: production
+```
+
+## PDB（Pod Disruption Budget）配置
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 2           # 或 maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+### PDB 策略对比
+
+| 策略 | 配置 | 说明 |
+|------|------|------|
+| minAvailable | 2 | 最少保留 2 个 Pod 可用 |
+| maxUnavailable | 1 | 最多允许 1 个 Pod 不可用 |
+
 ## 本篇补充 Checklist
 
 - [ ] 免 daemon 构建用 Kaniko / BuildKit，不挂 docker.sock，secret 用 mount。

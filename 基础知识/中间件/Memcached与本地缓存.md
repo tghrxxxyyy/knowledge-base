@@ -953,6 +953,365 @@ Key 哈希 → 环上位置 → 顺时针找最近节点
   推荐：100-200 个虚拟节点/物理节点
 ```
 
+## Caffeine W-TinyLFU 深度解析
+
+### 三层缓存架构
+
+```
+W-TinyLFU 三层架构：
+  1. Window Cache（窗口缓存）：1% 容量，LRU 策略
+     - 最近访问的数据进入 Window
+     - 淘汰时进入 Probation
+
+  2. Probation（试用区）：1% 容量，LFU 策略
+     - 新数据在此试用
+     - 命中后晋升到 Protected
+
+  3. Protected（保护区）：98% 容量，LFU 策略
+     - 高频数据在此存放
+     - 淘汰时降级到 Probation
+
+CountMinSketch 机制：
+  - 4 个独立的哈希函数
+  - 4 行计数器（每行 16KB）
+  - 通过 4 次哈希取最小值估算频率
+  - 支持增量更新和周期性衰减
+```
+
+### CountMinSketch 实现
+
+```java
+// CountMinSketch 频率估算
+public class CountMinSketch {
+    private final int width;
+    private final int depth;
+    private final int[][] table;
+    private final HashFunction[] hashes;
+
+    public void add(String item) {
+        for (int i = 0; i < depth; i++) {
+            int hash = hashes[i].hash(item);
+            table[i][hash % width]++;
+        }
+    }
+
+    public int estimate(String item) {
+        int min = Integer.MAX_VALUE;
+        for (int i = 0; i < depth; i++) {
+            int hash = hashes[i].hash(item);
+            min = Math.min(min, table[i][hash % width]);
+        }
+        return min;
+    }
+}
+```
+
+## expireAfterWrite vs Access 决策树
+
+```mermaid
+flowchart TD
+    START[缓存过期策略选择] --> Q1{数据会频繁更新?}
+    Q1 -->|是| Q2{更新频率?}
+    Q1 -->|否| Q3{访问频率?}
+    
+    Q2 -->|快速变化| WRITE_SHORT[expireAfterWrite 10-60s]
+    Q2 -->|缓慢变化| WRITE_LONG[expireAfterWrite 5-30min]
+    
+    Q3 -->|高频访问| ACCESS_LONG[expireAfterAccess 5-30min]
+    Q3 -->|低频访问| ACCESS_SHORT[expireAfterAccess 1-5min]
+    
+    WRITE_SHORT -->|配置/热点商品| SCENE1[配置信息/热点商品]
+    WRITE_LONG -->|用户信息| SCENE2[用户信息]
+    ACCESS_LONG -->|会话/浏览记录| SCENE3[用户会话/浏览记录]
+    ACCESS_SHORT -->|临时数据| SCENE4[临时数据]
+```
+
+### 过期策略对比
+
+| 策略 | 说明 | 适用场景 | 优点 | 缺点 |
+|------|------|---------|------|------|
+| expireAfterWrite | 写入后过期 | 数据会更新 | 保证数据新鲜 | 可能过期过快 |
+| expireAfterAccess | 访问后过期 | 数据不常更新 | 节省内存 | 可能数据过旧 |
+
+## Guava removalListener 异步通知
+
+```java
+// 异步通知配置
+CacheBuilder.newBuilder()
+    .removalListener(notification -> {
+        // 异步通知，不影响主逻辑
+        log.info("key={} evicted, cause={}",
+            notification.getKey(),
+            notification.getCause());
+        // 发送告警/统计
+        metricsService.recordEviction(notification.getCause().name());
+    })
+    .build();
+
+// 批量异步通知（更高效）
+ListeningExecutorService executor = MoreExecutors.newFixedThreadPool(4);
+CacheBuilder.newBuilder()
+    .removalListenerWithExecutor(executor, notification -> {
+        asyncHandleEviction(notification);
+    })
+    .build();
+```
+
+### removalListener 配置建议
+
+```
+removalListener 最佳实践：
+  1. 使用异步执行器，避免阻塞主逻辑
+  2. 设置队列大小限制，防止内存溢出
+  3. 添加监控指标，统计淘汰原因
+  4. 考虑使用 RemovalCause 枚举判断淘汰类型
+```
+
+## Redis 与本地缓存双写一致性
+
+### 延迟双删 + Canal 监听
+
+```java
+// 延迟双删示例
+public void updateWithDoubleDelete(String key, Object value) {
+    cache.delete(key);           // 1. 先删缓存
+    db.update(value);            // 2. 更新数据库
+    Thread.sleep(500);           // 3. 延迟（等待读请求完成）
+    cache.delete(key);           // 4. 再删缓存（兜底）
+}
+
+// Canal 监听配置
+@CanalListener
+public class CanalHandler {
+    @UpdateListenPoint(schema = "mydb", table = "users")
+    public void onUpdate(CanalEntry.RowData rowData) {
+        String key = extractKey(rowData);
+        cache.delete("user:" + key);
+    }
+}
+```
+
+### 一致性方案对比
+
+| 方案 | 一致性 | 复杂度 | 性能 | 适用场景 |
+|------|--------|--------|------|---------|
+| TTL 收敛 | 弱一致 | 低 | 高 | 弱一致场景 |
+| 消息失效 | 中一致 | 中 | 中 | 多实例场景 |
+| Canal 订阅 | 强一致 | 中 | 中 | 数据库变更 |
+| 版本号 | 强一致 | 高 | 中 | 强一致场景 |
+
+## 缓存穿透/击穿/雪崩代码实现
+
+```java
+// 1. 布隆过滤器防穿透
+BloomFilter<String> bloomFilter = BloomFilter.create(
+    Funnels.stringFunnel(Charset.defaultCharset()),
+    1000000,  // 预期元素数
+    0.01      // 误判率
+);
+
+public Object getDataWithBloomFilter(String key) {
+    if (!bloomFilter.mightContain(key)) {
+        return null;  // 一定不存在
+    }
+    Object value = cache.getIfPresent(key);
+    if (value != null) {
+        return value;
+    }
+    value = db.query(key);
+    if (value == null) {
+        cache.put(key, NULL_VALUE);  // 空值缓存（短 TTL）
+    } else {
+        bloomFilter.put(key);        // 动态添加
+        cache.put(key, value);
+    }
+    return value;
+}
+
+// 2. 互斥锁防击穿
+public Object getDataWithMutex(String key) {
+    Object value = cache.getIfPresent(key);
+    if (value != null) {
+        return value;
+    }
+    String lockKey = "lock:" + key;
+    try {
+        if (redis.setnx(lockKey, "1", 10, TimeUnit.SECONDS)) {
+            value = db.query(key);
+            cache.put(key, value);
+            redis.del(lockKey);
+            return value;
+        } else {
+            Thread.sleep(100);  // 等待
+            return cache.getIfPresent(key);
+        }
+    } finally {
+        redis.del(lockKey);
+    }
+}
+
+// 3. 随机过期防雪崩
+public void setWithRandomExpire(String key, Object value) {
+    int baseExpire = 300;  // 5 分钟基础过期
+    int randomExpire = ThreadLocalRandom.current().nextInt(0, 60);
+    cache.policy().expireAfterWrite().put(key, value,
+        baseExpire + randomExpire, TimeUnit.SECONDS);
+}
+```
+
+### 三件套选型
+
+```
+缓存问题选型：
+  穿透（查不存在）→ 布隆过滤器 + 空值缓存
+  击穿（热点过期）→ 互斥锁 + 永不过期
+  雪崩（批量过期）→ 随机过期 + 多级缓存
+  数据不一致 → 延迟双删 + Canal 监听
+```
+
+## 缓存预热策略
+
+### 预热时机与方式
+
+| 预热方式 | 触发时机 | 适用场景 | 实现复杂度 |
+|---------|---------|---------|-----------|
+| 启动加载 | 应用启动 | 配置数据、字典表 | 低 |
+| 定时刷新 | Cron 触发 | 准实时数据（分钟级） | 低 |
+| 懒加载 + 空值缓存 | 首次访问 | 大部分场景 | 中 |
+| 消息驱动 | MQ 通知 | 实时性要求高 | 高 |
+| 预测性预热 | 基于历史流量模型 | 电商大促、秒杀 | 高 |
+
+```java
+// 启动预热示例
+@PostConstruct
+public void warmUp() {
+    log.info("开始本地缓存预热...");
+    long start = System.currentTimeMillis();
+    
+    // 加载热点数据
+    List<String> hotKeys = redis.zrevrange("hot_keys", 0, 999);
+    Map<String, Object> batchValues = redis.mget(hotKeys);
+    
+    batchValues.forEach((key, value) -> {
+        if (value != null) {
+            localCache.put(key, value);
+        }
+    });
+    
+    log.info("预热完成，加载 {} 条数据，耗时 {}ms",
+        batchValues.size(), System.currentTimeMillis() - start);
+}
+```
+
+## 缓存降级与容错
+
+### 降级策略
+
+```text
+缓存降级优先级：
+  L0：本地缓存命中 → 直接返回
+  L1：Redis 命中 → 写入本地缓存 → 返回
+  L2：Redis 失败 → 本地缓存旧值 → 返回（标记降级）
+  L3：全部失败 → 返回默认值 / 熔断拒绝
+
+触发条件：
+  Redis 连续失败 N 次 → 自动切换到 L2
+  Redis 超时率 > 阈值 → 本地缓存延长过期
+  系统负载 > 阈值 → 关闭非核心缓存刷新
+```
+
+### 降级代码实现
+
+```java
+// 缓存降级处理器
+public class CacheFallbackHandler<K, V> {
+    private final Cache<K, V> localCache;
+    private final RedisClient redis;
+    private final AtomicBoolean degraded = new AtomicBoolean(false);
+    private volatile long degradeStartTime;
+
+    public V getWithFallback(K key, Function<K, V> dbLoader) {
+        // L0: 本地缓存
+        V value = localCache.getIfPresent(key);
+        if (value != null) return value;
+
+        // L1: Redis（降级期间跳过）
+        if (!degraded.get()) {
+            try {
+                value = redis.get(key);
+                if (value != null) {
+                    localCache.put(key, value);
+                    return value;
+                }
+            } catch (Exception e) {
+                if (isCircuitBreakerTriggered(e)) {
+                    triggerDegradation();
+                }
+            }
+        }
+
+        // L2: DB + 降级标记
+        value = dbLoader.apply(key);
+        if (value != null) {
+            long ttl = degraded.get() ? 600 : 300; // 降级时延长本地缓存
+            localCache.policy().expireAfterWrite().put(key, value,
+                ttl, TimeUnit.SECONDS);
+        }
+        return value;
+    }
+
+    private void triggerDegradation() {
+        if (degraded.compareAndSet(false, true)) {
+            degradeStartTime = System.currentTimeMillis();
+            // 30秒后自动尝试恢复
+            scheduledExecutor.schedule(this::tryRecover, 30, TimeUnit.SECONDS);
+        }
+    }
+}
+```
+
+## 缓存监控指标
+
+### Prometheus 指标导出
+
+```java
+// Prometheus 指标导出
+@Bean
+public MeterBinder cacheMetrics(CaffeineCacheManager cacheManager) {
+    return registry -> {
+        cacheManager.getCacheNames().forEach(name -> {
+            Cache<Object, Object> cache = cacheManager.getCache(name).getNativeCache();
+            if (cache instanceof Caffeine) {
+                Caffeine<Object, Object> caffeine = (Caffeine<Object, Object>) cache;
+                Stats stats = caffeine.stats();
+
+                Gauge.builder("cache_hit_rate", stats, s -> s.hitRate())
+                    .tag("cache", name)
+                    .register(registry);
+                Gauge.builder("cache_eviction_count", stats, s -> s.evictionCount())
+                    .tag("cache", name)
+                    .register(registry);
+                Gauge.builder("cache_load_duration_ms", stats,
+                    s -> s.averageLoadPenalty() / 1_000_000)
+                    .tag("cache", name)
+                    .register(registry);
+            }
+        });
+    };
+}
+```
+
+### 监控指标对照表
+
+| 指标名称 | 类型 | 说明 | 告警阈值 |
+|---------|------|------|---------|
+| hit_rate | Gauge | 命中率 | < 80% |
+| miss_rate | Gauge | 失效率 | > 20% |
+| eviction_count | Counter | 淘汰次数 | 增速过快 |
+| size | Gauge | 当前缓存条目数 | 接近 maximumSize |
+| load_count | Counter | 加载次数 | 异常增长 |
+| average_load_penalty | Gauge | 平均加载耗时 | > 100ms |
+
 ## 与其他板块的关系
 
 - 和「**基础知识/redis知识**」「**场景设计/多级缓存框架**」「**场景设计/缓存经典三问与一致性**」：本文是「本地 + Memcached」两翼，Redis 与多级缓存体系见那三篇。

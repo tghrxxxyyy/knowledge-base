@@ -1477,14 +1477,328 @@ transferThreadPoolNums=8              # 传输线程数
     消费 TPS：12 万
     延迟 P99：1ms
 
-调优建议：
+  调优建议：
   ├── 金融场景：配置 1（数据不丢）
   ├── 电商场景：配置 2（平衡性能和可靠）
   ├── 日志场景：配置 3（性能优先）
   └── 监控先行：部署 Prometheus + Grafana 监控
 ```
 
-## 与其他板块的关系
+## 事务消息原理
+
+### 事务消息流程
+
+```
+事务消息三阶段：
+  ① Half Message（半消息）：生产者发送消息到 Broker，消费者不可见
+  ② 本地事务执行：生产者执行本地事务（数据库操作）
+  ③ 提交/回滚：生产者根据本地事务结果提交或回滚消息
+
+流程：
+  Producer → Broker: 发送 Half Message
+  Producer → Database: 执行本地事务
+  Producer → Broker: 提交 Commit / 回滚 Rollback
+  Broker → Consumer: 投递已确认消息
+
+回查机制：
+  Broker 定时回查未确认的 Half Message
+  Producer 检查本地事务状态并回复
+  回查次数：默认 15 次，间隔 6s/10s/30s...
+```
+
+### 事务消息配置示例
+
+```java
+// 事务消息 Producer
+TransactionMQProducer producer = new TransactionMQProducer("tx-group");
+producer.setTransactionListener(new TransactionListener() {
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        try {
+            // 执行本地事务（数据库操作）
+            orderService.createOrder(msg.getBody());
+            return LocalTransactionState.COMMIT_MESSAGE;
+        } catch (Exception e) {
+            return LocalTransactionState.ROLLBACK_MESSAGE;
+        }
+    }
+    
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        // 回查：检查订单是否已创建
+        String orderId = msg.getProperty("orderId");
+        if (orderService.exists(orderId)) {
+            return LocalTransactionState.COMMIT_MESSAGE;
+        }
+        return LocalTransactionState.UNKNOW;
+    }
+});
+
+// 发送事务消息
+Message msg = new Message("OrderTopic", "order-key", orderId.getBytes());
+TransactionSendResult result = producer.sendMessageInTransaction(msg, null);
+```
+
+## 消息过滤（Tag / SQL92）
+
+### Tag 过滤
+
+```java
+// 生产者：设置 Tag
+Message msg = new Message("OrderTopic", "PayTag", "order-1", body);
+SendResult result = producer.send(msg);
+
+// 消费者：按 Tag 过滤
+consumer.subscribe("OrderTopic", "PayTag || CreateTag");
+
+// 消费者：SQL92 过滤
+consumer.subscribe("OrderTopic", 
+    MessageSelector.bySql("amount > 100 AND region = 'shanghai'"));
+```
+
+### SQL92 过滤语法
+
+| 操作符 | 说明 | 示例 |
+|--------|------|------|
+| = | 等于 | `region = 'shanghai'` |
+| != | 不等于 | `status != 'deleted'` |
+| >, <, >=, <= | 比较 | `amount > 100` |
+| BETWEEN | 范围 | `amount BETWEEN 100 AND 1000` |
+| IN | 集合 | `region IN ('shanghai', 'beijing')` |
+| LIKE | 模糊匹配 | `topic LIKE 'order_%'` |
+| AND, OR | 逻辑 | `amount > 100 AND region = 'shanghai'` |
+| IS NOT NULL | 非空 | `tag IS NOT NULL` |
+
+### 过滤配置
+
+```properties
+# Broker 配置
+enablePropertyFilter=true
+# 消费者属性
+consumer.property Windsor.filter.tag=PayTag
+consumer.property Windsor.filter.sql92=amount > 100
+```
+
+## 延迟消息配置
+
+### 延迟级别
+
+| 级别 | 延迟时间 | 级别 | 延迟时间 |
+|------|---------|------|---------|
+| 1 | 1s | 6 | 6m |
+| 2 | 5s | 7 | 7m |
+| 3 | 10s | 8 | 8m |
+| 4 | 30s | 9 | 9m |
+| 5 | 1m | 10 | 10m |
+| — | — | 11-18 | 20m-2h |
+
+### 延迟消息配置
+
+```java
+// 设置延迟级别
+Message msg = new Message("OrderTopic", "delay-key", body);
+msg.setDelayTimeLevel(3);  // 10 秒延迟
+producer.send(msg);
+
+// 自定义延迟时间（RocketMQ 5.x）
+msg.setDeliveryTimestamp(System.currentTimeMillis() + 30000);  // 30 秒后投递
+```
+
+```properties
+# Broker 延迟配置
+messageDelayLevel=1000 5000 10000 30000 60000 120000 180000 240000 300000 360000
+```
+
+## ACL 权限控制
+
+### ACL 配置
+
+```properties
+# broker-acl.json
+{
+  "accounts": [
+    {
+      "accessKey": "admin",
+      "secretKey": "admin-secret",
+      "admin": true,
+      "defaultTopicPerm": "DENY",
+      "defaultGroupPerm": "DENY",
+      "topicPerms": [
+        ["OrderTopic", "PUB|SUB"],
+        ["PayTopic", "PUB|SUB"]
+      ],
+      "groupPerms": [
+        ["OrderConsumerGroup", "DENY"],
+        ["PayConsumerGroup", "DENY"]
+      ]
+    }
+  ]
+}
+```
+
+### ACL 权限说明
+
+| 权限 | 说明 | 操作 |
+|------|------|------|
+| PUB | 发布消息 | SEND |
+| SUB | 订阅消息 | PULL |
+| DENY | 拒绝 | 拒绝访问 |
+| PUB\|SUB | 发布和订阅 | 完整权限 |
+
+```java
+// Producer 设置 ACL
+DefaultMQProducer producer = new DefaultMQProducer("producer-group");
+producer.setNamesrvAddr("localhost:9876");
+producer.setAccessChannel(AccessChannel.LOCAL);
+
+AclClientRPCHook rpcHook = new AclClientRPCHook(new SessionCredentials("admin", "admin-secret"));
+producer = new DefaultMQProducer("producer-group", rpcHook);
+```
+
+## 生产问题排查
+
+### 常见问题诊断
+
+| 问题 | 症状 | 排查方法 | 解决方案 |
+|------|------|---------|---------|
+| 消息堆积 | Consumer Lag 持续增长 | `mqadmin consumerProgress` | 增加 Consumer 实例 |
+| 消息丢失 | 生产者发送成功但消费不到 | 检查刷盘策略 + 副本同步 | 同步刷盘 + 同步复制 |
+| 重复消费 | 同一条消息消费多次 | 检查 ACK 机制 | 幂等消费 |
+| 消息乱序 | 消息顺序不一致 | 检查 Topic 分区数 | 同一 Queue 顺序发送 |
+| Broker 宕机 | 消息发送失败 | 检查 Broker 状态 | 主从切换 |
+| 消费失败 | 消费返回 RECONSUME_LATER | 检查消费逻辑 | 修复代码 + 重试 |
+
+### 命令行排查工具
+
+```bash
+# 查看 Broker 状态
+mqadmin brokerStatus -n localhost:9876
+
+# 查看 Topic 信息
+mqadmin topicStatus -n localhost:9876 -t OrderTopic
+
+# 查看 Consumer Group
+mqadmin consumerProgress -n localhost:9876 -g OrderConsumerGroup
+
+# 查看消息详情
+mqadmin queryMsgById -n localhost:9876 -i <msgId>
+
+# 重置 Offset
+mqadmin resetOffsetByTime -n localhost:9876 -g OrderConsumerGroup -t OrderTopic -s "2024-01-01#00:00:00"
+```
+
+## RocketMQ vs Kafka 对比
+
+| 维度 | RocketMQ | Kafka |
+|------|----------|-------|
+| 开发语言 | Java | Scala/Java |
+| 吞吐量 | 10万级 TPS | 100万级 TPS |
+| 延迟 | ms 级 | ms 级 |
+| 事务消息 | 原生支持 | 不支持 |
+| 定时消息 | 原生支持 | 不支持 |
+| 消息过滤 | Tag/SQL92 | 无（需外部处理） |
+| 消息回溯 | 支持 | 支持 |
+| 消息堆积 | 支持 | 支持 |
+| 运维工具 | RocketMQ Console | Kafka Manager |
+| 适用场景 | 金融/电商/事务 | 日志/大数据/流处理 |
+
+### 选型决策
+
+```
+消息队列选型：
+  需要事务消息 → RocketMQ
+  需要定时消息 → RocketMQ
+  需要消息过滤 → RocketMQ
+  超高吞吐量 → Kafka
+  大数据生态 → Kafka
+  金融级可靠 → RocketMQ
+  通用场景 → RocketMQ 或 Kafka 均可
+```
+
+## RocketMQ Dashboard 监控
+
+### 监控面板
+
+```
+RocketMQ 监控大盘：
+  ┌────────────────────────────────────────────────┐
+  │  Producer TPS  │  Consumer TPS  │  Broker 状态  │
+  ├────────────────────────────────────────────────┤
+  │  消息堆积量    │  消费延迟      │  队列分布      │
+  ├────────────────────────────────────────────────┤
+  │  JVM 内存      │  GC 情况       │  网络流量      │
+  └────────────────────────────────────────────────┘
+```
+
+### Prometheus 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|---------|
+| rocketmq_producer_tps | 生产 TPS | 基线±50% |
+| rocketmq_consumer_tps | 消费 TPS | 基线±50% |
+| rocketmq_consumer_lag | 消费堆积 | >100000 |
+| rocketmq_broker_disk_used | 磁盘使用率 | >80% |
+| rocketmq_broker_dispatch_behind | 刷盘延迟 | >1000 |
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: rocketmq_alerts
+    rules:
+      - alert: RocketMQConsumerLagHigh
+        expr: rocketmq_consumer_lag_sum > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RocketMQ 消费堆积超过 10 万条"
+          
+      - alert: RocketMQBrokerDiskHigh
+        expr: rocketmq_broker_disk_used_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RocketMQ Broker 磁盘使用率超过 80%"
+```
+
+## 集群部署架构
+
+### 部署模式
+
+```
+RocketMQ 集群部署：
+  单主模式：一个 Broker，无高可用
+  多主模式：多个 Broker，无从节点
+  主从模式：一个主 + 一个从，手动切换
+  集群模式：多个主从组，高可用
+
+推荐架构：
+  2主2从 + NameServer 集群
+  主从同步复制 + 异步刷盘
+  消费者组自动负载均衡
+```
+
+### 集群配置示例
+
+```properties
+# Broker 主节点配置
+brokerRole=SYNC_MASTER
+flushDiskType=SYNC_FLUSH
+brokerId=0
+brokerClusterName=DefaultCluster
+brokerName=broker-a
+
+# Broker 从节点配置
+brokerRole=SLAVE
+flushDiskType=SYNC_FLUSH
+brokerId=1
+brokerClusterName=DefaultCluster
+brokerName=broker-a
+
+# NameServer 集群
+namesrvAddr=192.168.1.10:9876;192.168.1.11:9876;192.168.1.12:9876
+```
 
 | 关联板块 | 关系描述 |
 |----------|----------|

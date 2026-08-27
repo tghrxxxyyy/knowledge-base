@@ -1192,9 +1192,284 @@ spec:
     secret: default-tls-secret
 ```
 
-## 十二、与其他板块的关系
+## 十二、Traefik 中间件详解
 
+### 12.1 常用中间件
 
+| 中间件 | 说明 | 配置示例 |
+|--------|------|----------|
+| BasicAuth | 基本认证 | users: ["admin:$apr1$..."] |
+| ForwardAuth | 外部认证服务 | authAddress: http://auth-svc |
+| RateLimit | 限流 | average: 100, burst: 50 |
+| Retry | 重试 | attempts: 3, initialInterval: 100ms |
+| StripPrefix | 路径前缀剥离 | prefixes: ["/api"] |
+| Headers | 响应头修改 | customResponseHeaders: {X-Custom: "value"} |
+| Compress | 响压压缩 | excludedContentTypes: ["image/*"] |
+| CircuitBreaker | 熔断 | expression: "LatencyAtQuantileMS(50.0) > 100" |
+
+### 12.2 中间件链组合示例
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-ratelimit
+spec:
+  chain:
+    middlewares:
+      - name: auth
+      - name: ratelimit
+        rateLimit:
+          average: 100
+          burst: 50
+      - name: compress
+```
+
+### 12.3 Traefik 可观测配置
+
+```yaml
+# Prometheus 指标
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+
+# 访问日志
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  bufferingSize: 100
+
+# Tracing（Jaeger/Zipkin）
+tracing:
+  jaeger:
+    localAgentHostPort: 127.0.0.1:6831
+```
+
+## 十三、Traefik Gateway API 支持
+
+### Gateway API 资源模型
+
+```yaml
+# Gateway 定义
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: production-gateway
+  namespace: traefik
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: wildcard-cert
+      allowedRoutes:
+        namespaces:
+          from: All
+---
+# HTTPRoute 定义
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: production-gateway
+      namespace: traefik
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-service
+          port: 80
+```
+
+### Gateway API 特性对比
+
+| Gateway API 特性 | 说明 | 优势 |
+|-----------------|------|------|
+| 角色分离 | Gateway/HTTPRoute/TLSRoute | 权限清晰 |
+| 多协议 | HTTP/TCP/UDP/gRPC | 统一入口 |
+| 可移植 | 标准 API | 避免厂商锁定 |
+| 高级路由 | Header 匹配/权重分配 | 灵活路由 |
+
+## 十四、Traefik Dashboard 安全配置
+
+### Dashboard 访问控制
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: traefik-dashboard
+  namespace: traefik
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`traefik.example.com`)
+      kind: Rule
+      services:
+        - name: api@internal
+          kind: TraefikService
+  tls:
+    certResolver: letsencrypt
+  middlewares:
+    - name: basic-auth
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-auth
+  namespace: traefik
+spec:
+  basicAuth:
+    secret: traefik-dashboard-auth
+```
+
+### Dashboard 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 生产关闭 | `--api.dashboard=false` |
+| 内网暴露 | 仅内网访问 |
+| BasicAuth | 加认证中间件 |
+| IP 白名单 | 限制访问 IP |
+| HTTPS | 强制 HTTPS |
+
+## 十五、负载均衡策略深度对比
+
+| 策略 | 算法 | 适用场景 | 优缺点 |
+|------|------|---------|--------|
+| Round Robin | 轮询 | 通用 | 简单均匀 |
+| Weighted Round Robin | 加权轮询 | 异构服务器 | 按能力分配 |
+| Least Connections | 最少连接 | 长连接场景 | 避免过载 |
+| IP Hash | IP 哈希 | 会话保持 | 会话粘性 |
+| Random | 随机 | 简单场景 | 均匀性差 |
+
+### 负载均衡配置
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: custom-transport
+spec:
+  serverName: backend
+  insecureSkipVerify: false
+  maxIdleConnsPerHost: 200
+  forwardingTimeouts:
+    dialTimeout: 30s
+    responseHeaderTimeout: 60s
+    idleConnTimeout: 90s
+```
+
+## 十六、TLS 证书管理最佳实践
+
+| 证书类型 | 适用场景 | 自动续期 | 成本 |
+|----------|---------|---------|------|
+| Let's Encrypt | 公网域名 | 是(90天) | 免费 |
+| 自签名 | 内部服务 | 否 | 免费 |
+| 商业证书 | 企业域名 | 否 | 付费 |
+| CA 证书 | 内部 PKI | 否 | 自建 |
+
+### TLS 配置示例
+
+```yaml
+# TLSOption 配置
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: default
+spec:
+  minVersion: VersionTLS12
+  cipherSuites:
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+
+# TLS Store（默认证书）
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  namespace: traefik
+spec:
+  defaultCertificate:
+    secretName: wildcard-tls
+```
+
+## 十七、Traefik 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 502/503 | 后端 Pod 不健康 | 检查 readiness probe |
+| 证书过期 | Let's Encrypt 续期失败 | 检查 ACME 配置/存储 |
+| 路由不生效 | IngressRoute 语法错 | kubectl describe 检查 |
+| 性能差 | 中间件过多 | 精简中间件链 |
+| 连接超时 | 后端响应慢 | 调整超时配置 |
+
+## 十八、Traefik Enterprise 功能
+
+### Traefik Mesh（服务网格）
+
+| 特性 | 说明 |
+|------|------|
+| 架构 | 轻量级服务网格，无 sidecar |
+| 数据面 | Traefik 代理（与 Ingress 共用） |
+| 控制面 | Traefik Mesh Controller |
+| 负载均衡 | 加权轮询、最少连接 |
+| 熔断 | 连接数/延迟/错误率 |
+| 限流 | 全局/每服务 |
+| mTLS | 服务间加密（可选） |
+
+### Traefik Enterprise vs 开源版
+
+| 维度 | 开源版 | Enterprise |
+|------|--------|-----------|
+| 中间件 | 30+ 内置 | 50+ 内置 |
+| 服务网格 | 无 | Traefik Mesh |
+| 高级路由 | 基础 | 高级（镜像/灰度） |
+| 支持 | 社区 | 官方支持 |
+| 许可 | MIT | 商业许可 |
+
+## 十九、Traefik vs Nginx vs HAProxy vs Kong vs APISIX 选型
+
+| 维度 | Traefik | Nginx | HAProxy | Kong | APISIX |
+|------|---------|-------|---------|------|--------|
+| 部署方式 | 单二进制 | 模块化 | 单二进制 | 插件化 | 插件化 |
+| 配置方式 | 文件/API/CRD | 配置文件 | 配置文件 | Admin API | Admin API |
+| 服务发现 | 原生支持 | 无 | 无 | 无 | 原生支持 |
+| 性能 | 高 | 极高 | 极高 | 中高 | 高 |
+| 学习曲线 | 低 | 中 | 高 | 中 | 高 |
+| 社区生态 | 增长中 | 成熟 | 成熟 | 成熟 | 增长中 |
+| 适用场景 | K8s/Docker | 传统/静态 | 高性能 TCP | 企业 API | 云原生 API |
+
+### 选型决策
+
+```
+K8s 原生 + 自动证书 + 动态环境 → Traefik
+极致性能 + WAF + 混合环境 → Nginx
+高 TCP 负载均衡 → HAProxy
+企业级 API 治理 → Kong/APISIX
+轻量级微服务网关 → Traefik
+```
+
+## 与其他板块的关系
 
 - 网关选型总览见「[API 网关](./API网关.md)」；
 - Kong/APISIX 对比见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」；

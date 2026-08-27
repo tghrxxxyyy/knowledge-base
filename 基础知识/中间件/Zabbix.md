@@ -1143,6 +1143,307 @@ Widget 类型：
   ④ Agent 版本兼容性检查
 ```
 
+## 七、Zabbix Proxy 分布式架构
+
+### Proxy 架构
+
+| 组件 | 说明 |
+|------|------|
+| Proxy | 数据采集+缓存+转发 |
+| Server | 数据处理+告警+存储 |
+| Database | 监控数据存储 |
+| Frontend | Web 界面 |
+
+### Proxy 部署模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| 独立 Proxy | 独立监控 | 远程分支 |
+| 聚合 Proxy | 多 Proxy 聚合 | 大规模 |
+| 高可用 Proxy | 主备 Proxy | 关键业务 |
+
+### Proxy 配置
+
+```bash
+# Proxy 配置文件
+Server=zabbix-server
+Hostname=proxy-shanghai
+DBName=/var/lib/zabbix/proxy.sqlite
+DBUser=zabbix
+DBPassword=zabbix
+CacheSize=512M
+ConfigCacheSize=256M
+HistoryCacheSize=128M
+```
+
+### Proxy vs 直连
+
+| 维度 | Proxy | 直连 |
+|------|-------|------|
+| 网络要求 | 低（仅 Proxy→Server） | 高（每 Agent→Server） |
+| 安全性 | 高（Proxy 代理） | 中 |
+| 维护成本 | 中 | 低 |
+| 扩展性 | 好（横向扩展） | 差 |
+| 数据延迟 | 秒级 | 毫秒级 |
+
+## 八、Zabbix LLD 高级应用
+
+### LLD 规则高级配置
+
+```json
+{
+  "macros": [
+    {
+      "macro": "{$FS_NAME}",
+      "value": "/data",
+      "type": 0,
+      "description": "文件系统名称"
+    }
+  ],
+  "filters": [
+    {
+      "evaltype": 0,
+      "conditions": [
+        {
+          "macro": "#FSTYPE",
+          "operator": 8,
+          "value": "ext4|xfs"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### LLD 高级过滤
+
+| 过滤类型 | 说明 | 示例 |
+|----------|------|------|
+| 正则匹配 | 正则表达式 | #NAME match "web.*" |
+| 包含匹配 | 字符串包含 | #NAME contains "data" |
+| 范围匹配 | 数值范围 | #PORT in 1000-9999 |
+| 枚举匹配 | 枚举值 | #TYPE in "TCP,UDP" |
+
+## 九、Zabbix 自定义监控项
+
+### 自定义 Item 开发
+
+```bash
+# UserParameter 示例
+# /etc/zabbix/zabbix_agentd.d/custom.conf
+UserParameter=custom.cpu.load[*],top -bn1 | grep "load average:" | awk '{print $$'$1'}'
+UserParameter=custom.memory.usage[*],free -m | awk 'NR==2{printf "%.2f", $$3*100/$$2}'
+UserParameter=custom.disk.io[*],iostat -d $1 1 1 | tail -1 | awk '{print $$2}'
+```
+
+### 自定义 Agent
+
+```python
+# 自定义 Agent 开发
+import psutil
+import json
+
+def get_metrics():
+    metrics = {
+        "cpu_percent": psutil.cpu_percent(interval=1),
+        "memory_percent": psutil.virtual_memory().percent,
+        "disk_io": psutil.disk_io_counters()._asdict(),
+        "net_io": psutil.net_io_counters()._asdict()
+    }
+    return json.dumps(metrics)
+
+if __name__ == "__main__":
+    print(get_metrics())
+```
+
+## 十、Zabbix Dashboard 设计
+
+### Dashboard 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| 分层展示 | 概览→详情→下钻 |
+| 重点突出 | 关键指标突出显示 |
+| 实时更新 | 数据实时刷新 |
+| 告警可视化 | 告警状态直观展示 |
+
+### Dashboard 组件配置
+
+```json
+{
+  "widgets": [
+    {
+      "type": "clock",
+      "name": "当前时间",
+      "x": 0, "y": 0,
+      "width": 6, "height": 4
+    },
+    {
+      "type": "problemhosts",
+      "name": "故障主机",
+      "x": 6, "y": 0,
+      "width": 18, "height": 4
+    },
+    {
+      "type": "graph",
+      "name": "CPU 使用率",
+      "x": 0, "y": 4,
+      "width": 12, "height": 8,
+      "items": ["system.cpu.util"]
+    }
+  ]
+}
+```
+
+## 十一、Zabbix 容量规划
+
+### 容量规划公式
+
+```
+Agent 数量 = 每 Agent 平均 Item 数 × Agent 总数
+Item 数量 = 每 Item 平均更新间隔 × Item 总数
+Storage = 每 Item 每天数据量 × Item 总数 × 保留天数
+Memory = Item 数量 × 0.5KB（内存缓存）
+
+示例：
+  10000 Agent × 100 Item/Agent = 100万 Item
+  100万 Item × 60 次/天 × 60 天 = 36 亿条数据
+  36 亿条 × 0.5KB = 1.8TB（压缩后约 500GB）
+```
+
+### 容量规划模板
+
+| 资源 | 计算公式 | 示例值 |
+|------|----------|--------|
+| Agent 数 | 业务节点数 | 10000 |
+| Item 数 | Agent 数 × Item/Agent | 100万 |
+| Storage | Item 数 × 天数 × 数据量 | 500GB |
+| Memory | Item 数 × 缓存系数 | 4GB |
+| CPU | Item 数 × 更新频率 | 8核 |
+
+## 十二、Zabbix 版本升级
+
+### 升级策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 就地升级 | 直接升级 | 小版本升级 |
+| 并行部署 | 新旧并存 | 大版本升级 |
+| 蓝绿部署 | 停旧启新 | 高可用环境 |
+
+### 升级步骤
+
+```bash
+# 升级前备份
+mysqldump -u zabbix -p zabbix > zabbix_backup.sql
+
+# 升级步骤
+1. 升级 Server（先从后主）
+2. 升级 Proxy（逐个升级）
+3. 升级 Agent（批量升级）
+4. 升级 Frontend（最后升级）
+5. 验证功能
+```
+
+### 升级注意事项
+
+```
+升级注意：
+  1. 备份数据库和配置
+  2. 阅读 Release Notes（破坏性变更）
+  3. 测试环境先升级
+  4. 选择低峰期升级
+  5. 准备回滚方案
+  6. 升级后验证监控数据
+```
+
+## 十三、Zabbix vs Prometheus 深度对比
+
+| 维度 | Zabbix | Prometheus |
+|------|--------|-----------|
+| 架构 | Agent + Server | Server + Exporter |
+| 数据模型 | 指标 + LLD | 多维指标 |
+| 查询语言 | 表达式 | PromQL |
+| 存储 | 关系数据库 | 时序数据库 |
+| 可视化 | 内置 | Grafana |
+| 告警 | 内置 | Alertmanager |
+| 扩展性 | Proxy | 联邦/远程存储 |
+| 云原生 | 弱 | 强 |
+
+### 选型决策
+
+```
+选 Zabbix：
+  1. 传统运维环境
+  2. 需要完整监控套件
+  3. 需要企业级支持
+  4. 需要复杂告警逻辑
+
+选 Prometheus：
+  1. 云原生环境
+  2. 需要多维指标
+  3. 需要灵活查询
+  4. 需要与 Kubernetes 集成
+```
+
+## 十四、Zabbix API 自动化
+
+### API 使用示例
+
+```python
+import requests
+import json
+
+# 登录
+url = "http://zabbix-server/api_jsonrpc.php"
+payload = {
+    "jsonrpc": "2.0",
+    "method": "user.login",
+    "params": {
+        "user": "Admin",
+        "password": "zabbix"
+    },
+    "id": 1
+}
+response = requests.post(url, json=payload)
+auth = response.json()["result"]
+
+# 获取主机列表
+payload = {
+    "jsonrpc": "2.0",
+    "method": "host.get",
+    "params": {
+        "output": ["hostid", "host"],
+        "selectInterfaces": ["ip"]
+    },
+    "auth": auth,
+    "id": 2
+}
+response = requests.post(url, json=payload)
+hosts = response.json()["result"]
+```
+
+### API 自动化场景
+
+| 场景 | 说明 |
+|------|------|
+| 批量创建 | 批量创建主机/模板 |
+| 自动发现 | 自动发现并监控 |
+| 报告生成 | 定期生成监控报告 |
+| 告警处理 | 自动处理告警 |
+| 配置同步 | 多环境配置同步 |
+
+## 十五、Zabbix 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| Agent 无法连接 | 防火墙/网络 | 检查网络/防火墙 |
+| 数据缺失 | Item 配置错误 | 检查 Item 配置 |
+| 告警风暴 | 阈值设置不当 | 调整阈值/依赖 |
+| 性能差 | 数据量过大 | 分 Proxy/优化配置 |
+| 磁盘满 | 数据保留过长 | 缩短保留期/扩容 |
+| 内存溢出 | 缓存不足 | 增加 CacheSize |
+
 ## 七、与其他板块的关系
 
 - 云原生监控对比见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；

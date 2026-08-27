@@ -1506,3 +1506,179 @@ defaults
     复用率：连接复用比例
     错误率：连接错误比例
 ```
+
+## 十七、负载均衡算法详解
+
+### 17.1 算法对比
+
+| 算法 | 说明 | 适用场景 | 优点 | 缺点 |
+|------|------|---------|------|------|
+| roundrobin | 轮询 | 通用场景 | 简单均匀 | 不考虑服务器性能 |
+| leastconn | 最少连接 | 长连接/数据库 | 动态均衡 | 有状态开销 |
+| source | 源地址哈希 | 会话保持 | 会话粘滞 | 分布不均 |
+| uri | URI 哈希 | 缓存代理 | 缓存友好 | 需要相同URI |
+| hdr | Header 哈希 | 多租户 | 灵活路由 | 需要Header |
+| random | 随机 | 大规模集群 | 简单快速 | 不保证均匀 |
+| tsource | 三层源地址哈希 | 会话保持增强 | 更均匀 | 复杂度高 |
+
+### 17.2 算法配置示例
+
+```ini
+# 轮询（默认）
+backend web_back
+    balance roundrobin
+    server server1 192.168.1.10:80 check weight 3
+    server server2 192.168.1.11:80 check weight 2
+    server server3 192.168.1.12:80 check weight 1
+
+# 最少连接
+backend db_back
+    balance leastconn
+    server db1 192.168.1.20:3306 check
+    server db2 192.168.1.21:3306 check
+
+# 源地址哈希（会话保持）
+backend app_back
+    balance source
+    hash-type consistent  # 一致性哈希，减少迁移
+    server app1 192.168.1.30:8080 check
+    server app2 192.168.1.31:8080 check
+
+# URI 哈希（缓存代理）
+backend cache_back
+    balance uri
+    hash-type consistent
+    server cache1 192.168.1.40:6379 check
+    server cache2 192.168.1.41:6379 check
+
+# Header 哈希
+backend tenant_back
+    balance hdr(X-Tenant-ID)
+    hash-type consistent
+    server t1 192.168.1.50:8080 check
+    server t2 192.168.1.51:8080 check
+```
+
+### 17.3 一致性哈希配置
+
+```ini
+# 一致性哈希（推荐用于生产环境）
+backend app_back
+    balance source
+    hash-type consistent  # 一致性哈希
+    hash-method murmur2    # 哈希算法（murmur2/crc32）
+    server app1 192.168.1.30:8080 check
+    server app2 192.168.1.31:8080 check
+    server app3 192.168.1.32:8080 check
+```
+
+### 17.4 算法选型决策
+
+```
+负载均衡算法选型：
+  通用Web服务 → roundrobin（轮询）
+  长连接/数据库 → leastconn（最少连接）
+  会话保持 → source（源地址哈希）
+  缓存代理 → uri（URI哈希）
+  多租户 → hdr（Header哈希）
+  大规模集群 → random（随机）
+  生产环境 → 一致性哈希（hash-type consistent）
+```
+
+## 十八、HAProxy vs Nginx L4 性能对比基准
+
+### 18.1 性能对比表
+
+| 指标 | HAProxy | Nginx | 说明 |
+|------|---------|-------|------|
+| 最大并发连接 | 50万+ | 50万+ | 均可配置 |
+| 每秒新建连接 | 10万+ | 10万+ | 取决于硬件 |
+| L4 吞吐量 | 40-60 Gbps | 30-50 Gbps | HAProxy 略优 |
+| L7 吞吐量 | 30-50 Gbps | 40-60 Gbps | Nginx 略优 |
+| 内存占用 | 低（~50MB） | 中（~100MB） | HAProxy 更轻 |
+| CPU 占用 | 低 | 中 | HAProxy 更高效 |
+| 配置复杂度 | 中 | 低 | Nginx 更简单 |
+| 健康检查 | 内置丰富 | 需要第三方模块 | HAProxy 更强 |
+| 热重载 | 支持 | 支持 | 均支持 |
+| WebSocket | 支持 | 支持 | 均支持 |
+| HTTP/2 | 支持 | 支持 | 均支持 |
+| gRPC | 支持 | 支持 | 均支持 |
+
+### 18.2 适用场景对比
+
+| 场景 | HAProxy | Nginx | 推荐 |
+|------|---------|-------|------|
+| L4 负载均衡 | 强项 | 一般 | HAProxy |
+| L7 HTTP 代理 | 强项 | 强项 | 均可 |
+| 反向代理 | 一般 | 强项 | Nginx |
+| 静态文件服务 | 不支持 | 强项 | Nginx |
+| API 网关 | 强项 | 一般 | HAProxy |
+| SSL 终结 | 支持 | 支持 | 均可 |
+| WebSocket 代理 | 支持 | 支持 | 均可 |
+| 会话保持 | 支持 | 支持 | HAProxy |
+| 健康检查 | 丰富 | 基础 | HAProxy |
+| 统计监控 | 内置 | 需插件 | HAProxy |
+
+### 18.3 选型决策树
+
+```
+负载均衡选型：
+  纯 L4 TCP 负载均衡 → HAProxy（性能更优）
+  L7 HTTP 代理 → HAProxy 或 Nginx（均可）
+  静态文件服务 → Nginx
+  反向代理 → Nginx
+  API 网关 → HAProxy
+  微服务网关 → HAProxy（健康检查强）
+  需要统计监控 → HAProxy
+  配置简单优先 → Nginx
+  性能优先 → HAProxy（L4）
+  生态丰富 → Nginx
+```
+
+### 18.4 性能测试基准
+
+```bash
+# wrk 基准测试命令
+wrk -t12 -c400 -d30s http://localhost:8080/
+
+# HAProxy 配置优化
+global
+    maxconn 100000
+    nbthread 4  # CPU核心数
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    option httplog
+    option dontlognull
+    option http-server-close
+    option forwardfor
+
+frontend http-in
+    bind *:80
+    default_backend servers
+
+backend servers
+    balance roundrobin
+    option httpchk GET /healthz
+    server server1 192.168.1.10:8080 check inter 2s rise 2 fall 3
+    server server2 192.168.1.11:8080 check inter 2s rise 2 fall 3
+```
+
+### 18.5 性能优化清单
+
+```
+HAProxy 性能优化：
+  1. 调整 maxconn（最大连接数）
+  2. 调整 nbthread（线程数）
+  3. 启用 HTTP 长连接（option http-keep-alive）
+  4. 调整超时时间（timeout connect/client/server）
+  5. 启用统计页面（stats enable）
+  6. 调整后端服务器权重（weight）
+  7. 启用连接复用（option http-server-close）
+  8. 调整缓冲区大小（tune.bufsize）
+  9. 启用内核优化（net.core.somaxconn）
+  10. 监控关键指标（连接数、会话率、错误率）
+```

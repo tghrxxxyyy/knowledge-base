@@ -1137,6 +1137,727 @@ access_by_lua_block {
   复杂网关 → OpenResty + Kong/APISIX
 ```
 
+---
+
+## lua-resty-limit-traffic 流量控制
+
+### 限流器类型
+
+| 类型 | 说明 | 适用场景 |
+|------|------|----------|
+| limit_req | 请求速率限制 | API 限流 |
+| limit_conn | 并发连接限制 | 下载限流 |
+| limit_traffic | 流量大小限制 | 带宽控制 |
+
+### limit_req 示例
+
+```nginx
+lua_shared_dict rate_limit 10m;
+
+server {
+    location /api/ {
+        access_by_lua_block {
+            local limit_req = require "resty.limit.req"
+
+            -- 创建限流器：每秒10个请求，突发20个
+            local lim, err = limit_req.new("rate_limit", 10, 20)
+            if not lim then
+                ngx.log(ngx.ERR, "failed to create rate limiter: ", err)
+                return ngx.exit(500)
+            end
+
+            -- 按客户端IP限流
+            local key = ngx.var.binary_remote_addr
+            local delay, err = lim:incoming(key, true)
+            if not delay then
+                if err == "rejected" then
+                    ngx.log(ngx.WARN, "rate limited: ", key)
+                    return ngx.exit(429)
+                end
+                ngx.log(ngx.ERR, "failed to limit req: ", err)
+                return ngx.exit(500)
+            end
+
+            -- delay > 0 表示需要延迟处理
+            if delay >= 0.001 then
+                ngx.sleep(delay)
+            end
+        }
+
+        proxy_pass http://backend;
+    }
+}
+```
+
+### limit_conn 示例
+
+```nginx
+lua_shared_dict conn_limit 10m;
+
+server {
+    location /download/ {
+        access_by_lua_block {
+            local limit_conn = require "resty.limit.conn"
+
+            -- 创建连接限制器：最大5个并发连接
+            local lim, err = limit_conn.new("conn_limit", 5, 10, 0.5)
+            -- 参数：共享字典名, 最大连接数, 预估连接数, 延迟(秒)
+            if not lim then
+                ngx.log(ngx.ERR, "failed to create conn limiter: ", err)
+                return ngx.exit(500)
+            end
+
+            local key = ngx.var.binary_remote_addr
+            local delay, err = lim:incoming(key, true)
+            if not delay then
+                if err == "rejected" then
+                    return ngx.exit(429)
+                end
+                ngx.log(ngx.ERR, "failed to limit conn: ", err)
+                return ngx.exit(500)
+            end
+
+            if delay >= 0.001 then
+                ngx.sleep(delay)
+            end
+        }
+
+        proxy_pass http://backend;
+    }
+}
+```
+
+---
+
+## lua-resty-http HTTP 客户端
+
+### 基础用法
+
+```lua
+local http = require "resty.http"
+local httpc = http.new()
+
+-- 简单 GET 请求
+local res, err = httpc:request_uri("http://example.com/api", {
+    method = "GET",
+    headers = {
+        ["Content-Type"] = "application/json",
+    },
+})
+
+if not res then
+    ngx.log(ngx.ERR, "request failed: ", err)
+    return ngx.exit(500)
+end
+
+ngx.say("Status: ", res.status)
+ngx.say("Body: ", res.body)
+```
+
+### 高级用法
+
+```lua
+local http = require "resty.http"
+local httpc = http.new()
+
+-- 设置超时
+httpc:set_timeout(5000)  -- 5秒
+
+-- 连接池复用
+local ok, err = httpc:connect("example.com", 443)
+if not ok then
+    return ngx.exit(500)
+end
+
+-- SSL 验证
+local session, err = httpc:ssl_handshake(nil, "example.com", true)
+
+-- POST JSON
+local cjson = require "cjson"
+local res, err = httpc:request({
+    method = "POST",
+    path = "/api/data",
+    headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer token123",
+    },
+    body = cjson.encode({key = "value"}),
+})
+
+-- 连接池回收
+httpc:set_keepalive(60000, 100)  -- 60秒, 最大100个连接
+```
+
+### 负载均衡
+
+```lua
+local http = require "resty.http"
+local balancer = require "resty.balance"
+
+local endpoints = {
+    { host = "10.0.0.1", port = 8080 },
+    { host = "10.0.0.2", port = 8080 },
+    { host = "10.0.0.3", port = 8080 },
+}
+
+-- 轮询选择
+local idx = ngx.var.connection_serial % #endpoints + 1
+local endpoint = endpoints[idx]
+
+local httpc = http.new()
+local res, err = httpc:request_uri(
+    string.format("http://%s:%d/api", endpoint.host, endpoint.port),
+    { method = "GET" }
+)
+```
+
+---
+
+## lua-resty-jwt JWT 认证
+
+### JWT 验证
+
+```lua
+local jwt = require "resty.jwt"
+local cjson = require "cjson"
+
+local secret = "your-secret-key"
+local token = ngx.var.http_Authorization
+
+if not token then
+    ngx.status = 401
+    ngx.say(cjson.encode({error = "Missing token"}))
+    return ngx.exit(401)
+end
+
+-- 提取 Bearer Token
+token = token:match("Bearer%s+(.+)")
+if not token then
+    ngx.status = 401
+    ngx.say(cjson.encode({error = "Invalid token format"}))
+    return ngx.exit(401)
+end
+
+-- 验证 JWT
+local jwt_obj = jwt:verify(secret, token)
+if not jwt_obj.verified then
+    ngx.status = 401
+    ngx.say(cjson.encode({error = jwt_obj.reason}))
+    return ngx.exit(401)
+end
+
+-- 检查过期
+local exp = jwt_obj.payload.exp
+if exp and exp < ngx.time() then
+    ngx.status = 401
+    ngx.say(cjson.encode({error = "Token expired"}))
+    return ngx.exit(401)
+end
+
+-- 传递用户信息到后端
+ngx.req.set_header("X-User-ID", jwt_obj.payload.sub)
+ngx.req.set_header("X-User-Role", jwt_obj.payload.role)
+```
+
+### JWT 生成
+
+```lua
+local jwt = require "resty.jwt"
+local cjson = require "cjson"
+
+local secret = "your-secret-key"
+
+local payload = {
+    sub = "user123",
+    role = "admin",
+    iat = ngx.time(),
+    exp = ngx.time() + 3600,  -- 1小时过期
+}
+
+local token = jwt:sign(secret, {
+    header = {alg = "HS256", typ = "JWT"},
+    payload = payload,
+})
+
+ngx.say(cjson.encode({token = token}))
+```
+
+---
+
+## 日志格式化与采集
+
+### 结构化日志
+
+```lua
+local cjson = require "cjson"
+
+local log_data = {
+    timestamp = ngx.now(),
+    request_id = ngx.var.request_id,
+    remote_addr = ngx.var.remote_addr,
+    request_method = ngx.var.request_method,
+    request_uri = ngx.var.request_uri,
+    status = ngx.status,
+    body_bytes_sent = ngx.var.body_bytes_sent,
+    request_time = ngx.var.request_time,
+    upstream_response_time = ngx.var.upstream_response_time,
+    upstream_addr = ngx.var.upstream_addr,
+    http_user_agent = ngx.var.http_user_agent,
+    http_referer = ngx.var.http_referer,
+    -- 业务字段
+    user_id = ngx.var.user_id,
+    api_version = ngx.var.api_version,
+    response_code = ngx.var.response_code,
+}
+
+-- 写入日志文件
+ngx.log(ngx.INFO, cjson.encode(log_data))
+
+-- 写入共享字典（用于统计）
+local stats = ngx.shared.stats
+stats:incr("request_count", 1, 0)
+stats:incr("error_count", 1, 0)
+stats:set("last_request_time", ngx.var.request_time)
+```
+
+### 日志采集架构
+
+```text
+OpenResty 日志采集：
+  1. 本地日志文件
+     → Filebeat 采集 → Logstash 解析 → Elasticsearch 存储 → Kibana 展示
+
+  2. 直接写入 Kafka
+     → kafka-resty 库 → Kafka → Flink 消费 → 实时分析
+
+  3. 写入 Loki
+     → promtail 采集 → Loki 存储 → Grafana 展示
+
+  4. 写入 ClickHouse
+     → lua-resty-clickhouse → ClickHouse → 实时分析
+```
+
+---
+
+## WAF 规则实现
+
+### SQL 注入检测
+
+```lua
+local function check_sql_injection(input)
+    if not input then return false end
+
+    local patterns = {
+        "'%s*or%s+",
+        "union%s+all",
+        "select%s+.*%s+from",
+        "insert%s+into",
+        "delete%s+from",
+        "drop%s+table",
+        "update%s+.*%s+set",
+        "exec%s+xp_",
+        "exec%s+sp_",
+    }
+
+    for _, pattern in ipairs(patterns) do
+        if input:lower():match(pattern) then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- 检查请求参数
+local args = ngx.req.get_uri_args()
+for key, value in pairs(args) do
+    if check_sql_injection(value) then
+        ngx.log(ngx.WARN, "SQL injection detected: ", key, "=", value)
+        ngx.exit(403)
+        return
+    end
+end
+```
+
+### XSS 检测
+
+```lua
+local function check_xss(input)
+    if not input then return false end
+
+    local patterns = {
+        "<script",
+        "javascript:",
+        "on%s*%w+%s*=",
+        "<iframe",
+        "<object",
+        "<embed",
+        "eval%s*(",
+        "document%.cookie",
+        "document%.write",
+    }
+
+    for _, pattern in ipairs(patterns) do
+        if input:lower():match(pattern) then
+            return true
+        end
+    end
+
+    return false
+end
+```
+
+### IP 黑名单
+
+```lua
+local ip_blacklist = ngx.shared.ip_blacklist
+
+local function check_ip_blacklist()
+    local client_ip = ngx.var.remote_addr
+
+    if ip_blacklist:get(client_ip) then
+        ngx.log(ngx.WARN, "blocked IP: ", client_ip)
+        ngx.exit(403)
+        return true
+    end
+
+    return false
+end
+
+-- 定期加载黑名单
+local function load_blacklist()
+    local httpc = require("resty.http").new()
+    local res = httpc:request_uri("http://blacklist-api/blocked-ips")
+    if res and res.status == 200 then
+        local cjson = require("cjson")
+        local ips = cjson.decode(res.body)
+        for _, ip in ipairs(ips) do
+            ip_blacklist:set(ip, true, 3600)  -- 1小时过期
+        end
+    end
+end
+```
+
+---
+
+## Nginx vs OpenResty 性能对比
+
+| 场景 | Nginx | OpenResty | 差异 |
+|------|-------|-----------|------|
+| 静态文件服务 | 100% | 100% | 无差异 |
+| 反向代理 | 100% | 99.5% | <1% |
+| 简单Lua逻辑 | - | 98% | 微小开销 |
+| 复杂Lua逻辑 | - | 90-95% | 取决于复杂度 |
+| 共享字典读写 | - | 99% | 锁竞争极小 |
+| HTTP 客户端调用 | - | 95% | 网络IO开销 |
+| JWT 验证 | - | 98% | 加密计算 |
+
+```text
+性能优化建议：
+  1. 避免在热路径中进行复杂计算
+  2. 使用共享字典缓存频繁访问的数据
+  3. 复用 HTTP 连接（连接池）
+  4. 使用 cosocket 异步IO（不阻塞事件循环）
+  5. 减少日志输出（避免在热路径中写日志）
+  6. 使用 LuaJIT 的 FFI 调用 C 库
+```
+
+---
+
+## lua-resty-mysql 数据库访问
+
+### 基础查询
+
+```lua
+local mysql = require "resty.mysql"
+local cjson = require "cjson"
+
+local db, err = mysql:new()
+if not db then
+    ngx.log(ngx.ERR, "failed to create mysql: ", err)
+    return ngx.exit(500)
+end
+
+db:set_timeout(1000)  -- 1秒超时
+
+local ok, err, errno, sqlstate = db:connect({
+    host = "127.0.0.1",
+    port = 3306,
+    database = "mydb",
+    user = "root",
+    password = "password",
+    charset = "utf8",
+    max_packet_size = 1024 * 1024,
+})
+
+if not ok then
+    ngx.log(ngx.ERR, "failed to connect: ", err, ": ", errno, " ", sqlstate)
+    return ngx.exit(500)
+end
+
+-- 执行查询
+local res, err, errno, sqlstate = db:query("SELECT * FROM users WHERE id = ?", {1})
+if not res then
+    ngx.log(ngx.ERR, "query error: ", err, ": ", errno, " ", sqlstate)
+    return ngx.exit(500)
+end
+
+-- 处理结果
+for i, row in ipairs(res) do
+    ngx.say("User: ", row.name, " Email: ", row.email)
+end
+
+-- 连接池回收
+local ok, err = db:set_keepalive(60000, 100)
+if not ok then
+    ngx.log(ngx.ERR, "failed to set keepalive: ", err)
+end
+```
+
+### 预编译语句
+
+```lua
+-- 防止 SQL 注入
+local stmt, err = db:prepare("INSERT INTO users (name, email) VALUES (?, ?)")
+if stmt then
+    local res, err = stmt:execute({"John", "john@example.com"})
+    stmt:close()
+end
+```
+
+---
+
+## lua-resty-redis 缓存集成
+
+### Redis 基础操作
+
+```lua
+local redis = require "resty.redis"
+local cjson = require "cjson"
+
+local red, err = redis:new()
+if not red then
+    ngx.log(ngx.ERR, "failed to create redis: ", err)
+    return ngx.exit(500)
+end
+
+red:set_timeout(1000)  -- 1秒超时
+
+local ok, err = red:connect("127.0.0.1", 6379)
+if not ok then
+    ngx.log(ngx.ERR, "failed to connect: ", err)
+    return ngx.exit(500)
+end
+
+-- 认证（如果需要）
+-- local ok, err = red:auth("password")
+
+-- 选择数据库
+-- local ok, err = red:select(0)
+
+-- 设置值
+local ok, err = red:set("key", "value")
+local ok, err = red:setex("key", 3600, "value")  -- 带过期时间
+
+-- 获取值
+local res, err = red:get("key")
+
+-- Hash 操作
+red:hset("user:1", "name", "John", "email", "john@example.com")
+local user = red:hgetall("user:1")
+
+-- 列表操作
+red:lpush("queue", "task1")
+red:lpush("queue", "task2")
+local task = red:rpop("queue")
+
+-- 集合操作
+red:sadd("tags", "lua", "nginx", "redis")
+local members = red:smembers("tags")
+
+-- 连接池回收
+local ok, err = red:set_keepalive(60000, 100)
+```
+
+### Redis 缓存模式
+
+```lua
+local redis = require "resty.redis"
+local cjson = require "cjson"
+
+local function get_from_cache(key)
+    local red = redis:new()
+    red:connect("127.0.0.1", 6379)
+
+    local res, err = red:get(key)
+    red:set_keepalive(60000, 100)
+
+    if res and res ~= ngx.null then
+        return cjson.decode(res)
+    end
+
+    return nil
+end
+
+local function set_to_cache(key, value, ttl)
+    local red = redis:new()
+    red:connect("127.0.0.1", 6379)
+
+    local ok, err = red:setex(key, ttl, cjson.encode(value))
+    red:set_keepalive(60000, 100)
+
+    return ok
+end
+
+-- 使用示例
+local cache_key = "user:" .. user_id
+local user = get_from_cache(cache_key)
+
+if not user then
+    -- 缓存未命中，查询数据库
+    user = query_database(user_id)
+    -- 写入缓存
+    set_to_cache(cache_key, user, 3600)
+end
+```
+
+---
+
+## 网关模式实现
+
+### 统一鉴权网关
+
+```lua
+local jwt = require "resty.jwt"
+
+-- 白名单路径（不需要鉴权）
+local white_list = {
+    ["/api/login"] = true,
+    ["/api/register"] = true,
+    ["/api/public"] = true,
+}
+
+-- 权限配置
+local permissions = {
+    ["/api/admin"] = {"admin"},
+    ["/api/user"] = {"admin", "user"},
+    ["/api/order"] = {"admin", "user", "guest"},
+}
+
+access_by_lua_block {
+    local path = ngx.var.uri
+
+    -- 白名单直接放行
+    if white_list[path] then
+        return
+    end
+
+    -- 验证 JWT
+    local token = ngx.var.http_Authorization
+    if not token then
+        ngx.status = 401
+        ngx.say('{"error":"Missing token"}')
+        return ngx.exit(401)
+    end
+
+    token = token:match("Bearer%s+(.+)")
+    local jwt_obj = jwt:verify("secret", token)
+    if not jwt_obj.verified then
+        ngx.status = 401
+        ngx.say('{"error":"Invalid token"}')
+        return ngx.exit(401)
+    end
+
+    -- 检查权限
+    local required_roles = permissions[path]
+    if required_roles then
+        local user_role = jwt_obj.payload.role
+        local has_role = false
+        for _, role in ipairs(required_roles) do
+            if role == user_role then
+                has_role = true
+                break
+            end
+        end
+
+        if not has_role then
+            ngx.status = 403
+            ngx.say('{"error":"Insufficient permissions"}')
+            return ngx.exit(403)
+        end
+    end
+
+    -- 传递用户信息到后端
+    ngx.req.set_header("X-User-ID", jwt_obj.payload.sub)
+    ngx.req.set_header("X-User-Role", jwt_obj.payload.role)
+}
+```
+
+### 限流熔断网关
+
+```lua
+local limit_req = require "resty.limit.req"
+local limit_conn = require "resty.limit.conn"
+local circuit_breaker = require "circuit_breaker"
+
+-- 请求限流
+local rate_limiter = limit_req.new("rate_limit", 100, 200)  -- 100r/s, 突发200
+
+-- 连接限流
+local conn_limiter = limit_conn.new("conn_limit", 1000, 500, 0.5)
+
+-- 熔断器
+local cb = circuit_breaker.new({
+    failure_threshold = 5,    -- 失败5次触发熔断
+    recovery_timeout = 30,    -- 30秒后尝试恢复
+    half_open_max = 3,        -- 半开状态最多3个请求
+})
+
+access_by_lua_block {
+    local key = ngx.var.remote_addr
+
+    -- 请求限流
+    local delay, err = rate_limiter:incoming(key, true)
+    if not delay then
+        if err == "rejected" then
+            ngx.status = 429
+            ngx.say('{"error":"Rate limit exceeded"}')
+            return ngx.exit(429)
+        end
+        ngx.exit(500)
+    end
+
+    -- 连接限流
+    local delay, err = conn_limiter:incoming(key, true)
+    if not delay then
+        if err == "rejected" then
+            ngx.status = 429
+            ngx.say('{"error":"Connection limit exceeded"}')
+            return ngx.exit(429)
+        end
+        ngx.exit(500)
+    end
+
+    -- 熔断器检查
+    if not cb:allow_request() then
+        ngx.status = 503
+        ngx.say('{"error":"Service unavailable (circuit breaker open)"}')
+        return ngx.exit(503)
+    end
+}
+
+-- 请求完成后更新熔断器
+log_by_lua_block {
+    if ngx.status >= 500 then
+        cb:record_failure()
+    else
+        cb:record_success()
+    end
+}
+```
+
+---
+
 ## 九、与其他板块的关系
 
 - 网关体系见「[Kong 与 APISIX 网关](./Kong与APISIX网关.md)」与「[Spring Cloud Gateway](./SpringCloudGateway.md)」；

@@ -740,6 +740,374 @@ pbm config --set storage.type=s3 && pbm backup --type=physical
 
 ---
 
+## 补充：分片键选择（zone/shardKey/index约束）
+
+### 分片键选择原则
+
+```text
+分片键选择原则：
+  高基数（Cardinality）：
+    分片键值种类多，分布均匀
+    避免"热分片"
+  
+  写分布均匀：
+    避免所有写集中到单个分片
+    使用哈希分片（hashered）分布更均匀
+  
+  查询隔离（Query Isolation）：
+    大多数查询包含分片键
+    避免跨分片查询（scatter-gather）
+  
+  低开销（Low Overhead）：
+    分片键大小适中（16-64字节）
+    避免复合分片键过于复杂
+
+  常见分片键：
+    userId：用户数据按用户分片
+    orderId：订单数据按订单ID分片
+    timestamp：时序数据按时间范围分片
+    GeoHash：地理数据按经纬度分片
+```
+
+### 哈希分片 vs 范围分片
+
+| 维度 | 哈希分片 | 范围分片 |
+|------|---------|---------|
+| 分布 | 均匀（随机） | 可能不均匀 |
+| 写热点 | 无 | 有（递增ID写单片） |
+| 范围查询 | 跨分片（效率低） | 单片（效率高） |
+| 适用 | 高并发写入 | 范围查询多 |
+| 示例 | `{_id: hashed}` | `{created_at: 1}` |
+
+### 分片键配置
+
+```javascript
+// 哈希分片
+sh.shardCollection("mydb.users", {_id: "hashed"})
+
+// 范围分片
+sh.shardCollection("mydb.logs", {created_at: 1})
+
+// 复合分片键
+sh.shardCollection("mydb.events", {userId: 1, timestamp: 1})
+
+// 查看分片分布
+sh.status()
+```
+
+## 补充：Change Streams（实时变更监听）
+
+### Change Streams架构
+
+```text
+Change Streams工作原理：
+  1. 基于Oplog实现
+  2. 提供增量变更流
+  3. 支持resume token（断点续传）
+  4. 支持聚合管道过滤
+  
+  事件类型：
+    insert：插入文档
+    update：更新文档
+    replace：替换文档
+    delete：删除文档
+    drop：删除集合
+    invalidate：集合被删除/重命名
+  
+  使用场景：
+    实时数据同步（ETL）
+    事件驱动架构
+    实时搜索索引
+    数据变更通知
+```
+
+```javascript
+// Change Streams示例
+const changeStream = db.users.watch([
+  {$match: {"operationType": {$in: ["insert", "update"]}}},
+  {$project: {"fullDocument": 1, "operationType": 1, "ns": 1}}
+]);
+
+changeStream.on("change", (change) => {
+  console.log("变更:", change.operationType, change.fullDocument);
+});
+
+// Resume token断点续传
+const resumeToken = changeStream.resumeToken;
+// 重启时传入resumeAfter
+const newStream = db.users.watch([], {resumeAfter: resumeToken});
+```
+
+## 补充：Atlas Search（全文搜索引擎）
+
+### Atlas Search架构
+
+```text
+Atlas Search架构：
+  基于Apache Lucene实现
+  集成MongoDB Atlas云服务
+  支持中文分词（jieba/IK）
+  支持模糊搜索、高亮、聚合
+  
+  常用操作符：
+    text：全文搜索
+    autocomplete：自动补全
+    regex：正则匹配
+    range：范围查询
+    exists：字段存在性
+    compound：复合查询（must/should/mustNot）
+```
+
+```javascript
+// Atlas Search索引创建
+db.users.createSearchIndex({
+  name: "default",
+  definition: {
+    mappings: {
+      dynamic: true,
+      fields: {
+        name: {type: "string"},
+        email: {type: "string"},
+        bio: {type: "string", analyzer: "luceneStandard"}
+      }
+    }
+  }
+});
+
+// 搜索查询
+db.users.aggregate([
+  {$search: {
+    index: "default",
+    compound: {
+      must: [
+        {text: {query: "张三", path: "name"}},
+        {text: {query: "北京", path: "address"}}
+      ]
+    },
+    highlight: {path: "bio"}
+  }},
+  {$project: {name: 1, email: 1, score: {$meta: "searchScore"}}}
+]);
+```
+
+## 补充：聚合管道（$lookup/$unwind/$facet）
+
+### 聚合管道详解
+
+| 阶段 | 功能 | 示例 |
+|------|------|------|
+| $match | 过滤 | `{status: "active"}` |
+| $group | 分组 | `{_id: "$userId", total: {$sum: "$amount"}}` |
+| $sort | 排序 | `{total: -1}` |
+| $project | 投影 | `{name: 1, total: 1}` |
+| $lookup | 关联 | `{from: "orders", localField: "_id", foreignField: "userId"}` |
+| $unwind | 展开数组 | `{path: "$tags"}` |
+| $facet | 多分支聚合 | 按不同维度聚合 |
+| $bucket | 桶分组 | 按范围分组统计 |
+
+```javascript
+// 聚合管道示例：用户订单统计
+db.orders.aggregate([
+  {$match: {status: "completed"}},
+  {$group: {
+    _id: "$userId",
+    totalAmount: {$sum: "$amount"},
+    orderCount: {$sum: 1},
+    avgAmount: {$avg: "$amount"}
+  }},
+  {$sort: {totalAmount: -1}},
+  {$limit: 10},
+  {$lookup: {
+    from: "users",
+    localField: "_id",
+    foreignField: "_id",
+    as: "user"
+  }},
+  {$unwind: "$user"},
+  {$project: {
+    userId: "$_id",
+    userName: "$user.name",
+    totalAmount: 1,
+    orderCount: 1,
+    avgAmount: 1
+  }}
+]);
+```
+
+## 补充：MongoDB事务限制（多文档事务/会话）
+
+### 事务限制
+
+```text
+MongoDB事务限制：
+  单文档事务：原子性，无需显式开启
+  多文档事务（4.0+）：需要显式开启
+  
+  限制：
+    事务内存上限：64MB（超过会报错）
+    事务超时：默认60秒（可配置）
+    跨分片事务：4.2+支持（需enableSharding）
+    读写分离：从节点读可能延迟（readConcern: majority）
+    操作数限制：每个事务最多1000个操作
+  
+  最佳实践：
+    保持事务尽可能小
+    避免在事务中做外部调用
+    合理设置超时时间
+    使用readConcern: majority保证一致性
+```
+
+```javascript
+// 事务示例
+const session = client.startSession();
+try {
+  session.startTransaction({
+    readConcern: {level: "majority"},
+    writeConcern: {w: "majority"},
+    readPreference: "primary",
+    maxTimeMS: 30000
+  });
+  
+  await db.orders.insertOne({userId: "user1", amount: 100}, {session});
+  await db.accounts.updateOne(
+    {userId: "user1"},
+    {$inc: {balance: -100}},
+    {session}
+  );
+  
+  await session.commitTransaction();
+} catch (error) {
+  await session.abortTransaction();
+  throw error;
+} finally {
+  session.endSession();
+}
+```
+
+## 补充：MongoDB备份与恢复（mongodump/mongorestore）
+
+### 备份策略对比
+
+| 方法 | 适用场景 | 一致性 | 备份速度 | 恢复速度 |
+|------|---------|--------|----------|----------|
+| mongodump | 逻辑备份 | 单实例快照 | 中 | 中 |
+| 文件拷贝 | 物理备份 | 需停服 | 快 | 快 |
+| LVM快照 | LVM存储 | 快照级别 | 快 | 快 |
+| Ops Manager | 生产环境 | 自动 | 快 | 快 |
+| Atlas备份 | Atlas集群 | 自动 | 快 | 快 |
+
+```bash
+# 完整备份
+mongodump --uri="mongodb://localhost:27017" \
+  --db=mydb \
+  --out=/backup/$(date +%Y%m%d)
+
+# 增量备份（Oplog）
+mongodump --uri="mongodb://localhost:27017" \
+  --db=mydb \
+  --oplog \
+  --out=/backup/oplog
+
+# 恢复
+mongorestore --uri="mongodb://localhost:27017" \
+  --db=mydb \
+  --drop \
+  /backup/mydb
+
+# 恢复指定集合
+mongorestore --uri="mongodb://localhost:27017" \
+  --db=mydb \
+  --collection=users \
+  --drop \
+  /backup/mydb/users.bson
+```
+
+## 补充：分片集群架构（mongos/config/replica set）
+
+### 分片集群组件
+
+```text
+分片集群组件：
+  mongos：路由器，接收客户端请求
+    部署多个（无状态）
+    缓存config server元数据
+    路由请求到目标分片
+  
+  config server：存储元数据（副本集）
+    存储分片信息、块分布、用户权限
+    3节点副本集（推荐）
+    启用journal持久化
+  
+  shard：数据分片（副本集）
+    每个分片是一个副本集
+    存储实际数据
+    支持水平扩展
+  
+  数据流：
+    客户端 → mongos → shard → 数据
+    config server → mongos → 路由信息
+```
+
+```bash
+# 分片集群部署示例
+# 1. 启动config server
+mongod --configsvr --replSet configRS --dbpath /data/config --port 27019
+
+# 2. 初始化config server副本集
+rs.initiate({
+  _id: "configRS",
+  configsvr: true,
+  members: [
+    {_id: 0, host: "config1:27019"},
+    {_id: 1, host: "config2:27019"},
+    {_id: 2, host: "config3:27019"}
+  ]
+})
+
+# 3. 启动mongos
+mongos --configdb configRS/config1:27019,config2:27019,config3:27019 --port 27017
+
+# 4. 添加分片
+sh.addShard("shard1/rs1:27017,rs2:27017,rs3:27017")
+sh.addShard("shard2/rs4:27017,rs5:27017,rs6:27017")
+
+# 5. 启用分片
+sh.enableSharding("mydb")
+sh.shardCollection("mydb.users", {_id: "hashed"})
+```
+
+## 补充：MongoDB索引（复合索引/覆盖索引/多键索引）
+
+### 索引类型详解
+
+| 索引类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| 单字段索引 | 单个字段 | 常用查询字段 |
+| 复合索引 | 多个字段组合 | 多条件查询 |
+| 多键索引 | 数组字段 | 数组元素查询 |
+| 文本索引 | 全文搜索 | 模糊搜索 |
+| 地理空间索引 | 地理位置 | 位置查询 |
+| 哈希索引 | 哈希值 | 哈希分片 |
+| TTL索引 | 自动过期 | 临时数据 |
+
+```javascript
+// 复合索引（最左前缀原则）
+db.users.createIndex({age: 1, name: -1})
+// 支持查询：
+// {age: 25} ✅
+// {age: 25, name: "张三"} ✅
+// {name: "张三"} ❌（不满足最左前缀）
+
+// 覆盖索引（查询字段全在索引中，无需回表）
+db.users.find({age: 25}, {name: 1, age: 1})
+// 索引 {age: 1, name: -1} 覆盖该查询
+
+// 多键索引（数组字段）
+db.articles.createIndex({tags: 1})
+// 查询数组元素
+db.articles.find({tags: "mongodb"})
+```
+
 ## 十九、与其他板块的关系（扩展）
 
 - 与 [MySQL](../mysql知识.md)、[Redis](../redis知识.md)：MongoDB 补「文档/半结构 + 水平扩展」，Redis 补缓存/高性能 KV，MySQL 保强事务。

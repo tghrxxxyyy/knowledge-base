@@ -1006,6 +1006,403 @@ K8s 资源模型：
     动态分配资源
 ```
 
+## 补充：公平vs容量调度器选型对比
+
+### 队列/资源借用/抢占机制对比
+
+| 维度 | Fair Scheduler | Capacity Scheduler |
+|------|----------------|-------------------|
+| 资源分配 | 动态均分（按权重） | 队列保底 + 弹性借用 |
+| 延迟调度 | 放置限制（避免数据本地性损失） | 无（按队列配额） |
+| 调度粒度 | 用户级 + 队列级 | 队列级（可嵌套） |
+| 预占用 | 支持（抢占低优先级） | 不支持（需配 AM 资源上限） |
+| 队列管理 | XML 配置，运行时动态调整 | XML 配置，支持热更新 |
+| 适用场景 | 交互式/多租户（公平性优先） | 多团队/SLA 保底（稳定性优先） |
+
+```xml
+<!-- Capacity Scheduler 生产级配置示例 -->
+<configuration>
+  <!-- 三级队列：root 下按业务域 -->
+  <property><name>yarn.scheduler.capacity.root.queues</name>
+    <value>core,bigdata,sandbox</value></property>
+  
+  <!-- 核心域保底60%，最大100% -->
+  <property><name>yarn.scheduler.capacity.root.core.capacity</name>
+    <value>60</value></property>
+  <property><name>yarn.scheduler.capacity.root.core.maximum-capacity</name>
+    <value>100</value></property>
+  
+  <!-- 核心域内分实时/批 -->
+  <property><name>yarn.scheduler.capacity.root.core.queues</name>
+    <value>realtime,batch</value></property>
+  <property><name>yarn.scheduler.capacity.root.core.realtime.capacity</name>
+    <value>40</value></property>
+  <property><name>yarn.scheduler.capacity.root.core.batch.capacity</name>
+    <value>60</value></property>
+  
+  <!-- 沙箱队列限制单用户 -->
+  <property><name>yarn.scheduler.capacity.root.sandbox.capacity</name>
+    <value>5</value></property>
+  <property><name>yarn.scheduler.capacity.root.sandbox.maximum-applications</name>
+    <value>200</value></property>
+</configuration>
+```
+
+## 补充：K8s调度扩展（Scheduler Extender/Webhook）
+
+### 扩展方式对比
+
+| 方式 | 原理 | 适用场景 | 延迟 |
+|------|------|---------|------|
+| Scheduler Extender | HTTP回调 | 简单扩展 | 高（网络开销） |
+| Scheduler Framework | 插件化接口 | 深度定制 | 低（进程内） |
+| Webhook | HTTP回调 | 外部系统集成 | 高 |
+| 自定义调度器 | 独立进程 | 特殊调度需求 | 中 |
+
+```yaml
+# K8s Scheduler Framework 插件配置
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+  - schedulerName: default-scheduler
+    plugins:
+      score:
+        enabled:
+          - name: NodeResourcesFit
+            weight: 1
+          - name: InterPodAffinity
+            weight: 1
+          - name: TaintToleration
+            weight: 1
+        disabled:
+          - name: NodeResourcesFit
+      filter:
+        enabled:
+          - name: NodeResourcesFit
+          - name: NodeAffinity
+          - name: PodToleratesNodeTaints
+    pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: LeastAllocated
+            resources:
+              - name: cpu
+                weight: 1
+              - name: memory
+                weight: 1
+```
+
+## 补充：资源模型requests/limits/QoS等级对照
+
+### QoS等级详解
+
+| QoS等级 | requests设置 | limits设置 | OOM Kill优先级 | CPU保障 | 适用场景 |
+|---------|-------------|-----------|---------------|---------|---------|
+| Guaranteed | requests=limits | requests=limits | 最后被Kill | 100% | 数据库/MQ核心服务 |
+| Burstable | requests<limits | requests<limits | 中间 | 保障requests | Web服务/API |
+| BestEffort | 未设置 | 未设置 | 最先被Kill | 无保障 | 离线批处理 |
+
+```yaml
+# QoS配置示例
+# Guaranteed QoS - 核心服务
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: database
+    resources:
+      requests:
+        cpu: "2000m"
+        memory: "4Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"  # requests=limits → Guaranteed
+
+# Burstable QoS - Web服务
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: web
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"  # requests<limits → Burstable
+
+# BestEffort QoS - 批处理
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: batch
+    resources: {}  # 无requests/limits → BestEffort
+```
+
+## 补充：Pod优先级与抢占（PriorityClass配置）
+
+```yaml
+# PriorityClass 配置
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: system-critical
+value: 1000000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "系统关键服务（如etcd、apiserver）"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "高优先级（如数据库、MQ）"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: medium-priority
+value: 100000
+globalDefault: true
+preemptionPolicy: PreemptLowerPriority
+description: "中优先级（如Web服务）"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 1000
+globalDefault: false
+preemptionPolicy: Never  # 不抢占其他Pod
+description: "低优先级（如批处理）"
+```
+
+### 抢占机制详解
+
+```text
+K8s Pod抢占流程：
+  1. 高优Pod调度失败（资源不足）
+  2. 调度器扫描所有可抢占的低优Pod
+  3. 按优先级排序：优先抢占最低优先级
+  4. 同优先级：优先抢占资源占用多的
+  5. 检查PodDisruptionBudget：确保不违反PDB
+  6. 驱逐低优Pod（grace period秒后删除）
+  7. 高优Pod获得资源并调度
+
+抢占规则：
+  - 只能抢占相同或更低PriorityClass的Pod
+  - 优先抢占「违约金最低」的Pod（PDB约束）
+  - 抢占后不会自动恢复（低优Pod需手动重建）
+  - 抢占决策考虑节点亲和性/污点容忍
+```
+
+## 补充：YARN→K8s迁移（先批后流/共存策略）
+
+### 迁移三阶段
+
+| 阶段 | 策略 | 目标 | 周期 |
+|------|------|------|------|
+| 第一阶段 | 先批后流（批处理先行） | 验证K8s批调度能力 | 3-6个月 |
+| 第二阶段 | 流批共存（混合架构） | 存量YARN+增量K8s | 6-12个月 |
+| 第三阶段 | 全面K8s化（统一调度） | YARN下线 | 12-18个月 |
+
+```mermaid
+graph TD
+    A[现状: YARN集群] --> B{评估}
+    B --> C[第一阶段: 批处理先行]
+    C --> D[Spark Batch on K8s]
+    C --> E[离线ETL on K8s]
+    D --> G[第二阶段: 流批共存]
+    G --> H[Spark Streaming on K8s]
+    G --> I[Flink on K8s]
+    G --> J[存量MR/Hive保YARN]
+    H --> K[第三阶段: 全面K8s]
+    K --> L[Spark/Flink全on K8s]
+    K --> M[YARN下线]
+```
+
+### 共存策略三原则
+
+```text
+1. 存储先统一：
+   两边读同一份湖/HDFS数据
+   避免数据孤岛
+   统一元数据管理
+
+2. 增量全走K8s：
+   YARN只减不增自然萎缩
+   新作业全部提交到K8s
+   逐步迁移存量作业
+
+3. 按SLA反向迁移：
+   SLA松的老作业最后迁
+   出问题影响最小
+   核心链路最后迁移
+```
+
+## 补充：Timeline Service v2（ATS-hub/ats-store）
+
+### 架构组件
+
+```text
+YARN Timeline Service v2架构：
+  ATS Hub（Timeline Reader）：
+    - 无状态读取服务
+    - 支持多实例负载均衡
+    - 提供REST API查询
+  
+  ATS Store（Timeline Writer）：
+    - 有状态写入服务
+    - 存储Application/Container历史信息
+    - 支持HBase/LevelDB后端
+
+数据流：
+  AppMaster → ATS Hub → ATS Store → HBase
+  客户端 → ATS Hub → 查询历史数据
+
+配置参数：
+  yarn.timeline-service.enabled=true
+  yarn.timeline-service.ats-timeline-service.enabled=true
+  yarn.timeline-service.store.class=HBase
+  yarn.timeline-service.ttl-ms=604800000  # 7天
+```
+
+## 补充：K8s调度器优化（亲和性/反亲和性/拓扑约束）
+
+### 调度策略配置
+
+```yaml
+# Pod亲和性示例：Web服务与缓存Pod部署在同一节点
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app
+spec:
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values:
+            - redis
+        topologyKey: kubernetes.io/hostname
+    
+    # 反亲和性：同一Deployment的Pod分散到不同节点
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - web
+          topologyKey: kubernetes.io/hostname
+    
+    # 节点亲和性：调度到SSD节点
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: disktype
+            operator: In
+            values:
+            - ssd
+  
+  # 拓扑分布约束：跨AZ均匀分布
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: web
+```
+
+## 补充：YARN动态资源池（Dynamic Resource Pool）
+
+```text
+YARN动态资源池：
+  场景：多团队共享集群，资源按需分配
+  
+  配置：
+    yarn.scheduler.capacity.root.queues=team-a,team-b
+    yarn.scheduler.capacity.root.team-a.capacity=50
+    yarn.scheduler.capacity.root.team-b.capacity=50
+    yarn.scheduler.capacity.root.team-a.maximum-capacity=80
+    yarn.scheduler.capacity.root.team-b.maximum-capacity=80
+  
+  动态调整：
+    yarn rmadmin -refreshQueues  # 热更新队列配置
+    不需要重启ResourceManager
+  
+  资源借用：
+    team-a空闲时，team-b可借用其资源
+    team-a提交作业时，自动回收借出资源
+    maximum-capacity限制借用上限
+```
+
+## 补充：K8s vs YARN资源隔离对比
+
+### cgroup vs container
+
+| 维度 | YARN Container | K8s Pod |
+|------|---------------|---------|
+| 资源隔离 | cgroup v1 | cgroup v2 |
+| CPU隔离 | 软限制（可超售） | 硬限制（不可超售） |
+| 内存隔离 | 硬限制（超限Kill） | 硬限制（OOMKill） |
+| 网络隔离 | 无原生支持 | NetworkPolicy |
+| 存储隔离 | 本地磁盘 | PV/PVC |
+| 优先级 | Queue优先级 | PriorityClass |
+| 抢占 | Queue内抢占 | 跨Namespace抢占 |
+| 资源配额 | Queue配额 | ResourceQuota |
+| 监控 | YARN Metrics | Prometheus |
+
+```yaml
+# K8s ResourceQuota 配置
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "50"
+    requests.memory: "200Gi"
+    limits.cpu: "100"
+    limits.memory: "400Gi"
+    pods: "50"
+    persistentvolumeclaims: "20"
+
+# K8s LimitRange 配置
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: team-a
+spec:
+  limits:
+  - default:
+      cpu: "1000m"
+      memory: "1Gi"
+    defaultRequest:
+      cpu: "500m"
+      memory: "512Mi"
+    type: Container
+```
+
 ## 十九、与其他板块的关系
 
 - 数据采集见「[03-数据采集与同步](03-数据采集与同步.md)」；

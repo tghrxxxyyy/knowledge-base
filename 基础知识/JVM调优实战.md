@@ -1586,6 +1586,324 @@ open cpu_profile.html
 
 > **终极口诀**：先现象再分类，定位了才动参数；一次只改一个变量，压测验证再上生产。G1通用（调IHOP+MaxGCPauseMillis），ZGC低延迟（调SoftMaxHeapSize），OOM必开HeapDump——Arthas是线上诊断瑞士军刀，trace/watch/thread -b三板斧。
 
+## 补充：GC日志分析（Unified Logging -Xlog:gc*）
+
+### GC日志配置
+
+```bash
+# JDK 9+ Unified Logging（推荐）
+java -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=10,filesize=100m \
+  -jar app.jar
+
+# 详细GC日志（包含堆信息）
+java -Xlog:gc*,gc+age=debug,gc+phases=debug:file=gc.log:time,uptime,level,tags:filecount=10,filesize=100m \
+  -jar app.jar
+
+# 输出到stdout（容器环境）
+java -Xlog:gc*:stdout:time,uptime,level,tags \
+  -jar app.jar
+
+# JDK 8及以下
+java -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log \
+  -XX:+PrintHeapAtGC -XX:+PrintTenuringDistribution \
+  -jar app.jar
+```
+
+### GC日志分析要点
+
+```text
+GC日志关键字段：
+  GCId：GC事件编号
+  Pause：STW暂停时间（关注P99）
+  Heap Before/After：GC前后堆大小
+  Alloc/Free：分配和释放量
+  Humongous：大对象分配（需关注）
+
+常用工具：
+  GCEasy：在线分析（gceasy.io）
+  GCViewer：本地可视化
+  JClarity Censum：商业工具
+  JVisualVM：实时监控
+```
+
+## 补充：JVM内存布局（Heap/Non-Heap/Metaspace/直接内存）
+
+### JVM内存区域
+
+```text
+JVM内存布局：
+  Heap（堆）：
+    Young Generation（新生代）
+      Eden：新对象分配区（80%）
+      Survivor0/S1：存活对象（各10%）
+    Old Generation（老年代）
+      长期存活对象
+    Metaspace（元空间，替代PermGen）
+      类元数据
+      字符串常量池（JDK 7+移到Heap）
+  
+  Non-Heap（非堆）：
+    Code Cache：JIT编译代码
+    Thread Stack：线程私有（每线程1MB）
+    Native Memory：JNI分配
+    Direct Buffer：NIO直接内存
+  
+  Direct Memory（直接内存）：
+    NIO ByteBuffer.allocateDirect()
+    受-XX:MaxDirectMemorySize限制
+    不在Heap中，不受GC直接管理
+    需要手动释放或等GC回收
+```
+
+## 补充：JIT编译（C1/C2/Graal编译器选择）
+
+### JIT编译器对比
+
+| 编译器 | 优化级别 | 编译速度 | 生成代码质量 | 适用场景 |
+|--------|---------|----------|-------------|---------|
+| C1 | 基础优化 | 快 | 中 | 客户端/启动速度优先 |
+| C2 | 深度优化 | 慢 | 高 | 服务端/吞吐量优先 |
+| Graal | 深度优化 | 中 | 高（实验性） | 新项目/Java 17+ |
+
+```bash
+# C1编译器（启动快）
+java -client -jar app.jar
+
+# C2编译器（吞吐量高，默认）
+java -server -jar app.jar
+
+# 分层编译（默认，推荐）
+java -XX:+TieredCompilation -jar app.jar
+# C1编译 → C2编译 → 优化热点代码
+
+# 禁用JIT（调试用）
+java -Xint -jar app.jar
+
+# Graal编译器（Java 17+）
+java -XX:+UnlockExperimentalVMOptions -XX:+UseJVMCICompiler -jar app.jar
+```
+
+## 补充：JVM Crash排查（hs_err_pid.log）
+
+### JVM Crash日志分析
+
+```text
+JVM Crash日志（hs_err_pid.log）关键信息：
+  头部信息：
+    JRE version：JRE版本
+    VM：JVM配置参数
+    Time：崩溃时间
+  
+  崩溃原因：
+    Internal Error：JVM内部错误
+    SIGSEGV：内存访问越界
+    SIGBUS：总线错误
+    SIGFPE：浮点异常
+  
+  线程信息：
+    线程状态（RUNNABLE/BLOCKED/WAITING）
+    线程调用栈
+    锁信息
+  
+  内存信息：
+    Heap使用情况
+    Metaspace使用情况
+    Code Cache使用情况
+```
+
+```bash
+# JVM Crash排查步骤
+# 1. 查看hs_err_pid.log
+ls -la hs_err_pid*.log
+
+# 2. 分析崩溃原因
+grep -A 20 "Internal Error" hs_err_pid.log
+
+# 3. 分析线程信息
+grep -A 50 "Current thread" hs_err_pid.log
+
+# 4. 检查JVM配置
+grep "VM Arguments" hs_err_pid.log
+```
+
+## 补充：容器环境调优（-XX:MaxRAMPercentage）
+
+### 容器环境JVM配置
+
+```bash
+# 容器环境推荐配置
+java \
+  -XX:MaxRAMPercentage=75.0 \
+  -XX:InitialRAMPercentage=50.0 \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/tmp/heapdump.hprof \
+  -jar app.jar
+
+# Kubernetes资源配置
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+  limits:
+    memory: "1024Mi"
+    cpu: "1000m"
+```
+
+## 补充：ZGC/Shenandoah低延迟GC
+
+### ZGC配置
+
+```bash
+# ZGC启动参数（Java 11+）
+java -XX:+UseZGC \
+  -XX:ZCollectionInterval=5 \
+  -XX:ZAllocationSpikeTolerance=2.0 \
+  -XX:SoftMaxHeapSize=1g \
+  -jar app.jar
+```
+
+### Shenandoah配置
+
+```bash
+# Shenandoah启动参数（Java 12+）
+java -XX:+UseShenandoahGC \
+  -XX:ShenandoahGCHeuristics=compact \
+  -XX:ShenandoahMinFreeThreshold=10 \
+  -XX:ShenandoahGuaranteedGCInterval=300000 \
+  -jar app.jar
+```
+
+### ZGC vs Shenandoah对比
+
+| 维度 | ZGC | Shenandoah |
+|------|-----|------------|
+| STW暂停 | <1ms | <1ms |
+| 吞吐量损失 | 5-10% | 10-15% |
+| 内存开销 | 高（15%） | 中（10%） |
+| 并发阶段 | 标记+压缩 | 标记+压缩 |
+| 适用场景 | 超低延迟 | 低延迟+兼容性 |
+| 生产成熟度 | 高（Red Hat支持） | 高（OpenJDK社区） |
+
+## 补充：async-profiler分析（CPU/内存/锁）
+
+### async-profiler使用
+
+```bash
+# CPU profiling
+./profiler.sh -d 30 -f cpu_profile.html -o flamegraph <pid>
+
+# 内存分配分析
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# 锁分析
+./profiler.sh -d 30 -e lock -f lock_profile.html <pid>
+```
+
+### 性能分析工具对比
+
+| 工具 | 采样方式 | 开销 | 适用场景 |
+|------|---------|------|---------|
+| async-profiler | JVMTI | 低 | 生产环境 |
+| JProfiler | JVMTI | 中 | 开发/测试 |
+| YourKit | JVMTI | 中 | 开发/测试 |
+| JVisualVM | JMX | 中 | 开发/测试 |
+| Arthas | JVMTI | 低 | 生产环境 |
+
+## 补充：JFR（Java Flight Recorder）
+
+### JFR配置
+
+```bash
+# 启动JFR
+java -XX:+FlightRecorder \
+  -XX:StartFlightRecording=duration=60s,filename=recording.jfr \
+  -jar app.jar
+
+# 运行时开启JFR
+jcmd 1 JFR.start duration=60s filename=recording.jfr
+
+# 持续录制
+jcmd 1 JFR.start settings=default filename=continuous.jfr
+jcmd 1 JFR.stop
+```
+
+### JFR事件分析
+
+```text
+JFR关键事件：
+  GC事件：G1GarbageCollection、ZGCCycle
+  CPU事件：MethodProfilingSample、ExecutionSample
+  内存事件：ObjectAllocationInNewTLAB、ObjectAllocationOutsideTLAB
+  I/O事件：FileRead、FileWrite、SocketRead、SocketWrite
+  锁事件：JavaMonitorEnter、JavaMonitorBlocked
+```
+
+## 补充：内存泄漏排查（LeakCanary/Dominator Tree）
+
+### 内存泄漏排查步骤
+
+```text
+内存泄漏排查步骤：
+  1. 确认泄漏
+     - 观察堆内存增长趋势
+     - Full GC后内存不下降
+     - OOM频繁发生
+  
+  2. 生成堆转储
+     - jmap -dump:format=b,file=dump.hprof <pid>
+     - 或 -XX:+HeapDumpOnOutOfMemoryError
+  
+  3. 分析堆转储
+     - MAT（Memory Analyzer Tool）
+     - VisualVM
+     - JProfiler
+  
+  4. 查找泄漏点
+     - Dominator Tree：查看最大对象
+     - Leak Suspects：自动分析报告
+     - Reference Tree：查看引用链
+  
+  5. 定位代码
+     - 查看对象创建位置
+     - 分析引用链
+     - 找到GC Root
+  
+  6. 修复验证
+     - 修复代码
+     - 重新测试
+     - 验证内存不再增长
+```
+
+### MAT分析示例
+
+```text
+MAT分析要点：
+  Leak Suspects Report：
+    自动识别可疑泄漏对象
+    显示对象大小和引用链
+  
+  Dominator Tree：
+    按对象大小排序
+    查看最大对象的GC Root
+  
+  Histogram：
+    按类统计对象数量
+    查找对象异常增长
+  
+  OQL（Object Query Language）：
+    SELECT * FROM java.lang.String s WHERE s.count > 1000
+    查找大字符串对象
+
+常见泄漏模式：
+  静态集合：static Map/List不断增长
+  ThreadLocal：未清理的ThreadLocal
+  未关闭资源：数据库/文件连接未关闭
+  监听器：注册后未注销
+  缓存：无限缓存未设置过期
+```
+
 ## 十七、与其他板块的关联
 
 - JVM 原理见「[Java 虚拟机](../基础知识/Java虚拟机.md)」；

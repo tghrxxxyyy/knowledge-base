@@ -1071,6 +1071,758 @@ upstream grpc_backend {
 
 ---
 
+## 代理缓存（proxy_cache）
+
+### 缓存原理与工作流程
+
+```text
+客户端请求 → Nginx
+  → 缓存命中？→ 是 → 直接返回缓存内容
+  → 否 → 转发至上游服务器 → 响应写入缓存 → 返回客户端
+```
+
+### 基础配置
+
+```nginx
+# 定义缓存路径和参数
+proxy_cache_path /var/cache/nginx/proxy
+    levels=1:2              # 目录层级（两级目录）
+    keys_zone=my_cache:10m  # 共享内存区域（10MB，约8万个key）
+    max_size=1g             # 最大磁盘缓存
+    inactive=60m            # 60分钟未访问则删除
+    use_temp_path=off;      # 直接写入缓存目录（避免跨分区）
+
+server {
+    location / {
+        proxy_cache my_cache;
+        proxy_cache_valid 200 302 10m;   # 200/302 缓存10分钟
+        proxy_cache_valid 404     1m;    # 404 缓存1分钟
+        proxy_cache_valid any     5m;    # 其他状态码缓存5分钟
+
+        proxy_cache_key "$scheme$host$request_uri$cookie_user";
+        # 自定义缓存key（加入cookie实现个性化缓存）
+
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503;
+        # 后端异常时使用旧缓存（stale）
+
+        proxy_cache_lock on;         # 缓存锁（防止缓存击穿）
+        proxy_cache_lock_timeout 5s; # 缓存锁超时
+        proxy_cache_lock_age 5s;     # 锁持有超时
+
+        add_header X-Cache-Status $upstream_cache_status;
+        # 响应头中标记缓存状态（HIT/MISS/BYPASS/EXPIRED/STALE）
+
+        proxy_pass http://backend;
+    }
+}
+```
+
+### 缓存状态码说明
+
+| 状态码 | 含义 | 排查方向 |
+|--------|------|----------|
+| HIT | 缓存命中 | 正常 |
+| MISS | 缓存未命中 | 首次请求或缓存过期 |
+| EXPIRED | 缓存已过期 | upstream 返回新内容 |
+| STALE | 使用过期缓存 | 后端故障时的降级 |
+| UPDATING | 正在更新缓存 | 后台刷新中 |
+| BYPASS | 绕过缓存 | `proxy_cache_bypass` 生效 |
+| REVALIDATED | 缓存验证通过 | `If-Modified-Since` 命中 |
+
+### 缓存优化技巧
+
+```nginx
+# 1. 缓存分层（两级缓存）
+proxy_cache_path /var/cache/nginx/l1
+    levels=1:2 keys_zone=l1:10m max_size=500m;
+proxy_cache_path /var/cache/nginx/l2
+    levels=1:2 keys_zone=l2:20m max_size=2g;
+
+# 2. 缓存预热（配合定时任务）
+# curl -s http://localhost/purge/warm > /dev/null
+
+# 3. 缓存清理（proxy_cache_purge 模块）
+location ~ /purge(/.*) {
+    allow 127.0.0.1;
+    deny all;
+    proxy_cache_purge my_cache "$scheme$host$1";
+}
+
+# 4. 按请求方法缓存
+proxy_cache_methods GET HEAD;  # 只缓存 GET/HEAD
+```
+
+### 缓存安全与一致性
+
+```text
+缓存一致性问题：
+  问题：后端数据更新后，缓存仍返回旧数据
+  解决方案：
+    1. 短 TTL + 主动刷新
+    2. 版本号缓存key（data:v1, data:v2）
+    3. 后端发布时主动清理缓存（purge接口）
+    4. 使用 ETag/Last-Modified 验证缓存
+
+缓存穿透防护：
+  问题：大量请求不存在的资源，缓存全部MISS，压垮后端
+  解决方案：
+    1. 布隆过滤器（在Lua层实现）
+    2. 空值缓存（proxy_cache_valid 404 5m）
+    3. 请求限流（limit_req）
+```
+
+---
+
+## 限流与流量控制
+
+### limit_req（请求速率限制）
+
+```nginx
+http {
+    # 定义限流区域
+    # 按客户端IP限流，每秒10个请求，突发允许20个
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    # 注意：$binary_remote_addr 比 $remote_addr 节省内存
+
+    server {
+        location /api/ {
+            # burst=20：突发队列长度20
+            # nodelay：突发请求不延迟，直接处理
+            limit_req zone=api_limit burst=20 nodelay;
+            # 返回 429 Too Many Requests（默认503）
+            limit_req_status 429;
+
+            proxy_pass http://backend;
+        }
+
+        location /login/ {
+            # 登录接口更严格：每秒5个请求，无突发
+            limit_req zone=api_limit burst=5 nodelay;
+            limit_req_status 429;
+
+            proxy_pass http://backend;
+        }
+    }
+}
+```
+
+### limit_req 参数详解
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| zone | 共享内存区域名 | 按业务区分 |
+| rate | 请求速率（r/s 或 r/m） | 根据业务容量设置 |
+| burst | 突发队列长度 | rate 的 2-5 倍 |
+| nodelay | 突发不延迟 | 需要快速响应时开启 |
+| delay | 延迟队列长度 | 与 burst 配合使用 |
+| noDelay | 突发全部延迟 | 不推荐 |
+
+### limit_conn（并发连接限制）
+
+```nginx
+http {
+    # 按客户端IP限制并发连接数
+    limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+    server {
+        location /download/ {
+            limit_conn conn_limit 5;  # 单IP最多5个并发连接
+            limit_rate 500k;          # 每个连接限速500KB/s
+            limit_rate_after 10m;     # 前10MB不限速
+
+            proxy_pass http://backend;
+        }
+
+        location / {
+            limit_conn conn_limit 100;  # 单IP最多100个并发连接
+            proxy_pass http://backend;
+        }
+    }
+}
+```
+
+### 分布式限流
+
+```text
+单机限流 vs 分布式限流：
+  单机限流：
+    - 每个 Nginx 实例独立限流
+    - 总流量 = 单机限流 × Nginx实例数
+    - 适用于实例数固定的场景
+
+  分布式限流：
+    - 多个 Nginx 共享限流状态
+    - 使用 Redis + lua-resty-redis 实现
+    - 适用于实例数动态变化的场景
+
+  实现方式：
+    1. Lua + Redis（原生实现）
+    2. lua-resty-redis（封装库）
+    3. OpenResty + lua-resty-limit-traffic
+```
+
+### 限流最佳实践
+
+```nginx
+# 按用户ID限流（需登录）
+map $cookie_user_id $user_id {
+    default $binary_remote_addr;
+    "~\w+"  $cookie_user_id;
+}
+limit_req_zone $user_id zone=user_limit:20m rate=100r/s;
+
+# 按请求头限流（API Key）
+map $http_x_api_key $api_key {
+    default $binary_remote_addr;
+    "~\w+"  $http_x_api_key;
+}
+limit_req_zone $api_key zone=api_limit:20m rate=1000r/s;
+
+# 按地理位置限流（geo模块）
+geo $limit {
+    default         1;
+    192.168.0.0/24  0;  # 内网不限流
+}
+map $limit $limit_key {
+    0 "";
+    1 $binary_remote_addr;
+}
+limit_req_zone $limit_key zone=geo_limit:10m rate=100r/s;
+```
+
+---
+
+## 访问控制
+
+### IP 白名单/黑名单
+
+```nginx
+# 方法1：allow/deny 指令
+location /admin/ {
+    allow 192.168.0.0/16;
+    allow 10.0.0.0/8;
+    deny all;
+
+    proxy_pass http://backend;
+}
+
+# 方法2：geo 模块（大规模IP控制）
+geo $blocked {
+    default 0;
+    1.2.3.4 1;
+    5.6.7.0/24 1;
+}
+server {
+    if ($blocked) {
+        return 403;
+    }
+}
+
+# 方法3：ngx_http_geoip_module（地理位置控制）
+geoip2 /usr/share/GeoIP/GeoLite2-Country.mmdb {
+    $geoip2_country_code country iso_code;
+}
+map $geoip2_country_code $allowed_country {
+    default no;
+    CN yes;
+    US yes;
+}
+server {
+    if ($allowed_country = no) {
+        return 403;
+    }
+}
+```
+
+### HTTP 基础认证
+
+```nginx
+# 生成密码文件
+# htpasswd -c /etc/nginx/.htpasswd admin
+
+server {
+    location /admin/ {
+        auth_basic "Restricted Area";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
+        proxy_pass http://backend;
+    }
+}
+```
+
+### JWT 认证（Lua 实现）
+
+```nginx
+# OpenResty + lua-resty-jwt
+location /api/ {
+    access_by_lua_block {
+        local jwt = require "resty.jwt"
+        local secret = "your-secret-key"
+
+        local auth_header = ngx.var.http_Authorization
+        if not auth_header then
+            ngx.status = 401
+            ngx.say('{"error":"Missing Authorization header"}')
+            return ngx.exit(401)
+        end
+
+        local token = auth_header:match("Bearer%s+(.+)")
+        if not token then
+            ngx.status = 401
+            ngx.say('{"error":"Invalid Authorization format"}')
+            return ngx.exit(401)
+        end
+
+        local jwt_obj = jwt:verify(secret, token)
+        if not jwt_obj.verified then
+            ngx.status = 401
+            ngx.say('{"error":"' .. jwt_obj.reason .. '"}')
+            return ngx.exit(401)
+        end
+
+        -- 将用户信息传递给后端
+        ngx.req.set_header("X-User-ID", jwt_obj.payload.sub)
+        ngx.req.set_header("X-User-Role", jwt_obj.payload.role)
+    }
+
+    proxy_pass http://backend;
+}
+```
+
+### CORS 跨域控制
+
+```nginx
+# 允许特定域名跨域访问
+location /api/ {
+    # 允许的源
+    add_header Access-Control-Allow-Origin "https://example.com" always;
+    add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
+    add_header Access-Control-Allow-Credentials "true" always;
+    add_header Access-Control-Max-Age 3600 always;
+
+    # 预检请求
+    if ($request_method = 'OPTIONS') {
+        return 204;
+    }
+
+    proxy_pass http://backend;
+}
+```
+
+---
+
+## 日志格式与分析
+
+### 自定义日志格式
+
+```nginx
+http {
+    # JSON格式日志（便于ELK解析）
+    log_format json_log escape=json
+        '{'
+            '"time":"$time_iso8601",'
+            '"remote_addr":"$remote_addr",'
+            '"remote_user":"$remote_user",'
+            '"request":"$request",'
+            '"status":$status,'
+            '"body_bytes_sent":$body_bytes_sent,'
+            '"request_time":$request_time,'
+            '"upstream_response_time":"$upstream_response_time",'
+            '"upstream_addr":"$upstream_addr",'
+            '"upstream_status":"$upstream_status",'
+            '"http_referer":"$http_referer",'
+            '"http_user_agent":"$http_user_agent",'
+            '"http_x_forwarded_for":"$http_x_forwarded_for",'
+            '"request_id":"$request_id",'
+            '"cache_status":"$upstream_cache_status"'
+        '}';
+
+    # 自定义格式（包含更多调试信息）
+    log_format debug_log '$remote_addr - $remote_user [$time_local] '
+                         '"$request" $status $body_bytes_sent '
+                         '"$http_referer" "$http_user_agent" '
+                         'rt=$request_time '
+                         'urt=$upstream_response_time '
+                         'uct=$upstream_connect_time '
+                         'uht=$upstream_header_time '
+                         'urt=$upstream_response_time '
+                         'cs=$upstream_cache_status';
+}
+
+server {
+    access_log /var/log/nginx/access.log json_log;
+    error_log  /var/log/nginx/error.log warn;
+}
+```
+
+### 日志变量说明
+
+| 变量 | 含义 | 示例值 |
+|------|------|--------|
+| $request_time | 请求处理总时间 | 0.123 |
+| $upstream_response_time | 上游响应时间 | 0.100 |
+| $upstream_connect_time | 与上游建立连接时间 | 0.001 |
+| $upstream_header_time | 上游返回第一个字节时间 | 0.050 |
+| $upstream_cache_status | 缓存状态 | HIT/MISS |
+| $request_id | 唯一请求ID | 1a2b3c... |
+| $connection | 连接序列号 | 12345 |
+| $msec | 毫秒级时间戳 | 1692000000.123 |
+
+### 日志切割配置
+
+```bash
+# /etc/logrotate.d/nginx
+/var/log/nginx/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    create 0640 nginx adm
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+}
+```
+
+---
+
+## OpenResty/Lua 集成
+
+### 基础架构
+
+```text
+┌─────────────────────────────────────┐
+│              Nginx                   │
+│  ┌─────────┐  ┌─────────────────┐  │
+│  │ 原生模块 │  │  LuaJIT 运行时  │  │
+│  │(proxy/   │  │  ┌───────────┐ │  │
+│  │ rewrite/ │  │  │  Lua 模块  │ │  │
+│  │ filter)  │  │  │  ┌──────┐ │ │  │
+│  └─────────┘  │  │  │业务   │ │ │  │
+│               │  │  │逻辑   │ │ │  │
+│  ┌─────────┐  │  │  └──────┘ │ │  │
+│  │共享字典  │  │  └───────────┘ │  │
+│  │(全局状态)│  └─────────────────┘  │
+│  └─────────┘                        │
+└─────────────────────────────────────┘
+```
+
+### Lua 执行阶段
+
+| 阶段 | 执行时机 | 用途 | 指令 |
+|------|----------|------|------|
+| init | Nginx 启动时（全局） | 初始化配置/连接池 | `init_by_lua` |
+| init_worker | 每个 worker 启动时 | 定时任务/健康检查 | `init_worker_by_lua` |
+| set_rewrite | URL 重写阶段 | 路由/参数处理 | `rewrite_by_lua` |
+| set_access | 访问控制阶段 | 认证/鉴权/限流 | `access_by_lua` |
+| content | 内容生成阶段 | 业务逻辑/响应生成 | `content_by_lua` |
+| log | 日志记录阶段 | 日志采集/统计 | `log_by_lua` |
+| header_filter | 响应头过滤 | 修改响应头 | `header_filter_by_lua` |
+| body_filter | 响应体过滤 | 修改响应内容 | `body_filter_by_lua` |
+
+### 共享字典（Shared Dict）
+
+```nginx
+http {
+    # 定义共享字典
+    lua_shared_dict my_dict 10m;           # 10MB
+    lua_shared_dict rate_limit 5m;         # 限流用
+    lua_shared_dict cache_data 20m;        # 缓存用
+    lua_shared_dict locks 1m;              # 分布式锁
+}
+
+-- Lua 中使用共享字典
+local dict = ngx.shared.my_dict
+
+-- 设置值（带过期时间）
+dict:set("key", "value", 300)  -- 300秒后过期
+
+-- 获取值
+local val = dict:get("key")
+
+-- 原子操作（计数器）
+local newval, err = dict:incr("counter", 1, 0)
+-- incr(key, init_value, init_ttl)
+```
+
+### 常用 Lua 库
+
+| 库名 | 功能 | 使用场景 |
+|------|------|----------|
+| lua-resty-http | HTTP 客户端 | 调用外部API |
+| lua-resty-redis | Redis 客户端 | 缓存/限流/会话 |
+| lua-resty-mysql | MySQL 客户端 | 数据库查询 |
+| lua-resty-jwt | JWT 认证 | Token 验证 |
+| lua-resty-openssl | 加密解密 | 数据安全 |
+| lua-resty-limit-traffic | 流量控制 | 限流/熔断 |
+| lua-resty-template | 模板引擎 | 页面渲染 |
+| lua-cjson | JSON 解析 | API 数据处理 |
+
+---
+
+## upstream 负载均衡与健康检查
+
+### 负载均衡算法
+
+```nginx
+upstream backend {
+    # 轮询（默认）
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+
+    # 加权轮询
+    server 10.0.0.1:8080 weight=3;
+    server 10.0.0.2:8080 weight=1;
+
+    # IP Hash（会话保持）
+    ip_hash;
+
+    # 最少连接
+    least_conn;
+
+    # 一致性Hash（基于请求URI）
+    hash $request_uri consistent;
+
+    # 通用Hash（基于自定义变量）
+    hash $cookie_sessionid consistent;
+}
+```
+
+### 健康检查配置
+
+```nginx
+upstream backend {
+    server 10.0.0.1:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.0.2:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.0.3:8080 backup;  # 备用服务器
+
+    # 被动健康检查参数
+    # max_fails=3：连续失败3次标记为不可用
+    # fail_timeout=30s：不可用持续30秒
+}
+
+# 主动健康检查（需要 nginx_upstream_check_module）
+upstream backend {
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+
+    check interval=3000 rise=2 fall=3 timeout=1000 type=http;
+    check_http_send "GET /health HTTP/1.0\r\n\r\n";
+    check_http_expect_alive http_2xx http_3xx;
+}
+```
+
+### upstream 参数详解
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| max_fails | 最大失败次数 | 3-5 |
+| fail_timeout | 失败超时时间 | 30s |
+| backup | 备用服务器 | 按需设置 |
+| down | 标记为不可用 | 维护时使用 |
+| max_conns | 最大连接数 | 根据后端容量 |
+| slow_start | 慢启动时间 | 30s-60s |
+
+---
+
+## Nginx 性能调优
+
+### Worker 进程配置
+
+```nginx
+# 自动设置 worker 进程数（等于CPU核心数）
+worker_processes auto;
+
+# 绑定 CPU 核心（避免上下文切换）
+worker_cpu_affinity auto;
+
+# 每个 worker 的最大连接数
+events {
+    worker_connections 16384;
+
+    # 使用 epoll 事件模型（Linux）
+    use epoll;
+
+    # 接受多个连接（Linux 3.9+）
+    multi_accept on;
+}
+```
+
+### 连接处理优化
+
+```nginx
+http {
+    # 连接超时
+    keepalive_timeout 65;
+    keepalive_requests 1000;  # 单个连接最大请求数
+
+    # 客户端超时
+    client_body_timeout 12;
+    client_header_timeout 12;
+    send_timeout 10;
+
+    # 缓冲区
+    client_body_buffer_size 16k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 8k;
+
+    # 缓冲区优化
+    proxy_buffering on;
+    proxy_buffer_size 4k;
+    proxy_buffers 8 16k;
+    proxy_busy_buffers_size 32k;
+
+    # 文件缓存
+    open_file_cache max=10000 inactive=20s;
+    open_file_cache_valid 30s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+}
+```
+
+### 内存优化
+
+```text
+Nginx 内存使用分析：
+  1. 连接内存：
+     - 每个连接约 2-3KB（不含请求体缓冲）
+     - worker_connections × worker_processes × 3KB
+     - 示例：16384 × 4 × 3KB = 192MB
+
+  2. 共享内存：
+     - proxy_cache_path keys_zone
+     - lua_shared_dict
+     - limit_req_zone
+
+  3. 缓冲区：
+     - client_body_buffer_size
+     - proxy_buffers
+     - large_client_header_buffers
+
+优化建议：
+  1. 减少 worker_connections（如 4096）
+  2. 优化缓冲区大小（按实际请求大小调整）
+  3. 使用 sendfile 和 tcp_nopush
+  4. 启用 gzip 压缩（减少传输体积）
+```
+
+### 性能测试指标
+
+```bash
+# 使用 wrk 进行压力测试
+wrk -t12 -c400 -d30s http://localhost/api/test
+
+# 使用 ab 进行基准测试
+ab -n 10000 -c 100 http://localhost/
+
+# 关键指标
+# - Requests per second (RPS)
+# - Latency (p50, p95, p99)
+# - Transfer rate
+# - Failed requests
+```
+
+---
+
+## SSL/TLS 优化
+
+### 现代 TLS 配置
+
+```nginx
+server {
+    listen 443 ssl http2;
+
+    # SSL 证书
+    ssl_certificate /etc/nginx/ssl/cert.pem;
+    ssl_certificate_key /etc/nginx/ssl/key.pem;
+
+    # TLS 版本（禁用 TLS 1.0/1.1）
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # 加密套件（优先使用 ECDHE）
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384';
+    ssl_prefer_server_ciphers on;
+
+    # SSL 会话缓存
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;  # 禁用 session tickets（更安全）
+
+    # OCSP Stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    ssl_trusted_certificate /etc/nginx/ssl/chain.pem;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+    resolver_timeout 5s;
+
+    # HSTS（HTTP严格传输安全）
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # 安全头
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+}
+```
+
+### HTTP 到 HTTPS 重定向
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+    return 301 https://$server_name$request_uri;
+}
+```
+
+### TLS 1.3 优化
+
+```text
+TLS 1.3 优势：
+  1. 握手时间：1-RTT（TLS 1.2 需要 2-RTT）
+  0-RTT 恢复：支持（需权衡安全性）
+  2. 加密算法：移除不安全算法（RSA、DH）
+  3. 证书验证：支持 ECDSA（更小、更快）
+  4. 压缩：支持 Certificate Compression
+
+配置要点：
+  - 仅启用 TLSv1.2 和 TLSv1.3
+  - 使用 ECDSA 证书（RSA 2048 仍安全）
+  - 启用 OCSP Stapling
+  - 禁用 SSL session tickets
+```
+
+---
+
+## Nginx vs Caddy 对比
+
+| 维度 | Nginx | Caddy |
+|------|-------|-------|
+| 配置语言 | 配置文件 | Caddyfile / JSON |
+| 自动 HTTPS | 需手动配置 | 内置（自动续期） |
+| 性能 | 极高 | 高（略低于Nginx） |
+| 模块生态 | 丰富 | 较少但够用 |
+| 学习曲线 | 中等 | 低 |
+| 静态文件服务 | 优秀 | 优秀 |
+| 反向代理 | 优秀 | 优秀 |
+| API 网关 | 需配合OpenResty | 需配合插件 |
+| 适用场景 | 大规模生产环境 | 中小规模/个人项目 |
+
+```text
+选择建议：
+  1. 大规模生产环境 → Nginx（生态成熟、性能极致）
+  2. 快速原型/个人项目 → Caddy（零配置HTTPS）
+  3. 需要复杂Lua逻辑 → Nginx + OpenResty
+  4. 需要动态配置 → Caddy（JSON API）或 Nginx + Consul
+```
+
+---
+
 ## 与其他板块的关系
 
 - 和「**基础知识/中间件/API网关**」：Nginx 是「入口层（南北向）」，网关（Spring Cloud Gateway/APISIX）做「应用层路由治理」，常串联使用。

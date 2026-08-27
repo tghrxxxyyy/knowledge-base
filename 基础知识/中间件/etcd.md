@@ -852,6 +852,420 @@ etcd 故障恢复流程：
    etcdctl endpoint status --cluster --write-out=table
 ```
 
+## 补充：MVCC原理（revision + tree index实现）
+
+### MVCC架构详解
+
+```text
+etcd MVCC实现：
+  revision（版本号）：
+    ├── 全局递增（每个事务+1）
+    ├── 格式：{main}.{sub}
+    └── main：全局事务计数
+      sub：同一事务内多次操作
+  
+  tree index（内存索引）：
+    ├── 基于B-tree实现
+    ├── key → revision映射
+    ├── 支持范围查询
+    └── 内存中维护，重启后从boltdb重建
+  
+  boltdb（持久化存储）：
+    ├── revision → value映射
+    ├── 存储实际数据
+    ├── 支持MVCC（保留历史版本）
+    └── 使用B+树索引
+  
+  读取流程：
+    1. 客户端Get(key)
+    2. tree index查找key的最新revision
+    3. boltdb按revision读取value
+    4. 返回结果
+  
+  历史版本读取：
+    Get(key, WithRevision(rev)) → 读指定版本
+    支持范围查询：Get(prefix, WithLastRev())
+```
+
+### revision编码结构
+
+```go
+// revision结构
+type revision struct {
+    main int64  // 全局事务计数
+    sub  int64  // 同一事务内操作序号
+}
+
+// 示例
+// 操作1: Put("/foo", "bar") → rev={1, 0}
+// 操作2: Put("/foo", "baz") → rev={2, 0}
+// 操作3: Put("/bar", "qux") → rev={3, 0}
+// 操作4: Put("/foo", "quux") → rev={4, 0}
+
+// 读取历史版本
+Get("/foo", WithRevision(2)) → 返回"baz"
+Get("/foo", WithRevision(1)) → 返回"bar"
+```
+
+## 补充：compact/defrag维护操作与影响
+
+### compact操作
+
+```bash
+# 手动压缩（保留当前revision之前的历史数据）
+etcdctl compact $(etcdctl endpoint status --write-out=json | jq -r '.[].header.revision')
+
+# 自动压缩配置
+# --auto-compaction-mode=periodic
+# --auto-compaction-retention=1h
+
+# 压缩策略选择
+# periodic：基于时间（推荐）
+# revision：基于版本号（高频写场景）
+```
+
+### defrag操作
+
+```bash
+# 手动碎片整理（释放磁盘空间）
+etcdctl defrag --endpoints=http://127.0.0.1:2379
+
+# 批量整理所有节点
+for host in node1 node2 node3; do
+  ETCDCTL_API=3 etcdctl --endpoints=$host:2379 defrag
+done
+
+# 注意事项：
+# defrag会阻塞写操作（拷贝数据+切换）
+# 建议在低峰期执行
+# 执行前确保磁盘空间充足
+# 建议先compact再defrag
+```
+
+### compact/defrag影响
+
+| 操作 | 影响 | 耗时 | 注意事项 |
+|------|------|------|----------|
+| compact | 减少存储空间 | 秒级 | 不影响当前版本数据 |
+| defrag | 回收磁盘空间 | 分钟级 | 阻塞写操作 |
+| 自动compact | 定期清理 | 后台 | 配置--auto-compaction-retention |
+| 组合操作 | compact+defrag | 分钟级 | 低峰期执行 |
+
+## 补充：lease租约（KeepAlive/TTL自动回收）
+
+### 租约机制详解
+
+```text
+Lease租约机制：
+  1. 创建租约（带TTL）
+     lease, _ := client.Grant(ctx, 30)  // 30秒TTL
+  
+  2. 绑定Key到租约
+     client.Put(ctx, "key", "value", clientv3.WithLease(lease.ID))
+  
+  3. 自动续期（KeepAlive）
+     ch, _ := client.KeepAlive(ctx, lease.ID)
+     for resp := range ch {
+         // 每次TTL/3自动续期
+     }
+  
+  4. 自动回收
+     租约过期 → 绑定的Key自动删除
+     客户端宕机 → KeepAlive停止 → 租约过期 → Key删除
+
+与ZK Session对比：
+  etcd Lease：时间戳比较，灵活（可调整TTL）
+  ZK Session：会话超时，固定（不易调整）
+
+适用场景：
+  分布式锁：持有者宕机→租约过期→锁自动释放
+  服务注册：服务下线→租约过期→注册信息自动清理
+  临时元数据：按需设置TTL→过期自动清理
+```
+
+### KeepAlive配置
+
+```go
+// 自动续期配置
+ctx := context.Background()
+grant, _ := client.Grant(ctx, 30)  // 30秒租约
+
+// KeepAlive选项
+keepAliveOpts := []clientv3.KeepAliveOption{
+    clientv3.WithKeepAliveTimeout(10 * time.Second),  // 续期超时
+    clientv3.WithKeepAliveInterval(10 * time.Second),  // 续期间隔
+}
+ch, _ := client.KeepAlive(ctx, grant.ID, keepAliveOpts...)
+
+// 监听续租状态
+for {
+    select {
+    case resp := <-ch:
+        if resp == nil {
+            log.Println("租约已过期")
+            // 重新绑定
+            return
+        }
+    case <-ctx.Done():
+        return
+    }
+}
+```
+
+## 补充：K8s etcd故障恢复（etcdctl snapshot restore）
+
+### 恢复流程详解
+
+```bash
+# 1. 备份（每小时）
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d%H%M).db
+
+# 2. 验证备份
+etcdctl snapshot status /backup/etcd-20260821.db --write-out=table
+
+# 3. 恢复（单节点）
+etcdctl snapshot restore /backup/etcd-20260821.db \
+  --data-dir=/var/lib/etcd-restored \
+  --name=etcd-0 \
+  --initial-cluster=etcd-0=http://etcd-0:2380 \
+  --initial-advertise-peer-urls=http://etcd-0:2380 \
+  --listen-peer-urls=http://etcd-0:2380
+
+# 4. 替换数据目录
+mv /var/lib/etcd /var/lib/etcd-old
+mv /var/lib/etcd-restored /var/lib/etcd
+
+# 5. 重启etcd
+systemctl restart etcd
+
+# 6. 验证恢复
+etcdctl endpoint health --cluster
+etcdctl endpoint status --cluster --write-out=table
+```
+
+### 恢复注意事项
+
+| 场景 | 注意事项 | 恢复时间 |
+|------|----------|----------|
+| 单节点恢复 | 直接snapshot restore+启动 | 分钟级 |
+| 集群恢复 | 所有节点使用同一快照恢复 | 小时级 |
+| 部分数据恢复 | 先恢复到新集群，再导出部分数据 | 小时级 |
+| 跨版本恢复 | 小版本可恢复，大版本需验证兼容性 | 小时级 |
+| K8s场景 | 需重启所有API Server | 分钟级 |
+
+## 补充：网络分区与leader election行为
+
+### 网络分区处理
+
+```text
+etcd网络分区行为：
+  场景：3节点集群（A,B,C），A被隔离
+  
+  正常状态：
+    A(Leader) ──── B(Follower)
+         │
+         └─── C(Follower)
+  
+  分区后：
+    A(Leader) ──── X (隔离)
+    B ──── C (仍连通)
+  
+  行为：
+    1. B/C检测到Leader不可达
+    2. 触发选举（随机超时后）
+    3. B或C当选新Leader
+    4. A被隔离后无法获得quorum→写被拒绝
+    5. A的读可能返回旧数据
+  
+  恢复后：
+    A重新加入集群
+    → 发现自己的Term较低
+    → 自动降级为Follower
+    → 从新Leader同步数据
+
+这就是CP特性的代价：
+  网络分区时少数派不可用（写被拒绝）
+  保证一致性（不会出现双主）
+```
+
+### 故障切换时间
+
+```text
+故障切换时间计算：
+  选举超时：默认1000ms
+  心跳超时：默认100ms
+  故障检测：3-5倍心跳超时
+  总切换时间：约3-5秒
+  
+  优化方法：
+    缩短heartbeat-interval（如50ms）
+    缩短election-timeout（如500ms）
+    启用PreVote机制（防止Term暴涨）
+```
+
+## 补充：v2 vs v3 API差异
+
+### HTTP REST vs gRPC
+
+| 特性 | v2 API | v3 API |
+|------|--------|--------|
+| 协议 | HTTP REST | gRPC |
+| 传输效率 | 低（JSON） | 高（Protocol Buffers） |
+| 连接方式 | 短连接 | 长连接（HTTP/2） |
+| Watch | 轮询 | 流式推送 |
+| 事务 | 不支持 | 支持（Txn） |
+| Lease | 无 | 支持（TTL） |
+| 性能 | 低 | 高（10x+） |
+| 状态 | 废弃 | 推荐 |
+
+```bash
+# v2 API（已废弃）
+curl http://localhost:2379/v2/keys/mykey
+curl http://localhost:2379/v2/keys/mykey -X PUT -d value="hello"
+
+# v3 API（推荐）
+etcdctl put mykey hello
+etcdctl get mykey
+
+# gRPC端口
+# 默认端口：2379（HTTP）+ 2380（peer）
+# v3 API使用同一个端口（2379）
+```
+
+## 补充：etcd性能调优
+
+### 关键参数配置
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| heartbeat-interval | 100ms | 100~300ms | 心跳间隔（跨机房可调大） |
+| election-timeout | 1000ms | 1000~5000ms | 选举超时 |
+| quota-backend-bytes | 2GB | 8GB | 后端存储大小限制 |
+| auto-compaction-retention | 0 | 8h | 自动压缩周期 |
+| snapshot-count | 10000 | 10000~50000 | 触发快照的事务数 |
+| max-request-bytes | 1.5MB | 4MB | 最大请求大小 |
+
+```bash
+# 性能调优配置
+etcd \
+  --heartbeat-interval=100 \
+  --election-timeout=1000 \
+  --quota-backend-bytes=8589934592 \
+  --auto-compaction-retention=8h \
+  --snapshot-count=10000 \
+  --max-request-bytes=4194304
+
+# 监控性能指标
+etcdctl endpoint status --write-out=table
+etcdctl endpoint health --cluster
+```
+
+### 磁盘优化
+
+```text
+磁盘选型：
+  推荐：NVMe SSD（最低延迟）
+  可接受：SATA SSD
+  禁止：HDD（fsync延迟高，会导致选举超时）
+
+文件系统：
+  推荐：ext4或xfs
+  挂载选项：noatime,nodiratime
+
+IO调度器：
+  SSD：noop或deadline
+  查看：cat /sys/block/sda/queue/scheduler
+```
+
+## 补充：etcd安全（TLS/mTLS/认证授权）
+
+### 认证配置
+
+```bash
+# 启用认证
+etcdctl auth enable
+
+# 创建用户
+etcdctl user add root:root-password
+
+# 创建角色
+etcdctl role add read-only
+
+# 给角色授权（只读/services前缀）
+etcdctl role grant-permission read-only read /services/
+
+# 绑定角色到用户
+etcdctl user grant-role root root
+```
+
+### TLS配置
+
+```bash
+# 生成证书
+cfssl gencert -ca=ca.pem -ca-key=ca-key.pem \
+  -config=ca-config.json -profile=server etcd-csr.json | cfssljson -bare etcd
+
+# 启动时配置TLS
+etcd \
+  --cert-file=/etc/etcd/server.pem \
+  --key-file=/etc/etcd/server-key.pem \
+  --trusted-ca-file=/etc/etcd/ca.pem \
+  --client-cert-auth=true \
+  --peer-cert-file=/etc/etcd/peer.pem \
+  --peer-key-file=/etc/etcd/peer-key.pem \
+  --peer-trusted-ca-file=/etc/etcd/ca.pem \
+  --peer-client-cert-auth=true
+```
+
+### RBAC权限控制
+
+| 角色 | 权限 | 用途 |
+|------|------|------|
+| root | 读写全部key | 管理员 |
+| k8s-apiserver | 读写/registry/* | K8s API Server |
+| monitoring | 读全部key | 监控系统 |
+| app-read | 读/services/* | 应用只读 |
+
+## 补充：etcd备份恢复策略
+
+### 备份策略
+
+```bash
+# 完整备份（每小时）
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d%H%M).db
+
+# 验证备份
+etcdctl snapshot status /backup/etcd-20260821.db --write-out=table
+
+# 定时备份（cron）
+0 * * * * /usr/local/bin/etcdctl snapshot save /backup/etcd-$(date +\%Y\%m\%d\%H\%M).db
+
+# 保留策略（保留最近7天）
+find /backup -name "etcd-*.db" -mtime +7 -delete
+```
+
+### 恢复演练
+
+```text
+恢复演练流程：
+  1. 在测试环境创建etcd集群
+  2. 导入备份快照
+  3. 验证数据完整性
+     - 检查key数量
+     - 抽样检查关键数据
+     - 验证revision连续性
+  4. 验证功能正常
+     - Put/Get操作
+     - Watch监听
+     - 事务操作
+  5. 记录恢复时间（RTO验证）
+  6. 生成恢复报告
+  
+  演练频率：
+    建议每月一次
+    大版本升级前必须演练
+```
+
 ## 十三、与其他板块的关系
 
 - 和「**基础知识/中间件/ZooKeeper**」：同为 CP 协调服务，etcd 是云原生替代者（对比见上）。

@@ -569,6 +569,548 @@ spec:
 
 ---
 
+## 远程写入（Remote Write）
+
+### 远程写入架构
+
+```text
+Prometheus Server
+    │
+    ├── Remote Write ──→ Thanos Receive / VictoriaMetrics / Mimir
+    │
+    ├── Remote Write ──→ 长期存储（S3/GCS/OSS）
+    │
+    └── Remote Write ──→ 其他监控系统（Elasticsearch）
+```
+
+### 配置示例
+
+```yaml
+# prometheus.yml
+remote_write:
+  - url: "http://thanos-receive:19291/api/v1/receive"
+    queue_config:
+      max_samples_per_send: 10000    # 每批最大样本数
+      batch_send_deadline: 5s        # 批次发送超时
+      max_shards: 30                 # 最大并发写入分片
+      capacity: 10000                # 队列容量
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: '(.*)'
+        action: keep
+    remote_timeout: 30s
+
+  # 写入多个后端（不同指标分离）
+  - url: "http://mimir:8080/api/v1/push"
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'node_.*'
+        action: drop  # 不写入 Mimir
+```
+
+### Remote Write 性能优化
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| max_samples_per_send | 每批发送样本数 | 5000-10000 |
+| batch_send_deadline | 批次超时时间 | 5s |
+| max_shards | 并发写入分片数 | 10-30 |
+| capacity | 发送队列容量 | 10000-50000 |
+| min_shards | 最小分片数 | 1 |
+| max_samples_per_second | 每秒最大样本数 | 根据带宽调整 |
+
+```text
+调优原则：
+  1. max_samples_per_send × max_shards = 最大写入吞吐
+  2. batch_send_deadline 越小，延迟越低但请求越多
+  3. capacity 太小会丢数据，太大占用内存
+  4. 根据网络带宽和存储能力反推参数
+```
+
+---
+
+## 服务发现（Service Discovery）
+
+### 支持的服务发现方式
+
+| 方式 | 说明 | 适用场景 |
+|------|------|----------|
+| static_configs | 静态配置 | 开发/测试环境 |
+| file_sd_configs | 文件发现 | 动态配置 |
+| consul_sd_configs | Consul 服务发现 | 微服务架构 |
+| dns_sd_configs | DNS 解析 | Kubernetes |
+| ec2_sd_configs | AWS EC2 发现 | AWS 环境 |
+| openstack_sd_configs | OpenStack 发现 | 私有云 |
+| kubernetes_sd_configs | Kubernetes API | K8s 环境 |
+| eureka_sd_configs | Eureka 发现 | Spring Cloud |
+
+### Consul 服务发现配置
+
+```yaml
+scrape_configs:
+  - job_name: 'consul-services'
+    consul_sd_configs:
+      - server: 'consul:8500'
+        services: []  # 空表示发现所有服务
+        tags:
+          - 'prometheus'
+    relabel_configs:
+      # 从 Consul 标签提取指标路径
+      - source_labels: [__meta_consul_tags]
+        regex: '.*,prometheus-([0-9]+),.*'
+        target_label: __address__
+        replacement: '${1}'
+
+      # 从 Consul 标签提取服务名
+      - source_labels: [__meta_consul_service]
+        target_label: service
+
+      # 从 Consul 标签提取环境
+      - source_labels: [__meta_consul_tags]
+        regex: '.*,env-(\w+),.*'
+        target_label: env
+```
+
+### Kubernetes 服务发现配置
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # 只抓取带 prometheus.io/scrape: "true" 的 Pod
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+
+      # 从注解获取指标路径
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+
+      # 从注解获取端口
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+      # 添加 Pod 标签
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+```
+
+---
+
+## Grafana Dashboard 设计
+
+### Dashboard 层次结构
+
+```text
+L1 - Overview Dashboard（全局概览）
+  ├── 总服务数、健康状态
+  ├── 关键 SLI 指标
+  └── 告警汇总
+
+L2 - Service Dashboard（服务维度）
+  ├── 请求量 / 延迟 / 错误率
+  ├── 资源使用率（CPU/内存/磁盘）
+  └── 依赖服务状态
+
+L3 - Detail Dashboard（实例维度）
+  ├── 单实例性能指标
+  ├── 线程/GC/JVM 状态
+  └── 连接池/队列状态
+
+L4 - Debug Dashboard（调试专用）
+  ├── 原始样本数据
+  ├── 查询性能分析
+  └── 标签基数分析
+```
+
+### Dashboard 变量（Variables）设计
+
+```yaml
+# Grafana Dashboard JSON 中的 templating 部分
+templating:
+  list:
+    - name: datasource
+      type: datasource
+      query: prometheus
+      current:
+        text: Prometheus
+        value: Prometheus
+
+    - name: cluster
+      type: query
+      query: label_values(up, cluster)
+      refresh: 2  # 时间范围变化时刷新
+      multi: true
+      includeAll: true
+
+    - name: namespace
+      type: query
+      query: label_values(up{cluster=~"$cluster"}, namespace)
+      refresh: 2
+      multi: true
+      includeAll: true
+
+    - name: service
+      type: query
+      query: label_values(up{cluster=~"$cluster", namespace=~"$namespace"}, service)
+      refresh: 2
+      multi: false
+```
+
+### Dashboard 最佳实践
+
+```text
+设计原则：
+  1. 按受众设计
+     - 管理层：Overview（SLI/SLO）
+     - 开发者：Service（依赖分析）
+     - 运维：Detail（资源/容量）
+
+  2. 信息密度
+     - 单行不超过 6 个面板
+     - 每个面板聚焦一个指标
+     - 使用 row 分组
+
+  3. 变量设计
+     - 多级联动：cluster → namespace → service
+     - 支持多选和 All
+     - 设置合理的默认值
+
+  4. 告警集成
+     - 面板标题包含关联的告警规则名
+     - 使用 Annotations 标记重要事件
+     - 链接到关联 Dashboard
+```
+
+### 常用 Dashboard 模板
+
+| 模板 ID | 名称 | 适用场景 |
+|---------|------|----------|
+| 1860 | Node Exporter Full | Linux 主机监控 |
+| 9628 | Docker & System | 容器监控 |
+| 6417 | Kafka Overview | Kafka 集群 |
+| 12006 | Redis Dashboard | Redis 监控 |
+| 14497 | MySQL Overview | MySQL 监控 |
+| 763 | Redis Dashboard | Redis 监控 |
+| 11055 | K8s Cluster | K8s 集群 |
+| 15757 | Spring Boot | Java 应用 |
+
+---
+
+## 统一告警体系
+
+### Alertmanager 路由配置
+
+```yaml
+# alertmanager.yml
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager'
+  smtp_auth_password: 'password'
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # P0 告警 → 立即通知
+    - match:
+        severity: critical
+      receiver: 'pager-critical'
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # P1 告警 → 工作时间通知
+    - match:
+        severity: warning
+      receiver: 'slack-warning'
+      active_time_intervals:
+        - work-hours
+      repeat_interval: 4h
+
+    # 按服务路由
+    - match_re:
+        service: 'payment|order'
+      receiver: 'team-commerce'
+
+receivers:
+  - name: 'default'
+    email_configs:
+      - to: 'ops@example.com'
+
+  - name: 'pager-critical'
+    pagerduty_configs:
+      - service_key: '<key>'
+
+  - name: 'slack-warning'
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/...'
+        channel: '#alerts'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+
+  - name: 'team-commerce'
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/...'
+        channel: '#commerce-alerts'
+
+inhibit_rules:
+  # critical 告警抑制 warning 告警
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+```
+
+### 告警抑制与静默
+
+```text
+抑制规则（Inhibit Rules）：
+  用途：当 P0 告警触发时，自动抑制相关的 P1/P2 告警
+  场景：
+    - 数据库主节点宕机 → 抑制从节点延迟告警
+    - 机房网络中断 → 抑制该机房所有服务告警
+    - 服务完全不可用 → 抑制该服务的性能告警
+
+静默（Silence）：
+  用途：临时屏蔽特定告警
+  场景：
+    - 计划维护窗口
+    - 已知问题的临时处理
+    - 新功能上线观察期
+```
+
+### 告警规则最佳实践
+
+```yaml
+groups:
+  - name: slo-alerts
+    rules:
+      # 基于 SLO 的告警
+      - alert: HighErrorRate
+        expr: |
+          100 - (
+            sum(rate(http_requests_total{status!~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m]))
+          ) > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "错误率超过 1%"
+          description: "当前错误率 {{ $value | printf \"%.2f\" }}%，SLO 目标 99.9%"
+
+      # 基于趋势的告警
+      - alert: ErrorRateTrend
+        expr: |
+          (
+            sum(rate(http_requests_total{status!~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+          )
+          /
+          (
+            sum(rate(http_requests_total{status!~"5.."}[1h])) / sum(rate(http_requests_total[1h]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "错误率趋势上升"
+          description: "5分钟错误率是1小时平均的 {{ $value | printf \"%.1f\" }} 倍"
+```
+
+---
+
+## 长期存储方案
+
+### Thanos vs VictoriaMetrics vs Mimir
+
+| 维度 | Thanos | VictoriaMetrics | Mimir |
+|------|--------|-----------------|-------|
+| 架构 | Sidecar + Store + Query | 单体/集群 | 微服务 |
+| 存储 | S3/GCS/Azure Blob | 本地/remote | S3/GCS/Azure Blob |
+| 降采样 | 支持 | 自动 | 支持 |
+| 全局查询 | 支持 | 支持 | 支持 |
+| 压缩 | 支持 | 自动 | 支持 |
+| 运维复杂度 | 高 | 低 | 中 |
+| 性能 | 高 | 极高 | 高 |
+| 适用场景 | 大规模多集群 | 中大规模 | 大规模多租户 |
+
+### 降采样策略
+
+```text
+降采样（Downsampling）：
+  目的：减少长期存储的数据量，提升查询性能
+  策略：
+    - 原始数据：保留 15 天
+    - 5 分钟聚合：保留 30 天
+    - 1 小时聚合：保留 1 年
+    - 1 天聚合：保留 5 年
+
+配置示例（Thanos Compact）：
+  --retention.resolution-raw=15d
+  --retention.resolution-5m=30d
+  --retention.resolution-1h=365d
+```
+
+### 数据保留策略
+
+```yaml
+# VictoriaMetrics 保留策略
+-retentionPeriod=90  # 保留 90 天
+-storageDataPath=/victoria-metrics-data
+
+# Thanos Store 保留策略
+--store.grpc.series-max-concurrency=100
+--min-time=-2h
+--max-time=-2h
+```
+
+---
+
+## 监控方法论
+
+### RED 方法
+
+```text
+适用于面向请求的服务
+  - Rate：请求速率（QPS）
+  - Errors：错误率
+  - Duration：延迟分布
+
+PromQL 示例：
+  Rate：  sum(rate(http_requests_total[5m])) by (service)
+  Errors：sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+  Duration：histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+```
+
+### USE 方法
+
+```text
+适用于资源（CPU/内存/磁盘/网络）
+  - Utilization：资源使用率
+  - Saturation：资源饱和度
+  - Errors：资源错误数
+
+PromQL 示例：
+  CPU Utilization：100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+  Memory Saturation：node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+  Disk Errors：rate(node_disk_io_errors_total[5m])
+```
+
+### SLI/SLO/SLA 关系
+
+```text
+SLI（Service Level Indicator）：
+  定义：服务质量指标（如可用性、延迟、错误率）
+  示例：
+    - 可用性 = 成功请求数 / 总请求数
+    - 延迟 = P99 响应时间
+    - 正确性 = 正确响应数 / 总响应数
+
+SLO（Service Level Objective）：
+  定义：SLI 的目标值
+  示例：
+    - 可用性 SLO = 99.9%（每月宕机 43.8 分钟）
+    - 延迟 SLO = P99 < 500ms
+    - 正确性 SLO = 99.99%
+
+SLA（Service Level Agreement）：
+  定义：服务等级协议（法律约束）
+  示例：
+    - 可用性 SLA = 99.9%（违约赔偿）
+    - 修复时间 SLA = 4 小时
+
+Error Budget：
+  公式：Error Budget = 1 - SLO
+  示例：SLO = 99.9% → Error Budget = 0.1%（每月 43.8 分钟）
+  用途：指导发布节奏（预算充足时加速发布，预算不足时冻结发布）
+```
+
+### 告警分级标准
+
+| 级别 | 响应时间 | 通知方式 | 处理要求 | 示例 |
+|------|----------|----------|----------|------|
+| P0（紧急） | 5分钟 | 电话+短信+IM | 立即处理 | 服务完全不可用 |
+| P1（严重） | 15分钟 | 短信+IM | 30分钟内响应 | 核心功能异常 |
+| P2（警告） | 30分钟 | IM | 2小时内响应 | 性能明显下降 |
+| P3（提示） | 4小时 | 邮件 | 24小时内处理 | 非核心功能异常 |
+| P4（信息） | 24小时 | 邮件 | 下一工作日 | 资源使用率预警 |
+
+---
+
+## Prometheus 联邦与高可用
+
+### 联邦架构
+
+```text
+层级联邦：
+  Edge Prometheus（采集层）
+    ├── 指标聚合后上报
+    └── 告警规则本地执行
+
+  Central Prometheus（聚合层）
+    ├── 全局视图
+    ├── 跨集群查询
+    └── 全局告警
+
+配置：
+  scrape_configs:
+    - job_name: 'federate'
+      honor_labels: true
+      metrics_path: '/federate'
+      params:
+        'match[]':
+          - '{job=~".+"}'           # 采集所有 job 的指标
+          - '{__name__=~"job:.*"}'  # 采集 job 级别聚合指标
+      static_configs:
+        - targets:
+          - 'edge-prometheus-1:9090'
+          - 'edge-prometheus-2:9090'
+```
+
+### 高可用部署
+
+```text
+方案1：双写（推荐）
+  - 两个 Prometheus 实例采集相同目标
+  - 告警规则在两个实例独立执行
+  - 查询时任选一个
+  优点：简单可靠
+  缺点：资源浪费
+
+方案2：Thanos Receive
+  - 多个 Prometheus 实例写入 Thanos Receive
+  - Thanos Receive 负责数据冗余
+  - 查询通过 Thanos Query 统一入口
+  优点：数据一致性好
+  缺点：架构复杂
+
+方案3：VictoriaMetrics Cluster
+  - 多个 vminsert 写入
+  - vmstorage 存储副本
+  - vmselect 查询
+  优点：性能极高
+  缺点：组件多
+```
+
+---
+
 ## 十七、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；

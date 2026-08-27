@@ -946,6 +946,109 @@ S3A / GCS / OSS vs HDFS 对比：
 | 版本管理 | Iceberg/Delta 快照保留策略 | 每周 |
 | Compaction | 小文件合并/孤儿文件清理 | 每日 |
 
+## 三十八、HDFS 3.x Erasure Coding vs RAID 深度对比
+
+### EC vs RAID 性能基准
+
+| 维度 | HDFS EC (RS-6-3) | RAID 5 | RAID 6 | 3 副本 |
+|------|------------------|--------|--------|--------|
+| 存储效率 | 66.7% | 75% | 80% | 33.3% |
+| 容错能力 | 3 块丢失 | 1 块丢失 | 2 块丢失 | 2 块丢失 |
+| 写放大 | 1.5x + CPU | 1.33x | 1.25x | 3x |
+| 恢复时间 | 分钟级（网络读多块） | 秒级（本地重建） | 秒级 | 秒级（直接复制） |
+| 扩展性 | 横向无限扩展 | 受限于控制器 | 受限于控制器 | 横向扩展 |
+| 适用场景 | 冷数据/归档 | 本地磁盘阵列 | 高可靠本地存储 | 热数据 |
+
+```
+EC 重建开销分析：
+  丢失 1 块：读 5 块 + RS 计算恢复（CPU 密集）
+  丢失 2 块：读 4 块 + RS 计算恢复
+  丢失 3 块：读 3 块 + RS 计算恢复（极限）
+  恢复带宽占用：n 块并行读取 × 网络传输
+
+EC vs RAID 选型：
+  HDFS 集群 → EC（原生支持，横向扩展）
+  本地存储 → RAID（低延迟重建）
+  冷数据目录 → EC（存储效率高）
+  热数据 → 副本（低延迟读取）
+```
+
+## 三十九、HDFS 存储策略自动化管理
+
+### 策略生命周期管理
+
+```bash
+# 自动分层脚本（基于访问热度）
+#!/bin/bash
+# HOT → WARM（30 天未访问）
+hdfs dfs -ls -R /data | awk '{print $8}' | while read file; do
+  atime=$(hdfs dfs -stat "%A" "$file")
+  now=$(date +%s)
+  days=$(( (now - atime) / 86400 ))
+  if [ $days -gt 30 ]; then
+    hdfs storagepolicies -setStoragePolicy -path "$file" -policy WARM
+  fi
+done
+
+# WARM → COLD（90 天未访问）
+# 同理替换策略为 COLD
+
+# 触发迁移
+hdfs mover -p /data
+
+# 监控迁移进度
+hdfs mover -p /data -moveWorkerThreads 4
+```
+
+### 存储策略监控
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| 策略分布 | 各策略下数据量占比 | 异常波动 |
+| 迁移积压 | 待迁移数据量 | > 1TB |
+| 迁移失败率 | 迁移失败比例 | > 5% |
+| 存储成本 | 各策略存储成本 | 超预算 |
+| 数据热度 | 访问频率分布 | 热数据占比异常 |
+
+## 四十、NameNode RPC 性能优化深入
+
+### handler.count 调优
+
+```
+NameNode RPC 处理瓶颈：
+  单线程处理所有元数据请求 → 高并发下延迟飙升
+  handler.count 控制 RPC 处理线程数
+
+调优公式：
+  handler.count = 预期并发连接数 × 1.5（预留）
+  建议范围：100~300（根据集群规模）
+
+  1000 主机集群：handler.count = 150~200
+  5000 主机集群：handler.count = 200~300
+  10000 主机集群：handler.count = 300~500
+
+监控指标：
+  NameNode RPC Queue Length：RPC 队列长度
+  NameNode RPC Processing Time：RPC 处理时间
+  NameNode GetImage/Txn：fsimage 加载时间
+
+瓶颈排查：
+  1. jstack 查看 NameNode 线程状态
+  2. 检查 RPC 队列是否积压
+  3. 检查 fsimage 合并频率
+  4. 检查 block 操作频率
+```
+
+### 其他 RPC 优化参数
+
+| 参数 | 默认值 | 说明 | 建议值 |
+|------|--------|------|--------|
+| dfs.namenode.handler.count | 10 | RPC 处理线程数 | 100~300 |
+| dfs.namenode.service.handler.count | 10 | 服务 RPC 线程数 | 100~200 |
+| dfs.namenode.max-extra-delay | 2s | 超时延迟 | 2~5s |
+| dfs.namenode.fs-limits.min-block-size | 1MB | 最小块大小 | 64MB |
+| dfs.namenode.safemode.threshold-pct | 0.999 | 安全模式阈值 | 0.999 |
+
 ## 与其他板块的关系
 
 - 对象存储见「[对象存储 MinIO/OSS](../中间件/对象存储MinIO-OSS.md)」；

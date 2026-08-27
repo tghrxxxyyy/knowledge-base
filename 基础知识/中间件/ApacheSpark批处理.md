@@ -942,6 +942,261 @@ resources:
 | 数据倾斜 | 加盐/两阶段聚合/Broadcast Join | P0 |
 | 小文件治理 | 合并小分区/文件 | P1 |
 
+## 二十二、Spark on Kubernetes 部署模式
+
+### 部署模式对比
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| Client | Driver 在客户端 | 调试 |
+| Cluster | Driver 在集群 | 生产 |
+| K8s Native | 原生 K8s 调度 | 云原生 |
+
+### K8s 部署配置
+
+```bash
+spark-submit \
+  --master k8s://https://k8s-master:6443 \
+  --deploy-mode cluster \
+  --name spark-etl \
+  --class com.example.ETLJob \
+  --conf spark.kubernetes.container.image=spark:3.5.0 \
+  --conf spark.kubernetes.namespace=spark-jobs \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+  --conf spark.kubernetes.driver.request.cores=2 \
+  --conf spark.kubernetes.executor.instances=10 \
+  --conf spark.kubernetes.executor.request.cores=4 \
+  --conf spark.kubernetes.executor.memory=8g \
+  local:///opt/spark/jars/etl-job.jar
+```
+
+## 二十三、动态资源分配（Dynamic Allocation）
+
+### 动态分配配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.dynamicAllocation.enabled | false | 启用动态分配 |
+| spark.shuffle.service.enabled | true | 外部 Shuffle 服务 |
+| spark.dynamicAllocation.minExecutors | 0 | 最小 Executor |
+| spark.dynamicAllocation.maxExecutors | ∞ | 最大 Executor |
+| spark.dynamicAllocation.executorIdleTimeout | 60s | 空闲超时 |
+| spark.dynamicAllocation.schedulerBacklogTimeout | 1s | 调度积压超时 |
+
+### 动态分配调优
+
+```
+动态分配策略：
+  1. 启用外部 Shuffle 服务（避免 Executor 退出丢失 Shuffle 数据）
+  2. 设置合理的最小/最大 Executor 数
+  3. 调整空闲超时时间
+  4. 监控 Executor 数量变化
+
+监控指标：
+  activeExecutors：活跃 Executor 数
+  idleExecutors：空闲 Executor 数
+  pendingTasks：等待任务数
+  shuffleBytesWritten：Shuffle 写入量
+```
+
+## 二十四、推测执行（Speculative Execution）
+
+### 推测执行配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.speculation | false | 启用推测执行 |
+| spark.speculation.multiplier | 3 | 倍数 |
+| spark.speculation.quantile | 0.9 | 分位数 |
+| spark.speculation.interval | 100ms | 检查间隔 |
+
+### 推测执行策略
+
+```
+推测执行原理：
+  1. 持续监控任务进度
+  2. 如果任务进度落后于中位数的 N 倍
+  3. 启动一个相同的任务副本
+  4. 先完成的任务结果生效
+  5. 另一个任务被取消
+
+适用场景：
+  数据倾斜（部分任务慢）
+  网络抖动（偶发慢任务）
+  磁盘 IO 不均（部分节点慢）
+
+不适用场景：
+  CPU 密集型（双倍 CPU 消耗）
+  网络带宽瓶颈（双倍网络）
+```
+
+## 二十五、Spark History Server 配置
+
+### History Server 配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.eventLog.enabled | true | 启用事件日志 |
+| spark.eventLog.dir | hdfs://... | 事件日志目录 |
+| spark.eventLog.compress | true | 压缩事件日志 |
+| spark.history.fs.logDirectory | hdfs://... | History 日志目录 |
+| spark.history.ui.port | 18080 | History UI 端口 |
+
+### History Server 启动
+
+```bash
+# 启动 History Server
+$SPARK_HOME/sbin/start-history-server.sh
+
+# 停止 History Server
+$SPARK_HOME/sbin/stop-history-server.sh
+
+# 配置 yarn 模式
+export SPARK_HISTORY_OPTS="-Dspark.history.fs.logDirectory=hdfs:///spark-logs -Dspark.history.ui.port=18080"
+```
+
+## 二十六、Spark 3.x 新特性
+
+### Spark 3.x 关键特性
+
+| 特性 | 说明 |
+|------|------|
+| Adaptive Query Execution (AQE) | 自适应查询执行 |
+| Dynamic Partition Pruning | 动态分区裁剪 |
+| Join Hints | Join 提示 |
+| Z-Ordering | 数据聚簇 |
+| Structured Streaming UI | 流处理 UI |
+| Arrow 集成增强 | 向量化执行 |
+
+### AQE 配置
+
+```scala
+// 启用 AQE
+spark.conf.set("spark.sql.adaptive.enabled", true)
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", true)
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", true)
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", 5)
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", 256 * 1024 * 1024)
+```
+
+## 二十七、Spark SQL 优化最佳实践
+
+### SQL 优化策略
+
+| 策略 | 说明 |
+|------|------|
+| 广播 Join | 小表广播避免 Shuffle |
+| 分区剪裁 | 只读取需要的分区 |
+| 列式存储 | 使用 Parquet/ORC |
+| 列剪裁 | 只读取需要的列 |
+| 谓词下推 | 过滤条件下推到数据源 |
+| Join 重排 | 避免笛卡尔积 |
+
+### SQL 优化示例
+
+```sql
+-- 启用 AQE 自动优化
+SET spark.sql.adaptive.enabled=true;
+
+-- 广播 Hint
+SELECT /*+ BROADCAST(small_table) */ *
+FROM large_table JOIN small_table ON large_table.id = small_table.id;
+
+-- 分区剪裁
+SELECT * FROM events WHERE date = '2024-01-01';
+
+-- 列剪裁
+SELECT id, name FROM users WHERE age > 18;
+
+-- 谓词下推（自动）
+SELECT * FROM parquet_table WHERE date = '2024-01-01';
+```
+
+## 二十八、Spark Shuffle 优化
+
+### Shuffle 优化参数
+
+| 参数 | 默认值 | 说明 | 建议值 |
+|------|--------|------|--------|
+| spark.sql.shuffle.partitions | 200 | Shuffle 分区数 | 根据数据量调整 |
+| spark.shuffle.compress | true | 压缩 Shuffle 数据 | true |
+| spark.shuffle.spill.compress | true | 压缩溢写数据 | true |
+| spark.reducer.maxSizeInFlight | 48m | Reducer 缓冲区 | 64~128m |
+| spark.shuffle.file.buffer | 32k | Shuffle 文件缓冲 | 64~128k |
+
+### Shuffle 分区数计算
+
+```
+Shuffle 分区数 = 数据量 / 单分区大小
+  推荐单分区大小：128MB~256MB
+
+  示例：100GB 数据 / 256MB = 400 分区
+
+  过小：过多小文件，IO 开销大
+  过大：单分区数据量大，内存溢出
+```
+
+## 二十九、Spark 内存管理
+
+### 内存布局
+
+```
+Executor 内存布局：
+  ├── Reserved Memory（300MB）
+  ├── User Memory（(1-0.4) * 可用内存）
+  └── Storage Memory（0.4 * 可用内存）
+      ├── Unroll Memory
+      ├── Broadcast 变量
+      └── 缓存数据
+```
+
+### 内存配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.executor.memory | 1g | Executor 内存 |
+| spark.executor.memoryOverhead | 384m | 额外内存（堆外） |
+| spark.memory.fraction | 0.6 | 执行+存储内存比例 |
+| spark.memory.storageFraction | 0.5 | 存储内存比例 |
+
+### 内存溢出处理
+
+```
+内存溢出类型：
+  1. OOM（堆内）：数据量超过 Executor 内存
+  2. OOM（堆外）：Netty/Arrow 内存不足
+  3. Shuffle 溢写：Shuffle 数据写磁盘
+  4. 缓存溢写：缓存数据写磁盘
+
+解决方案：
+  1. 增加 Executor 内存
+  2. 增加分区数（减小单分区数据量）
+  3. 启用堆外内存
+  4. 使用列式存储（Parquet）
+```
+
+## 三十、Spark 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 数据倾斜 | 分区键分布不均 | 加盐/repartition |
+| OOM | 数据量过大 | 增加内存/分区数 |
+| Shuffle 超时 | 网络/IO 瓶颈 | 增加分区数/优化 Join |
+| GC 频繁 | 内存不足 | 调整内存参数 |
+| 数据丢失 | Shuffle 网络抖动 | 启用外部 Shuffle 服务 |
+| 任务挂起 | 资源不足 | 增加 Executor/调整配置 |
+
+### 问题排查流程
+
+```
+问题排查：
+  1. 查看 Spark UI（任务/阶段/Shuffle）
+  2. 检查 Executor 日志（OOM/异常）
+  3. 分析 DAG（Stage 划分/数据倾斜）
+  4. 检查资源使用（CPU/内存/IO）
+  5. 优化配置（分区数/内存/并行度）
+```
+
 ## 二十二、与其他板块的关系
 
 - Flink（流处理对比）见「[Apache Flink 流处理](./ApacheFlink流处理.md)」；

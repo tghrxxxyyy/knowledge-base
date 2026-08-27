@@ -311,6 +311,515 @@ flowchart LR
 | Confluent Replicator | 商业方案 | 企业级 |
 | Cruise Control | 自动均衡 | 大规模 |
 
+---
+
+## 副本与 ISR 调优
+
+### ISR 机制详解
+
+```text
+ISR（In-Sync Replicas）同步副本集：
+  Leader 副本
+    ├── 接收所有读写请求
+    ├── 维护 ISR 列表
+    └── 向 Follower 同步数据
+
+  Follower 副本
+    ├── 从 Leader 拉取数据
+    ├── 追上 Leader（在 ISR 中）
+    └── 落后 Leader（被移出 ISR）
+
+  关键参数：
+    - replica.lag.time.max.ms：Follower 最大延迟时间（默认30秒）
+    - min.insync.replicas：最小同步副本数（默认1）
+    - unclean.leader.election.enable：是否允许非 ISR 成为 Leader
+```
+
+### ISR 调优配置
+
+```properties
+# Broker 端配置
+replica.lag.time.max.ms=30000          # Follower 最大延迟
+min.insync.replicas=2                   # 最小同步副本数
+unclean.leader.election.enable=false    # 禁止非 ISR 成为 Leader
+
+# Producer 端配置
+acks=all                                # 所有 ISR 确认
+retries=Integer.MAX_VALUE               # 无限重试
+retry.backoff.ms=100                    # 重试间隔
+delivery.timeout.ms=120000              # 投递超时
+request.timeout.ms=30000                # 请求超时
+max.in.flight.requests.per.connection=5 # 最大未确认请求数
+```
+
+### ISR 相关指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| kafka_server_ReplicaManager_IsrShrinksPerSec | ISR 缩减频率 | >0 |
+| kafka_server_ReplicaManager_IsrExpandsPerSec | ISR 扩展频率 | 异常波动 |
+| kafka_server_ReplicaManager_UnderReplicatedPartitions | 副本不足分区数 | >0 |
+| kafka_server_ReplicaManager_OfflineReplicaCount | 离线副本数 | >0 |
+
+### 副本分配策略
+
+```text
+副本分配策略：
+  轮询分配（默认）
+    Partition 0 → Broker 0, 1, 2
+    Partition 1 → Broker 1, 2, 0
+    Partition 2 → Broker 2, 0, 1
+
+  机架感知分配
+    Partition 0 → Broker 0 (Rack A), 1 (Rack B), 2 (Rack C)
+    确保副本分布在不同机架
+
+  自定义分配
+    通过 admin API 手动指定副本位置
+```
+
+---
+
+## 批处理与压缩优化
+
+### 批处理配置
+
+```properties
+# Producer 批处理
+batch.size=16384                        # 批次大小（16KB）
+linger.ms=5                             # 等待时间（5ms）
+buffer.memory=33554432                  # 缓冲区大小（32MB）
+max.block.ms=60000                      # 缓冲区满时阻塞时间
+
+# Consumer 批处理
+fetch.min.bytes=1                       # 最小拉取字节
+fetch.max.wait.ms=500                   # 最大等待时间
+max.partition.fetch.bytes=1048576       # 单分区最大拉取（1MB）
+```
+
+### 压缩配置
+
+```properties
+# Producer 压缩
+compression.type=snappy                 # 压缩类型（snappy/gzip/lz4/zstd）
+
+# Broker 端压缩
+compression.type=producer               # 保持 Producer 压缩（不重新压缩）
+```
+
+### 批处理与压缩效果
+
+| 配置 | 吞吐量 | 延迟 | CPU使用 | 适用场景 |
+|------|--------|------|---------|----------|
+| batch.size=16KB, linger.ms=0 | 低 | 低 | 低 | 低延迟 |
+| batch.size=64KB, linger.ms=5 | 高 | 中 | 中 | 平衡 |
+| batch.size=128KB, linger.ms=20 | 极高 | 高 | 高 | 高吞吐 |
+| compression.type=snappy | 高 | 中 | 中 | 通用 |
+| compression.type=lz4 | 高 | 低 | 低 | 实时 |
+| compression.type=zstd | 极高 | 高 | 高 | 归档 |
+
+---
+
+## 配额与限流
+
+### 配额配置
+
+```properties
+# Producer 配额
+producer_byte_rate=10485760            # 10MB/s
+
+# Consumer 配额
+consumer_byte_rate=20971520            # 20MB/s
+
+# Request 配额
+request_percentage=25                  # 请求处理时间占比25%
+```
+
+### 动态配额
+
+```bash
+# 设置配额
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --add-config 'producer_byte_rate=10485760' \
+  --entity-type users --entity-name user1
+
+# 查看配额
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --describe --entity-type users --entity-name user1
+
+# 删除配额
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --delete-config 'producer_byte_rate' \
+  --entity-type users --entity-name user1
+```
+
+### 限流策略
+
+```text
+限流维度：
+  1. 按用户限流
+     - 限制单个用户的生产/消费速率
+     - 防止单用户占用过多资源
+
+  2. 按客户端限流
+     - 限制单个客户端的请求频率
+     - 防止异常客户端影响集群
+
+  3. 按 Topic 限流
+     - 限制单个 Topic 的写入/读取速率
+     - 保护重要 Topic 的性能
+
+  4. 按 Broker 限流
+     - 限制单个 Broker 的请求处理速率
+     - 防止 Broker 过载
+
+限流触发处理：
+  - 返回 throttle（限流）响应
+  - 客户端等待 throttle 时间后重试
+  - 记录限流日志用于分析
+```
+
+---
+
+## 监控指标详解
+
+### Producer 关键指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| kafka-producer-metrics record-send-rate | 发送速率 | 异常波动 |
+| kafka-producer-metrics record-error-rate | 错误率 | >0.1% |
+| kafka-producer-metrics request-latency-avg | 请求延迟 | >100ms |
+| kafka-producer-metrics batch-size-avg | 批次大小 | 异常 |
+| kafka-producer-metrics buffer-available-bytes | 缓冲区可用空间 | 接近0 |
+
+### Consumer 关键指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| kafka-consumer-metrics records-lag-max | 消费延迟 | >10000 |
+| kafka-consumer-metrics fetch-rate | 拉取速率 | 异常波动 |
+| kafka-consumer-metrics fetch-latency-avg | 拉取延迟 | >500ms |
+| kafka-consumer-metrics commit-latency-avg | 提交延迟 | >1000ms |
+| kafka-consumer-metrics heartbeat-rate | 心跳频率 | 异常 |
+
+### Broker 关键指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| kafka_server_BrokerTopicMetrics_MessagesInPerSec | 消息输入速率 | 异常波动 |
+| kafka_server_BrokerTopicMetrics_BytesInPerSec | 字节输入速率 | 异常波动 |
+| kafka_server_BrokerTopicMetrics_BytesOutPerSec | 字节输出速率 | 异常波动 |
+| kafka_server_ReplicaManager_UnderReplicatedPartitions | 副本不足分区 | >0 |
+| kafka_server_ReplicaManager_OfflineReplicaCount | 离线副本数 | >0 |
+| kafka_server_ReplicaManager_IsrShrinksPerSec | ISR缩减频率 | >0 |
+| kafka_server_ReplicaManager_IsrExpandsPerSec | ISR扩展频率 | 异常 |
+
+### 监控仪表盘设计
+
+```text
+Grafana Dashboard 设计：
+  1. 集群概览
+     - Broker 数量和状态
+     - Topic 数量和分区分布
+     - 消息吞吐量趋势
+     - 延迟分布
+
+  2. Producer 分析
+     - 各 Producer 吞吐量
+     - 各 Producer 延迟
+     - 各 Producer 错误率
+     - 批次大小分布
+
+  3. Consumer 分析
+     - 各 Consumer 消费速率
+     - 各 Consumer 消费延迟
+     - Consumer Group 状态
+     - Offset 提交情况
+
+  4. 告警统计
+     - 告警数量趋势
+     - 告警级别分布
+     - 告警响应时间
+     - 告警解决率
+```
+
+---
+
+## 跨数据中心复制
+
+### 跨 DC 架构
+
+```text
+跨 DC 复制模式：
+  模式1：Active-Passive（主备）
+    DC1（Active）──→ DC2（Passive）
+    用途：灾备
+
+  模式2：Active-Active（双活）
+    DC1 ←──→ DC2
+    用途：多活
+
+  模式3：Hub-Spoke（中心辐射）
+    DC1（Hub）←──→ DC2（Spoke）
+    DC1（Hub）←──→ DC3（Spoke）
+    用途：多区域
+
+  模式4：Mesh（网状）
+    DC1 ←──→ DC2
+    DC1 ←──→ DC3
+    DC2 ←──→ DC3
+    用途：完全多活
+```
+
+### MirrorMaker 2 配置
+
+```properties
+# mm2.properties
+clusters = dc1, dc2
+
+dc1.bootstrap.servers = kafka-dc1:9092
+dc2.bootstrap.servers = kafka-dc2:9092
+
+dc1->dc2.enabled = true
+dc2->dc1.enabled = true
+
+replication.factor = 3
+sync.topic.configs.enabled = true
+
+# 同步所有 Topic
+dc1->dc2.topics = .*
+dc2->dc1.topics = .*
+
+# 排除内部 Topic
+dc1->dc2.topics.exclude = __.*, _confluent.*
+dc2->dc1.topics.exclude = __.*, _confluent.*
+```
+
+### 跨 DC 注意事项
+
+```text
+跨 DC 注意事项：
+  1. 网络延迟
+     - DC间延迟通常 1-50ms
+     - 影响 ISR 同步
+     - 需要调整 replica.lag.time.max.ms
+
+  2. 带宽成本
+     - 跨DC数据传输费用高
+     - 使用压缩减少传输量
+     - 选择性同步重要 Topic
+
+  3. 数据一致性
+     - 跨DC无法保证强一致性
+     - 使用最终一致性模型
+     - 配置合适的acks和min.insync.replicas
+
+  4. 故障处理
+     - DC间网络分区处理
+     - 优雅降级策略
+     - 数据冲突解决
+
+  5. 运维复杂度
+     - 多DC监控和告警
+     - 统一配置管理
+     - 跨DC故障演练
+```
+
+---
+
+## KRaft 模式
+
+### KRaft vs ZooKeeper
+
+| 维度 | ZooKeeper | KRaft |
+|------|-----------|-------|
+| 架构 | 外部依赖 | 内置 |
+| 扩展性 | 受限于ZK | 水平扩展 |
+| 性能 | 一般 | 更高 |
+| 运维 | 复杂 | 简单 |
+| 稳定性 | 成熟 | 逐步成熟 |
+
+### KRaft 配置
+
+```properties
+# KRaft 配置
+process.roles=broker,controller          # 节点角色
+node.id=1                                # 节点ID
+controller.quorum.voters=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+controller.listener.names=CONTROLLER
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+```
+
+### KRaft 迁移计划
+
+```text
+迁移步骤：
+  1. 准备阶段
+     - 部署 KRaft 集群
+     - 验证功能
+     - 测试性能
+
+  2. 数据迁移
+     - 使用 Kafka Raft Metadat Log
+     - 迁移元数据
+     - 验证数据一致性
+
+  3. 切换阶段
+     - 切换到 KRaft 模式
+     - 监控集群状态
+     - 准备回滚方案
+
+  4. 清理阶段
+     - 移除 ZooKeeper 集群
+     - 清理相关配置
+     - 更新运维文档
+```
+
+---
+
+## Kafka Streams vs 其他流处理
+
+| 维度 | Kafka Streams | Flink | Spark Streaming |
+|------|---------------|-------|-----------------|
+| 部署模式 | 嵌入式 | 独立集群 | 独立集群 |
+| 状态管理 | 本地状态 | 分布式状态 | 分布式状态 |
+| Exactly-Once | 支持 | 支持 | 支持 |
+| 窗口操作 | 支持 | 支持 | 支持 |
+| 运维复杂度 | 低 | 中 | 高 |
+| 适用场景 | 轻量级流处理 | 复杂流处理 | 批流一体 |
+
+```text
+选择建议：
+  1. 轻量级流处理 → Kafka Streams
+     - 简单的过滤、转换、聚合
+     - 不需要独立集群
+     - 与Kafka紧密集成
+
+  2. 复杂流处理 → Flink
+     - 复杂窗口操作
+     - 复杂状态管理
+     - 需要高吞吐低延迟
+
+  3. 批流一体 → Spark Streaming
+     - 统一批处理和流处理
+     - 已有Spark生态
+     - 需要复杂机器学习
+```
+
+---
+
+## 事务与 Exactly-Once
+
+### 事务配置
+
+```properties
+# Producer 事务配置
+transactional.id=my-transactional-id
+transaction.timeout.ms=60000
+
+# Broker 事务配置
+transaction.state.log.replication.factor=3
+transaction.state.log.min.isr=2
+```
+
+### 事务使用示例
+
+```java
+// 事务性 Producer
+Properties props = new Properties();
+props.put("transactional.id", "my-transactional-id");
+props.put("enable.idempotence", "true");
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();
+
+try {
+    producer.beginTransaction();
+    // 读取输入
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+    for (ConsumerRecord<String, String> record : records) {
+        // 处理并写入输出
+        producer.send(new ProducerRecord<>("output-topic", record.key(), record.value()));
+    }
+    // 提交偏移量
+    producer.sendOffsetsToTransaction(offsets, consumerGroupId);
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+}
+```
+
+### Exactly-Once 语义
+
+```text
+Exactly-Once 实现方式：
+  1. 幂等 Producer
+     - 每个 Producer 分配唯一 PID
+     - 每条消息分配序列号
+     - Broker 去重
+
+  2. 事务性 Producer
+     - 原子写入多个 Topic
+     - 原子提交偏移量
+     - 支持读-处理-写模式
+
+  3. Kafka Streams
+     - 内置 Exactly-Once 支持
+     - 状态存储和输出Topic原子写入
+     - 与事务性Producer集成
+
+配置要点：
+  - enable.idempotence=true
+  - transactional.id=唯一ID
+  - isolation.level=read_committed（Consumer端）
+```
+
+---
+
+## Sink Connector Exactly-Once
+
+### Sink Connector 配置
+
+```properties
+# JDBC Sink Connector
+connector.class=io.confluent.connect.jdbc.JdbcSinkConnector
+topics=user_events
+connection.url=jdbc:mysql://localhost:3306/mydb
+insert.mode=upsert
+pk.mode=record_key
+pk.fields=user_id
+batch.size=1000
+```
+
+### Exactly-Once Sink 实现
+
+```text
+Sink Connector Exactly-Once 实现：
+  1. 事务性 Sink
+     - 在事务内写入目标系统
+     - 原子提交偏移量
+     - 失败时回滚
+
+  2. 幂等 Sink
+     - 使用唯一键去重
+     - 支持 upsert 操作
+     - 目标系统支持幂等写入
+
+  3. 两阶段提交
+     - 准备阶段：预写入目标系统
+     - 提交阶段：确认写入
+     - 回滚阶段：撤销预写入
+
+注意事项：
+  - 目标系统需支持事务
+  - 配置合适的批处理大小
+  - 处理网络分区情况
+  - 监控事务状态
+```
+
+---
+
 ## 六、与其他板块的关系
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。

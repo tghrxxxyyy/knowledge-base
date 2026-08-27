@@ -1567,6 +1567,307 @@ apiGateway:
     否 → Kong/Spring Cloud Gateway
 ```
 
+## 补充：网关缓存配置（Redis缓存）
+
+### 缓存策略配置
+
+| 缓存策略 | 说明 | 适用场景 |
+|----------|------|---------|
+| 不缓存 | 每次请求都到后端 | 实时性要求高 |
+| 全局缓存 | 所有请求都缓存 | 静态资源 |
+| 按路由缓存 | 部分路由启用缓存 | 混合场景 |
+| 按Header缓存 | 根据Header判断 | 需要灵活控制 |
+
+```yaml
+# Kong缓存配置
+plugins:
+  - name: proxy-cache
+    config:
+      response_code: [200]
+      request_method: [GET]
+      content_type: [application/json]
+      cache_ttl: 300
+      cache_strategy: memory
+      storage_opts:
+        memory:
+          size: 128m
+```
+
+```java
+// Spring Cloud Gateway缓存配置
+@Bean
+public RouteLocator cachedRoutes(RouteLocatorBuilder builder) {
+    return builder.routes()
+        .route("cache-route", r -> r
+            .path("/api/users/**")
+            .filters(f -> f
+                .addResponseHeader("Cache-Control", "max-age=300")
+                .modifyRequestBody(String.class, String.class, 
+                    (exchange, body) -> Mono.just(body)))
+            .uri("http://user-service"))
+        .build();
+}
+```
+
+## 补充：限流算法（令牌桶/漏桶/滑动窗口/Redis+Lua）
+
+### 限流算法对比
+
+| 算法 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| 令牌桶 | 固定速率生成令牌 | 允许突发流量 | 实现复杂 |
+| 漏桶 | 固定速率处理请求 | 平滑流量 | 不允许突发 |
+| 滑动窗口 | 统计窗口内请求数 | 精确 | 内存开销大 |
+| 固定窗口 | 固定时间段内计数 | 简单 | 边界突发 |
+
+```lua
+-- Redis+Lua令牌桶实现
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])  -- 令牌生成速率
+local capacity = tonumber(ARGV[2])  -- 桶容量
+local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
+
+local last_tokens = tonumber(redis.call("get", key) or capacity)
+local last_refreshed = tonumber(redis.call("get", key..":time") or now)
+
+local delta = math.max(0, now - last_refreshed)
+local allowed_tokens = math.min(capacity, last_tokens + (delta * rate))
+
+local allowed = 0
+if allowed_tokens >= requested then
+    allowed = 1
+    allowed_tokens = allowed_tokens - requested
+end
+
+redis.call("setex", key, 3600, allowed_tokens)
+redis.call("setex", key..":time", 3600, now)
+
+return allowed
+```
+
+## 补充：API版本管理（URL/Header/Query策略）
+
+### 版本管理策略对比
+
+| 策略 | 示例 | 优点 | 缺点 |
+|------|------|------|------|
+| URL版本 | `/v1/users` | 直观、缓存友好 | URL膨胀 |
+| Header版本 | `Accept: application/vnd.api.v1+json` | URL干净 | 调试复杂 |
+| Query版本 | `/users?version=1` | 灵活 | 缓存复杂 |
+
+```yaml
+# Kong版本管理
+plugins:
+  - name: request-transformer
+    config:
+      add:
+        headers:
+          - "X-API-Version: 1.0"
+      remove:
+        headers:
+          - "Authorization"
+```
+
+```java
+// Spring Cloud Gateway版本路由
+@Bean
+public RouteLocator versionRoutes(RouteLocatorBuilder builder) {
+    return builder.routes()
+        .route("v1-users", r -> r
+            .path("/v1/users/**")
+            .filters(f -> f.rewritePath("/v1/users/(?<segment>.*)", "/users/${segment}"))
+            .uri("http://user-service-v1"))
+        .route("v2-users", r -> r
+            .path("/v2/users/**")
+            .filters(f -> f.rewritePath("/v2/users/(?<segment>.*)", "/users/${segment}"))
+            .uri("http://user-service-v2"))
+        .build();
+}
+```
+
+## 补充：网关高可用（故障注入/熔断降级）
+
+### 熔断降级配置
+
+```yaml
+# Kong熔断配置
+plugins:
+  - name: circuit-breaker
+    config:
+      threshold: 5
+      timeout: 30
+      volume: 10
+      window: 60
+```
+
+```java
+// Resilience4j熔断配置
+resilience4j:
+  circuitbreaker:
+    instances:
+      apiGateway:
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 5s
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+  timelimiter:
+    instances:
+      apiGateway:
+        timeoutDuration: 3s
+```
+
+## 补充：Kong vs APISIX vs Envoy vs Spring Cloud Gateway对比
+
+### 网关选型矩阵
+
+| 维度 | Kong | APISIX | Envoy | Spring Cloud Gateway |
+|------|------|--------|-------|---------------------|
+| 语言 | Lua/OpenResty | Lua/OpenResty | C++ | Java/Spring |
+| 配置 | Admin API | Admin API | xDS API | YAML/Java Config |
+| 性能 | 高 | 高 | 极高 | 中 |
+| 生态 | 插件丰富 | 插件丰富 | xDS生态 | Spring生态 |
+| 学习曲线 | 中 | 中 | 高 | 低 |
+| 社区 | 活跃 | 活跃 | 活跃 | 活跃 |
+| 适用场景 | 通用API网关 | 云原生网关 | Service Mesh | Spring微服务 |
+
+### 选型决策树
+
+```mermaid
+flowchart TD
+    A{技术栈} --> B{Java/Spring}
+    B -->|是| C[Spring Cloud Gateway]
+    B -->|否| D{需求}
+    D --> E{Service Mesh}
+    E -->|是| F[Envoy]
+    E -->|否| G{插件需求}
+    G -->|Lua插件| H[Kong/APISIX]
+    G -->|Go插件| I[APISIX]
+    G -->|通用| J[Kong]
+```
+
+## 补充：网关协同（网关与服务网格/服务发现）
+
+### 网关与服务网格
+
+```text
+网关协同架构：
+  传统网关：
+    客户端 → API网关 → 微服务
+  
+  服务网格：
+    客户端 → 边车代理（Sidecar）→ 微服务
+  
+  混合架构：
+    客户端 → API网关 → 边车代理 → 微服务
+  
+  职责划分：
+    API网关：南北向流量（外部→内部）
+    服务网格：东西向流量（内部→内部）
+    共同点：路由、限流、熔断、可观测性
+
+  集成方式：
+    网关作为网格入口
+    网关与边车代理通信
+    统一的控制平面
+```
+
+## 补充：网关性能基准（吞吐/延迟）
+
+### 性能基准数据
+
+| 网关 | QPS | P99延迟 | 内存占用 |
+|------|-----|---------|----------|
+| Kong | 50k | 5ms | 256MB |
+| APISIX | 80k | 3ms | 128MB |
+| Envoy | 100k | 1ms | 64MB |
+| Spring Cloud Gateway | 30k | 10ms | 512MB |
+
+### 压测方法
+
+```bash
+# wrk压测
+wrk -t12 -c400 -d30s --latency \
+    -s script.lua \
+    http://localhost:8080/api/test
+
+# 压测脚本（script.lua）
+wrk.method = "GET"
+wrk.headers["Content-Type"] = "application/json"
+```
+
+## 补充：网关安全（OAuth2/JWT/mTLS）
+
+### 安全配置对比
+
+| 安全方式 | 说明 | 适用场景 |
+|----------|------|---------|
+| API Key | 简单Token | 内部服务 |
+| JWT | 自包含Token | 微服务 |
+| OAuth2 | 授权框架 | 第三方接入 |
+| mTLS | 双向TLS | 服务间通信 |
+
+```yaml
+# Kong OAuth2配置
+plugins:
+  - name: oauth2
+    config:
+      scopes: ["read", "write"]
+      mandatory_scope: true
+      provision_key: my-secret-key
+      token_expiration: 3600
+      enable_authorization_code: true
+```
+
+```yaml
+# Kong JWT配置
+plugins:
+  - name: jwt
+    config:
+      uri_param_names: []
+      header_names: ["Authorization"]
+      claims_to_verify: ["exp", "iss"]
+      key_claim_name: "iss"
+```
+
+## 补充：网关监控（Prometheus/Grafana/Jaeger）
+
+### 监控指标
+
+```text
+网关监控指标：
+  请求指标：
+    请求总数
+    成功/失败数
+    QPS/TPS
+    延迟分布（P50/P95/P99）
+  
+  连接指标：
+    活跃连接数
+    等待连接数
+    连接超时数
+  
+  资源指标：
+    CPU使用率
+    内存使用率
+    线程池使用率
+  
+  业务指标：
+    限流触发次数
+    熔断触发次数
+    缓存命中率
+```
+
+```yaml
+# Prometheus指标暴露
+scrape_configs:
+  - job_name: 'kong-gateway'
+    static_configs:
+      - targets: ['kong:8444']
+    metrics_path: '/metrics'
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

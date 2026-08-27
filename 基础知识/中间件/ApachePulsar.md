@@ -831,7 +831,266 @@ pulsar-admin namespaces set-retention my-tenant/my-ns \
   队列+流统一 → Pulsar
 ```
 
-## 二十、与其他板块的关系
+## Pulsar IO 连接器生态
+
+### 常用连接器
+
+| 连接器 | 类型 | 功能 | 适用场景 |
+|--------|------|------|---------|
+| kafka-connector | Source/Sink | Kafka互操作 | 集群迁移 |
+| elasticsearch-connector | Sink | ES写入 | 日志分析 |
+| cassandra-connector | Sink | Cassandra写入 | 时序数据 |
+| mongodb-connector | Sink | MongoDB写入 | 文档存储 |
+| s3-connector | Sink | S3写入 | 数据湖 |
+| jdbc-connector | Sink | 数据库写入 | 关系型存储 |
+| debezium-connector | Source | CDC采集 | 数据同步 |
+
+### Pulsar IO 配置示例
+
+```bash
+# 创建 Kafka Source
+pulsar-admin sources create \
+  --source-config-file kafka-source-config.yaml \
+  --name kafka-source
+
+# kafka-source-config.yaml
+configs:
+  bootstrapServers: "kafka1:9092,kafka2:9092"
+  topic: "my-kafka-topic"
+  consumerGroupName: "pulsar-group"
+  ackType: "EXACTLY_ONCE"
+  schemaType: "STRING"
+
+# 创建 Elasticsearch Sink
+pulsar-admin sinks create \
+  --sink-config-file es-sink-config.yaml \
+  --name es-sink
+
+# es-sink-config.yaml
+configs:
+  elasticsearchNodes: "http://es1:9200,http://es2:9200"
+  indexName: "my-index"
+  typeName: "_doc"
+  connectorClassName: "org.apache.pulsar.io.elasticsearch.ElasticSearchSink"
+```
+
+## Pulsar Functions 轻量计算
+
+### Functions 开发模式
+
+```java
+// 无状态 Function
+public class TransformFunction implements Function<String, String> {
+    @Override
+    public Optional<String> process(String input) {
+        return Optional.of(input.toUpperCase());
+    }
+}
+
+// 有状态 Function
+public class CountFunction implements Function<String, Optional<Long>> {
+    private long count = 0;
+    
+    @Override
+    public Optional<Long> process(String input) {
+        count++;
+        return Optional.of(count);
+    }
+}
+```
+
+### Functions vs Kafka Streams vs Flink
+
+| 维度 | Pulsar Functions | Kafka Streams | Flink |
+|------|------------------|---------------|-------|
+| 部署模式 | 内嵌/独立/K8s | 内嵌 | 独立/K8s |
+| 状态管理 | 内置 | 内置 | 内置 |
+| 复杂度 | 低 | 中 | 高 |
+| 功能 | 轻量级 | 中等 | 丰富 |
+| 适用场景 | 简单ETL | 中等复杂 | 复杂流处理 |
+| 窗口支持 | 有限 | 丰富 | 丰富 |
+| Exactly-once | 支持 | 支持 | 支持 |
+
+```
+Functions 选型：
+  简单过滤/转换 → Pulsar Functions
+  中等复杂流处理 → Kafka Streams
+  复杂流处理 → Flink
+  简单聚合 → Pulsar Functions
+  复杂窗口 → Flink
+```
+
+## Pulsar 分层存储（Tiered Storage）
+
+### 分层存储架构
+
+```mermaid
+graph LR
+    A[Broker] --> B[BookKeeper 热数据]
+    B --> C[S3/OSS 冷数据]
+    B -->|自动迁移| C
+    C -->|按需加载| B
+```
+
+### 分层存储配置
+
+```bash
+# 分层存储配置
+pulsar-admin namespaces set-offload-threshold my-tenant/my-ns \
+  --threshold 10G \
+  --retention 7d
+
+# S3 配置
+broker.conf:
+  managedLedgerOffloadDriver=s3
+  s3ManagedLedgerOffloadRegion=us-east-1
+  s3ManagedLedgerOffloadBucket=pulsar-offload
+```
+
+### 分层存储优势
+
+| 维度 | 无分层 | 有分层 |
+|------|--------|--------|
+| 存储成本 | 高（BookKeeper） | 低（对象存储） |
+| 查询性能 | 高 | 中（冷数据慢） |
+| 数据保留 | 受限 | 无限 |
+| 运维复杂度 | 低 | 中 |
+
+## Pulsar vs Kafka Stream/Connect 对比
+
+### Pulsar Functions vs Kafka Streams
+
+| 维度 | Pulsar Functions | Kafka Streams |
+|------|------------------|---------------|
+| 架构 | 独立运行时 | 内嵌应用 |
+| 状态存储 | BookKeeper | 本地 RocksDB |
+| 扩展性 | 水平扩展 | 受分区数限制 |
+| 部署 | pulsar-admin | 嵌入应用代码 |
+| 复杂度 | 低 | 中 |
+| 适用 | 简单ETL | 复杂流处理 |
+
+### Pulsar IO vs Kafka Connect
+
+| 维度 | Pulsar IO | Kafka Connect |
+|------|-----------|---------------|
+| 架构 | 内置 | 独立集群 |
+| 配置 | YAML | JSON |
+| 扩展 | 内置 | 插件 |
+| 适用 | Pulsar生态 | Kafka生态 |
+
+## Pulsar 多租户管理
+
+### 多租户架构
+
+```
+Pulsar 多租户层次：
+  Tenant（租户）→ Namespace（命名空间）→ Topic（主题）
+  
+每个租户独立：
+  - 认证授权
+  - 配额管理
+  - 消息保留策略
+  - 访问控制
+```
+
+### 多租户配置
+
+```bash
+# 创建租户
+pulsar-admin tenants create my-tenant
+
+# 创建命名空间
+pulsar-admin namespaces create my-tenant/my-namespace
+
+# 设置命名空间策略
+pulsar-admin namespaces set-retention my-tenant/my-namespace \
+  --size 10G \
+  --time 7d
+
+# 设置配额
+pulsar-admin namespaces set-dispatch-rate my-tenant/my-namespace \
+  --msg-rate 10000 \
+  --byte-rate 10485760
+```
+
+## Pulsar Geo-Replication 跨地域复制
+
+### 跨地域复制架构
+
+```mermaid
+graph LR
+    subgraph 北京
+        B1[Broker] --> BK1[BookKeeper]
+    end
+    subgraph 上海
+        B2[Broker] --> BK2[BookKeeper]
+    end
+    subgraph 广州
+        B3[Broker] --> BK3[BookKeeper]
+    end
+    B1 <-->|异步复制| B2
+    B2 <-->|异步复制| B3
+    B1 <-->|异步复制| B3
+```
+
+### 跨地域复制策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 主从复制 | 一个主集群，多个从集群 | 读写分离 |
+| 对等复制 | 多集群对等，双向复制 | 多活架构 |
+| 级联复制 | A→B→C链式复制 | 跨地域部署 |
+
+## Pulsar WebSocket / MQTT 协议支持
+
+```bash
+# WebSocket 配置
+pulsar-client websocket ws://localhost:8080/ws/v2/producer/persistent/public/default/my-topic
+
+# MQTT 协议处理器
+# 安装协议处理器
+pulsar-admin protocols install mqtt
+
+# MQTT 客户端连接
+mosquitto -h localhost -p 1883 -t "my-topic" -m "hello"
+```
+
+### 协议支持矩阵
+
+| 协议 | 端口 | 说明 |
+|------|------|------|
+| Pulsar | 6650 | 原生协议 |
+| WebSocket | 8080 | 浏览器/IoT |
+| MQTT | 1883 | IoT 设备 |
+| AMQP | 5672 | 企业集成 |
+| Kafka | 9092 | Kafka兼容 |
+
+## Pulsar 大数据场景应用
+
+### 与大数据组件集成
+
+```bash
+# Pulsar + Spark
+spark-shell --packages org.apache.bahir:spark-streaming-pulsar_2.12:2.4.0
+
+# Pulsar + Flink
+flink run -c org.apache.flink.streaming.connectors.pulsar.FlinkPulsarProducer flink-pulsar.jar
+
+# Pulsar + Presto/Trino
+# 配置 Pulsar connector
+```
+
+### 大数据场景选型
+
+| 场景 | 推荐 | 说明 |
+|------|------|------|
+| 实时计算 | Pulsar + Flink | 低延迟 + 精确一次 |
+| 批处理 | Pulsar + Spark | 高吞吐 |
+| 数据湖 | Pulsar + S3 | 分层存储 |
+| 交互查询 | Pulsar + Presto | 即时查询 |
+| 日志分析 | Pulsar + ES | 全文检索 |
+
+## 与其他板块的关系
 
 - 与 [RabbitMQ](RabbitMQ.md)、[消息队列 MQ](../MQ.md)、[MQTT](MQTT与消息broker.md)：同属消息家族。Pulsar 是「云原生统一消息流」，RabbitMQ 是「业务路由」，MQTT 是「设备协议」。
 - 与 [注册中心与配置中心](注册中心与配置中心.md)：Pulsar 自带元数据层，不依赖外部注册中心。

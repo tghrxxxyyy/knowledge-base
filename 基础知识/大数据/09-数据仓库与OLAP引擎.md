@@ -1364,9 +1364,319 @@ graph LR
 | 并发 QPS | >100 | 同时查询 |
 | 可用性 | >99.9% | 服务可用 |
 
----
+## ClickHouse vs StarRocks 物化视图对比
 
-## 与其他板块的关系
+### 物化视图语法对比
+
+```sql
+-- ClickHouse 物化视图（INSERT 触发）
+CREATE MATERIALIZED VIEW mv_orders
+ENGINE = AggregatingMergeTree()
+ORDER BY (user_id, order_date)
+AS SELECT
+    user_id,
+    toDate(order_time) AS order_date,
+    sumState(amount) AS total_amount,
+    countState() AS order_count
+FROM orders
+GROUP BY user_id, order_date;
+
+-- StarRocks 物化视图（自动刷新）
+CREATE MATERIALIZED VIEW mv_orders
+REFRESH EVERY(INTERVAL 1 HOUR)
+AS SELECT
+    user_id,
+    DATE(order_time) AS order_date,
+    SUM(amount) AS total_amount,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY user_id, order_date;
+```
+
+### 物化视图选型
+
+| 场景 | ClickHouse | StarRocks | Doris |
+|------|-----------|-----------|-------|
+| 实时聚合 | ✅ INSERT触发 | ✅ 自动刷新 | ✅ 自动刷新 |
+| 增量更新 | ✅ | ✅ | ✅ |
+| 全量刷新 | ❌ | ✅ | ✅ |
+| 复杂查询 | 中 | 强 | 强 |
+| 并发能力 | 低 | 高 | 高 |
+
+## Doris Lakehouse 架构
+
+### Doris Lakehouse 特性
+
+```
+Doris Lakehouse 架构：
+  存储层：S3/OSS/HDFS（对象存储）
+  格式层：Iceberg/Hudi/Paimon（表格式）
+  计算层：Doris（MPP引擎）
+  服务层：SQL API + JDBC/ODBC
+
+优势：
+  - 存算分离：存储成本低
+  - ACID事务：数据一致性
+  - Schema演化：灵活扩展
+  - 时间旅行：数据回溯
+```
+
+### Doris Lakehouse 配置
+
+```sql
+-- 创建 Iceberg 外表
+CREATE EXTERNAL TABLE iceberg_orders
+EXTERNAL CATALOG iceberg_catalog
+PROPERTIES (
+    "iceberg.database" = "mydb",
+    "iceberg.table" = "orders"
+);
+
+-- 查询 Iceberg 数据
+SELECT * FROM iceberg_orders WHERE order_date = '2024-01-01';
+```
+
+## OLAP 选型决策树
+
+```mermaid
+flowchart TD
+    START[OLAP 选型] --> Q1{数据量?}
+    Q1 -->|<100GB| Q2{查询复杂度?}
+    Q1 -->|100GB-1TB| Q3{并发要求?}
+    Q1 -->|>1TB| Q4{实时性要求?}
+    
+    Q2 -->|简单聚合| MYSQL[MySQL + 慢查询优化]
+    Q2 -->|复杂分析| PRESTO[Trino/Presto]
+    
+    Q3 -->|高并发| STARROCKS[StarRocks]
+    Q3 -->|低并发| CLICKHOUSE[ClickHouse]
+    
+    Q4 -->|秒级| FLINK_SQL[Flink SQL + Doris]
+    Q4 -->|分钟级| SPARK[Spark + Hive]
+    
+    STARROCKS --> SCENE1[用户画像/BI报表]
+    CLICKHOUSE --> SCENE2[日志分析/监控]
+    FLINK_SQL --> SCENE3[实时大屏/风控]
+    SPARK --> SCENE4[离线报表/数据仓库]
+```
+
+### 选型决策矩阵
+
+| 维度 | ClickHouse | StarRocks | Doris | Trino |
+|------|-----------|-----------|-------|-------|
+| 数据量 | TB-PB级 | TB-PB级 | TB级 | PB级 |
+| 并发 | 低（<50） | 高（>100） | 中（50-100） | 中 |
+| 延迟 | 低 | 低 | 中 | 高 |
+| 实时写入 | 一般 | 强 | 强 | 不支持 |
+| 多表JOIN | 弱 | 强 | 强 | 强 |
+| 运维复杂度 | 中 | 高 | 中 | 高 |
+
+## 导入性能对比
+
+### 导入方式对比
+
+| 方式 | ClickHouse | StarRocks | Doris |
+|------|-----------|-----------|-------|
+| 批量导入 | 100万行/批 | 500万行/批 | 200万行/批 |
+| 流式导入 | Kafka引擎 | Routine Load | Routine Load |
+| 实时导入 | Buffer表 | Stream Load | Stream Load |
+| 并行导入 | 多分片并行 | 多tablet并行 | 多分区并行 |
+
+### 导入性能优化
+
+```sql
+-- ClickHouse 导入优化
+SET max_insert_threads = 4;
+SET min_insert_block_size_rows = 1048576;
+
+-- StarRocks 导入优化
+SET load_mem_limit = 2147483648;  -- 2GB
+SET parallel_fragment_exec_instance_num = 4;
+
+-- Doris 导入优化
+SET load_mem_limit = 2147483648;
+SET parallel_fragment_exec_instance_num = 4;
+```
+
+## 集群运维最佳实践
+
+### 集群监控指标
+
+| 指标 | ClickHouse | StarRocks | Doris |
+|------|-----------|-----------|-------|
+| 节点状态 | system.replicas | FE/BE状态 | Tablet状态 |
+| 复制延迟 | 表级延迟 | Tablet同步 | 复制延迟 |
+| 磁盘使用 | system.disks | BE磁盘 | BE磁盘 |
+| 查询性能 | system.query_log | query_profile | query_log |
+| 慢查询 | system.query_log | query_profile | query_log |
+
+### 告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: olap_alerts
+    rules:
+      - alert: ClickHouseReplicationLag
+        expr: clickhouse_replica_delay > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse 复制延迟超过 5 分钟"
+          
+      - alert: StarRocksBEOffline
+        expr: starrocks_be_alive == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "StarRocks BE 节点离线"
+          
+      - alert: DorisTabletUnhealthy
+        expr: doris_tablet_unhealthy > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Doris 存在不健康 Tablet"
+```
+
+## OLAP 实时报表案例
+
+### 实时报表架构
+
+```mermaid
+flowchart TB
+    subgraph 数据源
+        DB[MySQL/PostgreSQL]
+        LOG[日志]
+        MQTT[IoT]
+    end
+    
+    subgraph 数据采集
+        CANAL[Canal/Debezium]
+        FLUENT[Fluent Bit]
+        KAFKA[Kafka]
+    end
+    
+    subgraph 实时计算
+        FLINK[Flink SQL]
+    end
+    
+    subgraph OLAP存储
+        DORIS[Doris]
+        STARROCKS[StarRocks]
+    end
+    
+    subgraph 服务层
+        API[API Gateway]
+        CACHE[Redis Cache]
+        BI[BI工具]
+    end
+    
+    DB --> CANAL --> KAFKA
+    LOG --> FLUENT --> KAFKA
+    MQTT --> KAFKA
+    KAFKA --> FLINK
+    FLINK --> DORIS
+    FLINK --> STARROCKS
+    DORIS --> API
+    STARROCKS --> API
+    API --> CACHE
+    API --> BI
+```
+
+### 报表性能指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 查询延迟 P50 | <1s | 大部分查询 |
+| 查询延迟 P99 | <5s | 长尾查询 |
+| 数据延迟 | <1min | 从产生到可见 |
+| 并发 QPS | >100 | 同时查询 |
+| 可用性 | >99.9% | 服务可用 |
+
+## 数仓分层（ODS/DWD/DWS/ADS）
+
+### 分层架构
+
+```
+数仓分层：
+  ODS（Operational Data Store）：操作数据层
+    - 原始数据，不做处理
+    - 数据来源：业务系统、日志、外部数据
+    
+  DWD（Data Warehouse Detail）：明细数据层
+    - 数据清洗、标准化
+    - 维度退化、数据整合
+    
+  DWS（Data Warehouse Summary）：汇总数据层
+    - 轻度聚合、主题汇总
+    - 宽表构建、指标计算
+    
+  ADS（Application Data Store）：应用数据层
+    - 面向应用、高度聚合
+    - 报表、API、数据产品
+```
+
+### 分层优势
+
+| 分层 | 说明 | 优势 |
+|------|------|------|
+| ODS | 原始数据 | 数据溯源、不影响源系统 |
+| DWD | 明细数据 | 数据标准化、减少重复计算 |
+| DWS | 汇总数据 | 加速查询、减少资源消耗 |
+| ADS | 应用数据 | 面向应用、灵活扩展 |
+
+## 维度建模
+
+### 维度建模步骤
+
+```mermaid
+flowchart TD
+    A[业务过程] --> B[选择粒度]
+    B --> C[确认维度]
+    C --> D[确认事实]
+    D --> E[模型设计]
+    E --> F[ETL开发]
+```
+
+### 维度表 vs 事实表
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| 维度表 | 描述性属性 | 用户表、商品表、时间表 |
+| 事实表 | 度量值 | 订单事实表、访问事实表 |
+| 退化维度 | 事实表中的维度 | 订单号、交易号 |
+| 缓慢变化维度 | 维度随时间变化 | 用户地址、商品价格 |
+
+## OLAP vs 传统数仓
+
+### 架构对比
+
+| 维度 | OLAP引擎 | 传统数仓 |
+|------|---------|---------|
+| 存储 | 列式存储 | 行式存储 |
+| 计算 | MPP/向量化 | MapReduce/批处理 |
+| 延迟 | 秒级 | 分钟/小时级 |
+| 并发 | 中高 | 低 |
+| 成本 | 低（开源） | 高（商业） |
+| 扩展 | 水平扩展 | 垂直扩展 |
+
+### 选型建议
+
+```
+OLAP vs 传统数仓：
+  实时报表 → OLAP引擎（ClickHouse/StarRocks/Doris）
+  离线报表 → 传统数仓（Hive/Spark）
+  混合场景 → 湖仓一体（Iceberg + Spark/Trino）
+  
+  技术栈组合：
+    实时数仓：Kafka + Flink + Doris/StarRocks
+    离线数仓：Hive + Spark + Airflow
+    湖仓一体：Iceberg + Spark/Trino
+```
 
 ### OLAP 引擎选型决策树
 

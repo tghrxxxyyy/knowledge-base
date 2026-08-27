@@ -743,6 +743,688 @@ sre_practices:
       - 行动项：
 ```
 
+---
+
+## CFR（变更失败率）分析
+
+### CFR 计算方法
+
+```text
+CFR（Change Failure Rate）计算：
+  公式：CFR = 导致故障的部署数 / 总部署数 × 100%
+
+  分类标准：
+    - 致命故障：服务完全不可用
+    - 严重故障：核心功能异常
+    - 一般故障：非核心功能异常
+    - 轻微故障：性能下降但可用
+
+  数据来源：
+    - 部署系统：部署记录
+    - 监控系统：故障告警
+    - 事故工单：故障关联
+    - 变更系统：变更记录
+```
+
+### CFR 分析框架
+
+```yaml
+cfr_analysis:
+  dimensions:
+    - name: service
+      description: 按服务分析
+      values: [payment, order, user]
+
+    - name: environment
+      description: 按环境分析
+      values: [staging, production]
+
+    - name: change_type
+      description: 按变更类型分析
+      values: [feature, bugfix, hotfix, config]
+
+    - name: time_period
+      description: 按时间段分析
+      values: [daily, weekly, monthly]
+
+  metrics:
+    - name: cfr_percentage
+      description: 变更失败率
+      threshold: 5%
+      action: investigate
+
+    - name: mean_time_to_recovery
+      description: 平均恢复时间
+      threshold: 1 hour
+      action: optimize
+
+    - name: change_volume
+      description: 变更数量
+      threshold: normal ± 50%
+      action: monitor
+```
+
+### CFR 改进策略
+
+| 策略 | 说明 | 实施方法 |
+|------|------|----------|
+| 金丝雀发布 | 小流量验证 | 1% → 5% → 20% → 100% |
+| 蓝绿部署 | 快速回滚 | 双环境切换 |
+| 特性开关 | 功能隔离 | 代码级别控制 |
+| 自动化测试 | 质量保证 | 单元/集成/E2E |
+| 变更审批 | 人工把关 | 关键变更审批 |
+| 监控告警 | 快速发现 | 实时监控+告警 |
+
+### CFR 监控看板
+
+```text
+Grafana Dashboard 设计：
+  1. CFR 趋势
+     - 每日/每周/每月 CFR 变化
+     - 与 DORA 基准对比
+     - 异常点标注
+
+  2. 故障分类
+     - 致命/严重/一般/轻微故障占比
+     - 各服务故障分布
+     - 各环境故障分布
+
+  3. 根因分析
+     - 代码缺陷
+     - 配置错误
+     - 基础设施问题
+     - 依赖服务问题
+
+  4. 改进跟踪
+     - 改进措施执行情况
+     - 改进效果评估
+     - 未完成改进项
+```
+
+---
+
+## Lead Time 分解与优化
+
+### Lead Time 组成
+
+```text
+Lead Time 分解：
+  1. 编码时间（Coding Time）
+     - 从需求确认到代码提交
+     - 包括：需求理解、设计、编码、自测
+     - 优化：减少需求变更、提高编码效率
+
+  2. 构建时间（Build Time）
+     - 从代码提交到构建完成
+     - 包括：依赖下载、编译、打包
+     - 优化：缓存、并行构建、增量构建
+
+  3. 测试时间（Test Time）
+     - 从构建完成到测试通过
+     - 包括：单元测试、集成测试、E2E测试
+     - 优化：并行测试、测试分层、跳过不相关测试
+
+  4. 部署时间（Deploy Time）
+     - 从测试通过到生产部署
+     - 包括：审批、发布、验证
+     - 优化：自动化审批、金丝雀发布
+
+  5. 验证时间（Validation Time）
+     - 从部署完成到功能验证
+     - 包括：冒烟测试、监控验证
+     - 优化：自动化验证、监控前置
+```
+
+### Lead Time 优化策略
+
+| 阶段 | 优化策略 | 预期效果 |
+|------|----------|----------|
+| 编码 | 需求拆分、代码审查自动化 | 减少30% |
+| 构建 | 依赖缓存、并行构建 | 减少50% |
+| 测试 | 测试分层、并行执行 | 减少40% |
+| 部署 | 自动化审批、金丝雀发布 | 减少60% |
+| 验证 | 自动化验证、监控前置 | 减少50% |
+
+### Lead Time 监控
+
+```yaml
+# Lead Time 监控配置
+lead_time_monitoring:
+  stages:
+    - name: coding
+      start_trigger: jira_status_change_to_in_progress
+      end_trigger: git_commit
+      metric: coding_time_hours
+
+    - name: building
+      start_trigger: git_push
+      end_trigger: ci_build_success
+      metric: build_time_minutes
+
+    - name: testing
+      start_trigger: ci_build_success
+      end_trigger: ci_test_success
+      metric: test_time_minutes
+
+    - name: deploying
+      start_trigger: ci_test_success
+      end_trigger: deployment_success
+      metric: deploy_time_minutes
+
+    - name: validating
+      start_trigger: deployment_success
+      end_trigger: smoke_test_success
+      metric: validation_time_minutes
+
+  alerts:
+    - condition: coding_time_hours > 48
+      action: notify_team_lead
+
+    - condition: build_time_minutes > 30
+      action: investigate_build
+
+    - condition: test_time_minutes > 60
+      action: optimize_tests
+
+    - condition: deploy_time_minutes > 30
+      action: optimize_deployment
+```
+
+---
+
+## SAST 集成
+
+### SAST 工具对比
+
+| 工具 | 语言支持 | 误报率 | 集成难度 | 适用场景 |
+|------|----------|--------|----------|----------|
+| SonarQube | 多语言 | 中 | 低 | 通用 |
+| Checkmarx | 多语言 | 低 | 中 | 企业级 |
+| Fortify | 多语言 | 低 | 高 | 合规 |
+| Semgrep | 多语言 | 低 | 低 | 开源 |
+| Bandit | Python | 中 | 低 | Python项目 |
+| ESLint Security | JavaScript | 中 | 低 | JS项目 |
+
+### SAST 集成配置
+
+```yaml
+# GitHub Actions SAST 集成
+name: SAST Scan
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/owasp-top-ten
+            p/jwt
+
+      - name: Run SonarQube Scanner
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Run Checkmarx
+        uses: checkmarx/ast-github-action@master
+        with:
+          project_key: my-project
+          branch: main
+```
+
+### SAST 规则配置
+
+```yaml
+# SonarQube 规则配置
+sonar:
+  qualitygate:
+    conditions:
+      - metric: bugs
+        operator: GT
+        value: 0
+      - metric: vulnerabilities
+        operator: GT
+        value: 0
+      - metric: code_smells
+        operator: GT
+        value: 10
+
+  rules:
+    - key: java:S2077
+      name: SQL Injection
+      severity: BLOCKER
+      enabled: true
+
+    - key: java:S3649
+      name: SQL Injection
+      severity: BLOCKER
+      enabled: true
+
+    - key: java:S5542
+      name: insecure cryptography
+      severity: CRITICAL
+      enabled: true
+```
+
+### SAST 结果处理
+
+```text
+SAST 结果处理流程：
+  1. 扫描执行
+     - 代码扫描
+     - 规则匹配
+     - 生成报告
+
+  2. 结果分类
+     - 阻断（Blocker）：必须修复
+     - 严重（Critical）：必须修复
+     - 主要（Major）：建议修复
+     - 次要（Minor）：可选修复
+
+  3. 修复策略
+     - 阻断/严重：立即修复
+     - 主要：当前迭代修复
+     - 次要：计划修复
+
+  4. 验证确认
+     - 修复后重新扫描
+     - 确认问题已解决
+     - 更新工单状态
+```
+
+---
+
+## DevSecOps 成熟度模型
+
+### 成熟度等级
+
+```text
+DevSecOps 成熟度等级：
+  Level 1：初始级
+    - 安全活动临时进行
+    - 没有标准流程
+    - 依赖个人能力
+
+  Level 2：可重复级
+    - 基本安全流程建立
+    - 关键活动可重复
+    - 有基本工具支持
+
+  Level 3：已定义级
+    - 安全流程标准化
+    - 安全活动集成到流水线
+    - 有明确的安全策略
+
+  Level 4：已管理级
+    - 安全活动可度量
+    - 安全指标可追踪
+    - 持续改进机制
+
+  Level 5：优化级
+    - 安全活动自动化
+    - 安全智能分析
+    - 预测性安全
+```
+
+### 成熟度评估
+
+| 维度 | Level 1 | Level 2 | Level 3 | Level 4 | Level 5 |
+|------|---------|---------|---------|---------|---------|
+| 安全培训 | 无 | 基本培训 | 系统培训 | 持续培训 | 安全文化 |
+| 威胁建模 | 无 | 基本分析 | 系统分析 | 自动化 | 预测性 |
+| 安全测试 | 无 | 手动测试 | 自动化测试 | 持续测试 | 智能测试 |
+| 漏洞管理 | 无 | 被动修复 | 主动修复 | 自动化修复 | 预防性 |
+| 合规管理 | 无 | 基本合规 | 系统合规 | 自动化合规 | 持续合规 |
+
+### 成熟度提升路径
+
+```text
+提升路径：
+  Level 1 → Level 2
+    - 建立基本安全流程
+    - 引入安全工具
+    - 进行安全培训
+
+  Level 2 → Level 3
+    - 标准化安全流程
+    - 集成到CI/CD流水线
+    - 建立安全策略
+
+  Level 3 → Level 4
+    - 建立安全指标
+    - 实施度量体系
+    - 建立改进机制
+
+  Level 4 → Level 5
+    - 安全活动自动化
+    - 引入AI/ML
+    - 建立预测性安全
+```
+
+---
+
+## 混沌工程
+
+### 混沌工程原则
+
+| 原则 | 说明 | 实践 |
+|------|------|------|
+| 稳态假设 | 系统在故障下保持稳态 | 定义稳态指标 |
+| 真实场景 | 模拟真实故障场景 | 故障注入 |
+| 生产环境 | 在生产环境测试 | 灰度故障 |
+| 持续实验 | 持续进行故障测试 | 自动化实验 |
+| 自动化 | 自动化故障注入和恢复 | 工具支持 |
+
+### 混沌工程实验
+
+```yaml
+# Chaos Mesh 实验配置
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: network-delay
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - default
+    labelSelectors:
+      app: my-service
+  delay:
+    latency: "100ms"
+    jitter: "10ms"
+    correlation: "50"
+  duration: "5m"
+  scheduler:
+    cron: "@every 1h"
+```
+
+### 混沌工程工具
+
+| 工具 | 说明 | 适用场景 |
+|------|------|----------|
+| Chaos Mesh | Kubernetes混沌工程 | K8s环境 |
+| Litmus | 云原生混沌工程 | K8s环境 |
+| Gremlin | 企业级混沌工程 | 多云环境 |
+| Chaos Toolkit | 开源混沌工程 | 通用 |
+| AWS Fault Injection | AWS故障注入 | AWS环境 |
+
+### 混沌工程实施流程
+
+```text
+实施流程：
+  1. 实验设计
+     - 定义稳态假设
+     - 选择故障场景
+     - 设计实验方案
+
+  2. 实验准备
+     - 准备实验环境
+     - 配置监控告警
+     - 准备回滚方案
+
+  3. 实验执行
+     - 执行故障注入
+     - 观察系统行为
+     - 收集实验数据
+
+  4. 结果分析
+     - 分析系统表现
+     - 验证稳态假设
+     - 识别改进点
+
+  5. 改进实施
+     - 修复发现的问题
+     - 更新架构设计
+     - 优化应急预案
+```
+
+---
+
+## 部署频率优化
+
+### 部署频率提升策略
+
+| 策略 | 说明 | 实施方法 |
+|------|------|----------|
+| 小批量发布 | 减少每次变更量 | 需求拆分、任务拆分 |
+| 自动化部署 | 减少人工干预 | CI/CD流水线 |
+| 特性开关 | 功能与发布解耦 | 代码级别控制 |
+| 金丝雀发布 | 降低发布风险 | 流量控制 |
+| 蓝绿部署 | 快速回滚 | 双环境切换 |
+| 滚动更新 | 平滑升级 | K8s滚动更新 |
+
+### 部署频率监控
+
+```yaml
+# 部署频率监控配置
+deployment_monitoring:
+  metrics:
+    - name: deployment_frequency
+      type: counter
+      labels: [service, environment, success]
+      description: 部署次数
+
+    - name: deployment_duration
+      type: histogram
+      labels: [service, environment, stage]
+      description: 部署耗时
+
+    - name: deployment_success_rate
+      type: gauge
+      labels: [service, environment]
+      description: 部署成功率
+
+  alerts:
+    - condition: deployment_frequency < 1 per week
+      action: investigate_bottleneck
+
+    - condition: deployment_duration > 30 minutes
+      action: optimize_pipeline
+
+    - condition: deployment_success_rate < 95%
+      action: improve_quality
+```
+
+### 部署频率优化案例
+
+```text
+案例：某电商系统部署频率优化
+  优化前：
+    - 部署频率：每月1次
+    - Lead Time：2周
+    - CFR：30%
+
+  优化措施：
+    1. 需求拆分：大需求拆分为小需求
+    2. 自动化测试：增加单元测试覆盖率
+    3. 金丝雀发布：降低发布风险
+    4. 特性开关：功能与发布解耦
+    5. CI/CD优化：缓存、并行构建
+
+  优化后：
+    - 部署频率：每天多次
+    - Lead Time：1天
+    - CFR：5%
+    - MTTR：30分钟
+```
+
+---
+
+## MTTR 测量与优化
+
+### MTTR 计算方法
+
+```text
+MTTR（Mean Time To Recovery）计算：
+  公式：MTTR = 总故障恢复时间 / 故障次数
+
+  时间范围：
+    - 故障发现时间：从故障发生到被发现
+    - 故障诊断时间：从发现到定位根因
+    - 故障修复时间：从定位到修复完成
+    - 故障验证时间：从修复到验证通过
+
+  数据来源：
+    - 监控系统：故障检测时间
+    - 事故工单：故障处理时间
+    - 变更系统：修复变更时间
+    - 部署系统：部署完成时间
+```
+
+### MTTR 优化策略
+
+| 阶段 | 优化策略 | 预期效果 |
+|------|----------|----------|
+| 检测 | 监控告警优化 | 减少50% |
+| 诊断 | 链路追踪、日志分析 | 减少40% |
+| 修复 | 自动化回滚、热修复 | 减少60% |
+| 验证 | 自动化验证、监控前置 | 减少50% |
+
+### MTTR 监控看板
+
+```text
+Grafana Dashboard 设计：
+  1. MTTR 趋势
+     - 每日/每周/每月 MTTR 变化
+     - 与 DORA 基准对比
+     - 异常点标注
+
+  2. 故障分类
+     - 按故障类型分布
+     - 按服务分布
+     - 按环境分布
+
+  3. 根因分析
+     - 代码缺陷
+     - 配置错误
+     - 基础设施问题
+     - 依赖服务问题
+
+  4. 改进跟踪
+     - 改进措施执行情况
+     - 改进效果评估
+     - 未完成改进项
+```
+
+---
+
+## 安全扫描工具链
+
+### 工具链架构
+
+```text
+安全扫描工具链：
+  代码扫描（SAST）
+    ├── Semgrep（开源）
+    ├── SonarQube（开源/商业）
+    ├── Checkmarx（商业）
+    └── Fortify（商业）
+
+  依赖扫描（SCA）
+    ├── Snyk（商业）
+    ├── OWASP Dependency-Check（开源）
+    ├── Dependabot（GitHub）
+    └ FOSSA（商业）
+
+  容器扫描
+    ├── Trivy（开源）
+    ├── Clair（开源）
+    ├── Anchore（开源）
+    └ Prisma Cloud（商业）
+
+  基础设施扫描
+    ├── Checkov（开源）
+    ├── tfsec（开源）
+    ├── Terrascan（开源）
+    └ Bridgecrew（商业）
+
+  动态扫描（DAST）
+    ├── OWASP ZAP（开源）
+    ├── Burp Suite（商业）
+    ├── Acunetix（商业）
+    └ Netsparker（商业）
+```
+
+### 工具集成配置
+
+```yaml
+# 安全扫描工具集成
+security_scanning:
+  sast:
+    tool: semgrep
+    config: p/security-audit
+    severity: [ERROR, WARNING]
+    fail_on: ERROR
+
+  sca:
+    tool: snyk
+    config: default
+    severity: [critical, high]
+    fail_on: critical
+
+  container:
+    tool: trivy
+    config: default
+    severity: [CRITICAL, HIGH]
+    fail_on: CRITICAL
+
+  infrastructure:
+    tool: checkov
+    config: default
+    severity: [HIGH, MEDIUM]
+    fail_on: HIGH
+
+  dast:
+    tool: owasp-zap
+    config: default
+    severity: [HIGH, MEDIUM]
+    fail_on: HIGH
+```
+
+### 安全扫描流程
+
+```text
+安全扫描流程：
+  1. 代码提交
+     → SAST扫描
+     → 修复阻断问题
+
+  2. 依赖安装
+     → SCA扫描
+     → 更新依赖版本
+
+  3. 镜像构建
+     → 容器扫描
+     → 修复基础镜像
+
+  4. 基础设施
+     → IaC扫描
+     → 修复配置问题
+
+  5. 部署完成
+     → DAST扫描
+     → 修复运行时问题
+
+  6. 持续监控
+     → 漏洞监控
+     → 告警响应
+```
+
+---
+
 ## 与其他模块的关联
 
 - [01-概述与核心概念](../CI-CD/01-概述与核心概念.md)：CI/CD 全景与流水线基本形态。

@@ -1264,6 +1264,303 @@ HA 架构要点：
   审计日志 → 所有操作可追溯
 ```
 
+## 十五、DolphinScheduler Worker 分组隔离
+
+### Worker 分组机制
+
+| 特性 | 说明 |
+|------|------|
+| 分组方式 | 按标签分组 |
+| 任务分配 | 按分组指定 Worker |
+| 资源隔离 | 不同分组独立资源 |
+| 故障隔离 | 分组内故障不影响其他分组 |
+
+### Worker 分组配置
+
+```yaml
+# worker 分组配置
+worker:
+  groups:
+    - name: "spark-group"
+      workers: ["spark-worker-1", "spark-worker-2"]
+      resources:
+        cpu: 16
+        memory: 64G
+    - name: "flink-group"
+      workers: ["flink-worker-1", "flink-worker-2"]
+      resources:
+        cpu: 16
+        memory: 64G
+```
+
+### Worker 分组最佳实践
+
+```
+分组策略：
+  1. 按业务分组：不同业务线独立分组
+  2. 按资源类型：计算型/IO型分开
+  3. 按优先级：核心业务高优先级分组
+  4. 按环境：开发/测试/生产分开
+```
+
+## 十六、DolphinScheduler 告警插件开发
+
+### 告警插件架构
+
+```java
+// 自定义告警插件
+public class WeChatAlarm implements AlertPlugin {
+    @Override
+    public String getName() {
+        return "WeChat";
+    }
+
+    @Override
+    public Result send(AlertInfo alertInfo) {
+        // 构建企业微信消息
+        String content = buildWeChatMessage(alertInfo);
+        // 发送 HTTP 请求
+        return sendWeChatMessage(content);
+    }
+}
+```
+
+### 告警插件配置
+
+```yaml
+# alert-plugin.yaml
+plugins:
+  - name: WeChat
+    class: com.example.alert.WeChatAlarm
+    properties:
+      webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+      mentioned_list: ["@all"]
+```
+
+## 十七、DolphinScheduler vs Apache Airflow 深度对比
+
+| 维度 | DolphinScheduler | Airflow |
+|------|-----------------|---------|
+| 架构 | 去中心化 | 中心化（Scheduler） |
+| DAG 定义 | 可视化 | Python 代码 |
+| 任务类型 | Shell/SQL/Spark/Flink/Python | PythonOperator 等 |
+| 多租户 | 原生支持 | 不支持 |
+| 监控 | 内置 | 需集成 |
+| 社区 | 国内活跃 | 国际活跃 |
+| 学习曲线 | 低（可视化） | 高（Python） |
+
+### 选型决策
+
+```
+选 DolphinScheduler：
+  1. 需要可视化 DAG 编排
+  2. 需要多租户
+  3. 团队 Python 能力弱
+  4. 大数据组件集成（Hive/Spark/Flink）
+
+选 Airflow：
+  1. 需要复杂 Python 逻辑
+  2. 需要动态 DAG 生成
+  3. 团队 Python 能力强
+  4. 云原生环境
+```
+
+## 十八、DolphinScheduler HA 部署
+
+### HA 架构
+
+```mermaid
+flowchart LR
+    MASTER1[Master 1] --> DB[(MySQL)]
+    MASTER2[Master 2] --> DB
+    WORKER1[Worker 1] --> MASTER1
+    WORKER2[Worker 2] --> MASTER2
+    ALERT[Alert Server] --> DB
+```
+
+### HA 配置
+
+```yaml
+# master 高可用配置
+master:
+  # 注册中心
+  registry:
+    type: zookeeper
+    servers: zk1:2181,zk2:2181,zk3:2181
+  # 任务队列
+  queue:
+    type: redis
+    servers: redis1:6379,redis2:6379,redis3:6379
+  # 分布式锁
+  lock:
+    type: zookeeper
+    servers: zk1:2181,zk2:2181,zk3:2181
+```
+
+## 十九、DolphinScheduler 任务依赖最佳实践
+
+### 依赖关系设计
+
+```
+依赖设计原则：
+  1. 最小依赖：只依赖必要任务
+  2. 避免循环：依赖图无环
+  3. 并行优化：无依赖任务并行
+  4. 容错设计：失败任务可重试
+  5. 超时控制：设置任务超时
+```
+
+### 依赖配置示例
+
+```json
+{
+  "taskName": "etl_task",
+  "taskType": "SQL",
+  "sql": "INSERT INTO target_table SELECT * FROM source_table",
+  "dependencies": ["source_sync", "data_clean"],
+  "retryTimes": 3,
+  "retryInterval": 5,
+  "timeoutFlag": "OPEN",
+  "timeout": 3600
+}
+```
+
+## 二十、DolphinScheduler 监控指标
+
+### 关键监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| master.cpu.load | Master CPU 负载 | > 80% |
+| worker.cpu.load | Worker CPU 负载 | > 80% |
+| task.running.count | 运行中任务数 | > 100 |
+| task.waiting.count | 等待任务数 | > 50 |
+| task.failed.count | 失败任务数 | > 10 |
+| queue.length | 队列长度 | > 1000 |
+
+### 监控告警配置
+
+```yaml
+# prometheus 告警规则
+groups:
+  - name: dolphinscheduler_alerts
+    rules:
+      - alert: TaskFailed
+        expr: dolphinscheduler_task_failed_count > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "任务失败告警"
+
+      - alert: WorkerHighLoad
+        expr: dolphinscheduler_worker_cpu_load > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker 负载过高"
+```
+
+## 二十一、DolphinScheduler 多租户管理
+
+### 多租户架构
+
+| 组件 | 说明 |
+|------|------|
+| 租户 | 资源隔离单元 |
+| 项目 | 任务组织单元 |
+| 工作流 | 任务编排单元 |
+| 任务 | 最小执行单元 |
+
+### 租户资源配置
+
+```yaml
+# 租户配置
+tenant:
+  name: "data-team"
+  quota:
+    cpu: 32
+    memory: 128G
+    disk: 1TB
+  projects:
+    - name: "realtime"
+      workflows: 20
+    - name: "batch"
+      workflows: 50
+```
+
+## 二十二、DolphinScheduler 自定义任务类型
+
+### 自定义任务开发
+
+```java
+// 自定义任务处理器
+public class MyTaskExecutor extends AbstractTaskExecutor {
+    @Override
+    public void execute(TaskExecutionContext context) {
+        // 1. 解析参数
+        Map<String, Object> params = context.getParams();
+
+        // 2. 执行逻辑
+        String result = executeMyLogic(params);
+
+        // 3. 保存结果
+        saveResult(context.getTaskInstanceId(), result);
+    }
+
+    @Override
+    public void cancel() {
+        // 取消逻辑
+    }
+}
+```
+
+### 自定义任务配置
+
+```yaml
+# task-plugin.yaml
+task-plugins:
+  - name: MyTask
+    class: com.example.task.MyTaskExecutor
+    properties:
+      timeout: 3600
+      retry: 3
+```
+
+## 二十三、DolphinScheduler 性能调优
+
+### 性能调优参数
+
+| 参数 | 默认值 | 说明 | 建议值 |
+|------|--------|------|--------|
+| master.dispatch.task.num | 3 | 任务分发数 | 5~10 |
+| worker.exec.threads | 100 | Worker 执行线程数 | 200~500 |
+| worker.fetch.task.num | 3 | Worker 获取任务数 | 5~10 |
+| master.refresh.interval | 1000 | 刷新间隔(ms) | 500~1000 |
+
+### 性能优化策略
+
+```
+性能优化：
+  1. 任务分片：大任务分片执行
+  2. 资源隔离：不同任务不同资源
+  3. 缓存优化：元数据缓存
+  4. 并行执行：无依赖任务并行
+  5. 异步执行：长时间任务异步
+```
+
+## 二十四、DolphinScheduler 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 任务提交失败 | 资源不足 | 扩容 Worker |
+| 任务超时 | 任务执行时间过长 | 增加超时时间 |
+| 数据倾斜 | 数据分布不均 | 重新分区 |
+| 依赖失败 | 上游任务失败 | 重试上游任务 |
+| 内存溢出 | 任务内存不足 | 增加 Worker 内存 |
+| 连接超时 | 网络问题 | 检查网络配置 |
+
 ### 19.6 与其他板块的关系
 
 - 定时任务对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；
