@@ -1306,6 +1306,401 @@ spec:
 | RBAC | 权限控制 | 访问控制 |
 | PodSecurityPolicy | Pod安全策略 | 安全约束 |
 
+## K8s高级实践与故障排查
+
+### K8s网络模型CNI
+
+```yaml
+# CNI插件选择
+# Calico: 网络策略 + BGP路由
+# Flannel: 简单 overlay
+# Cilium: eBPF 高性能网络
+# Weave: 简单易用
+
+# Calico网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+
+# Cilium网络策略（eBPF）
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: frontend
+      toPorts:
+        - ports:
+            - port: "8080"
+```
+
+| CNI插件 | 特点 | 适用场景 |
+|---------|------|----------|
+| Calico | 网络策略+BGP | 企业级 |
+| Flannel | 简单overlay | 小型集群 |
+| Cilium | eBPF高性能 | 大规模 |
+| Weave | 简单易用 | 开发测试 |
+
+### Helm Chart开发
+
+```yaml
+# Chart.yaml
+apiVersion: v2
+name: myapp
+description: My application Helm chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+# values.yaml
+replicaCount: 3
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  hosts:
+    - host: myapp.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "myapp.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "myapp.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 80
+```
+
+| Helm组件 | 说明 | 用途 |
+|----------|------|------|
+| Chart.yaml | Chart元数据 | 版本管理 |
+| values.yaml | 默认配置 | 参数化 |
+| templates/ | 模板文件 | 渲染部署 |
+| helpers.tpl | 辅助函数 | 代码复用 |
+
+### Argo CD ApplicationSet
+
+```yaml
+# ApplicationSet配置
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: myapp-set
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            url: https://dev.example.com
+          - env: staging
+            url: https://staging.example.com
+          - env: prod
+            url: https://prod.example.com
+  
+  template:
+    metadata:
+      name: 'myapp-{{env}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/org/myapp.git
+        targetRevision: HEAD
+        path: 'k8s/{{env}}'
+      destination:
+        server: '{{url}}'
+        namespace: myapp
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+
+# 多集群管理
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-set
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            env: production
+  
+  template:
+    metadata:
+      name: 'myapp-{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/org/myapp.git
+        targetRevision: HEAD
+        path: k8s/production
+      destination:
+        server: '{{server}}'
+        namespace: myapp
+```
+
+| ApplicationSet特性 | 说明 | 适用场景 |
+|--------------------|------|----------|
+| List Generator | 列表生成 | 多环境部署 |
+| Clusters Generator | 集群生成 | 多集群管理 |
+| Git Generator | Git目录生成 | GitOps |
+| Matrix Generator | 矩阵生成 | 复杂组合 |
+
+### 容器安全
+
+```yaml
+# Pod安全策略
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 2000
+  
+  containers:
+    - name: app
+      image: nginx:latest
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      
+      resources:
+        limits:
+          cpu: "1"
+          memory: "512Mi"
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+      
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  
+  volumes:
+    - name: tmp
+      emptyDir: {}
+
+# 网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+# 镜像安全扫描
+# 使用Trivy扫描镜像漏洞
+# trivy image nginx:latest
+```
+
+| 安全措施 | 说明 | 重要性 |
+|----------|------|--------|
+| 非Root运行 | 降低权限 | 高 |
+| 只读文件系统 | 防止写入 | 高 |
+| 资源限制 | 防止资源耗尽 | 高 |
+| 网络策略 | 网络隔离 | 高 |
+| 镜像扫描 | 漏洞检测 | 高 |
+
+### 多租户隔离
+
+```yaml
+# Namespace隔离
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    team: a
+
+# ResourceQuota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+
+# LimitRange
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-a-limits
+  namespace: team-a
+spec:
+  limits:
+    - default:
+        cpu: "1"
+        memory: 1Gi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      type: Container
+
+# RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: team-a-role
+  namespace: team-a
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: team-a-binding
+  namespace: team-a
+subjects:
+  - kind: User
+    name: team-a-user
+roleRef:
+  kind: Role
+  name: team-a-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+| 隔离措施 | 说明 | 作用 |
+|----------|------|------|
+| Namespace | 命名空间隔离 | 资源隔离 |
+| ResourceQuota | 资源配额 | 限制资源 |
+| LimitRange | 资源限制 | 默认限制 |
+| RBAC | 权限控制 | 访问控制 |
+
+### K8s故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Pod CrashLoopBackOff | 启动失败 | kubectl logs | 检查日志 |
+| Pod Pending | 资源不足 | kubectl describe | 扩容节点 |
+| Service无法访问 | 网络问题 | kubectl get endpoints | 检查网络 |
+| Deployment不更新 | 镜像问题 | kubectl rollout status | 更新镜像 |
+| Node NotReady | 节点故障 | kubectl get nodes | 修复节点 |
+| etcd集群异常 | 数据问题 | etcdctl检查 | 恢复数据 |
+
+### K8s监控与告警
+
+```yaml
+# Prometheus监控配置
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: myapp-monitor
+spec:
+  selector:
+    matchLabels:
+      app: myapp
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+
+# 告警规则
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: myapp-alerts
+spec:
+  groups:
+    - name: myapp
+      rules:
+        - alert: HighErrorRate
+          expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "High error rate detected"
+        
+        - alert: HighLatency
+          expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High latency detected"
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| 错误率 | 5xx错误比例 | >10% |
+| 延迟 | P99延迟 | >1秒 |
+| CPU使用率 | 节点CPU使用率 | >80% |
+| 内存使用率 | 节点内存使用率 | >80% |
+
+> 核心原则：**CNI网络模型灵活，Helm Chart参数化，Argo CD声明式，容器安全多层防护，多租户资源隔离**。
+
 ## 二十二、与其他板块的关系
 
 - K8s 原理见「[云原生/Kubernetes核心](../../云原生/Kubernetes核心.md)」；

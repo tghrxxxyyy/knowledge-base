@@ -1305,6 +1305,359 @@ Account 隔离：
 | export/import | 跨 Account 通信 | 系统集成 |
 | JWT 认证 | 去中心化身份 | 大规模部署 |
 
+## NATS高级实践与故障排查
+
+### JetStream Stream配置
+
+```bash
+# 创建Stream
+nats stream add ORDERS \
+  --subjects="orders.>" \
+  --storage=file \
+  --replicas=3 \
+  --retention=limits \
+  --max-msgs=1000000 \
+  --max-bytes=1GB \
+  --max-age=24h \
+  --max-msg-size=1MB \
+  --storage-type=file \
+  --discard=old
+
+# 查看Stream信息
+nats stream info ORDERS
+
+# Stream配置说明
+# subjects: 监听的主题
+# storage: 存储类型（file/memory）
+# replicas: 副本数
+# retention: 保留策略（limits/workflow/interest）
+# max-msgs: 最大消息数
+# max-bytes: 最大存储空间
+# max-age: 最大保留时间
+# max-msg-size: 最大消息大小
+# discard: 丢弃策略（old/new）
+```
+
+| Stream配置 | 说明 | 推荐值 |
+|------------|------|--------|
+| storage | 存储类型 | file（持久化） |
+| replicas | 副本数 | 3（高可用） |
+| retention | 保留策略 | limits |
+| max-msgs | 最大消息数 | 1000000 |
+| max-age | 最大保留时间 | 24h |
+| discard | 丢弃策略 | old |
+
+### AckPolicy消费策略
+
+```bash
+# 创建消费者
+nats consumer add ORDERS ORDER-PROCESSOR \
+  --stream=ORDERS \
+  --filter="orders.new" \
+  --ack=explicit \
+  --deliver=all \
+  --max-deliver=3 \
+  --ack-wait=30s \
+  --max-pending=100
+
+# AckPolicy说明
+# explicit: 显式确认（推荐）
+# all: 自动确认所有
+# none: 不需要确认
+
+# 消费模式
+# push: 推模式（实时）
+# pull: 拉模式（批量）
+
+# 重试策略
+# max-deliver: 最大重试次数
+# ack-wait: 等待确认时间
+# max-pending: 最大待处理消息数
+```
+
+| AckPolicy | 说明 | 适用场景 |
+|-----------|------|----------|
+| explicit | 显式确认 | 可靠消费 |
+| all | 自动确认 | 广播场景 |
+| none | 无需确认 | 指标推送 |
+
+### Request-Reply超时重试
+
+```go
+// Request-Reply超时配置
+nc, err := nats.Connect(nats.DefaultURL)
+if err != nil {
+    log.Fatal(err)
+}
+
+// 设置超时
+nc.SetTimeout(5 * time.Second)
+
+// 发送请求（带超时）
+response, err := nc.Request("orders.create", payload, 5*time.Second)
+if err != nil {
+    if err == nats.ErrTimeout {
+        log.Println("Request timeout, retrying...")
+        // 重试逻辑
+        response, err = nc.Request("orders.create", payload, 5*time.Second)
+    }
+    log.Fatal(err)
+}
+
+// Request-Reply超时重试策略
+// 1. 设置合理超时时间
+// 2. 指数退避重试
+// 3. 限制最大重试次数
+// 4. 记录重试日志
+
+// 超时配置建议
+// 网络延迟: 100ms
+// 处理时间: 根据业务评估
+// 总超时 = 网络延迟 × 2 + 处理时间 + 安全余量
+```
+
+| 超时场景 | 建议超时时间 | 重试次数 |
+|----------|--------------|----------|
+| 本地网络 | 1秒 | 3次 |
+| 跨机房 | 5秒 | 2次 |
+| 跨区域 | 10秒 | 1次 |
+| 复杂业务 | 根据评估 | 1次 |
+
+### Leaf Node拓扑
+
+```bash
+# Leaf Node配置
+# 服务器配置
+listen: 0.0.0.0:4222
+
+# Leaf Node连接
+leafnodes {
+  remotes [
+    {
+      urls: ["nats://hub-server:7422"]
+      account: "Hub"
+    }
+  ]
+}
+
+# 客户端连接
+client {
+  port: 4222
+}
+
+# Leaf Node拓扑模式
+# 1. Hub-Spoke（中心辐射）
+#    Hub Server（中心）
+#    ├── Leaf 1
+#    ├── Leaf 2
+#    └── Leaf 3
+
+# 2. Mesh（网状）
+#    Leaf 1 ←→ Leaf 2
+#       ↑         ↑
+#       ↓         ↓
+#    Leaf 3 ←→ Leaf 4
+
+# 3. Multi-Tier（多层级）
+#    Tier 1: Hub Server
+#    ├── Tier 2: Regional Server
+#    │   ├── Tier 3: Edge Leaf 1
+#    │   └── Tier 3: Edge Leaf 2
+#    └── Tier 2: Regional Server
+#        ├── Tier 3: Edge Leaf 3
+#        └── Tier 3: Edge Leaf 4
+```
+
+| 拓扑模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| Hub-Spoke | 中心辐射 | 云边协同 |
+| Mesh | 网状 | 边缘自治 |
+| Multi-Tier | 多层级 | 大规模部署 |
+
+### K8s部署最佳实践
+
+```yaml
+# NATS K8s部署
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  labels:
+    app: nats
+spec:
+  ports:
+    - port: 4222
+      name: client
+    - port: 6222
+      name: clustering
+    - port: 8222
+      name: monitoring
+  clusterIP: None
+  selector:
+    app: nats
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+spec:
+  serviceName: nats
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10
+          ports:
+            - containerPort: 4222
+              name: client
+            - containerPort: 6222
+              name: clustering
+            - containerPort: 8222
+              name: monitoring
+          args:
+            - "-p"
+            - "4222"
+            - "--cluster_name"
+            - "nats-cluster"
+            - "--routes"
+            - "nats://nats-0.nats:6222,nats://nats-1.nats:6222,nats://nats-2.nats:6222"
+            - "--http_port"
+            - "8222"
+            - "-m"
+            - "8222"
+```
+
+| K8s资源 | 说明 | 配置建议 |
+|---------|------|----------|
+| Service | Headless服务 | clusterIP: None |
+| StatefulSet | 有状态副本集 | replicas: 3 |
+| ConfigMap | 配置文件 | 集群配置 |
+| PV/PVC | 持久化存储 | file存储 |
+
+### 账号隔离与安全
+
+```bash
+# 账号配置
+accounts {
+  # 系统账号
+  SYS {
+    users [
+      {user: sys-admin, password: sys-pass}
+    ]
+    exports [
+      {service: "$SYS.>"}
+    ]
+  }
+  
+  # 业务账号
+  APP {
+    users [
+      {user: app-user, password: app-pass}
+    ]
+    imports [
+      {service: {account: SYS, subject: "$SYS.>"}}
+    ]
+    exports [
+      {service: orders.>}
+      {stream: events.>}
+    ]
+  }
+  
+  # 边缘账号
+  EDGE {
+    users [
+      {user: edge-user, password: edge-pass}
+    ]
+    imports [
+      {service: {account: APP, subject: orders.>}}
+      {stream: {account: APP, subject: events.>}}
+    ]
+  }
+}
+
+# 账号隔离说明
+# 1. 独立主题空间
+# 2. 权限控制（publish/subscribe白名单）
+# 3. export/import跨账号通信
+# 4. JWT认证（去中心化身份）
+```
+
+| 安全措施 | 说明 | 重要性 |
+|----------|------|--------|
+| 账号隔离 | 独立主题空间 | 高 |
+| 权限控制 | publish/subscribe白名单 | 高 |
+| export/import | 跨账号通信 | 中 |
+| JWT认证 | 去中心化身份 | 高 |
+| TLS加密 | 传输加密 | 高 |
+
+### NATS故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 连接失败 | 网络问题 | 检查网络连通性 | 修复网络 |
+| 消息丢失 | 没有持久化 | 检查JetStream配置 | 启用JetStream |
+| 消费延迟 | 消费者性能 | 检查消费者配置 | 扩容消费者 |
+| 集群不同步 | 网络分区 | 检查集群状态 | 修复网络 |
+| 内存溢出 | 消息堆积 | 检查消息保留策略 | 限制消息数 |
+| 认证失败 | 账号配置 | 检查账号配置 | 修正账号 |
+
+### NATS监控与告警
+
+```yaml
+# NATS监控配置
+monitoring:
+  # 监控端点
+  endpoint: "http://localhost:8222"
+  
+  # 关键指标
+  metrics:
+    - name: "nats_connections"
+      description: "当前连接数"
+    
+    - name: "nats_messages_received"
+      description: "接收消息数"
+    
+    - name: "nats_messages_sent"
+      description: "发送消息数"
+    
+    - name: "nats_bytes_received"
+      description: "接收字节数"
+    
+    - name: "nats_bytes_sent"
+      description: "发送字节数"
+  
+  # 告警规则
+  alerts:
+    - name: "nats_connections_high"
+      condition: "nats_connections > 10000"
+      severity: "warning"
+    
+    - name: "nats_message_loss"
+      condition: "rate(nats_messages_dropped[5m]) > 0"
+      severity: "critical"
+    
+    - name: "nats_slow_consumers"
+      condition: "nats_slow_consumers > 100"
+      severity: "warning"
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| 连接数 | 当前连接数 | >10000 |
+| 消息丢失 | 丢弃消息数 | >0 |
+| 慢消费者 | 慢消费者数量 | >100 |
+| 内存使用 | 内存使用率 | >80% |
+
+> 核心原则：**JetStream持久化，AckPolicy可靠消费，Leaf Node灵活拓扑，K8s云原生部署，账号隔离安全**。
+
 ## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；
