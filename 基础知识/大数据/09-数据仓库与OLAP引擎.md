@@ -1427,6 +1427,83 @@ flowchart TD
     BI工具：Grafana/Superset/Metabase
 ```
 
+## 三十五、Lakehouse 架构与表格式对比
+
+### Lakehouse 核心架构
+
+```mermaid
+flowchart TB
+    A[数据源] --> B[数据湖存储<br/>S3/OSS/HDFS]
+    B --> C[表格式层<br/>Iceberg/Hudi/Delta]
+    C --> D[计算引擎<br/>Spark/Flink/Trino]
+    D --> E[SQL接口]
+    D --> F[数据应用]
+    C --> G[ACID事务]
+    C --> H[Schema演化]
+    C --> I[时间旅行]
+```
+
+### 表格式功能对比
+
+| 功能 | Iceberg | Hudi | Delta Lake |
+|------|---------|------|-----------|
+| ACID事务 | ✅ | ✅ | ✅ |
+| Schema演化 | ✅(完全) | ✅(有限) | ✅(追加列) |
+| 时间旅行 | ✅ | ✅ | ✅ |
+| 分区演化 | ✅ | ❌ | ❌ |
+| 小文件合并 | ✅(自动) | ✅(手动) | ✅(自动) |
+| 流处理 | ✅(Flink) | ✅(Flink) | ✅(Spark) |
+| 增量查询 | ✅ | ✅ | ✅ |
+| 计算引擎 | Spark/Flink/Trino | Spark/Flink | Spark |
+
+### OLAP 引擎性能基准
+
+| 查询类型 | ClickHouse | StarRocks | Doris | Trino |
+|----------|-----------|-----------|-------|-------|
+| 单表聚合 | 1x | 0.8x | 0.9x | 1.5x |
+| 多表JOIN | 2x | 1x | 1.2x | 1.3x |
+| 全文检索 | 0.5x | 1.5x | 1.5x | 2x |
+| 高并发(100QPS) | 1.2x | 0.8x | 0.9x | 1.5x |
+| 实时写入 | 1x | 0.9x | 1x | N/A |
+
+| 维度 | ClickHouse | StarRocks | Doris | Trino |
+|------|-----------|-----------|-------|-------|
+| 部署复杂度 | 中 | 高 | 中 | 高 |
+| 运维成本 | 中 | 高 | 中 | 高 |
+| 社区活跃度 | 高 | 中 | 中 | 高 |
+| 生态集成 | 中 | 中 | 中 | 高 |
+
+## 三十六、集群运维与监控
+
+### 集群健康检查指标
+
+| 指标 | ClickHouse | StarRocks | Doris |
+|------|-----------|-----------|-------|
+| 节点状态 | system.replicas | FE/BE状态 | Tablet状态 |
+| 复制延迟 | 表级延迟 | Tablet同步 | 复制延迟 |
+| 磁盘使用 | system.disks | BE磁盘 | BE磁盘 |
+| 查询性能 | system.query_log | query_profile | query_log |
+| 慢查询 | system.query_log | query_profile | query_log |
+
+```sql
+-- ClickHouse 集群健康检查
+SELECT 
+  database,
+  table,
+  is_leader,
+  is_readonly,
+  future_parts,
+  queue_size,
+  inserts_in_queue,
+  merges_in_queue
+FROM system.replicas
+WHERE is_leader = 1;
+
+-- StarRocks 集群状态
+SHOW PROC '/frontends';
+SHOW PROC '/backends';
+```
+
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
 - 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；
 - OLAP 引擎深挖见「[中间件/ClickHouse](../中间件/ClickHouse.md)」「[中间件/Doris与StarRocks](../中间件/Doris与StarRocks.md)」；

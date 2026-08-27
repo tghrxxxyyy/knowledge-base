@@ -1442,3 +1442,100 @@ UserParameter=http.status[*],curl -s -o /dev/null -w "%{http_code}" -m 5 $1
 | 新UI | Vue.js重写 | 用户体验 |
 
 > 一句话：**Zabbix = 采集（Agent/SNMP/主动）+ 触发器（阈值）+ 告警（升级/媒介）+ 报表——传统企业监控闭环；选型先看「环境（传统机房→Zabbix，云原生→Prometheus）」，再定「部署（多机房→Proxy 级联 + Server HA）」，最后配「模板批量 + 告警收敛 + 分级采集频率 + 数据保留策略」**。
+
+## Zabbix API 自动化运维
+
+### 常用 API 接口
+
+| 接口 | 功能 | 用途 |
+|------|------|------|
+| user.login | 用户认证 | 获取认证token |
+| host.get | 获取主机列表 | 资产管理 |
+| item.get | 获取监控项 | 数据查询 |
+| trigger.get | 获取触发器 | 告警管理 |
+| event.get | 获取事件 | 故障排查 |
+| template.get | 获取模板 | 模板管理 |
+
+```python
+# Zabbix API 调用示例
+import requests
+import json
+
+url = "http://zabbix.example.com/api_jsonrpc.php"
+headers = {"Content-Type": "application/json-rpc"}
+
+# 认证
+payload = {
+    "jsonrpc": "2.0",
+    "method": "user.login",
+    "params": {
+        "user": "Admin",
+        "password": "zabbix"
+    },
+    "id": 1
+}
+response = requests.post(url, headers=headers, data=json.dumps(payload))
+auth = response.json()["result"]
+
+# 获取主机列表
+payload = {
+    "jsonrpc": "2.0",
+    "method": "host.get",
+    "params": {
+        "output": ["hostid", "host", "name"],
+        "selectInterfaces": ["ip"]
+    },
+    "auth": auth,
+    "id": 2
+}
+response = requests.post(url, headers=headers, data=json.dumps(payload))
+hosts = response.json()["result"]
+```
+
+### Zabbix 自动发现与注册
+
+```bash
+# 网络发现规则配置
+Discovery rule:
+  Type: Network discovery
+  IP range: 192.168.1.1-254
+  Update interval: 1h
+  Checks:
+    - Zabbix agent "system.hostname"
+    - ICMP ping
+
+# 动作配置（自动注册）
+Action: Auto register
+  Conditions:
+    - Discovery status = Up
+    - Discovery check = Zabbix agent
+  Operations:
+    - Add host
+    - Add to host group "Discovered hosts"
+    - Link to template "Template OS Linux"
+```
+
+## Zabbix 与 Prometheus 混合部署
+
+| 组件 | Zabbix角色 | Prometheus角色 | 说明 |
+|------|-----------|---------------|------|
+| 传统基础设施 | 主采集 | 辅助 | SNMP/IPMI |
+| 云原生环境 | 辅助 | 主采集 | K8s/Pod |
+| 业务监控 | 主采集 | 辅助 | 自定义监控项 |
+| 日志监控 | 无 | 主采集 | Loki集成 |
+| 告警管理 | 统一告警 | 数据源 | Alertmanager |
+
+```mermaid
+flowchart TB
+    subgraph 传统环境
+        A[传统服务器] --> B[Zabbix Agent]
+        B --> C[Zabbix Server]
+    end
+    subgraph 云原生环境
+        D[K8s集群] --> E[Prometheus]
+        E --> F[Alertmanager]
+    end
+    C --> G[统一告警平台]
+    F --> G
+    G --> H[值班人员]
+```

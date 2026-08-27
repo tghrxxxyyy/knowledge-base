@@ -1463,4 +1463,47 @@ flowchart TD
     A -->|复杂流处理| G[Kafka Streams]
 ```
 
-## 十四、Pulsar 运维命令
+## 十四、Pulsar 运维命令与最佳实践
+
+### 常用运维命令
+
+```bash
+# 集群状态检查
+pulsar-admin brokers list
+pulsar-admin brokers healthcheck
+
+# Topic 管理
+pulsar-admin topics list persistent://public/default/
+pulsar-admin topics stats persistent://public/default/my-topic
+pulsar-admin topics compact persistent://public/default/my-topic
+
+# 租户管理
+pulsar-admin tenants list
+pulsar-admin namespaces list my-tenant/
+
+# 监控指标
+pulsar-admin persistent stats persistent://public/default/my-topic
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| brokerServicePort | 6650 | 6650 | Broker端口 |
+| webServicePort | 8080 | 8080 | Web端口 |
+| maxConcurrentLookup | 10000 | 50000 | 并发查找 |
+| maxConcurrentTopicLoading | 5000 | 10000 | 并发加载 |
+| managedLedgerDefaultEnsembleSize | 3 | 3 | 写入副本数 |
+| managedLedgerDefaultAckQuorumSize | 2 | 2 | 写入确认数 |
+| dispatchThrottlingRateInMsg | 0 | 10000 | 消息分发限流 |
+
+### 故障排查清单
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|---------|---------|
+| 延迟高 | 检查BookKeeper磁盘IO | 增加磁盘/优化写入 |
+| 消息丢失 | 检查确认机制 | 调整AckQuorumSize |
+| 消费堆积 | 检查消费速度 | 增加消费者/优化处理 |
+| 集群不均 | 检查Broker负载 | 手动迁移Topic |
+
+## 十五、Pulsar Functions 高级用法

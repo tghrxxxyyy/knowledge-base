@@ -1298,6 +1298,276 @@ etcd 网络分区行为：
 故障切换时间：约 3-5 秒
 ```
 
+## etcd高级实践与故障排查
+
+### MVCC原理详解
+
+```text
+etcd MVCC实现：
+┌─────────────────────────────────────────────────────────┐
+│                    Key-Value 存储                       │
+│  ┌─────────────┬─────────────┬─────────────┐           │
+│  │   Key       │   Value     │  Revision   │           │
+│  ├─────────────┼─────────────┼─────────────┤           │
+│  │   /foo      │   "bar"     │  rev=1      │           │
+│  │   /foo      │   "baz"     │  rev=2      │           │
+│  │   /foo      │   "qux"     │  rev=3      │           │
+│  └─────────────┴─────────────┴─────────────┘           │
+│                                                         │
+│  历史版本存储：                                          │
+│  ┌─────────────┬─────────────┬─────────────┐           │
+│  │   Key       │   Value     │  Revision   │           │
+│  ├─────────────┼─────────────┼─────────────┤           │
+│  │   /foo      │   "bar"     │  rev=1      │           │
+│  │   /foo      │   "baz"     │  rev=2      │           │
+│  │   /foo      │   "qux"     │  rev=3      │           │
+│  └─────────────┴─────────────┴─────────────┘           │
+└─────────────────────────────────────────────────────────┘
+
+# MVCC核心机制
+# 1. 每次写操作创建新版本（revision递增）
+# 2. 读操作基于revision读取历史版本
+# 3. Watch基于revision监听变更
+# 4. Compact压缩历史版本释放空间
+```
+
+| MVCC特性 | 说明 | 作用 |
+|----------|------|------|
+| 版本号递增 | 每次操作revision+1 | 全局有序 |
+| 历史版本 | 保留所有历史版本 | 支持Watch |
+| 压缩清理 | Compact压缩历史 | 释放空间 |
+| 并发控制 | 基于revision | 保证一致性 |
+
+### Compact与Defrag实战
+
+```bash
+# Compact压缩历史版本
+# 自动压缩（推荐）
+etcd --auto-compaction-mode periodic --auto-compaction-retention=8h
+
+# 手动压缩
+etcdctl compact <revision>
+
+# Defrag碎片整理
+etcdctl defrag
+
+# 压缩+碎片整理脚本
+#!/bin/bash
+CURRENT_REVISION=$(etcdctl endpoint status --write-out="json" | jq -r '.header.revision')
+echo "Current revision: $CURRENT_REVISION"
+
+# 压缩
+etcdctl compact $CURRENT_REVISION
+echo "Compacted revision: $CURRENT_REVISION"
+
+# 碎片整理
+etcdctl defrag
+echo "Defragmented"
+
+# 压缩策略配置
+# 1. 定期压缩（推荐）
+etcd --auto-compaction-mode periodic --auto-compaction-retention=24h
+
+# 2. 基于revision压缩
+etcd --auto-compaction-mode revision --auto-compaction-retention=10000
+```
+
+| 压缩模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| periodic | 定期压缩 | 通用场景 |
+| revision | 基于revision | 高频写场景 |
+| manual | 手动压缩 | 特殊场景 |
+
+### Lease租约高级用法
+
+```go
+// 创建租约
+ctx := context.Background()
+grant, err := client.Grant(ctx, 30)  // 30秒租约
+if err != nil {
+    log.Fatal(err)
+}
+
+// 绑定Key到租约
+_, err = client.Put(ctx, "foo", "bar", client.WithLease(grant.ID))
+if err != nil {
+    log.Fatal(err)
+}
+
+// 自动续租
+keepAlive, err := client.KeepAlive(ctx, grant.ID)
+if err != nil {
+    log.Fatal(err)
+}
+
+// 监听续租状态
+for {
+    select {
+    case resp := <-keepAlive:
+        if resp == nil {
+            log.Println("租约已过期")
+            // 重新绑定
+            return
+        }
+    case <-ctx.Done():
+        return
+    }
+}
+
+// 租约使用场景
+// 1. 服务注册：服务启动时创建租约，绑定服务地址
+// 2. 分布式锁：锁绑定租约，避免死锁
+// 3. 配置管理：配置绑定租约，过期自动清理
+```
+
+| 租约TTL | 说明 | 适用场景 |
+|---------|------|----------|
+| 10秒 | 短租约 | 服务注册 |
+| 30秒 | 中租约 | 分布式锁 |
+| 60秒 | 长租约 | 配置管理 |
+| 永不过期 | 无租约 | 永久数据 |
+
+### K8s etcd故障恢复
+
+```bash
+# K8s etcd故障恢复步骤
+# 1. 备份etcd数据
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot-$(date +%Y%m%d).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# 2. 恢复etcd数据
+ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot-20240101.db \
+  --data-dir=/var/lib/etcd-restore \
+  --name=master-1 \
+  --initial-cluster=master-1=https://127.0.0.1:2380 \
+  --initial-cluster-token=etcd-cluster \
+  --initial-advertise-peer-urls=https://127.0.0.1:2380
+
+# 3. 替换etcd数据目录
+mv /var/lib/etcd /var/lib/etcd-old
+mv /var/lib/etcd-restore /var/lib/etcd
+
+# 4. 重启etcd
+systemctl restart etcd
+
+# 5. 验证恢复
+ETCDCTL_API=3 etcdctl endpoint health \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+```
+
+| 故障类型 | 恢复方案 | 恢复时间 |
+|----------|----------|----------|
+| 单节点故障 | 自动恢复 | 分钟级 |
+| 数据损坏 | 从备份恢复 | 小时级 |
+| 集群崩溃 | 从快照恢复 | 小时级 |
+| 网络分区 | 等待分区恢复 | 秒级 |
+
+### 网络分区与Leader选举
+
+```text
+etcd网络分区处理：
+┌─────────────────────────────────────────────────────────┐
+│                    网络分区场景                         │
+│                                                         │
+│  节点1 (Leader)  ──── 网络 ────  节点2                 │
+│       │                           │                    │
+│       │                           │                    │
+│  节点3  ────────── 网络 ────  节点4                     │
+│                                                         │
+│  分区1: 节点1,3 (多数派)                               │
+│  分区2: 节点2,4 (少数派)                               │
+└─────────────────────────────────────────────────────────┘
+
+# Leader选举流程
+# 1. 检测到Leader不可达
+# 2. 触发选举超时（150-300ms随机）
+# 3. 发起选举请求
+# 4. 获得多数派投票
+# 5. 成为新Leader
+
+# 分区恢复后处理
+# 1. 旧Leader降级为Follower
+# 2. 同步新Leader数据
+# 3. 恢复正常服务
+
+# 故障切换时间
+# 选举超时: 150-300ms
+# 日志复制: <10ms
+# 总切换时间: <500ms
+```
+
+| 分区场景 | 处理策略 | 恢复时间 |
+|----------|----------|----------|
+| Leader在多数派 | 继续服务 | 无影响 |
+| Leader在少数派 | 选举新Leader | <1秒 |
+| 均等分区 | 多数派选举 | <1秒 |
+| 网络抖动 | 保持当前Leader | 无影响 |
+
+### etcd故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Leader选举失败 | 网络问题 | 检查网络连通性 | 修复网络 |
+| 日志复制延迟 | 磁盘IO慢 | 检查磁盘性能 | 优化磁盘 |
+| Watch断开 | 网络中断 | 检查连接状态 | 重连 |
+| 租约过期 | 续租失败 | 检查续租逻辑 | 修复续租 |
+| 数据损坏 | 异常宕机 | 检查数据文件 | 恢复备份 |
+| 性能下降 | 数据量大 | 检查数据大小 | 压缩+碎片整理 |
+
+### etcd监控与告警
+
+```yaml
+# etcd监控配置
+monitoring:
+  # 指标收集
+  metrics:
+    enabled: true
+    endpoint: "http://localhost:2381/metrics"
+    
+  # 关键指标
+  key_metrics:
+    - name: "etcd_server_leader_changes_seen_total"
+      description: "Leader切换次数"
+    
+    - name: "etcd_disk_wal_fsync_duration_seconds"
+      description: "WAL同步延迟"
+    
+    - name: "etcd_disk_backend_commit_duration_seconds"
+      description: "Backend提交延迟"
+    
+    - name: "etcd_network_peer_round_trip_time_seconds"
+      description: "网络延迟"
+  
+  # 告警规则
+  alerts:
+    - name: "etcd_leader_changes"
+      condition: "rate(etcd_server_leader_changes_seen_total[5m]) > 0"
+      severity: "critical"
+    
+    - name: "etcd_disk_fsync_slow"
+      condition: "histogram_quantile(0.99, etcd_disk_wal_fsync_duration_seconds) > 0.5"
+      severity: "warning"
+    
+    - name: "etcd_network_latency_high"
+      condition: "histogram_quantile(0.99, etcd_network_peer_round_trip_time_seconds) > 0.1"
+      severity: "warning"
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| Leader切换 | Leader变化频率 | >0次/5分钟 |
+| WAL同步延迟 | 磁盘写入性能 | >500ms |
+| Backend提交延迟 | 数据提交性能 | >500ms |
+| 网络延迟 | 节点间通信 | >100ms |
+
+> 核心原则：**MVCC版本管理，Compact定期压缩，Lease租约自动续租，网络分区自动恢复**。
+
 ## etcd v2 vs v3 API 本质差异
 
 | 特性 | v2 API | v3 API |

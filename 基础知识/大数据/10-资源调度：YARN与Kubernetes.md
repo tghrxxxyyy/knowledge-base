@@ -1458,3 +1458,124 @@ spec:
     matchLabels:
       app: spark-driver
 ```
+
+## YARN → K8s 迁移成本分析
+
+### 迁移成本对比
+
+| 成本项 | YARN | K8s | 差异 |
+|--------|------|-----|------|
+| 硬件成本 | 中 | 低 | K8s弹性更好 |
+| 许可费用 | 无 | 无 | 持平 |
+| 运维人力 | 低 | 高 | K8s学习曲线 |
+| 培训成本 | 低 | 中 | K8s生态复杂 |
+| 迁移成本 | - | 高 | 一次性投入 |
+| 长期运维 | 中 | 低 | K8s自动化 |
+
+### 迁移ROI计算
+
+```python
+# 迁移ROI计算
+def calculate_migration_roi(yarn_cost, k8s_cost, migration_cost, years=3):
+    """
+    yarn_cost: YARN年运维成本
+    k8s_cost: K8s年运维成本
+    migration_cost: 迁移一次性成本
+    """
+    annual_saving = yarn_cost - k8s_cost
+    total_saving = annual_saving * years - migration_cost
+    roi = total_saving / migration_cost * 100
+    payback_months = migration_cost / (annual_saving / 12)
+    
+    return {
+        "annual_saving": annual_saving,
+        "total_saving": total_saving,
+        "roi_percent": roi,
+        "payback_months": payback_months
+    }
+
+# 示例
+result = calculate_migration_roi(
+    yarn_cost=1000000,  # YARN年成本100万
+    k8s_cost=700000,    # K8s年成本70万
+    migration_cost=500000  # 迁移成本50万
+)
+print(f"年节省: {result['annual_saving']}")
+print(f"3年ROI: {result['roi_percent']}%")
+print(f"回收期: {result['payback_months']}个月")
+```
+
+### Spark on K8s Operator 最佳实践
+
+```yaml
+# SparkApplication 配置
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: spark-pi
+  namespace: data-processing
+spec:
+  type: Scala
+  mode: cluster
+  image: spark:3.3.1
+  mainClass: org.apache.spark.examples.SparkPi
+  sparkVersion: "3.3.1"
+  driver:
+    cores: 1
+    coreLimit: "2"
+    memory: "1g"
+    labels:
+      version: 3.3.1
+    serviceAccount: spark
+  executor:
+    cores: 4
+    coreLimit: "4"
+    memory: "8g"
+    instances: 3
+    labels:
+      version: 3.3.1
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 3
+    onFailureRetryInterval: 30
+    onSubmissionFailureRetries: 2
+    onSubmissionFailureRetryInterval: 20
+```
+
+### Flink on K8s 部署模式
+
+| 模式 | 说明 | 适用场景 | 弹性 |
+|------|------|---------|------|
+| Session | 共享集群 | 短作业 | 低 |
+| Per-Job | 独立集群 | 长作业 | 中 |
+| Application | 应用模式 | 生产环境 | 高 |
+
+```yaml
+# Flink Application Mode
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: flink-streaming
+  namespace: data-processing
+spec:
+  image: flink:1.17
+  flinkVersion: v1_17
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    high-availability: kubernetes
+    high-availability.storageDir: s3:///flink/ha
+  serviceAccount: flink
+  jobManager:
+    replicas: 2
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    replicas: 3
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/examples/streaming/WindowWordCount.jar
+    parallelism: 4
+```

@@ -1288,6 +1288,376 @@ Correlation ID 作用：
 ### 生产能力 / 消费能力 / 缓冲区
 
 ```
+## MQ高级实践与故障排查
+
+### 消息幂等性设计
+
+```java
+// 幂等性检查表
+CREATE TABLE message_idempotent (
+    message_id VARCHAR(64) PRIMARY KEY,
+    consumer_group VARCHAR(64),
+    consumer_id VARCHAR(64),
+    status ENUM('PROCESSING', 'COMPLETED', 'FAILED'),
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+
+// 幂等性检查逻辑
+public boolean isMessageProcessed(String messageId, String consumerGroup) {
+    // 1. 检查Redis缓存
+    String cacheKey = "mq:idempotent:" + consumerGroup + ":" + messageId;
+    if (redis.exists(cacheKey)) {
+        return true;
+    }
+    
+    // 2. 检查数据库
+    MessageIdempotent record = db.query(
+        "SELECT status FROM message_idempotent WHERE message_id = ? AND consumer_group = ?",
+        messageId, consumerGroup
+    );
+    
+    if (record != null) {
+        // 3. 更新缓存
+        redis.setex(cacheKey, 86400, record.getStatus());
+        return true;
+    }
+    
+    return false;
+}
+
+// 幂等性消费
+public void consumeMessage(Message message) {
+    if (isMessageProcessed(message.getId(), consumerGroup)) {
+        log.info("Message already processed: {}", message.getId());
+        return;
+    }
+    
+    try {
+        // 记录处理中
+        db.execute(
+            "INSERT INTO message_idempotent (message_id, consumer_group, status) VALUES (?, ?, 'PROCESSING')",
+            message.getId(), consumerGroup
+        );
+        
+        // 处理消息
+        processMessage(message);
+        
+        // 更新状态为完成
+        db.execute(
+            "UPDATE message_idempotent SET status = 'COMPLETED' WHERE message_id = ? AND consumer_group = ?",
+            message.getId(), consumerGroup
+        );
+        
+        // 更新缓存
+        redis.setex(cacheKey, 86400, "COMPLETED");
+        
+    } catch (Exception e) {
+        // 更新状态为失败
+        db.execute(
+            "UPDATE message_idempotent SET status = 'FAILED' WHERE message_id = ? AND consumer_group = ?",
+            message.getId(), consumerGroup
+        );
+        throw e;
+    }
+}
+```
+
+| 幂等性方案 | 说明 | 适用场景 |
+|------------|------|----------|
+| 消息ID去重 | 基于消息ID去重 | 通用方案 |
+| 数据库唯一约束 | 基于业务主键 | 数据库操作 |
+| Redis缓存 | 高性能去重 | 高并发场景 |
+| 状态机 | 业务状态流转 | 复杂业务 |
+
+### 延迟消息实现
+
+```java
+// 延迟消息配置（RocketMQ）
+// 生产者配置
+DefaultMQProducer producer = new DefaultMQProducer("delay-producer");
+producer.start();
+
+// 发送延迟消息
+Message msg = new Message("TopicTest", ("Hello RocketMQ").getBytes());
+// 设置延迟级别（18个级别）
+msg.setDelayTimeLevel(3);  // 10s
+// 或设置具体延迟时间（5.0+）
+msg.setDelayTimeSec(60);  // 60秒
+
+SendResult sendResult = producer.send(msg);
+producer.shutdown();
+
+// 消费者配置
+DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("delay-consumer");
+consumer.subscribe("TopicTest", "*");
+consumer.registerMessageListener(new MessageListenerConcurrently() {
+    @Override
+    public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs, ConsumeConcurrentlyContext context) {
+        for (MessageExt msg : msgs) {
+            long delayTime = msg.getBornTimestamp() - System.currentTimeMillis();
+            log.info("Message delay: {}ms, body: {}", delayTime, new String(msg.getBody()));
+        }
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+    }
+});
+consumer.start();
+
+// 延迟消息使用场景
+// 1. 订单超时取消（30分钟延迟）
+// 2. 定时任务调度（每天凌晨执行）
+// 3. 缓存预热（提前加载数据）
+// 4. 延迟通知（定时发送提醒）
+```
+
+| 延迟级别 | 延迟时间 | 适用场景 |
+|----------|----------|----------|
+| 1s | 1秒 | 短延迟 |
+| 5s | 5秒 | 短延迟 |
+| 10s | 10秒 | 短延迟 |
+| 30s | 30秒 | 中延迟 |
+| 1m | 1分钟 | 中延迟 |
+| 5m | 5分钟 | 中延迟 |
+| 30m | 30分钟 | 长延迟 |
+| 1h | 1小时 | 长延迟 |
+
+### correlationId全链路追踪
+
+```java
+// correlationId生成与传递
+public class CorrelationIdFilter implements Filter {
+    private static final String CORRELATION_ID_HEADER = "X-Correlation-Id";
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) 
+            throws IOException, ServletException {
+        
+        String correlationId = request.getHeader(CORRELATION_ID_HEADER);
+        if (correlationId == null) {
+            correlationId = generateCorrelationId();
+        }
+        
+        // 存入上下文
+        CorrelationContext.set(correlationId);
+        
+        // 传递到下游服务
+        ((HttpServletResponse) response).setHeader(CORRELATION_ID_HEADER, correlationId);
+        
+        chain.doFilter(request, response);
+    }
+    
+    private String generateCorrelationId() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+}
+
+// MQ消息中携带correlationId
+public class MessageProducer {
+    public void sendMessage(Object payload, String correlationId) {
+        Message message = new Message();
+        message.setHeaders(new MessageHeaders());
+        message.getHeaders().put("correlationId", correlationId);
+        message.setPayload(payload);
+        
+        kafkaTemplate.send("topic", message);
+    }
+}
+
+// 消费者中提取correlationId
+@KafkaListener(topics = "topic")
+public void consumeMessage(ConsumerRecord<String, String> record) {
+    String correlationId = record.headers().lastHeader("correlationId").value();
+    CorrelationContext.set(correlationId);
+    
+    log.info("Processing message with correlationId: {}", correlationId);
+    
+    // 业务处理
+    processMessage(record.value());
+}
+```
+
+| correlationId作用 | 说明 | 实现方式 |
+|-------------------|------|----------|
+| 全链路追踪 | 串联所有服务调用 | Header传递 |
+| 日志关联 | 关联同一请求所有日志 | MDC注入 |
+| 问题排查 | 快速定位问题 | 查询过滤 |
+| 性能分析 | 计算请求耗时 | 时间戳计算 |
+
+### 消息积压应急处理
+
+```java
+// 消息积压监控
+@Component
+public class MessageBacklogMonitor {
+    @Autowired private KafkaTemplate kafkaTemplate;
+    @Autowired private AlertService alertService;
+    
+    // 监控消费者组积压情况
+    public void monitorConsumerGroup(String consumerGroup, String topic) {
+        // 1. 获取消费者组信息
+        ConsumerGroupDescription description = adminClient.describeConsumerGroups(
+            Collections.singletonList(consumerGroup)
+        ).describedGroups().get(consumerGroup).get();
+        
+        // 2. 计算积压量
+        long totalLag = 0;
+        for (MemberDescription member : description.members()) {
+            for (TopicPartition partition : member.assignment()) {
+                long endOffset = adminClient.endOffsets(
+                    Collections.singletonList(partition)
+                ).get(partition);
+                long committedOffset = adminClient.listConsumerGroupOffsets(consumerGroup)
+                    .partitionsToOffsetAndMetadata()
+                    .get(partition)
+                    .offset();
+                
+                totalLag += (endOffset - committedOffset);
+            }
+        }
+        
+        // 3. 告警判断
+        if (totalLag > 10000) {
+            alertService.sendAlert("消息积压", 
+                String.format("消费者组 %s 积压 %d 条消息", consumerGroup, totalLag));
+        }
+    }
+    
+    // 应急处理
+    public void emergencyHandle(String consumerGroup, String topic) {
+        // 1. 增加消费者实例
+        scaleUpConsumers(consumerGroup, 10);
+        
+        // 2. 临时提高消费线程数
+        adjustConsumerThreads(consumerGroup, 20);
+        
+        // 3. 跳过非关键消息
+        skipNonCriticalMessages(consumerGroup, topic);
+        
+        // 4. 降级处理
+        enableDegradationMode(consumerGroup);
+    }
+}
+```
+
+| 积压程度 | 处理策略 | 恢复时间 |
+|----------|----------|----------|
+| <1000条 | 监控观察 | 自动恢复 |
+| 1000-10000条 | 增加消费者 | 1-2小时 |
+| 10000-100000条 | 扩容+降级 | 2-4小时 |
+| >100000条 | 紧急扩容+跳过 | 4-8小时 |
+
+### 消息体大小对性能的影响
+
+```java
+// 消息体大小优化
+public class MessageSizeOptimizer {
+    
+    // 1. 消息压缩
+    public byte[] compressMessage(byte[] data) {
+        // 使用Snappy压缩
+        byte[] compressed = Snappy.compress(data);
+        return compressed;
+    }
+    
+    // 2. 消息分片
+    public List<Message> splitMessage(byte[] data, int maxSize) {
+        List<Message> messages = new ArrayList<>();
+        int offset = 0;
+        
+        while (offset < data.length) {
+            int length = Math.min(maxSize, data.length - offset);
+            byte[] chunk = Arrays.copyOfRange(data, offset, offset + length);
+            
+            Message message = new Message();
+            message.setBody(chunk);
+            message.getHeaders().put("chunkIndex", messages.size());
+            message.getHeaders().put("totalChunks", (data.length + maxSize - 1) / maxSize);
+            
+            messages.add(message);
+            offset += length;
+        }
+        
+        return messages;
+    }
+    
+    // 3. 消息序列化优化
+    public byte[] serializeWithProtobuf(Object obj) {
+        // 使用Protobuf替代JSON
+        return ((Message) obj).toByteArray();
+    }
+    
+    // 4. 消息体大小监控
+    public void monitorMessageSize(String topic) {
+        // 监控消息大小分布
+        kafkaTemplate.send(topic, new byte[1024]);  // 1KB
+        kafkaTemplate.send(topic, new byte[10240]); // 10KB
+        kafkaTemplate.send(topic, new byte[102400]); // 100KB
+    }
+}
+
+// 消息体大小限制配置
+// Kafka: message.max.bytes=1048576 (1MB)
+// RocketMQ: maxMessageSize=4MB
+// RabbitMQ: max_message_size=128MB
+```
+
+| 消息体大小 | 性能影响 | 优化建议 |
+|------------|----------|----------|
+| <1KB | 无影响 | 直接发送 |
+| 1KB-10KB | 轻微 | 压缩可选 |
+| 10KB-100KB | 中等 | 必须压缩 |
+| 100KB-1MB | 显著 | 分片+压缩 |
+| >1MB | 严重 | 重构设计 |
+
+### MQ容量规划公式
+
+```yaml
+# 容量规划配置
+capacity_planning:
+  # 生产能力
+  production:
+    qps: 10000  # 每秒消息量
+    message_size: 1024  # 消息大小（字节）
+    bandwidth: 10240000  # 生产带宽（字节/秒）
+    
+  # 消费能力
+  consumption:
+    consumers: 10  # 消费者数量
+    consumer_qps: 2000  # 单消费者QPS
+    total_qps: 20000  # 总消费QPS
+    
+  # 缓冲区
+  buffer:
+    retention_days: 7  # 消息保留天数
+    buffer_space: 6048000000  # 缓冲空间（字节）
+    
+  # 规划建议
+  recommendations:
+    production_capacity: 20000  # 生产能力 = 预期峰值 × 2
+    consumption_capacity: 30000  # 消费能力 = 预期峰值 × 1.5
+    buffer_space: 12096000000  # 缓冲空间 = 预期峰值 × 消息大小 × 保留时间 × 2
+```
+
+| 规划指标 | 计算公式 | 推荐值 |
+|----------|----------|--------|
+| 生产能力 | 预期峰值 × 2 | 20000 QPS |
+| 消费能力 | 预期峰值 × 1.5 | 30000 QPS |
+| 缓冲空间 | 预期峰值 × 消息大小 × 保留时间 × 2 | 12GB |
+| 存储空间 | 缓冲空间 × 副本数 | 36GB |
+
+### MQ故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 消息丢失 | 生产者配置错误 | 检查acks配置 | 设置acks=all |
+| 消息重复 | 消费者重试 | 检查幂等性 | 实现幂等消费 |
+| 消费延迟 | 消费者性能 | 监控消费者 | 扩容消费者 |
+| 消息积压 | 消费能力不足 | 检查消费线程 | 增加消费线程 |
+| 消息乱序 | 分区策略 | 检查分区键 | 使用有序分区 |
+| 连接失败 | 网络问题 | 检查网络 | 修复网络 |
+
+> 核心原则：**幂等消费，延迟可配，全链路追踪，积压可应急，容量提前规划**。
+
 容量规划公式：
 
 生产能力：

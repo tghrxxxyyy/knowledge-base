@@ -1459,4 +1459,65 @@ service:
 - 日志体系见「[ELK 日志体系](./ELK日志体系.md)」与「[Loki](./Loki.md)」；
 - SRE 视角见「[SRE与稳定性工程/02-可观测性与稳定性看护](../../SRE与稳定性工程/02-可观测性与稳定性看护.md)」。
 
+## OTel SDK 自动注入与集成
+
+### Java Agent 自动注入
+
+```bash
+# Java Agent 启动参数
+java -javaagent:opentelemetry-javaagent.jar \
+     -Dotel.service.name=my-service \
+     -Dotel.exporter.otlp.endpoint=http://collector:4317 \
+     -Dotel.metrics.exporter=otlp \
+     -Dotel.traces.exporter=otlp \
+     -Dotel.logs.exporter=otlp \
+     -jar my-app.jar
+```
+
+### Python SDK 自动注入
+
+```python
+# Python 自动注入
+from opentelemetry.instrumentation.auto_instrumentation import sitecustomize
+
+# 或手动配置
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+provider = TracerProvider()
+processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="collector:4317"))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+```
+
+### 采样策略配置详解
+
+| 策略 | 配置参数 | 内存开销 | 准确性 | 适用场景 |
+|------|---------|---------|--------|---------|
+| AlwaysOn | sampling_percentage=100 | 高 | 100% | 开发测试 |
+| AlwaysOff | sampling_percentage=0 | 低 | 0% | 不采集 |
+| Probabilistic | sampling_percentage=N | 中 | N% | 生产默认 |
+| RateLimiting | max_spans_per_second | 低 | 限流 | 高流量 |
+| ParentBased | 根采样+继承 | 低 | 中 | 分布式 |
+
+```yaml
+# Tail-based 采样策略
+tail_sampling:
+  decision_wait: 5s
+  num_traces: 100000
+  expected_new_traces_per_sec: 1000
+  policies:
+    - name: errors
+      type: status_code
+      status_code: {status_codes: [ERROR]}
+    - name: slow
+      type: latency
+      latency: {threshold_ms: 1000}
+    - name: probabilistic
+      type: probabilistic
+      probabilistic: {sampling_percentage: 10}
+```
+
 > 一句话：**OTel = 采集标准（API/SDK/OTLP）+ 三支柱统一 + Collector 管道（接收→处理→导出）+ 上下文传播（W3C）+ 采样策略（Head+Tail）——埋一次点、后端随便换；落地四步：选后端 → 自动埋点 → Agent 采集 → Gateway 汇聚**。

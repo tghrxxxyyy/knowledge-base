@@ -1297,6 +1297,295 @@ jfr print --events jdk.GCHeapSummary recording.jfr
 | Socket | SocketRead/Write | 网络 IO |
 | Exception | JavaExceptionThrow | 异常统计 |
 
+## JVM调优高级实践与故障排查
+
+### GC日志分析实战
+
+```bash
+# GC日志配置（JDK11+）
+-Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=50m
+
+# GC日志分析工具
+# 1. GCEasy (在线分析)
+# 2. GCViewer (可视化)
+# 3. 命令行分析
+
+# GC日志关键指标
+# GC暂停时间 (Pause Time)
+# GC吞吐量 (Throughput)
+# 内存分配速率 (Allocation Rate)
+# GC频率 (GC Frequency)
+
+# GC日志分析示例
+grep -E "GC|Pause" gc.log | awk '{
+    if ($3 == "GC") {
+        count[$5]++
+    }
+} END {
+    for (key in count) {
+        print key, count[key]
+    }
+}'
+```
+
+| GC日志指标 | 说明 | 优化目标 |
+|------------|------|----------|
+| 暂停时间 | GC停顿时间 | <200ms |
+| 吞吐量 | 应用运行时间占比 | >95% |
+| 分配速率 | 内存分配速度 | 稳定 |
+| GC频率 | GC触发次数 | 尽量少 |
+
+### JVM内存布局详解
+
+```text
+JVM内存结构：
+┌─────────────────────────────────────────────────────────┐
+│                    线程共享                              │
+│  ┌─────────────────────────────────────────────────────┐│
+│  │                    堆 (Heap)                        ││
+│  │  ┌─────────────┬─────────────┬─────────────┐       ││
+│  │  │   Eden区    │  Survivor区 │   老年代    │       ││
+│  │  │  (80%)      │  (10%+10%)  │   (60%)     │       ││
+│  │  └─────────────┴─────────────┴─────────────┘       ││
+│  └─────────────────────────────────────────────────────┘│
+│  ┌─────────────────────────────────────────────────────┐│
+│  │              方法区 (Metaspace)                     ││
+│  └─────────────────────────────────────────────────────┘│
+├─────────────────────────────────────────────────────────┤
+│                    线程私有                              │
+│  ┌─────────────┬─────────────┬─────────────┐           │
+│  │   虚拟机栈  │  本地方法栈 │   程序计数器│           │
+│  └─────────────┴─────────────┴─────────────┘           │
+└─────────────────────────────────────────────────────────┘
+
+# 内存分配策略
+# 1. 对象优先在Eden分配
+# 2. 大对象直接进入老年代
+# 3. 长期存活的对象进入老年代
+# 4. 动态对象年龄判断
+# 5. 空间分配担保
+```
+
+| 内存区域 | 说明 | 调优参数 |
+|----------|------|----------|
+| Eden区 | 新生代 | -XX:NewRatio |
+| Survivor区 | 幸存者 | -XX:SurvivorRatio |
+| 老年代 | 长期对象 | -XX:MaxTenuringThreshold |
+| Metaspace | 类元数据 | -XX:MaxMetaspaceSize |
+
+### JIT编译优化
+
+```java
+// JIT编译优化策略
+// 1. 方法内联
+// -XX:CompileThreshold=10000  // 方法调用次数阈值
+// -XX:+PrintCompilation  // 打印编译日志
+
+// 2. 逃逸分析
+// -XX:+DoEscapeAnalysis  // 开启逃逸分析
+// -XX:+EliminateAllocations  // 标量替换
+// -XX:+OptimizeFill  // 栈上分配
+
+// 3. 循环展开
+// -XX:+UnrollLoops  // 循环展开
+
+// 4. 内存屏障
+// -XX:+UseMembar  // 内存屏障
+
+// 代码示例：JIT优化前 vs 优化后
+public class JITExample {
+    // 优化前：频繁创建对象
+    public void badExample() {
+        for (int i = 0; i < 1000; i++) {
+            String s = new String("test");  // 每次创建新对象
+            process(s);
+        }
+    }
+    
+    // 优化后：复用对象
+    public void goodExample() {
+        String s = "test";  // 字符串常量
+        for (int i = 0; i < 1000; i++) {
+            process(s);  // 复用同一对象
+        }
+    }
+}
+```
+
+| JIT优化 | 说明 | 影响 |
+|---------|------|------|
+| 方法内联 | 方法调用优化 | 性能提升10-30% |
+| 逃逸分析 | 对象分配优化 | 减少GC压力 |
+| 循环展开 | 循环优化 | 性能提升5-15% |
+| 内存屏障 | 内存访问优化 | 减少内存延迟 |
+
+### JVM Crash排查
+
+```bash
+# JVM Crash日志分析
+# 1. 崩溃日志位置
+ls -la hs_err_pid*.log
+
+# 2. 崩溃日志关键信息
+# - Problematic frame: 崩溃帧
+# - Current thread: 当前线程
+# - Native frames: 原生栈帧
+
+# 3. 常见崩溃原因
+# - SIGSEGV (段错误)
+# - SIGBUS (总线错误)
+# - SIGFPE (浮点异常)
+# - SIGILL (非法指令)
+
+# 4. 崩溃分析步骤
+# a. 查看崩溃日志
+grep -A 20 "Problematic frame" hs_err_pid*.log
+
+# b. 查看线程状态
+grep -A 50 "Current thread" hs_err_pid*.log
+
+# c. 查看内存状态
+grep -A 30 "Heap" hs_err_pid*.log
+
+# 5. 预防JVM Crash
+# -XX:+UseCompressedOops  // 启用压缩指针
+# -XX:+UseCompressedClassPointers  // 启用压缩类指针
+# -XX:+UseLargePages  // 使用大页面
+```
+
+| 崩溃类型 | 可能原因 | 解决方案 |
+|----------|----------|----------|
+| SIGSEGV | 内存访问越界 | 检查内存配置 |
+| SIGBUS | 硬件问题 | 检查硬件状态 |
+| SIGFPE | 浮点异常 | 检查代码逻辑 |
+| SIGILL | 非法指令 | 检查CPU兼容性 |
+
+### 容器环境JVM调优
+
+```bash
+# 容器环境JVM配置
+# 1. 容器内存限制
+docker run -m 4g -e JAVA_OPTS="-Xmx3g" app
+
+# 2. JVM容器感知（JDK10+）
+# -XX:+UseContainerSupport  // 启用容器支持
+# -XX:ActiveProcessorCount=2  // 设置CPU数量
+
+# 3. 容器环境最佳实践
+# -Xms = -Xmx = 容器内存的75%
+# -XX:MaxMetaspaceSize = 容器内存的10%
+# -XX:ReservedCodeCacheSize = 容器内存的10%
+
+# 4. 监控容器资源
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# 5. 容器环境OOM排查
+# 查看容器日志
+docker logs -f container_name
+
+# 查看JVM内存
+jcmd GC.heap_info
+
+# 查看进程状态
+docker exec container_name jps -l
+```
+
+| 容器配置 | 说明 | 推荐值 |
+|----------|------|--------|
+| 内存限制 | 容器最大内存 | 4GB |
+| JVM堆大小 | 最大堆内存 | 3GB |
+| Metaspace | 类元数据 | 400MB |
+| 线程栈 | 每个线程 | 1MB |
+
+### ZGC与Shenandoah调优
+
+```bash
+# ZGC调优配置
+# -XX:+UseZGC  // 启用ZGC
+# -XX:ZCollectionInterval=120  // GC间隔（秒）
+# -XX:ZAllocationSpikeTolerance=2  // 分配尖峰容忍度
+# -XX:ZProactive=1  // 主动GC
+
+# Shenandoah调优配置
+# -XX:+UseShenandoahGC  // 启用Shenandoah
+# -XX:ShenandoahGCHeuristics=adaptive  // 启发式策略
+# -XX:ShenandoahMinFreeThreshold=10  // 最小空闲阈值
+# -XX:ShenandoahUncommitDelay=1000  // 释放延迟
+
+# ZGC vs Shenandoah对比
+# ZGC: 停顿时间 < 1ms，吞吐量略低
+# Shenandoah: 停顿时间 < 10ms，吞吐量较高
+
+# 性能测试
+# ZGC
+java -Xmx4g -XX:+UseZGC -jar app.jar
+
+# Shenandoah
+java -Xmx4g -XX:+UseShenandoahGC -jar app.jar
+```
+
+| GC算法 | 停顿时间 | 吞吐量 | 适用场景 |
+|--------|----------|--------|----------|
+| ZGC | <1ms | 较低 | 大堆+低延迟 |
+| Shenandoah | <10ms | 较高 | 大堆+高吞吐 |
+| G1 | 100-200ms | 高 | 通用场景 |
+
+### async-profiler火焰图实战
+
+```bash
+# async-profiler安装
+# Linux
+wget https://github.com/async-profiler/async-profiler/releases/download/v2.9/async-profiler-2.9-linux-x64.tar.gz
+tar -xzf async-profiler-2.9-linux-x64.tar.gz
+
+# 采集CPU profile
+./profiler.sh -d 30 -f cpu_profile.html <pid>
+
+# 采集内存分配 profile
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# 采集锁竞争 profile
+./profiler.sh -d 30 -e lock -f lock_profile.html <pid>
+
+# 火焰图分析
+# 1. 打开火焰图
+open cpu_profile.html
+
+# 2. 关键指标
+# - 热点函数
+# - 调用栈深度
+# - CPU时间占比
+
+# 3. 性能瓶颈定位
+# - 宽度：调用频率高
+# - 高度：调用栈深
+
+# 4. 优化方向
+# - 减少热点函数调用
+# - 优化调用栈深度
+# - 减少锁竞争
+```
+
+| profile类型 | 说明 | 适用场景 |
+|-------------|------|----------|
+| CPU profile | CPU使用分析 | CPU密集型 |
+| alloc profile | 内存分配分析 | 内存问题 |
+| lock profile | 锁竞争分析 | 并发问题 |
+| wall profile | 全量分析 | 综合分析 |
+
+### JVM调优故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| CPU高 | 线程死循环 | jstack分析 | 优化代码 |
+| 内存溢出 | 内存泄漏 | heap dump | 修复泄漏 |
+| GC频繁 | 堆太小 | GC日志分析 | 调整堆大小 |
+| 停顿时间长 | GC暂停 | GC日志分析 | 调整GC参数 |
+| 类加载问题 | Metaspace不足 | jcmd分析 | 增加Metaspace |
+| JIT编译失败 | 代码问题 | 编译日志 | 优化代码 |
+
+> **终极口诀**：先现象再分类，定位了才动参数；一次只改一个变量，压测验证再上生产。G1通用（调IHOP+MaxGCPauseMillis），ZGC低延迟（调SoftMaxHeapSize），OOM必开HeapDump——Arthas是线上诊断瑞士军刀，trace/watch/thread -b三板斧。
+
 ## 十七、与其他板块的关联
 
 - JVM 原理见「[Java 虚拟机](../基础知识/Java虚拟机.md)」；

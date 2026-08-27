@@ -1482,3 +1482,72 @@ flowchart TB
 | 业务监控 | 30s | 趋势图为主 | 业务团队 |
 | 告警大屏 | 实时 | 告警列表 | 值班室 |
 | 成本大屏 | 1h | 柱状图/饼图 | 管理层 |
+
+### Grafana 告警配置
+
+```yaml
+# Grafana 告警规则
+apiVersion: 1
+groups:
+  - name: application
+    folder: production
+    interval: 1m
+    rules:
+      - uid: high-cpu
+        title: High CPU Usage
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+              interval: 1m
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+```
+
+## 统一告警管理
+
+### 告警分级策略
+
+| 级别 | 响应时间 | 通知方式 | 处理要求 |
+|------|---------|---------|---------|
+| P0-Critical | 5分钟 | 电话+短信+IM | 立即处理 |
+| P1-High | 15分钟 | 短信+IM | 30分钟内响应 |
+| P2-Medium | 30分钟 | IM | 4小时内处理 |
+| P3-Low | 4小时 | 邮件 | 下个工作日 |
+
+### 告警收敛策略
+
+```yaml
+# 告警收敛配置
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: 'default'
+    pagerduty_configs:
+      - service_key: '<key>'
+        severity: '{{ if eq .Labels.severity "critical" }}critical{{ else }}warning{{ end }}'
+```
+
+### 通知模板设计
+
+```yaml
+# 告警通知模板
+templates:
+  - '{{ define "pagerduty.default.message" }}'
+    '**{{ .GroupLabels.alertname }}**\n\n'
+    'Summary: {{ .CommonAnnotations.summary }}\n'
+    'Description: {{ .CommonAnnotations.description }}\n'
+    'Severity: {{ .CommonLabels.severity }}\n'
+    'Instance: {{ .CommonLabels.instance }}\n'
+    'Time: {{ .StartsAt.Format "2006-01-02 15:04:05" }}'
+```
