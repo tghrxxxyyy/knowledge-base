@@ -1307,6 +1307,320 @@ class UserRepositoryTest {
   5. 敏感信息脱敏（手机号/身份证/密码）
 ```
 
+## Java高级特性与最佳实践
+
+### Java 8→17→21 LTS特性演进
+
+```java
+// Java 8 特性
+// 1. Lambda表达式
+List<String> names = Arrays.asList("Alice", "Bob", "Charlie");
+names.forEach(name -> System.out.println(name));
+
+// 2. Stream API
+List<String> filtered = names.stream()
+    .filter(name -> name.startsWith("A"))
+    .collect(Collectors.toList());
+
+// 3. Optional
+Optional<String> name = Optional.of("Alice");
+name.ifPresent(System.out::println);
+
+// Java 17 特性（LTS）
+// 1. 文本块
+String json = """
+    {
+        "name": "Alice",
+        "age": 30
+    }
+    """;
+
+// 2. Switch表达式
+String result = switch (day) {
+    case MONDAY, FRIDAY -> "Working";
+    case SATURDAY, SUNDAY -> "Weekend";
+    default -> "Other";
+};
+
+// 3. Records
+record Person(String name, int age) {}
+
+// Java 21 特性（LTS）
+// 1. 虚拟线程
+Thread.startVirtualThread(() -> {
+    System.out.println("Virtual thread");
+});
+
+// 2. Pattern Matching
+if (obj instanceof String s) {
+    System.out.println(s.length());
+}
+
+// 3. Sequenced Collections
+SequencedCollection<String> list = new ArrayList<>();
+list.addFirst("first");
+list.addLast("last");
+```
+
+| Java版本 | 发布时间 | LTS | 关键特性 |
+|----------|----------|-----|----------|
+| Java 8 | 2014 | 是 | Lambda, Stream, Optional |
+| Java 11 | 2018 | 是 | HTTP Client, ZGC |
+| Java 17 | 2021 | 是 | Records, Switch, Text Blocks |
+| Java 21 | 2023 | 是 | Virtual Threads, Pattern Matching |
+
+### 模块化JPMS
+
+```java
+// 模块定义（module-info.java）
+module com.example.myapp {
+    requires java.sql;
+    requires java.logging;
+    requires com.example.utils;
+    
+    exports com.example.api;
+    opens com.example.model to com.example.serializer;
+}
+
+// 模块使用
+module com.example.client {
+    requires com.example.myapp;
+    uses com.example.api.ServiceProvider;
+}
+
+// 模块命令
+// 编译模块
+javac --module-source-path src -d out $(find src -name "*.java")
+
+// 运行模块
+java --module-path out -m com.example.myapp/com.example.Main
+
+// 打包模块
+jar --create --file myapp.jar --module-version 1.0 -C out .
+
+// 模块系统优势
+// 1. 强封装：明确API边界
+// 2. 可靠配置：依赖声明
+// 3. 安全性：访问控制
+// 4. 可维护性：模块化设计
+```
+
+| JPMS特性 | 说明 | 优势 |
+|----------|------|------|
+| requires | 依赖声明 | 明确依赖 |
+| exports | 导出包 | API控制 |
+| opens | 开放反射 | 框架兼容 |
+| uses | 服务使用 | 松耦合 |
+| provides | 服务提供 | 插件化 |
+
+### 国际化i18n
+
+```java
+// 资源文件配置
+// messages_zh_CN.properties
+user.greeting=你好，{0}！
+user.age=年龄：{0}
+
+// messages_en_US.properties
+user.greeting=Hello, {0}!
+user.age=Age: {0}
+
+// 国际化使用
+ResourceBundle bundle = ResourceBundle.getBundle("messages", Locale.CHINA);
+String greeting = bundle.getString("user.greeting");
+MessageFormat.format(greeting, "Alice");
+
+// 数字格式化
+NumberFormat numberFormat = NumberFormat.getNumberInstance(Locale.CHINA);
+String formatted = numberFormat.format(1234567.89);
+
+// 日期格式化
+DateFormat dateFormat = DateFormat.getDateInstance(DateFormat.LONG, Locale.CHINA);
+String date = dateFormat.format(new Date());
+
+// 国际化最佳实践
+// 1. 使用资源文件存储文本
+// 2. 避免硬编码文本
+// 3. 考虑文本长度差异
+// 4. 支持右到左语言
+// 5. 处理时区差异
+```
+
+| i18n组件 | 说明 | 用途 |
+|----------|------|------|
+| ResourceBundle | 资源包 | 文本管理 |
+| MessageFormat | 消息格式 | 参数化文本 |
+| NumberFormat | 数字格式 | 数字本地化 |
+| DateFormat | 日期格式 | 日期本地化 |
+| Locale | 地区设置 | 语言环境 |
+
+### 序列化对比
+
+```java
+// Java序列化
+public class User implements Serializable {
+    private static final long serialVersionUID = 1L;
+    private String name;
+    private int age;
+}
+
+// JSON序列化（Jackson）
+ObjectMapper mapper = new ObjectMapper();
+String json = mapper.writeValueAsString(user);
+User user = mapper.readValue(json, User.class);
+
+// Protobuf序列化
+// 定义.proto文件
+// message User {
+//     string name = 1;
+//     int32 age = 2;
+// }
+
+// Protobuf性能
+// 序列化速度：比JSON快10倍
+// 序列化大小：比JSON小3-5倍
+// 兼容性：支持向后兼容
+
+// 序列化对比
+// Java序列化：简单但性能差，不跨语言
+// JSON：通用但性能一般，可读性好
+// Protobuf：高性能，跨语言，需要定义schema
+```
+
+| 序列化方式 | 性能 | 跨语言 | 可读性 | 适用场景 |
+|------------|------|--------|--------|----------|
+| Java序列化 | 差 | 否 | 差 | 内部使用 |
+| JSON | 一般 | 是 | 好 | API接口 |
+| Protobuf | 高 | 是 | 差 | 高性能场景 |
+| Avro | 高 | 是 | 差 | 大数据 |
+
+### 安全模型
+
+```java
+// Java安全模型
+// 1. 安全管理器
+System.setSecurityManager(new SecurityManager());
+
+// 2. 策略文件
+// grant codeBase "file:${app.home}/lib/*" {
+//     permission java.net.SocketPermission "*:80", "connect";
+//     permission java.io.FilePermission "/tmp/-", "read,write";
+// };
+
+// 3. 权限检查
+if (System.getSecurityManager() != null) {
+    System.getSecurityManager().checkConnect("example.com", 80);
+}
+
+// 4. 代码签名
+// 使用jarsigner签名jar文件
+// jarsigner -keystore keystore.jks myapp.jar alias
+
+// 5. 加密解密
+KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+keyGen.init(256);
+SecretKey secretKey = keyGen.generateKey();
+
+Cipher cipher = Cipher.getInstance("AES");
+cipher.init(Cipher.ENCRYPT_MODE, secretKey);
+byte[] encrypted = cipher.doFinal(data);
+```
+
+| 安全机制 | 说明 | 用途 |
+|----------|------|------|
+| 安全管理器 | 访问控制 | 沙箱环境 |
+| 策略文件 | 权限定义 | 安全配置 |
+| 代码签名 | 完整性验证 | 代码信任 |
+| 加密解密 | 数据保护 | 敏感数据 |
+
+### 桌面开发
+
+```java
+// JavaFX桌面开发
+public class MyApp extends Application {
+    @Override
+    public void start(Stage primaryStage) {
+        primaryStage.setTitle("My Application");
+        
+        // 创建界面
+        VBox root = new VBox(10);
+        Label label = new Label("Hello, JavaFX!");
+        Button button = new Button("Click Me");
+        
+        button.setOnAction(e -> {
+            label.setText("Button Clicked!");
+        });
+        
+        root.getChildren().addAll(label, button);
+        
+        Scene scene = new Scene(root, 400, 300);
+        primaryStage.setScene(scene);
+        primaryStage.show();
+    }
+    
+    public static void main(String[] args) {
+        launch(args);
+    }
+}
+
+// JavaFX优势
+// 1. 现代UI组件
+// 2. CSS样式支持
+// 3.FXML布局
+// 4.多媒体支持
+// 5.3D图形支持
+```
+
+| 框架 | 特点 | 适用场景 |
+|------|------|----------|
+| JavaFX | 现代UI，CSS支持 | 新项目 |
+| Swing | 成熟稳定 | 遗留系统 |
+| SWT | 原生外观 | 桌面应用 |
+| AWT | 基础组件 | 简单应用 |
+
+### Java性能优化
+
+```java
+// 性能优化技巧
+// 1. 字符串优化
+// 使用StringBuilder替代String拼接
+StringBuilder sb = new StringBuilder();
+for (String s : list) {
+    sb.append(s);
+}
+String result = sb.toString();
+
+// 2. 集合优化
+// 预分配容量
+List<Object> list = new ArrayList<>(1000);
+Map<String, Object> map = new HashMap<>(1000);
+
+// 3. 流优化
+// 使用parallelStream处理大数据
+list.parallelStream()
+    .filter(x -> x > 100)
+    .collect(Collectors.toList());
+
+// 4. 缓存优化
+// 使用WeakReference/SoftReference
+Map<String, SoftReference<byte[]>> cache = new HashMap<>();
+
+// 5. JVM参数优化
+// -Xms4g -Xmx4g
+// -XX:+UseG1GC
+// -XX:MaxGCPauseMillis=200
+```
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 字符串优化 | StringBuilder | 减少内存 |
+| 集合优化 | 预分配容量 | 减少扩容 |
+| 流优化 | parallelStream | 提升性能 |
+| 缓存优化 | 弱引用缓存 | 减少GC |
+| JVM参数 | 调优参数 | 提升性能 |
+
+> 核心原则：**选择合适的Java版本，模块化设计，国际化支持，序列化选型合理，安全模型完善，桌面开发现代化**。
+
 ## 十一、与其他板块的关系
 
 - Redis 知识见「[基础知识/redis知识](redis知识.md)」；

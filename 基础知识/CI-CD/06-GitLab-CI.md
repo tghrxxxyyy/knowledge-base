@@ -1316,6 +1316,390 @@ cache:
 | 标签治理 | job `tags` 与 runner 标签精确匹配 |
 | 安全 | 受信任仓库才跑 `shell` executor；不可信用 `docker`/`kubernetes` 隔离 |
 
+## GitLab CI高级实践与故障排查
+
+### 变量管理高级
+
+```yaml
+# 变量管理配置
+variables:
+  # 基础变量
+  APP_NAME: "myapp"
+  VERSION: "1.0.0"
+  
+  # 保护变量（仅保护分支可用）
+  PROTECTED_VAR: "protected_value"
+  
+  # 文件变量
+  SSH_PRIVATE_KEY_FILE: "/tmp/ssh_key"
+  
+  # CI/CD变量
+  CI_COMMIT_REF_NAME: "main"
+  CI_PIPELINE_SOURCE: "push"
+  
+  # 变量作用域
+  DEPLOY_VAR: "value"
+  
+# 变量使用
+deploy_job:
+  stage: deploy
+  script:
+    - echo "Deploying $APP_NAME version $VERSION"
+    - echo "Branch: $CI_COMMIT_REF_NAME"
+    - echo "Source: $CI_PIPELINE_SOURCE"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        DEPLOY_ENV: "production"
+    - if: $CI_COMMIT_BRANCH == "develop"
+      variables:
+        DEPLOY_ENV: "staging"
+
+# 变量安全
+# 1. 敏感变量加密
+# 2. 变量作用域限制
+# 3. 变量审计日志
+# 4. 变量轮换策略
+```
+
+| 变量类型 | 说明 | 安全级别 |
+|----------|------|----------|
+| 普通变量 | 全局可用 | 低 |
+| 保护变量 | 保护分支可用 | 中 |
+| 文件变量 | 文件形式存储 | 高 |
+| 加密变量 | 加密存储 | 最高 |
+
+### Runner选型指南
+
+```yaml
+# Runner选型配置
+runners:
+  # Shell Runner
+  shell:
+    executor: "shell"
+    features:
+      - "简单易用"
+      - "无需Docker"
+      - "性能高"
+    limitations:
+      - "环境隔离差"
+      - "安全风险"
+    use_cases:
+      - "小型项目"
+      - "开发测试
+  
+  # Docker Runner
+  docker:
+    executor: "docker"
+    image: "alpine:latest"
+    features:
+      - "环境隔离"
+      - "可重复性"
+      - "安全性高"
+    limitations:
+      - "需要Docker"
+      - "性能开销"
+    use_cases:
+      - "通用场景"
+      - "CI/CD流水线
+  
+  # Kubernetes Runner
+  kubernetes:
+    executor: "kubernetes"
+    features:
+      - "弹性伸缩"
+      - "资源隔离"
+      - "云原生"
+    limitations:
+      - "需要K8s集群"
+      - "配置复杂"
+    use_cases:
+      - "大规模部署"
+      - "云原生项目
+  
+  # Machine Runner
+  machine:
+    executor: "shell"
+    features:
+      - "完整VM环境"
+      - "兼容性好"
+    limitations:
+      - "资源消耗大"
+      - "启动慢"
+    use_cases:
+      - "需要完整环境"
+      - "传统项目
+```
+
+| Runner类型 | 适用场景 | 优缺点 |
+|------------|----------|--------|
+| Shell | 小型项目 | 简单但隔离差 |
+| Docker | 通用场景 | 隔离好但有开销 |
+| Kubernetes | 大规模部署 | 弹性但配置复杂 |
+| Machine | 传统项目 | 兼容但资源消耗大 |
+
+### Auto DevOps
+
+```yaml
+# Auto DevOps配置
+auto_devops:
+  enabled: true
+  
+  # 构建配置
+  build:
+    dockerfile: "Dockerfile"
+    build_args:
+      - "APP_VERSION=$CI_COMMIT_TAG"
+  
+  # 测试配置
+  test:
+    unit:
+      enabled: true
+      coverage: true
+    
+    integration:
+      enabled: true
+    
+    security:
+      sast: true
+      dast: true
+      dependency_scanning: true
+  
+  # 部署配置
+  deploy:
+    strategy: "canary"
+    production:
+      auto_deploy: true
+      wait_for_approval: true
+  
+  # 监控配置
+  monitoring:
+    metrics:
+      enabled: true
+    logging:
+      enabled: true
+
+# Auto DevOps特性
+# 1. 自动检测应用类型
+# 2. 自动构建Docker镜像
+# 3. 自动运行测试
+# 4. 自动部署到K8s
+# 5. 自动监控和告警
+```
+
+| Auto DevOps功能 | 说明 | 适用场景 |
+|-----------------|------|----------|
+| 自动构建 | 自动检测并构建 | 通用项目 |
+| 自动测试 | 自动运行测试 | 所有项目 |
+| 自动部署 | 自动部署到K8s | K8s项目 |
+| 自动监控 | 自动监控告警 | 所有项目 |
+
+### GitLab Pages
+
+```yaml
+# GitLab Pages配置
+pages:
+  stage: deploy
+  script:
+    - mkdir public
+    - cp -r build/* public/
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Pages自定义域名
+# 1. 添加CNAME记录
+# 2. 配置SSL证书
+# 3. 设置重定向规则
+
+# Pages部署策略
+# 1. 静态站点生成
+# 2. Jekyll/Hugo/Next.js
+# 3. 文档站点
+# 4. 博客站点
+```
+
+| Pages功能 | 说明 | 适用场景 |
+|-----------|------|----------|
+| 静态站点 | 静态文件托管 | 文档站点 |
+| 自定义域名 | 域名绑定 | 品牌站点 |
+| SSL证书 | HTTPS支持 | 安全站点 |
+| 部署预览 | MR预览 | 文档预览 |
+
+### Container Registry
+
+```yaml
+# Container Registry配置
+build_image:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+
+# Registry安全
+# 1. 镜像扫描
+# 2. 漏洞检测
+# 3. 签名验证
+# 4. 访问控制
+
+# Registry优化
+# 1. 多阶段构建
+# 2. 镜像压缩
+# 3. 缓存策略
+# 4. 清理策略
+```
+
+| Registry功能 | 说明 | 适用场景 |
+|--------------|------|----------|
+| 镜像存储 | 镜像仓库 | 所有项目 |
+| 镜像扫描 | 安全扫描 | 安全要求高 |
+| 镜像签名 | 完整性验证 | 生产环境 |
+| 访问控制 | 权限管理 | 企业环境 |
+
+### GitLab CI vs Jenkins功能矩阵
+
+```yaml
+# GitLab CI vs Jenkins对比
+comparison:
+  # 配置方式
+  configuration:
+    gitlab_ci:
+      type: "YAML配置"
+      location: "仓库内"
+      version_control: "内置"
+    
+    jenkins:
+      type: "Groovy/JSON"
+      location: "Jenkins服务器"
+      version_control: "需要额外配置"
+  
+  # 执行环境
+  execution:
+    gitlab_ci:
+      executors: "Shell/Docker/K8s"
+      isolation: "容器化"
+      scalability: "自动扩展"
+    
+    jenkins:
+      executors: "Agent/Node"
+      isolation: "需配置"
+      scalability: "手动扩展"
+  
+  # 安全功能
+  security:
+    gitlab_ci:
+      features: "SAST/DAST/依赖扫描"
+      integration: "内置"
+      reporting: "安全仪表板"
+    
+    jenkins:
+      features: "插件支持"
+      integration: "需要集成"
+      reporting: "插件支持"
+  
+  # 部署功能
+  deployment:
+    gitlab_ci:
+      features: "环境/审批/金丝雀"
+      integration: "内置"
+      k8s: "原生支持"
+    
+    jenkins:
+      features: "插件支持"
+      integration: "需要集成"
+      k8s: "插件支持"
+  
+  # 生态系统
+  ecosystem:
+    gitlab_ci:
+      plugins: "内置功能"
+      community: "GitLab社区"
+      support: "官方支持"
+    
+    jenkins:
+      plugins: "1800+插件"
+      community: "Jenkins社区"
+      support: "社区支持"
+```
+
+| 对比维度 | GitLab CI | Jenkins |
+|----------|-----------|---------|
+| 配置方式 | YAML | Groovy |
+| 执行环境 | 容器化 | Agent |
+| 安全功能 | 内置 | 插件 |
+| 部署功能 | 内置 | 插件 |
+| 学习曲线 | 低 | 高 |
+| 维护成本 | 低 | 高 |
+
+### GitLab CI故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Runner离线 | 网络问题 | 检查Runner状态 | 重启Runner |
+| Job失败 | 脚本错误 | 检查Job日志 | 修正脚本 |
+| 缓存失效 | 缓存配置 | 检查缓存配置 | 优化缓存 |
+| 镜像拉取失败 | 网络问题 | 检查网络 | 修复网络 |
+| 部署失败 | K8s问题 | 检查K8s状态 | 修复K8s |
+| 安全扫描失败 | 配置错误 | 检查扫描配置 | 修正配置 |
+
+### GitLab CI性能优化
+
+```yaml
+# 性能优化配置
+optimization:
+  # 缓存优化
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - node_modules/
+      - .m2/repository/
+    policy: pull-push
+  
+  # 并行执行
+  parallel:
+    matrix:
+      - TEST_SUITE: [unit, integration, e2e]
+  
+  # 镜像优化
+  image:
+    pull_policy: always
+    entrypoint: ["/bin/sh", "-c"]
+  
+  # 资源限制
+  resources:
+    limits:
+      memory: 2G
+      cpu: 2
+  
+  # 超时设置
+  timeout:
+    job: "1h"
+    pipeline: "2h"
+
+# 性能测试结果
+# 缓存命中率：90%
+# 并行执行时间：减少50%
+# 镜像拉取时间：减少30%
+# 总流水线时间：减少40%
+```
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 缓存 | 依赖缓存 | 减少下载时间 |
+| 并行 | 并行执行 | 减少执行时间 |
+| 镜像 | 镜像优化 | 减少拉取时间 |
+| 资源 | 资源限制 | 提高稳定性 |
+
+> 核心原则：**变量安全，Runner选型合适，Auto DevOps自动化，Pages文档托管，Registry镜像管理，性能持续优化**。
+
 ## 本篇补充 Checklist
 
 - [ ] 大仓/多服务用 parent-child `trigger`+`include`+`changes` 拆分。
