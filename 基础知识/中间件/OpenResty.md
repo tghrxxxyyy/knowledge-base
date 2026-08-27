@@ -1389,4 +1389,167 @@ end
 | 社区 | 大 | 中 | 大 |
 | 配置 | nginx.conf | nginx.conf + Lua | API/JSON |
 
+---
+
+## limit-traffic 流量控制
+
+### 限流配置
+
+```lua
+-- 基于IP的限流
+local limit_ip = require "resty.limit.count"
+local lim, err = limit_ip.new("ip_store", 100, 1)  -- 100次/秒
+
+local key = ngx.var.remote_addr
+local delay, err = lim:incoming(key, true)
+
+if not delay then
+  if err == "rejected" then
+    ngx.exit(429)
+  end
+end
+
+-- 基于请求体大小的限制
+local limit_req = require "resty.limit.req"
+local lim, err = limit_req.new("req_store", 50, 100)  -- 50rps突发100
+
+local key = ngx.var.remote_addr
+local delay, err = lim:incoming(key, true)
+
+if not delay then
+  ngx.exit(503)
+end
+```
+
+### HTTP 连接池优化
+
+```lua
+-- HTTP 连接池配置
+local http = require "resty.http"
+local httpc = http.new()
+
+-- 连接池配置
+httpc:set_timeout(5000)  -- 5秒超时
+httpc:connect("backend.example.com", 80)
+
+-- 连接池大小
+local ok, err = httpc:set_keepalive(60000, 100)  -- 60秒超时,100连接
+
+-- 复用连接
+httpc:connect("backend.example.com", 80)
+```
+
+## JWT 认证中间件
+
+```lua
+-- JWT 验证
+local jwt = require "resty.jwt"
+
+local secret = "your-secret-key"
+local token = ngx.var.http_authorization
+
+if not token then
+  ngx.exit(401)
+  return
+end
+
+-- 解析token
+local jwt_obj = jwt:verify(secret, token)
+if not jwt_obj.verified then
+  ngx.exit(401)
+  return
+end
+
+-- 注入用户信息
+ngx.var.user_id = jwt_obj.payload.user_id
+```
+
+## 日志格式与性能基准
+
+### 结构化日志
+
+```lua
+-- JSON结构化日志
+local cjson = require "cjson"
+
+local log_data = {
+  timestamp = ngx.now(),
+  level = "INFO",
+  message = "request processed",
+  trace_id = ngx.var.http_x_trace_id,
+  user_id = ngx.var.http_x_user_id,
+  request_time = ngx.var.request_time,
+  upstream_response_time = ngx.var.upstream_response_time,
+  status = ngx.status,
+  method = ngx.req.get_method(),
+  uri = ngx.var.uri
+}
+
+ngx.log(ngx.INFO, cjson.encode(log_data))
+```
+
+### WAF 规则增强
+
+```lua
+-- 增强WAF规则
+local waf = {}
+
+-- IP黑名单
+waf.blacklist = {
+  "1.2.3.4",
+  "5.6.7.8"
+}
+
+-- 地理位置限制
+waf.geo_restrict = function()
+  local geo = require "resty.maxminddb"
+  local db = geo.open("/path/to/GeoLite2-Country.mmdb")
+  local res = db:lookup(ngx.var.remote_addr)
+  
+  if res.country.iso_code == "CN" then
+    return true  -- 允许中国IP
+  end
+  return false
+end
+
+-- 请求头检查
+waf.check_headers = function()
+  local headers = ngx.req.get_headers()
+  
+  -- 检查常见攻击头
+  if headers["X-Forwarded-For"] then
+    local ip = headers["X-Forwarded-For"]
+    if waf.is_blacklisted(ip) then
+      return true
+    end
+  end
+  
+  return false
+end
+```
+
+### 性能基准测试
+
+| 测试项 | QPS | 延迟P99 | 说明 |
+|--------|-----|---------|------|
+| 静态文件 | 50000+ | <10ms | Nginx原生 |
+| 反向代理 | 30000+ | <20ms | 无Lua |
+| Lua逻辑 | 20000+ | <30ms | 简单逻辑 |
+| JWT验证 | 15000+ | <50ms | 加密运算 |
+| WAF检测 | 10000+ | <100ms | 正则匹配 |
+
+```mermaid
+flowchart LR
+    A[客户端] --> B[OpenResty]
+    B --> C{WAF检查}
+    C -->|通过| D[限流检查]
+    C -->|拒绝| E[403]
+    D -->|通过| F[JWT验证]
+    D -->|拒绝| G[429]
+    F -->|通过| H[后端服务]
+    F -->|拒绝| I[401]
+    H --> J[响应处理]
+    J --> K[日志记录]
+```
+
 > 一句话：**OpenResty = Nginx 阶段模型（rewrite/access/content...）+ LuaJIT（worker 内协程）+ cosocket（异步 IO 不阻塞事件循环）+ 共享内存（跨 worker 状态）——生产要点：禁阻塞 IO、配超时连接池、共享内存容量规划、阶段职责清晰**。

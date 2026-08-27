@@ -1362,6 +1362,99 @@ Adaptive Sampling（自适应采样）：
 | Adaptive | 中 | 高 | 流量波动 |
 
 - 链路追踪见「[Jaeger 链路追踪](./Jaeger链路追踪.md)」与「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；
+
+## OTel Collector 高级配置
+
+### Collector 管道拓扑
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['localhost:8888']
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  attributes:
+    actions:
+      - key: environment
+        action: upsert
+        value: production
+  tail_sampling:
+    decision_wait: 5s
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 1000}
+      - name: probabilistic
+        type: probabilistic
+        probabilistic: {sampling_percentage: 10}
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger-collector:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  logging:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, tail_sampling]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+```
+
+### 资源属性与上下文传播
+
+| 资源属性 | 用途 | 示例 |
+|----------|------|------|
+| service.name | 服务标识 | payment-service |
+| service.version | 版本 | 1.2.3 |
+| deployment.environment | 环境 | production |
+| service.namespace | 命名空间 | payments |
+| service.instance.id | 实例ID | pod-name |
+
+```
+上下文传播流程：
+  HTTP Header注入：traceparent: 00-TraceID-SpanID-Flags
+  gRPC Metadata：traceparent头
+  Kafka Header：Base64编码traceparent
+
+  传播规则：
+    1. 入口服务生成TraceID
+    2. 所有下游服务共享TraceID
+    3. 每个服务生成自己的SpanID
+    4. Span通过ParentID关联
+```
+
+## 与其他板块的关系
 - 监控指标见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；
 - 日志体系见「[ELK 日志体系](./ELK日志体系.md)」与「[Loki](./Loki.md)」；
 - SRE 视角见「[SRE与稳定性工程/02-可观测性与稳定性看护](../../SRE与稳定性工程/02-可观测性与稳定性看护.md)」。

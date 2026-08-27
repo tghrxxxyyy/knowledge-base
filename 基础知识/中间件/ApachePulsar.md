@@ -1378,4 +1378,89 @@ pulsar-admin namespaces set-clusters my-tenant/my-namespace \
 
 ---
 
-## 十二、Pulsar 运维命令
+## 十二、Pulsar IO 连接器生态
+
+### 常用连接器
+
+| 连接器 | 类型 | 功能 | 适用场景 |
+|--------|------|------|---------|
+| kafka-connector | Source/Sink | Kafka互操作 | 集群迁移 |
+| elasticsearch-connector | Sink | ES写入 | 日志分析 |
+| cassandra-connector | Sink | Cassandra写入 | 时序数据 |
+| mongodb-connector | Sink | MongoDB写入 | 文档存储 |
+| s3-connector | Sink | S3写入 | 数据湖 |
+| jdbc-connector | Sink | 数据库写入 | 关系型存储 |
+| debezium-connector | Source | CDC采集 | 数据同步 |
+
+### Pulsar Functions 轻量计算
+
+```java
+// 简单函数示例
+public class WordCountFunction implements Function<String, Void> {
+    @Override
+    public Void process(String input) throws Exception {
+        String[] words = input.split("\\s+");
+        for (String word : words) {
+            ctx.getOutputTopic().publish(word, "1");
+        }
+        return null;
+    }
+}
+
+// 部署函数
+pulsar-admin functions create \
+  --jar word-count.jar \
+  --classname WordCountFunction \
+  --input-topic persistent://public/default/input \
+  --output-topic persistent://public/default/output \
+  --window-config '{"windowLengthCount":10,"slidingIntervalCount":5}'
+```
+
+### 分层存储（Tiered Storage）
+
+| 存储层 | 介质 | 数据热度 | 访问延迟 | 成本 |
+|--------|------|---------|---------|------|
+| 热存储 | SSD | 最近24h | <1ms | 高 |
+| 温存储 | HDD | 1-30天 | 1-10ms | 中 |
+| 冷存储 | 对象存储 | >30天 | 100ms+ | 低 |
+
+```
+分层存储配置：
+  broker.conf:
+    managedLedgerDefaultEnsembleSize=3
+    managedLedgerDefaultWriteQuorumSize=3
+    managedLedgerDefaultAckQuorumSize=2
+    offloadTieredStorageEnabled=true
+    offloadDriver=s3
+
+  分层策略：
+    1. 新消息写入热存储(SSD)
+    2. 24小时后自动降级到温存储(HDD)
+    3. 30天后自动降级到冷存储(S3)
+    4. 查询时自动从对应层读取
+```
+
+## 十三、Pulsar vs Kafka 功能矩阵深度对比
+
+| 维度 | Pulsar | Kafka | 选型建议 |
+|------|--------|-------|---------|
+| 架构 | 存算分离 | 存算耦合 | 弹性→Pulsar |
+| 多租户 | 原生支持 | 无 | 多团队→Pulsar |
+| 地域复制 | 原生Geo-Replication | MirrorMaker | 跨地域→Pulsar |
+| 消息语义 | At-least-once/Effectively-once | At-least-once/Exactly-once | 金融→Kafka |
+| 吞吐量 | 极高 | 极高 | 基本持平 |
+| 运维复杂度 | 高(Broker+BookKeeper+ZK) | 中(Broker+ZK) | 简单→Kafka |
+| 社区生态 | 增长中 | 成熟 | 生态→Kafka |
+| 流处理 | Pulsar Functions | Kafka Streams | 轻量→Pulsar |
+
+```mermaid
+flowchart TD
+    A{选型因素?} -->|多租户| B[Pulsar]
+    A -->|跨地域| C[Pulsar]
+    A -->|简单运维| D[Kafka]
+    A -->|成熟生态| E[Kafka]
+    A -->|轻量计算| F[Pulsar Functions]
+    A -->|复杂流处理| G[Kafka Streams]
+```
+
+## 十四、Pulsar 运维命令

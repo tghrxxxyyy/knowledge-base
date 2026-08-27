@@ -1385,3 +1385,76 @@ YARN → K8s 迁移路线：
 | 存储共享 | 共享 HDFS/S3 | 统一存储 |
 | 监控统一 | Prometheus 统一采集 | 统一运维 |
 | 调度独立 | 各自管理资源 | 避免干扰 |
+
+## YARN → K8s 迁移详细方案
+
+### 迁移优先级评估
+
+| 作业类型 | 迁移难度 | 优先级 | 推荐方式 |
+|----------|---------|--------|---------|
+| 无状态批处理 | 低 | 高 | Spark on K8s |
+| 有状态流处理 | 高 | 中 | Flink on K8s |
+| 调度依赖作业 | 中 | 低 | Airflow on K8s |
+| 资源密集型 | 中 | 中 | 按资源迁移 |
+
+### 迁移风险与缓解
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| 数据倾斜 | 性能下降 | 重分区+采样 |
+| 网络延迟 | 作业变慢 | 本地存储+缓存 |
+| 资源争抢 | 作业失败 | QoS+优先级 |
+| 监控断层 | 问题发现延迟 | 统一监控 |
+
+```mermaid
+flowchart TD
+    A[迁移评估] --> B{作业类型?}
+    B -->|无状态| C[Spark on K8s]
+    B -->|有状态| D[Flink on K8s]
+    B -->|调度依赖| E[Airflow on K8s]
+    C --> F[监控验证]
+    D --> F
+    E --> F
+    F --> G{性能达标?}
+    G -->|是| H[流量切换]
+    G -->|否| I[调优/回滚]
+    H --> J[YARN下线]
+```
+
+### K8s 资源管理最佳实践
+
+| 策略 | 配置 | 适用场景 |
+|------|------|---------|
+| ResourceQuota | Namespace配额 | 多租户隔离 |
+| LimitRange | Pod/Container限制 | 默认资源 |
+| PriorityClass | 优先级+抢占 | 关键作业 |
+| PodDisruptionBudget | 最小可用 | 高可用 |
+| TopologySpreadConstraints | 拓扑分布 | 跨AZ部署 |
+
+```yaml
+# 资源配额配置
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark-quota
+  namespace: data-processing
+spec:
+  hard:
+    requests.cpu: "50"
+    requests.memory: "200Gi"
+    limits.cpu: "100"
+    limits.memory: "400Gi"
+    pods: "50"
+    persistentvolumeclaims: "20"
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: spark-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: spark-driver
+```

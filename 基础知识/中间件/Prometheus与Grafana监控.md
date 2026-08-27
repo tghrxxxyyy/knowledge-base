@@ -1384,3 +1384,101 @@ Google 四个黄金信号：
   适用场景：Google SRE 方法论
   落地方式：Prometheus + Grafana
 ```
+
+## 服务发现配置详解
+
+### 服务发现方式对比
+
+| 方式 | 配置 | 适用场景 | 优缺点 |
+|------|------|---------|--------|
+| static_configs | 静态IP列表 | 简单环境 | 简单但不灵活 |
+| file_sd | 文件发现 | 变更不频繁 | 需重载配置 |
+| consul_sd | Consul注册 | 微服务 | 动态但依赖Consul |
+| kubernetes_sd | K8s API | 容器化 | 动态自动 |
+| dns_sd | DNS查询 | 传统服务 | 简单但无健康检查 |
+
+```yaml
+# Kubernetes 服务发现配置
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+```
+
+## Grafana 仪表板设计原则
+
+### 仪表板布局模板
+
+| 区域 | 内容 | 行高 | 说明 |
+|------|------|------|------|
+| 概览行 | SLA/关键指标 | 3行 | 一眼看到核心状态 |
+| 服务行 | 各服务健康度 | 4行 | 服务粒度监控 |
+| 基础设施行 | 主机/容器资源 | 4行 | 资源使用情况 |
+| 告警行 | 活跃告警 | 2行 | 问题聚焦 |
+
+### 告警规则设计
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: application
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "错误率超过5%"
+          
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99延迟超过1秒"
+```
+
+## 统一告警与长期存储
+
+### 长期存储方案对比
+
+| 方案 | 存储格式 | 查询能力 | 成本 | 适用规模 |
+|------|---------|---------|------|---------|
+| Thanos | TSDB+S3 | 分布式查询 | 低 | 中大型 |
+| Cortex | TSDB+S3 | 分布式查询 | 低 | 中大型 |
+| VictoriaMetrics | 自有格式 | 原生查询 | 极低 | 中小型 |
+| Mimir | TSDB+S3 | 分布式查询 | 中 | 大型 |
+
+```mermaid
+flowchart TB
+    A[Prometheus] --> B[Thanos Sidecar]
+    B --> C[Thanos Query]
+    C --> D[Thanos Store Gateway]
+    D --> E[对象存储 S3]
+    F[Grafana] --> C
+    G[告警管理] --> C
+```
+
+## 监控大屏设计最佳实践
+
+| 大屏类型 | 数据更新频率 | 布局特点 | 适用场景 |
+|----------|-------------|---------|---------|
+| 全局概览 | 1min | 关键指标大字 | 运维中心 |
+| 业务监控 | 30s | 趋势图为主 | 业务团队 |
+| 告警大屏 | 实时 | 告警列表 | 值班室 |
+| 成本大屏 | 1h | 柱状图/饼图 | 管理层 |

@@ -1085,6 +1085,307 @@ GDS 算法：
   Louvain：社群发现（用户分群）
 ```
 
+## 九、Neo4j 高级特性与生产实践
+
+### 9.1 集群架构（因果集群）
+
+```yaml
+# Neo4j因果集群部署
+cluster:
+  core_nodes:
+    - neo4j-core-1
+    - neo4j-core-2
+    - neo4j-core-3
+  read_replicas:
+    - neo4j-replica-1
+    - neo4j-replica-2
+  
+  configuration:
+    causal_clustering.minimum_core_cluster_size_at_core: 3
+    causal_clustering.expected_core_cluster_size: 3
+    causal_clustering.read_replica_sampling_strategy: "server_groups"
+    
+    # 复制配置
+    causal_clustering.state_machine_apply_max_batch_size: 100
+    causal_clustering.state_machine_max_queue_size: 10000
+    
+    # 故障检测
+    causal_clustering.leader_election_timeout: 7s
+    causal_clustering.catch_up_batch_size: 1024
+```
+
+| 集群角色 | 说明 | 扩展方式 |
+|----------|------|----------|
+| Core | 读写节点（Raft共识） | 加Core节点 |
+| Read Replica | 只读副本（异步复制） | 加Replica节点 |
+| Edge | 边缘节点（单向同步） | 跨数据中心 |
+
+```mermaid
+flowchart TB
+    CLIENT[客户端] --> LB[负载均衡]
+    LB --> CORE1[Core 1]
+    LB --> CORE2[Core 2]
+    LB --> CORE3[Core 3]
+    CORE1 --> REPLICA1[Replica 1]
+    CORE2 --> REPLICA2[Replica 2]
+    CORE3 --> REPLICA3[Replica 3]
+```
+
+### 9.2 Cypher 查询优化
+
+```cypher
+// 1. 使用EXPLAIN分析查询计划
+EXPLAIN MATCH (p:Person)-[:FRIEND]->(f:Person)-[:WORKS_AT]->(c:Company)
+WHERE c.name = 'Neo4j'
+RETURN p.name
+
+// 2. 创建复合索引
+CREATE INDEX person_name_age FOR (p:Person) ON (p.name, p.age)
+
+// 3. 使用参数化查询（避免缓存污染）
+MATCH (p:Person {name: $name})-[:FRIEND]->(f)
+RETURN f.name
+
+// 4. 限制结果集大小
+MATCH (p:Person)
+WHERE p.city = '北京'
+RETURN p.name
+ORDER BY p.score DESC
+LIMIT 10
+
+// 5. 使用PROFILE分析实际执行
+PROFILE MATCH (p:Person)-[:FRIEND*1..3]->(f:Person)
+WHERE p.name = '张三'
+RETURN f.name
+```
+
+| 优化策略 | 说明 | 收益 |
+|----------|------|------|
+| 索引优化 | 创建合适的索引 | 查询性能提升10-100倍 |
+| 查询重写 | 避免全图扫描 | 性能提升5-50倍 |
+| 参数化查询 | 利用查询缓存 | 减少解析开销 |
+| 结果限制 | LIMIT/SKIP | 减少数据传输 |
+| 批量操作 | UNWIND批量写入 | 写入性能提升5-10倍 |
+
+### 9.3 内存配置优化
+
+```yaml
+# Neo4j内存配置
+server:
+  memory:
+    # 堆内存（JVM）
+    heap:
+      initial_size: "4G"
+      max_size: "8G"
+    
+    # 原生内存（Off-Heap）
+    pagecache:
+      size: "16G"  # 建议为数据量的1.5倍
+    
+    # 查询内存限制
+    query:
+      max_memory: "2G"
+    
+    # 缓存配置
+    cache:
+      # 节点缓存
+      node_cache_size: "2G"
+      # 关系缓存
+      relationship_cache_size: "2G"
+```
+
+| 内存类型 | 说明 | 配置建议 |
+|----------|------|----------|
+| Heap | JVM堆内存 | 数据量的10-20% |
+| Page Cache | 页面缓存 | 数据量的1.5-2倍 |
+| Query Memory | 查询内存限制 | 并发查询数×单查询内存 |
+| Cache | 节点/关系缓存 | 热点数据量 |
+
+### 9.4 数据导入高级
+
+```cypher
+// 1. LOAD CSV批量导入
+LOAD CSV WITH HEADERS FROM 'file:///persons.csv' AS row
+CALL {
+    WITH row
+    CREATE (p:Person {
+        id: toInteger(row.id),
+        name: row.name,
+        age: toInteger(row.age),
+        city: row.city
+    })
+} IN TRANSACTIONS OF 10000 ROWS
+
+// 2. 使用apoc.periodic.iterate批量处理
+CALL apoc.periodic.iterate(
+    "MATCH (p:Person) RETURN p",
+    "SET p.processed = true",
+    {batchSize: 1000, parallel: true}
+)
+
+// 3. 图算法批量计算
+CALL gds.pageRank.write({
+    nodeProjection: 'Person',
+    relationshipProjection: 'FRIEND',
+    writeProperty: 'pagerank_score'
+})
+
+// 4. 数据迁移（Neo4j到Neo4j）
+apoc.export.cypher.all('export.cypher')
+// 目标库执行
+apoc.cypher.importFile('export.cypher')
+```
+
+| 导入方式 | 适用场景 | 性能 |
+|----------|----------|------|
+| LOAD CSV | 小中数据量（<100万） | 中 |
+| apoc.periodic.iterate | 大数据量并行 | 高 |
+| Neo4j Admin Import | 初始全量导入 | 最高 |
+| APOC Spatial | 地理数据导入 | 中 |
+
+### 9.5 Spring Data Neo4j
+
+```java
+// 实体定义
+@Node
+public class Person {
+    @Id @GeneratedValue
+    private Long id;
+    
+    private String name;
+    private int age;
+    
+    @Relationship(type = "FRIEND", direction = Relationship.Direction.OUTGOING)
+    private Set<Person> friends;
+    
+    @Relationship(type = "WORKS_AT", direction = Relationship.Direction.OUTGOING)
+    private Company company;
+}
+
+// Repository接口
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    List<Person> findByName(String name);
+    
+    @Query("MATCH (p:Person)-[:FRIEND]->(f:Person) WHERE p.name = $name RETURN f")
+    List<Person> findFriendsByName(@Param("name") String name);
+    
+    @Query("MATCH (p:Person)-[:FRIEND*1..3]->(f:Person) WHERE p.name = $name RETURN DISTINCT f")
+    List<Person> findFriendsOfFriends(@Param("name") String name);
+}
+
+// Service层
+@Service
+public class PersonService {
+    @Autowired
+    private PersonRepository personRepository;
+    
+    @Transactional
+    public Person createPerson(Person person) {
+        return personRepository.save(person);
+    }
+    
+    public List<Person> getFriendsOfFriends(String name) {
+        return personRepository.findFriendsOfFriends(name);
+    }
+}
+```
+
+### 9.6 知识图谱推荐案例
+
+```cypher
+// 1. 基于协同过滤的推荐
+MATCH (u:User {id: $userId})-[:PURCHASED]->(p:Product)
+      <-[:PURCHASED]-(other:User)-[:PURCHASED]->(recommendation:Product)
+WHERE NOT (u)-[:PURCHASED]->(recommendation)
+RETURN recommendation.name, COUNT(other) AS frequency
+ORDER BY frequency DESC
+LIMIT 10
+
+// 2. 基于图算法的推荐（PageRank）
+CALL gds.pageRank.stream({
+    nodeProjection: 'Product',
+    relationshipProjection: {
+        PURCHASED: { orientation: 'UNDIRECTED' }
+    }
+})
+YIELD nodeId, score
+WITH gds.util.asNode(nodeId) AS product, score
+WHERE NOT EXISTS {
+    MATCH (u:User {id: $userId})-[:PURCHASED]->(product)
+}
+RETURN product.name, score
+ORDER BY score DESC
+LIMIT 10
+
+// 3. 社群发现推荐
+CALL gds.louvain.stream({
+    nodeProjection: 'User',
+    relationshipProjection: 'FRIEND'
+})
+YIELD nodeId, communityId
+WITH gds.util.asNode(nodeId) AS user, communityId
+WHERE user.id = $userId
+MATCH (other:User)-[:FRIEND*2..3]->(u:User {id: $userId})
+WHERE other.communityId = communityId
+  AND NOT (u)-[:FRIEND]->(other)
+RETURN other.name, COUNT(*) AS mutualFriends
+ORDER BY mutualFriends DESC
+LIMIT 5
+```
+
+| 推荐算法 | 适用场景 | 复杂度 |
+|----------|----------|--------|
+| 协同过滤 | 用户-商品推荐 | O(n²) |
+| PageRank | 关键节点识别 | O(n) |
+| Louvain | 社群发现 | O(n log n) |
+| Node Similarity | 相似实体计算 | O(n²) |
+| 最短路径 | 路径推荐 | O(n+m) |
+
+### 9.7 Neo4j 故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 查询慢 | 缺少索引 | `EXPLAIN`分析 | 创建合适索引 |
+| 内存溢出 | 堆设置不当 | 监控JVM内存 | 调整heap size |
+| 集群不同步 | 网络问题 | 检查集群状态 | 修复网络/重启 |
+| 写入拒绝 | 事务冲突 | 检查锁等待 | 优化事务逻辑 |
+| 数据损坏 | 异常宕机 | 检查日志 | 恢复备份 |
+| 连接数满 | 并发过高 | 监控连接数 | 连接池优化 |
+
+### 9.8 Neo4j 监控与运维
+
+```yaml
+# Neo4j监控配置
+monitoring:
+  # 指标收集
+  metrics:
+    enabled: true
+    endpoint: "http://localhost:2004"
+    
+  # 告警规则
+  alerts:
+    - name: heap_usage_high
+      condition: "heap_usage > 80%"
+      severity: "warning"
+    
+    - name: query_slow
+      condition: "avg_query_time > 5000"
+      severity: "warning"
+    
+    - name: cluster_unhealthy
+      condition: "cluster_status != 'healthy'"
+      severity: "critical"
+  
+  # 备份策略
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"  # 每天凌晨2点
+    retention: "30d"
+    location: "s3://neo4j-backups"
+```
+
+> 核心原则：**索引优化先行，内存合理配置，集群高可用，监控备份到位**。
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。

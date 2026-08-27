@@ -1368,6 +1368,65 @@ graph LR
 
 ## 与其他板块的关系
 
+### OLAP 引擎选型决策树
+
+```mermaid
+flowchart TD
+    A{查询模式?} -->|单表分析| B{数据量?}
+    B -->|<1TB| C[ClickHouse]
+    B -->|>1TB| D[StarRocks]
+    A -->|多表关联| E{并发要求?}
+    E -->|高并发| F[StarRocks]
+    E -->|低并发| G[Trino]
+    A -->|实时写入| H[Doris]
+    A -->|批处理| I{延迟要求?}
+    I -->|秒级| J[ClickHouse]
+    I -->|分钟级| K[Hive]
+```
+
+### 物化视图对比
+
+| 引擎 | 物化视图 | 刷新方式 | 适用场景 |
+|------|---------|---------|---------|
+| ClickHouse | 物化视图 | INSERT触发 | 实时聚合 |
+| StarRocks | 物化视图 | 自动/手动 | 通用 |
+| Doris | 物化视图 | 自动 | 通用 |
+| Trino | 无 | - | 临时查询 |
+
+### 导入性能优化
+
+| 优化项 | ClickHouse | StarRocks | Doris |
+|--------|-----------|-----------|-------|
+| 批量写入 | 100万行/批 | 500万行/批 | 200万行/批 |
+| 并行导入 | 多分片并行 | 多tablet并行 | 多分区并行 |
+| 数据压缩 | LZ4/ZSTD | LZ4/ZSTD | LZ4/ZSTD |
+| 索引构建 | 写入时 | 合并时 | 写入时 |
+| 写入限流 | max_insert_threads | load_mem_limit | load_mem_limit |
+
+### 实时报表架构选型
+
+```text
+实时报表技术栈选择：
+
+  数据采集层：
+    CDC：Debezium/Canal → Kafka
+    日志：Fluentd/Flume → Kafka
+
+  计算层：
+    Flink：实时聚合/窗口计算
+    Spark Streaming：微批处理
+
+  存储层：
+    StarRocks：高并发+实时写入
+    ClickHouse：单表极致性能
+    Doris：轻量省心
+
+  服务层：
+    API Gateway：查询代理
+    Redis Cache：热点缓存
+    BI工具：Grafana/Superset/Metabase
+```
+
 - 列式存储/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
 - 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；
 - OLAP 引擎深挖见「[中间件/ClickHouse](../中间件/ClickHouse.md)」「[中间件/Doris与StarRocks](../中间件/Doris与StarRocks.md)」；

@@ -1282,6 +1282,352 @@ PUT _ilm/policy/logs-ilm-policy
 
 ---
 
+## 十四、ELK 高级实践与故障排查
+
+### 14.1 ES 索引管理高级（ILM 深度）
+
+```json
+// 高级ILM策略：分层存储+性能优化
+PUT _ilm/policy/logs-advanced-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": { "priority": 100 },
+          "shrink": { "number_of_shards": 1 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 },
+          "allocate": {
+            "require": { "node_type": "warm" }
+          }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {},
+          "set_priority": { "priority": 0 },
+          "allocate": {
+            "require": { "node_type": "cold" }
+          }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+| ILM阶段 | 优化策略 | 性能影响 | 存储成本 |
+|----------|----------|----------|----------|
+| Hot | rollover + shrink | 高写入性能 | 高（SSD） |
+| Warm | forcemerge + allocate | 查询性能提升 | 中（HDD） |
+| Cold | freeze + allocate | 查询延迟增加 | 低（归档） |
+| Delete | 自动删除 | 无 | 无 |
+
+### 14.2 Logstash Filter 高级模式
+
+```ruby
+# 高级Logstash Filter配置
+filter {
+  # 1. 多条件解析
+  if [type] == "nginx" {
+    grok {
+      match => { "message" => "%{COMBINEDAPACHELOG}" }
+    }
+    geoip {
+      source => "clientip"
+      target => "geoip"
+    }
+  } else if [type] == "java" {
+    grok {
+      match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} \[%{DATA:thread}\] %{DATA:class} - %{GREEDYDATA:log}" }
+    }
+    mutate {
+      add_field => { "service" => "%{class}" }
+    }
+  }
+  
+  # 2. 高级脱敏
+  mutate {
+    gsub => [
+      "message", "\b\d{3}[-.]?\d{4}[-.]?\d{4}\b", "***-****-****",
+      "message", "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "***@***.com",
+      "message", "\b(?:\d{1,3}\.){3}\d{1,3}\b", "***.***.***.***"
+    ]
+  }
+  
+  # 3. 字段丰富
+  translate {
+    field => "[level]"
+    destination => "[level_name]"
+    dictionary => {
+      "INFO" => "信息"
+      "WARN" => "警告"
+      "ERROR" => "错误"
+      "FATAL" => "致命"
+    }
+  }
+  
+  # 4. 性能优化
+  ruby {
+    code => "
+      event.set('processed_at', Time.now.utc.iso8601)
+      if event.get('level') == 'ERROR'
+        event.set('priority', 'high')
+      else
+        event.set('priority', 'normal')
+      end
+    "
+  }
+}
+```
+
+| Filter模式 | 用途 | 性能影响 |
+|------------|------|----------|
+| grok | 日志解析 | 中（正则匹配） |
+| geoip | IP地理位置 | 低（本地数据库） |
+| translate | 字典映射 | 低（内存查找） |
+| ruby | 自定义逻辑 | 高（JVM执行） |
+| mutate | 字段操作 | 低（内存操作） |
+
+### 14.3 Kibana Dashboard 高级设计
+
+```json
+// 高级Dashboard配置
+{
+  "dashboard": {
+    "title": "生产环境监控大盘",
+    "description": "黄金信号+业务指标+安全监控",
+    "panels": [
+      {
+        "title": "请求量趋势",
+        "type": "TSVB",
+        "query": "sum(rate(http_requests_total[5m])) by (service)",
+        "interval": "1m"
+      },
+      {
+        "title": "错误率分布",
+        "type": "Lens",
+        "query": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))",
+        "visualization": "line"
+      },
+      {
+        "title": "延迟P99",
+        "type": "TSVB",
+        "query": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+        "interval": "1m"
+      },
+      {
+        "title": "Top10慢查询",
+        "type": "Data Table",
+        "query": "top10(slow_queries by (query) order by duration desc)",
+        "columns": ["query", "duration", "count"]
+      }
+    ],
+    "timefilter": {
+      "default": "now-1h",
+      "quick": ["now-15m", "now-1h", "now-24h"]
+    }
+  }
+}
+```
+
+| Dashboard设计原则 | 说明 | 收益 |
+|-------------------|------|------|
+| 分层展示 | 概览→服务→单条 | 排障效率提升 |
+| 黄金信号 | QPS/错误率/延迟/饱和度 | 快速定位问题 |
+| 筛选器 | 全局时间+服务+环境 | 灵活下钻 |
+| 可操作性 | 点击跳转traceId | 闭环排障 |
+
+### 14.4 ELK 性能调优
+
+```yaml
+# ELK性能调优配置
+elasticsearch:
+  # JVM调优
+  jvm:
+    heap_size: "16g"  # 不超过31GB
+    gc: "G1GC"
+    gc_log: true
+  
+  # 索引优化
+  index:
+    refresh_interval: "30s"  # 降低刷新频率
+    number_of_replicas: 0    # 写入时关闭副本
+    translog.durability: "async"  # 异步translog
+  
+  # 查询优化
+  query:
+    max_result_window: 10000
+    request_cache: true
+  
+  # 聚合优化
+  aggregation:
+    max_buckets: 10000
+    shard_size: 100
+
+logstash:
+  # Pipeline优化
+  pipeline:
+    workers: 8  # CPU核数
+    batch_size: 500
+    batch_delay: 50ms
+  
+  # 队列优化
+  queue:
+    type: persisted
+    max_bytes: "2GB"
+
+filebeat:
+  # 采集优化
+  harvester:
+    buffer_size: 65536
+    max_backoff: "10s"
+  
+  # 输出优化
+  output.kafka:
+    compression: "snappy"
+    batch_size: 2048
+```
+
+| 调优项 | 默认值 | 优化值 | 效果 |
+|--------|--------|--------|------|
+| refresh_interval | 1s | 30s | 写入性能提升50% |
+| number_of_replicas | 1 | 0（写入时） | 写入性能提升30% |
+| pipeline.workers | 4 | 8 | 吞吐量提升80% |
+| batch_size | 125 | 500 | 吞吐量提升40% |
+| compression | none | snappy | 网络带宽减少60% |
+
+### 14.5 ELK 安全加固
+
+```yaml
+# ELK安全配置
+elasticsearch:
+  xpack.security.enabled: true
+  xpack.security.transport.ssl.enabled: true
+  xpack.security.http.ssl.enabled: true
+  
+  # 用户权限
+  roles:
+    - name: log_reader
+      cluster: ["monitor"]
+      indices:
+        - names: ["logs-*"]
+          privileges: ["read"]
+    
+    - name: log_writer
+      cluster: ["manage_index_templates"]
+      indices:
+        - names: ["logs-*"]
+          privileges: ["write", "create_index"]
+
+logstash:
+  # SSL加密
+  ssl: true
+  cacert: "/path/to/ca.crt"
+  
+  # 输出安全配置
+  output.elasticsearch:
+    ssl: true
+    user: "logstash_writer"
+    password: "${ES_PASSWORD}"
+
+kibana:
+  server.ssl.enabled: true
+  server.ssl.certificate: "/path/to/server.crt"
+  elasticsearch.username: "kibana_user"
+  elasticsearch.password: "${ES_PASSWORD}"
+```
+
+| 安全措施 | 说明 | 重要性 |
+|----------|------|--------|
+| SSL/TLS | 传输加密 | 高 |
+| 用户认证 | 身份验证 | 高 |
+| 权限控制 | 最小权限 | 高 |
+| 审计日志 | 操作记录 | 中 |
+| 网络隔离 | 访问控制 | 高 |
+
+### 14.6 ELK vs Loki 深度对比
+
+| 维度 | ELK | Loki |
+|------|-----|------|
+| 索引方式 | 全文倒排索引 | 标签索引+内容流式 |
+| 存储 | ES集群（JVM） | 对象存储（S3/GCS） |
+| 查询语言 | KQL/Lucene | LogQL |
+| 资源占用 | 高（JVM内存） | 低（Go二进制） |
+| 成本 | 高（存储+计算） | 低（对象存储） |
+| 功能 | 全文检索+聚合+安全 | 轻量日志查看 |
+| 适用场景 | 复杂日志分析 | 云原生轻量日志 |
+| 生态 | 完整（SIEM/APM） | 与Prometheus集成 |
+
+### 14.7 ELK 故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 集群红/黄 | 分片未分配 | `GET _cluster/health` | 检查节点状态/磁盘空间 |
+| 写入拒绝 | 磁盘水位线 | `GET _cat/allocation` | 清理索引/调watermark |
+| 查询超时 | 段太多/分片太大 | `GET _cat/segments` | forcemerge/优化查询 |
+| 内存溢出 | 堆设置不当 | 监控JVM内存 | 调整heap size |
+| 数据丢失 | 采集断点 | 检查Filebeat registry | 修复采集链路 |
+| 性能下降 | 资源不足 | 监控CPU/内存/IO | 扩容/优化配置 |
+
+### 14.8 ELK 监控与告警
+
+```yaml
+# ELK监控配置
+monitoring:
+  # 集群健康监控
+  cluster_health:
+    enabled: true
+    interval: "30s"
+    alert:
+      - name: cluster_red
+        condition: "status == 'red'"
+        severity: "critical"
+      
+      - name: cluster_yellow
+        condition: "status == 'yellow'"
+        severity: "warning"
+  
+  # 索引监控
+  index_monitoring:
+    enabled: true
+    interval: "1m"
+    alert:
+      - name: index_growth_high
+        condition: "primary_size > 100GB"
+        severity: "warning"
+  
+  # 查询性能监控
+  query_performance:
+    enabled: true
+    interval: "5m"
+    alert:
+      - name: slow_queries
+        condition: "avg_query_time > 5000"
+        severity: "warning"
+```
+
+> 核心原则：**索引规划合理，Filter高效，Dashboard实用，安全加固到位，性能持续监控**。
+
 ## 六、与其他板块的关系
 
 - 和「**基础知识/ES体系**」「**基础知识/中间件/ClickHouse**」：ES 系检索细节见 ES 体系篇；日志分析报表可用 ClickHouse。

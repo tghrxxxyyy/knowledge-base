@@ -1362,4 +1362,83 @@ Dashboard 分层设计：
   6. 验证监控数据
 ```
 
+## Zabbix Proxy 分布式监控
+
+### Proxy 同步模式
+
+| 模式 | 数据流向 | 适用场景 | 延迟 |
+|------|---------|---------|------|
+| Active Proxy | Agent→Proxy→Server | 远程机房 | 秒级 |
+| Passive Proxy | Server→Proxy→Agent | DMZ/防火墙 | 分钟级 |
+| Proxy级联 | Agent→Proxy1→Proxy2→Server | 多级机房 | 分钟级 |
+
+```mermaid
+flowchart TB
+    subgraph 机房A
+        A1[Agent] --> P1[Proxy Active]
+        A2[Agent] --> P1
+    end
+    subgraph 机房B
+        B1[Agent] --> P2[Proxy Active]
+        B2[Agent] --> P2
+    end
+    subgraph 中心机房
+        P1 --> S[Zabbix Server]
+        P2 --> S
+        S --> DB[MySQL/PG]
+        S --> FE[Web Frontend]
+    end
+```
+
+### LLD 低级发现高级用法
+
+```bash
+# 自定义LLD规则（JSON格式）
+{
+  "data": [
+    {"{#IFNAME}": "eth0", "{#IFSPEED}": "1000"},
+    {"{#IFNAME}": "eth1", "{#IFSPEED}": "10000"}
+  ]
+}
+
+# LLD宏替换
+Discovery rule: net.if.discovery
+Item prototype: net.if.in[{#IFNAME}]
+Trigger prototype: avg(/host/net.if.in[{#IFNAME}],5m) > {$IF_SPEED:{#IFNAME}}*0.8
+```
+
+### 自定义监控项与触发器
+
+```yaml
+# UserParameter 自定义监控项
+# /etc/zabbix/zabbix_agentd.d/custom.conf
+
+# MySQL连接数
+UserParameter=mysql.connections,mysql -u monitor -p'password' -e "SHOW STATUS LIKE 'Threads_connected'" | awk 'NR==2{print $2}'
+
+# Redis内存使用率
+UserParameter=redis.memory.used,redis-cli info memory | grep used_memory: | cut -d: -f2 | tr -d '\r'
+
+# HTTP状态码统计
+UserParameter=http.status[*],curl -s -o /dev/null -w "%{http_code}" -m 5 $1
+```
+
+### Zabbix 仪表板设计
+
+| 仪表板类型 | 布局组件 | 适用场景 |
+|------------|---------|---------|
+| 全局概览 | 问题主机/网络拓扑/SLA | 运维大屏 |
+| 业务监控 | 业务指标/交易量/错误率 | 业务团队 |
+| 容器监控 | Pod状态/资源使用/网络 | K8s集群 |
+| 数据库监控 | 连接数/慢查询/复制延迟 | DBA |
+
+## Zabbix 7.x 新特性
+
+| 特性 | 说明 | 升级价值 |
+|------|------|---------|
+| 原生OTLP | 支持OpenTelemetry协议 | 统一可观测 |
+| 新Agent2 | Go语言，插件化 | 性能提升 |
+| API增强 | GraphQL支持 | 集成友好 |
+| 新UI | Vue.js重写 | 用户体验 |
+
 > 一句话：**Zabbix = 采集（Agent/SNMP/主动）+ 触发器（阈值）+ 告警（升级/媒介）+ 报表——传统企业监控闭环；选型先看「环境（传统机房→Zabbix，云原生→Prometheus）」，再定「部署（多机房→Proxy 级联 + Server HA）」，最后配「模板批量 + 告警收敛 + 分级采集频率 + 数据保留策略」**。
