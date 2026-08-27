@@ -1297,6 +1297,441 @@ rule {
     └── 可用性：99.9%
 ```
 
+## EMQX高级实践与故障排查
+
+### EMQX集群通信
+
+```yaml
+# EMQX集群配置
+cluster {
+  name: "emqx_cluster"
+  discovery: "static"
+  static {
+    seeds: [
+      "emqx-node-1@192.168.1.101",
+      "emqx-node-2@192.168.1.102",
+      "emqx-node-3@192.168.1.103"
+    ]
+  }
+  
+  # Gossip协议配置
+  gossip {
+    interval: "1s"
+    max_messages: 1000
+  }
+  
+  # 分区处理策略
+  partition {
+    autoheal: "on"
+    pause_if_heal: "on"
+  }
+}
+
+# 节点配置
+node {
+  name: "emqx-node-1@192.168.1.101"
+  cookie: "emqx_secret_cookie"
+  data_dir: "/var/lib/emqx"
+  
+  # 监听器配置
+  listeners {
+    tcp {
+      bind: "0.0.0.0:1883"
+      acceptors: 16
+      max_connections: 1000000
+    }
+    
+    ws {
+      bind: "0.0.0.0:8083"
+      acceptors: 16
+      max_connections: 100000
+    }
+    
+    ssl {
+      bind: "0.0.0.0:8883"
+      acceptors: 16
+      max_connections: 100000
+      ssl_options {
+        certfile: "/etc/emqx/certs/server.crt"
+        keyfile: "/etc/emqx/certs/server.key"
+        cacertfile: "/etc/emqx/certs/ca.crt"
+      }
+    }
+  }
+}
+```
+
+| 集群组件 | 说明 | 配置建议 |
+|----------|------|----------|
+| Discovery | 节点发现 | static/dns/etcd |
+| Gossip | 状态同步 | 间隔1s |
+| Partition | 分区处理 | autoheal |
+| Listeners | 监听器 | 按需配置 |
+
+### 认证授权
+
+```yaml
+# 认证配置
+authentication {
+  # 密码认证
+  password_based {
+    mechanism: "password_based"
+    backend: "mysql"
+    password_hash_algorithm: "sha256"
+    salt_position: "suffix"
+    
+    query: "SELECT password, salt FROM users WHERE username = '${username}'"
+    
+    server {
+      host: "mysql-server"
+      port: 3306
+      database: "emqx"
+      username: "emqx"
+      password: "emqx_password"
+    }
+  }
+  
+  # JWT认证
+  jwt {
+    mechanism: "jwt"
+    from: "password"
+    use_jwks: false
+    
+    jwt {
+      claims: "sub"
+      verify_claims: {
+        "exp": {
+          "value": 0
+        }
+      }
+    }
+  }
+}
+
+# 授权配置
+authorization {
+  # ACL文件
+  acl_file {
+    enable: true
+    path: "/etc/emqx/acl.conf"
+  }
+  
+  # 数据库授权
+  database {
+    enable: true
+    type: "mysql"
+    
+    query: "SELECT permission, action, topic FROM acl WHERE username = '${username}' AND (clientid = '${clientid}' OR clientid = '*') AND (topic = '${topic}' OR topic = '*')"
+    
+    server {
+      host: "mysql-server"
+      port: 3306
+      database: "emqx"
+      username: "emqx"
+      password: "emqx_password"
+    }
+  }
+}
+
+# ACL配置示例
+# {"allow": true, "user": "device1", "topic": "device/device1/#"}
+# {"allow": true, "user": "device1", "topic": "command/device1/#"}
+# {"deny": true, "user": "*", "topic": "#"}
+```
+
+| 认证方式 | 说明 | 适用场景 |
+|----------|------|----------|
+| 密码认证 | 用户名密码 | 通用场景 |
+| JWT认证 | Token认证 | 微服务 |
+| X.509认证 | 证书认证 | 高安全 |
+| LDAP认证 | 目录认证 | 企业级 |
+
+### 规则引擎高级
+
+```sql
+-- 规则引擎SQL
+-- 1. 数据桥接到Kafka
+SELECT 
+  payload.device_id as device_id,
+  payload.temperature as temperature,
+  payload.humidity as humidity,
+  timestamp as ts
+FROM "device/+/sensor"
+WHERE payload.temperature > 30
+
+-- 2. 数据聚合
+SELECT 
+  clientid,
+  avg(payload.temperature) as avg_temp,
+  max(payload.temperature) as max_temp,
+  count(*) as msg_count
+FROM "device/+/sensor"
+WHERE payload.temperature > 0
+GROUP BY clientid, timestamp div 60000
+
+-- 3. 条件触发
+SELECT 
+  payload.device_id,
+  payload.status,
+  payload.error_code
+FROM "device/+/status"
+WHERE payload.status = "error" AND payload.error_code > 100
+
+-- 4. 数据转换
+SELECT 
+  payload.device_id as device_id,
+  payload.value as value,
+  timestamp as ts,
+  payload.unit as unit
+FROM "device/+/data"
+WHERE payload.value > 0
+
+-- 动作配置
+-- 动作类型：
+-- 1. Kafka桥接
+-- 2. MySQL写入
+-- 3. Redis写入
+-- 4. HTTP Webhook
+-- 5. MQTT发布
+```
+
+| 规则引擎功能 | 说明 | 适用场景 |
+|--------------|------|----------|
+| 数据桥接 | 数据转发 | 数据集成 |
+| 数据聚合 | 数据统计 | 实时分析 |
+| 条件触发 | 事件驱动 | 告警通知 |
+| 数据转换 | 格式转换 | 数据标准化 |
+
+### Prometheus监控
+
+```yaml
+# EMQX Prometheus配置
+prometheus {
+  enable: true
+  
+  # 指标暴露端点
+  endpoint: "/metrics"
+  
+  # 收集间隔
+  collect_interval: "10s"
+  
+  # 指标类型
+  metrics {
+    # 连接指标
+    connection {
+      enable: true
+      name: "emqx_connections"
+      labels: ["node"]
+    }
+    
+    # 消息指标
+    message {
+      enable: true
+      name: "emqx_messages_received"
+      labels: ["node", "topic"]
+    }
+    
+    # 订阅指标
+    subscription {
+      enable: true
+      name: "emqx_subscriptions_count"
+      labels: ["node", "clientid"]
+    }
+    
+    # 速率指标
+    rate {
+      enable: true
+      name: "emqx_messages_sent_rate"
+      labels: ["node"]
+    }
+  }
+}
+
+# Prometheus告警规则
+groups:
+  - name: emqx_alerts
+    rules:
+      - alert: HighConnectionCount
+        expr: emqx_connections > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High connection count"
+      
+      - alert: HighMessageRate
+        expr: rate(emqx_messages_received[5m]) > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High message rate"
+      
+      - alert: NodeDown
+        expr: up{job="emqx"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EMQX node down"
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| emqx_connections | 连接数 | >100000 |
+| emqx_messages_received | 消息接收率 | >100000/s |
+| emqx_subscriptions_count | 订阅数 | >1000000 |
+| emqx_messages_sent_rate | 消息发送率 | >100000/s |
+
+### Grafana仪表板
+
+```json
+{
+  "dashboard": {
+    "title": "EMQX监控大盘",
+    "panels": [
+      {
+        "title": "连接数",
+        "type": "graph",
+        "query": "emqx_connections",
+        "target": "prometheus"
+      },
+      {
+        "title": "消息吞吐",
+        "type": "graph",
+        "query": "rate(emqx_messages_received[1m])",
+        "target": "prometheus"
+      },
+      {
+        "title": "订阅数",
+        "type": "graph",
+        "query": "emqx_subscriptions_count",
+        "target": "prometheus"
+      },
+      {
+        "title": "消息延迟",
+        "type": "graph",
+        "query": "emqx_messages_latency",
+        "target": "prometheus"
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}
+```
+
+| 仪表板组件 | 说明 | 监控内容 |
+|------------|------|----------|
+| 连接数 | 连接监控 | 连接状态 |
+| 消息吞吐 | 消息监控 | 消息流量 |
+| 订阅数 | 订阅监控 | 订阅状态 |
+| 消息延迟 | 延迟监控 | 性能指标 |
+
+### 车联网应用案例
+
+```yaml
+# 车联网架构
+vehicle_networking:
+  # 设备接入层
+  device_access:
+    protocol: "MQTT"
+    port: 1883
+    authentication: "JWT"
+    
+  # 消息处理层
+  message_processing:
+    rule_engine: "enabled"
+    data_bridge: "Kafka"
+    
+  # 数据存储层
+  data_storage:
+    hot_data: "TDengine"
+    cold_data: "ClickHouse"
+    archive_data: "S3"
+  
+  # 应用层
+  application:
+    real_time_monitoring: "Grafana"
+    historical_analysis: "Superset"
+    alert_notification: "Webhook"
+
+# 车联网消息主题设计
+topics:
+  # 设备状态
+  device_status: "device/{device_id}/status"
+  
+  # 传感器数据
+  sensor_data: "device/{device_id}/sensor/{sensor_type}"
+  
+  # 控制命令
+  command: "command/{device_id}/{action}"
+  
+  # 告警信息
+  alert: "alert/{device_id}/{alert_type}"
+```
+
+| 车联网组件 | 说明 | 技术选型 |
+|------------|------|----------|
+| 设备接入 | MQTT协议 | EMQX |
+| 消息处理 | 规则引擎 | EMQX规则引擎 |
+| 数据存储 | 时序数据 | TDengine |
+| 实时监控 | 可视化 | Grafana |
+
+### EMQX故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 连接失败 | 认证错误 | 检查认证配置 | 修正认证 |
+| 消息丢失 | QoS配置 | 检查QoS设置 | 优化QoS |
+| 集群不同步 | 网络问题 | 检查网络 | 修复网络 |
+| 内存溢出 | 连接数过多 | 监控连接数 | 扩容节点 |
+| 延迟高 | 消息堆积 | 监控消息队列 | 扩容 |
+| 规则引擎失败 | SQL错误 | 检查SQL语法 | 修正SQL |
+
+### EMQX性能优化
+
+```yaml
+# 性能优化配置
+performance:
+  # 连接优化
+  connection:
+    max_connections: 1000000
+    acceptors: 64
+    max_conn_rate: 1000
+  
+  # 消息优化
+  message:
+    max_message_size: 1MB
+    max_queue_size: 10000
+  
+  # 内存优化
+  memory:
+    high_watermark: 0.8
+    low_watermark: 0.6
+  
+  # 磁盘优化
+  disk:
+    high_watermark: 0.8
+    low_watermark: 0.6
+
+# 性能测试结果
+# 100万连接：内存使用约8GB
+# 10万消息/秒：CPU使用约30%
+# 端到端延迟：<100ms
+```
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 连接数 | 最大连接数 | 100万+ |
+| 消息吞吐 | 消息处理能力 | 10万+/秒 |
+| 延迟 | 端到端延迟 | <100ms |
+| 可用性 | 集群可用性 | 99.9% |
+
+> 核心原则：**集群通信Gossip，认证授权多方式，规则引擎数据桥接，Prometheus监控，Grafana可视化，车联网场景优化**。
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

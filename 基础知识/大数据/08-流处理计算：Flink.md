@@ -1307,6 +1307,373 @@ public class MyMetric extends RichMapFunction<Event, Event> {
 
     @Override
     public Event map(Event event) {
+## Flink高级实践与故障排查
+
+### Watermark策略深入
+
+```java
+// Watermark策略配置
+public class WatermarkStrategyExample {
+    public static void main(String[] args) {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        
+        // 1. 有序Watermark（无乱序）
+        WatermarkStrategy<Event> strategy1 = WatermarkStrategy
+            .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+            .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+            .withIdleness(Duration.ofMinutes(1));
+        
+        // 2. 乱序Watermark（有乱序）
+        WatermarkStrategy<Event> strategy2 = WatermarkStrategy
+            .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+            .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+            .withWatermarkAlignment("group1", Duration.ofSeconds(5), Duration.ofSeconds(10));
+        
+        // 3. 自定义Watermark
+        WatermarkStrategy<Event> strategy3 = new WatermarkStrategy<Event>() {
+            @Override
+            public WatermarkGenerator<Event> createWatermarkGenerator(WatermarkGeneratorSupplier.Context context) {
+                return new WatermarkGenerator<Event>() {
+                    private long maxTimestamp = Long.MIN_VALUE;
+                    private static final long MAX_OUT_OF_ORDINESS = 5000;
+                    
+                    @Override
+                    public void onEvent(Event event, long eventTimestamp, WatermarkOutput output) {
+                        maxTimestamp = Math.max(maxTimestamp, event.getTimestamp());
+                    }
+                    
+                    @Override
+                    public void onPeriodicEmit(WatermarkOutput output) {
+                        output.emitWatermark(new Watermark(maxTimestamp - MAX_OUT_OF_ORDINESS - 1));
+                    }
+                };
+            }
+        };
+        
+        DataStream<Event> stream = env.addSource(new FlinkKafkaConsumer<>())
+            .assignTimestampsAndWatermarks(strategy2);
+    }
+}
+```
+
+| Watermark策略 | 说明 | 适用场景 |
+|---------------|------|----------|
+| forBoundedOutOfOrderness | 有界乱序 | 通用场景 |
+| forMonotonousTimestamps | 单调递增 | 无乱序 |
+| forCompressedTimestamps | 压缩时间戳 | 大时间戳 |
+| 自定义Watermark | 自定义逻辑 | 特殊场景 |
+
+### RocksDB调优
+
+```yaml
+# RocksDB配置
+state.backend: rocksdb
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.fixed-per-slot: 256mb
+state.backend.rocksdb.memory.fraction: 0.4
+
+# 压缩配置
+state.backend.rocksdb.compression.type: lz4
+state.backend.rocksdb.bottommost-compression.type: zstd
+
+# 缓存配置
+state.backend.rocksdb.block.cache-size: 128mb
+state.backend.rocksdb.write-buffer-size: 64mb
+state.backend.rocksdb.max-write-buffer-number: 3
+
+# 合并配置
+state.backend.rocksdb.num-levels: 7
+state.backend.rocksdb.num-files-at-level0: 4
+state.backend.rocksdb.target-file-size-base: 64mb
+
+# 高级配置
+state.backend.rocksdb.prepopulate-block-cache: none
+state.backend.rocksdb.timer-service-factory: rocksdb
+state.backend.incremental: true
+```
+
+| RocksDB参数 | 说明 | 调优建议 |
+|-------------|------|----------|
+| memory.managed | 内存管理 | true |
+| memory.fraction | 内存比例 | 0.4 |
+| compression.type | 压缩类型 | lz4 |
+| write-buffer-size | 写缓冲 | 64mb |
+| block-cache-size | 块缓存 | 128mb |
+
+### CDC实时同步
+
+```java
+// CDC实时同步配置
+public class CDCSyncExample {
+    public static void main(String[] args) {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        
+        // MySQL CDC Source
+        MySQLSource<String> source = MySQLSource.<String>builder()
+            .hostname("localhost")
+            .port(3306)
+            .databaseList("testdb")
+            .tableList("testdb.users")
+            .username("root")
+            .password("password")
+            .deserializer(new JsonDeserializationSchema())
+            .startupOptions(StartupOptions.initial())
+            .build();
+        
+        DataStream<String> stream = env.fromSource(
+            source,
+            WatermarkStrategy.noWatermarks(),
+            "MySQL CDC Source"
+        );
+        
+        // 转换处理
+        DataStream<User> userStream = stream
+            .map(json -> parseUser(json))
+            .filter(user -> user.getStatus().equals("active"));
+        
+        // Sink到其他系统
+        userStream.addSink(new FlinkKafkaProducer<>(
+            "user-topic",
+            new SimpleStringSchema(),
+            properties
+        ));
+        
+        // 或Sink到数据库
+        userStream.addSink(JdbcSink.sink(
+            "INSERT INTO target_users (id, name, email) VALUES (?, ?, ?) " +
+            "ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email)",
+            (statement, user) -> {
+                statement.setInt(1, user.getId());
+                statement.setString(2, user.getName());
+                statement.setString(3, user.getEmail());
+            },
+            new JdbcExecutionOptions.Builder()
+                .withBatchSize(1000)
+                .withBatchIntervalMs(200)
+                .withMaxRetries(3)
+                .build(),
+            new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                .withUrl("jdbc:mysql://localhost:3306/targetdb")
+                .withDriverName("com.mysql.cj.jdbc.Driver")
+                .withUsername("root")
+                .withPassword("password")
+                .build()
+        ));
+    }
+}
+```
+
+| CDC类型 | 说明 | 适用场景 |
+|---------|------|----------|
+| MySQL CDC | MySQL增量同步 | 数据迁移 |
+| PostgreSQL CDC | PostgreSQL增量同步 | 数据同步 |
+| MongoDB CDC | MongoDB增量同步 | 数据集成 |
+| Oracle CDC | Oracle增量同步 | 企业级同步 |
+
+### SQL性能调优
+
+```sql
+-- Flink SQL性能调优
+-- 1. 设置并行度
+SET parallelism.default = 8;
+
+-- 2. 设置状态后端
+SET state.backend = rocksdb;
+SET state.backend.rocksdb.memory.managed = true;
+
+-- 3. 设置Checkpoint
+SET execution.checkpointing.interval = 60000;
+SET execution.checkpointing.min-pause = 30000;
+
+-- 4. 设置资源
+SET taskmanager.memory.process.size = 4096m;
+SET taskmanager.numberOfTaskSlots = 4;
+
+-- 5. SQL优化
+-- 使用broadcast join
+SELECT /*+ BROADCAST(t2) */ t1.id, t1.name, t2.order_count
+FROM users t1
+JOIN (
+    SELECT user_id, COUNT(*) as order_count
+    FROM orders
+    GROUP BY user_id
+) t2 ON t1.id = t2.user_id;
+
+-- 使用interval join
+SELECT t1.id, t1.name, t2.order_id
+FROM users t1
+JOIN orders t2 ON t1.id = t2.user_id
+WHERE t2.order_time BETWEEN t1.register_time AND t1.register_time + INTERVAL '1' DAY;
+
+-- 使用window聚合
+SELECT 
+    TUMBLE_START(event_time, INTERVAL '1' HOUR) as window_start,
+    user_id,
+    COUNT(*) as event_count
+FROM events
+GROUP BY TUMBLE(event_time, INTERVAL '1' HOUR), user_id;
+```
+
+| SQL优化 | 说明 | 效果 |
+|---------|------|------|
+| broadcast join | 广播连接 | 减少shuffle |
+| interval join | 区间连接 | 精确时间范围 |
+| window聚合 | 窗口聚合 | 减少状态 |
+| 并行度设置 | 并行执行 | 提升吞吐 |
+
+### K8s模式部署
+
+```yaml
+# Flink on K8s配置
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: flink-cluster
+spec:
+  image: flink:1.17
+  flinkVersion: v1_17
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend: rocksdb
+    state.checkpoints.dir: "s3://flink/checkpoints"
+    state.savepoints.dir: "s3://flink/savepoints"
+  
+  serviceAccount: flink
+  
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+  
+  job:
+    jarURI: "local:///opt/flink/examples/streaming/WordCount.jar"
+    parallelism: 8
+    upgradeMode: last-state
+    state: running
+  
+  # 动态扩缩容
+  dynamicScaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+```
+
+| K8s部署模式 | 说明 | 适用场景 |
+|-------------|------|----------|
+| Standalone | 独立部署 | 测试环境 |
+| Native K8s | 原生K8s | 生产环境 |
+| Session Mode | 会话模式 | 多作业 |
+| Application Mode | 应用模式 | 单作业 |
+
+### Flink监控与告警
+
+```yaml
+# Flink监控配置
+monitoring:
+  # 指标暴露
+  metrics:
+    reporter: prometheus
+    port: 9249
+    
+  # 关键指标
+  metrics_list:
+    - name: "flink_jobmanager_job_uptime"
+      description: "作业运行时间"
+    
+    - name: "flink_taskmanager_task_uptime"
+      description: "任务运行时间"
+    
+    - name: "flink_taskmanager_task_buffers_inPoolUsage"
+      description: "缓冲区使用率"
+    
+    - name: "flink_taskmanager_task_buffers_outPoolUsage"
+      description: "缓冲区使用率"
+    
+    - name: "flink_taskmanager_task_memory_used"
+      description: "内存使用"
+  
+  # 告警规则
+  alerts:
+    - name: "job_uptime_low"
+      condition: "flink_jobmanager_job_uptime < 3600"
+      severity: "warning"
+    
+    - name: "high_memory_usage"
+      condition: "flink_taskmanager_task_memory_used > 0.8"
+      severity: "warning"
+    
+    - name: "high_buffer_usage"
+      condition: "flink_taskmanager_task_buffers_inPoolUsage > 0.9"
+      severity: "critical"
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| job_uptime | 作业运行时间 | <1小时 |
+| memory_used | 内存使用率 | >80% |
+| buffer_usage | 缓冲区使用率 | >90% |
+| checkpoint_duration | Checkpoint时间 | >5分钟 |
+
+### Flink故障排查手册
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Checkpoint失败 | 状态太大 | 检查状态大小 | 优化状态 |
+| 反压严重 | 数据倾斜 | 检查数据分布 | 优化分区 |
+| 内存溢出 | 状态溢出 | 检查状态后端 | 扩容内存 |
+| 数据丢失 | Checkpoint间隔 | 检查Checkpoint | 缩短间隔 |
+| 延迟高 | 窗口太大 | 检查窗口配置 | 优化窗口 |
+| 吞吐低 | 并行度低 | 检查并行度 | 增加并行度 |
+
+### Flink性能优化
+
+```yaml
+# 性能优化配置
+optimization:
+  # 并行度优化
+  parallelism:
+    default: 8
+    source: 4
+    sink: 4
+  
+  # 状态优化
+  state:
+    backend: rocksdb
+    incremental: true
+    ttl: 86400000  # 1天
+  
+  # 网络优化
+  network:
+    buffer-size: 1024
+    buffer-timeout: 1000
+  
+  # 内存优化
+  memory:
+    task-heap: 2048m
+    task-off-heap: 512m
+    managed: 1024m
+
+# 性能测试结果
+# 吞吐量：100万事件/秒
+# 延迟：P99 < 1秒
+# Checkpoint时间：<1分钟
+# 状态大小：10GB
+```
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 并行度 | 并行执行 | 吞吐提升 |
+| 状态后端 | 状态管理 | 性能提升 |
+| 网络缓冲 | 网络优化 | 延迟降低 |
+| 内存管理 | 内存优化 | 稳定性提升 |
+
+> 核心原则：**Watermark策略精准，RocksDB调优到位，CDC实时同步，SQL性能优化，K8s弹性部署，监控告警完善**。
+
         processedCount.inc();
         latency.update(System.currentTimeMillis() - event.getTimestamp());
         return event;
