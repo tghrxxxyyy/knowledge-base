@@ -1127,6 +1127,298 @@ ORDER BY window_start;
 
 ---
 
+## 二十二、ClickHouse MergeTree 排序键设计（ORDER BY vs PRIMARY KEY）
+
+### 22.1 ORDER BY 与 PRIMARY KEY 的区别
+
+```sql
+-- ORDER BY 决定物理排序 + 稀疏索引
+-- PRIMARY KEY 默认是 ORDER BY 前缀，可单独定义
+CREATE TABLE events (
+    event_time DateTime,
+    service LowCardinality(String),
+    user_id UInt64,
+    message String
+) ENGINE = MergeTree()
+ORDER BY (service, event_time, user_id)
+PRIMARY KEY (service, event_time);  -- 稀疏索引只覆盖前两列
+
+-- 关键区别：
+--   ORDER BY：决定数据物理排序顺序 + 稀疏索引 + 去重依据
+--   PRIMARY KEY：稀疏索引的前缀（可以比 ORDER BY 短）
+--   PRIMARY KEY 越短 → 稀疏索引粒度越粗 → 跳块越慢但索引越小
+```
+
+### 22.2 排序键设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 高频过滤字段在前 | WHERE 条件最常用的列放最前 | `service, event_time` |
+| 低基数在前 | 低基数列前置可提升压缩率 | `status, region, timestamp` |
+| 时间字段靠后 | 时间通常范围查询，放后面 | `service, event_time` |
+| 避免过多列 | ORDER BY 列数影响写入性能 | 3~5 列为宜 |
+
+```sql
+-- 反例：ORDER BY (user_id, event_time, service)
+-- 查询 WHERE service = 'api' AND event_time > now() - 1h 无法利用索引
+
+-- 正例：ORDER BY (service, event_time, user_id)
+-- 查询 WHERE service = 'api' AND event_time > now() - 1h 可命中索引
+```
+
+## 二十三、ReplicatedMergeTree 副本同步机制
+
+### 23.1 副本同步流程
+
+```mermaid
+graph LR
+    A[Client写入] --> B[Replica A]
+    B --> C[ZooKeeper写入操作日志]
+    C --> D[Replica B监听变更]
+    D --> E[Replica B拉取并重放]
+    E --> F[数据最终一致]
+```
+
+### 23.2 副本同步配置
+
+```sql
+-- 创建3副本复制表
+CREATE TABLE events ON CLUSTER cluster (
+    event_time DateTime,
+    service LowCardinality(String),
+    user_id UInt64
+) ENGINE = ReplicatedMergeTree(
+    '/clickhouse/tables/{cluster}/events',  -- ZK 路径
+    '{replica}'                             -- 副本标识（自动替换）
+)
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (service, event_time, user_id);
+
+-- 副本同步参数
+SET max_replicated_fetches_network_bandwidth = 100000000;  -- 限制同步带宽
+SET replicated_dedup_window = 1000;  -- 去重窗口
+```
+
+### 23.3 副本状态监控
+
+```sql
+-- 查看副本同步状态
+SELECT
+    database,
+    table,
+    is_leader,
+    is_readonly,
+    future_parts,
+    parts_to_check,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue,
+    log_max_index,
+    log_pointer
+FROM system.replicas
+WHERE future_parts > 5 OR queue_size > 10;
+
+-- 查看复制延迟
+SELECT
+    database,
+    table,
+    absolute_delay,
+    last_queue_update
+FROM system.replicas
+WHERE absolute_delay > 60;
+```
+
+## 二十四、ClickHouse 物化视图（MaterializedView vs LiveView）
+
+### 24.1 MaterializedView 原理
+
+```sql
+-- MaterializedView = 写入触发器 + 目标表
+-- 数据写入源表时自动写入视图表
+CREATE MATERIALIZED VIEW mv_service_metrics
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(window_start)
+ORDER BY (service, window_start)
+AS SELECT
+    service,
+    toStartOfMinute(event_time) AS window_start,
+    countState() AS request_count,
+    avgState(response_time_ms) AS avg_latency
+FROM access_log
+GROUP BY service, window_start;
+
+-- 查询时必须用 -Merge 函数
+SELECT
+    service,
+    window_start,
+    countMerge(request_count),
+    avgMerge(avg_latency)
+FROM mv_service_metrics
+WHERE window_start > now() - INTERVAL 1 HOUR
+GROUP BY service, window_start;
+```
+
+### 24.2 LiveView 原理
+
+```sql
+-- LiveView = 实时视图（支持增量查询）
+CREATE LIVE VIEW lv_realtime_metrics WITH REFRESH INTERVAL 5 SECOND AS
+SELECT
+    service,
+    count() AS request_count,
+    avg(response_time_ms) AS avg_latency
+FROM access_log
+WHERE event_time > now() - INTERVAL 5 MINUTE
+GROUP BY service;
+
+-- LiveView 特点：
+--   定期刷新（REFRESH INTERVAL）
+--   支持增量查询
+--   性能低于 MaterializedView（每次查询重新计算）
+--   适合实时监控场景
+```
+
+### 24.3 MaterializedView vs LiveView 对比
+
+| 维度 | MaterializedView | LiveView |
+|------|------------------|----------|
+| 数据写入 | 写入时自动触发 | 查询时计算 |
+| 查询性能 | 极快（预计算） | 中等（增量计算） |
+| 存储开销 | 需要额外存储 | 无需额外存储 |
+| 实时性 | 取决于写入频率 | 取决于刷新间隔 |
+| 适用场景 | 高频聚合查询 | 实时监控 |
+
+## 二十五、ClickHouse 与 Kafka 集成（Kafka Engine 配置）
+
+### 25.1 Kafka Engine 配置
+
+```sql
+-- Kafka 消费表（不存储数据，实时消费）
+CREATE TABLE kafka_consumer (
+    message String,
+    topic LowCardinality(String),
+    partition UInt32,
+    offset UInt64
+) ENGINE = Kafka()
+SETTINGS
+    kafka_broker_list = 'kafka1:9092,kafka2:9092',
+    kafka_topic_list = 'access_log',
+    kafka_group_name = 'clickhouse_consumer',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 4,
+    kafka_max_block_size = 1048576,
+    kafka_skip_broken_messages = 100;
+
+-- Kafka Engine 不存储数据！必须配合物化视图落地
+CREATE MATERIALIZED VIEW kafka_to_local
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (event_time)
+AS SELECT
+    JSONExtractString(message, 'service') AS service_name,
+    toDateTime(JSONExtractString(message, 'timestamp')) AS event_time,
+    JSONExtractFloat(message, 'latency') AS latency
+FROM kafka_consumer;
+```
+
+### 25.2 Kafka 集成最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 消费者数 | kafka_num_consumers ≤ topic 分区数 |
+| 批量大小 | kafka_max_block_size 控制刷写频率 |
+| 错误处理 | kafka_skip_broken_messages 跳过解析失败 |
+| 格式选择 | JSONEachRow/CSV/Avro/Protobuf |
+| 监控消费延迟 | 监控 Kafka Consumer Group lag |
+
+## 二十六、ClickHouse 分布式表（Distributed 引擎/本地表路由）
+
+### 26.1 分布式表架构
+
+```sql
+-- 本地表（实际存储数据）
+CREATE TABLE events_local ON CLUSTER cluster (
+    event_time DateTime,
+    user_id UInt64,
+    event_type LowCardinality(String)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (user_id, event_time);
+
+-- 分布式表（查询入口，自动路由到分片）
+CREATE TABLE events ON CLUSTER cluster AS events_local
+ENGINE = Distributed(cluster, default, events_local, xxHash64(user_id));
+
+-- Distributed 引擎参数：
+--   cluster: 集群名
+--   database: 数据库名
+--   local_table: 本地表名
+--   sharding_key: 分片键（决定数据路由）
+
+-- 查询分布式表：
+SELECT count() FROM events WHERE event_time > now() - INTERVAL 1 DAY;
+-- Coordinator 将查询分发到所有分片 → 并行执行 → 合并结果
+```
+
+### 26.2 本地表路由机制
+
+```mermaid
+graph TD
+    A[客户端查询分布式表] --> B[Coordinator节点]
+    B --> C[根据sharding_key路由]
+    C --> D[分片1本地表]
+    C --> E[分片2本地表]
+    C --> F[分片3本地表]
+    D --> G[合并结果返回]
+    E --> G
+    F --> G
+```
+
+## 二十七、ClickHouse 内存管理（max_memory_usage/max_threads 参数调优）
+
+### 27.1 内存管理参数
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|----------|
+| max_memory_usage | 10GB | 单查询最大内存 | 按并发数调整 |
+| max_threads | CPU核数 | 查询并行度 | 保持默认或减半 |
+| max_insert_block_size | 1048576 | 写入批次大小 | 调整写入性能 |
+| mark_cache_size | 10GB | 稀疏索引缓存 | SSD 可调小 |
+| uncompressed_cache_size | 8MB | 解压缓存 | 默认即可 |
+
+### 27.2 内存管理最佳实践
+
+```sql
+-- 设置用户级内存限制
+CREATE USER analytics IDENTIFIED BY 'password'
+SETTINGS max_memory_usage = 10000000000;  -- 10GB
+
+-- 设置查询级内存限制
+SET max_memory_usage = 5000000000;  -- 5GB
+
+-- 监控内存使用
+SELECT
+    query_id,
+    user,
+    formatReadableSize(memory_usage) AS mem,
+    query
+FROM system.processes
+ORDER BY memory_usage DESC
+LIMIT 10;
+
+-- 内存溢出保护
+SET max_memory_usage_for_all_queries = 50000000000;  -- 50GB 全局限制
+```
+
+### 27.3 调优建议
+
+| 场景 | 调优策略 |
+|------|----------|
+| 高并发查询 | 降低 max_memory_usage，增加 max_threads |
+| 大查询 | 提高 max_memory_usage，降低并发 |
+| 写入密集 | 增加 max_insert_block_size |
+| 分析密集 | 增加 max_threads，启用并行查询 |
+
 ## 与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。

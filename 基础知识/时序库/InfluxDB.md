@@ -1257,3 +1257,168 @@ influx delete --bucket my-bucket \
   --start 1970-01-01T00:00:00Z \
   --stop $(date -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
 ```
+
+## InfluxDB 最佳实践
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 合理设计 Measurement | 避免高基数标签 | 减少存储压力 |
+| 使用时间分区 | retention policy 自动清理 | 控制数据量 |
+| 预计算连续查询 | CQ 自动聚合 | 查询加速 |
+| 合理配置 Shard Group | 按时间窗口分片 | 写入均衡 |
+| 使用 TSI 索引 | 倒排索引加速查询 | 查询性能 |
+
+## InfluxQL 常用查询
+
+```sql
+-- 查询最近1小时数据
+SELECT * FROM cpu WHERE time > now() - 1h
+
+-- 按5分钟聚合
+SELECT mean(usage_idle) FROM cpu WHERE time > now() - 1h GROUP BY time(5m)
+
+-- 按主机分组
+SELECT mean(usage_idle) FROM cpu WHERE time > now() - 1h GROUP BY host
+
+-- 降采样（保留策略）
+SELECT mean(usage_idle) INTO "cpu_5m" FROM cpu WHERE time > now() - 1h GROUP BY time(5m)
+
+-- 连续查询
+CREATE CONTINUOUS QUERY "cq_cpu_5m" ON "telegraf"
+BEGIN
+  SELECT mean(usage_idle) INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), host
+END
+```
+
+## Flux 脚本示例
+
+```flux
+// 查询最近1小时数据
+from(bucket: "telegraf")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> filter(fn: (r) => r._field == "usage_idle")
+  |> aggregateWindow(every: 5m, fn: mean)
+  |> yield(name: "mean")
+
+// 多数据源合并
+from(bucket: "telegraf")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "cpu" or r._measurement == "memory")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> yield(name: "merged")
+```
+
+## InfluxDB 常见问题排查
+
+### 写入失败排查
+
+```
+写入失败排查：
+  1. 检查连接
+     → 网络是否通畅
+     → 端口是否开放
+     → 认证是否正确
+
+  2. 检查数据格式
+     → Line Protocol 格式
+     → 时间戳精度
+     → 字段类型
+
+  3. 检查存储
+     → 磁盘空间
+     → 保留策略
+     → Shard 状态
+
+  4. 检查日志
+     → 错误日志
+     → 慢查询日志
+```
+
+### 查询性能优化
+
+| 优化项 | 方法 | 效果 |
+|--------|------|------|
+| 时间范围 | 缩小查询范围 | 减少数据量 |
+| 聚合查询 | 使用 GROUP BY | 减少返回数据 |
+| 索引优化 | 合理设计 measurement | 加速查询 |
+| 缓存 | 使用连续查询 | 预计算 |
+
+## InfluxDB 与其他时序库对比
+
+| 维度 | InfluxDB | Prometheus | VictoriaMetrics |
+|------|----------|------------|-----------------|
+| 数据模型 | Measurement | Metric | Metric |
+| 查询语言 | InfluxQL/Flux | PromQL | PromQL |
+| 适用场景 | IoT/DevOps | 监控 | 监控 |
+| 高可用 | Enterprise | 联邦 | 集群 |
+| 许可证 | MIT/OSS | Apache 2.0 | Apache 2.0 |
+
+## InfluxDB 版本对比
+
+| 版本 | 功能 | 适用场景 | 许可证 |
+|------|------|----------|--------|
+| InfluxDB OSS | 基础功能 | 开发/测试 | MIT |
+| InfluxDB Enterprise | 高可用/集群 | 生产环境 | 商业 |
+| InfluxDB Cloud | 全托管 | 云环境 | 按量付费 |
+
+### 版本选择建议
+
+```
+版本选择：
+  开发/测试 → OSS
+  生产环境 → Enterprise 或 Cloud
+  小规模 → OSS
+  大规模 → Enterprise 或 Cloud
+  需要高可用 → Enterprise 或 Cloud
+```
+
+## InfluxDB 最佳实践总结
+
+### 实践清单
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 合理设计数据模型 | 避免高基数 | 查询高效 |
+| 使用连续查询 | 预计算聚合 | 查询加速 |
+| 合理配置保留策略 | 自动清理数据 | 控制存储 |
+| 监控关键指标 | 写入/查询/存储 | 及时发现问题 |
+| 定期维护 | 数据压缩/清理 | 性能稳定 |
+
+### 常见问题处理
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 写入失败 | 检查连接/数据格式 | 修复连接/格式 |
+| 查询慢 | 检查索引/数据量 | 优化查询/索引 |
+| 存储满 | 检查保留策略/清理 | 扩容/清理 |
+| 高可用故障 | 检查节点状态 | 重启/恢复 |
+
+## InfluxDB 资源规划
+
+### 资源规划建议
+
+| 资源类型 | 规划方法 | 说明 |
+|----------|----------|------|
+| CPU | 按写入/QPS规划 | 写入密集型需更多CPU |
+| 内存 | 按series数规划 | 每series约2-4KB |
+| 磁盘 | 按数据量/保留期规划 | 考虑压缩比 |
+| 网络 | 按写入/查询带宽规划 | 高并发需万兆网络 |
+
+### 容量规划公式
+
+```
+容量规划：
+  存储量 = 写入速率 × 数据大小 × 保留期
+  内存 = series数 × 4KB
+  CPU = 写入QPS / 10万
+
+  示例：
+    写入速率：10万点/秒
+    数据大小：100字节/点
+    保留期：30天
+    
+    存储量 = 10万 × 100 × 86400 × 30 = 25TB
+    内存 = 100万series × 4KB = 4GB
+    CPU = 10万 / 10万 = 1核
+```

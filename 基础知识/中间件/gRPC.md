@@ -1197,6 +1197,274 @@ asyncStub.getUser(request, new StreamObserver<User>() {
     public void onCompleted() {
         // 完成处理
     }
+```
+
+## gRPC 四种调用模式（Unary/Server-Stream/Client-Stream/Bidirectional）
+
+### 1. Unary RPC（一元调用）
+
+```protobuf
+service UserService {
+  rpc GetUser (GetUserRequest) returns (UserResponse);
+}
+```
+
+```java
+// 客户端
+UserResponse response = stub.getUser(request);
+
+// 服务端
+@Override
+public void getUser(GetUserRequest request, StreamObserver<UserResponse> responseObserver) {
+    UserResponse response = UserResponse.newBuilder().setName("John").build();
+    responseObserver.onNext(response);
+    responseObserver.onCompleted();
+}
+```
+
+### 2. Server Streaming RPC（服务端流）
+
+```protobuf
+service UserService {
+  rpc ListUsers (ListUsersRequest) returns (stream UserResponse);
+}
+```
+
+```java
+// 客户端
+stub.listUsers(request, new StreamObserver<UserResponse>() {
+    @Override
+    public void onNext(UserResponse user) { /* 处理每个用户 */ }
+    @Override
+    public void onCompleted() { /* 流结束 */ }
+});
+```
+
+### 3. Client Streaming RPC（客户端流）
+
+```protobuf
+service UserService {
+  rpc UploadUsers (stream UserRequest) returns (UploadResponse);
+}
+```
+
+### 4. Bidirectional Streaming RPC（双向流）
+
+```protobuf
+service UserService {
+  rpc Chat (stream ChatMessage) returns (stream ChatMessage);
+}
+```
+
+## gRPC 拦截器（Unary/Stream Interceptor）
+
+### Unary Interceptor
+
+```java
+// 服务端拦截器
+public class AuthInterceptor implements ServerInterceptor {
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+        ServerCall<ReqT, RespT> call,
+        Metadata headers,
+        ServerCallHandler<ReqT, RespT> next) {
+        
+        // 鉴权逻辑
+        String token = headers.get(AUTHORIZATION_KEY);
+        if (!validateToken(token)) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Invalid token"), headers);
+            return new ServerCall.Listener<ReqT>() {};
+        }
+        return next.startCall(call, headers);
+    }
+}
+
+// 注册拦截器
+ServerBuilder.forPort(8080)
+    .intercept(new AuthInterceptor())
+    .addService(new UserServiceImpl())
+    .build();
+```
+
+### Client Interceptor
+
+```java
+// 客户端拦截器
+public class LoggingInterceptor implements ClientInterceptor {
+    @Override
+    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+        MethodDescriptor<ReqT, RespT> method,
+        CallOptions options,
+        Channel next) {
+        
+        long start = System.currentTimeMillis();
+        return new ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(
+            next.newCall(method, options)) {
+            @Override
+            public void start(Listener<RespT> responseListener, Metadata headers) {
+                super.start(new ForwardingClientCallListener.SimpleForwardingClientCallListener<RespT>(responseListener) {
+                    @Override
+                    public void onClose(Status status, Metadata trailers) {
+                        long elapsed = System.currentTimeMillis() - start;
+                        log.info("RPC {} completed in {}ms", method.getFullMethodName(), elapsed);
+                    }
+                }, headers);
+            }
+        };
+    }
+}
+```
+
+## gRPC 负载均衡（round-robin/pick_first/custom LB）
+
+### 负载均衡策略
+
+```java
+// Pick First（默认）
+ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8080)
+    .defaultLoadBalancingPolicy("pick_first")
+    .build();
+
+// Round Robin
+ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8080)
+    .defaultLoadBalancingPolicy("round_robin")
+    .build();
+
+// 使用 Name Resolver
+ManagedChannel channel = ManagedChannelBuilder.forTarget("dns:///my-service:8080")
+    .defaultLoadBalancingPolicy("round_robin")
+    .build();
+```
+
+### 负载均衡策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| pick_first | 选择第一个可用连接 | 简单场景 |
+| round_robin | 轮询所有连接 | 通用场景 |
+| weighted_round_robin | 加权轮询 | 异构服务器 |
+| custom | 自定义策略 | 特殊需求 |
+
+## gRPC 健康检查（Health Checking Protocol）
+
+### 健康检查配置
+
+```protobuf
+syntax = "proto3";
+
+package grpc.health.v1;
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}
+
+service Health {
+  rpc Check (HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch (HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+```
+
+### 健康检查实现
+
+```java
+// 服务端实现
+public class HealthServiceImpl extends HealthGrpc.HealthImplBase {
+    private final Map<String, ServingStatus> statusMap = new ConcurrentHashMap<>();
+    
+    @Override
+    public void check(HealthCheckRequest request, StreamObserver<HealthCheckResponse> observer) {
+        ServingStatus status = statusMap.getOrDefault(request.getService(), ServingStatus.UNKNOWN);
+        observer.onNext(HealthCheckResponse.newBuilder().setStatus(status).build());
+        observer.onCompleted();
+    }
+    
+    public void setServiceStatus(String service, ServingStatus status) {
+        statusMap.put(service, status);
+    }
+}
+```
+
+## gRPC 错误处理（Status Code/Retry Policy）
+
+### Status Code
+
+| Code | 名称 | 说明 |
+|------|------|------|
+| OK | SUCCESS | 成功 |
+| CANCELLED | CANCELLED | 客户端取消 |
+| UNKNOWN | UNKNOWN | 未知错误 |
+| INVALID_ARGUMENT | INVALID_ARGUMENT | 参数无效 |
+| DEADLINE_EXCEEDED | DEADLINE_EXCEEDED | 超时 |
+| NOT_FOUND | NOT_FOUND | 资源不存在 |
+| ALREADY_EXISTS | ALREADY_EXISTS | 资源已存在 |
+| PERMISSION_DENIED | PERMISSION_DENIED | 权限不足 |
+| UNAUTHENTICATED | UNAUTHENTICATED | 未认证 |
+| RESOURCE_EXHAUSTED | RESOURCE_EXHAUSTED | 资源耗尽 |
+| INTERNAL | INTERNAL | 内部错误 |
+| UNAVAILABLE | UNAVAILABLE | 服务不可用 |
+| DATA_LOSS | DATA_LOSS | 数据丢失 |
+
+### Retry Policy
+
+```java
+// 客户端重试配置
+ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8080)
+    .enableRetry()
+    .maxRetryAttempts(3)
+    .maxHedgedAttempts(3)
+    .build();
+
+// 方法级重试
+stub.withDeadlineAfter(5, TimeUnit.SECONDS)
+    .withOption(CallOptions.Key.of("retryPolicy"), "...")
+    .getUser(request);
+```
+
+## gRPC 与 REST 共存（gRPC-Gateway）
+
+### gRPC-Gateway 配置
+
+```protobuf
+syntax = "proto3";
+
+import "google/api/annotations.proto";
+
+service UserService {
+  rpc GetUser (GetUserRequest) returns (UserResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{id}"
+    };
+  }
+  
+  rpc CreateUser (CreateUserRequest) returns (UserResponse) {
+    option (google.api.http) = {
+      post: "/v1/users"
+      body: "*"
+    };
+  }
+}
+```
+
+### Gateway 生成
+
+```bash
+# 生成 Gateway 代码
+protoc -I . --grpc-gateway_out=. --grpc-gateway_opt=paths=source_relative \
+  --grpc-gateway_opt=generate_unbound_methods=true \
+  api.proto
+
+# 启动 Gateway
+go run gateway.go -grpc-server=localhost:8080 -http-server=:8081
+```
 });
 ```
 

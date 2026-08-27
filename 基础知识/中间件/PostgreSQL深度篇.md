@@ -786,6 +786,225 @@ DROP TABLE orders_2025_01;
 
 ---
 
+## 十七、PostgreSQL MVCC 实现（tuple visibility/Vacuum/Bloat）
+
+### 17.1 Tuple 可见性判断
+
+```
+MVCC 可见性判断流程：
+  1. 获取事务快照（snapshot）
+  2. 检查 xmin（创建事务 ID）
+     - xmin 未提交 → 不可见
+     - xmin 已提交但 > snapshot.xmax → 不可见
+     - xmin 已提交且 < snapshot.xmin → 可见
+  3. 检查 xmax（删除事务 ID）
+     - xmax = 0 → 未删除
+     - xmax 已提交且 < snapshot.xmax → 已删除
+     - xmax 未提交 → 未删除
+
+  可见性判断公式：
+    visible = (xmin committed AND xmin < snapshot.xmin)
+              AND (xmax = 0 OR xmax uncommitted OR xmax > snapshot.xmax)
+```
+
+### 17.2 Vacuum 与 Bloat
+
+```
+死元组产生：
+  UPDATE：创建新版本，旧版本变成死元组
+  DELETE：标记删除，变成死元组
+
+Bloat 问题：
+  表膨胀：死元组占用空间，查询变慢
+  索引膨胀：索引条目增多，维护成本高
+
+Vacuum 类型：
+  VACUUM：标记死元组空间可复用
+  VACUUM FULL：重写表释放空间（锁表）
+  Autovacuum：自动 VACUUM
+```
+
+## 十八、分区表（Declarative Partitioning/分区裁剪）
+
+### 18.1 声明式分区
+
+```sql
+-- 范围分区（按时间）
+CREATE TABLE orders (
+    id BIGSERIAL,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at TIMESTAMPTZ
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE orders_2026_01 PARTITION OF orders
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE orders_2026_02 PARTITION OF orders
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+-- 列表分区（按地区）
+CREATE TABLE users (
+    id BIGSERIAL,
+    name TEXT,
+    region TEXT
+) PARTITION BY LIST (region);
+
+CREATE TABLE users_cn PARTITION OF users FOR VALUES IN ('中国');
+CREATE TABLE users_us PARTITION OF users FOR VALUES IN ('美国');
+```
+
+### 18.2 分区裁剪（Partition Pruning）
+
+```sql
+-- 自动分区裁剪（只扫描相关分区）
+EXPLAIN SELECT * FROM orders WHERE created_at >= '2026-02-01';
+-- → 只扫描 orders_2026_02 分区
+
+-- 手动设置
+SET enable_partition_pruning = on;
+```
+
+## 十九、JSONB 索引（GIN/GiST 索引）
+
+### 19.1 GIN 索引
+
+```sql
+-- 创建 GIN 索引（支持 @>、?、?|、?& 操作符）
+CREATE INDEX idx_metadata_gin ON products USING GIN (metadata);
+
+-- JSONB 查询
+SELECT * FROM products WHERE metadata @> '{"color": "red"}';
+SELECT * FROM products WHERE metadata ? 'price';
+SELECT * FROM products WHERE metadata ?| array['color', 'size'];
+```
+
+### 19.2 GiST 索引
+
+```sql
+-- 创建 GiST 索引（支持 @>、<@、&& 操作符）
+CREATE INDEX idx_metadata_gist ON products USING GiST (metadata);
+
+-- GiST 索引适合范围查询
+SELECT * FROM products WHERE metadata @> '{"price": {"min": 100, "max": 500}}';
+```
+
+## 二十、连接池（PgBouncer/Pgpool-II）
+
+### 20.1 PgBouncer 配置
+
+```ini
+# pgbouncer.ini
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 20
+min_pool_size = 5
+reserve_pool_size = 5
+server_lifetime = 3600
+server_idle_timeout = 600
+```
+
+### 20.2 PgBouncer vs Pgpool-II
+
+| 维度 | PgBouncer | Pgpool-II |
+|------|-----------|-----------|
+| 定位 | 纯连接池 | 连接池+读写分离+HA |
+| 复杂度 | 低（单进程） | 高（多进程） |
+| 读写分离 | 不支持 | 原生支持 |
+| 故障转移 | 不支持 | 支持 |
+
+## 二十一、逻辑复制 vs 流复制
+
+| 维度 | 逻辑复制 | 流复制 |
+|------|----------|--------|
+| 复制级别 | 指定表 | 整个实例 |
+| 数据同步 | 逻辑变更 | 物理 WAL |
+| 跨版本 | 支持 | 不支持 |
+| DDL | 不复制 | 复制 |
+| 用途 | 跨库同步/升级 | 高可用/灾备 |
+
+## 二十二、高可用（Patroni+etcd 架构）
+
+### 22.1 Patroni 架构
+
+```mermaid
+graph TD
+    A[etcd 集群] --> B[Patroni Agent 1]
+    A --> C[Patroni Agent 2]
+    A --> D[Patroni Agent 3]
+    B --> E[Primary]
+    C --> F[Standby 1]
+    D --> G[Standby 2]
+```
+
+### 22.2 Patroni 配置
+
+```yaml
+# patroni.yml
+scope: postgres-cluster
+name: node1
+etcd3:
+  hosts: 10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/data
+  authentication:
+    replication:
+      username: replicator
+      password: password
+    superuser:
+      username: postgres
+      password: password
+```
+
+## 二十三、pg_stat_statements 慢查询分析
+
+### 23.1 安装与配置
+
+```sql
+-- 安装扩展
+CREATE EXTENSION pg_stat_statements;
+
+-- 配置 postgresql.conf
+shared_preload_libraries = 'pg_stat_statements'
+pg_stat_statements.max = 10000
+pg_stat_statements.track = all
+```
+
+### 23.2 慢查询分析
+
+```sql
+-- 查看慢查询 Top 10
+SELECT
+    query,
+    calls,
+    total_exec_time,
+    mean_exec_time,
+    rows
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+
+-- 查看按调用次数排序
+SELECT
+    query,
+    calls,
+    total_exec_time,
+    mean_exec_time
+FROM pg_stat_statements
+ORDER BY calls DESC
+LIMIT 10;
+```
+
 ## 十七、与其他板块的关系
 
 - MySQL 知识见「[基础知识/mysql知识](../mysql知识.md)」；

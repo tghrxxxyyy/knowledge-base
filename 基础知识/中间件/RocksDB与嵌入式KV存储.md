@@ -1213,6 +1213,188 @@ Flink + RocksDB 性能优化：
      └── 异步 Checkpoint：不阻塞主流程
 ```
 
+## RocksDB 压缩策略（LZ4/Snappy/Zstd 级别选择）
+
+### 压缩策略对比
+
+| 算法 | 压缩比 | 压缩速度 | 解压速度 | 适用场景 |
+|------|--------|----------|----------|----------|
+| LZ4 | 低 | 极快 | 极快 | 热数据（L0-L3） |
+| Snappy | 低 | 快 | 快 | 热数据 |
+| ZSTD | 高 | 中 | 快 | 冷数据（L4+） |
+| 无压缩 | 无 | 无 | 无 | 临时数据 |
+
+### 压缩级别配置
+
+```
+LZ4 压缩级别：
+  level 1: 默认（推荐）
+  level 2-3: 更高压缩比，更慢
+
+ZSTD 压缩级别：
+  level 1-3: 快速压缩
+  level 4-6: 平衡（推荐）
+  level 7-9: 高压缩比
+
+推荐配置：
+  L0-L3: LZ4（热数据，快速压缩）
+  L4+: ZSTD level 6（冷数据，高压缩比）
+```
+
+### 配置示例
+
+```cpp
+// RocksDB 压缩配置
+options.compression_per_level = {
+    kLZ4Compression,    // Level 0
+    kLZ4Compression,    // Level 1
+    kLZ4Compression,    // Level 2
+    kLZ4Compression,    // Level 3
+    kZSTD,              // Level 4
+    kZSTD,              // Level 5
+    kZSTD               // Level 6
+};
+
+// ZSTD 压缩选项
+options.bottommost_compression = kZSTD;
+options.compression_opts_max_dict_bytes = 16 * 1024;  // 16KB 字典
+```
+
+## RocksDB MemTable（SkipList/HashSkipList/Vector）
+
+### MemTable 类型对比
+
+| 类型 | 查找复杂度 | 插入复杂度 | 内存开销 | 适用场景 |
+|------|------------|------------|----------|----------|
+| SkipList | O(log n) | O(log n) | 中 | 通用（默认） |
+| HashSkipList | O(1) 平均 | O(1) 平均 | 高 | 等值查询 |
+| Vector | O(n) | O(1) | 低 | 只追加写入 |
+| CuckooHash | O(1) 平均 | O(1) 平均 | 高 | 等值查询 |
+
+### 配置示例
+
+```cpp
+// SkipList（默认）
+options.mem_table_factory.reset(new SkipListFactory());
+
+// HashSkipList
+options.mem_table_factory.reset(new HashSkipListFactory(
+    10000,           // bucket count
+    8,               // height
+    4                // bucket count for hash table
+));
+
+// Vector MemTable
+options.mem_table_factory.reset(new VectorRepFactory());
+```
+
+## RocksDB Block Cache 配置（LRU Cache/Sharded Cache）
+
+### Block Cache 类型
+
+| 类型 | 说明 | 适用场景 |
+|------|------|----------|
+| LRU Cache | 最近最少使用 | 通用 |
+| HyperClockCache | 时钟算法，更高并发 | 高并发场景 |
+| FixedHyperClockCache | 固定大小时钟缓存 | 内存受限 |
+
+### 配置示例
+
+```cpp
+// LRU Cache
+BlockBasedTableOptions table_options;
+table_options.block_cache = NewLRUCache(8ULL * 1024 * 1024 * 1024);  // 8GB
+
+// HyperClockCache（更高并发）
+table_options.block_cache = NewHyperClockCache(
+    8ULL * 1024 * 1024 * 1024,  // 8GB
+    8                             // cache 倍数
+);
+
+// 缓存配置优化
+table_options.cache_index_and_filter_blocks = true;
+table_options.cache_index_and_filter_blocks_with_high_priority = true;
+table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+```
+
+## RocksDB Compaction 策略（Level/Universal/FIFO 适用场景）
+
+### Compaction 策略对比
+
+| 策略 | 说明 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|----------|
+| Level | 分层合并 | 空间放大小 | 写放大大 | 通用（默认） |
+| Universal | 全量合并 | 写放大小 | 空间放大 | 写密集 |
+| FIFO | 先进先出 | 写放大极小 | 不保证一致性 | 时序数据 |
+
+### 配置示例
+
+```cpp
+// Level Compaction（默认）
+options.compaction_style = kCompactionStyleLevel;
+
+// Universal Compaction
+options.compaction_style = kCompactionStyleUniversal;
+options.compaction_options_universal.max_size_amplification_percent = 200;
+
+// FIFO Compaction
+options.compaction_style = kCompactionStyleFIFO;
+options.compaction_options_fifo.max_table_files_size = 1ULL * 1024 * 1024 * 1024;  // 1GB
+```
+
+## RocksDB 在 Kafka/Flink/LSM-tree 中的调优
+
+### Kafka Streams 调优
+
+```
+Kafka Streams + RocksDB 调优：
+  state.dir: RocksDB 状态存储目录
+  rocksdb.block.cache.size: Block Cache 大小
+  rocksdb.write.buffer.size: MemTable 大小
+  rocksdb.max.write.buffer.number: MemTable 数量
+  rocksdb.compaction.style: Compaction 策略
+```
+
+### Flink 状态后端调优
+
+```
+Flink RocksDB State Backend 调优：
+  state.backend.rocksdb.block.cache-size: Block Cache
+  state.backend.rocksdb.writebuffer.size: MemTable
+  state.backend.rocksdb.writebuffer.count: MemTable 数量
+  state.backend.rocksdb.compaction.style: Compaction 策略
+```
+
+## RocksDB 事务（TransactionDB/Optimistic TransactionDB）
+
+### 事务类型对比
+
+| 类型 | 锁机制 | 并发性 | 适用场景 |
+|------|--------|--------|----------|
+| TransactionDB | 悲观锁 | 低 | 写冲突多 |
+| Optimistic TransactionDB | 乐观锁 | 高 | 写冲突少 |
+
+### 事务配置
+
+```cpp
+// TransactionDB（悲观锁）
+TransactionDB* txn_db;
+TransactionDBOptions txn_db_options;
+txn_db_options.write_policy = TxnDBWritePolicy::WRITE_COMMITTED;
+TransactionDB::Open(options, txn_db_options, "db_path", &txn_db);
+
+// Optimistic TransactionDB（乐观锁）
+OptimisticTransactionDB* opt_txn_db;
+OptimisticTransactionDB::Open(options, "db_path", &opt_txn_db);
+
+// 事务操作
+Transaction* txn = txn_db->BeginTransaction(write_options);
+txn->Put("key1", "value1");
+txn->Put("key2", "value2");
+Status s = txn->Commit();
+delete txn;
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

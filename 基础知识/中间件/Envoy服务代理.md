@@ -636,6 +636,263 @@ resources:
 
 ---
 
+## 十六、Envoy Filters 架构（L4/L7 Filters 配置示例）
+
+### 16.1 L4 Network Filter 配置
+
+```yaml
+# TCP 代理过滤器
+listeners:
+- name: listener_tcp
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 3306
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.tcp_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+        stat_prefix: mysql_proxy
+        cluster: mysql_cluster
+        access_log:
+        - name: envoy.access_loggers.file
+          typed_config:
+            path: /var/log/envoy/tcp_access.log
+```
+
+### 16.2 L7 HTTP Filter 配置
+
+```yaml
+# HTTP 过滤器链
+http_filters:
+- name: envoy.filters.http.cors
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+
+- name: envoy.filters.http.fault
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+    delay:
+      percentage:
+        numerator: 10
+        denominator: HUNDRED
+      fixed_duration: 5s
+
+- name: envoy.filters.http.local_ratelimit
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+    stat_prefix: http_local_rate_limiter
+    token_bucket:
+      max_tokens: 100
+      tokens_per_fill: 10
+      fill_interval: 1s
+
+- name: envoy.filters.http.router
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+```
+
+### 16.3 Filter 执行顺序
+
+```mermaid
+graph TD
+    A[请求进入] --> B[L4 Network Filter]
+    B --> C[HTTP Connection Manager]
+    C --> D[HTTP Filter 1: CORS]
+    D --> E[HTTP Filter 2: Fault]
+    E --> F[HTTP Filter 3: Rate Limit]
+    F --> G[HTTP Filter 4: Router]
+    G --> H[转发到上游]
+```
+
+## 十七、Envoy xDS 协议（LDS/RDS/CDS/EDS 动态配置）
+
+### 17.1 xDS 协议详解
+
+| 协议 | 全称 | 作用 | 推送方式 |
+|------|------|------|----------|
+| LDS | Listener Discovery Service | 发现监听器配置 | 全量/增量 |
+| RDS | Route Discovery Service | 发现路由规则 | 全量/增量 |
+| CDS | Cluster Discovery Service | 发现上游集群 | 全量/增量 |
+| EDS | Endpoint Discovery Service | 发现实例端点 | 增量优先 |
+
+### 17.2 xDS 推送流程
+
+```mermaid
+sequenceDiagram
+    participant C as 控制面(Istiod)
+    participant E as Envoy Proxy
+    C->>E: LDS推送(监听器配置)
+    E-->>C: ACK/NACK
+    C->>E: RDS推送(路由规则)
+    E-->>C: ACK/NACK
+    C->>E: CDS推送(集群配置)
+    E-->>C: ACK/NACK
+    C->>E: EDS推送(端点列表)
+    E-->>C: ACK/NACK
+```
+
+### 17.3 xDS 调试命令
+
+```bash
+# 查看当前配置
+curl -s localhost:15000/config_dump
+
+# 查看集群状态
+curl -s localhost:15000/clusters
+
+# 查看统计信息
+curl -s localhost:15000/stats
+
+# Istio 代理状态
+istioctl proxy-status
+istioctl proxy-config listener <pod-name>
+```
+
+## 十八、Envoy 熔断（Outlier Detection 配置）
+
+### 18.1 异常检测配置
+
+```yaml
+# Outlier Detection 配置
+clusters:
+- name: service_backend
+  outlier_detection:
+    consecutive_5xx: 5           # 连续5次5xx错误
+    interval: 10s                # 检测间隔
+    base_ejection_time: 30s      # 基础驱逐时间
+    max_ejection_percent: 50     # 最大驱逐比例
+    split_external_local_origin_errors: true
+    consecutive_local_origin_failure: 5
+```
+
+### 18.2 熔断状态监控
+
+```bash
+# 查看异常检测统计
+curl -s localhost:15000/stats | grep outlier
+
+# 关键指标：
+# envoy_cluster_outlier_detection_ejections_active - 当前驱逐数
+# envoy_cluster_outlier_detection_ejections_total - 累计驱逐数
+# envoy_cluster_outlier_detection_ejections_consecutive_5xx - 连续5xx数
+```
+
+## 十九、Envoy 访问日志（Access Log 格式/自定义字段）
+
+### 19.1 JSON 格式日志
+
+```yaml
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+    path: /var/log/envoy/access.log
+    log_format:
+      json_format:
+        timestamp: "%START_TIME%"
+        method: "%REQ(:METHOD)%"
+        path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
+        protocol: "%PROTOCOL%"
+        response_code: "%RESPONSE_CODE%"
+        response_flags: "%RESPONSE_FLAGS%"
+        bytes_received: "%BYTES_RECEIVED%"
+        bytes_sent: "%BYTES_SENT%"
+        duration: "%DURATION%"
+        upstream_cluster: "%UPSTREAM_CLUSTER%"
+        upstream_host: "%UPSTREAM_HOST%"
+        request_id: "%REQ(X-REQUEST-ID)%"
+        trace_id: "%REQ(X-B3-TRACEID)%"
+```
+
+### 19.2 自定义字段提取
+
+```yaml
+# 从请求头提取自定义字段
+log_format:
+  json_format:
+    user_agent: "%REQ(USER-AGENT)%"
+    x_forwarded_for: "%REQ(X-FORWARDED-FOR)%"
+    content_type: "%REQ(CONTENT-TYPE)%"
+    authorization: "%REQ(AUTHORIZATION)%"
+    custom_header: "%REQ(X-CUSTOM-HEADER)%"
+```
+
+## 二十、Envoy 与 OpenTelemetry 集成（Trace/Lambda Filters）
+
+### 20.1 OpenTelemetry 追踪配置
+
+```yaml
+tracing:
+  provider:
+    name: envoy.tracers.opentelemetry
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+      collector_cluster: otel_collector
+      collector_endpoint: /api/v1/traces
+      resource_attributes:
+        service.name: my-service
+        service.version: v1.0.0
+```
+
+### 20.2 Lambda Filter（AWS Lambda 集成）
+
+```yaml
+http_filters:
+- name: envoy.filters.http.aws_lambda
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.aws_lambda.v3.Lambda
+    credentials_provider:
+      inline:
+        access_key_id:AKIA...
+        secret_access_key: secret...
+    arn: arn:aws:lambda:us-east-1:123456789:function:my-function
+    payload_passthrough: true
+```
+
+## 二十一、Envoy 在 Service Mesh 中的 Sidecar 部署模式
+
+### 21.1 Sidecar 注入配置
+
+```yaml
+# 自动注入（Istio）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "true"
+    sidecar.istio.io/rewriteAppHTTPProbers: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        app: my-service
+    spec:
+      containers:
+      - name: my-service
+        image: my-service:v1
+        ports:
+        - containerPort: 8080
+      - name: istio-proxy
+        image: proxyv2:latest
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+```
+
+### 21.2 Sidecar 资源优化
+
+| 资源 | 请求 | 限制 | 说明 |
+|------|------|------|------|
+| CPU | 100m | 1000m | 根据流量调整 |
+| 内存 | 128Mi | 512Mi | 根据连接数调整 |
+| 启动超时 | - | 60s | 避免启动失败 |
+
 ## 十七、与其他板块的关系
 
 - 服务网格（Istio + Envoy）见「[云原生/Service Mesh](../../云原生/ServiceMesh.md)」；

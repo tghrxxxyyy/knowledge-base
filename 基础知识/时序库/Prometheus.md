@@ -1253,3 +1253,165 @@ inhibit_rules:
 **查询超时 SOP**
 - [ ] 是否全量扫、区间过大；加 recording rule。
 - [ ] 远程读（remote_read）延迟高 → 查后端 VM/Thanos 状态。
+
+## 标签命名规范
+
+### 高基数避免
+
+```
+标签命名规范：
+  1. 避免高基数标签：
+     ❌ user_id, trace_id, request_id, session_id
+     ✅ user_group, service, method, status_code
+
+  2. 标签值枚举化：
+     ❌ /api/users/12345  → 标签值无限
+     ✅ /api/users/{id}   → 标签值有限
+
+  3. 标签长度限制：
+     标签名 ≤ 64 字节
+     标签值 ≤ 16KB
+
+  4. 命名规范：
+     使用 snake_case
+     不使用特殊字符
+     以 _unit/_total 结尾（Counter）
+```
+
+### 高基数治理
+
+| 策略 | 方法 | 效果 |
+|------|------|------|
+| 标签丢弃 | metric_relabel_configs | 减少 series 数 |
+| 标签聚合 | Recording Rules | 预计算聚合 |
+| 采样 | 按 service 采样 | 减少数据量 |
+| 分片 | hashmod 分片 | 分散负载 |
+
+## Recording Rules 预计算
+
+### 聚合预计算
+
+```yaml
+# recording_rules.yml
+groups:
+  - name: http_requests
+    rules:
+      # 预计算 QPS（每分钟）
+      - record: http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (service, method)
+
+      # 预计算 P99 延迟
+      - record: http_request_duration_seconds:p99
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+
+      # 预计算错误率
+      - record: http_requests:error_rate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+        / sum(rate(http_requests_total[5m])) by (service)
+```
+
+### Recording Rules 最佳实践
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 分层聚合 | 先 service 级，再 cluster 级 | 查询快 |
+| 合理间隔 | 1m/5m/15m 三级 | 平衡精度与性能 |
+| 命名规范 | metric:operation[window] | 可读性 |
+| 限量 | 单 group ≤ 500 rules | 避免 OOM |
+
+## Alerting Rules 多窗口 burn rate
+
+### SLO burn rate 告警
+
+```yaml
+# slo_alerts.yml
+groups:
+  - name: slo-burn-rate
+    rules:
+      # 5 分钟窗口 burn rate > 14.4x（1小时 SLO 消耗）
+      - alert: HighErrorBurnRate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          / sum(rate(http_requests_total[5m])) by (service) > 0.144
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SLO 5分钟burn rate过高"
+
+      # 1 小时窗口 burn rate > 3x（6小时 SLO 消耗）
+      - alert: HighErrorBurnRate1h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1h])) by (service)
+          / sum(rate(http_requests_total[1h])) by (service) > 0.03
+        for: 15m
+        labels:
+          severity: warning
+```
+
+## Thanos Store Gateway 缓存与索引分片
+
+### Store Gateway 架构
+
+```text
+Thanos Store Gateway：
+  职责：从对象存储加载 TSDB blocks
+  缓存：索引缓存 + 数据块缓存
+  索引分片：按 block 时间范围分片
+
+  缓存配置：
+    index-cache-size: 500MB
+    chunk-cache-size: 512MB
+    max-sample-count: 10000
+```
+
+### Store Gateway 调优
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| index-cache-size | 500MB | 1-2GB | 索引缓存 |
+| chunk-cache-size | 512MB | 1-2GB | 数据块缓存 |
+| sync-interval | 3m | 1m | 同步间隔 |
+
+## Thanos Compactor 降采样与块合并
+
+### Compactor 配置
+
+```text
+Thanos Compactor：
+  降采样（Downsampling）：
+    5m 原始数据 → 1h 降采样（保留 30 天）
+    1h 降采样 → 5m 降采样（保留 365 天）
+
+  块合并（Compaction）：
+    小块合并成大块（减少查询时扫描块数）
+    保留策略：按时间窗口删除旧块
+
+  配置：
+    --retention.raw-resolution=30d
+    --retention.resolution-1h=365d
+    --retention.resolution-5m=365d
+```
+
+## Prometheus 容量规划公式
+
+```
+容量规划公式：
+
+存储容量：
+  每秒样本数 = series 数 × scrape 间隔倒数
+  每天存储 = 每秒样本数 × 8 字节 × 86400 秒 × 压缩系数(0.4)
+  
+  示例：
+    100 万 series，15s scrape
+    每秒 = 100万 / 15 = 66667 样本/秒
+    每天 = 66667 × 8 × 86400 × 0.4 = 184GB/天
+
+  内存容量：
+    每 series 约 2-4KB 内存
+    100 万 series ≈ 2-4GB 内存
+
+  CPU 容量：
+    每 10 万 series 约 1 CPU
+    100 万 series ≈ 10 CPU
+```

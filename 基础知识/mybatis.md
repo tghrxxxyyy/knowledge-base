@@ -1264,3 +1264,185 @@ wrapper.inSql(User::getId, "SELECT user_id FROM orders WHERE amount > 1000");
     LEFT JOIN order_items oi ON o.id = oi.order_id
 </select>
 ```
+
+## MyBatis 缓存机制
+
+### 一级缓存与二级缓存
+
+```
+一级缓存（SqlSession 级别）：
+  默认开启
+  同一个 SqlSession 中的查询会缓存
+  执行增删改操作后自动清空
+  跨 SqlSession 不共享
+
+二级缓存（Mapper 级别）：
+  需要手动开启
+  多个 SqlSession 共享
+  跨 SqlSession 共享
+  命名空间级别的缓存
+
+  开启方式：
+    在 Mapper.xml 中添加 <cache/>
+    或使用 @CacheNamespace 注解
+```
+
+### 缓存配置对比
+
+| 缓存类型 | 级别 | 默认 | 作用域 | 清空策略 |
+|----------|------|------|--------|----------|
+| 一级缓存 | SqlSession | 开启 | 同一 SqlSession | 增删改操作 |
+| 二级缓存 | Mapper | 关闭 | 同一 Mapper | 增删改操作 |
+
+### 缓存最佳实践
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 启用二级缓存 | 提升跨 SqlSession 查询性能 | 减少数据库查询 |
+| 合理设置缓存大小 | 避免内存溢出 | 稳定运行 |
+| 监控缓存命中率 | 评估缓存效果 | 优化配置 |
+| 避免多表关联缓存 | 防止脏数据 | 数据一致性 |
+| 使用 Redis 二级缓存 | 分布式缓存 | 跨实例共享 |
+
+## MyBatis 动态 SQL 进阶
+
+### 常用动态 SQL 标签
+
+```xml
+<!-- if 标签 -->
+<if test="username != null">
+    AND username = #{username}
+</if>
+
+<!-- choose/when/otherwise -->
+<choose>
+    <when test="status == 'ACTIVE'">
+        AND status = 'ACTIVE'
+    </when>
+    <when test="status == 'INACTIVE'">
+        AND status = 'INACTIVE'
+    </when>
+    <otherwise>
+        AND status = 'ACTIVE'
+    </otherwise>
+</choose>
+
+<!-- where 标签 -->
+<where>
+    <if test="username != null">
+        username = #{username}
+    </if>
+    <if test="age != null">
+        AND age = #{age}
+    </if>
+</where>
+
+<!-- set 标签 -->
+<update>
+    UPDATE user
+    <set>
+        <if test="username != null">username = #{username},</if>
+        <if test="age != null">age = #{age},</if>
+    </set>
+    WHERE id = #{id}
+</update>
+
+<!-- foreach 标签 -->
+<delete id="deleteByIds">
+    DELETE FROM user WHERE id IN
+    <foreach collection="ids" item="id" open="(" separator="," close=")">
+        #{id}
+    </foreach>
+</delete>
+```
+
+### 动态 SQL 标签对比
+
+| 标签 | 功能 | 适用场景 |
+|------|------|----------|
+| if | 条件判断 | 可选条件 |
+| choose/when/otherwise | 多条件选择 | 类似 switch |
+| where | 自动处理 WHERE | 动态 WHERE 条件 |
+| set | 自动处理 SET | 动态 UPDATE |
+| foreach | 遍历集合 | IN 查询、批量操作 |
+| trim | 自定义前后缀 | 复杂场景 |
+
+## MyBatis 拦截器原理
+
+### Interceptor 执行顺序
+
+```java
+// 拦截器执行链
+Executor.query()
+  → ParameterHandler.setParameters()
+    → ResultSetHandler.handleResultSets()
+
+// 拦截器实现
+@Intercepts({
+    @Signature(type = Executor.class,
+              method = "query",
+              args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})
+})
+public class QueryInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        // 前置处理
+        Object result = invocation.proceed();
+        // 后置处理
+        return result;
+    }
+}
+```
+
+### 拦截器原理
+
+| 阶段 | 说明 | 应用 |
+|------|------|------|
+| Executor | 拦截 SQL 执行 | 分页、缓存 |
+| ParameterHandler | 拦截参数设置 | 参数加密 |
+| ResultSetHandler | 拦截结果集处理 | 数据脱敏 |
+
+## MyBatis 多数据源配置
+
+### 多数据源配置
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    primary:
+      url: jdbc:mysql://localhost:3306/db1
+      username: root
+      password: root
+    secondary:
+      url: jdbc:mysql://localhost:3306/db2
+      username: root
+      password: root
+```
+
+### 多数据源切换
+
+```java
+// 动态数据源
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DataSource {
+    String value() default "primary";
+}
+
+// 拦截器实现
+public class DataSourceInterceptor implements MethodInterceptor {
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        DataSource ds = invocation.getMethod().getAnnotation(DataSource.class);
+        if (ds != null) {
+            DataSourceContextHolder.setDataSourceType(ds.value());
+        }
+        try {
+            return invocation.proceed();
+        } finally {
+            DataSourceContextHolder.clearDataSourceType();
+        }
+    }
+}
+```

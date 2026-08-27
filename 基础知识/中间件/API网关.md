@@ -1234,6 +1234,159 @@ plugins:
           end
 ```
 
+## 十一、网关限流算法深入对比
+
+### 固定窗口 vs 滑动窗口 vs 令牌桶
+
+```
+固定窗口（Fixed Window）：
+  时间窗口固定（如1秒）
+  问题：窗口边界突发（2秒内可允许2倍流量）
+  实现：Redis INCR + EXPIRE
+
+滑动窗口（Sliding Window）：
+  窗口随时间滑动
+  更精确，但实现复杂
+  实现：Redis Sorted Set + 时间戳
+
+令牌桶（Token Bucket）：
+  固定速率放入令牌
+  允许突发（桶容量）
+  最常用（Guava RateLimiter）
+
+漏桶（Leaky Bucket）：
+  固定速率流出
+  平滑流量，但不允许突发
+  适合严格限速场景
+```
+
+### 网关限流维度
+
+| 维度 | 限流对象 | 实现方式 | 适用场景 |
+|------|----------|----------|----------|
+| 用户级 | 每个用户 | Redis + 用户ID | API 配额 |
+| 接口级 | 每个API | Redis + 接口路径 | 防刷 |
+| 服务级 | 每个服务 | 服务端限流 | 保护后端 |
+| 全局级 | 全部请求 | 网关全局 | 过载保护 |
+
+## 十二、网关与 Service Mesh 协同
+
+### 边缘网关 vs Sidecar
+
+```text
+边缘网关（Ingress Gateway）：
+  职责：南北向流量管理
+  功能：认证、限流、路由、SSL终结
+  部署：独立 Pod
+  代表：Kong、Spring Cloud Gateway
+
+Sidecar Proxy：
+  职责：东西向流量管理
+  功能：负载均衡、熔断、mTLS、可观测
+  部署：Pod 内注入
+  代表：Envoy、Istio
+
+协同模式：
+  请求 → 边缘网关（认证+限流）
+    → Sidecar（负载均衡+熔断）
+    → 业务服务
+```
+
+### 选型决策
+
+| 场景 | 推荐方案 | 原因 |
+|------|----------|------|
+| 单体应用 | 边缘网关 | 简单，够用 |
+| 微服务少量 | 边缘网关 | 复杂度低 |
+| 微服务大量 | Service Mesh | 功能全面 |
+| 混合架构 | 边缘网关 + Mesh | 南北 + 东西流量 |
+
+## 十三、网关灰度发布能力
+
+### 灰度路由配置
+
+```yaml
+# Spring Cloud Gateway 灰度路由
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-service-canary
+          uri: lb://user-service-canary
+          predicates:
+            - Header=x-canary, true
+            - Path=/api/users/**
+        - id: user-service-stable
+          uri: lb://user-service-stable
+          predicates:
+            - Path=/api/users/**
+```
+
+### 灰度流量分配
+
+| 策略 | 分配方式 | 配置示例 |
+|------|----------|----------|
+| 按比例 | 权重分流 | 90% stable + 10% canary |
+| 按用户 | 用户ID尾号 | 尾号0-1走canary |
+| 按地域 | IP段/地域 | 北京走canary |
+| 按设备 | 设备类型 | iOS走canary |
+
+## 网关故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 路由失败 | 检查路由配置 | 修正路由规则 |
+| 限流触发 | 检查限流配置 | 调整限流参数 |
+| 认证失败 | 检查认证配置 | 修正认证逻辑 |
+| 超时 | 检查超时配置 | 调整超时时间 |
+
+### 故障排查命令
+
+```bash
+# 检查网关状态
+curl -s http://localhost:8080/actuator/health
+
+# 查看路由配置
+curl -s http://localhost:8080/actuator/gateway/routes
+
+# 查看限流状态
+curl -s http://localhost:8080/actuator/metrics/gateway.requests
+
+# 查看日志
+tail -f /var/log/gateway/gateway.log
+```
+
+## 网关性能对比
+
+| 维度 | Spring Cloud Gateway | Kong | APISIX |
+|------|---------------------|------|--------|
+| 语言 | Java | Lua | Lua |
+| 性能 | 高 | 极高 | 极高 |
+| 插件 | Java | Lua | Lua |
+| 适用场景 | Spring 生态 | 通用 | 云原生 |
+| 许可证 | Apache 2.0 | Apache 2.0 | Apache 2.0 |
+
+## 网关版本对比
+
+| 版本 | 功能 | 适用场景 | 许可证 |
+|------|------|----------|--------|
+| Spring Cloud Gateway 4.x | 最新特性 | 新项目 | Apache 2.0 |
+| Spring Cloud Gateway 3.x | 稳定 | 生产环境 | Apache 2.0 |
+| Spring Cloud Gateway 2.x | 旧版本 | 已有项目 | Apache 2.0 |
+
+### 版本选择建议
+
+```
+版本选择：
+  新项目 → Spring Cloud Gateway 4.x
+  生产环境 → Spring Cloud Gateway 3.x 或 4.x
+  已有项目 → Spring Cloud Gateway 3.x
+  需要新特性 → Spring Cloud Gateway 4.x
+  需要稳定性 → Spring Cloud Gateway 3.x
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

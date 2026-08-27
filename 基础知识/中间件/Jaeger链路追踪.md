@@ -1238,6 +1238,227 @@ best_practices:
 | 监控告警 | 及时发现问题 | 保障稳定性 |
 | 定期维护 | 清理旧数据 | 节省存储 |
 
+## Jaeger 采样策略配置（probability/peratering/remote）
+
+### 采样策略类型
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| constant | 0 或 1（全采样/不采样） | 开发/测试 |
+| probabilistic | 概率采样（0.0-1.0） | 生产环境 |
+| rateLimiting | 速率限制 | 保护后端 |
+| remote | 远程动态采样 | 大规模部署 |
+
+### 采样配置
+
+```yaml
+# Jaeger Agent 采样配置
+sampling:
+  type: probabilistic
+  param: 0.1  # 10% 采样率
+
+# 远程采样配置
+sampling:
+  type: remote
+  options:
+    endpoint: http://jaeger-collector:14269/sampling
+```
+
+### 动态采样策略
+
+```go
+// 远程采样配置
+sampler, _ := remote.NewRemotelyControlledSampler(
+    "http://jaeger-collector:14269/sampling",
+    nil,
+)
+
+tracer, _ := jaeger.NewTracer(
+    serviceName,
+    jaeger.NewSpanRecorderWithOptions(jaeger.SpanRecorderOptions{
+        LocalAgentDiskSpanStore: &jaeger.LocalAgentDiskSpanStore{
+            MaxPaths: 1000,
+            MaxSpansPerPath: 10000,
+        },
+    }),
+    sampler,
+)
+```
+
+## Jaeger Span 数据模型（operation name/tags/logs/references）
+
+### Span 结构
+
+```
+Span 结构：
+  TraceID: 追踪 ID（128 位）
+  SpanID: Span ID（64 位）
+  ParentSpanID: 父 Span ID
+  OperationName: 操作名称
+  StartTime: 开始时间
+  Duration: 持续时间
+  Tags: 标签（键值对）
+  Logs: 日志（时间戳+事件）
+  References: 引用（ChildOf/FollowsFrom）
+```
+
+### Span 数据模型
+
+```json
+{
+  "traceID": "abc123",
+  "spanID": "def456",
+  "parentSpanID": "ghi789",
+  "operationName": "HTTP GET /api/users",
+  "startTime": 1609459200000000,
+  "duration": 123456,
+  "tags": [
+    {"key": "http.method", "value": "GET"},
+    {"key": "http.url", "value": "/api/users"},
+    {"key": "http.status_code", "value": 200},
+    {"key": "span.kind", "value": "server"}
+  ],
+  "logs": [
+    {
+      "timestamp": 1609459200100000,
+      "fields": [
+        {"key": "event", "value": "cache miss"},
+        {"key": "message", "value": "User not found in cache"}
+      ]
+    }
+  ],
+  "references": [
+    {
+      "refType": "CHILD_OF",
+      "traceID": "abc123",
+      "spanID": "ghi789"
+    }
+  ]
+}
+```
+
+## Jaeger 存储后端对比（Cassandra/ES/Kafka）
+
+### 存储后端对比
+
+| 维度 | Cassandra | Elasticsearch | Kafka |
+|------|-----------|---------------|-------|
+| 写入性能 | 极高 | 高 | 极高 |
+| 查询性能 | 中 | 高（全文搜索） | 低 |
+| 存储成本 | 中 | 高 | 低 |
+| 运维复杂度 | 高 | 中 | 中 |
+| 数据保留 | 原生支持 | 原生支持 | 需配置 |
+| 适用场景 | 大规模写入 | 复杂查询 | 缓冲层 |
+
+### Kafka 作为缓冲层
+
+```mermaid
+graph LR
+    A[Jaeger Agent] --> B[Kafka]
+    B --> C[Jaeger Collector]
+    C --> D[Elasticsearch]
+    C --> E[Cassandra]
+```
+
+## Jaeger 与 OpenTelemetry 集成
+
+### OpenTelemetry SDK 集成
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/jaeger"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+
+// 初始化 Jaeger 导出器
+exporter, _ := jaeger.New(jaeger.WithCollectorEndpoint(
+    jaeger.WithEndpoint("http://jaeger-collector:14268/api/traces"),
+))
+
+// 创建 Tracer Provider
+tp := sdktrace.NewTracerProvider(
+    sdktrace.WithBatcher(exporter),
+    sdktrace.WithResource(resource.NewWithAttributes(
+        semconv.SchemaURL,
+        semconv.ServiceNameKey.String("my-service"),
+    )),
+)
+
+// 设置全局 Tracer Provider
+otel.SetTracerProvider(tp)
+```
+
+## Jaeger 依赖图生成原理
+
+### 依赖图生成
+
+```
+依赖图生成流程：
+  1. 收集所有 Span 数据
+  2. 提取服务间调用关系（parent-child）
+  3. 统计调用次数、延迟、错误率
+  4. 生成服务依赖图
+
+依赖图数据：
+  节点：服务（Service）
+  边：调用关系（调用次数、延迟、错误率）
+  
+使用场景：
+  服务依赖分析
+  调用链可视化
+  性能瓶颈定位
+```
+
+## Jaeger 生产部署架构（Agent+Collector+Query+存储分离）
+
+### 生产部署架构
+
+```mermaid
+graph TD
+    A[应用] --> B[Jaeger Agent]
+    B --> C[Jaeger Collector]
+    C --> D[Kafka]
+    D --> E[Jaeger Collector]
+    E --> F[Elasticsearch]
+    G[Jaeger Query] --> F
+    H[Jaeger UI] --> G
+```
+
+### 部署组件说明
+
+| 组件 | 说明 | 部署方式 |
+|------|------|----------|
+| Agent | 接收应用上报的 Span | DaemonSet/每节点一个 |
+| Collector | 处理、转换、存储 Span | Deployment/多副本 |
+| Query | 查询 Span 数据 | Deployment/多副本 |
+| UI | Web 界面 | Deployment |
+| Kafka | 缓冲层 | StatefulSet |
+| ES/Cassandra | 持久化存储 | 集群部署 |
+
+## Jaeger 性能开销实测
+
+### 性能开销指标
+
+| 指标 | 影响 | 说明 |
+|------|------|------|
+| CPU | 1-5% | 采样+序列化+网络 |
+| 内存 | 10-50MB | 缓冲区+队列 |
+| 网络 | 0.1-1% | Span 数据传输 |
+| 延迟 | < 1ms | 异步上报，不影响业务 |
+
+### 性能优化建议
+
+```
+性能优化：
+  1. 使用异步 Span 上报
+  2. 合理采样率（生产环境 1-10%）
+  3. 批量发送 Span
+  4. 使用 Kafka 缓冲
+  5. 本地 Agent 减少网络延迟
+```
+
 ---
 
 > 一句话：**Jaeger = OpenTelemetry 原生后端 + W3C Trace Context 传播 + 灵活采样（Head/Tail-based）+ ES/Cassandra/ClickHouse 存储；选型先看「生态（云原生→Jaeger，Java→SkyWalking）」，再定「采样策略（高吞吐→概率采样，找问题→Tail-based）」**。

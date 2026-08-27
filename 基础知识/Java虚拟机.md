@@ -892,6 +892,240 @@ sc -d com.xxx.Class   # 类详情
 
 # 第二轮深度优化：低延迟 GC / GC 日志与火焰图 / NMT / OOM 排查 / JFR
 
+## 三、JVM 内存模型（JMM）详解
+
+### 3.1 主内存与工作内存
+
+```
+JMM 内存模型：
+  主内存（Main Memory）：
+    ├── 所有线程共享
+    ├── 存储类的实例变量、静态变量
+    └── 所有操作必须先读写主内存
+
+  工作内存（Working Memory）：
+    ├── 线程私有
+    ├── 存储主内存变量的副本
+    └── 线程间通信必须通过主内存
+
+  交互流程：
+    线程A修改变量 → 写回主内存 → 线程B从主内存读取
+    线程A工作内存 ← 主内存 → 线程B工作内存
+```
+
+### 3.2 happens-before 规则
+
+| 规则 | 说明 | 示例 |
+|------|------|------|
+| 程序顺序规则 | 同一线程内，前面的操作 happens-before 后面的操作 | a=1; b=2; |
+| 监视器锁规则 | unlock happens-before lock | synchronized 块 |
+| volatile 变量规则 | 写 happens-before 读 | volatile int x |
+| 线程启动规则 | start() happens-before 子线程 | thread.start() |
+| 线程终止规则 | 所有操作 happens-before join() | thread.join() |
+| 传递性规则 | A hb B, B hb C → A hb C | 复合规则 |
+
+### 3.3 volatile 底层实现
+
+```java
+// volatile 变量
+volatile int count;
+
+// 底层实现：
+// 1. 写操作后插入 StoreLoad 屏障
+// 2. 读操作前插入 LoadLoad 屏障
+// 3. 禁止指令重排序
+// 4. 保证可见性（立即刷新到主内存）
+
+// volatile vs synchronized：
+// volatile：轻量级，只保证可见性+有序性，不保证原子性
+// synchronized：重量级，保证可见性+有序性+原子性
+```
+
+## 四、JVM 类加载机制（双亲委派/打破双亲委派 SPI/Tomcat）
+
+### 4.1 双亲委派模型
+
+```mermaid
+graph TD
+    A[Bootstrap ClassLoader] --> B[Extension ClassLoader]
+    B --> C[Application ClassLoader]
+    C --> D[Custom ClassLoader]
+
+    E[加载请求] --> D
+    D --> C
+    C --> B
+    B --> A
+    A --> F[尝试加载]
+    F -->|失败| G[委托子加载器]
+```
+
+### 4.2 打破双亲委派
+
+| 场景 | 实现方式 | 示例 |
+|------|----------|------|
+| SPI | ServiceLoader + 线程上下文加载器 | JDBC Driver |
+| Tomcat | WebAppClassLoader（每个应用独立） | war 包隔离 |
+| OSGi | 模块化类加载（网状结构） | Eclipse 插件 |
+| 热部署 | 自定义 ClassLoader 重新加载 | DevTools |
+
+```java
+// SPI 打破双亲委派示例
+ServiceLoader<Driver> loader = ServiceLoader.load(Driver.class);
+// 线程上下文加载器加载 SPI 实现
+Thread.currentThread().getContextClassLoader();
+```
+
+### 4.3 Tomcat 类加载
+
+```mermaid
+graph TD
+    A[Common ClassLoader] --> B[ Catalina ClassLoader]
+    A --> C[Shared ClassLoader]
+    B --> D[WebAppClassLoader 1]
+    B --> E[WebAppClassLoader 2]
+    C --> D
+    C --> E
+
+    D --> F[Web 应用 1 类]
+    E --> G[Web 应用 2 类]
+```
+
+## 五、JVM GC 日志分析（-Xlog:gc* 关键字段解读）
+
+### 5.1 GC 日志配置
+
+```bash
+# JDK 9+ 统一日志
+-Xlog:gc*,gc+heap=debug,gc+age=trace:file=/path/gc-%t.log:time,uptime,pid:filecount=10,filesize=100M
+
+# JDK 8 及以前
+-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:/path/gc.log
+```
+
+### 5.2 关键字段解读
+
+```
+[2024-01-01T00:00:00.000+0800][0.001s][info][gc] GC(0) Pause Young (Normal) 1234.567ms
+[2024-01-01T00:00:00.001+0800][0.002s][info][gc] GC(0) Pause Full GC 5678.901ms
+[2024-01-01T00:00:00.002+0800][0.003s][info][gc] GC(0) Heap: 1024MB->512MB(2048MB)
+
+关键字段：
+  Pause Young (Normal) - Young GC 停顿
+  Pause Full GC - Full GC 停顿
+  Heap: 1024MB->512MB(2048MB) - GC前->GC后(总堆)
+  user/sys/real - 用户时间/系统时间/实际时间
+```
+
+## 六、JVM Crash 分析（hs_err_pid.log 解读）
+
+### 6.1 Crash Log 结构
+
+```
+hs_err_pid12345.log 结构：
+  1. 头部信息：JVM 版本、OS、崩溃时间
+  2. 线程信息：崩溃线程名称、状态
+  3. 信号信息：SIGSEGV/SIGBUS/SIGFPE
+  4. 寄存器状态：崩溃时寄存器值
+  5. 内存映射：加载的 so 库
+  6. 栈回溯：native 调用栈
+  7. JVM 状态：运行时状态、GC 状态
+```
+
+### 6.2 常见崩溃原因
+
+| 崩溃类型 | 信号 | 常见原因 |
+|----------|------|----------|
+| SIGSEGV | 段错误 | JNI 库野指针、栈溢出 |
+| SIGBUS | 总线错误 | 内存对齐问题、mmap 文件 |
+| SIGFPE | 浮点异常 | 除零错误 |
+| SIGABRT | 主动终止 | abort() 调用、glibc 错误 |
+
+## 七、容器环境 JVM 调优（MaxRAMPercentage/UseContainerSupport）
+
+### 7.1 容器感知配置
+
+```bash
+# JDK 8u191+ 容器感知
+-XX:+UseContainerSupport                  # 默认开启
+-XX:MaxRAMPercentage=75.0                # 最大堆占容器内存 75%
+-XX:InitialRAMPercentage=50.0            # 初始堆占容器内存 50%
+-XX:+UseOOMLoaderOutOfMemoryError        # OOM 时抛出异常而非直接退出
+-XX:MaxDirectMemorySize=256m             # 堆外内存限制
+```
+
+### 7.2 容器调优陷阱
+
+| 陷阱 | 问题 | 解决方案 |
+|------|------|----------|
+| 内存陷阱 | 读到宿主机内存 | 使用 -XX:MaxRAMPercentage |
+| CPU 陷阱 | availableProcessors 读宿主机核数 | JDK 11+ 修复 |
+| 启动陷阱 | 探针超时太短 | 考虑 JVM 启动时间 |
+
+## 八、ZGC/Shenandoah 调优参数
+
+### 8.1 ZGC 调优参数
+
+```bash
+-XX:+UseZGC                           # 启用 ZGC
+-XX:+ZGenerational                    # 分代 ZGC（JDK 21+）
+-XX:SoftMaxHeapSize=4g                # 软性堆大小
+-XX:ConcGCThreads=2                   # 并发 GC 线程数
+-XX:ZCollectionInterval=5             # GC 间隔（秒）
+-XX:+ZProactive                       # 主动回收
+```
+
+### 8.2 Shenandoah 调优参数
+
+```bash
+-XX:+UseShenandoahGC                  # 启用 Shenandoah
+-XX:ShenandoahGCHeuristics=adaptive   # 启发式策略
+-XX:ShenandoahMinFreeThreshold=10     # 最小空闲比例
+-XX:ShenandoahUncommitDelay=5000      # 释放延迟（ms）
+```
+
+## 九、async-profiler 性能剖析
+
+### 9.1 安装与使用
+
+```bash
+# 安装
+wget https://github.com/async-profiler/async-profiler/releases/download/v2.9/async-profiler-2.9-linux-x64.tar.gz
+tar xzf async-profiler-2.9-linux-x64.tar.gz
+
+# CPU 采样
+./profiler.sh -e cpu -d 30 -f cpu.html <pid>
+
+# 内存分配采样
+./profiler.sh -e alloc -d 30 -f alloc.html <pid>
+
+# Wall-clock 采样
+./profiler.sh -e wall -d 30 -f wall.html <pid>
+```
+
+### 9.2 火焰图分析
+
+```
+火焰图解读：
+  横轴 = 采样比例（越宽占用 CPU 越多）
+  纵轴 = 调用栈深度（越深调用链越长）
+  颜色无特殊含义
+
+  分析方法：
+    1. 找最宽顶帧（自身耗 CPU 多）
+    2. 看调用链（优化热点函数）
+    3. 对比优化前后（差异火焰图）
+```
+
+## 十、面试高频与易错点（续）
+
+21. **JMM 8 种操作**：read/load/use/assign/store/write/lock/unlock，保证原子性+可见性+有序性。
+22. **双亲委派意义**：防止核心类被篡改、避免类重复加载、保证类的唯一性。
+23. **volatile 不能保证原子性**：i++ 不是原子操作，需用 AtomicInteger。
+24. **JVM Crash 日志分析**：看 Problematic frame（崩在哪个 so/方法）、siginfo（信号）、Native frames。
+25. **容器 JVM 调优**：-XX:MaxRAMPercentage 替代 -Xmx，JDK 8u191+ 默认开启 UseContainerSupport。
+
+---
+
 ## 一、ZGC 与 Shenandoah：低延迟 GC
 
 - **ZGC**（JDK 11 引入、JDK 15 生产可用、JDK 21 分代 ZGC）：**染色指针（colored pointers）** + 多重映射，几乎全并发（标记/重定位/重映射都并发），停顿**不随堆大小增长**，目标 < 10ms（实测常 < 1ms）。Region 动态分小/中/大。适合超大堆（TB 级）、低延迟金融/交易系统。注意堆上限受染色位地址约束（新版本已放宽到 TB 级）。

@@ -1219,6 +1219,202 @@ public class InputValidator {
 | 失败安全 | 失败时拒绝访问 | 默认拒绝所有请求 |
 | 代码审计 | 定期安全审查 | 静态代码分析 |
 
+## 二十六、CSP 配置实例（nonce/unsafe-inline 限制）
+
+### CSP 配置
+
+```html
+<!-- nonce 方式（推荐） -->
+<meta http-equiv="Content-Security-Policy" 
+      content="default-src 'self'; 
+               script-src 'self' 'nonce-abc123'; 
+               style-src 'self' 'nonce-abc123';
+               img-src 'self' data: https:;">
+
+<!-- unsafe-inline 限制 -->
+<meta http-equiv="Content-Security-Policy" 
+      content="default-src 'self'; 
+               script-src 'self' 'unsafe-inline' https:;">
+
+<!-- 完整 CSP 配置 -->
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' 'nonce-abc123' https://cdn.example.com;
+  style-src 'self' 'nonce-abc123' https://fonts.googleapis.com;
+  img-src 'self' data: https:;
+  font-src 'self' https://fonts.gstatic.com;
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  form-action 'self';
+  base-uri 'self';
+```
+
+### CSP 配置说明
+
+| 指令 | 说明 | 推荐值 |
+|------|------|--------|
+| default-src | 默认策略 | 'self' |
+| script-src | 脚本来源 | 'self' 'nonce-xxx' |
+| style-src | 样式来源 | 'self' 'nonce-xxx' |
+| img-src | 图片来源 | 'self' data: https: |
+| connect-src | 请求来源 | 'self' |
+| frame-ancestors | 嵌入来源 | 'none' |
+
+## 二十七、CSRF 防御三方案对比（SameSite/双重提交/Origin）
+
+### CSRF 防御方案
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| SameSite Cookie | 限制 Cookie 发送范围 | 简单 | 浏览器兼容性 |
+| 双重提交 Cookie | 表单提交时携带 CSRF Token | 无状态 | 需要服务端验证 |
+| Origin Header | 检查请求来源 | 简单 | 可被伪造 |
+
+### SameSite Cookie 配置
+
+```java
+// Java Servlet 配置
+Cookie cookie = new Cookie("session", sessionId);
+cookie.setHttpOnly(true);
+cookie.setSecure(true);
+cookie.setPath("/");
+cookie.setAttribute("SameSite", "Strict");  // 或 "Lax"
+response.addCookie(cookie);
+```
+
+```nginx
+# Nginx 配置
+add_header Set-Cookie "session=abc123; HttpOnly; Secure; SameSite=Strict";
+```
+
+## 二十八、JWT 安全配置（none 攻击/密钥管理）
+
+### JWT 安全配置
+
+```java
+// 防止 none 攻击
+Algorithm algorithm = Algorithm.HMAC256(secret);
+JWTVerifier verifier = JWT.require(algorithm)
+    .withIssuer("my-app")
+    .acceptLeeway(60)  // 60 秒容错
+    .build();
+
+// 验证时检查算法
+DecodedJWT jwt = verifier.verify(token);
+if (!jwt.getAlgorithm().equals("HS256")) {
+    throw new SecurityException("Invalid algorithm");
+}
+```
+
+### 密钥管理
+
+| 实践 | 说明 |
+|------|------|
+| 使用强密钥 | 至少 256 位 |
+| 定期轮换 | 密钥过期策略 |
+| 安全存储 | 密钥管理服务（KMS） |
+| 禁用 none 算法 | 显式指定算法 |
+
+## 二十九、Web 安全响应头完整配置（HSTS/CSP/X-Frame-Options）
+
+### 安全响应头配置
+
+```nginx
+# Nginx 安全响应头
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "DENY" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'" always;
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+```
+
+### 响应头说明
+
+| 响应头 | 说明 | 推荐值 |
+|--------|------|--------|
+| X-Content-Type-Options | 防止 MIME 类型嗅探 | nosniff |
+| X-Frame-Options | 防止点击劫持 | DENY |
+| X-XSS-Protection | XSS 过滤 | 1; mode=block |
+| Referrer-Policy | 引用策略 | strict-origin-when-cross-origin |
+| HSTS | 强制 HTTPS | max-age=63072000 |
+| CSP | 内容安全策略 | 见 CSP 配置 |
+
+## 三十、OWASP Top 10 2021 速查表与防御代码
+
+### OWASP Top 10 2021
+
+| 排名 | 风险 | 防御措施 |
+|------|------|----------|
+| A01 | 访问控制失效 | 最小权限、RBAC |
+| A02 | 加密机制失效 | 使用强加密算法 |
+| A03 | 注入 | 参数化查询、输入验证 |
+| A04 | 不安全设计 | 威胁建模、安全设计 |
+| A05 | 安全配置错误 | 默认拒绝、最小安装 |
+| A06 | 易受攻击组件 | 依赖扫描、及时更新 |
+| A07 | 认证失败 | 多因素认证、强密码策略 |
+| A08 | 数据完整性失败 | 数字签名、校验和 |
+| A09 | 日志监控不足 | 完整日志、实时监控 |
+| A10 | SSRF | 白名单、网络隔离 |
+
+### 防御代码示例
+
+```java
+// SQL 注入防御
+PreparedStatement stmt = conn.prepareStatement("SELECT * FROM users WHERE id = ?");
+stmt.setLong(1, userId);
+
+// XSS 防御
+String escaped = HtmlUtils.htmlEscape(input);
+
+// CSRF 防御
+String csrfToken = generateCsrfToken();
+session.setAttribute("csrfToken", csrfToken);
+// 表单中包含：<input type="hidden" name="csrfToken" value="${csrfToken}">
+```
+
+## 三十一、XSS 分类（存储/反射/DOM 型）防御
+
+### XSS 类型与防御
+
+| 类型 | 存储位置 | 攻击方式 | 防御措施 |
+|------|----------|----------|----------|
+| 存储型 XSS | 数据库 | 恶意脚本存储到数据库 | 输入验证+输出编码 |
+| 反射型 XSS | URL 参数 | 恶意脚本在 URL 中 | 输入验证+输出编码 |
+| DOM 型 XSS | DOM | JavaScript 操作 DOM | 使用 textContent 而非 innerHTML |
+
+### 防御代码
+
+```java
+// 存储型 XSS 防御
+public String sanitizeInput(String input) {
+    if (input == null) return null;
+    return input.replaceAll("[<>\"'&]", "");
+}
+
+// 输出编码
+public String escapeHtml(String input) {
+    return input.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#x27;");
+}
+```
+
+```javascript
+// DOM XSS 防御
+// 错误方式
+element.innerHTML = userInput;
+
+// 正确方式
+element.textContent = userInput;
+
+// 或使用 DOMPurify
+element.innerHTML = DOMPurify.sanitize(userInput);
+```
+
 ## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；

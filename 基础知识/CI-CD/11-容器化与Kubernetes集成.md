@@ -1197,6 +1197,156 @@ spec:
 | 日志 | 文本型事件记录 | ELK/Loki |
 | 追踪 | 请求链路追踪 | Jaeger/Tempo |
 
+## 容器化与 Kubernetes 集成深度
+
+### Helm Chart 开发最佳实践
+
+```yaml
+# helpers.tpl 模板助手
+{{/*
+通用标签
+*/}}
+{{- define "app.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end }}
+
+# values.yaml 验证
+{{- if not .Values.image.repository }}
+{{- fail "image.repository is required" }}
+{{- end }}
+```
+
+| 实践 | 说明 |
+|------|------|
+| helpers.tpl | 提取通用模板，避免重复 |
+| Subcharts | 复用其他 Chart 作为依赖 |
+| values 验证 | 使用 required/fail 确保必填项 |
+| Chart.yaml 版本管理 | 遵循 SemVer 2.0 |
+
+### Argo CD Application 配置
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/org/charts
+    targetRevision: main
+    path: apps/my-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true           # 删除资源
+      selfHeal: true        # 自动修复
+      allowEmpty: false     # 不允许删除所有资源
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true      # 最后删除资源
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### 镜像安全扫描（Trivy 集成 CI）
+
+```yaml
+# GitHub Actions 集成
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: my-app:${{ github.sha }}
+    format: 'sarif'
+    output: 'trivy-results.sarif'
+    severity: 'CRITICAL,HIGH'
+    exit-code: '1'  # 发现高危漏洞时失败
+
+- name: Upload Trivy scan results
+  uses: github/codeql-action/upload-sarif@v2
+  with:
+    sarif_file: 'trivy-results.sarif'
+```
+
+### K8s RBAC 权限模型
+
+```yaml
+# Role（命名空间级）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+
+# ClusterRole（集群级）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-reader
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: default
+subjects:
+- kind: User
+  name: jane
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+| 资源 | 作用域 | 说明 |
+|------|--------|------|
+| Role | 命名空间 | 命名空间内权限 |
+| ClusterRole | 集群 | 集群级权限 |
+| RoleBinding | 命名空间 | 绑定用户到 Role |
+| ClusterRoleBinding | 集群 | 绑定用户到 ClusterRole |
+
+### 容器运行时对比
+
+| 运行时 | 语言 | 特点 | 适用 |
+|--------|------|------|------|
+| containerd | Go | CNCF 毕业项目，主流选择 | K8s 默认 |
+| CRI-O | Go | 轻量级，仅支持 K8s | OpenShift |
+| gVisor | Go | 用户态内核，安全隔离 | 多租户 |
+| Kata Containers | Go | 轻量级 VM，安全隔离 | 安全敏感 |
+
+### 本篇补充 Checklist
+
+- [ ] Helm chart 使用 helpers.tpl 提取通用模板
+- [ ] Argo CD 启用 automated sync + selfHeal
+- [ ] 镜像扫描集成 CI（Trivy/Snyk）
+- [ ] RBAC 最小权限原则
+- [ ] 容器运行时选型考虑安全需求
+
 ## 本篇补充 Checklist
 
 - [ ] 免 daemon 构建用 Kaniko / BuildKit，不挂 docker.sock，secret 用 mount。

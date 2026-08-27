@@ -1220,3 +1220,193 @@ perf record -e sched:sched_switch -g -p <pid> -- sleep 30
 ```
 
 > 一句话：**Linux 排障三板斧：`top` 看整体 → `perf/strace` 定热点 → `jstack/jmap` 进应用——wa 高查 IO、us 高查代码、load 高查阻塞（D 状态）**。
+
+## CPU 高完整定位链路（top→top -Hp→printf→jstack 对照）
+
+### 完整排查流程
+
+```bash
+# 1. top 查看整体 CPU 使用
+top -bn1 | head -20
+# 关注：%Cpu(s): us(用户态), sy(内核态), wa(IO等待), id(空闲)
+
+# 2. top -Hp <pid> 查看线程 CPU
+top -Hp <java_pid>
+# 记录 CPU 最高的线程 PID
+
+# 3. printf '%x' <tid> 转换为 16 进制
+printf '%x\n' <tid>
+# 输出如：1a2b
+
+# 4. jstack <pid> | grep <tid_hex> 查看线程栈
+jstack <java_pid> | grep "1a2b" -A 30
+```
+
+### 排查路径图
+
+```mermaid
+graph TD
+    A[CPU 高] --> B[top 查看整体]
+    B --> C{us 高还是 sy 高?}
+    C -->|us 高| D[用户态代码问题]
+    C -->|sy 高| E[内核态/系统调用]
+    C -->|wa 高| F[IO 等待]
+    D --> G[jstack 查看线程栈]
+    E --> H[strace 跟踪系统调用]
+    F --> I[iostat/pidstat 定位 IO]
+```
+
+## 内存泄漏 vs 内存溢出判别流程图
+
+```mermaid
+graph TD
+    A[内存问题] --> B{进程是否退出?}
+    B -->|是| C[内存溢出 OOM]
+    B -->|否| D[内存泄漏]
+    C --> E[查看 dmesg/journalctl]
+    E --> F{OOM 类型?}
+    F -->|Java heap space| G[堆内存不足]
+    F -->|Metaspace| H[类加载泄漏]
+    F -->|Direct buffer| I[堆外内存泄漏]
+    D --> J[监控内存增长趋势]
+    J --> K{是否持续增长?}
+    K -->|是| L[内存泄漏]
+    K -->|否| M[内存使用不合理]
+```
+
+## io_wait 高用 iostat/pidstat 定位
+
+```bash
+# 1. iostat 查看磁盘 IO
+iostat -x 1 10
+# 关注：%util（磁盘使用率）、await（平均 IO 等待时间）
+
+# 2. pidstat 查看进程 IO
+pidstat -d 1 10
+# 关注：kB_rd/s（读速率）、kB_wr/s（写速率）
+
+# 3. iotop 查看 IO 最高的进程
+iotop -o -P
+
+# 4. 定位具体文件
+lsof -p <pid> | grep REG
+strace -e trace=read,write -p <pid>
+```
+
+### IO 排查清单
+
+| 工具 | 用途 | 关注指标 |
+|------|------|----------|
+| iostat -x | 磁盘级 IO | %util, await, r/s, w/s |
+| pidstat -d | 进程级 IO | kB_rd/s, kB_wr/s |
+| iotop | 进程 IO 排名 | Total DISK READ/WRITE |
+| lsof | 文件句柄 | 打开的文件列表 |
+
+## 网络丢包排查路径（ethtool -S→netstat -s→dropwatch）
+
+### 排查流程
+
+```bash
+# 1. 确认丢包
+netstat -s | grep -i "drop\|retrans"
+ss -s
+
+# 2. 网卡级别
+ethtool -S eth0 | grep -i "drop\|error"
+cat /proc/net/dev
+
+# 3. 内核级别
+nstat -az | grep -i "drop\|retrans"
+cat /proc/net/snmp
+
+# 4. 连接级别
+ss -tnp state established
+netstat -an | grep ESTABLISHED | wc -l
+
+# 5. 抓包分析
+tcpdump -i eth0 -w /tmp/drop.pcap
+wireshark 分析
+```
+
+### 丢包类型与原因
+
+| 丢包类型 | 原因 | 解决方案 |
+|----------|------|----------|
+| RX drop | 接收缓冲区满 | 调大 net.core.rmem_max |
+| TX drop | 发送缓冲区满 | 调大 net.core.wmem_max |
+| FIFO overrun | 网卡队列满 | 调大网卡队列长度 |
+| Frame errors | 物理层错误 | 检查网线/交换机 |
+
+## dmesg OOM Killer 日志解读
+
+### OOM 日志分析
+
+```bash
+# 查看 OOM 事件
+dmesg | grep -i "oom"
+journalctl -k | grep -i "oom"
+
+# 日志格式：
+# [xxx.xxx] Out of memory: Kill process 12345 (java) score 800 or sacrifice child
+# [xxx.xxx] Killed process 12345 (java) total-vm:4096000kB, anon-rss:2048000kB
+
+# OOM 分数计算：
+# 基础分 = 进程 RSS / 总内存 × 1000
+# 调整分 = oom_score_adj
+# 最终分 = 基础分 + 调整分
+```
+
+### OOM 防护
+
+```bash
+# 查看 OOM 分数
+cat /proc/<pid>/oom_score
+cat /proc/<pid>/oom_score_adj
+
+# 设置 OOM 分数调整（不被杀）
+echo -1000 > /proc/<pid>/oom_score_adj
+
+# cgroup 内存限制
+cat /sys/fs/cgroup/memory/<cgroup>/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/<cgroup>/memory.usage_in_bytes
+```
+
+## perf flamegraph 生成步骤
+
+### 火焰图完整流程
+
+```bash
+# 1. 安装工具
+apt install linux-tools-common linux-tools-$(uname -r)
+pip install perf-flamegraph
+
+# 2. 采集数据
+perf record -g -p <pid> -- sleep 30
+# 或
+perf record -g -F 99 -p <pid> -- sleep 30
+
+# 3. 生成火焰图
+perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg
+
+# 4. 差异火焰图（优化前后）
+difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
+```
+
+### 火焰图分析
+
+```
+火焰图解读：
+  横轴 = 采样比例（越宽占用 CPU 越多）
+  纵轴 = 调用栈深度（越深调用链越长）
+  颜色无特殊含义
+
+  分析方法：
+    1. 找最宽顶帧（自身耗 CPU 多）
+    2. 看调用链（优化热点函数）
+    3. 对比优化前后（差异火焰图）
+
+  火焰图类型：
+    CPU 火焰图：分析 CPU 热点
+    Off-CPU 火焰图：分析阻塞等待
+    内存火焰图：分析内存分配
+```

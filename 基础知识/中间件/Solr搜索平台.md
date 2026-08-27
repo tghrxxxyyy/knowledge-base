@@ -1267,3 +1267,139 @@ bin/solr api -get http://localhost:8983/solr/admin/cores?action=STATUS&core=my_c
 | 适用场景 | 传统企业搜索/电商分面搜索 |
 | 替代方案 | Elasticsearch（日志/实时/云原生） |
 | 一句话 | 「Lucene 企业级封装 + 全文检索 + 分面搜索」 |
+
+## Solr 核心配置详解
+
+### solrconfig.xml 关键配置
+
+```xml
+<!-- 索引配置 -->
+<indexConfig>
+  <lockType>${solr.lock.type:native}</lockType>
+  <ramBufferSizeMB>32</ramBufferSizeMB>
+  <maxBufferedDocs>1000</maxBufferedDocs>
+  <mergePolicyFactory class="org.apache.solr.index.TieredMergePolicyFactory">
+    <int name="maxMergeAtOnce">10</int>
+    <int name="segmentsPerTier">10</int>
+  </mergePolicyFactory>
+</indexConfig>
+
+<!-- 查询配置 -->
+<query>
+  <maxBooleanClauses>1024</maxBooleanClauses>
+  <filterCache class="solr.FastLRUCache" size="512" initialSize="512" autowarmCount="0"/>
+  <queryResultCache class="solr.LRUCache" size="512" initialSize="512" autowarmCount="0"/>
+  <enableLazyFieldLoading>true</enableLazyFieldLoading>
+</query>
+```
+
+### 关键配置参数
+
+| 参数 | 说明 | 建议值 |
+|------|------|--------|
+| ramBufferSizeMB | 内存缓冲区大小 | 32-128MB |
+| maxBufferedDocs | 最大缓冲文档数 | 1000-10000 |
+| mergePolicy | 合并策略 | TieredMergePolicy |
+| filterCache | 过滤器缓存 | 256-1024 |
+| queryResultCache | 查询结果缓存 | 256-1024 |
+
+## Solr 全量导入与增量导入
+
+### DataImportHandler 配置
+
+```xml
+<!-- data-config.xml -->
+<dataConfig>
+  <dataSource type="JdbcDataSource" 
+              driver="com.mysql.jdbc.Driver"
+              url="jdbc:mysql://localhost:3306/mydb"
+              user="root" password="root"/>
+  <document>
+    <entity name="item" query="SELECT id,name,description FROM items">
+      <field column="id" name="id"/>
+      <field column="name" name="name"/>
+      <field column="description" name="description"/>
+    </entity>
+  </document>
+</dataConfig>
+```
+
+### 增量导入策略
+
+| 策略 | 实现方式 | 适用场景 |
+|------|----------|----------|
+| 时间戳 | updated_at 字段 | 实时性要求高 |
+| 触发器 | 数据库触发器 | 数据一致性要求高 |
+| 日志解析 | binlog/CDC | 实时同步 |
+| 定时全量 | 全量导入 | 数据量小 |
+
+## SolrJ 客户端使用
+
+### SolrJ 查询示例
+
+```java
+// 创建 SolrClient
+SolrClient client = new HttpSolrClient.Builder("http://localhost:8983/solr/mycore").build();
+
+// 构建查询
+SolrQuery query = new SolrQuery();
+query.setQuery("*:*");
+query.addFilterQuery("status:ACTIVE");
+query.setSort("create_time", SolrQuery.ORDER.desc);
+query.setStart(0);
+query.setRows(10);
+query.setFacet(true);
+query.addFacetField("category");
+query.setHighlight(true);
+query.addHighlightField("name");
+
+// 执行查询
+QueryResponse response = client.query(query);
+SolrDocumentList docs = response.getResults();
+
+// 处理结果
+for (SolrDocument doc : docs) {
+    String id = (String) doc.getFieldValue("id");
+    String name = (String) doc.getFieldValue("name");
+}
+
+// 处理高亮
+Map<String, Map<String, List<String>>> highlighting = response.getHighlighting();
+```
+
+### SolrJ 更新示例
+
+```java
+// 添加文档
+SolrInputDocument doc = new SolrInputDocument();
+doc.addField("id", "1");
+doc.addField("name", "测试商品");
+doc.addField("description", "这是一个测试商品");
+client.add(doc);
+client.commit();
+
+// 批量添加
+List<SolrInputDocument> docs = new ArrayList<>();
+for (Item item : items) {
+    SolrInputDocument doc = new SolrInputDocument();
+    doc.addField("id", item.getId());
+    doc.addField("name", item.getName());
+    docs.add(doc);
+}
+client.add(docs);
+client.commit();
+
+// 删除文档
+client.deleteById("1");
+client.commit();
+```
+
+## Solr 与 Elasticsearch 对比
+
+| 维度 | Solr | Elasticsearch |
+|------|------|---------------|
+| 架构 | SolrCloud | 分布式 |
+| 查询语法 | SolrQL | DSL |
+| 适用场景 | 企业搜索 | 日志/全文搜索 |
+| 运维复杂度 | 中 | 中 |
+| 许可证 | Apache 2.0 | SSPL |

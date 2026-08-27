@@ -1292,3 +1292,120 @@ Lindorm 搜索引擎（Lindorm Search）：
 | 资源弹性 | 闲时缩容，忙时扩容 | 30-50% |
 
 ## 与其他板块的关系
+
+- Lindorm 与云数据库对比见「[云上数据库与缓存生态](../中间件/云上数据库与缓存生态.md)」；
+- Lindorm 与 HBase 对比见「[中间件/HBase列式存储](../中间件/HBase列式存储.md)」；
+- Lindorm 与 ClickHouse 对比见「[中间件/ClickHouse](../中间件/ClickHouse.md)」；
+- Lindorm 与 InfluxDB 对比见「[时序库/InfluxDB](./InfluxDB.md)」。
+
+## Lindorm 最佳实践
+
+### 数据模型设计
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 合理设计 Tag | 避免高基数 | 查询高效 |
+| 使用时间分区 | 按时间范围分区 | 写入均衡 |
+| 合理设置 TTL | 数据自动过期 | 存储优化 |
+| 使用压缩 | ZSTD 压缩 | 减少存储 |
+
+### 查询优化
+
+| 优化项 | 方法 | 效果 |
+|--------|------|------|
+| 索引优化 | 合理建立索引 | 查询加速 |
+| 分区裁剪 | 按时间范围查询 | 减少扫描 |
+| 聚合查询 | 预计算聚合 | 查询加速 |
+| 缓存 | 热数据缓存 | 命中率提升 |
+
+## Lindorm 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 写入延迟 | 写入操作延迟 | > 10ms |
+| 读取延迟 | 读取操作延迟 | > 100ms |
+| 内存使用率 | 内存使用 | > 80% |
+| 磁盘使用率 | 磁盘使用 | > 80% |
+| 连接数 | 数据库连接数 | > 80% 最大连接 |
+
+### 告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: lindorm-alerts
+    rules:
+      - alert: LindormWriteLatencyHigh
+        expr: lindorm_write_latency_seconds > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lindorm写入延迟过高"
+
+      - alert: LindormReadLatencyHigh
+        expr: lindorm_read_latency_seconds > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lindorm读取延迟过高"
+```
+
+## Lindorm 故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 写入失败 | 检查连接/配额 | 调整配额 |
+| 查询超时 | 检查索引/数据量 | 优化查询 |
+| 存储满 | 检查数据量/清理 | 扩容/清理 |
+| 连接数满 | 检查连接池/调整 | 增加连接数 |
+
+### 故障排查命令
+
+```sql
+-- 查看表结构
+SHOW CREATE TABLE t;
+
+-- 查看索引
+SHOW INDEX FROM t;
+
+-- 查看执行计划
+EXPLAIN SELECT * FROM t WHERE id = 1;
+
+-- 查看慢查询
+SELECT * FROM information_schema.slow_query ORDER BY query_time DESC LIMIT 10;
+```
+
+## Lindorm 与其他时序库对比
+
+| 维度 | Lindorm | InfluxDB | Prometheus |
+|------|---------|----------|------------|
+| 数据模型 | 宽表+时序 | Measurement | Metric |
+| 查询语言 | SQL | InfluxQL/Flux | PromQL |
+| 适用场景 | IoT/日志 | IoT/DevOps | 监控 |
+| 高可用 | 集群 | 集群 | 联邦 |
+| 许可证 | 商业 | MIT/OSS | Apache 2.0 |
+
+## Lindorm 版本对比
+
+| 版本 | 功能 | 适用场景 | 许可证 |
+|------|------|----------|--------|
+| Lindorm 基础版 | 基础功能 | 开发/测试 | 商业 |
+| Lindorm 企业版 | 高级功能 | 生产环境 | 商业 |
+| Lindorm 旗舰版 | 全功能 | 大型企业 | 商业 |
+
+### 版本选择建议
+
+```
+版本选择：
+  开发/测试 → 基础版
+  生产环境 → 企业版
+  大型企业 → 旗舰版
+  需要高可用 → 企业版或旗舰版
+  需要全功能 → 旗舰版
+```

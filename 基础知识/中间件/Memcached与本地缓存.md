@@ -694,6 +694,265 @@ public void putWithRandom(String key, Object value) {
 }
 ```
 
+## 九-8、Caffeine W-TinyLFU 深度解析
+
+### CountMinSketch 近似计数原理
+
+```text
+CountMinSketch（计数最小草图）：
+  用于近似估算 key 的访问频率
+  空间效率极高（4-bit 计数器）
+
+  结构：
+    4 个独立的哈希函数
+    4 行计数器（每行 16KB）
+    通过 4 次哈希取最小值估算频率
+
+  原理：
+    hash1(key) → row1[col1]++
+    hash2(key) → row2[col2]++
+    hash3(key) → row3[col3]++
+    hash4(key) → row4[col4]++
+    频率估算 = min(row1[col1], row2[col2], row3[col3], row4[col4])
+
+  误判率：
+    误判率 ≈ 1/(2^counter_bits) × 2
+    实际测试：80%+ 命中率场景下，频率估算误差 <5%
+
+  衰减机制：
+    定期将所有计数器减半
+    防止历史热点永久占用计数空间
+    窗口衰减 = 新鲜度保障
+```
+
+### W-TinyLFU 三层架构
+
+```text
+W-TinyLFU = Window TinyLFU（频率 + 新鲜度）
+
+组成：
+  Window Cache（1% 容量）：LRU，短期热点快速进入
+  Main Cache（99% 容量）：Segmented LRU（sLRU）
+    Probation（10%）：新数据进入，低频淘汰
+    Protected（90%）：高频数据保护，不轻易淘汰
+
+准入策略：
+  新数据先入 Window Cache
+  要进入 Main Cache → 频率 > Main 中最低频率
+  → 自然淘汰低频数据，保留高频热点
+
+对比传统算法：
+  LRU：只看时间，一次性热点会污染
+  LFU：只看频率，新热点进不来
+  W-TinyLFU：频率+新鲜度，兼顾两者
+  准确率接近 LFU，性能接近 LRU
+```
+
+## 九-9、expireAfterWrite vs expireAfterAccess 决策树
+
+```text
+选择决策树：
+  
+  数据会频繁更新吗？
+    ├─ 是 → expireAfterWrite（写入后过期）
+    │    └─ 更新频率决定过期时间
+    │        快速变化 → 短过期（10-60s）
+    │        缓慢变化 → 长过期（5-30min）
+    └─ 否 → expireAfterAccess（访问后过期）
+         └─ 访问频率决定过期时间
+             高频访问 → 长过期（5-30min）
+             低频访问 → 短过期（1-5min）
+
+组合使用：
+  expireAfterWrite(5min) + expireAfterAccess(30min)
+  → 最长 5 分钟过期，热点可续命
+```
+
+| 策略 | 行为 | 适用场景 |
+|------|------|----------|
+| expireAfterWrite | 写入后固定时间过期 | 防脏数据（如配置/缓存 DB 结果） |
+| expireAfterAccess | 访问后重置过期时间 | 防热点被清（如用户 Session） |
+| 两者组合 | 可叠加（取较短时间） | 热点数据 + 最大容忍时间 |
+
+## 九-10、Guava Cache removalListener 异步通知
+
+```java
+// Guava Cache removalListener
+LoadingCache<String, Object> cache = CacheBuilder.newBuilder()
+    .maximumSize(10_000)
+    .removalListener(notification -> {
+        // cause: SIZE/EVICTED/EXPIRED/REPLACED/EXPLICIT/INVALIDATION
+        log.info("Removed: key={}, cause={}", 
+            notification.getKey(), notification.getCause());
+    })
+    .build(key -> loadFromDb(key));
+
+// 注意：
+// 1. removalListener 在删除时同步执行（会阻塞）
+// 2. 需要异步 → 用 AsyncLoadingCache + 异步 listener
+// 3. 批量异步通知用 ListeningExecutorService
+
+// 批量异步通知（更高效）
+ListeningExecutorService executor = MoreExecutors.newFixedThreadPool(4);
+CacheBuilder.newBuilder()
+    .removalListenerWithExecutor(executor, notification -> {
+        asyncHandleEviction(notification);
+    })
+    .build();
+```
+
+## 九-11、本地缓存分布式一致性
+
+### 延迟双删方案
+
+```
+延迟双删 = 保证 Redis 与 DB 最终一致
+
+流程：
+  1. 写入 DB（更新数据）
+  2. 删除本地缓存（Caffeine）
+  3. 删除 Redis 缓存
+  4. 延迟 N 毫秒（如 500ms）
+  5. 再次删除 Redis 缓存（防止并发读写脏数据）
+
+为什么延迟双删：
+  并发场景：线程 A 写 DB → 线程 B 读 Redis（旧值）→ 写本地缓存
+  → 线程 A 删 Redis → 线程 B 的本地缓存已是旧值
+  → 延迟后再删一次，确保最终一致
+```
+
+### Canal 订阅方案
+
+```
+Canal 订阅 DB binlog → 广播失效本地缓存
+
+流程：
+  1. MySQL binlog → Canal
+  2. Canal 解析变更事件
+  3. 广播失效本地缓存（MQ/Redis Pub/Sub）
+  4. 本地缓存 TTL 兜底
+
+优势：
+  - 无代码侵入
+  - 最终一致（延迟秒级）
+  - 跨语言/跨服务
+```
+
+## 九-12、Redis 与本地缓存双写一致性
+
+### 最终一致 vs 强一致
+
+```text
+最终一致方案（推荐）：
+  写入流程：DB → 删除 Redis → 删除本地缓存
+  读取流程：本地缓存 → Redis → DB
+  一致性保证：通过延迟删除 + TTL 兜底
+
+强一致方案（复杂）：
+  写入流程：DB → 删除 Redis → 广播删除本地缓存
+  读取流程：本地缓存 → Redis → DB
+  一致性保证：通过消息广播 + 版本号
+
+实现对比：
+  最终一致：延迟双删 + Canal 监听 + TTL 兜底
+  强一致：Redis 订阅 + 本地缓存版本号 + CAS 更新
+```
+
+## 九-13、缓存穿透击穿雪崩三件套代码
+
+```java
+// 1. 缓存穿透（查不存在的 key）→ 布隆过滤器 + 空值缓存
+public Object getWithBloom(String key) {
+    if (!bloomFilter.mightContain(key)) return null;  // 布隆过滤器拦截
+    Object value = cache.getIfPresent(key);
+    if (value == null) {
+        value = db.query(key);
+        if (value == null) {
+            cache.put(key, NULL_VALUE);  // 空值缓存（短 TTL）
+        } else {
+            cache.put(key, value);
+        }
+    }
+    return value;
+}
+
+// 2. 缓存击穿（热点 key 过期）→ 分布式锁重建
+public Object getWithLock(String key) {
+    Object value = cache.getIfPresent(key);
+    if (value != null) return value;
+    String lockKey = "lock:" + key;
+    if (redis.setnx(lockKey, "1", 10, TimeUnit.SECONDS)) {
+        try {
+            value = db.query(key);
+            cache.put(key, value);
+        } finally {
+            redis.del(lockKey);
+        }
+    } else {
+        Thread.sleep(100);
+        return cache.getIfPresent(key);
+    }
+    return value;
+}
+
+// 3. 缓存雪崩（大批 key 同时过期）→ 随机过期时间
+public void putWithRandom(String key, Object value) {
+    int ttl = baseTtl + ThreadLocalRandom.current().nextInt(60);
+    cache.put(key, value, ttl, TimeUnit.SECONDS);
+}
+```
+
+## 九-14、布隆过滤器误判率公式
+
+```
+布隆过滤器误判率公式：
+  P ≈ (1 - e^(-kn/m))^k
+  
+  其中：
+    m = 位数组大小（bit）
+    n = 元素数量
+    k = 哈希函数个数
+  
+  最优 k 值：
+    k = (m/n) × ln(2)
+  
+  示例：
+    预期 100 万元素，误判率 1%
+    m = 100万 × 10 × ln(2) ≈ 693万 bit ≈ 866KB
+    k = 7
+
+  Guava 实现：
+    BloomFilter.create(
+      Funnels.stringFunnel(Charset.defaultCharset()),
+      1000000,  // 预期元素数
+      0.01      // 误判率
+    )
+```
+
+## 九-15、一致性哈希虚拟节点
+
+```
+一致性哈希环（客户端实现）：
+
+Key 哈希 → 环上位置 → 顺时针找最近节点
+  增删节点只影响相邻 key（~1/N 数据迁移）
+
+虚拟节点：
+  每个真实节点 → M 个虚拟节点（均匀分布）
+  默认 100-200 个虚拟节点/节点
+  
+  解决问题：
+  ├── 物理节点少时数据倾斜
+  ├── 异构硬件性能差异
+  └── 增删节点影响范围更小
+
+负载均衡因子：
+  虚拟节点数越多，分布越均匀
+  但内存开销增加（每个虚拟节点需维护路由表）
+  
+  推荐：100-200 个虚拟节点/物理节点
+```
+
 ## 与其他板块的关系
 
 - 和「**基础知识/redis知识**」「**场景设计/多级缓存框架**」「**场景设计/缓存经典三问与一致性**」：本文是「本地 + Memcached」两翼，Redis 与多级缓存体系见那三篇。

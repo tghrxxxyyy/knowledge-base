@@ -1280,3 +1280,132 @@ Schema 演进策略：
 - 消息幂等见「[场景设计/幂等设计](../../场景设计/幂等设计.md)」。
 
 > 一句话：**Schema Registry = Schema 集中注册（Avro/Protobuf/JSON）+ 版本兼容策略（BACKWARD 默认）+ 客户端自动编解码（magic byte + ID）+ 治理体系（评审/审批/审计）——选型先看「格式（Kafka 生态→Avro）」，再定「兼容策略（默认 BACKWARD）」，最后配「认证 + CI 兼容检查 + 集群高可用 + 监控」**。
+
+## Schema Registry 集群部署
+
+### 集群架构
+
+```
+Schema Registry 集群：
+  多节点部署
+    → 主节点（Leader）
+    → 从节点（Follower）
+    → 客户端随机选择节点
+
+  同步机制：
+    Leader 接收写请求
+    Follower 同步 Leader
+    读请求可到任意节点
+
+  高可用：
+    Leader 故障 → 选举新 Leader
+    数据同步 → 保证一致性
+    客户端重试 → 自动切换节点
+```
+
+### 集群配置
+
+| 参数 | 说明 | 建议值 |
+|------|------|--------|
+| kafkastore.bootstrap.servers | Kafka 地址 | 集群地址 |
+| kafkastore.topic | 存储 topic | _schemas |
+| master.eligibility | 是否可选为主 | true |
+| leader.read.timeout.ms | 读超时 | 30000 |
+
+## Schema Registry 安全配置
+
+### 认证与授权
+
+```
+认证方式：
+  1. SASL/PLAIN
+     用户名密码认证
+     简单易实现
+
+  2. SASL/SCRAM
+     动态密码管理
+     更安全
+
+  3. SSL/TLS
+     证书认证
+     最安全
+
+  4. OAuth2
+     第三方认证
+     企业级
+```
+
+### 安全配置
+
+```properties
+# SASL 配置
+kafkastore.bootstrap.servers=PLAINTEXT://kafka:9092
+kafkastore.security.protocol=SASL_PLAINTEXT
+kafkastore.sasl.mechanism=PLAIN
+kafkastore.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret";
+```
+
+## Schema Registry 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| Schema 注册失败率 | 注册失败比例 | > 1% |
+| Schema 兼容性检查失败率 | 兼容性检查失败比例 | > 5% |
+| 集群同步延迟 | Follower 同步延迟 | > 10s |
+| 内存使用率 | JVM 内存使用 | > 80% |
+| 请求延迟 | API 请求延迟 | > 1s |
+
+### 告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: schema-registry
+    rules:
+      - alert: SchemaRegistrationFailed
+        expr: rate(schema_registry_registration_failed_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schema注册失败率过高"
+
+      - alert: SchemaCompatibilityCheckFailed
+        expr: rate(schema_registry_compatibility_check_failed_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schema兼容性检查失败率过高"
+```
+
+## Schema Registry 故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 注册失败 | 检查Schema格式 | 修正Schema |
+| 兼容性失败 | 检查兼容性策略 | 调整Schema |
+| 集群不同步 | 检查网络/日志 | 重启节点 |
+| 性能下降 | 检查JVM/网络 | 调整参数 |
+
+### 故障排查命令
+
+```bash
+# 检查集群状态
+curl -s http://localhost:8081/subjects
+
+# 检查Schema
+curl -s http://localhost:8081/subjects/my-topic-value/versions
+
+# 检查兼容性
+curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  -d '{"schema": "..."}' \
+  http://localhost:8081/subjects/my-topic-value/compatibility
+
+# 检查配置
+curl -s http://localhost:8081/config
+```

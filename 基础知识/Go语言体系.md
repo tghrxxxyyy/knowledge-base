@@ -1205,6 +1205,223 @@ go tool pprof http://localhost:6060/debug/pprof/block
 
 ## 与其他板块的关系
 
+## 二十、Go GC 调优（GOGC/内存限制/debug.SetGCPercent）
+
+### 20.1 GOGC 参数
+
+```bash
+# GOGC 控制 GC 触发频率（默认 100，表示堆增长 100% 时触发 GC）
+GOGC=50      # 更频繁 GC（堆增长 50% 触发）
+GOGC=200     # 更少 GC（堆增长 200% 触发）
+GOGC=off     # 禁用 GC
+
+# Go 1.19+ 内存限制
+GOMEMLIMIT=4GiB  # 设置内存限制（硬限制）
+```
+
+### 20.2 debug.SetGCPercent
+
+```go
+import "runtime/debug"
+
+// 动态调整 GC 百分比
+debug.SetGCPercent(50)  // 堆增长 50% 触发 GC
+
+// 设置内存限制（Go 1.19+）
+debug.SetMemoryLimit(4 * 1024 * 1024 * 1024)  // 4GB
+```
+
+### 20.3 GC 调优建议
+
+| 场景 | 参数 | 说明 |
+|------|------|------|
+| 低延迟 | GOGC=off + GOMEMLIMIT | 禁用 GC，用内存限制兜底 |
+| 高吞吐 | GOGC=200 | 减少 GC 频率 |
+| 内存敏感 | GOGC=50 | 更频繁回收 |
+
+## 二十一、Go goroutine 泄漏排查（pprof/泄漏检测工具）
+
+### 21.1 pprof 排查
+
+```go
+import _ "net/http/pprof"
+
+// 启动 pprof HTTP 服务
+go func() {
+    http.ListenAndServe(":6060", nil)
+}()
+```
+
+```bash
+# 查看 goroutine 数量
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+
+# 交互式分析
+(pprof) top 20
+(pprof) web
+```
+
+### 21.2 泄漏检测工具
+
+```bash
+# 使用 golang.org/x/tools/go/analysis
+go install golang.org/x/tools/go/analysis/passes/printf/cmd/printf@latest
+
+# 使用 goleak（Uber 开源）
+go install go.uber.org/goleak/cmd/goleak@latest
+goleak -test ./...
+```
+
+## 二十二、Go channel 使用模式（Fan-in/Fan-out/Pipeline/Error Group）
+
+### 22.1 Fan-out/Fan-in 模式
+
+```go
+// Fan-out：多个 goroutine 从同一 channel 读取
+func fanOut(jobs <-chan Job, workerCount int) []<-chan Result {
+    results := make([]<-chan Result, workerCount)
+    for i := 0; i < workerCount; i++ {
+        results[i] = worker(jobs)
+    }
+    return results
+}
+
+// Fan-in：多个 channel 合并为一个
+func fanIn(channels ...<-chan Result) <-chan Result {
+    var wg sync.WaitGroup
+    merged := make(chan Result)
+    for _, ch := range channels {
+        wg.Add(1)
+        go func(c <-chan Result) {
+            defer wg.Done()
+            for result := range c {
+                merged <- result
+            }
+        }(ch)
+    }
+    go func() {
+        wg.Wait()
+        close(merged)
+    }()
+    return merged
+}
+```
+
+### 22.2 Error Group
+
+```go
+import "golang.org/x/sync/errgroup"
+
+func main() {
+    g, ctx := errgroup.WithContext(context.Background())
+    
+    g.Go(func() error {
+        return task1(ctx)
+    })
+    
+    g.Go(func() error {
+        return task2(ctx)
+    })
+    
+    if err := g.Wait(); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+## 二十三、Go interface 设计原则（隐式实现/空接口/duck typing）
+
+### 23.1 隐式实现
+
+```go
+// 接口定义
+type Writer interface {
+    Write([]byte) (int, error)
+}
+
+// 隐式实现（无需声明 implements）
+type FileWriter struct {
+    file *os.File
+}
+
+func (w *FileWriter) Write(data []byte) (int, error) {
+    return w.file.Write(data)
+}
+
+// FileWriter 自动实现 Writer 接口
+var _ Writer = &FileWriter{}
+```
+
+### 23.2 空接口与类型断言
+
+```go
+// 空接口（任意类型）
+func printAny(v interface{}) {
+    switch val := v.(type) {
+    case string:
+        fmt.Println("string:", val)
+    case int:
+        fmt.Println("int:", val)
+    default:
+        fmt.Println("unknown:", val)
+    }
+}
+```
+
+## 二十四、Go 测试最佳实践（Table-driven Test/Mock/Testify）
+
+### 24.1 Table-driven Test
+
+```go
+func TestAdd(t *testing.T) {
+    tests := []struct {
+        name     string
+        a, b     int
+        expected int
+    }{
+        {"positive", 1, 2, 3},
+        {"negative", -1, -2, -3},
+        {"zero", 0, 0, 0},
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := Add(tt.a, tt.b)
+            if result != tt.expected {
+                t.Errorf("Add(%d, %d) = %d, want %d", tt.a, tt.b, result, tt.expected)
+            }
+        })
+    }
+}
+```
+
+### 24.2 Testify Mock
+
+```go
+import "github.com/stretchr/testify/mock"
+
+type MockUserRepository struct {
+    mock.Mock
+}
+
+func (m *MockUserRepository) GetByID(id int) (*User, error) {
+    args := m.Called(id)
+    return args.Get(0).(*User), args.Error(1)
+}
+
+func TestGetUser(t *testing.T) {
+    mockRepo := new(MockUserRepository)
+    mockRepo.On("GetByID", 1).Return(&User{Name: "John"}, nil)
+    
+    service := NewUserService(mockRepo)
+    user, err := service.GetUser(1)
+    
+    assert.NoError(t, err)
+    assert.Equal(t, "John", user.Name)
+    mockRepo.AssertExpectations(t)
+}
+```
+
 - etcd 源码见「[etcd 源码](../源码系列/etcd源码.md)」；
 - Kubernetes 见「[Kubernetes 核心](../云原生/Kubernetes核心.md)」；
 - gRPC 见「[gRPC](../基础知识/中间件/gRPC.md)」；

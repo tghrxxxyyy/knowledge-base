@@ -1272,3 +1272,141 @@ tar czf jenkins-backup-$(date +%Y%m%d).tar.gz \
   JENKINS_HOME/plugins/*.jpi \
   JENKINS_HOME/jobs/*/config.xml
 ```
+
+## 二十七、Pipeline as Code 高级模式
+
+### 二十七.1 Shared Library 架构
+
+```
+Shared Library 结构：
+  vars/
+   .groovy              # 全局变量/方法
+    deploy.groovy        # 可调用的 Step
+    buildAndTest.groovy  # 可复用的 Pipeline 片段
+  src/
+    com/example/Utils.groovy   # 类库
+  resources/
+    templates/            # 配置模板
+
+  引用方式：
+    @Library('my-shared-lib') _
+    
+  优势：
+    跨项目复用
+    统一构建逻辑
+    版本控制
+```
+
+### 二十七.2 递归检测与并行 Stage
+
+```groovy
+// 并行 Stage
+stage('Build & Test') {
+    parallel {
+        stage('Unit Tests') {
+            steps { sh 'mvn test' }
+        }
+        stage('Integration Tests') {
+            steps { sh 'mvn verify -Pintegration' }
+        }
+        stage('Code Analysis') {
+            steps { sh 'sonar-scanner' }
+        }
+    }
+}
+
+// 递归检测
+stage('Quality Gates') {
+    steps {
+        script {
+            def gates = [
+                [name: 'Unit Tests', condition: { currentBuild.result != 'FAILURE' }],
+                [name: 'Code Coverage', condition: { getCoverage() > 80 }],
+                [name: 'Sonar Quality', condition: { getQualityGate() == 'PASSED' }]
+            ]
+            gates.each { gate ->
+                if (!gate.condition()) {
+                    error("Quality gate failed: ${gate.name}")
+                }
+            }
+        }
+    }
+}
+```
+
+## 二十八、Agent/Kubernetes Agent 弹性伸缩
+
+### K8s Agent 配置
+
+```yaml
+# Kubernetes Agent Pod Template
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: jnlp
+    image: jenkins/inbound-agent:latest
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+  - name: maven
+    image: maven:3.8-openjdk-11
+    command:
+    - cat
+    tty: true
+```
+
+### 弹性伸缩策略
+
+| 策略 | 配置 | 适用场景 |
+|------|------|----------|
+| 固定副本 | replicas: 3 | 稳定负载 |
+| HPA | min/max replicas | 变化负载 |
+| 节点亲和性 | nodeSelector | 特殊硬件 |
+| 容忍度 | tolerations | 污点节点 |
+
+## 二十九、Artifact 归档与制品库集成
+
+### 制品归档配置
+
+```groovy
+// 归档制品
+post {
+    always {
+        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+        junit 'target/surefire-reports/*.xml'
+    }
+}
+
+// 上传到 Nexus/Artifactory
+stage('Publish') {
+    steps {
+        sh 'mvn deploy'
+        nexusArtifactUploader(
+            nexusVersion: 'nexus3',
+            protocol: 'http',
+            nexusUrl: 'nexus.example.com',
+            groupId: 'com.example',
+            version: "${env.BUILD_NUMBER}",
+            repository: 'releases',
+            credentialsId: 'nexus-credentials',
+            artifacts: [
+                [artifactId: 'my-app', classifier: '', file: 'target/my-app.jar', type: 'jar']
+            ]
+        )
+    }
+}
+```
+
+### 制品库对比
+
+| 制品库 | 特点 | 许可证 | 适用场景 |
+|--------|------|--------|----------|
+| Nexus | 功能全面 | OSS/Pro | 企业级 |
+| Artifactory | 多格式支持 | 商业 | 大型团队 |
+| Harbor | 镜像仓库 | 开源 | K8s 环境 |
+| GitHub Packages | 集成 GitHub | 按量付费 | GitHub 用户 |

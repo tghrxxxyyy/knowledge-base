@@ -1225,4 +1225,188 @@ public class IdGeneratorHA {
     }
 }
 ```
-| 一句话 | 「分布式系统的地基——唯一+有序+高性能的本地生成」 |
+
+## UUID v7 时间排序优势与 MySQL InnoDB 友好性
+
+### UUID 版本对比
+
+| 版本 | 格式 | 时间有序 | MySQL InnoDB 友好 |
+|------|------|----------|------------------|
+| UUID v1 | 时间+MAC | 部分有序 | 不友好（随机插入） |
+| UUID v4 | 随机 | 无序 | 不友好（页分裂） |
+| UUID v7 | 时间戳+随机 | 严格有序 | 友好（顺序插入） |
+
+### UUID v7 优势
+
+```
+UUID v7 结构：
+  48 bit: Unix 时间戳毫秒
+  12 bit: 随机数（同一毫秒内唯一）
+  62 bit: 随机数（全局唯一）
+
+优势：
+  1. 时间有序：按时间排序，范围查询友好
+  2. InnoDB 友好：顺序插入，减少页分裂
+  3. 全局唯一：无需协调
+  4. 可从 ID 提取时间：调试方便
+```
+
+## ID 在分库分表路由中的使用陷阱
+
+### 路由陷阱
+
+| 陷阱 | 问题 | 解决方案 |
+|------|------|----------|
+| UUID 路由不均 | 随机值导致数据倾斜 | 使用有序 ID（雪花/UUID v7） |
+| 自增 ID 冲突 | 不同分库 ID 重复 | 使用全局唯一 ID 生成器 |
+| 时钟回拨 | 雪花 ID 重复 | 预留位+时钟回拨检测 |
+| 分片键选择 | 高频查询字段不匹配 | 业务字段做分片键 |
+
+### 最佳实践
+
+```java
+// 分库分表路由
+public int getShardIndex(long userId, int shardCount) {
+    // 使用 userId 做路由键
+    return (int) (userId % shardCount);
+}
+
+// 避免使用时间做路由键（数据分布不均）
+// 错误：return (int) (System.currentTimeMillis() % shardCount);
+```
+
+## ID 生成器高可用设计（主备切换/降级到本地/多活）
+
+### 高可用架构
+
+```
+ID 生成器高可用：
+  主节点：实时生成 ID，对外服务
+  备节点：实时同步状态，准备接管
+  本地降级：主备都不可用时，本地生成临时 ID
+
+主备切换条件：
+  1. 主节点心跳超时（>30s）
+  2. 主节点响应延迟（>1s 持续 5min）
+  3. 主节点 CPU/内存 >90%
+
+降级策略：
+  Level 1：主→备（自动切换，<1s）
+  Level 2：备→本地（降级，ID 不连续）
+  Level 3：本地生成（UUID v7，保证唯一性）
+```
+
+### 主备切换实现
+
+```java
+public class IdGeneratorHA {
+    private AtomicReference<String> currentMode = new AtomicReference<>("primary");
+    private IdGenerator primary;
+    private IdGenerator backup;
+    private LocalIdGenerator local;
+
+    public long nextId() {
+        try {
+            switch (currentMode.get()) {
+                case "primary":
+                    return primary.nextId();
+                case "backup":
+                    return backup.nextId();
+                case "local":
+                    return local.nextId();
+            }
+        } catch (Exception e) {
+            failover();
+            return nextId();
+        }
+        throw new RuntimeException("No available generator");
+    }
+
+    private void failover() {
+        if (currentMode.compareAndSet("primary", "backup")) {
+            log.warn("Failing over to backup");
+        } else if (currentMode.compareAndSet("backup", "local")) {
+            log.warn("Failing over to local");
+        }
+    }
+}
+```
+
+## ID 长度对性能影响（UUID 128bit vs 雪花 64bit vs 自增 64bit）
+
+### 性能对比
+
+| ID 类型 | 长度 | 索引大小 | 范围查询 | 插入性能 |
+|---------|------|----------|----------|----------|
+| UUID v4 | 128 bit | 大 | 差 | 差（随机） |
+| UUID v7 | 128 bit | 大 | 好 | 好（有序） |
+| 雪花 ID | 64 bit | 中 | 好 | 好（有序） |
+| 自增 ID | 64 bit | 小 | 好 | 极好（顺序） |
+
+### 存储影响
+
+```
+存储影响计算（1 亿条记录）：
+  UUID v4：16 字节 × 1 亿 = 1.6 GB（仅 ID 列）
+  雪花 ID：8 字节 × 1 亿 = 800 MB
+  自增 ID：8 字节 × 1 亿 = 800 MB
+
+  索引开销：
+    UUID v4：B+ 树节点分裂频繁，索引膨胀
+    雪花 ID：顺序插入，索引紧凑
+    自增 ID：顺序插入，索引最紧凑
+```
+
+## ID 生成器监控（QPS/时钟偏差/重复检测）
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| QPS | 每秒生成 ID 数 | 超过容量 80% |
+| 时钟偏差 | 本地时钟与 NTP 时钟偏差 | > 100ms |
+| 重复率 | 重复 ID 出现概率 | > 0 |
+| 延迟 | ID 生成耗时 | > 10ms |
+
+### 监控实现
+
+```java
+// ID 生成器监控
+@Component
+public class IdGeneratorMetrics {
+    private final MeterRegistry registry;
+    private final AtomicLong qpsCounter = new AtomicLong();
+    private final AtomicLong duplicateCounter = new AtomicLong();
+    
+    @Scheduled(fixedRate = 1000)
+    public void reportMetrics() {
+        registry.gauge("id.generator.qps", qpsCounter.getAndSet(0));
+        registry.gauge("id.generator.duplicates", duplicateCounter.get());
+    }
+    
+    public void recordDuplicate() {
+        duplicateCounter.incrementAndGet();
+    }
+}
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+- name: id-generator
+  rules:
+  - alert: IdGeneratorHighQPS
+    expr: id_generator_qps > 10000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "ID 生成器 QPS 过高"
+      
+  - alert: IdGeneratorDuplicate
+    expr: id_generator_duplicates > 0
+    labels:
+      severity: critical
+    annotations:
+      summary: "ID 生成器出现重复 ID"
+```

@@ -1287,3 +1287,128 @@ class UserRepositoryTests {
 8. **限流降级**：入口与关键依赖调用都限流；非核心依赖加 Feature Flag 默认可关。
 9. **启动校验**：`@PostConstruct`/SmartLifecycle 做依赖就绪校验（DB 连通、配置合法），fail-fast。
 10. **日志与追踪**：MDC 透传 traceId；默认 INFO、DEBUG 动态开；敏感信息脱敏。
+
+## Spring Boot 3.x 新特性
+
+### 虚拟线程支持
+
+```
+虚拟线程配置：
+  spring.threads.virtual.enabled=true
+
+  效果：
+    请求处理使用虚拟线程
+    不再需要线程池配置
+    并发能力大幅提升
+
+  注意：
+    阻塞操作会阻塞虚拟线程
+    传统 JDBC 驱动可能不兼容
+    需要测试验证
+```
+
+### GraalVM Native 支持
+
+| 特性 | 说明 | 配置 |
+|------|------|------|
+| AOT 编译 | 提前编译为本地代码 | spring-boot:build-image |
+| 原生镜像 | 独立可执行文件 | GraalVM Native Image |
+| 快速启动 | 毫秒级启动 | 无需 JVM |
+| 低内存 | 内存占用大幅降低 | 适合容器 |
+
+## Spring Security 新特性
+
+### 授权服务器
+
+```
+Spring Authorization Server：
+  OAuth 2.1 支持
+  PKCE 增强
+  Token 绑定
+  自定义扩展点
+
+  配置示例：
+    @Bean
+    public RegisteredClientRepository registeredClientRepository() {
+        return new InMemoryRegisteredClientRepository();
+    }
+
+    @Bean
+    public OAuth2TokenService tokenService() {
+        return new OpaqueTokenIntrospector() {
+            @Override
+            public OAuth2AuthenticatedPrincipal introspect(String token) {
+                // 验证 token
+            }
+        };
+    }
+```
+
+### 安全配置对比
+
+| 配置项 | Spring Security 5.x | Spring Security 6.x |
+|--------|---------------------|---------------------|
+| 默认配置 | 全部拦截 | 最小化配置 |
+| 授权服务器 | 需要单独模块 | 内置支持 |
+| 密码编码 | BCrypt | Argon2 |
+| CSRF | 默认开启 | 按需开启 |
+
+## Spring Cloud Gateway 新特性
+
+### 路由配置增强
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: my-route
+          uri: lb://my-service
+          predicates:
+            - Path=/api/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: my-circuitbreaker
+                fallbackUri: forward:/fallback
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+```
+
+### 网关增强功能
+
+| 功能 | 说明 | 配置 |
+|------|------|------|
+| 限流 | 请求速率限制 | RequestRateLimiter |
+| 熔断 | 服务熔断降级 | CircuitBreaker |
+| 重试 | 请求重试 | Retry |
+| 超时 | 请求超时 | Timeout |
+
+## Spring 故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 启动失败 | 检查依赖/配置 | 修复依赖 |
+| Bean 注入失败 | 检查 Bean 定义 | 修复注入 |
+| 事务失效 | 检查事务注解 | 修复事务 |
+| 异步失效 | 检查线程池配置 | 修复线程池 |
+
+### 故障排查命令
+
+```bash
+# 检查应用状态
+curl -s http://localhost:8080/actuator/health
+
+# 检查 Bean 状态
+curl -s http://localhost:8080/actuator/beans
+
+# 检查环境变量
+curl -s http://localhost:8080/actuator/env
+
+# 检查日志
+tail -f /var/log/myservice/myservice.log
+```

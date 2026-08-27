@@ -1218,4 +1218,95 @@ etcdctl get mykey
 # 默认端口：2379（HTTP）+ 2380（peer）
 # v3 API 使用同一个端口（2379）
 ```
+
+## etcd MVCC 原理（revision+tree index 实现）
+
+### MVCC 架构
+
+```
+etcd MVCC 实现：
+  revision（版本号）：
+    ├── 全局递增（每个事务+1）
+    ├── 格式：{main}.{sub}
+    └── main：全局事务计数
+
+  tree index（内存索引）：
+    ├── 基于 B-tree 实现
+    ├── key → revision 映射
+    └── 支持范围查询
+
+  boltdb（持久化存储）：
+    ├── revision → value 映射
+    └── 存储实际数据
+```
+
+## compact/defrag 周期性维护操作
+
+```bash
+# 手动 compact
+etcdctl compact $(etcdctl endpoint status --write-out=json | jq -r '.[].header.revision')
+
+# 自动 compact（配置）
+--auto-compaction-mode=periodic
+--auto-compaction-retention=1h
+
+# 手动 defrag（释放空间）
+etcdctl defrag --cluster
+```
+
+## etcd lease 租约续期（KeepAlive）与自动回收（TTL）
+
+```go
+// 创建租约（TTL=30s）
+lease, _ := client.Grant(ctx, 30)
+
+// 绑定 key 到租约
+client.Put(ctx, "/services/my-service", "instance-1", clientv3.WithLease(lease.ID))
+
+// 自动续期
+ch, _ := client.KeepAlive(ctx, lease.ID)
+
+// 撤销租约（自动删除绑定的 key）
+client.Revoke(ctx, lease.ID)
+```
+
+## K8s etcd 故障恢复（etcdctl snapshot restore）
+
+```bash
+# 1. 备份
+etcdctl snapshot save /backup/etcd-snapshot-$(date +%Y%m%d).db
+
+# 2. 恢复
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --data-dir=/var/lib/etcd-restored \
+  --name=etcd-0
+
+# 3. 替换数据目录
+mv /var/lib/etcd /var/lib/etcd-old
+mv /var/lib/etcd-restored /var/lib/etcd
+```
+
+## etcd 网络分区与 leader election 行为
+
+```
+etcd 网络分区行为：
+  1. Leader 与多数节点失去连接
+  2. 少数派节点无法选举新 Leader
+  3. 多数派节点选举新 Leader
+  4. 分区恢复后，旧 Leader 降级为 Follower
+
+故障切换时间：约 3-5 秒
+```
+
+## etcd v2 vs v3 API 本质差异
+
+| 特性 | v2 API | v3 API |
+|------|--------|--------|
+| 协议 | HTTP REST | gRPC |
+| 传输效率 | 低（JSON） | 高（Protocol Buffers） |
+| Watch | 轮询 | 流式推送 |
+| 事务 | 不支持 | 支持（Txn） |
+| Lease | 无 | 支持（TTL） |
+| 状态 | 废弃 | 推荐 |
+
 | 一句话 | 「K8s 的大脑」——云原生协调的事实标准，Raft 工程范式 |

@@ -1295,3 +1295,118 @@ TiDB 方案：
 - 数据迁移生态见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」。
 
 > 一句话：**TiDB = TiDB（无状态 SQL 层）+ PD（元数据/TSO/调度）+ TiKV（Raft 行存）+ TiFlash（列存 HTAP）——事务走 Percolator 两阶段提交，扩展靠 Region 自动分裂迁移——选型先看「MySQL 兼容+海量数据→TiDB」，迁移走 DM 全量+增量，生产守则：随机主键防热点、大事务拆批、GC 监控、执行计划分析**。
+
+## TiDB 故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 连接超时 | 检查网络/负载 | 调整连接池 |
+| 慢查询 | EXPLAIN ANALYZE | 优化SQL/索引 |
+| Region 热点 | PD Dashboard | 调整Region分布 |
+| 存储满 | 扩容/清理 | 扩容磁盘 |
+
+### 故障排查命令
+
+```sql
+-- 查看集群信息
+SHOW CREATE TABLE t\G
+
+-- 查看执行计划
+EXPLAIN SELECT * FROM t WHERE id = 1;
+
+-- 查看慢查询
+SELECT * FROM information_schema.slow_query ORDER BY query_time DESC LIMIT 10;
+
+-- 查看Region分布
+SHOW TABLE t REGIONS;
+
+-- 查看TiKV状态
+SELECT * FROM information_schema.tikv_region_status;
+```
+
+## TiDB 与其他数据库对比
+
+| 维度 | TiDB | MySQL | PostgreSQL |
+|------|------|-------|------------|
+| 架构 | 分布式 | 单机 | 单机 |
+| 扩展性 | 水平扩展 | 垂直扩展 | 垂直扩展 |
+| 事务 | 分布式事务 | 本地事务 | 本地事务 |
+| 兼容性 | MySQL 兼容 | - | 标准 SQL |
+| 适用场景 | 海量数据 | 传统业务 | 复杂查询 |
+
+## TiDB 版本对比
+
+| 版本 | 功能 | 适用场景 | 许可证 |
+|------|------|----------|--------|
+| TiDB 5.x | 稳定 | 生产环境 | Apache 2.0 |
+| TiDB 6.x | 新特性 | 新项目 | Apache 2.0 |
+| TiDB 7.x | 实验性 | 测试 | Apache 2.0 |
+
+### 版本选择建议
+
+```
+版本选择：
+  生产环境 → TiDB 5.x 或 6.x
+  新项目 → TiDB 6.x
+  测试 → TiDB 7.x
+  需要稳定性 → TiDB 5.x
+  需要新特性 → TiDB 6.x
+```
+
+## TiDB 最佳实践
+
+### 写入优化
+
+| 优化项 | 方法 | 效果 |
+|--------|------|------|
+| 批量写入 | 批量 INSERT/UPDATE | 减少事务开销 |
+| 随机主键 | 避免热点写入 | 写入均衡 |
+| 分区表 | 按时间/范围分区 | 数据管理 |
+| 大事务拆批 | 分批提交 | 避免大事务 |
+
+### 查询优化
+
+| 优化项 | 方法 | 效果 |
+|--------|------|------|
+| 索引优化 | 合理建立索引 | 查询加速 |
+| 执行计划 | EXPLAIN ANALYZE | 分析慢查询 |
+| 统计信息 | ANALYZE TABLE | 优化器决策 |
+| SQL 改写 | 避免全表扫描 | 减少 IO |
+
+## TiDB 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| QPS | 每秒查询数 | 按需 |
+| 延迟 | 查询延迟 | > 100ms |
+| 连接数 | 数据库连接数 | > 80% 最大连接 |
+| 存储使用 | 磁盘使用率 | > 80% |
+| 复制延迟 | TiKV 复制延迟 | > 10s |
+
+### 告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: tidb-alerts
+    rules:
+      - alert: TiDBQueryLatencyHigh
+        expr: histogram_quantile(0.99, rate(tidb_session_query_duration_seconds_bucket[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TiDB查询延迟过高"
+
+      - alert: TiDBStorageHigh
+        expr: tidb_storage_used_bytes / tidb_storage_total_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TiDB存储使用率过高"
+```

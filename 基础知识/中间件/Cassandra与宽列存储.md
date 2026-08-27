@@ -1273,3 +1273,143 @@ SELECT * FROM users WHERE user_id = 123;
 | 灾备切换 | NetworkTopologyStrategy | EACH_QUORUM |
 | 读多写少 | NetworkTopologyStrategy | LOCAL_ONE |
 | 强一致要求 | SimpleStrategy | QUORUM |
+
+## Cassandra 性能调优
+
+### 24.1 JVM 调优
+
+```
+JVM 调优参数：
+  -Xms8G -Xmx8G
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=300
+  -XX:+ParallelRefProcEnabled
+  -XX:+AlwaysPreTouch
+
+  堆内存建议：
+    数据量 < 1TB → 8GB
+    数据量 1-10TB → 16GB
+    数据量 > 10TB → 32GB
+
+  注意：不要超过 32GB（压缩指针失效）
+```
+
+### 24.2 数据模型优化
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 分区键设计 | 避免热分区 | 写入均衡 |
+| 聚簇列排序 | 按查询设计 | 查询高效 |
+| 数据压缩 | LZ4/Snappy | 减少存储 |
+| TTL | 自动过期 | 数据清理 |
+
+### 24.3 读写路径优化
+
+```
+写入优化：
+  1. 批量写入（Batch）
+     → 同一分区内的批量
+     → 避免跨分区批量
+
+  2. 一致性级别选择
+     → 写多：ONE
+     → 强一致：QUORUM
+
+  3. 压缩策略
+     → STCS：写密集
+     → LCS：读密集
+     → TWCS：时序数据
+
+读取优化：
+  1. 二级索引
+     → 非分区键查询
+     → 性能影响写入
+
+  2. 物化视图
+     → 多表查询
+     → 自动同步
+
+  3. 一致性级别
+     → 读多：ONE
+     → 强一致：QUORUM
+```
+
+## Cassandra 故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 节点宕机 | nodetool status | 重启节点 |
+| 数据不一致 | nodetool repair | 修复数据 |
+| 磁盘满 | nodetool cleanup | 清理数据 |
+| 性能下降 | nodetool tpstats | 调整参数 |
+
+### 故障排查命令
+
+```bash
+# 检查集群状态
+nodetool status
+
+# 检查节点信息
+nodetool info
+
+# 检查线程池
+nodetool tpstats
+
+# 修复数据
+nodetool repair
+
+# 清理数据
+nodetool cleanup
+```
+
+## Cassandra 与其他存储对比
+
+| 维度 | Cassandra | HBase | MongoDB |
+|------|-----------|-------|---------|
+| 数据模型 | 宽列 | 宽列 | 文档 |
+| 一致性 | 可调 | 强一致 | 最终一致 |
+| 扩展性 | 线性扩展 | 区域扩展 | 分片 |
+| 适用场景 | 时序/日志 | 大数据 | 文档存储 |
+| 运维复杂度 | 中 | 高 | 低 |
+
+## Cassandra 版本对比
+
+| 版本 | 功能 | 适用场景 | 许可证 |
+|------|------|----------|--------|
+| Cassandra 3.x | 稳定 | 生产环境 | Apache 2.0 |
+| Cassandra 4.x | 新特性 | 新项目 | Apache 2.0 |
+| Cassandra 5.x | 实验性 | 测试 | Apache 2.0 |
+
+### 版本选择建议
+
+```
+版本选择：
+  生产环境 → Cassandra 3.x
+  新项目 → Cassandra 4.x
+  测试 → Cassandra 5.x
+  需要稳定性 → Cassandra 3.x
+  需要新特性 → Cassandra 4.x
+```
+
+## Cassandra 最佳实践总结
+
+### 实践清单
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 合理设计分区键 | 避免热分区 | 写入均衡 |
+| 使用批量写入 | 同一分区内批量 | 写入高效 |
+| 合理设置TTL | 数据自动过期 | 存储优化 |
+| 监控关键指标 | 读写/存储/复制 | 及时发现问题 |
+| 定期维护 | repair/cleanup | 数据一致 |
+
+### 常见问题处理
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 写入失败 | 检查连接/数据模型 | 修复连接/模型 |
+| 查询慢 | 检查索引/数据量 | 优化查询/索引 |
+| 存储满 | 检查TTL/清理 | 扩容/清理 |
+| 高可用故障 | 检查节点状态 | 重启/恢复 |

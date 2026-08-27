@@ -1247,6 +1247,162 @@ spring:
                 fallbackUri: forward:/fallback
 ```
 
+## 二十、OpenTelemetry 统一可观测
+
+### 20.3 OpenTelemetry SDK 初始化与导出
+
+```text
+SDK 初始化流程：
+  1. 创建 TracerProvider
+     → 设置 Resource（service.name, env）
+     → 配置 BatchSpanProcessor
+     → 挂载 OTLP Exporter
+
+  2. 创建 MeterProvider
+     → 配置 PeriodicExportingMeterReader
+     → 挂载 OTLP Metrics Exporter
+
+  3. 创建 LoggerProvider
+     → 配置 BatchLogRecordProcessor
+     → 挂载 OTLP Log Exporter
+
+  4. 注册到 GlobalOpenTelemetry
+     → 自动注入 Spring Bean
+     → 通过 @Observed 注解采集
+```
+
+### 20.4 Trace Context 传播格式
+
+| 传播格式 | 说明 | 适用场景 |
+|----------|------|----------|
+| W3C TraceContext | 标准格式 | HTTP/gRPC 调用 |
+| B3 (Zipkin) | Zipkin 格式 | 兼容 Zipkin |
+| Jaeger | Jaeger 格式 | 兼容 Jaeger |
+| baggage | 业务上下文 | 跨服务传递业务数据 |
+
+## 二十一、微服务灰度发布与流量染色
+
+### 灰度发布策略
+
+```
+灰度发布策略：
+  1. 金丝雀发布（Canary）
+     → 先发 1% 流量到新版本
+     → 观察指标 15 分钟
+     → 逐步扩大到 100%
+
+  2. 蓝绿发布（Blue-Green）
+     → 两套环境并行
+     → 流量一次性切换
+     → 回滚 = 切回旧环境
+
+  3. A/B 测试
+     → 按用户属性分流
+     → 同时运行多版本
+     → 统计效果对比
+```
+
+### 流量染色架构
+
+```text
+流量染色流程：
+  请求进入 → API 网关
+    → 根据规则打标（Header: x-canary=true）
+    → 染色流量 → 灰度服务
+    → 未染色流量 → 正常服务
+
+  染色规则：
+    按用户 ID 尾号
+    按地域/IP 段
+    按 Header/Query 参数
+    按比例百分比
+```
+
+## 二十二、Service Mesh 数据平面（Envoy Sidecar）
+
+### Envoy Sidecar 注入
+
+```yaml
+# Istio 自动注入
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    sidecar.istio.io/inject: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        sidecar.istio.io/inject: "true"
+```
+
+### Envoy 代理能力
+
+| 能力 | 说明 | 配置方式 |
+|------|------|----------|
+| 负载均衡 | 多种算法 | RouteConfiguration |
+| 熔断 | 连接/请求限制 | CircuitBreaker |
+| 超时重试 | 可配置 | RouteAction |
+| mTLS | 双向认证 | PeerAuthentication |
+| 访问日志 | 详细记录 | AccessLog |
+
+## 二十三、混沌工程注入框架
+
+### Chaos Mesh 架构
+
+```text
+Chaos Mesh 架构：
+  Control Plane → Dashboard + Controller
+    → 管理 Chaos 实验
+
+  Daemon Plane → Chaosd + Chaos Daemon
+    → 在每个 Pod 注入故障
+
+  支持故障类型：
+    Pod Chaos：PodKill / PodChaos / PodNetworkChaos
+    Network Chaos：延迟/丢包/带宽限制
+    IO Chaos：文件读写延迟/错误
+    Time Chaos：时钟偏移
+    Stress Chaos：CPU/内存压力
+```
+
+### 混沌实验流程
+
+| 阶段 | 活动 | 目标 |
+|------|------|------|
+| 稳态假设 | 定义正常指标范围 | P99 < 200ms |
+| 注入故障 | Pod 网络延迟 200ms | 验证熔断是否生效 |
+| 观察指标 | 监控延迟/错误率 | 确认影响范围 |
+| 恢复验证 | 移除故障 | 指标回归正常 |
+| 经验沉淀 | 文档化实验结果 | 优化架构设计 |
+
+## 微服务故障排查
+
+### 常见故障处理
+
+| 故障类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| 服务不可用 | 检查注册中心/健康检查 | 重启服务 |
+| 调用超时 | 检查网络/超时配置 | 调整超时 |
+| 限流触发 | 检查限流配置 | 调整限流参数 |
+| 熔断触发 | 检查下游服务 | 修复下游 |
+
+### 故障排查命令
+
+```bash
+# 检查服务注册状态
+curl -s http://localhost:8848/nacos/v1/ns/instance/list?serviceName=myservice
+
+# 检查服务健康状态
+curl -s http://localhost:8848/nacos/v1/ns/instance/list?serviceName=myservice&healthy=true
+
+# 检查配置
+curl -s http://localhost:8848/nacos/v1/cs/configs?dataId=myconfig&group=DEFAULT_GROUP
+
+# 检查日志
+tail -f /var/log/myservice/myservice.log
+```
+
 ## 十八、与其他板块的关系
 
 - Spring Cloud Gateway 见「[Spring Cloud Gateway](../基础知识/中间件/SpringCloudGateway.md)」；

@@ -1248,4 +1248,199 @@ db.createUser({
 | 审计日志 | 记录操作日志 | auditLog配置 |
 | 权限控制 | 最小权限原则 | 角色权限管理 |
 
+## 二十六、分片键选择深度
+
+### 分片键评估维度
+
+| 维度 | 评估要点 | 反例 |
+|------|----------|------|
+| 基数（Cardinality） | 取值越多分布越均匀 | status（仅 3 种值） |
+| 均匀性（Evenness） | 数据在各分片均匀分布 | 自增 id（写热点） |
+| 写入热点 | 避免单调递增键 | created_at、ObjectId |
+| 查询模式 | 高频查询必带分片键 | 查询不带分片键 |
+| 稳定性 | 分片键不可变更 | 手机号（用户换号） |
+
+### 分片键选择决策树
+
+```
+分片键选择决策：
+  写入为主？
+    → 是 → 哈希分片（{ _id: "hashed" }）
+    → 否 → 查询为主？
+      → 是 → 复合分片键（{ region: 1, user_id: 1 }）
+      → 否 → 混合场景 → 哈希前缀 + 范围后缀
+```
+
+### 分片键反例复盘
+
+```text
+反例1: 单调递增键 {created_at: 1}
+  后果：所有新写集中到最后一个 chunk，单分片热点
+  修正：哈希分片打散
+
+反例2: 低基数 { status: 1 }
+  后果：chunk 无法分裂，数据倾斜
+  修正：复合键补高基数字段
+
+反例3: 查询不带键
+  后果：全分片广播路由（scatter-gather），延迟翻倍
+  修正：分片键=高频查询必带字段
+```
+
+## 二十七、Change Streams 实时同步
+
+### Change Streams 事件类型
+
+| 事件类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| insert | 新文档插入 | 新订单通知 |
+| update | 文档更新 | 库存变更 |
+| replace | 文档替换 | 全量更新 |
+| delete | 文档删除 | 软删除 |
+| invalidate | 集合被删/重命名 | DDL 变更 |
+
+### Change Streams 实时缓存失效
+
+```javascript
+// 监听变更 → 失效 Redis 缓存
+const changeStream = db.collection("products").watch([
+  { $match: { operationType: { $in: ["update", "replace", "delete"] } } }
+]);
+
+changeStream.on("change", async (event) => {
+  const key = `cache:product:${event.documentKey._id}`;
+  await redis.del(key);  // 失效而非更新
+  checkpoint.save(event._id);  // resume token 持久化
+});
+```
+
+### Change Streams vs CDC 对比
+
+| 维度 | Change Streams | CDC (Canal/Debezium) |
+|------|---------------|---------------------|
+| 数据源 | MongoDB oplog | MySQL binlog |
+| 延迟 | 毫秒级 | 秒级 |
+| 目标 | MongoDB 间同步 | 异构系统同步 |
+| 部署 | 内嵌 MongoDB | 独立组件 |
+
+## 二十八、Atlas Search 全文检索
+
+### Atlas Search 特性
+
+```javascript
+// 创建搜索索引
+db.products.createSearchIndex({
+  name: "default",
+  definition: {
+    mappings: {
+      dynamic: false,
+      fields: {
+        title: { type: "string", analyzer: "lucene.english" },
+        description: { type: "string" },
+        price: { type: "number" },
+        tags: { type: "string" }
+      }
+    }
+  }
+});
+
+// 全文搜索查询
+db.products.aggregate([
+  { $search: {
+      text: { query: "wireless headphones", path: "title" }
+    }
+  },
+  { $project: { title: 1, price: 1, score: { $meta: "searchScore" } } }
+]);
+```
+
+### Atlas Search vs Elasticsearch
+
+| 维度 | Atlas Search | Elasticsearch |
+|------|-------------|---------------|
+| 部署 | Atlas 托管 | 自建/云托管 |
+| 功能 | 基础全文检索 | 丰富分析能力 |
+| 成本 | Atlas 计费 | 独立部署成本 |
+| 集成 | MongoDB 原生 | 需同步管道 |
+
+## 二十九、聚合管道优化
+
+### 优化原则
+
+| 原则 | 说明 | 效果 |
+|------|------|------|
+| $match 前置 | 尽早过滤数据 | 减少后续处理量 |
+| $project 精简 | 只传递需要的字段 | 减少内存占用 |
+| 索引支持 | $match/$sort 命中索引 | 避免全表扫描 |
+| 避免 $lookup | 用嵌入文档替代关联 | 减少 JOIN 开销 |
+| $limit 提前 | 限制结果集大小 | 减少排序开销 |
+
+### 优化示例
+
+```javascript
+// 差：$lookup 放前面
+db.orders.aggregate([
+  { $lookup: { from: "users", localField: "user_id", foreignField: "_id", as: "user" } },
+  { $match: { status: "paid" } },
+  { $group: { _id: "$user_id", total: { $sum: "$amount" } } }
+])
+
+// 好：$match 前置 + 嵌入文档
+db.orders.aggregate([
+  { $match: { status: "paid" } },
+  { $project: { user_id: 1, amount: 1 } },
+  { $group: { _id: "$user_id", total: { $sum: "$amount" } } }
+])
+```
+
+## 三十、事务限制与最佳实践
+
+### 事务限制
+
+| 限制 | 说明 |
+|------|------|
+| 隔离级别 | 仅 Read Committed（非可串行化） |
+| 文档大小 | 单文档 ≤ 16MB |
+| Oplog 条目 | 事务内操作 ≤ oplog 大小限制 |
+| 性能开销 | 事务越多性能越差（锁竞争） |
+| 嵌套事务 | 不支持嵌套事务 |
+| 延迟写入 | 不支持 w:0 |
+
+### 最佳实践
+
+```
+事务使用建议：
+  1. 尽量用单文档原子操作（$set/$inc）
+  2. 跨文档事务尽量控制在 5 个文档以内
+  3. 设置合理超时（默认 60 秒）
+  4. 核心金融交易仍首选 MySQL/PostgreSQL
+  5. MongoDB 事务只用于非核心或单文档原子操作
+```
+
+## 三十一、备份策略
+
+### 备份方案对比
+
+| 方案 | 工具 | 原理 | RPO | RTO | 适用 |
+|------|------|------|-----|-----|------|
+| 逻辑备份 | mongodump | BSON 导出 | 小时级 | 小时级 | 小数据量 |
+| 物理备份 | LVM/S3 快照 | 块设备快照 | 分钟级 | 分钟级 | 中等数据量 |
+| 持续备份 | Ops Manager | 增量备份 | 秒级 | 分钟级 | 大数据量 |
+| PITR | Atlas/Atlas | 时间点恢复 | 秒级 | 分钟级 | 企业级 |
+
+### PITR 时间点恢复
+
+```
+PITR（Point-in-Time Recovery）：
+  1. 基于连续的 oplog 备份
+  2. 恢复到任意秒级时间点
+  3. Atlas 原生支持
+  4. 自建需 Ops Manager 或 Percona Backup
+
+配置要点：
+  oplog 大小：足够容纳备份窗口内的写操作
+  备份频率：每小时增量 + 每天全量
+  保留策略：至少保留 7 天
+```
+
 ## 二十六、与其他板块的关系

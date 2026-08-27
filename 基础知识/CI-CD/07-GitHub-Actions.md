@@ -872,6 +872,412 @@ on:
 
 ---
 
+## Actions 缓存策略深度
+
+### 缓存层级与命中率优化
+
+```
+Actions 缓存架构：
+  L1: Runner 本地缓存（本机缓存目录）
+  L2: GitHub 托管缓存（跨 Runner 共享）
+  L3: 远程构建缓存（BuildKit / Bazel remote）
+
+缓存键设计原则：
+  key = 基准键 + 哈希文件
+  示例：cache-${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+  
+  坑：用分支名作 key → 每分支一份 → 几乎不命中
+  正确：用 lockfile 内容哈希 → 同依赖跨分支复用
+```
+
+| 缓存层 | 键策略 | 命中率目标 | 失效场景 |
+|--------|--------|-----------|----------|
+| Maven .m2 | hashFiles('**/pom.xml') | >90% | 依赖变更 |
+| npm node_modules | hashFiles('**/package-lock.json') | >90% | lockfile 变更 |
+| Docker BuildKit | type=gha + SHA | >70% | 基础镜像变更 |
+| Go module | hashFiles('**/go.sum') | >90% | go.mod 变更 |
+
+### 缓存安全与隔离
+
+```
+安全风险：
+  公共仓库的 fork PR 可能篡改共享缓存
+  恶意 PR 修改 package.json → 投毒缓存 → 污染主分支
+
+防护：
+  1. 分支隔离：fork PR 使用独立缓存键
+     key: ${{ github.head_ref || github.ref }}
+  2. 缓存清理：PR 关闭后清理相关缓存
+  3. 依赖签名：npm audit / pip-audit 校验包完整性
+  4. 强制重建：安全补丁发布时 --no-cache 重构建
+```
+
+## 矩阵构建高级策略
+
+### 矩阵维度爆炸控制
+
+```yaml
+# 控制矩阵规模的策略
+strategy:
+  max-parallel: 6          # 限制最大并行数
+  fail-fast: false         # 一个失败不取消其他
+  matrix:
+    os: [ubuntu-latest, macos-latest]
+    node: [18, 20, 22]
+    include:
+      - os: ubuntu-latest
+        node: 22
+        experimental: true
+        coverage: true      # 额外字段
+    exclude:
+      - os: macos-latest
+        node: 18            # 排除低价值组合
+```
+
+### 矩阵条件执行
+
+| 条件 | 用法 | 效果 |
+|------|------|------|
+| fail-fast: false | 矩阵项独立 | 收集所有失败 |
+| max-parallel | 控制并发数 | 避免配额耗尽 |
+| continue-on-error | 允许失败 | 实验性维度 |
+| if: matrix.coverage | 条件步骤 | 仅在特定维度跑覆盖率 |
+
+## Reusable Workflow 传参与安全
+
+### Secrets 透传最佳实践
+
+```yaml
+# 可复用工作流接收 secrets
+on:
+  workflow_call:
+    secrets:
+      REGISTRY_TOKEN:
+        required: true
+    inputs:
+      environment:
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      - run: ./deploy.sh ${{ inputs.environment }}
+```
+
+### 安全传递 Secrets
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| secrets: inherit | 透传所有 secrets | 内部可信仓库 |
+| secrets: [key] | 显式传递特定 secret | 最小权限 |
+| inputs + secrets | 组合传参 | 通用场景 |
+
+## OIDC 免密推送生产实战
+
+### GCP OIDC 配置
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/123/locations/global/.../provider'
+          service_account: 'github-actions@my-project.iam.gserviceaccount.com'
+      - run: gcloud run deploy my-app --image gcr.io/my-project/app:${{ github.sha }}
+```
+
+### Azure OIDC 配置
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: az webapp deploy --resource-group myRG --name myApp
+```
+
+## 安全最佳实践 Checklist
+
+| 检查项 | 说明 | 严重度 |
+|--------|------|--------|
+| Action 版本固定 | Pin SHA 而非 tag | HIGH |
+| Secrets 不落日志 | withCredentials 或环境变量 | CRITICAL |
+| OIDC 优先 | 免长期密钥 | HIGH |
+| 权限最小化 | permissions 显式声明 | MEDIUM |
+| 缓存隔离 | fork PR 独立缓存键 | MEDIUM |
+| Runner 安全 | self-hosted 隔离执行 | HIGH |
+| 审计日志 | 启用 GitHub Audit Log | LOW |
+
+## 自托管 Runner 安全加固
+
+### 容器化 Runner 部署
+
+```yaml
+# 使用 Docker 容器隔离构建
+jobs:
+  build:
+    runs-on: self-hosted
+    container:
+      image: node:20
+      options: --user 1001
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npm test
+```
+
+### Ephemeral Runner 模式
+
+```
+Ephemeral（一次性）Runner：
+  每次构建起新 Runner，完成后销毁
+  
+  优势：
+    - 无状态，无残留文件
+    - 隔离彻底，无跨构建污染
+    - 适合不可信代码（fork PR）
+  
+  配置：
+    ./config.sh --ephemeral
+    或使用 K8s + 动态 Pod
+```
+
+## Actions 缓存策略进阶
+
+### 缓存层级架构
+
+```text
+Actions 缓存层级：
+  L1: Runner 本地缓存（本机缓存目录）
+  L2: GitHub 托管缓存（跨 Runner 共享）
+  L3: 远程构建缓存（BuildKit / Bazel Remote Cache）
+
+缓存键设计原则：
+  key = 基准键 + 哈希文件
+  restore-keys = 回退匹配前缀
+
+  示例：
+    key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+    restore-keys: |
+      ${{ runner.os }}-maven-
+```
+
+### restore-key 匹配机制
+
+| 优先级 | 匹配方式 | 说明 |
+|--------|----------|------|
+| 1 | key 精确匹配 | 命中率最高 |
+| 2 | restore-keys 前缀匹配 | 从长到短匹配 |
+| 3 | 缓存不存在 | 完全 miss |
+
+```yaml
+# restore-keys 最佳实践
+- uses: actions/cache@v4
+  with:
+    path: ~/.m2
+    key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+    restore-keys: |
+      ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+      ${{ runner.os }}-maven-
+```
+
+### 缓存命中率优化
+
+```
+提升命中率的手段：
+  1. 精确键值：hashFiles 精确匹配 → +20% 命中率
+  2. 恢复键 fallback：设置多级前缀匹配 → +15% 命中率
+  3. 分层缓存：依赖缓存 + 构建缓存分离 → +25% 命中率
+  4. 预热缓存：定时更新 → +10% 命中率
+
+常见坑：
+  用分支名作 key → 每分支一份 → 几乎不命中
+  正确：用 lockfile 内容哈希 → 同依赖跨分支复用
+```
+
+## 矩阵构建高级策略
+
+### 矩阵维度爆炸控制
+
+```yaml
+strategy:
+  max-parallel: 6
+  fail-fast: false
+  matrix:
+    os: [ubuntu-latest, macos-latest]
+    node: [18, 20, 22]
+    shard: [1, 2, 3, 4, 5]
+    include:
+      - os: ubuntu-latest
+        node: 22
+        experimental: true
+        coverage: true
+    exclude:
+      - os: macos-latest
+        node: 18
+```
+
+### 矩阵条件执行
+
+| 条件 | 用法 | 效果 |
+|------|------|------|
+| fail-fast: false | 矩阵项独立 | 收集所有失败 |
+| max-parallel | 控制并发数 | 避免配额耗尽 |
+| continue-on-error | 允许失败 | 实验性维度 |
+| if: matrix.coverage | 条件步骤 | 仅在特定维度跑覆盖率 |
+
+## Reusable Workflow 传参与安全
+
+### Secrets 透传最佳实践
+
+```yaml
+on:
+  workflow_call:
+    secrets:
+      REGISTRY_TOKEN:
+        required: true
+    inputs:
+      environment:
+        required: true
+        type: string
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      - run: ./deploy.sh ${{ inputs.environment }}
+```
+
+### 安全传递 Secrets
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| secrets: inherit | 透传所有 secrets | 内部可信仓库 |
+| secrets: [key] | 显式传递特定 secret | 最小权限 |
+| inputs + secrets | 组合传参 | 通用场景 |
+
+## OIDC 免密推送实战
+
+### AWS OIDC 配置
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-deploy
+          aws-region: cn-north-1
+      - run: aws s3 sync ./dist s3://my-bucket
+```
+
+### OIDC 信任策略配置
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:org/repo:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+```
+
+## 安全最佳实践 Checklist
+
+| 检查项 | 说明 | 严重度 |
+|--------|------|--------|
+| Action 版本固定 | Pin SHA 而非 tag | HIGH |
+| Secrets 不落日志 | withCredentials 或环境变量 | CRITICAL |
+| OIDC 优先 | 免长期密钥 | HIGH |
+| 权限最小化 | permissions 显式声明 | MEDIUM |
+| 缓存隔离 | fork PR 独立缓存键 | MEDIUM |
+| Runner 安全 | self-hosted 隔离执行 | HIGH |
+| 审计日志 | 启用 GitHub Audit Log | LOW |
+
+## 自托管 Runner Auto Scaling Group
+
+### ASG 动态扩缩容
+
+```mermaid
+flowchart TB
+    QUEUE[Job Queue] --> ASG[Auto Scaling Group]
+    ASG --> R1[Runner 1]
+    ASG --> R2[Runner 2]
+    ASG --> RN[Runner N]
+    R1 -->|scale up| ASG
+    R2 -->|scale down| ASG
+```
+
+```yaml
+# 自托管 Runner 部署配置
+# 1. 创建 Runner AMI
+# 2. 配置 ASG 策略
+# 3. 注册到 GitHub
+
+# ASG 配置示例（Terraform）
+resource "aws_autoscaling_group" "gha_runner" {
+  min_size         = 0
+  max_size         = 10
+  desired_capacity = 2
+  
+  launch_template {
+    id = aws_launch_template.runner.id
+  }
+  
+  tag {
+    key                 = "Name"
+    value               = "github-actions-runner"
+    propagate_at_launch = true
+  }
+}
+```
+
+### Runner 健康检查
+
+| 检查项 | 方法 | 阈值 |
+|--------|------|------|
+| Runner 注册状态 | GitHub API | active |
+| 磁盘空间 | 脚本检测 | > 10GB |
+| 内存使用 | 脚本检测 | < 80% |
+| 网络连通 | HTTP 探测 | < 1s |
+
 ## 十三、与其他模块的关联
 
 - 流水线总纲与 DORA 指标，见 [01-概述与核心概念](01-概述与核心概念.md)。
