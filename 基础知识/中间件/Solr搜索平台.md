@@ -983,6 +983,111 @@ DC1 (北京) → CDCR → DC2 (上海)
     - 分片路由（CompositeIdRouter）
 ```
 
+## Solr 搜索平台深度补充
+
+### 13.1 自定义 Tokenizer 配置
+
+```xml
+<!-- schema.xml 自定义分词器 -->
+<fieldType name="text_custom" class="solr.TextField">
+  <analyzer type="index">
+    <tokenizer class="solr.StandardTokenizerFactory"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <filter class="solr.StopFilterFactory" words="stopwords.txt"/>
+    <filter class="solr.PorterStemFilterFactory"/>
+  </analyzer>
+  <analyzer type="query">
+    <tokenizer class="solr.StandardTokenizerFactory"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <filter class="solr.SynonymGraphFilterFactory" synonyms="synonyms.txt"/>
+  </analyzer>
+</fieldType>
+```
+
+### 13.2 评分公式（BM25）
+
+```text
+BM25 评分公式：
+  score(Q, D) = Σ IDF(qi) × (f(qi, D) × (k1 + 1)) / (f(qi, D) + k1 × (1 - b + b × |D|/avgdl))
+
+  参数说明：
+    k1 = 1.2（词频饱和参数）
+    b = 0.75（文档长度归一化参数）
+    avgdl = 平均文档长度
+    f(qi, D) = 词 qi 在文档 D 中的频率
+    IDF(qi) = 逆文档频率
+
+  调优建议：
+    - k1 越大，词频影响越大
+    - b 越大，文档长度惩罚越大
+    - 搜索场景：k1=1.2, b=0.75
+    - 精确匹配：k1=0.9, b=0.4
+```
+
+### 13.3 Faceted Search 实战
+
+```json
+// 查询示例：按品牌、价格区间分面
+{
+  "query": "*:*",
+  "facet": {
+    "brand": {
+      "type": "terms",
+      "field": "brand_s",
+      "limit": 10
+    },
+    "price_range": {
+      "type": "range",
+      "field": "price_f",
+      "ranges": [
+        {"from": 0, "to": 100, "label": "0-100"},
+        {"from": 100, "to": 500, "label": "100-500"},
+        {"from": 500, "label": "500+"}
+      ]
+    }
+  }
+}
+```
+
+### 13.4 CDCR 跨数据中心复制
+
+| 模式 | 说明 | 适用场景 |
+|------|------|---------|
+| 主从复制 | 单向同步 | 灾备 |
+| 双向复制 | 双向同步 | 多活 |
+| 路由复制 | 多节点路由 | 多区域 |
+
+### 13.5 电商搜索实战
+
+```java
+// 电商搜索查询构建
+SolrQuery query = new SolrQuery();
+query.setQuery("手机");
+query.setFilterQueries("brand_s:Apple", "price_f:[2000 TO 5000]");
+query.setSort("score", ORDER.desc);
+query.setStart(0);
+query.setRows(20);
+query.setFacet(true);
+query.addFacetField("brand_s");
+query.addFacetField("color_s");
+
+QueryResponse response = solrServer.query(query);
+SolrDocumentList results = response.getResults();
+```
+
+### 13.6 Solr vs Elasticsearch 对比
+
+| 维度 | Solr | Elasticsearch |
+|------|------|---------------|
+| 架构 | Master-Slave | 去中心化 |
+| 查询语法 | SolrQuery | Query DSL |
+| 分词 | Schema 定义 | 动态映射 |
+| 实时性 | 近实时 | 近实时 |
+| 生态 | 成熟 | 活跃 |
+| 运维 | 复杂 | 相对简单 |
+
+---
+
 ## 十三、与其他板块的关系（扩展）
 
 - Elasticsearch 见「[ES 体系](../ES体系.md)」；

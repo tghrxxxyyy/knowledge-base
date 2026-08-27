@@ -1599,6 +1599,185 @@ MQTT 是 IoT 设备通信的轻量级协议，Broker 是发布/订阅模式的�
 
 ---
 
+## 五、QoS 级别深入对比
+
+### 5.1 QoS 级别详解
+
+| QoS 级别 | 名称 | 传输次数 | 性能 | 适用场景 |
+|----------|------|----------|------|----------|
+| 0 | At most once | 0-1次 | 最快 | 传感器数据（允许丢失） |
+| 1 | At least once | 1+次 | 中等 | 命令下发（不允许丢失） |
+| 2 | Exactly once | 恰好1次 | 最慢 | 关键数据（不允许重复） |
+
+### 5.2 QoS 实现原理
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant B as Broker
+    participant S as Subscriber
+    
+    Note over P,B: QoS 0 (Fire and Forget)
+    P->>B: PUBLISH (QoS 0)
+    Note right of B: 无确认，可能丢失
+    
+    Note over P,B: QoS 1 (至少一次)
+    P->>B: PUBLISH (QoS 1)
+    B->>P: PUBACK
+    Note right of B: 未收到PUBACK则重传
+    
+    Note over P,B: QoS 2 (恰好一次)
+    P->>B: PUBLISH (QoS 2)
+    B->>P: PUBREC
+    P->>B: PUBREL
+    B->>P: PUBCOMP
+```
+
+### 5.3 QoS 降级与升级
+
+```
+QoS 降级场景：
+  网络不稳定 → QoS 2 降级为 QoS 1
+  下游处理慢 → QoS 1 降级为 QoS 0
+  资源受限 → 降低 QoS 级别
+
+QoS 升级场景：
+  数据重要性高 → QoS 0 升级为 QoS 1
+  需要精确一次 → QoS 1 升级为 QoS 2
+  网络质量好 → 提升 QoS 级别
+```
+
+---
+
+## 六、消息持久化与存储
+
+### 6.1 持久化策略
+
+| 策略 | 说明 | 性能 | 数据安全 |
+|------|------|------|----------|
+| 内存持久化 | 消息存内存，重启丢失 | 最快 | 不安全 |
+| 磁盘持久化 | 消息写磁盘 | 中等 | 安全 |
+| 分布式持久化 | 多节点复制 | 较慢 | 最安全 |
+| 混合持久化 | 内存+磁盘 | 快 | 安全 |
+
+### 6.2 存储架构
+
+```
+MQTT Broker 存储架构：
+  ├── 消息存储
+  │   ├── 内存存储（热数据）
+  │   ├── 磁盘存储（温数据）
+  │   └── 对象存储（冷数据）
+  ├── 会话存储
+  │   ├── 本地会话（单节点）
+  │   └── 分布式会话（集群）
+  └── 订阅存储
+      ├── 内存订阅树
+      └── 持久化订阅
+```
+
+---
+
+## 七、集群与高可用
+
+### 7.1 集群架构
+
+| 架构 | 说明 | 适用场景 |
+|------|------|----------|
+| 单节点 | 简单部署 | 开发测试 |
+| 主从 | 读写分离 | 小规模生产 |
+| 集群 | 水平扩展 | 中大规模生产 |
+| 分片集群 | 数据分片 | 超大规模 |
+
+### 7.2 集群配置
+
+```yaml
+# EMQX 集群配置
+emqx:
+  cluster:
+    # 集群发现方式
+    discovery: static
+    # 集群节点列表
+    nodes:
+      - "emqx1@192.168.1.101"
+      - "emqx2@192.168.1.102"
+      - "emqx3@192.168.1.103"
+    # 集群同步方式
+    sync: full_mesh
+```
+
+---
+
+## 八、安全机制
+
+### 8.1 安全特性
+
+| 特性 | 说明 | 实现方式 |
+|------|------|----------|
+| 身份认证 | 客户端身份验证 | 用户名密码/证书/Token |
+| 访问控制 | 控制客户端权限 | ACL 规则 |
+| 传输加密 | 数据加密传输 | TLS/SSL |
+| 消息加密 | 消息内容加密 | 端到端加密 |
+| 审计日志 | 记录操作日志 | 日志系统 |
+
+### 8.2 ACL 规则示例
+
+```conf
+# EMQX ACL 规则
+## 允许所有客户端发布到 topic sensor/#
+{allow, {user, "sensor_client"}, publish, ["sensor/#"]}.
+
+## 允许所有客户端订阅 topic command/#
+{allow, {user, "command_client"}, subscribe, ["command/#"]}.
+
+## 禁止所有客户端发布到 topic admin/#
+{deny, all, publish, ["admin/#"]}.
+
+## 默认拒绝所有
+{deny, all}.
+```
+
+---
+
+## 九、性能优化
+
+### 9.1 性能指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 连接数 | 100万+ | 单节点最大连接 |
+| 消息吞吐 | 10万+/秒 | 单节点消息处理 |
+| 延迟 | < 1ms | 消息投递延迟 |
+| 可用性 | 99.99% | 集群可用性 |
+
+### 9.2 优化策略
+
+```bash
+# 1. 系统参数优化
+sysctl -w net.core.somaxconn=65535
+sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+# 2. 文件描述符优化
+ulimit -n 1000000
+
+# 3. 网络优化
+sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w net.ipv4.tcp_fin_timeout=15
+```
+
+---
+
+## 十、与其他板块的关系
+
+- MQTT 协议规范见「[MQTT v5.0 规范](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)」；
+- 消息队列对比见「[中间件/Kafka](./Kafka.md)」；
+- IoT 平台见「[云原生IoT平台](../../云原生/IoT平台.md)」；
+- 边缘计算见「[边缘计算架构](../../边缘计算/架构.md)」；
+- 设备管理见「[IoT设备管理](../../边缘计算/设备管理.md)」。
+
+---
+
 ## 参考资料
 
 - [MQTT v5.0 规范](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)

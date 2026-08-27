@@ -1641,10 +1641,207 @@ jobs:
 | 并行构建 | 多包并行构建 | 缩短50%时间 |
 | 依赖图 | 分析包依赖关系 | 智能构建顺序 |
 
-## 本篇补充 Checklist
+## 缓存策略进阶
 
-- [ ] reusable workflow 用 `workflow_call` 传 `inputs`/`secrets`，分层复用。
-- [ ] matrix：`fail-fast:false` + `include`/`exclude` 精确组合。
-- [ ] self-hosted 严守安全边界，不可信代码禁跑。
-- [ ] 云部署用 OIDC `id-token: write` 免静态密钥，trust policy 最小授权。
-- [ ] monorepo 用路径过滤 + 远程缓存，避免全量跑。
+### Actions Cache 深度优化
+
+```yaml
+# 多层缓存策略
+- name: Cache node modules
+  uses: actions/cache@v4
+  with:
+    path: ~/.npm
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-node-
+
+# 使用 setup-node 内置缓存
+- uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: 'npm'
+
+# Go 模块缓存
+- uses: actions/setup-go@v5
+  with:
+    go-version: '1.22'
+    cache: true
+
+# 自定义缓存策略
+- name: Cache Gradle
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.gradle/caches
+      ~/.gradle/wrapper
+    key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+    restore-keys: |
+      ${{ runner.os }}-gradle-
+```
+
+### 缓存命中率监控
+
+```yaml
+- name: Check cache hit
+  run: |
+    echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
+    if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ]; then
+      echo "⚠️ Cache miss - first build or key changed"
+    fi
+```
+
+---
+
+## 矩阵策略进阶
+
+### 复杂矩阵配置
+
+```yaml
+strategy:
+  fail-fast: false
+  matrix:
+    os: [ubuntu-latest, macos-latest, windows-latest]
+    node: [18, 20, 22]
+    exclude:
+      - os: windows-latest
+        node: 18
+    include:
+      - os: ubuntu-latest
+        node: 22
+        experimental: true
+    max-parallel: 4
+
+# 矩阵输出
+outputs:
+  result: ${{ steps.test.outputs.result }}
+
+steps:
+  - name: Run tests
+    id: test
+    run: echo "result=${{ matrix.os }}-${{ matrix.node }}" >> $GITHUB_OUTPUT
+```
+
+### 矩阵组合策略
+
+```yaml
+# 并行测试分片
+strategy:
+  matrix:
+    shard: [1, 2, 3, 4, 5]
+steps:
+  - name: Run shard ${{ matrix.shard }}/5
+    run: |
+      npx jest --shard=${{ matrix.shard }}/5
+
+# 语言版本矩阵
+strategy:
+  matrix:
+    java: [11, 17, 21]
+    os: [ubuntu-latest]
+    include:
+      - java: 17
+        os: macos-latest
+```
+
+---
+
+## Self-hosted Runner 安全加固
+
+### Runner 安全配置
+
+```yaml
+# 使用临时实例
+jobs:
+  build:
+    runs-on: [self-hosted, ephemeral]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Running on ephemeral runner"
+
+# 标签隔离
+runs-on: [self-hosted, linux, x64, production]
+
+# 环境隔离
+jobs:
+  build:
+    runs-on: self-hosted
+    environment: production
+    steps:
+      - run: echo "Deploying to production"
+```
+
+### Runner 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 临时实例 | 每次构建使用新实例 |
+| 标签隔离 | 不同项目用不同标签 |
+| 网络隔离 | Runner 在私有网络 |
+| 密钥管理 | 使用 Secrets Manager |
+| 审计日志 | 记录所有操作 |
+| 定期更新 | 更新 Runner 和工具版本 |
+
+```bash
+# Runner 安全检查脚本
+#!/bin/bash
+# 检查 Runner 版本
+./config.sh --version
+
+# 检查网络连接
+curl -s https://api.github.com | head -1
+
+# 检查磁盘空间
+df -h
+
+# 检查内存
+free -m
+```
+
+---
+
+## Monorepo 优化方案
+
+### 路径过滤配置
+
+```yaml
+name: CI
+on:
+  push:
+    paths:
+      - 'packages/api/**'
+      - 'packages/web/**'
+      - '!packages/api/**/*.md'
+      - '!packages/web/**/*.md'
+
+jobs:
+  api:
+    if: contains(github.event.head_commit.modified, 'packages/api/')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "API changed"
+
+  web:
+    if: contains(github.event.head_commit.modified, 'packages/web/')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Web changed"
+```
+
+### 构建依赖图
+
+```yaml
+# 使用 Nx 分析依赖
+- name: Get affected packages
+  id: affected
+  run: |
+    AFFECTED=$(npx nx show projects --affected)
+    echo "packages=$AFFECTED" >> $GITHUB_OUTPUT
+
+# 根据依赖构建
+- name: Build affected
+  run: npx nx run-many --target=build --projects=${{ steps.affected.outputs.packages }}
+```
+
+---
+
+## 本篇补充 Checklist

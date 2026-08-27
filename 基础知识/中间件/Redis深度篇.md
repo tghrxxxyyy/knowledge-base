@@ -1629,3 +1629,152 @@ Functions部署流程：
 - 云上缓存见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」。
 
 > 一句话：**Redis = 内存数据结构服务器（5大基础+5大数据结构）+ 持久化（RDB/AOF/混合）+ 集群（Cluster/哨兵）+ 分布式锁（Redlock/Redisson）；选型先看「数据结构需求（缓存→String，排行榜→ZSet，UV→HLL）」，再定「规模（单机/主从/Cluster）」，最后治「大Key/热Key/慢命令」**。
+
+---
+
+## 二十、Redis 与数据库一致性
+
+### 20.1 缓存一致性方案
+
+| 方案 | 说明 | 一致性 | 复杂度 | 适用场景 |
+|------|------|--------|--------|----------|
+| Cache Aside | 先更新DB，再删缓存 | 最终一致 | 低 | 通用 |
+| Read Through | 缓存层自动加载 | 最终一致 | 中 | 读多写少 |
+| Write Through | 缓存层自动写DB | 强一致 | 中 | 写多读少 |
+| Write Behind | 异步写DB | 最终一致 | 高 | 高写入 |
+
+### 20.2 延迟双删
+
+```java
+// 延迟双删策略
+public void updateWithDoubleDelete(String key, Object value) {
+    // 1. 先删缓存
+    redisTemplate.delete(key);
+    
+    // 2. 更新数据库
+    db.update(value);
+    
+    // 3. 延迟再删缓存
+    executor.schedule(() -> {
+        redisTemplate.delete(key);
+    }, 500, TimeUnit.MILLISECONDS);
+}
+```
+
+---
+
+## 二十一、Redis 分布式锁深入
+
+### 21.1 Redlock 算法
+
+```
+Redlock 算法流程：
+  1. 获取当前时间 T1
+  2. 依次向 N 个 Redis 实例请求锁
+     - 使用相同 key 和随机 value
+     - 设置较短超时时间
+  3. 计算获取锁耗时 = 当前时间 - T1
+  4. 判断是否获取成功：
+     - 成功数 > N/2
+     - 耗时 < 锁过期时间
+  5. 锁有效时间 = 过期时间 - 获取耗时
+  6. 如果获取失败，向所有实例发送释放锁
+```
+
+### 21.2 Redisson 看门狗
+
+```java
+// Redisson 看门狗机制
+RLock lock = redisson.getLock("myLock");
+
+// 看门狗默认30秒过期，每10秒续期
+lock.lock();
+
+// 或指定过期时间（不启用看门狗）
+lock.lock(30, TimeUnit.SECONDS);
+
+// 尝试获取锁
+boolean acquired = lock.tryLock(5, 30, TimeUnit.SECONDS);
+```
+
+---
+
+## 二十二、Redis 序列化方案
+
+### 22.1 序列化方案对比
+
+| 方案 | 性能 | 可读性 | 跨语言 | 体积 |
+|------|------|--------|--------|------|
+| JDK 序列化 | 低 | 差 | 否 | 大 |
+| JSON | 中 | 好 | 是 | 中 |
+| Protobuf | 高 | 差 | 是 | 小 |
+| MsgPack | 高 | 差 | 是 | 小 |
+| Kryo | 高 | 差 | 否 | 小 |
+
+### 22.2 序列化配置
+
+```java
+// Redis 序列化配置
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+        
+        // Key 序列化
+        template.setKeySerializer(new StringRedisSerializer());
+        
+        // Value 序列化（JSON）
+        GenericJackson2JsonRedisSerializer jsonSerializer = 
+            new GenericJackson2JsonRedisSerializer();
+        template.setValueSerializer(jsonSerializer);
+        template.setHashValueSerializer(jsonSerializer);
+        
+        return template;
+    }
+}
+```
+
+---
+
+## 二十三、Redis 监控与运维
+
+### 23.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 内存使用率 | 已用内存/总内存 | > 80% |
+| 连接数 | 当前连接数 | > 最大连接数 80% |
+| 命中率 | 缓存命中次数/总次数 | < 80% |
+| 慢查询数 | 慢查询日志数量 | > 0 |
+| 延迟 | 命令执行延迟 | > 5ms |
+
+### 23.2 运维命令
+
+```bash
+# 查看内存使用
+redis-cli info memory
+
+# 查看慢查询
+redis-cli slowlog get 10
+
+# 查看大Key
+redis-cli --bigkeys
+
+# 查看连接数
+redis-cli info clients
+
+# 监控实时命令
+redis-cli monitor
+```
+
+---
+
+## 二十四、与其他板块的关系
+
+- 缓存设计模式见「[缓存经典三问](../../场景设计/缓存经典三问与一致性.md)」；
+- 分布式锁见「[分布式锁](../../场景设计/分布式锁.md)」；
+- 多级缓存见「[多级缓存框架](../../场景设计/多级缓存框架.md)」；
+- 云上缓存见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」；
+- 消息队列见「[Kafka](./Kafka.md)」。

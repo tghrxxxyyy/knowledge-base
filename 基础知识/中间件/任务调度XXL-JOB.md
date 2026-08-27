@@ -1598,3 +1598,307 @@ XXL-JOB 是分布式任务调度平台，将调度中心与执行器分离，提
 - [XXL-JOB GitHub](https://github.com/xuxueli/xxl-job)
 - [Cron 表达式参考](https://www.xuxueli.com/xxl-job/#7.1%C2%A0Cron%E8%A1%A8%E8%BE%BE%E5%BC%8F)
 - [XXL-JOB vs Elastic-Job](https://www.xuxueli.com/xxl-job/#11.1%C2%A0%E4%B8%8EXXJ-JOB%E5%AF%B9%E6%AF%94)
+
+## 十六、任务依赖与 DAG 编排
+
+### 16.1 依赖类型
+
+| 依赖类型 | 说明 | 配置方式 | 适用场景 |
+|----------|------|----------|----------|
+| 任务依赖 | 上游任务完成后才执行下游 | JobHandler 内部触发 | ETL 链路 |
+| 数据依赖 | 上游产出数据后才执行 | 文件/Hive 表存在性检查 | 离线数仓 |
+| 时间依赖 | 固定时间点触发 | Cron 表达式 | 定时报表 |
+| 参数依赖 | 上游传递参数给下游 | 任务参数透传 | 动态链路 |
+
+### 16.2 DAG 编排实现
+
+```java
+// 在 JobHandler 中触发下游任务
+@Component
+public class ETLJobHandler extends IJobHandler {
+    @Override
+    public void execute(String param) throws Exception {
+        // 1. 执行当前任务
+        doExtract(param);
+        
+        // 2. 触发下游任务（异步）
+        XxlJobHelper.execute("transform_job", param);
+        
+        // 3. 等待下游完成（轮询状态）
+        while (!isJobFinished("transform_job")) {
+            Thread.sleep(5000);
+        }
+        
+        // 4. 触发更下游
+        XxlJobHelper.execute("load_job", param);
+    }
+}
+```
+
+### 16.3 调度链路图
+
+```mermaid
+flowchart LR
+    A[数据抽取] -->|成功| B[数据清洗]
+    B -->|成功| C[数据转换]
+    C -->|成功| D[数据加载]
+    D -->|成功| E[报表生成]
+    E -->|成功| F[邮件通知]
+    
+    style A fill:#e1f5fe
+    style F fill:#c8e6c9
+```
+
+---
+
+## 十七、分片广播深入
+
+### 17.1 分片广播原理
+
+```
+分片广播流程：
+  1. 调度中心触发分片广播任务
+  2. 所有执行器实例同时收到任务
+  3. 每个实例根据分片参数处理不同数据
+  4. 分片参数：shardIndex（当前分片）/ shardTotal（总分片数）
+
+分片策略：
+  数据库分片：按 user_id % shardTotal == shardIndex 过滤
+  文件分片：按文件名 hash % shardTotal 分配
+  消息分片：按消息 key hash % shardTotal 分配
+```
+
+### 17.2 分片广播示例
+
+```java
+@Component
+public class ShardingJobHandler extends IJobHandler {
+    @Override
+    public void execute(String param) throws Exception {
+        int shardIndex = XxlJobHelper.getShardIndex();
+        int shardTotal = XxlJobHelper.getShardTotal();
+        
+        // 按分片查询数据
+        List<User> users = userService.getUsersByShard(shardIndex, shardTotal);
+        
+        for (User user : users) {
+            processUser(user);
+        }
+        
+        XxlJobHelper.log("分片{}处理完成，共{}条数据", shardIndex, users.size());
+    }
+}
+```
+
+---
+
+## 十八、任务依赖与重试机制
+
+### 18.1 重试策略
+
+| 重试策略 | 说明 | 配置 | 适用场景 |
+|----------|------|------|----------|
+| 固定间隔重试 | 每次重试间隔固定时间 | retryInterval=5000 | 网络抖动 |
+| 指数退避重试 | 重试间隔指数增长 | retryStrategy=exponential | 下游过载 |
+| 最大重试次数 | 超过次数不再重试 | retryCount=3 | 所有场景 |
+| 失败告警 | 重试失败后告警 | alarmEmail=xxx | 生产环境 |
+
+### 18.2 重试实现
+
+```java
+@Component
+public class RetryJobHandler extends IJobHandler {
+    @Override
+    public void execute(String param) throws Exception {
+        int maxRetries = 3;
+        int retryCount = 0;
+        
+        while (retryCount < maxRetries) {
+            try {
+                doBusiness(param);
+                return; // 成功则退出
+            } catch (Exception e) {
+                retryCount++;
+                if (retryCount >= maxRetries) {
+                    throw e; // 超过最大重试次数，抛出异常
+                }
+                Thread.sleep((long) Math.pow(2, retryCount) * 1000); // 指数退避
+            }
+        }
+    }
+}
+```
+
+---
+
+## 十九、执行器弹性伸缩
+
+### 19.1 弹性伸缩策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 固定数量 | 执行器实例数固定 | 稳定负载 |
+| 动态伸缩 | 根据任务量自动调整 | 波动负载 |
+| 分组隔离 | 不同任务组独立伸缩 | 多业务线 |
+| 优先级调度 | 高优先级任务优先执行 | 关键业务 |
+
+### 19.2 弹性伸缩配置
+
+```yaml
+# 执行器弹性伸缩配置
+xxl:
+  job:
+    executor:
+      # 最小实例数
+      min-instances: 2
+      # 最大实例数
+      max-instances: 10
+      # 伸缩指标
+      scale-metric: cpu-usage
+      # 伸缩阈值
+      scale-threshold: 80
+      # 伸缩冷却时间
+      scale-cooldown: 300
+```
+
+---
+
+## 二十、任务监控与告警
+
+### 20.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 任务成功率 | 成功任务/总任务 | < 95% |
+| 任务执行时间 | 平均执行时间 | > 预期时间 2 倍 |
+| 失败任务数 | 失败任务数量 | > 10 |
+| 执行器在线数 | 在线执行器数量 | < 最小实例数 |
+| 调度延迟 | 调度到执行的延迟 | > 5s |
+
+### 20.2 告警配置
+
+```java
+@Component
+public class JobAlarm implements JobAlarm {
+    @Override
+    public void alarm(JobAlarmInfo info) {
+        // 1. 发送邮件告警
+        mailService.sendAlarmMail(info);
+        
+        // 2. 发送钉钉/企微通知
+        dingTalkService.sendAlarmMessage(info);
+        
+        // 3. 写入监控系统
+        monitorService.recordAlarm(info);
+        
+        // 4. 触发自动修复（如重启任务）
+        if (info.isAutoRecover()) {
+            recoverJob(info.getJobId());
+        }
+    }
+}
+```
+
+---
+
+## 二十一、安全与权限控制
+
+### 21.1 安全机制
+
+| 机制 | 说明 | 配置 |
+|------|------|------|
+| 登录认证 | 用户名密码登录 | 配置文件设置 |
+| 权限控制 | 基于角色的访问控制 | RBAC 模型 |
+| 操作审计 | 记录所有操作日志 | 审计日志 |
+| 任务加密 | 任务参数加密传输 | AES/RSA 加密 |
+| 网络隔离 | 调度中心与执行器网络隔离 | 白名单机制 |
+
+### 21.2 权限模型
+
+```java
+// 权限模型
+public enum Permission {
+    JOB_VIEW("任务查看", 1),
+    JOB_CREATE("任务创建", 2),
+    JOB_EDIT("任务编辑", 4),
+    JOB_DELETE("任务删除", 8),
+    JOB_EXECUTE("任务执行", 16),
+    JOB_LOG("日志查看", 32),
+    USER_MANAGE("用户管理", 64);
+    
+    private String name;
+    private int code;
+}
+```
+
+---
+
+## 二十二、生产最佳实践
+
+### 22.1 部署建议
+
+```
+生产部署建议：
+  调度中心：
+    1. 至少 2 个实例，主备或负载均衡
+    2. 使用独立数据库（MySQL/PostgreSQL）
+    3. 配置异地容灾
+    
+  执行器：
+    1. 与业务应用同进程部署
+    2. 合理配置线程池大小
+    3. 监控执行器资源使用
+    
+  任务设计：
+    1. 任务幂等性设计
+    2. 合理设置超时时间
+    3. 避免长任务阻塞
+    4. 分片任务合理分片
+```
+
+### 22.2 性能优化
+
+| 优化点 | 优化策略 | 预期效果 |
+|--------|----------|----------|
+| 调度性能 | 合理设置调度线程数 | 提升调度吞吐 |
+| 执行性能 | 任务分片并行执行 | 减少执行时间 |
+| 网络性能 | 压缩传输数据 | 减少网络延迟 |
+| 存储性能 | 定期清理日志 | 减少存储压力 |
+| 监控性能 | 异步上报指标 | 减少监控开销 |
+
+---
+
+## 二十三、故障排查指南
+
+### 23.1 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 任务不执行 | 执行器未注册 | 检查执行器配置 |
+| 任务执行慢 | 任务逻辑复杂 | 优化任务逻辑/分片 |
+| 任务失败率高 | 下游服务不稳定 | 增加重试/降级机制 |
+| 调度延迟高 | 调度中心负载高 | 增加调度中心实例 |
+| 日志丢失 | 日志存储空间不足 | 配置日志清理策略 |
+
+### 23.2 排查步骤
+
+```bash
+# 1. 检查执行器状态
+curl http://调度中心/admin/executor/list
+
+# 2. 检查任务日志
+curl http://调度中心/admin/joblog/list?jobId=1
+
+# 3. 检查调度日志
+curl http://调度中心/admin/joblog/list?jobGroup=1
+
+# 4. 手动触发任务测试
+curl http://调度中心/admin/job/trigger?jobId=1&executorParam=test
+
+# 5. 检查数据库连接
+mysql -u用户名 -p密码 -e "SELECT * FROM xxl_job_info WHERE id=1"
+```
+
+---
+
+## 二十四、与其他板块的关系

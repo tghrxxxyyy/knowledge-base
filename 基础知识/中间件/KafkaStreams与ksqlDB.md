@@ -1639,3 +1639,89 @@ ksqlDB最佳实践：
 | 适用场景 | 服务内实时聚合/清洗/Join |
 | 替代方案 | Flink（复杂流处理）/ Spark（批流一体） |
 | 一句话 | 「零运维的轻量流处理——库形态 + KStream/KTable + RocksDB 状态」 |
+
+---
+
+## 十三、Kafka Streams 生产部署
+
+### 13.1 部署架构
+
+| 部署模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| 独立进程 | 独立部署流处理应用 | 一般场景 |
+| K8s 部署 | 容器化部署 | 云原生环境 |
+| 与业务同进程 | 嵌入业务应用 | 轻量场景 |
+
+### 13.2 部署配置
+
+```yaml
+# Kafka Streams 部署配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-streams-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka-streams
+  template:
+    spec:
+      containers:
+        - name: streams-app
+          image: kafka-streams-app:latest
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka:9092"
+            - name: APPLICATION_ID
+              value: "my-streams-app"
+            - name: NUM_STREAM_THREADS
+              value: "4"
+```
+
+---
+
+## 十四、Kafka Streams 与 Flink 对比
+
+### 14.1 特性对比
+
+| 特性 | Kafka Streams | Flink |
+|------|---------------|-------|
+| 部署模式 | 库嵌入 | 独立集群 |
+| 状态管理 | RocksDB 本地 | 分布式状态 |
+| 窗口支持 | 基本窗口 | 丰富窗口 |
+| Exactly-once | 事务保证 | Checkpoint 保证 |
+| 运维成本 | 低（复用Kafka） | 中等 |
+
+### 14.2 选型建议
+
+```
+选型决策树：
+  场景是否简单？
+    ├─ 是 → Kafka Streams
+    │    └─ 需要复杂窗口？→ 否
+    └─ 否 → Flink
+         └─ 需要复杂状态？→ 是
+
+Kafka Streams 适用场景：
+  - 消息过滤/转换
+  - 简单聚合
+  - 流表 Join
+  - 服务内实时计算
+
+Flink 适用场景：
+  - 复杂事件处理
+  - 多流 Join
+  - 复杂窗口
+  - 大状态计算
+```
+
+---
+
+## 十五、与其他板块的关系
+
+- Kafka 基础见「[Kafka](./Kafka.md)」；
+- 流处理见「[Flink](../大数据/08-流处理计算：Flink.md)」；
+- 消息队列见「[消息队列对比](./消息队列对比.md)」；
+- 实时数仓见「[实时数仓与湖仓一体](../大数据/11-实时数仓与湖仓一体.md)」；
+- 数据湖见「[数据湖格式](../大数据/05-列式存储与数据湖格式.md)」。

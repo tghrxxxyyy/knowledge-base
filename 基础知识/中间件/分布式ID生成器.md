@@ -1620,3 +1620,77 @@ public class IdGeneratorMetrics {
     }
 }
 ```
+
+---
+
+## 十八、ID 生成器安全机制
+
+### 18.1 安全威胁
+
+| 威胁 | 说明 | 应对措施 |
+|------|------|----------|
+| ID 猜测 | 攻击者猜测下一个 ID | 随机化起始值 |
+| 重放攻击 | 恶意重复请求 ID | 时间戳+签名 |
+| 时钟回拨 | 时钟倒退导致 ID 冲突 | 检测+拒绝+等待 |
+| 节点伪造 | 伪造 Worker 节点 | 节点注册+心跳 |
+
+### 18.2 安全配置
+
+```java
+// 安全配置示例
+@Component
+public class SecureIdGenerator {
+    // 1. 随机化起始值
+    private long workerId = new Random().nextLong() & 0x1F;
+    
+    // 2. 时间戳签名
+    public long generateSecureId() {
+        long timestamp = System.currentTimeMillis();
+        String sign = sign(timestamp + "-" + workerId);
+        return (timestamp << 22) | (workerId << 17) | sequence | sign.hashCode();
+    }
+    
+    // 3. 时钟回拨检测
+    private void checkClockTurnback(long timestamp) {
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("时钟回拨，拒绝生成ID");
+        }
+    }
+}
+```
+
+---
+
+## 十九、ID 生成器监控与运维
+
+### 19.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 生成速率 | ID 生成 QPS | < 1000/s |
+| 重复率 | 重复 ID 比例 | > 0 |
+| 时钟回拨 | 回拨次数 | > 0 |
+| 延迟 | ID 生成耗时 | > 10ms |
+
+### 19.2 运维命令
+
+```bash
+# 检查 Snowflake 节点状态
+curl http://localhost:8080/actuator/snowflake/status
+
+# 检查号段模式状态
+curl http://localhost:8080/actuator/segment/status
+
+# 手动触发号段加载
+curl -X POST http://localhost:8080/actuator/segment/refresh
+```
+
+---
+
+## 二十、与其他板块的关系
+
+- 分布式锁见「[分布式锁](../../场景设计/分布式锁.md)」；
+- 分布式事务见「[分布式事务](./分布式事务Seata.md)」；
+- 消息队列见「[Kafka](./Kafka.md)」；
+- 缓存见「[Redis深度篇](./Redis深度篇.md)」；
+- 数据库见「[MySQL](../数据库/MySQL.md)」。

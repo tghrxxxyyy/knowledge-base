@@ -1609,3 +1609,121 @@ spring:
 - 微服务治理见「[架构/微服务治理全链路](../架构/微服务治理全链路.md)」。
 
 > 一句话：**Spring Cloud Alibaba = Nacos（注册+配置）+ Sentinel（限流熔断）+ Seata（分布式事务）+ Gateway（网关）——微服务全家桶，先跑通一个完整 demo，再逐个深入**。
+
+---
+
+## 二十四、微服务通信模式
+
+### 24.1 同步 vs 异步
+
+| 通信模式 | 技术 | 优点 | 缺点 | 适用场景 |
+|----------|------|------|------|----------|
+| 同步 REST | Feign/RestTemplate | 简单直观 | 阻塞、延迟高 | 查询操作 |
+| 同步 gRPC | gRPC | 高性能、强类型 | 学习成本高 | 内部调用 |
+| 异步消息 | Kafka/RocketMQ | 解耦、削峰 | 最终一致性 | 事件驱动 |
+| 异步事件 | Spring Event | 简单、进程内 | 不可靠 | 单体应用 |
+
+### 24.2 通信模式选择
+
+```mermaid
+flowchart TD
+    A[服务间通信需求] --> B{实时性要求}
+    B -->|高| C{调用频率}
+    B -->|低| D[异步消息]
+    C -->|高| E[gRPC]
+    C -->|低| F[REST/Feign]
+    D --> G{数据一致性}
+    G -->|强| H[分布式事务]
+    G -->|最终| I[消息队列]
+```
+
+---
+
+## 二十五、服务治理深入
+
+### 25.1 服务治理能力矩阵
+
+| 治理能力 | Sentinel | Hystrix | Resilience4j | 说明 |
+|----------|----------|---------|--------------|------|
+| 限流 | 支持 | 不支持 | 支持 | 流量控制 |
+| 熔断 | 支持 | 支持 | 支持 | 失败率触发 |
+| 降级 | 支持 | 支持 | 支持 | 返回兜底值 |
+| 热点参数 | 支持 | 不支持 | 不支持 | 热点数据保护 |
+| 系统自适应 | 支持 | 不支持 | 不支持 | CPU/负载保护 |
+
+### 25.2 服务治理配置
+
+```yaml
+# Sentinel 限流配置
+sentinel:
+  transport:
+    dashboard: localhost:8080
+  datasource:
+    flow:
+      nacos:
+        server-addr: localhost:8848
+        data-id: sentinel-flow-rules
+        group-id: SENTINEL_GROUP
+        rule-type: flow
+```
+
+---
+
+## 二十六、分布式事务深入
+
+### 26.1 事务模式对比
+
+| 模式 | 一致性 | 性能 | 复杂度 | 适用场景 |
+|------|--------|------|--------|----------|
+| AT | 最终一致 | 高 | 低 | 一般业务 |
+| TCC | 最终一致 | 中 | 高 | 资金业务 |
+| SAGA | 最终一致 | 高 | 中 | 长事务 |
+| XA | 强一致 | 低 | 高 | 银行核心 |
+
+### 26.2 事务模式选择
+
+```mermaid
+flowchart TD
+    A[分布式事务需求] --> B{一致性要求}
+    B -->|强一致| C[XA模式]
+    B -->|最终一致| D{业务复杂度}
+    D -->|简单| E[AT模式]
+    D -->|复杂| F{TCC模式]
+    D -->|长事务| G[SAGA模式]
+```
+
+---
+
+## 二十七、监控与可观测性
+
+### 27.1 可观测性三支柱
+
+| 支柱 | 技术栈 | 采集方式 | 存储 | 可视化 |
+|------|--------|----------|------|--------|
+| 指标 | Prometheus | Agent采集 | TSDB | Grafana |
+| 日志 | ELK/Loki | Filebeat | ES/Loki | Kibana |
+| 链路 | SkyWalking/Jaeger | SDK埋点 | ES | UI |
+
+### 27.2 监控配置
+
+```yaml
+# Prometheus 监控配置
+scrape_configs:
+  - job_name: 'spring-cloud-service'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['localhost:8080']
+```
+
+---
+
+## 二十八、与其他板块的关系
+
+- Redis 知识见「[基础知识/redis知识](redis知识.md)」；
+- 大数据链路见「[大数据/08-流处理计算：Flink](大数据/08-流处理计算：Flink.md)」；
+- 架构设计见「[基础知识/一些概念](一些概念.md)」；
+- 微服务网关见「[Spring Cloud Gateway](../基础知识/中间件/SpringCloudGateway.md)」；
+- 服务注册见「[Nacos](../源码系列/Nacos.md)」；
+- 限流熔断见「[Sentinel](../源码系列/sentinel.md)」；
+- 分布式事务见「[Seata](../基础知识/中间件/分布式事务Seata.md)」；
+- 微服务治理见「[架构/微服务治理全链路](../架构/微服务治理全链路.md)」。

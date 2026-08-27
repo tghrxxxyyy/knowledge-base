@@ -1573,6 +1573,124 @@ flowchart TD
 </loadBalance>
 ```
 
+## 分库分表全局ID方案对比
+
+### 方案选型决策树
+
+```text
+全局 ID 方案选择：
+  1. 是否需要有序？
+     - 是 → 雪花算法 / 数据库自增
+     - 否 → UUID / Leaf-segment
+
+  2. 是否需要高可用？
+     - 是 → 雪花算法（无中心依赖）/ Leaf（双 Buffer）
+     - 否 → 数据库自增
+
+  3. 性能要求？
+     - 极高 → 雪花算法（本地生成）
+     - 中等 → Leaf-segment（号段模式）
+     - 低 → 数据库自增
+
+  4. 时钟回拨处理？
+     - 需要 → 雪花算法（扩展位 + 回拨检测）
+     - 不需要 → UUID
+```
+
+### 各方案性能对比
+
+| 方案 | QPS | 有序性 | 依赖 | 适用场景 |
+|------|-----|--------|------|---------|
+| UUID | 无限制 | 无序 | 无 | 分布式系统唯一标识 |
+| 数据库自增 | ~10万/秒 | 严格有序 | 数据库 | 单库场景 |
+| Redis INCR | ~100万/秒 | 严格有序 | Redis | 分布式锁/计数器 |
+| 雪花算法 | ~400万/秒 | 趋势有序 | 无 | 分布式系统 |
+| Leaf-segment | ~100万/秒 | 严格有序 | 数据库 | 分布式系统 |
+| Leaf-snowflake | ~400万/秒 | 趋势有序 | ZK | 分布式系统 |
+
+### 雪花算法改进版
+
+```java
+// 改进雪花算法 - 解决时钟回拨问题
+public class ImprovedSnowflake {
+    private final long epoch = 1609459200000L; // 自定义起始时间
+    private final long workerIdBits = 5L;
+    private final long datacenterIdBits = 5L;
+    private final long sequenceBits = 12L;
+    
+    private long lastTimestamp = -1L;
+    private long sequence = 0L;
+    private long workerId;
+    private long datacenterId;
+    
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+        
+        // 时钟回拨处理
+        if (timestamp < lastTimestamp) {
+            long offset = lastTimestamp - timestamp;
+            if (offset <= 5) {
+                // 小范围回拨，等待
+                Thread.sleep(offset << 1);
+                timestamp = System.currentTimeMillis();
+            } else {
+                // 大范围回拨，使用扩展位
+                timestamp = lastTimestamp + 1;
+            }
+        }
+        
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & 4095;
+            if (sequence == 0) {
+                timestamp = waitNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        return ((timestamp - epoch) << 22)
+                | (datacenterId << 17)
+                | (workerId << 12)
+                | sequence;
+    }
+}
+```
+
+### 号段模式（Leaf-segment）实现
+
+```sql
+-- 号段表设计
+CREATE TABLE id_alloc (
+    biz_tag VARCHAR(128) NOT NULL COMMENT '业务标识',
+    max_id BIGINT NOT NULL DEFAULT 1 COMMENT '当前最大ID',
+    step INT NOT NULL COMMENT '号段步长',
+    description VARCHAR(256) COMMENT '描述',
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (biz_tag)
+);
+
+-- 获取号段
+UPDATE id_alloc SET max_id = max_id + step WHERE biz_tag = 'order';
+-- 返回 [max_id - step, max_id) 作为可用ID范围
+```
+
+### Leaf 预热机制
+
+```text
+Leaf 双 Buffer 预热：
+  1. 从 DB 加载号段 [0, 1000)
+  2. 异步预加载下一个号段 [1000, 2000)
+  3. 当前号段使用到 10% 时，切换到下一个号段
+  4. 保证不会因为 DB 故障导致服务中断
+
+  优势：
+    - 减少 DB 访问频率
+    - 提高可用性
+    - 平滑切换号段
+```
+
 ---
 
 ## 二十五、全局 ID 方案详细对比

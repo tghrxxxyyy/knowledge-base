@@ -99,6 +99,86 @@ public class ExampleInterceptor implements Interceptor {
 
 ## 面试高频
 
+### 常见问题
+
+| 问题 | 答案要点 |
+|------|----------|
+| MyBatis 执行流程 | 加载配置→创建SqlSession→执行SQL→映射结果 |
+| 缓存机制 | 一级缓存(SqlSession)、二级缓存(Namespace) |
+| 动态 SQL | OGNL 表达式 + SqlNode 树 |
+| 插件机制 | 拦截四大对象，责任链模式 |
+| 延迟加载 | CGLIB 代理 + 按需加载 |
+
+---
+
+## 九、MyBatis 与 Spring 集成
+
+### 9.1 Spring 集成方式
+
+| 方式 | 说明 | 适用场景 |
+|------|------|----------|
+| SqlSessionTemplate | 线程安全 SqlSession | 一般场景 |
+| MapperScannerConfigurer | 自动扫描 Mapper | 推荐方式 |
+| MyBatis-Spring-Boot-Starter | 自动配置 | Spring Boot |
+
+### 9.2 Spring 配置
+
+```java
+// MyBatis Spring 配置
+@Configuration
+@MapperScan("com.example.mapper")
+public class MyBatisConfig {
+    @Bean
+    public SqlSessionFactory sqlSessionFactory(DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean factory = new SqlSessionFactoryBean();
+        factory.setDataSource(dataSource);
+        factory.setMapperLocations(new PathMatchingResourcePatternResolver()
+            .getResources("classpath:mapper/*.xml"));
+        return factory.getObject();
+    }
+}
+```
+
+---
+
+## 十、MyBatis 性能优化
+
+### 10.1 性能优化策略
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| 批量操作 | 批量插入/更新 | 减少网络往返 |
+| 缓存 | 二级缓存 | 减少数据库查询 |
+| 延迟加载 | 按需加载关联数据 | 减少不必要的查询 |
+| 连接池 | 合理配置连接池 | 减少连接创建 |
+| 索引 | 合理使用索引 | 加速查询 |
+
+### 10.2 批量操作配置
+
+```java
+// 批量操作配置
+SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH);
+try {
+    UserMapper mapper = sqlSession.getMapper(UserMapper.class);
+    for (int i = 0; i < 1000; i++) {
+        mapper.insert(new User("user" + i, "password" + i));
+    }
+    sqlSession.commit();
+} finally {
+    sqlSession.close();
+}
+```
+
+---
+
+## 十一、与其他板块的关系
+
+- 数据库见「[MySQL](../数据库/MySQL.md)」；
+- 缓存见「[Redis](./Redis深度篇.md)」；
+- 连接池见「[连接池配置](../数据库/连接池.md)」；
+- 分布式事务见「[Seata](./分布式事务Seata.md)」；
+- 微服务见「[Spring Cloud](../SpringCloud微服务.md)」。
+
 1. **MyBatis 与 Hibernate 区别**：半自动（手写 SQL，灵活可控）vs 全自动（HQL，对象化、屏蔽 SQL）；MyBatis 在复杂查询/性能敏感场景占优。
 2. **插件能拦截哪些**：四大对象（Executor/ParameterHandler/ResultSetHandler/StatementHandler）。
 3. **逻辑分页 vs 物理分页**：`RowBounds` 是逻辑分页（先查全量再内存截取，禁用）；PageHelper 是物理分页（改写 SQL）。

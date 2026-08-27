@@ -1629,3 +1629,87 @@ difffolded.pl before.folded after.folded | flamegraph.pl > diff.svg
     Off-CPU火焰图：分析阻塞等待
     内存火焰图：分析内存分配
 ```
+
+---
+
+## 三十二、Linux 性能优化实战
+
+### 32.1 系统级优化
+
+| 优化项 | 优化策略 | 效果 |
+|--------|----------|------|
+| 内核参数 | 调整内核参数 | 提升系统性能 |
+| 文件描述符 | 增加文件描述符限制 | 支持更多连接 |
+| 网络参数 | 优化网络缓冲区 | 提升网络性能 |
+| CPU 调度 | 调整 CPU 亲和性 | 减少上下文切换 |
+
+### 32.2 应用级优化
+
+```bash
+# 1. JVM 优化
+java -Xms4g -Xmx4g \
+     -XX:+UseG1GC \
+     -XX:MaxGCPauseMillis=200 \
+     -XX:+HeapDumpOnOutOfMemoryError \
+     -jar app.jar
+
+# 2. 数据库连接池优化
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+
+# 3. 线程池优化
+server:
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    accept-count: 100
+```
+
+---
+
+## 三十三、Linux 故障排查案例
+
+### 33.1 常见故障场景
+
+| 场景 | 症状 | 排查步骤 |
+|------|------|----------|
+| CPU 100% | 系统卡顿 | top → perf top → 火焰图 |
+| 内存溢出 | OOM Kill | free → vmstat → pmap |
+| 磁盘满 | 写入失败 | df → du → lsof |
+| 连接超时 | 服务不可用 | ss → netstat → tcpdump |
+| 进程假死 | 无响应 | strace → /proc/pid |
+
+### 33.2 故障排查流程
+
+```mermaid
+flowchart TD
+    A[故障发现] --> B[信息收集]
+    B --> C{故障类型}
+    C -->|CPU| D[top/perf]
+    C -->|内存| E[free/vmstat]
+    C -->|磁盘| F[df/du]
+    C -->|网络| G[ss/tcpdump]
+    C -->|进程| H[strace/pstack]
+    D --> I[定位根因]
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+    I --> J[解决方案]
+    J --> K[验证修复]
+```
+
+---
+
+## 三十四、与其他板块的关系
+
+- 网络排查见「[网络](./网络.md)」；
+- 性能监控见「[Prometheus](./时序库/Prometheus.md)」；
+- 容器排查见「[K8s排查](./云原生/排查.md)」；
+- 数据库排查见「[MySQL排查](./数据库/MySQL排查.md)」；
+- JVM 排查见「[JVM调优](./基础知识/JVM.md)」。

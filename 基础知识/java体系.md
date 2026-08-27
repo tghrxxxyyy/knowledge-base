@@ -1636,3 +1636,69 @@ Map<String, SoftReference<byte[]>> cache = new HashMap<>();
   3. **构建慢**（分钟级）、需 `native-image` 工具链与足够内存。
   4. **不全平台一致**：需目标 OS/架构对应的 builder 镜像（多阶段构建）。
 - **选型**：Quarkus 对原生镜像支持最顺（响应式优先）；Spring Boot 3 + `spring-boot-starter-aot` 可用但需逐一验证第三方库兼容性；不适合依赖大量反射的老项目硬上。
+
+---
+
+## 十二、Java 并发编程深入
+
+### 12.1 并发工具对比
+
+| 工具 | 说明 | 适用场景 |
+|------|------|----------|
+| synchronized | 内置锁 | 简单同步 |
+| ReentrantLock | 可重试锁 | 复杂同步 |
+| ReadWriteLock | 读写锁 | 读多写少 |
+| StampedLock | 乐观读写锁 | 高并发读 |
+| Condition | 条件变量 | 等待通知 |
+
+### 12.2 线程池配置
+
+```java
+// 线程池配置
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    5,  // 核心线程数
+    10, // 最大线程数
+    60L, TimeUnit.SECONDS, // 空闲线程存活时间
+    new LinkedBlockingQueue<>(100), // 任务队列
+    new ThreadPoolExecutor.CallerRunsPolicy() // 拒绝策略
+);
+```
+
+---
+
+## 十三、Java 内存模型（JMM）
+
+### 13.1 内存模型
+
+```
+JMM 内存模型：
+  主内存：所有线程共享
+  工作内存：每个线程私有
+  
+  8 种原子操作：
+    lock/unlock：锁定/解锁
+    read/load：读取/加载
+    use/assign：使用/赋值
+    store/write：存储/写入
+```
+
+### 13.2 happens-before 原则
+
+| 原则 | 说明 |
+|------|------|
+| 程序顺序 | 同线程内按代码顺序 |
+| 监视器锁定 | unlock 在 lock 之前 |
+| volatile | volatile 写在读之前 |
+| 线程启动 | start() 在子线程动作之前 |
+| 线程终止 | 所有动作在 join() 之前 |
+| 传递性 | A→B→C 则 A→C |
+
+---
+
+## 十四、与其他板块的关系
+
+- 并发编程见「[并发编程](./并发编程.md)」；
+- JVM 调优见「[JVM](./JVM.md)」；
+- 设计模式见「[设计模式](./设计模式.md)」；
+- 框架原理见「[Spring](./Spring.md)」；
+- 微服务见「[Spring Cloud](./SpringCloud微服务.md)」。

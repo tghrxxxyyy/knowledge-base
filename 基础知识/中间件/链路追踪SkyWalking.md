@@ -1620,3 +1620,84 @@ Agent 性能优化：
 | 存储 | ES（生产首选）/ BanyanDB（原生）/ MySQL（轻量） |
 | 许可证 | Apache 2.0（三家） |
 | 一句话 | 「微服务排障第一视角」——慢在哪一跳、坏在哪一环，一目了然 |
+
+---
+
+## 二十、链路追踪性能优化
+
+### 20.1 采样策略
+
+| 采样策略 | 说明 | 适用场景 |
+|----------|------|----------|
+| 固定比例采样 | 按固定比例采样 | 一般场景 |
+| 自适应采样 | 根据流量动态调整 | 高流量场景 |
+| 尾部采样 | 请求结束后决定是否采样 | 需要完整链路 |
+| 强制采样 | 特定请求强制采样 | 问题排查 |
+
+### 20.2 采样配置
+
+```yaml
+# SkyWalking 采样配置
+agent:
+  # 固定比例采样
+  sample_n_per_3_secs: 10  # 每3秒采样10条
+  
+  # 自适应采样
+  sample_per_path: -1  # 不限制
+  
+  # 强制采样
+  force_sample_error: true  # 错误请求强制采样
+  force_sample_slow: true   # 慢请求强制采样
+  slow_threshold_millis: 5000  # 慢请求阈值
+```
+
+---
+
+## 二十一、链路追踪数据模型
+
+### 21.1 核心概念
+
+| 概念 | 说明 | 示例 |
+|------|------|------|
+| Trace | 一次完整请求链路 | 用户下单流程 |
+| Segment | 单个服务内的调用链 | 订单服务处理 |
+| Span | 一次具体操作 | 数据库查询 |
+| Tag | 错误日志/业务标记 | error=true |
+| Log | 事件日志 | 异常堆栈 |
+
+### 21.2 数据模型
+
+```json
+{
+  "traceId": "abc123def456",
+  "segmentId": "segment789",
+  "spanId": 0,
+  "parentSpanId": -1,
+  "operationName": "/api/user/login",
+  "startTime": 1704067200000,
+  "endTime": 1704067201000,
+  "duration": 1000,
+  "tags": {
+    "http.method": "POST",
+    "http.url": "/api/user/login",
+    "http.status_code": 200
+  },
+  "logs": [
+    {
+      "timestamp": 1704067200500,
+      "event": "error",
+      "stack": "java.lang.NullPointerException..."
+    }
+  ]
+}
+```
+
+---
+
+## 二十二、与其他板块的关系
+
+- 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；
+- 日志采集见「[日志采集与传输](./日志采集与传输.md)」；
+- 指标监控见「[Prometheus](../时序库/Prometheus.md)」；
+- 微服务网关见「[Spring Cloud Gateway](./SpringCloudGateway.md)」；
+- 服务网格见「[Istio](../../云原生/ServiceMesh.md)」。

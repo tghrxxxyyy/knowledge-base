@@ -1642,6 +1642,201 @@ resources:
 | 部署复杂度 | 低 | 高 |
 | 适用场景 | 日志聚合 | 全文搜索 |
 
+## Loki 多租户架构
+
+### 多租户隔离
+
+| 维度 | 实现方式 | 说明 |
+|------|---------|------|
+| 数据隔离 | 租户ID标签 | 每条日志标记租户 |
+| 查询隔离 | 租户认证 | 查询时过滤租户 |
+| 存储隔离 | 前缀隔离 | 不同租户不同存储路径 |
+| 速率限制 | 租户配额 | 按租户限制摄入速率 |
+
+```yaml
+# Loki 多租户配置
+auth_enabled: true
+limits_config:
+  per_tenant_rate_limit: 10MB
+  per_tenant_rate_limit_burst: 20MB
+```
+
+---
+
+## LogQL 实战查询
+
+### 常用查询模式
+
+```logql
+# 查找包含 "error" 的日志
+{job="api-server"} |= "error"
+
+# 正则匹配
+{job=~"api-.*"} |~ "status=(5[0-9]{2})"
+
+# 日志解析（JSON格式）
+{job="api-server"} | json | status >= 500
+
+# 日志解析（logfmt）
+{job="api-server"} | logfmt | duration > 1s
+
+# 日志统计（速率）
+rate({job="api-server"} |= "error" [5m])
+
+# 日志统计（计数）
+count_over_time({job="api-server"} |= "error" [1h])
+
+# 日志统计（百分位）
+quantile_over_time(0.99, {job="api-server"} | unwrap duration [5m])
+```
+
+### LogQL 聚合操作
+
+| 操作 | 说明 | 示例 |
+|------|------|------|
+| rate | 每秒速率 | rate({job="api"} [5m]) |
+| count_over_time | 时间范围内计数 | count_over_time({job="api"} [1h]) |
+| sum | 求和 | sum(rate({job="api"} [5m])) |
+| topk | 前K个 | topk(10, sum by (path) (rate({job="api"} [5m]))) |
+| histogram_quantile | 分位数 | histogram_quantile(0.99, rate({job="api"} [5m])) |
+
+---
+
+## 存储后端对比
+
+| 后端 | 优点 | 缺点 | 适用场景 |
+|------|------|------|---------|
+| filesystem | 简单、本地 | 无扩展 | 开发/测试 |
+| S3 | 成本低、可扩展 | 延迟较高 | 生产环境 |
+| GCS | GCP原生 | 依赖GCP | GCP用户 |
+| Azure Blob | Azure原生 | 依赖Azure | Azure用户 |
+| Swift | OpenStack | 运维复杂 | 私有云 |
+
+```yaml
+# S3 存储配置
+storage_config:
+  s3:
+    s3: s3://us-east-1/loki-data
+    endpoint: s3.us-east-1.amazonaws.com
+    access_key: YOUR_ACCESS_KEY
+    secret_key: YOUR_SECRET_KEY
+    insecure: false
+    s3forcepathstyle: false
+```
+
+---
+
+## Grafana 集成实战
+
+### 数据源配置
+
+```json
+{
+  "name": "Loki",
+  "type": "loki",
+  "url": "http://loki:3100",
+  "access": "proxy",
+  "jsonData": {
+    "maxLines": 1000,
+    "timeout": 60
+  }
+}
+```
+
+### Dashboard 常用面板
+
+| 面板类型 | 用途 | 查询示例 |
+|----------|------|---------|
+| Logs | 日志流 | {job="api-server"} |
+| Time Series | 错误率趋势 | sum(rate({job="api"} |= "error" [5m])) |
+| Stat | 错误总数 | sum(count_over_time({job="api"} |= "error" [1h])) |
+| Table | 日志解析 | {job="api"} \| json \| line_format "{{.status}} {{.path}}" |
+
+---
+
+## Loki vs ELK 对比
+
+| 维度 | Loki | ELK |
+|------|------|-----|
+| 索引 | 只索引标签 | 全文索引 |
+| 存储成本 | 低（对象存储） | 高（ES集群） |
+| 查询能力 | LogQL | KQL |
+| 部署复杂度 | 低 | 高 |
+| 适用场景 | 日志聚合 | 全文搜索 |
+| 扩展性 | 水平扩展 | 水平扩展 |
+| 学习曲线 | 低 | 中 |
+
+---
+
+## 集群模式部署
+
+### 微服务模式
+
+```mermaid
+flowchart LR
+    APP[应用] -->|HTTP| Gateway[Loki Gateway]
+    Gateway --> Query[Query Frontend]
+    Gateway --> Distributor[Distributor]
+    Distributor --> Ingester[Ingester]
+    Ingester -->|写入| Chunk[Chunk Store]
+    Chunk -->|读取| Querier[Querier]
+    Querier --> Index[Index Store]
+```
+
+### 集群组件
+
+| 组件 | 职责 | 副本建议 |
+|------|------|---------|
+| Distributor | 接收写入，分发 | 2+ |
+| Ingester | 日志聚合，写入存储 | 3+ |
+| Querier | 查询处理 | 2+ |
+| Query Frontend | 查询缓存，拆分 | 2+ |
+| Gateway | 统一入口 | 2+ |
+
+---
+
+## 告警规则配置
+
+### 告警规则示例
+
+```yaml
+groups:
+  - name: api-errors
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate({job="api-server"} |= "error" [5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} per second"
+      
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, rate({job="api-server"} | unwrap duration [5m])) > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High latency detected"
+          description: "P99 latency is {{ $value }} seconds"
+```
+
+### 告警路由
+
+```yaml
+# ruler 配置
+ruler:
+  alertmanager_url: http://alertmanager:9093
+  rule_path: /tmp/rules
+  storage:
+    type: local
+    local:
+      directory: /tmp/rules
+```
+
+---
+
 ## 与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；

@@ -1625,3 +1625,132 @@ ByteBuf slice = buf.slice(readerIndex, readableBytes);
 - 零拷贝见「[操作系统](../基础知识/操作系统.md)」。
 
 > 一句话：**Netty = 主从 Reactor + ByteBuf（零拷贝+内存池）+ Pipeline（链式处理）+ EventLoop（单线程无锁）——生产调优核心：业务线程池隔离 + IdleStateHandler 心跳 + PooledByteBufAllocator + leakDetection**。
+
+---
+
+## 十六、Netty 线程模型深入
+
+### 16.1 线程模型对比
+
+| 模型 | 说明 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|----------|
+| 单线程 | 一个线程处理所有 | 简单 | 阻塞 | 低并发 |
+| 多线程 | 业务交给线程池 | 并发高 | 复杂 | 一般场景 |
+| 主从 Reactor | Boss+Worker | 高性能 | 复杂 | 高并发 |
+
+### 16.2 EventLoop 线程模型
+
+```mermaid
+flowchart TB
+    subgraph BossGroup
+        B1[EventLoop 1]
+    end
+    subgraph WorkerGroup
+        W1[EventLoop 1]
+        W2[EventLoop 2]
+        W3[EventLoop 3]
+        W4[EventLoop 4]
+    end
+    B1 -->|Accept| W1
+    B1 -->|Accept| W2
+    B1 -->|Accept| W3
+    B1 -->|Accept| W4
+    W1 --> C1[Channel 1]
+    W1 --> C2[Channel 2]
+    W2 --> C3[Channel 3]
+    W3 --> C4[Channel 4]
+    W4 --> C5[Channel 5]
+```
+
+---
+
+## 十七、Netty 协议设计
+
+### 17.1 私有协议设计
+
+| 字段 | 长度 | 说明 |
+|------|------|------|
+| 魔数 | 4字节 | 协议标识 |
+| 版本 | 1字节 | 协议版本 |
+| 序列化 | 1字节 | 序列化类型 |
+| 消息类型 | 1字节 | 请求/响应/通知 |
+| 状态码 | 2字节 | 响应状态 |
+| 消息ID | 8字节 | 请求-响应匹配 |
+| 数据长度 | 4字节 | 数据体长度 |
+| 数据体 | 变长 | 业务数据 |
+
+### 17.2 协议处理流程
+
+```mermaid
+flowchart LR
+    A[客户端] -->|编码| B[协议编码器]
+    B -->|网络传输| C[协议解码器]
+    C -->|解码| D[服务端]
+    D -->|业务处理| E[业务Handler]
+    E -->|响应| F[协议编码器]
+    F -->|网络传输| G[客户端解码器]
+```
+
+---
+
+## 十八、Netty 与 Dubbo/gRPC
+
+### 18.1 集成方式
+
+| 框架 | Netty 使用 | 说明 |
+|------|------------|------|
+| Dubbo | 底层传输层 | Dubbo 协议 |
+| gRPC | HTTP/2 实现 | 高性能 RPC |
+| RocketMQ | Broker/Client | 消息传输 |
+| Redis | Lettuce 客户端 | Redis 通信 |
+
+### 18.2 Dubbo 中的 Netty
+
+```
+Dubbo 通信流程：
+  Consumer → Netty Client → 网络 → Netty Server → Provider
+  
+  Netty 在 Dubbo 中的作用：
+    1. 连接管理：长连接复用
+    2. 协议编解码：Dubbo 协议
+    3. 心跳检测：连接保活
+    4. 负载均衡：客户端负载
+```
+
+---
+
+## 十九、Netty 安全机制
+
+### 19.1 安全威胁
+
+| 威胁 | 说明 | 应对措施 |
+|------|------|----------|
+| DDoS | 大量连接请求 | 限制连接数/速率 |
+| 恶意数据 | 超大包攻击 | 限制帧长度 |
+| 内存耗尽 | 内存泄漏 | 内存池+引用计数 |
+| 连接耗尽 | 大量短连接 | 长连接+连接池 |
+
+### 19.2 安全配置
+
+```java
+// 安全配置
+ServerBootstrap b = new ServerBootstrap();
+b.option(ChannelOption.SO_BACKLOG, 1024)
+ .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)
+ .childOption(ChannelOption.SO_RCVBUF, 1024 * 1024)  // 接收缓冲区
+ .childOption(ChannelOption.SO_SNDBUF, 1024 * 1024)  // 发送缓冲区
+ .childOption(ChannelOption.MAX_MESSAGES_PER_READ, 16)  // 每次读取最大消息数
+ .childOption(ChannelOption.ALLOCATOR, new PooledByteBufAllocator(true));
+```
+
+---
+
+## 二十、与其他板块的关系
+
+- 网络基础见「[网络](../基础知识/网络.md)」；
+- Reactor 模式见「[并发编程](../基础知识/并发编程.md)」；
+- Dubbo RPC 见「[Dubbo](./中间件/ApacheDubboRPC框架.md)」；
+- gRPC 见「[gRPC](./中间件/gRPC.md)」；
+- Kafka 源码见「[源码系列/Kafka 源码](../源码系列/Kafka源码.md)」；
+- 零拷贝见「[操作系统](../基础知识/操作系统.md)」；
+- 内存管理见「[JVM内存模型](../基础知识/JVM.md)」。

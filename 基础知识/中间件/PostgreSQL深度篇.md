@@ -1238,6 +1238,229 @@ LIMIT 10;
 
 ---
 
+## PostgreSQL MVCC 深度解析
+
+### MVCC 原理
+
+```text
+PostgreSQL MVCC（多版本并发控制）：
+  1. 每行数据有 xmin 和 xmax 系统列
+     - xmin：创建该行的事务ID
+     - xmax：删除/更新该行的事务ID（0表示未删除）
+
+  2. 事务隔离实现：
+     - 读操作不阻塞写操作
+     - 写操作不阻塞读操作
+     - 每个事务看到数据的一致性快照
+
+  3. 可见性判断：
+     - 检查 xmin 是否已提交
+     - 检查 xmax 是否未提交或不存在
+     - 根据隔离级别决定是否可见
+```
+
+### 事务ID与冻结
+
+| 概念 | 说明 |
+|------|------|
+| Transaction ID | 32位无符号整数，循环使用 |
+| Frozen ID | 冻结的事务ID，不再变化 |
+| 事务ID回卷 | 当ID接近最大值时回卷到3 |
+| autovacuum freeze | 自动冻结旧版本 |
+
+```sql
+-- 查看事务ID年龄
+SELECT relname, age(relfrozenxid) as xid_age
+FROM pg_class
+WHERE relkind = 'r'
+ORDER BY xid_age DESC;
+
+-- 手动冻结
+VACUUM FREEZE table_name;
+```
+
+---
+
+## 分区表深度
+
+### 分区策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| Range | 范围分区 | 时间序列 |
+| List | 列表分区 | 枚举值 |
+| Hash | 哈希分区 | 均匀分布 |
+| Multi-level | 复合分区 | 复杂场景 |
+
+### 分区表创建
+
+```sql
+-- 创建范围分区
+CREATE TABLE logs (
+    id BIGSERIAL,
+    created_at TIMESTAMP NOT NULL,
+    message TEXT
+) PARTITION BY RANGE (created_at);
+
+-- 创建分区
+CREATE TABLE logs_2025_01 PARTITION OF logs
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE logs_2025_02 PARTITION OF logs
+    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+
+-- 自动创建分区（使用 pg_partman）
+CREATE EXTENSION pg_partman;
+SELECT partman.create_parent('public.logs', 'created_at', 'native', 'monthly');
+```
+
+### 分区裁剪
+
+```sql
+-- 分区裁剪查询
+EXPLAIN SELECT * FROM logs
+WHERE created_at >= '2025-01-01' AND created_at < '2025-02-01';
+-- 只扫描 logs_2025_01 分区
+
+-- 验证分区裁剪
+EXPLAIN ANALYZE SELECT * FROM logs
+WHERE created_at = '2025-01-15';
+-- Seq Scan on logs_2025_01
+```
+
+---
+
+## JSONB 索引与查询
+
+### JSONB 索引类型
+
+```json
+// GIN 索引（包含查询）
+CREATE INDEX idx_data_gin ON documents USING gin(data);
+
+// GIN 索引（特定路径）
+CREATE INDEX idx_data_path ON documents USING gin((data->'tags'));
+
+// B-tree 索引（特定值）
+CREATE INDEX idx_data_key ON documents USING btree((data->>'status'));
+```
+
+### JSONB 查询操作
+
+| 操作 | 说明 | 示例 |
+|------|------|------|
+| -> | 按键获取（JSON） | data->'name' |
+| ->> | 按键获取（文本） | data->>'name' |
+| @> | 包含查询 | data @> '{"status":"active"}' |
+| ? | 键存在 | data ? 'name' |
+| ?\| | 任一键存在 | data ?\| ARRAY['name','age'] |
+| ?& | 所有键存在 | data ?& ARRAY['name','age'] |
+
+```sql
+-- JSONB 查询示例
+SELECT * FROM documents
+WHERE data @> '{"status": "active"}';
+
+SELECT * FROM documents
+WHERE data->>'type' = 'article';
+
+-- JSONB 聚合
+SELECT data->>'category' as category, COUNT(*)
+FROM documents
+GROUP BY data->>'category';
+```
+
+---
+
+## 连接池配置
+
+### PgBouncer 配置
+
+```ini
+# pgbouncer.ini
+[databases]
+mydb = host=localhost port=5432 dbname=mydb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+default_pool_size = 20
+max_client_conn = 1000
+min_pool_size = 5
+reserve_pool_size = 5
+```
+
+### 连接池模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|---------|
+| Session | 会话级别 | 长连接 |
+| Transaction | 事务级别 | 短事务 |
+| Statement | 语句级别 | 无状态查询 |
+
+---
+
+## 高可用架构
+
+### 高可用方案对比
+
+| 方案 | RPO | RTO | 复杂度 |
+|------|-----|-----|--------|
+| 流复制 | 0（同步） | 秒级 | 低 |
+| 逻辑复制 | 秒级 | 分钟级 | 中 |
+| Patroni | 0 | 秒级 | 中 |
+| pgpool-II | 0 | 秒级 | 高 |
+
+### Patroni 高可用
+
+```yaml
+# patroni.yml
+scope: postgres
+name: node1
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 10.0.0.1:8008
+etcd:
+  hosts: 10.0.0.10:2379
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 10.0.0.1:5432
+  data_dir: /var/lib/postgresql/data
+  authentication:
+    replication:
+      username: repl
+      password: repl_password
+    superuser:
+      username: postgres
+      password: postgres_password
+```
+
+---
+
+## 调优参数
+
+### 关键参数配置
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| shared_buffers | 128MB | RAM/4 | 共享缓冲区 |
+| effective_cache_size | 4GB | RAM*3/4 | 有效缓存 |
+| work_mem | 4MB | 64MB | 排序/哈希操作内存 |
+| maintenance_work_mem | 64MB | 512MB | 维护操作内存 |
+| max_connections | 100 | 200-500 | 最大连接数 |
+| wal_buffers | -1 | 64MB | WAL缓冲区 |
+| checkpoint_completion_target | 0.9 | 0.9 | 检查点完成目标 |
+
+---
+
 ## 十四、与其他板块的关系（扩展）
 
 - MySQL 知识见「[基础知识/mysql知识](../mysql知识.md)」；

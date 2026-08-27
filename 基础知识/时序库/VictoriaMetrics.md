@@ -1634,8 +1634,243 @@ VM 自身监控：
 
 3. Grafana Dashboard：
    官方 Dashboard：ID 10229（VictoriaMetrics Cluster）
-   关键面板：
-     写入 QPS、查询 QPS、存储使用、内存使用、CPU 使用
+    关键面板：
+      写入 QPS、查询 QPS、存储使用、内存使用、CPU 使用
 ```
+
+## VictoriaMetrics 集群架构深度解析
+
+### 集群组件协作
+
+```mermaid
+flowchart LR
+    APP[应用] -->|remote write| VMINsert[vminsert]
+    APP2[应用2] -->|remote write| VMINsert
+    VMINsert --> VMStorage[vmstorage]
+    PROM[Prometheus] -->|remote write| VMINsert
+    QUERY[查询] --> VMSelect[vmselect]
+    VMSelect --> VMStorage
+    VMINsert -.->|Gossip| VMStorage
+    VMSelect -.->|Gossip| VMStorage
+```
+
+### 集群配置关键参数
+
+| 组件 | 关键参数 | 说明 |
+|------|---------|------|
+| vminsert | `-storageNode` | 指定 vmstorage 地址 |
+| vmselect | `-storageNode` | 指定 vmstorage 地址 |
+| vmstorage | `-storageDataPath` | 数据存储路径 |
+| vmstorage | `-retentionPeriod` | 数据保留周期 |
+
+```bash
+# vminsert 启动示例
+vminsert \
+  -storageNode=vmstorage-0:8400,vmstorage-1:8400 \
+  -httpListenAddr=:8480
+
+# vmselect 启动示例
+vmselect \
+  -storageNode=vmstorage-0:8401,vmstorage-1:8401 \
+  -httpListenAddr=:8481
+
+# vmstorage 启动示例
+vmstorage \
+  -storageDataPath=/data \
+  -retentionPeriod=12 \
+  -httpListenAddr=:8482
+```
+
+---
+
+## 去重策略与数据一致性
+
+### 去重原理
+
+| 场景 | 处理方式 | 说明 |
+|------|---------|------|
+| 单实例 | 无去重 | 单实例无需去重 |
+| 集群 | 按时间戳去重 | 相同时间戳只保留一条 |
+| 跨区域 | 可能重复 | 需要应用层去重 |
+
+```text
+VictoriaMetrics 去重策略：
+  1. 接收数据时检查 (timestamp, value) 对
+  2. 如果已存在相同时间戳，保留最后写入的值
+  3. 去重窗口：默认 30 秒
+  4. 可通过 -dedup.minScrapeInterval 调整
+
+  注意：
+    - 去重是最终一致性，不是强一致
+    - 高并发写入时可能有短暂重复
+    - 建议在采集端（如 Prometheus）避免重复
+```
+
+---
+
+## 降采样配置
+
+### 降采样规则
+
+```yaml
+# vmstorage 降采样配置
+- interval: 5m    # 原始数据间隔
+  offset: 0       # 降采样偏移
+- interval: 1h    # 1小时聚合
+  offset: 0
+- interval: 1d    # 1天聚合
+  offset: 0
+```
+
+### 降采样效果
+
+| 数据量 | 保留周期 | 降采样前 | 降采样后 | 节省 |
+|--------|---------|---------|---------|------|
+| 100万点/天 | 30天 | 3000万点 | 1500万点 | 50% |
+| 100万点/天 | 90天 | 9000万点 | 3000万点 | 67% |
+| 100万点/天 | 365天 | 3.65亿点 | 7300万点 | 80% |
+
+---
+
+## 多租户与资源隔离
+
+### 多租户配置
+
+```text
+多租户实现方式：
+  1. 每个租户独立集群
+     - 完全隔离，安全最高
+     - 成本最高，运维复杂
+
+  2. 共享集群 + 账号隔离
+     - 使用 accountID 区分租户
+     - 资源配额控制
+     - 成本低，隔离性中等
+
+  3. 共享集群 + 命名空间
+     - 使用标签区分租户
+     - 查询时过滤
+     - 成本最低，隔离性最低
+```
+
+---
+
+## Prometheus Remote Write 最佳实践
+
+### Remote Write 配置
+
+```yaml
+# prometheus.yml
+remote_write:
+  - url: "http://vminsert:8480/insert/0/prometheus/api/v1/write"
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 5s
+      max_shards: 30
+      capacity: 10000
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*'
+        action: drop
+```
+
+### Remote Write 性能调优
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| max_samples_per_send | 1000 | 5000-10000 | 每批发送样本数 |
+| batch_send_deadline | 5s | 5-10s | 批次发送超时 |
+| max_shards | 1 | 10-30 | 并发发送数 |
+| queue_config.capacity | 10000 | 50000 | 队列容量 |
+
+---
+
+## K8s 部署方案
+
+### Helm 部署
+
+```bash
+# 添加 Helm 仓库
+helm repo add vm https://victoriametrics.github.io/helm-charts/
+helm repo update
+
+# 安装集群版
+helm install vmcluster vm/victoria-metrics-cluster \
+  --namespace monitoring \
+  --set vmselect.replicaCount=2 \
+  --set vminsert.replicaCount=2 \
+  --set vmstorage.replicaCount=3 \
+  --set vmstorage.persistentVolume.size=100Gi
+```
+
+### K8s 资源配置
+
+```yaml
+resources:
+  vmstorage:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      cpu: 2
+      memory: 8Gi
+  vmselect:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 1
+      memory: 4Gi
+  vminsert:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 2Gi
+```
+
+---
+
+## 容量规划
+
+### 容量计算公式
+
+```text
+存储容量 = 数据点数 × 每点大小 × 保留天数 × 副本数 × 压缩系数
+
+  数据点数 = 序列数 × 采集间隔（秒）× 86400（每天秒数）
+  每点大小 ≈ 1.5 字节（压缩后）
+  压缩系数 ≈ 0.3-0.5
+
+  示例：
+    100万序列，15秒采集，保留30天，2副本
+    存储 = 100万 × (86400/15) × 1.5 × 30 × 2 × 0.4
+         ≈ 207TB（压缩后）
+```
+
+### 资源规划
+
+| 序列数 | vmstorage | vmselect | vminsert |
+|--------|-----------|----------|----------|
+| 100万 | 3节点×16C64G | 2节点×8C32G | 2节点×8C16G |
+| 500万 | 5节点×32C128G | 3节点×16C64G | 3节点×16C32G |
+| 1000万 | 10节点×64C256G | 5节点×32C128G | 5节点×32C64G |
+
+---
+
+## VictoriaMetrics vs Prometheus 对比
+
+| 维度 | VictoriaMetrics | Prometheus |
+|------|-----------------|------------|
+| 架构 | 集群版支持水平扩展 | 单机或联邦 |
+| 存储 | 对象存储，成本低 | 本地磁盘 |
+| 去重 | 内置去重 | 需外部处理 |
+| 降采样 | 内置支持 | 需外部处理 |
+| 多租户 | 支持 | 不支持 |
+| 查询性能 | 更快（列式存储） | 一般 |
+| 兼容性 | 100% 兼容 PromQL | 原生 PromQL |
+
+---
 
 ## 二十四、与其他板块的关系

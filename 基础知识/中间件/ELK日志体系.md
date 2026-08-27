@@ -1628,6 +1628,260 @@ monitoring:
 
 > 核心原则：**索引规划合理，Filter高效，Dashboard实用，安全加固到位，性能持续监控**。
 
+## ILM 生命周期管理
+
+### ILM 阶段配置
+
+| 阶段 | 动作 | 说明 |
+|------|------|------|
+| Hot | Rollover | 索引写满后滚动 |
+| Warm | Shrink/Force Merge | 冷数据压缩 |
+| Cold | Freeze | 冻结索引 |
+| Delete | Delete | 删除过期索引 |
+
+```json
+// ILM 策略配置
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "warm": {
+        "min_age": "3d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          },
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "set_priority": {
+            "priority": 50
+          }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {},
+          "set_priority": {
+            "priority": 0
+          }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+## Logstash Filter 实战
+
+### 常用 Filter 配置
+
+```ruby
+# grok 解析 Nginx 日志
+filter {
+  grok {
+    match => {
+      "message" => "%{COMBINEDAPACHELOG}"
+    }
+  }
+  date {
+    match => ["timestamp", "dd/MMM/yyyy:HH:mm:ss Z"]
+  }
+  geoip {
+    source => "clientip"
+  }
+  useragent {
+    source => "user_agent"
+    target => "ua"
+  }
+}
+
+# 多行日志合并
+filter {
+  multiline {
+    pattern => "^%{TIMESTAMP_ISO8601}"
+    negate => true
+    what => "previous"
+  }
+}
+
+# JSON 解析
+filter {
+  json {
+    source => "message"
+    target => "parsed"
+  }
+  if [parsed][status] >= 500 {
+    mutate {
+      add_tag => ["error"]
+    }
+  }
+}
+```
+
+---
+
+## Kibana Dashboard 设计
+
+### 常用 Dashboard 类型
+
+| Dashboard | 用途 | 关键指标 |
+|-----------|------|---------|
+| Overview | 全局概览 | 日志量、错误率、延迟 |
+| Error Analysis | 错误分析 | 错误类型、错误分布 |
+| Performance | 性能监控 | 延迟、吞吐、资源 |
+| Security | 安全审计 | 登录、异常访问 |
+
+### Dashboard JSON 示例
+
+```json
+{
+  "dashboard": {
+    "title": "API Error Dashboard",
+    "panels": [
+      {
+        "type": "metric",
+        "title": "Error Rate",
+        "query": "status >= 500"
+      },
+      {
+        "type": "line",
+        "title": "Error Trend",
+        "query": "status >= 500",
+        "aggs": "date_histogram"
+      },
+      {
+        "type": "pie",
+        "title": "Error Type Distribution",
+        "query": "status >= 500",
+        "aggs": "terms(status)"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## 性能调优
+
+### ES 性能调优参数
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| index.refresh_interval | 1s | 30s | 刷新频率 |
+| index.translog.durability | request | async | 事务日志持久化 |
+| index.translog.sync_interval | 5s | 30s | 同步间隔 |
+| indices.memory.index_buffer_size | 10% | 20% | 索引缓冲区 |
+| thread_pool.search.size | CPU*1.5 | CPU*2 | 搜索线程池 |
+
+### JVM 调优
+
+```bash
+# jvm.options 配置
+-Xms16g
+-Xmx16g
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=50
+-XX:+ParallelRefProcEnabled
+-XX:InitiatingHeapOccupancyPercent=30
+```
+
+---
+
+## ELK 安全加固
+
+### X-Pack 安全配置
+
+```yaml
+# elasticsearch.yml
+xpack.security.enabled: true
+xpack.security.transport.ssl.enabled: true
+xpack.security.http.ssl.enabled: true
+
+# Kibana 安全配置
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "${KIBANA_PASSWORD}"
+xpack.security.enabled: true
+```
+
+### 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 网络隔离 | ES 集群在内网，禁止公网访问 |
+| 认证授权 | 启用 X-Pack Security |
+| 传输加密 | 启用 TLS/SSL |
+| 审计日志 | 记录所有操作 |
+| 定期备份 | Snapshot 定期备份 |
+| 监控告警 | 集群健康、磁盘使用监控 |
+
+---
+
+## 热温冷架构
+
+### 架构设计
+
+```text
+热温冷架构：
+  热数据（Hot）：
+    - SSD 存储
+    - 最新数据（7天内）
+    - 高写入/查询性能
+    - 高成本
+
+  温数据（Warm）：
+    - HDD 存储
+    - 近期数据（30天内）
+    - 中等查询性能
+    - 中成本
+
+  冷数据（Cold）：
+    - 对象存储/归档
+    - 历史数据（90天内）
+    - 低查询性能
+    - 低成本
+```
+
+### 节点角色配置
+
+```yaml
+# 热节点配置
+node.roles: ["data_hot", "ingest"]
+node.attr.data: hot
+
+# 温节点配置
+node.roles: ["data_warm"]
+node.attr.data: warm
+
+# 冷节点配置
+node.roles: ["data_cold"]
+node.attr.data: cold
+```
+
+---
+
 ## 六、与其他板块的关系
 
 - 和「**基础知识/ES体系**」「**基础知识/中间件/ClickHouse**」：ES 系检索细节见 ES 体系篇；日志分析报表可用 ClickHouse。

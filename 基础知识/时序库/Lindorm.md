@@ -1617,3 +1617,72 @@ IoT应用架构：
   4. 监控资源使用率（避免过度配置）
   5. 使用冷存储（降低存储成本）
 ```
+
+---
+
+## 十六、Lindorm 性能优化
+
+### 16.1 写入优化
+
+| 优化项 | 配置建议 | 效果 |
+|--------|----------|------|
+| 批量写入 | batch_size=1000 | 提升写入吞吐 |
+| 异步写入 | async=true | 降低延迟 |
+| 压缩 | compression=zstd | 减少存储 |
+| 缓存 | write_cache_size=1GB | 提升热点写入 |
+
+### 16.2 查询优化
+
+```sql
+-- 时序查询优化
+-- 1. 时间范围过滤
+SELECT * FROM metrics 
+WHERE time > now() - 1h 
+AND device_id = 'd001';
+
+-- 2. 降采样
+SELECT time_bucket(time, '1h') as hour, avg(value)
+FROM metrics 
+WHERE time > now() - 24h 
+GROUP BY hour;
+
+-- 3. 标签过滤
+SELECT * FROM metrics 
+WHERE device_type = 'sensor' 
+AND location = '北京';
+```
+
+---
+
+## 十七、Lindorm 与云生态集成
+
+### 17.1 集成服务
+
+| 云服务 | 集成方式 | 用途 |
+|--------|----------|------|
+| Flink | JDBC Connector | 实时写入/查询 |
+| Spark | DataSource API | 批量分析 |
+| DataWorks | 数据集成 | ETL 链路 |
+| MaxCompute | 外部表 | 离线分析 |
+| Grafana | Plugin | 监控可视化 |
+
+### 17.2 数据流转
+
+```mermaid
+flowchart LR
+    IoT[IoT设备] -->|MQTT/Kafka| Flink[Flink实时处理]
+    Flink -->|JDBC| Lindorm[(Lindorm)]
+    Lindorm -->|JDBC| Grafana[Grafana监控]
+    Lindorm -->|外部表| MaxCompute[MaxCompute离线]
+    Lindorm -->|Spark API| Spark[Spark分析]
+```
+
+---
+
+## 十八、与其他板块的关系
+
+- 时序数据库对比见「[时序库对比](./时序库对比.md)」；
+- IoT 数据采集见「[IoT平台](../../云原生/IoT平台.md)」；
+- 实时计算见「[Flink实时计算](../../大数据/08-流处理计算：Flink.md)」；
+- 监控系统见「[Prometheus监控](./Prometheus.md)」；
+- 云数据库见「[云上数据库与缓存生态](../中间件/云上数据库与缓存生态.md)」。

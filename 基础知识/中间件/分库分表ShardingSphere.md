@@ -1449,6 +1449,178 @@ rules:
 | shadowDataSourceName | 影子库 | shadow_ds |
 | operation | SQL 类型匹配 | insert/update/delete |
 
+## ShardingSphere 分片算法深度
+
+### 分片算法选型
+
+| 算法 | 说明 | 适用场景 |
+|------|------|---------|
+| Inline | 表达式分片 | 简单均匀分片 |
+| Standard | 标准分片 | 范围+分片键 |
+| Complex | 复合分片 | 多分片键 |
+| Hint | 强制分片 | 无分片键 |
+| Class | 自定义分片 | 复杂业务 |
+
+### 分片算法配置
+
+```yaml
+# 分片规则配置
+rules:
+  - !SHARDING
+    tables:
+      t_order:
+        actualDataNodes: ds_${0..1}.t_order_${0..3}
+        databaseStrategy:
+          standard:
+            shardingColumn: user_id
+            shardingAlgorithmName: db-mod
+        tableStrategy:
+          standard:
+            shardingColumn: order_id
+            shardingAlgorithmName: table-mod
+    shardingAlgorithms:
+      db-mod:
+        type: INLINE
+        props:
+          algorithm-expression: ds_${user_id % 2}
+      table-mod:
+        type: INLINE
+        props:
+          algorithm-expression: t_order_${order_id % 4}
+```
+
+### 全局ID方案对比
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| UUID | 随机生成 | 简单、无依赖 | 无序、索引性能差 |
+| 数据库自增 | 步长控制 | 严格有序 | 依赖数据库 |
+| 雪花算法 | 时间戳+序列号 | 趋势有序 | 时钟回拨问题 |
+| Leaf | 号段模式 | 高性能 | 依赖数据库 |
+| Redis INCR | 原子递增 | 高性能 | 依赖Redis |
+
+---
+
+## 读写分离组合策略
+
+### 读写分离架构
+
+```mermaid
+flowchart LR
+    APP[应用] --> Proxy[ShardingSphere-Proxy]
+    Proxy -->|写| Master[主库]
+    Proxy -->|读| Slave1[从库1]
+    Proxy -->|读| Slave2[从库2]
+    Master -->|复制| Slave1
+    Master -->|复制| Slave2
+```
+
+### 负载均衡配置
+
+```yaml
+loadBalancers:
+  round-robin:
+    type: ROUND_ROBIN
+  random:
+    type: RANDOM
+  weight:
+    type: WEIGHT
+    props:
+      ds_0: 5
+      ds_1: 3
+```
+
+---
+
+## 分布式事务集成
+
+### 事务模式对比
+
+| 模式 | 性能 | 一致性 | 复杂度 |
+|------|------|--------|--------|
+| XA | 低 | 强 | 高 |
+| AT | 中 | 最终 | 中 |
+| TCC | 高 | 最终 | 高 |
+| Saga | 高 | 最终 | 中 |
+
+### Seata 集成配置
+
+```yaml
+# ShardingSphere + Seata 集成
+props:
+  sql-show: true
+  sql-simple: true
+  check-table-metadata-enabled: false
+
+# 事务配置
+transaction:
+  defaultType: LOCAL
+  providerType: Seata
+```
+
+---
+
+## Proxy vs JDBC 深度对比
+
+| 维度 | ShardingSphere-JDBC | ShardingSphere-Proxy |
+|------|---------------------|---------------------|
+| 架构 | 嵌入应用 | 独立服务 |
+| 性能 | 高（无网络开销） | 中（网络开销） |
+| 语言 | Java | 任意语言 |
+| 运维 | 简单 | 复杂 |
+| 功能 | 完整 | 完整 |
+| 部署 | 应用内 | 独立部署 |
+
+---
+
+## 数据加密
+
+### 加密配置
+
+```yaml
+# ShardingSphere 数据加密
+rules:
+  - !ENCRYPT
+    tables:
+      t_user:
+        columns:
+          user_name:
+            cipher:
+              name: user_cipher
+              type: AES
+            plain:
+              name: user_plain
+    encryptors:
+      encryptor_aes:
+        type: AES
+        props:
+          AES_KEY_VALUE: 1234567890abcdef
+```
+
+### 加密算法对比
+
+| 算法 | 安全性 | 性能 | 适用场景 |
+|------|--------|------|---------|
+| AES | 高 | 高 | 通用 |
+| RSA | 高 | 低 | 小数据 |
+| SM4 | 高 | 中 | 国密 |
+
+---
+
+## 分布式ID生成
+
+### ID生成策略
+
+| 策略 | 说明 | 优点 | 缺点 |
+|------|------|------|------|
+| UUID | 全局唯一 | 简单 | 无序 |
+| 雪花算法 | 时间+序列号 | 有序 | 时钟回拨 |
+| 号段模式 | 数据库号段 | 有序 | 依赖DB |
+| Redis INCR | 原子递增 | 高性能 | 依赖Redis |
+| Leaf | 号段+双Buffer | 高性能 | 复杂度高 |
+
+---
+
 ## 十九、与其他板块的关系
 
 - 和「**基础知识/分布式事务 Seata**」：跨库事务走 Seata AT 模式。

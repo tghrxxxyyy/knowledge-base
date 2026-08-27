@@ -1619,3 +1619,103 @@ hdfs dfsadmin -report | grep "Live datanodes"
 | 数据分类 | Atlas | 敏感数据自动分类标签 |
 | 数据质量 | Great Expectations | 数据质量规则校验 |
 | 生命周期 | HDFS 策略 | HOT/WARM/COLD 自动迁移 |
+
+---
+
+## 二十七、HDFS 安全机制
+
+### 27.1 安全特性
+
+| 特性 | 说明 | 配置 |
+|------|------|------|
+| 认证 | Kerberos 认证 | core-site.xml |
+| 授权 | POSIX 权限 + ACL | hdfs dfs -chmod |
+| 加密 | 透明加密 | KMS 密钥管理 |
+| 审计 | 操作日志 | hdfs-audit.log |
+| 保密 | 数据脱敏 | DistCp 加密 |
+
+### 27.2 安全配置
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>hadoop.security.authentication</name>
+  <value>kerberos</value>
+</property>
+<property>
+  <name>hadoop.security.authorization</name>
+  <value>true</value>
+</property>
+
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.encryption.key.provider.uri</name>
+  <value>kms://http@kms-host:16000/kms</value>
+</property>
+```
+
+---
+
+## 二十八、HDFS 高级特性
+
+### 28.1 快照
+
+| 操作 | 说明 | 命令 |
+|------|------|------|
+| 创建快照 | 保存目录当前状态 | hdfs dfsadmin -allowSnapshot /path |
+| 拍摄快照 | 创建时间点副本 | hdfs dfs -createSnapshot /path |
+| 删除快照 | 删除时间点副本 | hdfs dfs -deleteSnapshot /path |
+| 比较快照 | 对比两个快照差异 | hdfs dfs -diffSnapshot |
+
+### 28.2 异构存储
+
+```
+HDFS 异构存储层级：
+  RAM_DISK：内存磁盘（热数据）
+  SSD：固态硬盘（温数据）
+  DISK：普通磁盘（冷数据）
+  ARCHIVE：归档存储（历史数据）
+
+数据流转：
+  热数据 → RAM_DISK/SSD
+  温数据 → DISK
+  冷数据 → ARCHIVE
+  过期数据 → 删除/归档
+```
+
+---
+
+## 二十九、HDFS 生态集成
+
+### 29.1 集成组件
+
+| 组件 | 集成方式 | 用途 |
+|------|----------|------|
+| Hive | 外部表 | SQL 查询 |
+| Spark | DataSource API | 批处理 |
+| Flink | FileSystem API | 流处理 |
+| HBase | HFile 存储 | NoSQL |
+| Kafka | 日志存储 | 消息持久化 |
+
+### 29.2 数据流转
+
+```mermaid
+flowchart LR
+    DB[(业务DB)] -->|Sqoop/DataX| HDFS[(HDFS)]
+    HDFS -->|Hive| Hive[(Hive)]
+    HDFS -->|Spark| Spark[(Spark)]
+    HDFS -->|Flink| Flink[(Flink)]
+    HDFS -->|HBase| HBase[(HBase)]
+    Hive -->|查询| BI[BI报表]
+    Spark -->|分析| ML[机器学习]
+```
+
+---
+
+## 三十、与其他板块的关系
+
+- 分布式存储原理见「[分布式存储原理](./分布式存储原理.md)」；
+- 对象存储见「[对象存储S3](../中间件/对象存储S3.md)」；
+- 数据湖见「[数据湖格式](./05-列式存储与数据湖格式.md)」；
+- 资源调度见「[YARN与Kubernetes](./10-资源调度：YARN与Kubernetes.md)」；
+- 云存储见「[云上存储](../中间件/云上存储体系.md)」。

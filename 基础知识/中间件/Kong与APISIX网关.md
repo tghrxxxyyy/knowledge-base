@@ -1644,6 +1644,198 @@ plugins:
 | 错误率 | > 5% | 错误过多 |
 | 限流次数 | > 100/min | 流量过大 |
 
+## Kong 与 APISIX 深度对比
+
+### 核心架构对比
+
+| 维度 | Kong | APISIX |
+|------|------|--------|
+| 核心 | Nginx + LuaJIT | Nginx + LuaJIT + etcd |
+| 配置存储 | PostgreSQL / DB-less | etcd |
+| 配置同步 | polling / events | etcd watch |
+| 插件热加载 | 支持 | 支持 |
+| 性能 | 高 | 极高 |
+| 生态 | 成熟 | 活跃 |
+
+### 插件开发对比
+
+```lua
+-- Kong 自定义插件
+local kong = kong
+
+local MyPlugin = {
+  PRIORITY = 1000,
+  schema = {
+    fields = {
+      { path = { type = "string", required = true } },
+    },
+  },
+}
+
+function MyPlugin:access(conf)
+  kong.service.request.set_header("X-Custom", conf.path)
+end
+
+return MyPlugin
+```
+
+```lua
+-- APISIX 自定义插件
+local core = require("apisix.core")
+local plugin = require("apisix.plugin")
+
+local _M = {
+  version = 1.0,
+  priority = 1000,
+  schema = core.schema.def{
+    type = "object",
+    properties = {
+      path = {type = "string"},
+    },
+    required = {"path"},
+  },
+}
+
+function _M.access(conf, ctx)
+  core.request.set_header(ctx, "X-Custom", conf.path)
+end
+
+return _M
+```
+
+---
+
+## 认证插件深度配置
+
+### 多种认证方式
+
+| 认证方式 | 说明 | 插件 |
+|----------|------|------|
+| JWT | JSON Web Token | jwt / jwt-auth |
+| OAuth2 | 第三方授权 | oauth2 |
+| HMAC | 签名认证 | hmac-auth |
+| Basic Auth | 基本认证 | basic-auth |
+| Key Auth | API Key | key-auth |
+| LDAP | 目录认证 | ldap-auth |
+
+### JWT 认证配置
+
+```yaml
+# Kong JWT 配置
+plugins:
+  - name: jwt
+    config:
+      claims_to_verify:
+        - exp
+        - nbf
+      key_claim_name: iss
+      secret_is_base64: false
+
+# APISIX JWT 配置
+plugins:
+  - name: jwt-auth
+    config:
+      header: Authorization
+      claim_headers: ["exp", "nbf"]
+      clock_skew: 10
+```
+
+---
+
+## K8s Ingress 集成
+
+### Kong Ingress 配置
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    konghq.com/plugins: rate-limiting,jwt
+spec:
+  ingressClassName: kong
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+```
+
+### APISIX Ingress 配置
+
+```yaml
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: api-route
+spec:
+  http:
+    - name: api
+      match:
+        paths:
+          - /api
+        hosts:
+          - api.example.com
+      backends:
+        - serviceName: api-service
+          servicePort: 80
+      plugins:
+        - name: rate-limiting
+          config:
+            count: 100
+            time_window: 60
+        - name: jwt-auth
+```
+
+---
+
+## 性能基准测试
+
+### 基准测试结果
+
+| 指标 | Kong | APISIX |
+|------|------|--------|
+| QPS（单核） | 3000+ | 5000+ |
+| 延迟 P99 | < 10ms | < 5ms |
+| 内存占用 | 100-200MB | 50-100MB |
+| 连接数 | 10000+ | 50000+ |
+
+### 压测配置
+
+```yaml
+# wrk 压测命令
+wrk -t12 -c400 -d30s --latency \
+  -s post.lua \
+  http://localhost:8080/api
+
+# post.lua
+wrk.method = "POST"
+wrk.body = '{"key": "value"}'
+wrk.headers["Content-Type"] = "application/json"
+```
+
+---
+
+## 选型对比
+
+| 维度 | Kong | APISIX | Nginx |
+|------|------|--------|-------|
+| 定位 | API 网关 | API 网关 | Web 服务器 |
+| 插件生态 | 丰富 | 丰富 | 有限 |
+| 性能 | 高 | 极高 | 高 |
+| 学习曲线 | 中 | 中 | 低 |
+| 运维复杂度 | 中 | 中 | 低 |
+| 适用场景 | 企业级 | 高性能 | 通用 |
+
+---
+
 ## 与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；

@@ -1605,3 +1605,126 @@ public class PersonService {
 | Spring 集成 | SDN（@Node/@Relationship） |
 | 超大规模替代 | NebulaGraph/Dgraph |
 | 一句话 | 「关系密集 + 多跳」场景的天然解 |
+
+---
+
+## 十、图算法深入
+
+### 10.1 常用图算法
+
+| 算法类别 | 算法名称 | 用途 | 时间复杂度 |
+|----------|----------|------|------------|
+| 中心性 | PageRank | 页面重要性排名 | O(n²) |
+| 中心性 | Betweenness | 关键节点识别 | O(nm) |
+| 中心性 | Closeness | 影响力传播 | O(n²) |
+| 社区检测 | Louvain | 社区发现 | O(n log n) |
+| 社区检测 | Label Propagation | 快速社区检测 | O(n) |
+| 路径 | Dijkstra | 最短路径 | O(n²) |
+| 路径 | A* | 启发式最短路径 | O(n log n) |
+| 相似度 | Jaccard | 集合相似度 | O(n²) |
+| 相似度 | Cosine | 向量相似度 | O(n²) |
+
+### 10.2 图算法示例
+
+```cypher
+// PageRank 算法
+CALL gds.pageRank.stream('myGraph')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).name AS name, score
+ORDER BY score DESC
+LIMIT 10
+
+// 最短路径
+MATCH path = shortestPath(
+  (p1:Person {name: "Alice"})-[*]-(p2:Person {name: "Bob"})
+)
+RETURN path
+
+// 社区检测
+CALL gds.louvain.stream('myGraph')
+YIELD nodeId, communityId
+RETURN gds.util.asNode(nodeId).name AS name, communityId
+ORDER BY communityId
+
+// 相似度计算
+CALL gds.nodeSimilarity.stream('myGraph')
+YIELD node1, node2, similarity
+RETURN gds.util.asNode(node1).name AS person1,
+       gds.util.asNode(node2).name AS person2,
+       similarity
+ORDER BY similarity DESC
+LIMIT 10
+```
+
+---
+
+## 十一、性能优化
+
+### 11.1 索引优化
+
+| 索引类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| 节点属性索引 | 加速属性查找 | WHERE 条件查询 |
+| 关系类型索引 | 加速关系遍历 | 关系过滤 |
+| 全文索引 | 文本搜索 | 模糊查询 |
+| 空间索引 | 地理位置查询 | 附近的人 |
+| 复合索引 | 多属性组合查询 | 多条件过滤 |
+
+### 11.2 查询优化
+
+```cypher
+// 使用索引提示
+MATCH (n:Person) USING INDEX n:Person(name)
+WHERE n.name = "Alice"
+RETURN n
+
+// 使用强制标签
+MATCH (n:Person)-[:KNOWS]->(m:Person)
+WHERE n.name = "Alice"
+RETURN m
+
+// 避免全图扫描
+MATCH (n:Person {name: "Alice"})
+MATCH (m:Person {name: "Bob"})
+RETURN shortestPath((n)-[*]-(m))
+```
+
+---
+
+## 十二、生产部署
+
+### 12.1 部署架构
+
+```
+Neo4j 部署架构：
+  单机模式：
+    适用：开发测试、小规模生产
+    配置：4核8G，100GB SSD
+    
+  集群模式：
+    适用：大规模生产、高可用
+    配置：3节点集群（1主2从）
+    
+  云服务模式：
+    适用：免运维、弹性伸缩
+    配置：Neo4j AuraDB
+```
+
+### 12.2 性能调优
+
+| 调优项 | 配置建议 | 效果 |
+|--------|----------|------|
+| 内存 | dbms.memory.heap.initial_size=4G | 提升查询性能 |
+| 缓存 | dbms.memory.pagecache.size=8G | 减少磁盘IO |
+| 并发 | dbms.connector.bolt.thread_pool_min_size=10 | 提升并发能力 |
+| 存储 | 块存储 vs 高性能存储 | 提升读写性能 |
+
+---
+
+## 十三、与其他板块的关系
+
+- 图数据库选型见「[图数据库对比](./图数据库对比.md)」；
+- 知识图谱见「[知识图谱构建](../../知识图谱/构建.md)」；
+- 推荐系统见「[推荐算法](../../推荐系统/算法.md)」；
+- 社交网络见「[社交网络分析](../../社交网络/分析.md)」；
+- 欺诈检测见「[反欺诈系统](../../风控/反欺诈.md)」。

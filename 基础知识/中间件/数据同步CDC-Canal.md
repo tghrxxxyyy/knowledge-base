@@ -1664,4 +1664,272 @@ tail -f logs/canal/canal.log | grep -i "filter"
 tail -f logs/canal/instance.log | grep -i "filter"
 ```
 
+## Canal vs Debezium 深度对比
+
+### 架构对比
+
+| 维度 | Canal | Debezium |
+|------|-------|----------|
+| 核心原理 | 伪装MySQL Slave | MySQL binlog解析 |
+| 数据格式 | 自定义格式 | Kafka Connect |
+| 支持数据库 | MySQL | MySQL/PostgreSQL/MongoDB等 |
+| 生态 | 阿里开源 | Red Hat 开源 |
+| 维护状态 | 社区维护 | 活跃开发 |
+| 学习曲线 | 中等 | 中等 |
+
+### 功能对比
+
+| 功能 | Canal | Debezium |
+|------|-------|----------|
+| 全量同步 | 支持 | 支持 |
+| 增量同步 | 支持 | 支持 |
+| DDL捕获 | 支持 | 支持 |
+| 消息格式 | JSON/Protobuf | JSON/Avro/Protobuf |
+| 事务支持 | 支持 | 支持 |
+| 数据库版本 | 5.5+ | 5.6+ |
+
+---
+
+## Canal HA + ZooKeeper
+
+### 高可用架构
+
+```mermaid
+flowchart TB
+    MySQL[(MySQL Master)] --> Canal1[Canal Server 1]
+    MySQL --> Canal2[Canal Server 2]
+    Canal1 --> ZK[ZooKeeper]
+    Canal2 --> ZK
+    Canal1 -->|主节点| MQ1[Kafka]
+    Canal2 -->|备节点| MQ1
+```
+
+### ZooKeeper 配置
+
+```properties
+# canal.properties
+canal.zkServers = zk1:2181,zk2:2181,zk3:2181
+canal.instance.global.mode = spring
+canal.instance.global.spring.xml = classpath:spring/file-instance.xml
+
+# 故障切换
+canal.auto.scan = true
+canal.auto.scan.interval = 5
+```
+
+### 故障切换流程
+
+```text
+故障切换流程：
+  1. 主节点心跳超时（默认30秒）
+  2. ZooKeeper 检测主节点下线
+  3. 备节点接管主节点角色
+  4. 备节点重新拉取binlog
+  5. 恢复数据同步
+
+  注意事项：
+    - 需要配置正确的serverId
+    - binlog位置需要持久化
+    - 网络分区可能导致脑裂
+```
+
+---
+
+## 消息格式深度
+
+### Canal 消息格式
+
+```json
+{
+  "data": [
+    {
+      "id": "1",
+      "name": "test",
+      "status": "active"
+    }
+  ],
+  "database": "test_db",
+  "es": 1616346789000,
+  "id": 1,
+  "isDdl": false,
+  "mysqlType": {
+    "id": "bigint",
+    "name": "varchar",
+    "status": "varchar"
+  },
+  "old": [
+    {
+      "status": "inactive"
+    }
+  ],
+  "pkNames": [
+    "id"
+  ],
+  "sql": "",
+  "sqlType": {
+    "id": -5,
+    "name": 12,
+    "status": 12
+  },
+  "table": "users",
+  "ts": 1616346789000,
+  "type": "UPDATE"
+}
+```
+
+### 消息字段说明
+
+| 字段 | 说明 |
+|------|------|
+| data | 变更后的数据 |
+| old | 变更前的数据（UPDATE时有值） |
+| type | INSERT/UPDATE/DELETE |
+| isDdl | 是否DDL语句 |
+| mysqlType | MySQL字段类型 |
+| sqlType | JDBC字段类型 |
+| pkNames | 主键字段名 |
+| ts | 事件时间戳 |
+
+---
+
+## 过滤规则配置
+
+### 过滤规则语法
+
+```properties
+# canal.instance.filter.regex
+# 匹配所有表
+.*\\..*
+
+# 匹配特定数据库的所有表
+test_db\\..*
+
+# 匹配特定表
+test_db\\.users
+
+# 排除特定表
+test_db\\..*,.*\\.temp_.*
+
+# 正则表达式组合
+test_db\\.(users|orders|products)
+```
+
+### 黑白名单
+
+```properties
+# 白名单（只同步）
+canal.instance.filter.regex=test_db\\.users,test_db\\.orders
+
+# 黑名单（不同步）
+canal.instance.filter.black.regex=test_db\\.temp_.*,test_db\\.log_.*
+```
+
+---
+
+## 实时数据链路
+
+### 数据链路架构
+
+```mermaid
+flowchart LR
+    MySQL[(MySQL)] --> Canal[Canal Server]
+    Canal -->|Binlog| Kafka[Kafka]
+    Kafka --> Flink[Flink]
+    Kafka --> Spark[Spark]
+    Flink --> ES[Elasticsearch]
+    Flink --> HBase[HBase]
+    Spark --> Hive[Hive]
+    HBase --> Redis[Redis]
+```
+
+### 链路延迟监控
+
+```java
+// 延迟监控
+public class LagMonitor {
+    private final AtomicLong lastBinlogPosition = new AtomicLong(0);
+    
+    public void checkLag() {
+        long currentPosition = getCurrentBinlogPosition();
+        long lag = currentPosition - lastBinlogPosition.get();
+        
+        if (lag > LAG_THRESHOLD) {
+            // 告警：同步延迟过高
+            alert("Canal lag: " + lag);
+        }
+        
+        lastBinlogPosition.set(currentPosition);
+    }
+}
+```
+
+---
+
+## 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|---------|
+| 消费延迟 | binlog消费延迟 | > 1000条 |
+| 消息队列积压 | Kafka消息积压 | > 10000条 |
+| 同步错误率 | 同步失败比例 | > 1% |
+| 连接状态 | MySQL连接状态 | 断开 |
+
+### Prometheus 指标
+
+```java
+// Canal 监控指标
+public class CanalMetrics {
+    private final Counter messageCounter = Counter.build()
+        .name("canal_messages_total")
+        .help("Total canal messages")
+        .labelNames("database", "table", "type")
+        .register();
+
+    private final Gauge lagGauge = Gauge.build()
+        .name("canal_lag_messages")
+        .help("Canal lag messages")
+        .register();
+
+    public void recordMessage(String database, String table, String type) {
+        messageCounter.labels(database, table, type).inc();
+    }
+}
+```
+
+---
+
+## 生产环境排查
+
+### 常见问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|---------|---------|
+| 同步延迟 | 检查binlog位置、网络延迟 | 优化网络、调整batchsize |
+| 数据丢失 | 检查过滤规则、binlog保留 | 调整过滤规则、增加binlog保留 |
+| 内存溢出 | 检查内存使用、GC日志 | 增加内存、优化处理逻辑 |
+| 连接断开 | 检查网络、MySQL状态 | 重连机制、网络优化 |
+
+### 排查命令
+
+```bash
+# 查看Canal状态
+curl http://localhost:11112/api/v1/health
+
+# 查看instance状态
+curl http://localhost:11112/api/v1/instances
+
+# 查看binlog位置
+mysql> SHOW MASTER STATUS;
+
+# 查看Canal日志
+tail -f logs/canal/canal.log
+
+# 查看instance日志
+tail -f logs/canal/instance.log
+```
+
+---
+
 ## 二十二、与其他板块的关系

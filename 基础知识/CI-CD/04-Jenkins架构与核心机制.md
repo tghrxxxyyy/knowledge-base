@@ -1618,7 +1618,215 @@ JAVA_OPTS="$JAVA_OPTS -XX:MaxGCPauseMillis=200"
 # 清理旧构建
 ```
 
-## 三十五、JCasC配置即代码详解
+## Agent 弹性扩缩机制
+
+### Agent 类型对比
+
+| 类型 | 特点 | 适用场景 |
+|------|------|---------|
+| Permanent Agent | 固定节点 | 稳定负载 |
+| SSH Agent | 远程连接 | 动态扩展 |
+| Docker Agent | 容器化 | 隔离环境 |
+| Kubernetes Agent | Pod 弹性 | 云原生 |
+| Inbound Agent | 节点主动连接 | 防火墙环境 |
+
+### Kubernetes Agent 配置
+
+```yaml
+apiVersion: "jenkins.io/v1"
+kind: "Pod"
+metadata:
+  labels:
+    jenkins/agent-type: "kaniko"
+spec:
+  containers:
+  - name: "jnlp"
+    image: "jenkins/inbound-agent:latest"
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
+  - name: "maven"
+    image: "maven:3.9-eclipse-temurin-17"
+    command: "cat"
+    tty: true
+    volumeMounts:
+      - mountPath: "/root/.m2"
+        name: "maven-cache"
+  volumes:
+  - name: "maven-cache"
+    emptyDir: {}
+```
+
+---
+
+## 共享库详解
+
+### 共享库结构
+
+```groovy
+// vars/buildWithMaven.groovy
+def call(Map config = [:]) {
+    def artifactId = config.artifactId ?: 'app'
+    def javaVersion = config.javaVersion ?: '17'
+    
+    pipeline {
+        agent any
+        stages {
+            stage('Build') {
+                steps {
+                    sh """
+                        java -version
+                        mvn clean package -DartifactId=${artifactId}
+                    """
+                }
+            }
+        }
+    }
+}
+
+// vars/deployToK8s.groovy
+def call(Map config) {
+    def namespace = config.namespace ?: 'default'
+    def image = config.image
+    
+    sh """
+        kubectl set image deployment/${config.app} \
+            ${config.app}=${image} \
+            -n ${namespace}
+        kubectl rollout status deployment/${config.app} -n ${namespace}
+    """
+}
+```
+
+### 共享库使用
+
+```groovy
+// Jenkinsfile
+@Library('my-shared-library') _
+
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                buildWithMaven(artifactId: 'user-service', javaVersion: '17')
+            }
+        }
+        stage('Deploy') {
+            steps {
+                deployToK8s(
+                    app: 'user-service',
+                    image: "registry.example.com/user-service:${BUILD_NUMBER}",
+                    namespace: 'production'
+                )
+            }
+        }
+    }
+}
+```
+
+---
+
+## 凭据绑定详解
+
+### 凭据类型与绑定
+
+```groovy
+// SSH 凭据绑定
+withCredentials([sshUserPrivateKey(
+    credentialsId: 'ssh-deploy-key',
+    keyFileVariable: 'SSH_KEY',
+    usernameVariable: 'SSH_USER'
+)]) {
+    sh 'ssh -i ${SSH_KEY} ${SSH_USER}@server "deploy.sh"'
+}
+
+// Username/Password 凭据
+withCredentials([usernamePassword(
+    credentialsId: 'docker-registry',
+    usernameVariable: 'DOCKER_USER',
+    passwordVariable: 'DOCKER_PASS'
+)]) {
+    sh 'echo ${DOCKER_PASS} | docker login -u ${DOCKER_USER} --password-stdin'
+}
+
+// Secret File 凭据
+withCredentials([file(
+    credentialsId: 'kubeconfig',
+    variable: 'KUBECONFIG'
+)]) {
+    sh 'kubectl --kubeconfig=${KUBECONFIG} get pods'
+}
+
+// API Token 凭据
+withCredentials([string(
+    credentialsId: 'github-token',
+    variable: 'GITHUB_TOKEN'
+)]) {
+    sh 'curl -H "Authorization: token ${GITHUB_TOKEN}" https://api.github.com/user'
+}
+```
+
+---
+
+## Fingerprint制品追溯详解
+
+```java
+// 指纹生成与验证
+Fingerprint f = Fingerprint.get(filepath);
+if (f != null) {
+    println "MD5: ${f.getMD5().hexdigest()}"
+    println "SHA1: ${f.getSHA1().hexdigest()}"
+}
+
+// 跨构建指纹比对
+Fingerprint say = hudson.model.Fingerprint.get(
+    "path/to/artifact.jar"
+);
+boolean same = say.getFor()[buildA].equals(say.getFor()[buildB]);
+```
+
+---
+
+## Jenkins性能调优详解
+
+### JVM 调优参数
+
+```bash
+# $JENKINS_HOME/jenkins.xml 或环境变量
+JAVA_OPTS="-Xmx4g -Xms2g -XX:MaxPermSize=512m"
+JAVA_OPTS="$JAVA_OPTS -XX:+UseG1GC"
+JAVA_OPTS="$JAVA_OPTS -XX:+ParallelRefProcEnabled"
+JAVA_OPTS="$JAVA_OPTS -XX:MaxGCPauseMillis=200"
+
+# 线程池配置
+JAVA_OPTS="$JAVA_OPTS -Dhudson.model.WorkspaceCleanupThread.disable=false"
+JAVA_OPTS="$JAVA_OPTS -Dhudson.model.ParametersAction.keepUndefinedParameters=true"
+```
+
+### 性能监控
+
+```groovy
+// 构建时间统计
+def buildTimes = currentBuild.parent.builds.collect { build ->
+    [
+        number: build.number,
+        duration: build.duration,
+        timestamp: build.timestamp
+    ]
+}
+
+// 队列等待时间
+def queueWaitTime = currentBuild.startTimeInMillis - currentBuild.queueStartTimeInMillis
+```
+
+---
+
+## JCasC配置即代码详解
 
 ### 35.1 JCasC配置示例
 

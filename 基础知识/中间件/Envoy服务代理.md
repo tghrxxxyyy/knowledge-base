@@ -1630,3 +1630,97 @@ spec:
 | 扩展 | Wasm / Lua / C++ |
 | 云原生 | Istio 数据面事实标准 |
 | 一句话 | 「xDS 动态配置 + 过滤器链 + 可观测性 + HTTP/2/gRPC」 |
+
+---
+
+## 十六、Envoy 安全机制
+
+### 16.1 安全特性
+
+| 特性 | 说明 | 配置 |
+|------|------|------|
+| mTLS | 双向 TLS 认证 | downSTransport: TLS |
+| JWT | JWT 认证 | jwt_authn filter |
+| RBAC | 基于角色的访问控制 | rbac filter |
+| CORS | 跨域控制 | cors filter |
+| 限流 | 速率限制 | rate_limit filter |
+
+### 16.2 mTLS 配置
+
+```yaml
+# Envoy mTLS 配置
+static_resources:
+  listeners:
+    - name: listener_0
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                transport_socket:
+                  name: envoy.transport_sockets.tls
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                    require_client_certificate: true
+                    common_tls_context:
+                      tls_certificates:
+                        - certificate_chain:
+                            filename: /etc/envoy/certs/server.crt
+                          private_key:
+                            filename: /etc/envoy/certs/server.key
+                      validation_context:
+                        trusted_ca:
+                          filename: /etc/envoy/certs/ca.crt
+```
+
+---
+
+## 十七、Envoy 性能优化
+
+### 17.1 性能指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 连接数 | 100万+ | 单节点最大连接 |
+| 吞吐量 | 100K+ RPS | 请求处理能力 |
+| 延迟 | < 1ms | P99 延迟 |
+| 内存 | < 1GB | 空闲状态 |
+
+### 17.2 优化策略
+
+```yaml
+# Envoy 性能优化配置
+static_resources:
+  listeners:
+    - name: listener_0
+      per_connection_buffer_limit_bytes: 32768  # 连接缓冲区
+      tcp_backlog: 1024  # TCP 队列
+  clusters:
+    - name: cluster_0
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8080
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 1024
+```
+
+---
+
+## 十八、与其他板块的关系
+
+- 服务网格见「[Istio](../../云原生/ServiceMesh.md)」；
+- Nginx 对比见「[Nginx](./Nginx.md)」；
+- API 网关见「[Kong/APISIX](./Kong与APISIX网关.md)」；
+- 链路追踪见「[SkyWalking](./链路追踪SkyWalking.md)」；
+- 负载均衡见「[HAProxy](./HAProxy与L4负载均衡.md)」；
+- 安全见「[云安全体系](./云安全体系.md)」。

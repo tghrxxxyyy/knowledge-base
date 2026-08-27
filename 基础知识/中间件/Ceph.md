@@ -1616,3 +1616,88 @@ ceph daemon osd.0 bench
   需要新特性 → Ceph Reef
   需要稳定性 → Ceph Quincy
 ```
+
+---
+
+## 十四、Ceph 与云平台集成
+
+### 14.1 OpenStack 集成
+
+| 组件 | Ceph 存储 | 说明 |
+|------|-----------|------|
+| Nova | 虚拟机磁盘 | 临时盘/持久盘 |
+| Cinder | 块存储 | 云硬盘 |
+| Glance | 镜像存储 | 虚拟机镜像 |
+| Swift | 对象存储 | S3 兼容 |
+
+### 14.2 Kubernetes 集成
+
+```yaml
+# Ceph CSI 配置
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-block
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: <ceph-cluster-id>
+  pool: kubernetes
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: default
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+### 14.3 性能对比
+
+| 场景 | Ceph RBD | 本地 SSD | EBS |
+|------|----------|----------|-----|
+| IOPS | 5000+ | 10000+ | 3000+ |
+| 带宽 | 500MB/s | 1GB/s | 250MB/s |
+| 延迟 | 1-3ms | <1ms | 1-2ms |
+| 成本 | 中 | 低 | 高 |
+
+---
+
+## 十五、故障排查与运维
+
+### 15.1 常用命令
+
+```bash
+# 集群状态检查
+ceph health
+ceph -s
+ceph osd tree
+
+# 性能监控
+ceph osd perf
+ceph osd pool stats
+ceph df
+
+# 故障排查
+ceph osd find <osd-id>
+ceph pg dump_stuck unclean
+ceph auth list
+```
+
+### 15.2 运维最佳实践
+
+| 运维项 | 操作 | 频率 |
+|--------|------|------|
+| 健康检查 | ceph health | 实时 |
+| 性能监控 | Prometheus + Grafana | 实时 |
+| 数据平衡 | ceph osd rebalance | 按需 |
+| 版本升级 | 滚动升级 | 季度 |
+| 数据备份 | rados snap | 每日 |
+
+---
+
+## 十六、与其他板块的关系
+
+- 分布式存储原理见「[分布式存储与HDFS](../大数据/04-分布式存储与HDFS.md)」；
+- 对象存储见「[对象存储S3](./对象存储S3.md)」；
+- 云存储见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」；
+- 容器存储见「[K8s存储](../../云原生/存储.md)」；
+- 数据库存储见「[数据库存储引擎](../数据库/存储引擎.md)」。

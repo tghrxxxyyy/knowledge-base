@@ -922,6 +922,146 @@ FROM orders GROUP BY dt, category_id;
 
 ---
 
+## 函数下推与计算优化
+
+### 函数下推策略
+
+| 函数类型 | 下推条件 | 示例 |
+|----------|---------|------|
+| 聚合函数 | 支持下推 | SUM/COUNT/AVG |
+| 条件函数 | 支持下推 | CASE/IF |
+| 字符串函数 | 部分下推 | CONCAT/SUBSTRING |
+| 日期函数 | 支持下推 | DATE_FORMAT |
+| 数学函数 | 支持下推 | ABS/ROUND |
+
+### 物化视图
+
+```sql
+-- 创建物化视图
+CREATE MATERIALIZED VIEW mv_orders
+AS
+SELECT 
+  date_trunc('day', order_time) as dt,
+  user_id,
+  SUM(amount) as total_amount,
+  COUNT(*) as order_count
+FROM orders
+GROUP BY date_trunc('day', order_time), user_id;
+
+-- 查询自动匹配物化视图
+SELECT dt, SUM(total_amount)
+FROM mv_orders
+WHERE dt >= '2025-01-01'
+GROUP BY dt;
+```
+
+---
+
+## Hive Catalog 集成
+
+### Hive Catalog 配置
+
+```sql
+-- 创建 Hive Catalog
+CREATE CATALOG hive_catalog PROPERTIES (
+  'type' = 'hive',
+  'hive.metastore.uris' = 'thrift://metastore:9083',
+  'hive.config.resources' = '/etc/hive/core-site.xml,/etc/hive/hdfs-site.xml'
+);
+
+-- 使用 Hive Catalog
+SELECT * FROM hive_catalog.default.users LIMIT 10;
+```
+
+### Hive Catalog vs Native Catalog
+
+| 维度 | Hive Catalog | Native Catalog |
+|------|-------------|----------------|
+| 性能 | 中等（需要网络IO） | 高（本地存储） |
+| 数据格式 | Parquet/ORC/Text | Parquet |
+| 元数据 | Hive Metastore | Doris Metastore |
+| 适用场景 | 数据湖分析 | 实时分析 |
+
+---
+
+## 存储格式对比
+
+| 格式 | 压缩比 | 读取性能 | 写入性能 | 适用场景 |
+|------|--------|---------|---------|---------|
+| Parquet | 高 | 高 | 中 | OLAP查询 |
+| ORC | 高 | 高 | 中 | Hive查询 |
+| CSV | 低 | 高 | 高 | 数据导入 |
+| JSON | 低 | 中 | 高 | 半结构化 |
+| Avro | 中 | 中 | 高 | 流式数据 |
+
+---
+
+## 导入最佳实践
+
+### 导入方式对比
+
+| 方式 | 实时性 | 吞吐量 | 复杂度 |
+|------|--------|--------|--------|
+| Stream Load | 分钟级 | 高 | 低 |
+| Broker Load | 小时级 | 极高 | 低 |
+| Routine Load | 秒级 | 中 | 中 |
+| Multi-Catalog | 分钟级 | 高 | 低 |
+
+### Stream Load 优化
+
+```bash
+# Stream Load 优化配置
+curl -u user:password \
+  -H "format:json" \
+  -H "strip_outer_array: true" \
+  -H "max_filter_ratio: 0.1" \
+  -H "timeout: 300" \
+  -T data.json \
+  http://fe:8030/api/db1/table1/_stream_load
+```
+
+---
+
+## Doris vs StarRocks 对比
+
+| 维度 | Doris | StarRocks |
+|------|-------|-----------|
+| 架构 | FE + BE | FE + BE |
+| 查询引擎 | 向量化执行 | MPP + 向量化 |
+| 性能 | 高 | 极高 |
+| 社区 | Apache | 商业驱动 |
+| 生态 | 活跃 | 活跃 |
+| 适用场景 | 通用OLAP | 高性能OLAP |
+
+---
+
+## OLAP 建模
+
+### 维度建模
+
+| 概念 | 说明 | 示例 |
+|------|------|------|
+| 事实表 | 业务事件 | orders |
+| 维度表 | 业务上下文 | users, products |
+| 度量 | 数值指标 | amount, count |
+| 维度 | 分析角度 | time, region, category |
+
+### 星型模型
+
+```text
+星型模型：
+          [time_dim]
+              |
+[users] --- [orders] --- [products]
+              |
+          [region_dim]
+
+  事实表：orders
+  维度表：time_dim, users, products, region_dim
+```
+
+---
+
 ## 八、与其他板块的关系（扩展）
 
 - ClickHouse 对比见「[ClickHouse](./ClickHouse.md)」；

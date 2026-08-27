@@ -1620,3 +1620,129 @@ Compactor 资源调优：
     每 10 万 series 约 1 CPU
     100 万 series ≈ 10 CPU
 ```
+
+---
+
+## 二十、Prometheus 高可用架构
+
+### 20.1 高可用方案
+
+| 方案 | 说明 | 优缺点 |
+|------|------|--------|
+| 双写 | 两个 Prometheus 同时采集 | 简单但资源浪费 |
+| 联邦 | 多个 Prometheus 联邦到中心 | 可扩展但复杂 |
+| Thanos | 全局视图+长期存储 | 功能强但运维复杂 |
+| Cortex | 多租户+长期存储 | 云原生但学习成本高 |
+
+### 20.2 Thanos 架构
+
+```mermaid
+flowchart TB
+    subgraph 采集层
+        P1[Prometheus 1]
+        P2[Prometheus 2]
+        P3[Prometheus 3]
+    end
+    subgraph Thanos
+        Sidecar[Sidecar]
+        Query[Query]
+        Store[Store Gateway]
+        Compactor[Compactor]
+    end
+    subgraph 存储
+        OBJ[(对象存储)]
+    end
+    P1 --> Sidecar
+    P2 --> Sidecar
+    P3 --> Sidecar
+    Sidecar --> Query
+    Store --> Query
+    Query --> UI[Grafana]
+    Sidecar --> OBJ
+    Store --> OBJ
+    Compactor --> OBJ
+```
+
+---
+
+## 二十一、Prometheus 与 Kubernetes
+
+### 21.1 Kubernetes 集成
+
+| 组件 | 说明 | 部署方式 |
+|------|------|----------|
+| kube-state-metrics | K8s 对象指标 | Deployment |
+| node-exporter | 节点指标 | DaemonSet |
+| cAdvisor | 容器指标 | 内置 |
+| metrics-server | 资源指标 | Deployment |
+
+### 21.2 Kubernetes 配置
+
+```yaml
+# kube-state-metrics 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    spec:
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.0
+          args:
+            - --metric-labels=app
+            - --metric-annotations=app
+```
+
+---
+
+## 二十二、Prometheus 告警深入
+
+### 22.1 告警规则设计
+
+| 规则类型 | 说明 | 示例 |
+|----------|------|------|
+| 阈值告警 | 超过阈值触发 | CPU > 80% |
+| 趋势告警 | 趋势预测触发 | 预测1小时后磁盘满 |
+| 异常检测 | ML 异常检测 | 突然下降 |
+| 组合告警 | 多条件组合 | CPU高且内存高 |
+
+### 22.2 告警规则示例
+
+```yaml
+groups:
+  - name: node-alerts
+    rules:
+      - alert: NodeHighCPU
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "节点CPU使用率过高"
+          description: "节点 {{ $labels.instance }} CPU使用率超过80%，当前值 {{ $value }}%"
+          
+      - alert: NodeDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 20
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "节点磁盘空间不足"
+          description: "节点 {{ $labels.instance }} 磁盘剩余空间不足20%"
+```
+
+---
+
+## 二十三、与其他板块的关系
+
+- 可观测性三支柱见「[云上可观测性体系](../中间件/云上可观测性体系.md)」；
+- 日志采集见「[日志采集与传输](../中间件/日志采集与传输.md)」；
+- 链路追踪见「[SkyWalking](../中间件/链路追踪SkyWalking.md)」；
+- 告警通知见「[Alertmanager](./Alertmanager.md)」；
+- 可视化见「[Grafana](./Grafana.md)」。

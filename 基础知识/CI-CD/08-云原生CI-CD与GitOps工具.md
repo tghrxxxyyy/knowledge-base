@@ -1632,3 +1632,91 @@ notary verify myregistry/myapp:latest --key mykey.pub
     镜像策略：只允许签名镜像
     部署策略：只允许安全部署
 ```
+
+---
+
+## 十六、CI/CD 性能优化
+
+### 16.1 性能指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 构建时间 | < 5min | 代码到镜像 |
+| 部署时间 | < 2min | 镜像到Pod |
+| 回滚时间 | < 1min | 故障回滚 |
+| 并发构建 | 10+ | 同时运行 |
+
+### 16.2 优化策略
+
+```yaml
+# 构建优化配置
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+spec:
+  workspaces:
+    - name: shared-workspace
+  tasks:
+    - name: fetch-source
+      taskSpec:
+        workspaces:
+          - name: output
+        steps:
+          - name: clone
+            image: alpine/git
+            script: |
+              git clone --depth 1 $(params.repo-url) $(workspaces.output.path)
+    - name: build-image
+      runAfter: ["fetch-source"]
+      taskSpec:
+        params:
+          - name: image
+            type: string
+        steps:
+          - name: build
+            image: gcr.io/kaniko-project/executor
+            args:
+              - --dockerfile=Dockerfile
+              - --context=$(workspaces.source.path)
+              - --destination=$(params.image)
+              - --cache=true
+              - --cache-repo=cache.registry.io/cache
+```
+
+---
+
+## 十七、CI/CD 监控与可观测性
+
+### 17.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 构建成功率 | 成功构建/总构建 | < 95% |
+| 构建耗时 | 平均构建时间 | > 10min |
+| 部署频率 | 每天部署次数 | 异常波动 |
+| 部署失败率 | 失败部署/总部署 | > 5% |
+| 回滚率 | 回滚次数/部署次数 | > 10% |
+
+### 17.2 可观测性配置
+
+```yaml
+# Prometheus 监控配置
+scrape_configs:
+  - job_name: 'tekton-pipelines'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['tekton-pipelines-controller:9090']
+  - job_name: 'argocd'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['argocd-server:8083']
+```
+
+---
+
+## 十八、与其他板块的关系
+
+- 容器镜像见「[Docker](../../云原生/Docker.md)」；
+- Kubernetes 部署见「[K8s部署](../../云原生/部署.md)」；
+- 服务网格见「[Istio](../../云原生/ServiceMesh.md)」；
+- 密钥管理见「[Secret管理](../../云原生/安全.md)」；
+- 监控见「[Prometheus](../../时序库/Prometheus.md)」。

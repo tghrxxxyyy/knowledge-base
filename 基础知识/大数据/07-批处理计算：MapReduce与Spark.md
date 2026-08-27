@@ -1616,3 +1616,118 @@ Dynamic Partition Pruning：
 - 离线任务编排见「[中间件/Airflow](../中间件/Airflow.md)」。
 
 > 一句话：**Spark = RDD（血缘容错）+ DAG（窄宽依赖切 Stage）+ Catalyst（谓词下推/列裁剪/Codegen）+ Unified Memory（Storage/Execution 动态共享）——调优三件事：分区数≥2×核、倾斜必治理（加盐/广播）、AQE 必开；Shuffle 是性能天花板**。
+
+---
+
+## 二十七、Spark 内存管理深入
+
+### 27.1 内存布局
+
+```
+Spark Executor 内存布局：
+  总内存 = 堆内内存 + 堆外内存
+  
+  堆内内存：
+    ├── 执行内存（Execution）：Shuffle/Join/Sort/Aggregation
+    ├── 存储内存（Storage）：缓存 RDD/DataFrame
+    ├── 用户内存（User Memory）：用户数据结构
+    └── 预留内存（Reserved）：300MB
+    
+  堆外内存：
+    ├── 存储内存： offHeap.storage.memory
+    └── 执行内存： offHeap.execution.memory
+```
+
+### 27.2 统一内存管理
+
+| 内存区域 | 默认占比 | 动态调整 | 说明 |
+|----------|----------|----------|------|
+| 执行内存 | 50% | 可借用存储 | Shuffle/Sort |
+| 存储内存 | 50% | 可借用执行 | 缓存数据 |
+| 用户内存 | 25% | 固定 | 用户对象 |
+| 预留内存 | 固定300MB | 固定 | 系统开销 |
+
+### 27.3 内存配置
+
+```bash
+# 内存配置
+--executor-memory 8g
+--driver-memory 4g
+--conf spark.memory.fraction=0.6
+--conf spark.memory.storageFraction=0.5
+--conf spark.memory.offHeap.enabled=true
+--conf spark.memory.offHeap.size=4g
+```
+
+---
+
+## 二十八、Spark 调度器深入
+
+### 28.1 调度模式
+
+| 调度模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| FIFO | 先来先服务 | 单用户 |
+| FAIR | 公平调度 | 多用户 |
+| Capacity | 容量调度 | 多租户 |
+
+### 28.2 调度配置
+
+```yaml
+# FAIR 调度配置
+spark.scheduler.mode: FAIR
+spark.scheduler.allocation.file: fair-scheduler.xml
+
+# fair-scheduler.xml
+<?xml version="1.0"?>
+<allocations>
+  <pool name="production">
+    <schedulingMode>FAIR</schedulingMode>
+    <weight>1</weight>
+    <minShare>2</minShare>
+  </pool>
+  <pool name="testing">
+    <schedulingMode>FIFO</schedulingMode>
+    <weight>1</weight>
+    <minShare>1</minShare>
+  </pool>
+</allocations>
+```
+
+---
+
+## 二十九、Spark 安全机制
+
+### 29.1 安全特性
+
+| 特性 | 说明 | 配置 |
+|------|------|------|
+| 认证 | 用户身份验证 | spark.authenticate=true |
+| 授权 | 访问控制 | spark.acls.enabled=true |
+| 加密 | 数据传输加密 | spark.ssl.enabled=true |
+| 审计 | 操作日志记录 | spark.eventLog.enabled=true |
+
+### 29.2 安全配置
+
+```bash
+# 安全配置
+--conf spark.authenticate=true
+--conf spark.authenticate.secret=mysecret
+--conf spark.acls.enabled=true
+--conf spark.ui.view.acls.groups=users
+--conf spark.ssl.enabled=true
+--conf spark.ssl.keyStore=/path/to/keystore
+--conf spark.ssl.trustStore=/path/to/truststore
+```
+
+---
+
+## 三十、与其他板块的关系
+
+- 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；
+- 文件格式/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；
+- 资源调度见「[10-资源调度：YARN与Kubernetes](10-资源调度：YARN与Kubernetes.md)」；
+- 数据仓库见「[09-数据仓库与OLAP引擎](09-数据仓库与OLAP引擎.md)」；
+- 离线任务编排见「[中间件/Airflow](../中间件/Airflow.md)」；
+- 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；
+- 数据湖见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」。

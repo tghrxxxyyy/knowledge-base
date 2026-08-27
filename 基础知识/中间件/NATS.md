@@ -1658,6 +1658,227 @@ monitoring:
 
 > 核心原则：**JetStream持久化，AckPolicy可靠消费，Leaf Node灵活拓扑，K8s云原生部署，账号隔离安全**。
 
+## NATS JetStream 深度解析
+
+### JetStream 配置
+
+| 参数 | 说明 | 建议值 |
+|------|------|--------|
+| storage | 存储类型 | file/memory |
+| max_msgs | 最大消息数 | 100万 |
+| max_bytes | 最大存储大小 | 1GB |
+| retention | 保留策略 | limits/workqueue/interest |
+| max_age | 消息最大年龄 | 7d |
+| max_msgs_per_subject | 每主题最大消息数 | 10万 |
+
+### AckPolicy 对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| AckNone | 不需要确认 | 日志收集 |
+| AckAll | 所有消息确认 | 严格有序 |
+| AckExplicit | 单条确认 | 通用场景 |
+
+```bash
+# 创建 Stream
+nats stream add ORDERS \
+  --subjects="orders.>" \
+  --storage=file \
+  --retention=limits \
+  --max-msgs=1000000 \
+  --max-bytes=1GB \
+  --max-age=168h \
+  --storage=file \
+  --replicas=3
+
+# 创建 Consumer
+nats consumer add ORDERS ORDER_PROCESSOR \
+  --ack=explicit \
+  --deliver=all \
+  --max-deliver=5 \
+  --ack-wait=30s
+```
+
+---
+
+## NATS Request-Reply 模式
+
+### 请求回复流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant NATS
+    participant Server
+    
+    Client->>NATS: 请求 (reply: _INBOX.xxx)
+    NATS->>Server: 转发请求
+    Server->>NATS: 回复 (_INBOX.xxx)
+    NATS->>Client: 转发回复
+```
+
+### Request-Reply 配置
+
+```go
+// Go NATS Request-Reply
+nc, _ := nats.Connect("nats://localhost:4222")
+
+// 服务端
+nc.Subscribe("api.users", func(m *nats.Msg) {
+    // 处理请求
+    response := processRequest(m.Data)
+    nc.Publish(m.Reply, response)
+})
+
+// 客户端
+msg, err := nc.Request("api.users", []byte("get_all"), 5*time.Second)
+fmt.Println(string(msg.Data))
+```
+
+---
+
+## Leaf Node 拓扑
+
+### Leaf Node 架构
+
+```text
+Leaf Node 拓扑：
+  Hub Cluster（中心集群）
+    ├── Leaf Node 1（边缘集群）
+    ├── Leaf Node 2（边缘集群）
+    └── Leaf Node 3（边缘集群）
+
+  优势：
+    - 灵活部署：边缘节点独立运行
+    - 消息路由：自动跨集群路由
+    - 故障隔离：边缘节点故障不影响中心
+    - 带宽优化：只传输需要的消息
+```
+
+### Leaf Node 配置
+
+```bash
+# 服务器配置
+listen: 0.0.0.0:4222
+
+leafnodes {
+  remotes [
+    {
+      urls: ["nats://hub-server:4222"]
+      account: "CONNECT"
+    }
+  ]
+}
+```
+
+---
+
+## K8s 部署方案
+
+### Helm 部署
+
+```bash
+# 添加 Helm 仓库
+helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+helm repo update
+
+# 安装 NATS
+helm install nats nats/nats \
+  --namespace nats-system \
+  --create-namespace \
+  --set cluster.enabled=true \
+  --set cluster.replicas=3 \
+  --set jetstream.enabled=true \
+  --set jetstream.storage.size=10Gi
+```
+
+### K8s 资源配置
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 4Gi
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: fast-ssd
+```
+
+---
+
+## 账号隔离
+
+### 账号配置
+
+```text
+账号隔离策略：
+  1. 服务账号
+     - 每个服务独立账号
+     - 最小权限原则
+     - 独立的密钥
+
+  2. 租户账号
+     - 每个租户独立账号
+     - 资源配额限制
+     - 消息隔离
+
+  3. 环境账号
+     - 开发/测试/生产隔离
+     - 不同的集群
+     - 不同的配置
+```
+
+### 账号权限配置
+
+```conf
+# accounts.conf
+accounts {
+  # 服务账号
+  ORDERS {
+    users: [
+      {user: order-service, password: "xxx"}
+    ]
+    exports: [
+      {subjects: ["orders.>"], account: ORDER_PROCESSOR}
+    ]
+    imports: [
+      {subjects: ["inventory.>"], account: INVENTORY}
+    ]
+  }
+  
+  # 租户账号
+  TENANT_A {
+    users: [
+      {user: tenant-a-service, password: "xxx"}
+    ]
+    limits: {
+      max_connections: 100
+      max_subscriptions: 1000
+      max_payload: 1048576
+    }
+  }
+}
+```
+
+---
+
+## NATS vs Kafka vs Pulsar 对比
+
+| 维度 | NATS | Kafka | Pulsar |
+|------|------|-------|--------|
+| 架构 | 去中心化 | 分布式日志 | 分层架构 |
+| 消息模型 | Pub/Sub + Queue | Pull模式 | Pub/Sub + Queue |
+| 延迟 | 微秒级 | 毫秒级 | 毫秒级 |
+| 持久化 | JetStream | 原生支持 | BookKeeper |
+| 运维复杂度 | 低 | 中 | 高 |
+| 适用场景 | IoT/微服务 | 日志/事件流 | 多租户/跨地域 |
+
+---
+
 ## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；

@@ -1650,6 +1650,189 @@ iceberg.file-format=PARQUET
 iceberg.delete-file-granularity=PARTITION
 ```
 
+## Trino Connector 开发
+
+### Connector 架构
+
+| 组件 | 职责 | 接口 |
+|------|------|------|
+| Metadata | 元数据管理 | ConnectorMetadata |
+| SplitManager | 分片管理 | ConnectorSplitManager |
+| PageSource | 数据读取 | ConnectorPageSource |
+| RecordSink | 数据写入 | ConnectorRecordSink |
+
+### 自定义 Connector 示例
+
+```java
+public class CustomConnector implements Connector {
+    private final ConnectorMetadata metadata;
+    private final ConnectorSplitManager splitManager;
+    private final ConnectorPageSourceFactory pageSourceFactory;
+
+    @Override
+    public ConnectorMetadata getMetadata(ConnectorTransactionHandle transaction) {
+        return metadata;
+    }
+
+    @Override
+    public ConnectorSplitManager getSplitManager(ConnectorTransactionHandle transaction) {
+        return splitManager;
+    }
+
+    @Override
+    public ConnectorPageSource createPageSource(
+            ConnectorTransactionHandle transaction,
+            ConnectorSession session,
+            ConnectorSplit split,
+            ColumnHandles columnHandles) {
+        return pageSourceFactory.createPageSource(session, split, columnHandles);
+    }
+}
+```
+
+---
+
+## Trino 内存管理
+
+### 内存模型
+
+```text
+Trino 内存管理：
+  1. 堆内存：JVM 堆内存
+     - 查询内存
+     - 缓存内存
+     - 元数据内存
+
+  2. 堆外内存：Netty 缓冲区
+     - 网络缓冲区
+     - 序列化缓冲区
+
+  3. 内存池：
+     - General Pool：通用查询
+     - Reserved Pool：保留查询
+     - System Pool：系统内存
+```
+
+### 内存配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| query.max-memory | 20GB | 单查询最大内存 |
+| query.max-memory-per-node | 4GB | 单节点查询内存 |
+| memory.heap-headroom-per-node | 1GB | 堆内存预留 |
+| query.max-total-memory | 30GB | 单查询总内存 |
+
+---
+
+## Trino 安全配置
+
+### 安全配置
+
+```properties
+# 认证配置
+http-server.authentication.type=PASSWORD
+http-server.authentication.password.file=/etc/trino/users.txt
+
+# 授权配置
+access-control.config-file=/etc/trino/access-control.properties
+
+# TLS 配置
+http-server.https.enabled=true
+http-server.https.port=8443
+http-server.https.keystore.path=/etc/trino/keystore.jks
+http-server.https.keystore.password=keystore-password
+```
+
+### 访问控制配置
+
+```properties
+# access-control.properties
+# 表级权限
+table.orders=ALLOW_READ
+table.user_data=ALLOW_READ,ALLOW_WRITE
+
+# Schema 权限
+schema.production=ALLOW_READ
+schema.development=ALLOW_ALL
+```
+
+---
+
+## 性能调优
+
+### 查询优化
+
+| 优化点 | 说明 | 方法 |
+|--------|------|------|
+| 数据本地性 | 减少数据传输 | 分片与计算同节点 |
+| 谓词下推 | 减少扫描量 | 过滤条件下推到数据源 |
+| 列裁剪 | 减少IO | 只读取需要的列 |
+| 并行度 | 提高并发 | 调整task.max-worker-per-node |
+
+### 配置优化
+
+```properties
+# 并行度配置
+task.max-worker-per-node=8
+query.initial-hash-partitions=16
+
+# 缓存配置
+query.max-query-length=1MB
+query.max-stage-count=100
+
+# 连接器配置
+hive.metastore.uri=thrift://metastore:9083
+hive.config.resources=/etc/trino/core-site.xml,/etc/trino/hdfs-site.xml
+```
+
+---
+
+## Catalog 管理
+
+### Catalog 配置示例
+
+```properties
+# catalog/hive.properties
+connector.name=hive-hadoop2
+hive.metastore.uri=thrift://metastore:9083
+hive.config.resources=/etc/trino/core-site.xml,/etc/trino/hdfs-site.xml
+
+# catalog/postgres.properties
+connector.name=postgresql
+connection-url=jdbc:postgresql://postgres:5432/mydb
+connection-user=trino
+connection-password=trino-password
+
+# catalog/mysql.properties
+connector.name=mysql
+connection-url=jdbc:mysql://mysql:3306/mydb
+connection-user=trino
+connection-password=trino-password
+```
+
+### Catalog 管理操作
+
+| 操作 | SQL | 说明 |
+|------|-----|------|
+| 查看Catalog | SHOW CATALOGS | 列出所有Catalog |
+| 切换Catalog | USE CATALOG hive | 切换Catalog |
+| 查看Schema | SHOW SCHEMAS | 列出Schema |
+| 切换Schema | USE SCHEMA default | 切换Schema |
+
+---
+
+## Trino vs PrestoDB 对比
+
+| 维度 | Trino | PrestoDB |
+|------|-------|----------|
+| 开源 | 社区驱动 | Facebook 驱动 |
+| 优化器 | CBO + RBO | CBO |
+| 性能 | 更快（新优化器） | 稳定 |
+| 生态 | 活跃 | 稳定 |
+| Connector | 丰富 | 丰富 |
+
+---
+
 ## 二十六、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../大数据/05-列式存储与数据湖格式.md)」；
