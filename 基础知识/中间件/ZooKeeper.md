@@ -1667,9 +1667,351 @@ get /myNode
 delete /myNode
 ```
 
-## 十七、ZooKeeper安全加固详解
+## 十七、ZAB协议深度解析
 
-### 17.1 安全加固措施
+### 17.1 ZAB写流程与读流程对比
+
+```text
+ZAB写流程：
+  1. Leader接收写请求
+  2. Leader生成事务Proposal（ZXID）
+  3. Leader广播Proposal给所有Follower
+  4. 等待多数Follower的ACK（投票）
+  5. 发送COMMIT消息
+  6. Follower执行写操作
+
+ZAB读流程：
+  1. 任意节点接收读请求
+  2. 直接从本地内存读取（无网络开销）
+  3. 读操作不是线性一致的
+  4. 可能读到旧数据
+  5. 需要线性一致读：sync() + read()
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F1 as Follower1
+    participant F2 as Follower2
+    
+    C->>L: 写请求 (setData)
+    L->>L: 生成Proposal(ZXID=1.10)
+    L->>F1: PROPOSAL(1.10)
+    L->>F2: PROPOSAL(1.10)
+    F1->>L: ACK
+    F2->>L: ACK
+    Note over L: 多数派确认(2/3)
+    L->>F1: COMMIT(1.10)
+    L->>F2: COMMIT(1.10)
+    L->>C: 成功
+```
+
+### 17.2 ZXID结构解析
+
+```text
+ZXID = 64位整数
+  ├── 高32位：epoch（Leader纪元）
+  │     ├── 每次选举新Leader epoch+1
+  │     └── 用于区分不同Leader时代
+  └── 低32位：counter（事务计数器）
+        ├── 每次写操作counter+1
+        └── 同epoch内单调递增
+
+示例：
+  初始状态：epoch=0, counter=0 → ZXID=0.0
+  第1次写：epoch=0, counter=1 → ZXID=0.1
+  第2次写：epoch=0, counter=2 → ZXID=0.2
+  新选举后：epoch=1, counter=0 → ZXID=1.0
+```
+
+| ZXID字段 | 位数 | 作用 | 单调性 |
+|----------|------|------|--------|
+| epoch | 32位 | 区分Leader纪元 | 递增（选举时+1） |
+| counter | 32位 | 事务计数 | 递增（每次写+1） |
+
+### 17.3 ZAB选举流程详解
+
+```mermaid
+flowchart TD
+    A[选举触发] --> B[每个节点投自己]
+    B --> C[广播投票]
+    C --> D{比较ZXID}
+    D -->|ZXID更大| E[切换投票到该节点]
+    D -->|ZXID相同| F[比较myid]
+    F -->|myid更大| E
+    E --> G[收集所有投票]
+    G --> H{是否多数派}
+    H -->|是| I[成为Leader]
+    H -->|否| J[继续投票]
+    
+    style I fill:#9f9
+    style J fill:#f99
+```
+
+```text
+选举关键规则：
+  1. ZXID越大 = 数据越新 → 优先当选
+  2. ZXID相同 → myid越大越优先
+  3. 必须获得多数节点投票
+  4. 选举期间不处理写请求
+  5. Follower发现Leader故障才触发选举
+```
+
+---
+
+## 十八、Watcher机制深度解析
+
+### 18.1 Watcher类型与特性
+
+```text
+Watcher类型对比：
+  1. 默认Watcher（getData/exists/getChildren）：
+     ├── 一次性触发
+     ├── 触发后自动移除
+     ├── 需要重新注册
+     └── 适合一次性通知
+
+  2. 持久Watcher（addWatch）：
+     ├── ZK 3.6+支持
+     ├── 持续监听
+     ├── 不会自动移除
+     └── 适合持续监控
+
+  3. 加前缀Watcher（addWatchWPrefix）：
+     ├── 监听整个子树
+     ├── 包括子节点变化
+     └── 适合目录监控
+```
+
+### 18.2 Watcher事件类型
+
+| 事件类型 | 触发场景 | 通知内容 | 使用场景 |
+|----------|----------|----------|----------|
+| NodeCreated | 节点创建 | 节点路径 | 监听新节点 |
+| NodeDeleted | 节点删除 | 节点路径 | 监听下线 |
+| NodeDataChanged | 数据变更 | 节点路径 | 配置更新 |
+| NodeChildrenChanged | 子节点变化 | 父节点路径 | 服务发现 |
+
+```java
+// Watcher注册示例
+String path = "/myapp/config";
+
+// 默认Watcher（一次性）
+byte[] data = zookeeper.getData(path, event -> {
+    System.out.println("事件类型: " + event.getType());
+    System.out.println("节点路径: " + event.getPath());
+    // 需要重新注册Watcher
+}, null);
+
+// 持久Watcher
+Stat stat = zookeeper.addWatch(path, event -> {
+    System.out.println("持久Watcher触发: " + event.getType());
+    // 自动重新监听
+}, Watcher.WatcherMode.PERSISTENT);
+```
+
+### 18.3 Watcher性能优化
+
+```text
+Watcher性能问题：
+  1. 大量Watch导致内存膨胀
+  2. Watcher触发导致网络风暴
+  3. 重新注册Watcher开销
+
+优化方案：
+  1. 使用Curator框架（自动管理Watcher）
+  2. 合并Watch路径（减少Watch数量）
+  3. 使用持久Watcher（减少注册开销）
+  4. 批量处理Watcher事件（减少网络请求）
+```
+
+---
+
+## 十九、Curator InterProcessMutex生产实战
+
+### 19.1 Curator锁高级特性
+
+```java
+// 可重入锁
+InterProcessMutex lock = new InterProcessMutex(client, "/lock/myresource");
+lock.acquire();
+// 同一线程可多次获取
+lock.acquire();
+lock.release();
+lock.release();
+
+// 可重入读写锁
+InterProcessReadWriteLock rwLock = new InterProcessReadWriteLock(client, "/lock/rw");
+rwLock.readLock().acquire();  // 多个读锁可并发
+rwLock.writeLock().acquire(); // 写锁独占
+
+// 信号量（限制并发数）
+InterProcessSemaphoreV2 semaphore = new InterProcessSemaphoreV2(client, "/lock/sem", 5);
+SemaphoreLease lease = semaphore.acquire();
+try {
+    // 限制最多5个并发
+} finally {
+    lease.release();
+}
+
+// 领导者选举
+LeaderLatch latch = new LeaderLatch(client, "/leader");
+latch.start();
+latch.await(); // 阻塞直到成为领导者
+if (latch.hasLeadership()) {
+    // 执行领导者任务
+}
+```
+
+### 19.2 Curator锁配置优化
+
+| 配置项 | 默认值 | 生产建议 | 说明 |
+|--------|--------|----------|------|
+| sessionTimeout | 60s | 30-60s | 会话超时 |
+| connectionTimeout | 15s | 5-15s | 连接超时 |
+| retryPolicy | ExponentialBackoff | 自定义重试 | 重试策略 |
+| lockPath | /lock | 合理规划 | 锁路径前缀 |
+| maxRetries | 3 | 5-10 | 最大重试次数 |
+
+---
+
+## 二十、ZK配置中心设计模式
+
+### 20.1 配置管理架构
+
+```mermaid
+flowchart TD
+    A[配置变更] --> B[ZK节点更新]
+    B --> C[Watcher通知]
+    C --> D[应用收到通知]
+    D --> E[重新读取配置]
+    E --> F[热更新生效]
+    
+    G[配置发布] --> B
+    
+    H[配置版本] --> I[灰度发布]
+    I --> J[部分节点更新]
+    J --> K[验证后全量发布]
+```
+
+```text
+ZK配置中心设计要点：
+  1. 配置结构：
+     /app/config/{key} → value
+     /app/config/db_url → jdbc:mysql://...
+     /app/config/cache_ttl → 3600
+
+  2. Watcher机制：
+     ├── 监听/config节点
+     ├── 子节点变化通知
+     ├── 数据变更通知
+     └── 自动重新加载配置
+
+  3. 灰度发布：
+     ├── 版本号：v1, v2, v3
+     ├── 指定节点灰度更新
+     ├── 验证后全量发布
+     └── 支持快速回滚
+```
+
+---
+
+## 二十一、ZK集群扩缩容实战
+
+### 21.1 集群扩容流程
+
+```bash
+# 1. 启动新节点
+bin/zkServer.sh start
+
+# 2. 在新节点配置集群信息
+echo "server.1=zk1:2888:3888" >> conf/zoo.cfg
+echo "server.2=zk2:2888:3888" >> conf/zoo.cfg
+echo "server.3=zk3:2888:3888" >> conf/zoo.cfg
+echo "server.4=zk4:2888:3888" >> conf/zoo.cfg
+
+# 3. 在现有节点执行reconfig
+echo "reconfig add,server.4=zk4:2888:3888:observer" | nc zk1 2181
+
+# 4. 验证集群状态
+echo "stat" | nc zk1 2181
+```
+
+### 21.2 集群扩缩容对比
+
+| 操作 | 步骤 | 停机 | 风险 | 建议 |
+|------|------|------|------|------|
+| 扩容 | 添加节点+reconfig | 无需 | 低 | 在线操作 |
+| 缩容 | reconfig remove | 无需 | 中 | 先迁数据 |
+| 替换 | 扩容+缩容 | 无需 | 低 | 推荐方式 |
+| 升级 | 滚动升级 | 无需 | 低 | 逐个升级 |
+
+---
+
+## 二十二、ZK vs etcd vs Kafka Watcher对比
+
+| 维度 | ZK Watcher | etcd Watch | Kafka Watch |
+|------|-----------|------------|-------------|
+| 机制 | 一次性 | 持续流 | 持续流 |
+| 性能 | 中 | 高 | 高 |
+| 历史数据 | 不支持 | 支持（fromRevision） | 支持（offset） |
+| 事件类型 | 4种 | 5种 | 3种 |
+| 前缀监听 | 不支持 | 支持 | 不支持 |
+| 复杂度 | 中 | 低 | 高 |
+
+---
+
+## 二十三、ZK运维最佳实践
+
+### 23.1 日常运维操作
+
+```bash
+# 集群状态检查
+echo "stat" | nc zk1 2181
+
+# 四字命令
+echo "ruok" | nc zk1 2181  # 健康检查
+echo "mntr" | nc zk1 2181  # 监控指标
+echo "conf" | nc zk1 2181  # 配置信息
+echo "cons" | nc zk1 2181  # 连接信息
+echo "dump" | nc zk1 2181  # 会话信息
+
+# 数据清理
+echo "kill" | nc zk1 2181  # 清理过期会话
+
+# 日志清理
+bin/zkCleanup.sh /var/lib/zookeeper 3  # 保留3个快照
+```
+
+### 23.2 运维监控指标
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| zk_avg_latency | >100ms | 平均延迟 |
+| zk_outstanding_requests | >1000 | 排队请求数 |
+| zk_num_alive_connections | >1000 | 连接数 |
+| zk_followers | <n/2 | Follower数量 |
+| zk_pending_syncs | >100 | 待同步数 |
+
+### 23.3 故障排查流程
+
+```text
+ZK故障排查步骤：
+  1. 检查进程：jps | grep QuorumPeerMain
+  2. 检查端口：netstat -tlnp | grep 2181
+  3. 检查日志：tail -f zookeeper.out
+  4. 检查磁盘：df -h
+  5. 检查内存：free -m
+  6. 检查连接：echo "cons" | nc zk1 2181
+  7. 检查节点：echo "ls /" | nc zk1 2181
+```
+
+---
+
+## 二十四、ZooKeeper安全加固详解
+
+### 24.1 安全加固措施
 
 | 措施 | 做法 | 目的 |
 |------|------|------|

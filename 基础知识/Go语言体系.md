@@ -1203,7 +1203,305 @@ go tool pprof http://localhost:6060/debug/pprof/block
 (pprof) list funcName # 查看具体函数的逐行耗时
 ```
 
-## 与其他板块的关系
+---
+
+## 十九、Go GC调优深度解析
+
+### 19.1 GOGC参数详解
+
+```bash
+# GOGC 控制 GC 触发频率（默认 100，表示堆增长 100% 时触发 GC）
+GOGC=50      # 更频繁 GC（堆增长 50% 触发）
+GOGC=200     # 更少 GC（堆增长 200% 触发）
+GOGC=off     # 禁用 GC
+
+# GOMEMLIMIT 内存软限制（Go 1.19+）
+GOMEMLIMIT=1GiB  # 内存软限制 1GB
+```
+
+| 参数 | 默认值 | 作用 | 生产建议 |
+|------|--------|------|----------|
+| GOGC | 100 | 堆增长比例触发GC | 按业务调整50-200 |
+| GOMEMLIMIT | 无 | 内存软限制 | 设置为物理内存70% |
+| debug.SetGCPercent | 100 | 运行时调整GOGC | 动态调优 |
+
+### 19.2 GC调优最佳实践
+
+```go
+// 1. 设置内存软限制（推荐）
+import "runtime/debug"
+debug.SetMemoryLimit(1 << 30) // 1GB
+
+// 2. 调整GOGC
+debug.SetGCPercent(50) // 更频繁GC
+
+// 3. 监控GC统计
+var gcStats debug.GCStats
+debug.ReadGCStats(&gcStats)
+fmt.Printf("上次GC暂停: %v\n", gcStats.PauseTotal)
+
+// 4. 使用runtime/metrics（Go 1.16+）
+import "runtime/metrics"
+samples := []metrics.Sample{
+    {Name: "/gc/cycles/total:gc-cycles"},
+    {Name: "/memory/classes/heap/objects:bytes"},
+}
+metrics.Read(samples)
+```
+
+### 19.3 GC调优指标
+
+| 指标 | 健康范围 | 异常处理 |
+|------|----------|----------|
+| GC暂停时间 | <1ms | 增大GOGC |
+| GC频率 | 1-10次/秒 | 调整GOGC |
+| 堆大小 | <500MB | 减少分配 |
+| 内存使用 | <80% | 增加内存 |
+
+---
+
+## 二十、Goroutine泄漏检测
+
+### 20.1 泄漏检测方法
+
+```go
+// 方法1：runtime.NumGoroutine()
+fmt.Println("当前goroutine数:", runtime.NumGoroutine())
+
+// 方法2：使用pprof
+import _ "net/http/pprof"
+go func() {
+    http.ListenAndServe("localhost:6060", nil)
+}()
+
+// 方法3：使用goleak（Uber出品）
+import "go.uber.org/goleak"
+func TestMain(m *testing.M) {
+    goleak.VerifyTestMain(m)
+}
+
+// 方法4：手动监控
+ticker := time.NewTicker(time.Second)
+for range ticker.C {
+    fmt.Println("goroutine数:", runtime.NumGoroutine())
+}
+```
+
+### 20.2 常见泄漏场景
+
+| 场景 | 原因 | 解决方案 |
+|------|------|----------|
+| channel未关闭 | 永久阻塞 | 及时close |
+| 未读取的channel | 发送阻塞 | 读取或丢弃 |
+| 锁未释放 | 死锁 | defer unlock |
+| context未取消 | 永久等待 | 使用WithCancel |
+| time.After泄漏 | GC延迟 | 使用time.NewTimer |
+
+---
+
+## 二十一、Channel模式大全
+
+### 21.1 常用Channel模式
+
+```go
+// 1. Fan-out/Fan-in（扇出扇入）
+func fanOut(input <-chan int, workers int) []<-chan int {
+    channels := make([]<-chan int, workers)
+    for i := 0; i < workers; i++ {
+        channels[i] = process(input)
+    }
+    return channels
+}
+
+// 2. Pipeline（管道）
+func pipeline(nums <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range nums {
+            out <- n * 2
+        }
+    }()
+    return out
+}
+
+// 3. Or-channel（或通道）
+func or(channels ...<-chan interface{}) <-chan interface{} {
+    switch len(channels) {
+    case 0:
+        return nil
+    case 1:
+        return channels[0]
+    }
+    orDone := make(chan interface{})
+    go func() {
+        defer close(orDone)
+        switch len(channels) {
+        case 2:
+            select {
+            case <-channels[0]:
+            case <-channels[1]:
+            }
+        default:
+            select {
+            case <-channels[0]:
+            case <-channels[1]:
+            case <-channels[2]:
+            case <-or(append(channels[3:], orDone)...):
+            }
+        }
+    }()
+    return orDone
+}
+```
+
+### 21.2 Channel性能对比
+
+| 模式 | 性能 | 适用场景 |
+|------|------|----------|
+| Fan-out/Fan-in | 高 | 并行处理 |
+| Pipeline | 中 | 流式处理 |
+| Or-channel | 中 | 竞争处理 |
+| Semaphore | 低 | 并发控制 |
+
+---
+
+## 二十二、Go接口设计最佳实践
+
+### 22.1 接口设计原则
+
+```go
+// 1. 小接口原则（Go风格）
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+
+// 2. 接口组合
+type ReadWriter interface {
+    Reader
+    Writer
+}
+
+// 3. 接口断言
+func process(r io.Reader) {
+    if f, ok := r.(*os.File); ok {
+        // 文件特殊处理
+    }
+}
+
+// 4. 接口值检查
+var w io.Writer
+if w != nil {
+    w.Write([]byte("hello"))
+}
+```
+
+### 22.2 接口设计对比
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 小接口 | 单一职责 | io.Reader |
+| 接口组合 | 灵活组合 | io.ReadWriter |
+| 接口断言 | 类型检查 | type assertion |
+| 隐式实现 | 松耦合 | 结构体自动实现 |
+
+---
+
+## 二十三、Go测试最佳实践
+
+### 23.1 测试类型对比
+
+| 类型 | 命令 | 用途 | 性能 |
+|------|------|------|------|
+| 单元测试 | go test | 函数测试 | 高 |
+| 基准测试 | go test -bench | 性能测试 | 中 |
+| 模糊测试 | go test -fuzz | 模糊测试 | 低 |
+| 端到端测试 | go test -e2e | 集成测试 | 低 |
+
+### 23.2 测试覆盖率
+
+```bash
+# 生成覆盖率报告
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+
+# 覆盖率阈值（CI/CD）
+go test -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out | grep total | awk '{print $3}'
+```
+
+---
+
+## 二十四、Go 1.21+新特性
+
+### 24.1 新特性对比
+
+| 版本 | 新特性 | 用途 |
+|------|--------|------|
+| 1.21 | slog | 结构化日志 |
+| 1.21 | slices | 切片操作 |
+| 1.21 | maps | map操作 |
+| 1.22 | range over func | 迭代器 |
+| 1.22 | 增强for | 循环优化 |
+
+### 24.2 新特性示例
+
+```go
+// Go 1.21+ slog
+import "log/slog"
+slog.Info("user logged in", "user_id", 123)
+
+// Go 1.21+ slices
+import "slices"
+nums := []int{3, 1, 4, 1, 5}
+slices.Sort(nums)
+slices.Contains(nums, 4)
+
+// Go 1.21+ maps
+import "maps"
+m := map[string]int{"a": 1, "b": 2}
+keys := maps.Keys(m)
+```
+
+---
+
+## 二十五、Go并发模式对比
+
+### 25.1 并发原语对比
+
+| 原语 | 性能 | 适用场景 | 复杂度 |
+|------|------|----------|--------|
+| goroutine+channel | 高 | 通用并发 | 低 |
+| sync.WaitGroup | 高 | 等待完成 | 低 |
+| sync.Mutex | 高 | 互斥锁 | 低 |
+| sync.RWMutex | 高 | 读写锁 | 低 |
+| atomic | 最高 | 原子操作 | 中 |
+| errgroup | 高 | 并发+错误处理 | 低 |
+
+### 25.2 并发模式选择
+
+```text
+选择决策：
+  需要通信？→ channel
+  需要同步？→ WaitGroup
+  需要互斥？→ Mutex
+  需要原子操作？→ atomic
+  需要错误处理？→ errgroup
+  需要超时？→ context+channel
+```
+
+---
+
+## 二十六、Go vs Java vs Rust对比
+
+| 维度 | Go | Java | Rust |
+|------|-----|------|------|
+| 性能 | 中 | 中 | 高 |
+| 并发 | goroutine | 线程池 | async/await |
+| 内存 | GC | GC | 所有权 |
+| 学习曲线 | 低 | 中 | 高 |
+| 生态 | 云原生 | 企业级 | 系统编程 |
+| 编译速度 | 快 | 慢 | 慢 |
 
 ## 二十、Go GC 调优（GOGC/内存限制/debug.SetGCPercent）
 

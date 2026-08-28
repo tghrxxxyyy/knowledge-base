@@ -1694,6 +1694,257 @@ ceph auth list
 
 ---
 
+## 十七、CRUSH Map自定义详解
+
+### 17.1 CRUSH Map结构
+
+```text
+CRUSH Map组成：
+  ├── 规则（Rules）
+  │     ├── replication规则
+  │     ├── 选择规则
+  │     └── 故障域规则
+  ├── 桶（Buckets）
+  │     ├── 根桶（root）
+  │     ├── 区域桶（region/datacenter）
+  │     ├── 机架桶（rack）
+  │     └── 主机桶（host）
+  └── 权重（Weights）
+        ├── OSD权重（容量）
+        ├── 桶权重（聚合）
+        └── 归一化（0-1）
+```
+
+### 17.2 CRUSH规则配置
+
+```bash
+# 查看CRUSH Map
+ceph osd getcrushmap -o /tmp/crushmap
+crushtool -d /tmp/crushmap -o /tmp/crushmap.txt
+
+# 编辑CRUSH规则
+cat > /tmp/crushmap.txt << 'EOF'
+rule replicated_rule {
+    id 0
+    type replicated
+    min_size 1
+    max_size 10
+    step set_chooseleaf_tries 5
+    step choose firstn 0 type host
+    step emit
+}
+EOF
+
+# 编译并注入
+crushtool -c /tmp/crushmap.txt -o /tmp/crushmap.new
+ceph osd setcrushmap -i /tmp/crushmap.new
+```
+
+### 17.3 CRUSH规则对比
+
+| 规则类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| replicated | 副本 | 通用场景 |
+| erasure | 纠删码 | 大容量存储 |
+| host | 主机级故障域 | 小规模集群 |
+| rack | 机架级故障域 | 大规模集群 |
+
+---
+
+## 十八、RBD缓存优化详解
+
+### 18.1 RBD缓存配置
+
+```ini
+# /etc/ceph/ceph.conf
+[client]
+# 开启RBD缓存
+rbd cache = true
+rbd cache size = 256MB
+rbd cache max dirty = 128MB
+rbd cache dirty flush threshold = 64MB
+rbd cache max dirty age = 5
+
+# SSD缓存
+rbd cache ssd = true
+rbd cache ssd size = 1GB
+```
+
+### 18.2 RBD缓存效果
+
+| 配置 | 缓存前 | 缓存后 | 提升 |
+|------|--------|--------|------|
+| 随机读 | 1000 IOPS | 5000 IOPS | 5x |
+| 随机写 | 5000 IOPS | 20000 IOPS | 4x |
+| 顺序读 | 100MB/s | 500MB/s | 5x |
+| 延迟 | 10ms | 2ms | 5x |
+
+---
+
+## 十九、MDS调优详解
+
+### 19.1 MDS配置优化
+
+```ini
+# /etc/ceph/ceph.conf
+[mds]
+# 元数据缓存
+mds cache size = 1000000
+mds cache memory limit = 10GB
+
+# 日志优化
+mds log max size = 1GB
+mds log max segments = 100
+
+# 响应超时
+mds heartbeat grace = 10
+```
+
+### 19.2 MDS性能指标
+
+| 指标 | 说明 | 健康范围 |
+|------|------|----------|
+| mds_cache_size | 元数据缓存 | <80% |
+| mds_log_latency | 日志延迟 | <1ms |
+| mds_request_latency | 请求延迟 | <10ms |
+
+---
+
+## 二十、Ceph监控与告警
+
+### 20.1 监控指标
+
+```bash
+# 集群状态
+ceph -s
+ceph health detail
+
+# OSD状态
+ceph osd tree
+ceph osd df
+
+# 性能指标
+ceph osd perf
+ceph mds perf
+```
+
+### 20.2 告警配置
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| health status | WARN/ERR | 集群健康 |
+| osd up/down | 非预期变化 | OSD状态 |
+| pg degraded | >0 | 数据降级 |
+| pool full | >80% | 池空间不足 |
+
+---
+
+## 二十一、Ceph故障排查
+
+### 21.1 常见故障处理
+
+```bash
+# OSD故障
+ceph osd down 0
+ceph osd out 0
+# 修复后
+ceph osd in 0
+
+# PG不一致
+ceph pg deep-scrub <pgid>
+ceph pg repair <pgid>
+
+# 元数据服务器故障
+ceph mds fail 0
+ceph mds deploy <mds-name>
+```
+
+### 21.2 故障排查流程
+
+```text
+故障排查步骤：
+  1. 检查集群状态：ceph -s
+  2. 检查OSD状态：ceph osd tree
+  3. 检查PG状态：ceph pg stat
+  4. 检查日志：tail -f /var/log/ceph/*
+  5. 检查网络：ping/osd network
+  6. 检查磁盘：iostat/smartctl
+```
+
+---
+
+## 二十二、Ceph与OpenStack集成
+
+### 22.1 集成架构
+
+```text
+OpenStack + Ceph架构：
+  ├── Nova（计算）
+  │     └── Ceph RBD（虚拟机磁盘）
+  ├── Cinder（块存储）
+  │     └── Ceph RBD（卷存储）
+  ├── Glance（镜像）
+  │     └── Ceph RBD（镜像存储）
+  └── Swift（对象存储）
+        └── Ceph RGW（对象网关）
+```
+
+### 22.2 集成配置
+
+```bash
+# OpenStack配置Ceph
+[DEFAULT]
+enabled_backends = ceph
+
+[ceph]
+volume_driver = cinder.volume.drivers.rbd.RBDDriver
+rbd_pool = volumes
+rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_flatten_volume_from_snapshot = False
+```
+
+---
+
+## 二十三、Ceph运维最佳实践
+
+### 23.1 日常运维操作
+
+```bash
+# 健康检查
+ceph health
+ceph osd df
+ceph pg stat
+
+# 性能监控
+ceph osd perf
+ceph mds perf
+
+# 数据平衡
+ceph osd reweight-all
+ceph osd thrash 10
+```
+
+### 23.2 运维监控指标
+
+| 指标 | 说明 | 健康范围 |
+|------|------|----------|
+| OSD使用率 | OSD容量使用 | <80% |
+| PG状态 | PG健康状态 | active+clean |
+| 延迟 | 读写延迟 | <10ms |
+| 吞吐量 | 读写带宽 | 满足需求 |
+
+---
+
+## 二十四、Ceph vs 其他存储对比
+
+| 维度 | Ceph | MinIO | GlusterFS |
+|------|------|-------|-----------|
+| 架构 | 统一存储 | 对象存储 | 分布式文件 |
+| 扩展性 | 线性扩展 | 水平扩展 | 水平扩展 |
+| 性能 | 高 | 高 | 中 |
+| 复杂度 | 高 | 低 | 中 |
+| 生态 | OpenStack | K8s | 通用 |
+
 ## 十六、与其他板块的关系
 
 - 分布式存储原理见「[分布式存储与HDFS](../大数据/04-分布式存储与HDFS.md)」；

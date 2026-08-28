@@ -1694,6 +1694,334 @@ flowchart LR
 
 ---
 
+## 十、TDengine STable与子表深度解析
+
+### 10.1 STable与子表关系
+
+```text
+STable（超级表）：
+  ├── 定义：表结构模板
+  ├── 作用：管理同类型设备
+  ├── 标签：设备属性（静态）
+  └── 数据列：采集数据（动态）
+
+子表（Child Table）：
+  ├── 继承：自动继承STable结构
+  ├── 独立：独立存储和查询
+  ├── 标签：独立标签值
+  └── 数据：独立数据存储
+
+关系：
+  STable 1:N 子表
+  如：温度STable 包含 1000个设备子表
+```
+
+### 10.2 STable操作示例
+
+```sql
+-- 创建超级表
+CREATE STABLE sensors (
+    ts TIMESTAMP,
+    temperature FLOAT,
+    humidity FLOAT
+) TAGS (
+    location BINARY(64),
+    type BINARY(32)
+);
+
+-- 创建子表
+CREATE TABLE sensor_01 USING sensors TAGS ('北京', '温度');
+CREATE TABLE sensor_02 USING sensors TAGS ('上海', '温度');
+
+-- 插入数据
+INSERT INTO sensor_01 VALUES (NOW, 25.5, 60.0);
+INSERT INTO sensor_02 VALUES (NOW, 28.3, 55.0);
+
+-- 查询所有设备
+SELECT * FROM sensors;
+
+-- 按标签查询
+SELECT * FROM sensors WHERE location = '北京';
+```
+
+### 10.3 STable vs 普通表
+
+| 特性 | STable | 普通表 |
+|------|--------|--------|
+| 设备管理 | 支持 | 不支持 |
+| 标签 | 支持 | 不支持 |
+| 批量创建 | 支持 | 不支持 |
+| 设备查询 | 高效 | 低效 |
+| 聚合查询 | 支持 | 不支持 |
+
+---
+
+## 十一、TDengine流计算详解
+
+### 11.1 流计算架构
+
+```mermaid
+flowchart LR
+    A[数据写入] --> B[流计算引擎]
+    B --> C[窗口聚合]
+    C --> D[结果输出]
+    D --> E[告警/存储]
+```
+
+### 11.2 流计算示例
+
+```sql
+-- 创建流计算
+CREATE STREAM avg_temp_stream
+TRIGGER WINDOW_CLOSE
+AS
+SELECT
+    _wstart AS start_time,
+    _wend AS end_time,
+    device_id,
+    AVG(temperature) AS avg_temp
+FROM sensor_data
+PARTITION BY device_id
+INTERVAL(1h);
+
+-- 创建告警流
+CREATE STREAM alert_stream
+TRIGGER WINDOW_CLOSE
+AS
+SELECT
+    _wstart AS start_time,
+    device_id,
+    MAX(temperature) AS max_temp
+FROM sensor_data
+PARTITION BY device_id
+INTERVAL(5m)
+HAVING max_temp > 30;
+```
+
+### 11.3 流计算特性
+
+| 特性 | 说明 | 用途 |
+|------|------|------|
+| 窗口类型 | 滑动/滚动/会话 | 不同聚合场景 |
+| 触发方式 | 窗口关闭/定时 | 实时性需求 |
+| 分区 | 按设备/标签 | 并行计算 |
+| 状态管理 | 内置 | 容错恢复 |
+
+---
+
+## 十二、TDengine数据订阅详解
+
+### 12.1 数据订阅架构
+
+```text
+数据订阅机制：
+  ├── 订阅主题（Topic）
+  │     ├── 定义数据范围
+  │     ├── 支持多消费者
+  │     └── 消息持久化
+  ├── 消费者（Consumer）
+  │     ├── 消费组管理
+  │     ├── 负载均衡
+  │     └── 位点管理
+  └── 消息（Message）
+        ├── 数据变更
+        ├── 事件通知
+        └── 顺序保证
+```
+
+### 12.2 数据订阅示例
+
+```sql
+-- 创建订阅主题
+CREATE TOPIC sensor_topic
+AS SELECT * FROM sensors;
+
+-- 创建消费者组
+CREATE CONSUMER GROUP sensor_consumer_group;
+
+-- 创建消费者
+CREATE CONSUMER sensor_consumer
+IN GROUP sensor_consumer_group
+TOPIC sensor_topic;
+
+-- 消费消息
+CONSUME FROM sensor_consumer;
+```
+
+---
+
+## 十三、TDengine集群部署详解
+
+### 13.1 集群架构
+
+```mermaid
+flowchart TD
+    subgraph 客户端
+        A[应用] --> B[连接器]
+    end
+    
+    subgraph 集群
+        B --> C[dn1]
+        B --> D[dn2]
+        B --> E[dn3]
+    end
+    
+    subgraph 存储
+        C --> F[数据分片1]
+        D --> G[数据分片2]
+        E --> H[数据分片3]
+    end
+```
+
+### 13.2 集群配置
+
+```bash
+# 启动集群
+taosd -c /etc/taos/taos.cfg
+
+# 配置节点
+firstEp: dn1:6030
+secondEp: dn2:6030
+
+# 数据分片
+vgroups: 6
+replica: 3
+
+# 压缩
+compression: 2
+```
+
+---
+
+## 十四、TDengine vs 时序库对比
+
+| 维度 | TDengine | InfluxDB | TimescaleDB |
+|------|----------|----------|-------------|
+| 数据模型 | STable+子表 | measurement | 表 |
+| 查询语言 | SQL | InfluxQL/Flux | SQL |
+| 性能 | 极高 | 高 | 中 |
+| 压缩率 | 极高 | 高 | 中 |
+| 扩展性 | 高 | 中 | 中 |
+| 生态 | 国产 | 丰富 | PostgreSQL |
+
+---
+
+## 十五、TDengine容量规划
+
+### 15.1 容量计算
+
+```text
+存储量 = 数据点数 × 每点大小 × 保留天数 / 压缩率
+
+示例：
+  写入：100万点/秒
+  每点：100字节
+  保留：365天
+  压缩率：1/10
+  
+  存储 = 100万 × 100 × 86400 × 365 / 10 = 315TB
+```
+
+### 15.2 硬件配置建议
+
+| 数据量 | CPU | 内存 | 存储 |
+|--------|-----|------|------|
+| <10万点/秒 | 2核 | 4GB | 100GB |
+| 10-100万点/秒 | 4核 | 8GB | 500GB |
+| 100-1000万点/秒 | 8核 | 16GB | 2TB |
+| >1000万点/秒 | 16+核 | 32+GB | 10+TB |
+
+---
+
+## 十六、TDengine监控与运维
+
+### 16.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 写入延迟 | 写入响应时间 | >100ms |
+| 查询延迟 | 查询响应时间 | >1s |
+| 磁盘使用 | 空间使用率 | >80% |
+| 内存使用 | 内存使用率 | >80% |
+
+### 16.2 运维操作
+
+```bash
+# 集群状态
+taos -s "SHOW DNODES;"
+taos -s "SHOW VGROUPS;"
+
+# 数据管理
+taos -s "COMPACT sensor_data;"
+taos -s "ALTER DATABASE sensor_data KEEP 365;"
+
+# 备份恢复
+taosdump -o /backup -D sensor_data
+taosdump -i /backup
+```
+
+---
+
+## 十七、TDengine最佳实践
+
+### 17.1 数据建模最佳实践
+
+```text
+建模原则：
+  1. 每个设备一张子表
+  2. 标签使用固定值
+  3. 时间戳使用 TIMESTAMP
+  4. 避免过多列（<100）
+  5. 合理设置保留策略
+```
+
+### 17.2 写入最佳实践
+
+```text
+写入优化：
+  1. 批量写入（>100行）
+  2. 避免频繁建表
+  3. 使用参数化SQL
+  4. 合理设置缓存
+  5. 避免热点写入
+```
+
+---
+
+## 十八、TDengine IoT场景实践
+
+### 18.1 IoT数据模型
+
+```sql
+-- 设备管理
+CREATE STABLE devices (
+    ts TIMESTAMP,
+    battery FLOAT,
+    signal INT
+) TAGS (
+    device_id BINARY(64),
+    device_type BINARY(32),
+    location BINARY(64)
+);
+
+-- 数据采集
+CREATE TABLE device_01 USING devices TAGS ('D001', '温度计', '北京');
+CREATE TABLE device_02 USING devices TAGS ('D002', '湿度计', '上海');
+
+-- 数据查询
+SELECT * FROM devices WHERE device_type = '温度计';
+SELECT AVG(battery) FROM devices GROUP BY location;
+```
+
+### 18.2 IoT场景优化
+
+| 优化点 | 方法 | 效果 |
+|--------|------|------|
+| 数据压缩 | 使用二进制类型 | 减少存储 |
+| 查询优化 | 按标签分区 | 提升性能 |
+| 写入优化 | 批量写入 | 提升吞吐 |
+| 保留策略 | 按设备设置 | 节省空间 |
+
 ## 九、与其他板块的关系
 
 - 时序数据库对比见「[时序库对比](./时序库对比.md)」；

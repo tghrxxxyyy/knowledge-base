@@ -1695,6 +1695,401 @@ JMM 内存模型：
 
 ---
 
+## 十五、Java 8→17→21 LTS特性全景
+
+### 15.1 LTS版本特性对比
+
+| 版本 | 关键特性 | 发布时间 | LTS支持 |
+|------|----------|----------|---------|
+| Java 8 | Lambda/Stream/Optional | 2014 | 至2030 |
+| Java 11 | HTTP Client/ZGC | 2018 | 至2032 |
+| Java 17 | Records/Sealed Classes | 2021 | 至2029 |
+| Java 21 | Virtual Threads/Pattern Matching | 2023 | 至2031 |
+
+### 15.2 Java 17新特性
+
+```java
+// 1. Records（不可变数据类）
+public record Point(int x, int y) {}
+public record Range(int start, int end) {
+    public int length() { return end - start; }
+}
+
+// 2. Sealed Classes（密封类）
+public sealed interface Shape 
+    permits Circle, Rectangle, Triangle {}
+public record Circle(double radius) implements Shape {}
+public record Rectangle(double w, double h) implements Shape {}
+public record Triangle(double a, double b, double c) implements Shape {}
+
+// 3. Pattern Matching（模式匹配）
+if (obj instanceof String s) {
+    System.out.println(s.length());
+}
+
+// 4. Switch表达式
+String result = switch (day) {
+    case MONDAY, FRIDAY -> "工作日";
+    case SATURDAY, SUNDAY -> "周末";
+    default -> "其他";
+};
+```
+
+### 15.3 Java 21新特性
+
+```java
+// 1. Virtual Threads（虚拟线程）
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    IntStream.range(0, 10000).forEach(i -> {
+        executor.submit(() -> {
+            Thread.sleep(Duration.ofSeconds(1));
+            return i;
+        });
+    });
+}
+
+// 2. Pattern Matching增强
+switch (obj) {
+    case Integer i when i > 0 -> "正整数";
+    case Integer i -> "非正整数";
+    case String s -> "字符串: " + s;
+    default -> "其他";
+}
+
+// 3. Sequenced Collections
+List<String> list = List.of("a", "b", "c");
+String first = list.getFirst();
+String last = list.getLast();
+
+// 4. Foreign Function & Memory API
+// 安全访问本地内存
+```
+
+---
+
+## 十六、JPMS（Java平台模块系统）
+
+### 16.1 模块系统详解
+
+```java
+// module-info.java
+module com.example.myapp {
+    // 依赖模块
+    requires java.sql;
+    requires java.logging;
+    
+    // 导出包
+    exports com.example.api;
+    
+    // 开放包（反射可访问）
+    opens com.example.model;
+    
+    // 服务提供
+    provides com.example.spi.MyService 
+        with com.example.impl.MyServiceImpl;
+    
+    // 服务使用
+    uses com.example.spi.MyService;
+}
+```
+
+### 16.2 模块系统优势
+
+| 优势 | 说明 | 效果 |
+|------|------|------|
+| 强封装 | 隐藏内部实现 | 安全性提升 |
+| 依赖管理 | 明确模块依赖 | 可维护性提升 |
+| 性能优化 | 模块级优化 | 启动速度提升 |
+| 安全增强 | 最小权限原则 | 安全性提升 |
+
+---
+
+## 17、Java国际化（i18n）
+
+### 17.1 资源文件管理
+
+```properties
+# messages.properties（默认）
+greeting=Hello, {0}!
+farewell=Goodbye, {0}!
+
+# messages_zh.properties（中文）
+greeting=你好, {0}!
+farewell=再见, {0}!
+
+# messages_ja.properties（日语）
+greeting=こんにちは, {0}!
+farewell=さようなら, {0}!
+```
+
+### 17.2 国际化API
+
+```java
+// 使用ResourceBundle
+ResourceBundle bundle = ResourceBundle.getBundle("messages", Locale.CHINA);
+String greeting = bundle.getString("greeting");
+
+// 使用MessageFormat
+String message = MessageFormat.format(greeting, "张三");
+
+// 使用NumberFormat
+NumberFormat nf = NumberFormat.getCurrencyInstance(Locale.CHINA);
+String price = nf.format(1234.56);
+```
+
+---
+
+## 十八、Java序列化机制
+
+### 18.1 序列化方案对比
+
+| 方案 | 性能 | 安全性 | 生态 | 适用场景 |
+|------|------|--------|------|----------|
+| Java原生 | 低 | 低 | 好 | 兼容性 |
+| JSON | 中 | 高 | 好 | 通用 |
+| Protobuf | 高 | 高 | 中 | 高性能 |
+| Kryo | 高 | 低 | 中 | 内部使用 |
+
+### 18.2 序列化最佳实践
+
+```java
+// 1. 使用JSON（推荐）
+public class User {
+    private String name;
+    private int age;
+    // Jackson/Gson序列化
+}
+
+// 2. 使用Protobuf
+// 定义.proto文件
+message User {
+    string name = 1;
+    int32 age = 2;
+}
+
+// 3. 避免Java原生序列化
+// 实现Serializable时指定serialVersionUID
+public class User implements Serializable {
+    private static final long serialVersionUID = 1L;
+}
+```
+
+---
+
+## 十九、Java安全模型（JAAS）
+
+### 19.1 JAAS架构
+
+```mermaid
+flowchart TD
+    A[应用代码] --> B[LoginContext]
+    B --> C[LoginModule]
+    C --> D[Subject]
+    D --> E[Principal]
+    E --> F[权限检查]
+```
+
+### 19.2 权限控制示例
+
+```java
+// 自定义权限
+public class FilePermission extends BasicPermission {
+    public FilePermission(String name) {
+        super(name);
+    }
+}
+
+// 安全策略
+grant codeBase "file:/app/lib/*" {
+    permission FilePermission "/data/*", "read,write";
+    permission java.net.SocketPermission "*:80", "connect";
+};
+```
+
+---
+
+## 二十、Java桌面开发（Swing/JavaFX）
+
+### 20.1 桌面框架对比
+
+| 框架 | 特点 | 适用场景 |
+|------|------|----------|
+| Swing | 老旧但稳定 | 维护项目 |
+| JavaFX | 现代化 | 新项目 |
+| SWT | 原生风格 | Eclipse插件 |
+
+### 20.2 JavaFX示例
+
+```java
+public class App extends Application {
+    @Override
+    public void start(Stage stage) {
+        Label label = new Label("Hello, JavaFX!");
+        Scene scene = new Scene(new StackPane(label), 400, 300);
+        stage.setScene(scene);
+        stage.show();
+    }
+}
+```
+
+---
+
+## 二十一、JMH性能基准测试
+
+### 21.1 JMH使用示例
+
+```java
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+@State(Scope.Benchmark)
+public class MyBenchmark {
+    private String string;
+    
+    @Setup
+    public void setup() {
+        string = "Hello, World!";
+    }
+    
+    @Benchmark
+    public int stringLength() {
+        return string.length();
+    }
+    
+    public static void main(String[] args) throws RunnerException {
+        Options opt = new OptionsBuilder()
+            .include(MyBenchmark.class.getSimpleName())
+            .forks(1)
+            .build();
+        new Runner(opt).run();
+    }
+}
+```
+
+### 21.2 JMH配置对比
+
+| 注解 | 说明 | 用途 |
+|------|------|------|
+| @BenchmarkMode | 测试模式 | 性能指标 |
+| @OutputTimeUnit | 时间单位 | 结果展示 |
+| @State | 状态作用域 | 数据管理 |
+| @Setup | 初始化 | 准备工作 |
+| @Benchmark | 测试方法 | 标记测试 |
+
+---
+
+## 二十二、JMC/JOL诊断工具
+
+### 22.1 JMC（Java Mission Control）
+
+```bash
+# 启动JMC
+jmc
+
+# 飞行记录
+jcmd <pid> JFR.start duration=60s filename=recording.jfr
+```
+
+### 22.2 JOL（Java Object Layout）
+
+```java
+// 查看对象布局
+import org.openjdk.jol.info.ClassLayout;
+System.out.println(ClassLayout.parseClass(User.class).toPrintable());
+
+// 查看对象图
+import org.openjdk.jol.info.GraphLayout;
+System.out.println(GraphLayout.parseInstance(user).toPrintable());
+```
+
+---
+
+## 二十三、Java性能优化最佳实践
+
+### 23.1 性能优化清单
+
+| 优化点 | 方法 | 效果 |
+|--------|------|------|
+| 字符串拼接 | StringBuilder | 减少GC |
+| 集合初始化 | 指定容量 | 减少扩容 |
+| 对象池化 | 连接池 | 减少创建 |
+| 缓存 | Guava/Caffeine | 提升性能 |
+| 异步 | CompletableFuture | 提升吞吐 |
+
+### 23.2 GC选择指南
+
+| GC | 适用场景 | 特点 |
+|----|----------|------|
+| Serial | 小堆 | 简单 |
+| Parallel | 吞吐优先 | 高吞吐 |
+| G1 | 通用 | 平衡 |
+| ZGC | 低延迟 | 亚毫秒 |
+| Shenandoah | 低延迟 | 并发 |
+
+---
+
+## 二十四、虚拟线程（Virtual Threads）详解
+
+### 24.1 虚拟线程 vs 平台线程
+
+| 特性 | 虚拟线程 | 平台线程 |
+|------|----------|----------|
+| 资源消耗 | 极低 | 高 |
+| 创建数量 | 百万级 | 千级 |
+| 切换开销 | 低 | 高 |
+| 阻塞处理 | 自动让出 | 占用线程 |
+| 适用场景 | IO密集 | 通用 |
+
+### 24.2 虚拟线程最佳实践
+
+```java
+// 1. 使用虚拟线程池
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    IntStream.range(0, 100000).forEach(i -> {
+        executor.submit(() -> {
+            Thread.sleep(Duration.ofSeconds(1));
+            return i;
+        });
+    });
+}
+
+// 2. 避免阻塞操作
+// 不推荐
+Thread.sleep(Duration.ofSeconds(1));
+
+// 推荐
+Thread.sleep(Duration.ofSeconds(1));
+
+// 3. 使用StructuredTaskScope（预览）
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Future<String> user = scope.fork(() -> fetchUser());
+    Future<Integer> order = scope.fork(() -> fetchOrder());
+    scope.join();
+    return new Response(user.get(), order.get());
+}
+```
+
+---
+
+## 二十五、Java 21+新特性展望
+
+### 25.1 即将到来的特性
+
+| 版本 | 特性 | 状态 |
+|------|------|------|
+| Java 22 | 语义化变量 | 预览 |
+| Java 23 | 未命名变量 | 预览 |
+| Java 24 | 分代ZGC | 稳定 |
+| Java 25 | 结构化并发 | 预览 |
+
+### 25.2 升级建议
+
+| 版本 | 建议 | 原因 |
+|------|------|------|
+| Java 8→11 | 推荐 | 安全更新 |
+| Java 11→17 | 强烈推荐 | LTS+新特性 |
+| Java 17→21 | 推荐 | 虚拟线程 |
+| Java 21→22+ | 关注 | 新特性预览 |
+
 ## 十四、与其他板块的关系
 
 - 并发编程见「[并发编程](./并发编程.md)」；

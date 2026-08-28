@@ -866,6 +866,370 @@ helm install myminio minio/minio \
 
 ---
 
+## 十、Erasure Coding深度解析
+
+### 10.1 纠删码原理
+
+```text
+纠删码（Erasure Coding）原理：
+  ├── 编码过程：
+  │     ├── 将数据分成N个数据块
+  │     ├── 计算M个校验块
+  │     └── 总共N+M个块
+  ├── 存储分布：
+  │     ├── 数据块分散到不同节点
+  │     ├── 校验块分散到不同节点
+  │     └── 避免单点故障
+  └── 恢复过程：
+        ├── 任意≤M个块丢失可恢复
+        ├── 使用线性代数恢复
+        └── 无需完整数据副本
+```
+
+### 10.2 纠删码配置
+
+```bash
+# MinIO纠删码配置
+# 默认：4数据+2校验（EC:4/2）
+MINIO_STORAGE_CLASS_STANDARD="EC:4"
+
+# 高可用配置：8数据+4校验（EC:8/4）
+MINIO_STORAGE_CLASS_ARCHIVE="EC:8"
+
+# 查看纠删码状态
+mc admin info myminio
+```
+
+### 10.3 纠删码 vs 副本对比
+
+| 维度 | 纠删码 | 三副本 |
+|------|--------|--------|
+| 存储效率 | 高（50-70%） | 低（33%） |
+| 容错能力 | 高（M个故障） | 低（1个故障） |
+| 性能 | 中 | 高 |
+| 复杂度 | 高 | 低 |
+| 适用场景 | 大容量 | 高性能 |
+
+---
+
+## 十一、多站点复制详解
+
+### 11.1 复制架构
+
+```mermaid
+flowchart TD
+    subgraph 主站点
+        A[MinIO主集群]
+    end
+    
+    subgraph 从站点
+        B[MinIO从集群1]
+        C[MinIO从集群2]
+    end
+    
+    A -->|异步复制| B
+    A -->|异步复制| C
+    B -->|同步复制| C
+```
+
+### 11.2 复制配置
+
+```bash
+# 配置站点复制
+mc admin replicate add myminio myminio-dr
+
+# 查看复制状态
+mc admin replicate status myminio
+
+# 配置规则
+mc admin replicate add myminio myminio-dr \
+    --replicate "delete,delete-marker" \
+    --bandwidth "100MB/s" \
+    --health-check "30s"
+```
+
+### 11.3 复制策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 同步复制 | 实时同步 | 强一致 |
+| 异步复制 | 延迟同步 | 高性能 |
+| 批量复制 | 定时同步 | 低频更新 |
+
+---
+
+## 十二、生命周期管理详解
+
+### 12.1 生命周期规则
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "transition-to-warm",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "logs/"
+      },
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
+      }
+    }
+  ]
+}
+```
+
+### 12.2 生命周期策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 过期删除 | 自动删除旧数据 | 日志清理 |
+| 过期过渡 | 自动降级存储 | 成本优化 |
+| 版本控制 | 保留历史版本 | 数据保护 |
+| 清理不完整 | 清理未完成上传 | 空间回收 |
+
+---
+
+## 十三、安全加固详解
+
+### 13.1 安全配置
+
+```bash
+# 1. 启用HTTPS
+MINIO_CERT_FILE=/path/to/cert.pem
+MINIO_KEY_FILE=/path/to/key.pem
+
+# 2. 配置访问策略
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": ["arn:aws:iam::user/example"]},
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+
+# 3. 启用审计日志
+MINIO_AUDIT_ENABLE=on
+MINIO_AUDIT_TARGETS=file:///var/log/minio/audit.log
+```
+
+### 13.2 安全特性对比
+
+| 特性 | MinIO | S3 | OSS |
+|------|-------|-----|-----|
+| HTTPS | 支持 | 支持 | 支持 |
+| 加密 | SSE-S3/SSE-KMS | SSE-S3/SSE-KMS | SSE |
+| 访问策略 | IAM | IAM | RAM |
+| 审计日志 | 支持 | 支持 | 支持 |
+| VPC | 支持 | 支持 | 支持 |
+
+---
+
+## 十四、性能调优详解
+
+### 14.1 写入优化
+
+```bash
+# 1. 批量写入
+mc cp --recursive /data/files myminio/mybucket/
+
+# 2. 并行上传
+mc cp --parallel 16 /data/file myminio/mybucket/
+
+# 3. 使用分片上传
+mc cp --part-size 64MB /data/largefile myminio/mybucket/
+
+# 4. 调整网络参数
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+```
+
+### 14.2 读取优化
+
+```bash
+# 1. 使用范围请求
+mc cat --offset 0 --length 1024 myminio/mybucket/file
+
+# 2. 启用缓存
+export MINIO_CACHE_DRIVES="/mnt/ssd1,/mnt/ssd2"
+export MINIO_CACHE_QUOTA=80
+
+# 3. 使用CDN
+mc anonymous set download myminio/mybucket/public/
+```
+
+### 14.3 性能指标对比
+
+| 操作 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 顺序写 | 100MB/s | 500MB/s | 5x |
+| 顺序读 | 100MB/s | 1GB/s | 10x |
+| 随机读 | 1000 IOPS | 10000 IOPS | 10x |
+| 并发上传 | 10MB/s | 100MB/s | 10x |
+
+---
+
+## 十五、监控与告警详解
+
+### 15.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| minio_disk_available_bytes | 磁盘可用空间 | <20% |
+| minio_s3_requests_total | S3请求数 | 下降50% |
+| minio_s3_request_duration_seconds | 请求延迟 | >1s |
+| minio_cluster_nodes_online | 节点在线数 | <预期 |
+
+### 15.2 Prometheus配置
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'minio'
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ['minio1:9000', 'minio2:9000']
+
+# 告警规则
+groups:
+  - name: minio_alerts
+    rules:
+      - alert: MinIODiskLow
+        expr: minio_disk_available_bytes / minio_disk_total_bytes < 0.2
+        for: 5m
+        labels:
+          severity: warning
+```
+
+---
+
+## 十六、大数据集成详解
+
+### 16.1 集成架构
+
+```text
+MinIO + 大数据生态：
+  ├── Spark
+  │     ├── 直接读取S3兼容API
+  │     ├── 使用Hadoop兼容层
+  │     └── 支持Parquet/ORC
+  ├── Hive
+  │     ├── 外部表直接读取
+  │     ├── 分区表支持
+  │     └── ACID事务支持
+  ├── Flink
+  │     ├── 流式读写
+  │     ├── 检查点支持
+  │     └── 增量处理
+  └── Presto/Trino
+        ├── 联邦查询
+        ├── 跨源分析
+        └── 性能优化
+```
+
+### 16.2 集成配置
+
+```scala
+// Spark配置
+spark.conf.set("fs.s3a.endpoint", "http://minio:9000")
+spark.conf.set("fs.s3a.access.key", "minioadmin")
+spark.conf.set("fs.s3a.secret.key", "minioadmin")
+spark.conf.set("fs.s3a.path.style.access", "true")
+
+// 读取数据
+val df = spark.read.parquet("s3a://mybucket/data/")
+
+// 写入数据
+df.write.parquet("s3a://mybucket/output/")
+```
+
+---
+
+## 十七、S3兼容性对比
+
+### 17.1 S3 API兼容性
+
+| API | MinIO | S3 | OSS |
+|-----|-------|-----|-----|
+| PutObject | 支持 | 支持 | 支持 |
+| GetObject | 支持 | 支持 | 支持 |
+| DeleteObject | 支持 | 支持 | 支持 |
+| ListObjects | 支持 | 支持 | 支持 |
+| MultipartUpload | 支持 | 支持 | 支持 |
+| PresignedURL | 支持 | 支持 | 支持 |
+
+### 17.2 功能对比
+
+| 功能 | MinIO | S3 | OSS |
+|------|-------|-----|-----|
+| 版本控制 | 支持 | 支持 | 支持 |
+| 生命周期 | 支持 | 支持 | 支持 |
+| 跨区域复制 | 支持 | 支持 | 支持 |
+| 事件通知 | 支持 | 支持 | 支持 |
+| 加密 | 支持 | 支持 | 支持 |
+
+---
+
+## 十八、运维最佳实践
+
+### 18.1 日常运维操作
+
+```bash
+# 健康检查
+mc admin info myminio
+
+# 磁盘检查
+mc admin scanner status myminio
+
+# 数据修复
+mc admin heal -r myminio/mybucket
+
+# 备份配置
+mc mirror myminio/mybucket /backup/
+```
+
+### 18.2 运维监控指标
+
+| 指标 | 说明 | 健康范围 |
+|------|------|----------|
+| 磁盘使用率 | 空间使用 | <80% |
+| 节点状态 | 在线状态 | 全部在线 |
+| 请求延迟 | 响应时间 | <100ms |
+| 错误率 | 请求错误 | <1% |
+
+---
+
+## 十九、对象存储对比矩阵
+
+| 维度 | MinIO | S3 | OSS | Ceph |
+|------|-------|-----|-----|------|
+| 部署方式 | 自建 | 托管 | 托管 | 自建 |
+| 成本 | 低 | 中 | 中 | 高 |
+| 性能 | 高 | 高 | 高 | 高 |
+| 扩展性 | 高 | 高 | 高 | 高 |
+| 生态 | 中 | 丰富 | 丰富 | 丰富 |
+| 复杂度 | 低 | 低 | 低 | 高 |
+
+### 选型建议
+
+| 场景 | 推荐方案 | 原因 |
+|------|----------|------|
+| 成本敏感 | MinIO | 自建成本低 |
+| 全托管 | S3/OSS | 运维简单 |
+| 数据主权 | MinIO | 自建可控 |
+| 高性能 | MinIO | 本地部署 |
+| 混合云 | MinIO | 一致性体验 |
+
 ## 九、与其他板块的关系（扩展）
 
 - 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。

@@ -1699,3 +1699,217 @@ groups:
     内存 = 100万series × 4KB = 4GB
     CPU = 10万 / 10万 = 1核
 ```
+
+---
+
+## 十九、InfluxDB连续查询与任务详解
+
+### 19.1 连续查询（CQ）vs 任务（Task）
+
+| 特性 | 连续查询 | 任务 |
+|------|----------|------|
+| 版本 | InfluxDB 1.x | InfluxDB 2.x |
+| 语言 | InfluxQL | Flux |
+| 灵活性 | 低 | 高 |
+| 聚合 | 支持 | 支持 |
+| 转换 | 不支持 | 支持 |
+| 复杂度 | 简单 | 中等 |
+
+### 19.2 连续查询示例
+
+```sql
+-- 每小时聚合一次
+CREATE CONTINUOUS QUERY "cq_1h" ON "mydb"
+BEGIN
+  SELECT mean("value") INTO "average_1h"
+  FROM "cpu"
+  GROUP BY time(1h), "host"
+END
+
+-- 降采样到每天
+CREATE CONTINUOUS QUERY "cq_1d" ON "mydb"
+BEGIN
+  SELECT mean("value") INTO "average_1d"
+  FROM "cpu"
+  GROUP BY time(1d)
+END
+```
+
+### 19.3 Flux任务示例
+
+```flux
+// 每小时聚合任务
+option task = {name: "hourly_aggregate", every: 1h}
+
+from(bucket: "mydb")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> aggregateWindow(every: 1h, fn: mean)
+  |> to(bucket: "mydb", org: "myorg")
+```
+
+---
+
+## 二十、InfluxDB高可用架构
+
+### 20.1 InfluxDB Enterprise集群
+
+```text
+InfluxDB Enterprise架构：
+  ├── 数据节点（3+）
+  │     ├── 接收写入
+  │     ├── 处理查询
+  │     └── 数据分片
+  ├── 元数据节点（3）
+  │     ├── 集群管理
+  │     ├── 元数据存储
+  │     └── 负载均衡
+  └── 客户端
+        ├── 直连数据节点
+        └── 负载均衡
+
+数据复制：
+  ├── 副本因子（Replication Factor）
+  ├── 默认为1（单副本）
+  ├── 生产建议：3（三副本）
+  └── 跨数据中心复制
+```
+
+### 20.2 高可用方案对比
+
+| 方案 | 一致性 | 性能 | 成本 | 适用场景 |
+|------|--------|------|------|----------|
+| 单节点 | N/A | 高 | 低 | 开发测试 |
+| 副本因子3 | 强 | 中 | 中 | 生产环境 |
+| 多数据中心 | 最终一致 | 低 | 高 | 灾备 |
+
+---
+
+## 二十一、InfluxDB性能优化
+
+### 21.1 写入优化
+
+```text
+写入优化策略：
+  1. 批量写入：
+     ├── 使用line protocol批量写入
+     ├── 批量大小：1000-5000点
+     └── 减少网络开销
+
+  2. Tag设计：
+     ├── Tag基数低（<1000唯一值）
+     ├── 避免高基数Tag
+     └── 合理使用Tag分组
+
+  3. 字段设计：
+     ├── 避免过多字段
+     ├── 合理数据类型
+     └── 压缩存储
+
+  4. 保留策略：
+     ├── 设置合理保留期
+     ├── 自动清理旧数据
+     └── 减少存储压力
+```
+
+### 21.2 查询优化
+
+```text
+查询优化策略：
+  1. 使用Tag过滤：
+     ├── Tag有索引
+     ├── 字段无索引
+     └── 优先Tag过滤
+
+  2. 时间范围：
+     ├── 限制查询时间范围
+     ├── 使用GROUP BY time()
+     └── 避免全量扫描
+
+  3. 聚合查询：
+     ├── 使用CQ预聚合
+     ├── 避免COUNT(*)
+     └── 使用exact_count等
+
+  4. 索引优化：
+     ├── 合理设置TSM缓存
+     ├── 调整WAL配置
+     └── 监控索引大小
+```
+
+---
+
+## 二十二、InfluxDB vs 时序库对比
+
+| 维度 | InfluxDB | Prometheus | TimescaleDB |
+|------|----------|------------|-------------|
+| 数据模型 | measurement | metric | 表 |
+| 查询语言 | InfluxQL/Flux | PromQL | SQL |
+| 聚合 | CQ/Task | Recording Rule | Continuous Aggregate |
+| 高可用 | Enterprise | 联邦 | 主从复制 |
+| 存储引擎 | TSM | 本地存储 | PostgreSQL |
+| 生态 | TICK | Cloud Native | PostgreSQL |
+
+---
+
+## 二十三、InfluxDB容量规划
+
+### 23.1 容量计算公式
+
+```text
+存储量 = 数据点数 × 每点大小 × 保留天数
+内存 = 唯一series数 × 每series内存
+CPU = 写入QPS / 单核处理能力
+
+示例：
+  写入：10万点/秒
+  每点：100字节
+  保留：30天
+  
+  存储 = 10万 × 100 × 86400 × 30 = 25.9TB
+  内存 = 100万series × 4KB = 4GB
+  CPU = 10万 / 10万 = 1核
+```
+
+### 23.2 硬件配置建议
+
+| 数据量 | CPU | 内存 | 存储 |
+|--------|-----|------|------|
+| <1万点/秒 | 2核 | 4GB | 100GB |
+| 1-10万点/秒 | 4核 | 8GB | 500GB |
+| 10-100万点/秒 | 8核 | 16GB | 2TB |
+| >100万点/秒 | 16+核 | 32+GB | 10+TB |
+
+---
+
+## 二十四、InfluxDB监控与告警
+
+### 24.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| influxdb_write_points_total | 写入点数 | 下降50% |
+| influxdb_query_duration_seconds | 查询延迟 | >1s |
+| influxdb_tsm_cache_size_bytes | 缓存大小 | >1GB |
+| influxdb_disk_bytes | 磁盘使用 | >80% |
+
+### 24.2 告警配置
+
+```yaml
+# Prometheus监控InfluxDB
+scrape_configs:
+  - job_name: 'influxdb'
+    static_configs:
+      - targets: ['influxdb:8086']
+    metrics_path: /metrics
+
+# 告警规则
+groups:
+  - name: influxdb_alerts
+    rules:
+      - alert: InfluxDBWriteDown
+        expr: rate(influxdb_write_points_total[5m]) < 1000
+        for: 5m
+        labels:
+          severity: warning
+```

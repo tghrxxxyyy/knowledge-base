@@ -1704,3 +1704,226 @@ alerting:
         summary: "设备 {{ $labels.device_id }} 温度过高"
         description: "设备 {{ $labels.device_id }} 当前温度 {{ $value }}°C"
 ```
+
+---
+
+## 十九、TimescaleDB连续聚合详解
+
+### 19.1 连续聚合（Continuous Aggregate）
+
+```sql
+-- 创建连续聚合
+CREATE MATERIALIZED VIEW device_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    device_id,
+    AVG(temperature) AS avg_temp,
+    MAX(temperature) AS max_temp,
+    MIN(temperature) AS min_temp,
+    COUNT(*) AS sample_count
+FROM device_data
+GROUP BY bucket, device_id;
+
+-- 自动刷新策略
+SELECT add_continuous_aggregate_policy('device_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour'
+);
+```
+
+### 19.2 连续聚合 vs 普通视图
+
+| 特性 | 连续聚合 | 普通视图 | 手动聚合表 |
+|------|----------|----------|------------|
+| 数据存储 | 物化 | 不存储 | 存储 |
+| 自动更新 | 支持 | 不支持 | 不支持 |
+| 查询性能 | 高 | 低 | 高 |
+| 存储成本 | 中 | 无 | 高 |
+| 数据新鲜度 | 分钟级 | 实时 | 手动 |
+
+---
+
+## 二十、TimescaleDB压缩策略详解
+
+### 20.1 压缩策略配置
+
+```sql
+-- 启用压缩
+ALTER TABLE device_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+
+-- 设置自动压缩策略
+SELECT add_compression_policy('device_data', INTERVAL '7 days');
+
+-- 手动压缩
+SELECT compress_chunk(c FROM device_data WHERE time < now() - INTERVAL '7 days');
+```
+
+### 20.2 压缩效果对比
+
+| 数据量 | 压缩前 | 压缩后 | 压缩率 |
+|--------|--------|--------|--------|
+| 1亿行 | 10GB | 1GB | 90% |
+| 10亿行 | 100GB | 8GB | 92% |
+| 100亿行 | 1TB | 70GB | 93% |
+
+---
+
+## 二十一、TimescaleDB多节点部署
+
+### 21.1 多节点架构
+
+```text
+TimescaleDB多节点架构：
+  ├── 数据节点（Data Node）
+  │     ├── 存储分片数据
+  │     ├── 处理本地查询
+  │     └── 执行分布式查询
+  ├── 访问节点（Access Node）
+  │     ├── 接收客户端连接
+  │     ├── 路由查询到数据节点
+  │     └── 聚合结果返回
+  └── 分布式 hypertable
+        ├── 自动分片
+        ├── 透明路由
+        └── 跨节点查询
+```
+
+### 21.2 多节点部署步骤
+
+```sql
+-- 1. 添加数据节点
+SELECT add_data_node('data_node_1', host => '192.168.1.101');
+SELECT add_data_node('data_node_2', host => '192.168.1.102');
+
+-- 2. 创建分布式hypertable
+CREATE TABLE device_data (
+    time TIMESTAMPTZ NOT NULL,
+    device_id INT NOT NULL,
+    temperature DOUBLE PRECISION
+);
+SELECT create_distributed_hypertable('device_data', 'time');
+
+-- 3. 设置复制因子
+ALTER TABLE device_data SET (
+    timescaledb.replication_factor = 2
+);
+```
+
+---
+
+## 二十二、TimescaleDB性能调优
+
+### 22.1 查询优化
+
+```sql
+-- 1. 使用时间分桶聚合
+SELECT time_bucket('1 hour', time) AS bucket,
+       AVG(temperature) AS avg_temp
+FROM device_data
+WHERE time > now() - INTERVAL '24 hours'
+GROUP BY bucket;
+
+-- 2. 使用连续聚合预计算
+CREATE MATERIALIZED VIEW device_hourly
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket,
+       device_id,
+       AVG(temperature) AS avg_temp
+FROM device_data
+GROUP BY bucket, device_id;
+
+-- 3. 使用索引优化
+CREATE INDEX idx_device_time ON device_data (device_id, time DESC);
+```
+
+### 22.2 性能指标监控
+
+| 指标 | 说明 | 健康范围 |
+|------|------|----------|
+| 查询延迟 | 平均查询时间 | <100ms |
+| 写入吞吐 | 每秒写入行数 | >10万 |
+| 压缩率 | 压缩前后比 | >90% |
+| 缓存命中率 | 缓存使用率 | >90% |
+
+---
+
+## 二十三、TimescaleDB vs PostgreSQL对比
+
+| 维度 | TimescaleDB | PostgreSQL |
+|------|-------------|------------|
+| 数据模型 | hypertable | 表 |
+| 时间分区 | 自动 | 手动 |
+| 压缩 | 内置 | 需要扩展 |
+| 连续聚合 | 内置 | 需要pg_cron |
+| 性能 | 高 | 中 |
+| 扩展性 | 高 | 中 |
+| 兼容性 | 100% | 原生 |
+
+---
+
+## 二十四、TimescaleDB容量规划
+
+### 24.1 容量计算
+
+```text
+存储量 = 数据点数 × 每点大小 × 保留天数
+压缩后 = 存储量 × (1 - 压缩率)
+
+示例：
+  写入：10万点/秒
+  每点：100字节
+  保留：30天
+  压缩率：90%
+  
+  原始存储 = 10万 × 100 × 86400 × 30 = 25.9TB
+  压缩后 = 25.9TB × 0.1 = 2.59TB
+```
+
+### 24.2 硬件配置建议
+
+| 数据量 | CPU | 内存 | 存储 |
+|--------|-----|------|------|
+| <1万点/秒 | 2核 | 4GB | 100GB |
+| 1-10万点/秒 | 4核 | 8GB | 500GB |
+| 10-100万点/秒 | 8核 | 16GB | 2TB |
+| >100万点/秒 | 16+核 | 32+GB | 10+TB |
+
+---
+
+## 二十五、TimescaleDB监控与告警
+
+### 25.1 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| timescaledb_num_chunks | 分片数量 | >1000 |
+| timescaledb_compression_ratio | 压缩率 | <0.5 |
+| timescaledb_cache_hit_rate | 缓存命中率 | <0.9 |
+| pg_stat_user_tables_n_tup_ins | 写入行数 | 下降50% |
+
+### 25.2 告警配置
+
+```yaml
+# Prometheus监控TimescaleDB
+scrape_configs:
+  - job_name: 'timescaledb'
+    static_configs:
+      - targets: ['timescaledb:5432']
+    metrics_path: /metrics
+
+# 告警规则
+groups:
+  - name: timescaledb_alerts
+    rules:
+      - alert: TimescaleDBWriteDown
+        expr: rate(pg_stat_user_tables_n_tup_ins[5m]) < 1000
+        for: 5m
+        labels:
+          severity: warning
+```

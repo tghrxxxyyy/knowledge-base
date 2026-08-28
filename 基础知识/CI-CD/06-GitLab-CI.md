@@ -1700,6 +1700,263 @@ optimization:
 
 > 核心原则：**变量安全，Runner选型合适，Auto DevOps自动化，Pages文档托管，Registry镜像管理，性能持续优化**。
 
+## GitLab CI 缓存深度策略（依赖缓存/构建缓存）
+
+### 缓存类型对比
+
+| 缓存类型 | 用途 | 存储位置 | 生命周期 | 典型场景 |
+|----------|------|----------|----------|----------|
+| 依赖缓存 | node_modules/.m2/vendor | Runner 共享目录/S3 | 跨流水线 | npm install/maven build |
+| 构建缓存 | 编译中间产物 | Runner 共享目录 | 跨流水线 | Docker 层缓存 |
+| 分支隔离缓存 | 分支独立的依赖 | 按 key 隔离 | 跨流水线 | 多分支并行开发 |
+| 文件哈希缓存 | 按依赖文件变更触发 | 按文件内容 hash | 依赖变更时失效 | 精确缓存失效 |
+
+```yaml
+# 依赖缓存：按文件哈希精确失效
+cache:
+  key:
+    files:
+      - pom.xml              # Maven 依赖变更才重建
+      - build.gradle.kts     # Gradle 依赖变更才重建
+  paths:
+    - .m2/repository/
+  policy: pull-push
+
+# 构建缓存：Docker 层缓存
+docker_build:
+  stage: build
+  image: docker:24
+  services: [docker:24-dind]
+  variables:
+    DOCKER_BUILDKIT: "1"
+  cache:
+    - key: docker-layers-${CI_COMMIT_REF_SLUG}
+      paths:
+        - .docker-cache/
+      policy: pull-push
+  script:
+    - docker build --cache-from=$CI_REGISTRY_IMAGE:latest --cache-from=.docker-cache/ -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+# 分支隔离缓存：不同分支独立缓存空间
+cache:
+  key: ${CI_COMMIT_REF_SLUG}     # 分支名作为 key 前缀
+  paths:
+    - node_modules/
+    - dist/
+  policy: pull-push
+```
+
+### 缓存配置最佳实践
+
+| 实践 | 说明 | 效果 |
+|------|------|------|
+| 文件哈希失效 | `key.files` 指定依赖文件 | 依赖不变不重建缓存 |
+| 分支隔离 | `key: $CI_COMMIT_REF_SLUG` | 避免跨分支污染 |
+| policy 分离 | pull/pull-push 精确控制 | 减少不必要的上传 |
+| S3 共享后端 | `cache.type=s3` 配置 S3 | 多 Runner 共享缓存 |
+| 缓存监控 | 监控缓存命中率 | 优化缓存策略 |
+
+```toml
+# Runner 配置：S3 共享缓存
+[[runners.cache]]
+  Type = "s3"
+  Shared = true
+  [runners.cache.s3]
+    BucketName = "gitlab-cache"
+    BucketLocation = "us-east-1"
+    Insecure = false
+```
+
+## GitLab CI Include 模板复用（multi-project/remote）
+
+### Include 类型对比
+
+| Include 类型 | 语法 | 适用场景 | 示例 |
+|-------------|------|----------|------|
+| local | `include: local` | 本仓库模板文件 | `include: templates/docker.yml` |
+| remote | `include: remote` | 远程仓库模板 | `include: https://gitlab.com/group/-/raw/main/templates/docker.yml` |
+| project | `include: project` | 其他项目模板 | `include: project: 'mygroup/ci-templates'` |
+| template | `include: template` | GitLab 官方模板 | `include: template: Security/SAST.gitlab-ci.yml` |
+| component | `include: component` | 可复用组件 | `include: component: gitlab.com/group/template` |
+| 多源组合 | 多个 include 堆叠 | 复杂场景 | 同时引入多个模板 |
+
+```yaml
+# 多项目模板复用
+include:
+  # 1. 引用其他项目的 Docker 构建模板
+  - project: 'devops/ci-templates'
+    ref: 'main'
+    file: '/templates/docker-build.yml'
+  
+  # 2. 引用远程仓库的安全扫描模板
+  - remote: 'https://gitlab.com/security-templates/-/raw/main/sast.yml'
+  
+  # 3. 引用 GitLab 官方模板
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  
+  # 4. 本地模板
+  - local: '.gitlab/ci/templates/deploy.yml'
+
+# 覆盖模板变量
+variables:
+  DOCKER_REGISTRY: "registry.example.com"
+  K8S_NAMESPACE: "production"
+
+# 继承模板 job 并自定义
+deploy:
+  extends: .deploy-template        # 继承模板中的 .deploy-template
+  variables:
+    K8S_NAMESPACE: "staging"       # 覆盖变量
+```
+
+### Include 模板设计最佳实践
+
+| 实践 | 说明 | 示例 |
+|------|------|------|
+| 模板目录集中 | 统一放在 `templates/` 目录 | `templates/docker.yml` |
+| 版本锁定 | 使用 tag/ref 锁定模板版本 | `ref: 'v1.2.3'` |
+| 变量覆盖 | 通过 variables 覆盖模板参数 | `variables: { IMAGE_TAG: 'latest' }` |
+| extends 继承 | 用 extends 复用 job 定义 | `extends: .template-job` |
+| hidden job | 用 `.` 前缀定义可复用 job | `.build-template: { ... }` |
+
+```yaml
+# 隐藏 job 模板设计
+.build-template:
+  image: maven:3.9-eclipse-temurin-21
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths: [.m2/repository/]
+  before_script:
+    - echo "Building $CI_PROJECT_NAME..."
+
+build_java:
+  extends: .build-template
+  stage: build
+  script: mvn package -DskipTests
+
+build_java_prod:
+  extends: .build-template
+  stage: build
+  script: mvn package -DskipTests -Pprod
+```
+
+## GitLab CI vs GitHub Actions 深度对比
+
+| 维度 | GitLab CI | GitHub Actions |
+|------|-----------|----------------|
+| 配置文件 | `.gitlab-ci.yml` | `.github/workflows/*.yml` |
+| 触发机制 | push/MR/tag/schedule/trigger | push/MR/tag/schedule/workflow_dispatch |
+| Runner/Runner | 自建 Runner（docker/k8s/shell） | 托管 Runner（ubuntu/windows/mac） |
+| 缓存 | Runner 共享目录/S3 | GitHub Actions Cache（跨 workflow） |
+| 制品 | Artifacts + Package Registry | Artifacts + GitHub Packages |
+| 安全扫描 | 官方模板（SAST/DAST/依赖扫描） | CodeQL + 第三方 Action |
+| 环境/审批 | Environments + manual job | Environments + manual review |
+| OIDC | id_tokens（JWT） | OIDC（Workload Identity） |
+| 私有 Runner | 自建 Runner（灵活） | 自托管 Runner（需配置） |
+| 生态集成 | GitLab 全家桶（代码/CI/安全/Registry） | GitHub 生态（代码/Actions/Packages） |
+| 定价 | 自托管免费/Cloud 按用量 | 免费额度/按分钟计费 |
+| YAML 语法 | 自有语法（rules/needs/stages） | 自有语法（jobs/steps/matrix） |
+
+```yaml
+# GitLab CI：矩阵构建
+build:
+  stage: build
+  parallel:
+    matrix:
+      - PLATFORM: [linux, macos, windows]
+        NODE_VERSION: [18, 20]
+  script:
+    - echo "Building on $PLATFORM with Node $NODE_VERSION"
+
+# GitHub Actions：矩阵构建（对比）
+# strategy:
+#   matrix:
+#     platform: [ubuntu-latest, macos-latest, windows-latest]
+#     node-version: [18, 20]
+```
+
+### 功能矩阵对比
+
+| 功能 | GitLab CI | GitHub Actions | 差异 |
+|------|-----------|----------------|------|
+| DAG 调度 | `needs` 关键字 | `needs` + `if` 条件 | 语法不同，能力相似 |
+| 条件执行 | `rules` | `if` + `jobs.*.if` | GitLab 更灵活 |
+| 矩阵构建 | `parallel.matrix` | `strategy.matrix` | 类似 |
+| 环境变量 | `variables` + 后台配置 | `env` + repository secrets | 类似 |
+| 缓存策略 | `cache`（S3/共享目录） | `actions/cache`（GitHub Cache） | GitLab 更灵活 |
+| 多项目触发 | `trigger: project` | `repository_dispatch` | GitLab 原生支持 |
+| 审批门控 | `when: manual` | `environment: review` | 类似 |
+| 安全扫描 | 官方模板一键启用 | CodeQL + 第三方 | GitLab 更集成 |
+| 私有 Runner | 原生支持 | 自托管 Runner | 类似 |
+
+## GitLab CI 安全扫描深入（SAST/DAST/依赖扫描）
+
+### 五大扫描能力详解
+
+| 扫描类型 | 工具 | 检测对象 | 配置要点 | 阶段 |
+|----------|------|----------|----------|------|
+| SAST | Semgrep/SonarQube | 源码安全漏洞（SQLi/XSS） | `SAST_EXCLUDED_PATHS` 排除路径 | build/test |
+| DAST | OWASP ZAP | 运行中应用漏洞 | 配置目标 URL + 认证 | deploy 后 |
+| 依赖扫描 | Trivy/Snyk | 依赖库 CVE | `DS_EXCLUDE_ANALYZERS` 排除 | test |
+| 密钥检测 | TruffleHog/GitLeaks | 提交中的密钥/Token | 自定义规则 | test |
+| 容器扫描 | Trivy/Grype | 镜像层 CVE | `CONTAINER_SCANNING_DISABLED` | build |
+
+```yaml
+# 完整安全扫描配置
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+  - template: Security/DAST.gitlab-ci.yml
+
+# SAST 配置
+sast:
+  stage: test
+  variables:
+    SAST_EXCLUDED_PATHS: "vendor/,node_modules/,tests/"
+    SAST_SEMGREP_RULES: "p/security-audit p/owasp-top-ten"
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    paths: [gl-sast-report.json]
+
+# DAST 配置
+dast:
+  stage: deploy
+  variables:
+    DAST_TARGET_URL: "https://staging.example.com"
+    DAST_AUTH_URL: "https://staging.example.com/login"
+    DAST_USERNAME: "admin"
+    DAST_PASSWORD: "$DAST_PASSWORD"
+    DAST_EXCLUDED_RULES: "10021,10022"
+  artifacts:
+    reports:
+      dast: gl-dast-report.json
+
+# 依赖扫描配置
+dependency_scanning:
+  stage: test
+  variables:
+    DS_EXCLUDE_ANALYZERS: "bundler-audit"
+    DS_EXCLUDE_PATHS: "vendor/,node_modules/"
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+```
+
+### 安全扫描最佳实践
+
+| 实践 | 说明 | 效果 |
+|------|------|------|
+| 扫描阶段前置 | SAST/密钥检测放 test 阶段 | 尽早发现问题 |
+| 排除路径 | `SAST_EXCLUDED_PATHS` 排除测试/vendor | 减少误报 |
+| 阻断流水线 | `sast: fail_on_severity: high` | 高危漏洞阻止合并 |
+| 扫描报告归档 | `artifacts: reports` 收集报告 | 安全审计 |
+| 定期扫描 | scheduled pipeline 定期全量扫描 | 持续安全 |
+
 ## 本篇补充 Checklist
 
 - [ ] 大仓/多服务用 parent-child `trigger`+`include`+`changes` 拆分。

@@ -1694,6 +1694,236 @@ agent:
 
 ---
 
+## 二十三、OAP集群高可用部署
+
+### 23.1 OAP集群架构
+
+```mermaid
+flowchart TD
+    subgraph OAP集群
+        A[OAP Node1] --> B[OAP Node2]
+        B --> C[OAP Node3]
+    end
+    
+    subgraph 存储层
+        A --> D[Elasticsearch]
+        B --> D
+        C --> D
+    end
+    
+    subgraph 采集层
+        E[Agent1] --> A
+        F[Agent2] --> B
+        G[Agent3] --> C
+    end
+```
+
+### 23.2 集群配置
+
+```yaml
+# OAP集群配置
+cluster:
+  standalone: false
+  selector: ${SW_CLUSTER:standalone}
+  
+  # ZooKeeper集群
+  zookeeper:
+    nameSpace: /skywalking
+    hostPort: zk1:2181,zk2:2181,zk3:2181
+    
+  # Kubernetes集群
+  kubernetes:
+    namespace: skywalking
+    labelSelector: name=skywalking-oap
+    
+  # Nacos集群
+  nacos:
+    serverAddr: nacos1:8848,nacos2:8848,nacos3:8848
+```
+
+---
+
+## 二十四、链路分析与告警
+
+### 24.1 链路分析功能
+
+| 功能 | 说明 | 用途 |
+|------|------|------|
+| 全链路拓扑 | 服务依赖关系 | 架构分析 |
+| 慢查询分析 | 响应时间分布 | 性能优化 |
+| 异常链路 | 错误追踪 | 问题定位 |
+| 链路对比 | 版本对比 | 变更影响 |
+
+### 24.2 告警规则配置
+
+```yaml
+# 告警规则
+rules:
+  - name: HighResponseTime
+    metrics: service_resp_time
+    op: ">"
+    threshold: 1000
+    period: 5
+    count: 3
+    
+  - name: HighErrorRate
+    metrics: service_sla
+    op: "<"
+    threshold: 99
+    period: 5
+    count: 3
+```
+
+---
+
+## 二十五、日志与链路关联
+
+### 25.1 日志关联原理
+
+```text
+日志-链路关联：
+  1. TraceID注入：
+     ├── Agent自动注入TraceID到日志
+     ├── 日志格式包含TraceID
+     └── 通过TraceID关联链路
+
+  2. 日志查询：
+     ├── 根据TraceID查询完整链路
+     ├── 查看链路中各服务日志
+     └── 定位问题根源
+
+  3. 日志告警：
+     ├── 日志异常触发告警
+     ├── 自动关联相关链路
+     └── 提供完整上下文
+```
+
+### 25.2 日志配置示例
+
+```yaml
+# 日志配置
+log4j2:
+  properties:
+    pattern: "%d{yyyy-MM-dd HH:mm:ss} [%t] [%X{tid}] %-5level %logger{36} - %msg%n"
+
+# Logback配置
+<encoder>
+    <pattern>%d{HH:mm:ss.SSS} [%thread] [%X{tid}] %-5level %logger{36} - %msg%n</pattern>
+</encoder>
+```
+
+---
+
+## 二十六、SkyWalking与Istio集成
+
+### 26.1 集成架构
+
+```text
+SkyWalking + Istio架构：
+  ├── Istio数据面
+  │     ├── Envoy代理（自动注入Trace）
+  │     └── Sidecar采集指标
+  ├── SkyWalking控制面
+  │     ├── OAP接收Envoy数据
+  │     ├── 分析Trace/Metrics
+  │     └── 提供UI/API
+  └── 存储层
+        └── Elasticsearch/H2
+```
+
+### 26.2 集成配置
+
+```yaml
+# Istio Telemetry配置
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: skywalking
+      randomSamplingPercentage: 100
+```
+
+---
+
+## 二十七、SkyWalking Agent性能优化
+
+### 27.1 Agent配置优化
+
+```yaml
+# agent.config
+# 采样率
+agent.sample_n_per_3_secs=100
+
+# 队列大小
+agent.span_collect_queue_size=300
+
+# 批量发送大小
+agent.span_batch_size=100
+
+# 异步发送
+agent.span_async_send=true
+```
+
+### 27.2 Agent性能指标
+
+| 指标 | 说明 | 健康范围 |
+|------|------|----------|
+| Agent CPU使用率 | 采集开销 | <5% |
+| Agent内存使用 | 内存占用 | <100MB |
+| 网络带宽 | 传输开销 | <10MB/s |
+| 延迟影响 | 对业务的影响 | <1ms |
+
+---
+
+## 二十八、SkyWalking生产架构
+
+### 28.1 生产架构设计
+
+```mermaid
+flowchart TD
+    subgraph 采集层
+        A[Java Agent] --> B[OAP Cluster]
+        C[Envoy] --> B
+        D[Go Agent] --> B
+    end
+    
+    subgraph 处理层
+        B --> E[Elasticsearch Cluster]
+        B --> F[BMySQL Cluster]
+    end
+    
+    subgraph 展示层
+        E --> G[SkyWalking UI]
+        F --> G
+        H[Grafana] --> E
+    end
+```
+
+### 28.2 生产配置建议
+
+| 组件 | 配置 | 说明 |
+|------|------|------|
+| OAP | 3节点+ | 高可用 |
+| ES | 3节点+ | 数据存储 |
+| UI | 2节点+ | 负载均衡 |
+| Agent | 采样100 | 生产采样 |
+
+---
+
+## 二十九、SkyWalking vs 其他追踪系统
+
+| 维度 | SkyWalking | Jaeger | Zipkin |
+|------|-----------|--------|--------|
+| 语言 | Java/Go | Go | Java |
+| 性能 | 高 | 中 | 中 |
+| 功能 | 全面 | 基础 | 基础 |
+| 生态 | 丰富 | 中等 | 中等 |
+| 学习曲线 | 中 | 低 | 低 |
+
 ## 二十二、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；
