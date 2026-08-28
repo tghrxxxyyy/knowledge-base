@@ -1899,6 +1899,138 @@ redis-cli monitor
 
 ---
 
+## Redis深度优化与高级特性
+
+### Cluster故障转移详解
+
+| 阶段 | 说明 | 时间 |
+|------|------|------|
+| 故障检测 | 主观下线→客观下线 | 15-30s |
+| 故障迁移 | 选举新主节点 | 1-5s |
+| 配置传播 | 更新集群配置 | 1-2s |
+| 总时间 | 故障转移总时间 | 20-40s |
+
+### 内存淘汰策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| noeviction | 不淘汰，返回错误 | 数据不允许丢失 |
+| allkeys-lru | 所有key使用LRU | 通用缓存 |
+| volatile-lru | 有过期时间的key使用LRU | 混合场景 |
+| allkeys-lfu | 所有key使用LFU | 热点数据 |
+| volatile-lfu | 有过期时间的key使用LFU | 混合场景 |
+| allkeys-random | 所有key随机淘汰 | 无明确热点 |
+| volatile-random | 有过期时间的key随机淘汰 | 混合场景 |
+| volatile-ttl | 淘汰最快过期的key | 有明确TTL |
+
+### 事务与Lua脚本对比
+
+| 维度 | 事务 | Lua脚本 |
+|------|------|---------|
+| 原子性 | 部分原子 | 完全原子 |
+| 隔离性 | 无 | 无 |
+| 错误处理 | 简单 | 复杂 |
+| 性能 | 高 | 中 |
+| 适用场景 | 简单操作 | 复杂操作 |
+
+### Redis 7.x Functions
+
+```lua
+-- Redis Functions示例
+#!lua name=mylib
+
+-- 限流函数
+local function rate_limiter(keys, args)
+    local key = keys[1]
+    local limit = tonumber(args[1])
+    local window = tonumber(args[2])
+    
+    local current = redis.call('INCR', key)
+    if current == 1 then
+        redis.call('EXPIRE', key, window)
+    end
+    
+    if current > limit then
+        return 0
+    end
+    return 1
+end
+
+redis.register_function('rate_limiter', rate_limiter)
+```
+
+### RDB-AOF混合持久化
+
+| 配置 | 说明 | 推荐值 |
+|------|------|--------|
+| aof-use-rdb-preamble | 混合持久化 | yes |
+| aof-enabled | 启用AOF | yes |
+| appendfsync | 同步策略 | everysec |
+| auto-aof-rewrite-percentage | AOF重写阈值 | 100 |
+| auto-aof-rewrite-min-size | AOF重写最小大小 | 64mb |
+
+### 多DB使用陷阱
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| KEYS阻塞 | 全量扫描 | 使用SCAN |
+| FLUSHDB危险 | 清空数据 | 禁用/重命名 |
+| SELECT切换 | 上下文切换 | 使用单DB |
+| 事务跨DB | 不支持跨DB | 使用Lua |
+
+### 大Key检测与处理
+
+```bash
+# 检测大Key
+redis-cli --bigkeys
+
+# 使用memory usage检测
+redis-cli MEMORY USAGE key_name
+
+# 拆分大Key
+# Hash: 分片存储
+# List: 分段存储
+# Set: 分片存储
+# ZSet: 分片存储
+```
+
+### 热Key检测与解决方案
+
+| 检测方式 | 说明 | 工具 |
+|----------|------|------|
+| MONITOR | 实时监控 | redis-cli |
+| 采样分析 | 采样统计 | redis-cli |
+| 专业工具 | 热Key分析 | Redis Insight |
+
+| 解决方案 | 说明 | 适用场景 |
+|----------|------|----------|
+| 本地缓存 | JVM缓存热Key | 读多写少 |
+| 读写分离 | 主从分离 | 读多写少 |
+| 分片 | 热Key分散 | 写密集 |
+| 预热 | 提前加载 | 启动时 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 内存优化 | 设置maxmemory | 高 |
+| 持久化 | RDB+AOF混合 | 高 |
+| 监控告警 | 内存/CPU/连接数 | 高 |
+| 大Key处理 | 定期检测拆分 | 高 |
+| 热Key处理 | 本地缓存/读写分离 | 中 |
+| 连接池 | 使用连接池 | 高 |
+| 命令优化 | 避免慢查询 | 高 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 内存溢出 | 大Key/内存不足 | 增加内存/拆分大Key |
+| 慢查询 | KEYS/大Key | 使用SCAN/拆分大Key |
+| 连接数耗尽 | 连接泄漏 | 检查连接池 |
+| 主从延迟 | 网络/负载 | 检查网络/优化 |
+| Cluster节点故障 | 硬件/网络 | 检查硬件/网络 |
+
 ## 二十四、与其他板块的关系
 
 - 缓存设计模式见「[缓存经典三问](../../场景设计/缓存经典三问与一致性.md)」；

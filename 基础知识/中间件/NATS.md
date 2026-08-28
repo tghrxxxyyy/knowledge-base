@@ -1879,6 +1879,411 @@ accounts {
 
 ---
 
+## NATS JetStream 配置深入
+
+### Stream 保留策略配置
+
+```bash
+# 创建 Stream（保留策略详解）
+nats stream add EVENTS \
+  --subjects="events.>" \
+  --storage=file \
+  --retention=limits \
+  --max-msgs=1000000 \
+  --max-bytes=10GB \
+  --max-age=72h \
+  --max-msg-size=1MB \
+  --discard=old \
+  --replicas=3
+
+# 查看 Stream 信息
+nats stream info EVENTS
+
+# 手动清除过期消息
+nats stream purge EVENTS --subject events.old
+```
+
+| Retention 策略 | 说明 | 适用场景 |
+|----------------|------|----------|
+| Limits | 保留所有消息直到达到限制 | 通用日志 |
+| Interest | 保留直到所有消费者确认 | 队列语义 |
+| WorkQueue | 消息被消费后立即删除 | 任务队列 |
+
+### Consumer 配置详解
+
+```bash
+# 创建消费者（Explicit Ack）
+nats consumer add EVENTS order-processor \
+  --subject="events.order.>" \
+  --ack-explicit \
+  --max-deliver=5 \
+  --ack-wait=30s \
+  --backoff=1s,5s,30s
+
+# 创建消费者（All Ack）
+nats consumer add EVENTS log-processor \
+  --subject="events.>" \
+  --ack-all
+
+# 创建消费者（None Ack）
+nats consumer add EVENTS metrics-processor \
+  --subject="events.>" \
+  --ack-none
+```
+
+| AckPolicy | 语义 | 适用场景 | 消息重复风险 |
+|-----------|------|----------|--------------|
+| Explicit | 每条消息单独确认 | 精确控制（Exactly-once 基础） | 低 |
+| All | 一批消息批量确认 | 高吞吐批量消费 | 高 |
+| None | 不确认（消息不重发） | 幂等日志采集 | 无 |
+
+## NATS Request-Reply 超时与重试
+
+```go
+// Go Request-Reply 示例（带超时和重试）
+nc, _ := nats.Connect("nats://localhost:4222")
+defer nc.Close()
+
+// 发送请求（5秒超时）
+resp, err := nc.Request("orders.query", []byte(`{"id":"123"}`), 5*time.Second)
+if err != nil {
+    if err == nats.ErrTimeout {
+        // 重试逻辑
+        for i := 0; i < 3; i++ {
+            resp, err = nc.Request("orders.query", []byte(`{"id":"123"}`), 5*time.Second)
+            if err == nil {
+                break
+            }
+            time.Sleep(time.Duration(1<<i) * 100 * time.Millisecond)
+        }
+    }
+}
+fmt.Printf("Response: %s\n", resp.Data)
+```
+
+| 超时场景 | 建议超时时间 | 重试次数 |
+|----------|--------------|----------|
+| 本地网络 | 1秒 | 3次 |
+| 跨机房 | 5秒 | 2次 |
+| 跨区域 | 10秒 | 1次 |
+| 复杂业务 | 根据评估 | 1次 |
+
+## NATS Leaf Node 拓扑设计
+
+```text
+Leaf Node 拓扑模式：
+
+1. Hub-Spoke（中心辐射）：
+   Hub 节点（中心）：
+     - 接收所有消息
+     - 路由到 Spoke 节点
+   
+   Spoke 节点（边缘）：
+     - 连接到 Hub
+     - 本地发布/订阅
+   
+   优点：简单、易于管理
+   缺点：Hub 单点故障
+
+2. Mesh（网状）：
+   所有节点相互连接：
+     - 每个节点都与所有其他节点连接
+     - 消息自动路由
+   
+   优点：无单点故障、高可用
+   缺点：连接数多、配置复杂
+
+3. Multi-Tier（多层级）：
+   Tier 1: Hub Server
+   ├── Tier 2: Regional Server
+   │   ├── Tier 3: Edge Leaf 1
+   │   └── Tier 3: Edge Leaf 2
+   └── Tier 2: Regional Server
+       ├── Tier 3: Edge Leaf 3
+       └── Tier 3: Edge Leaf 4
+```
+
+```bash
+# Leaf Node 配置
+listen: 0.0.0.0:4223
+leafnodes {
+  remotes [
+    {
+      urls: ["nats://hub-server1:4222", "nats://hub-server2:4222"]
+      tls {
+        cert_file: "/etc/nats/leaf-cert.pem"
+        key_file: "/etc/nats/leaf-key.pem"
+      }
+    }
+  ]
+}
+```
+
+| 拓扑模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| Hub-Spoke | 中心辐射 | 云边协同 |
+| Mesh | 网状 | 边缘自治 |
+| Multi-Tier | 多层级 | 大规模部署 |
+
+## NATS K8s 部署
+
+### Helm 部署
+
+```bash
+# 添加 Helm 仓库
+helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+helm repo update
+
+# 安装 NATS
+helm install nats nats/nats \
+  --namespace nats-system \
+  --create-namespace \
+  --set cluster.enabled=true \
+  --set cluster.replicas=3 \
+  --set jetstream.enabled=true \
+  --set jetstream.storage.size=10Gi
+```
+
+### K8s 资源配置
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 4Gi
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: fast-ssd
+```
+
+## NATS Account 隔离
+
+```bash
+# 账号配置
+accounts {
+  # 系统账号
+  SYS {
+    users [
+      {user: sys-admin, password: sys-pass}
+    ]
+    exports [
+      {service: "$SYS.>"}
+    ]
+  }
+  
+  # 业务账号
+  APP {
+    users [
+      {user: app-user, password: app-pass}
+    ]
+    imports [
+      {service: {account: SYS, subject: "$SYS.>"}}
+    ]
+    exports [
+      {service: orders.>}
+      {stream: events.>}
+    ]
+  }
+  
+  # 边缘账号
+  EDGE {
+    users [
+      {user: edge-user, password: edge-pass}
+    ]
+    imports [
+      {service: {account: APP, subject: orders.>}}
+      {stream: {account: APP, subject: events.>}}
+    ]
+  }
+}
+```
+
+| 安全措施 | 说明 | 重要性 |
+|----------|------|--------|
+| 账号隔离 | 独立主题空间 | 高 |
+| 权限控制 | publish/subscribe白名单 | 高 |
+| export/import | 跨账号通信 | 中 |
+| JWT认证 | 去中心化身份 | 高 |
+| TLS加密 | 传输加密 | 高 |
+
+## NATS vs Kafka vs RabbitMQ 选型对比
+
+| 维度 | NATS | Kafka | RabbitMQ | Pulsar |
+|------|------|-------|----------|--------|
+| 定位 | 轻量消息/服务通信 | 高吞吐流平台 | 业务消息 | 云原生流+队列 |
+| 延迟 | 微秒 | 毫秒 | 毫秒 | 毫秒 |
+| 吞吐 | 高 | 最高 | 中 | 最高 |
+| 持久化 | JetStream（可选） | 强（磁盘日志） | 强 | 强（分层存储） |
+| 顺序保证 | 流内有序 | 分区内有序 | 队列有序 | 分区内有序 |
+| 运维成本 | 最低 | 高（ZK/KRaft） | 中 | 高 |
+| 多租户 | 原生（Accounts） | 弱 | 弱 | 原生（强） |
+| 适用 | 边缘/微服务/实时 | 日志/管道/流处理 | 业务解耦 | 云原生多租户 |
+
+```text
+选型决策树：
+延迟敏感/轻量/边缘 → NATS
+需要持久化/流处理 → NATS + JetStream（轻量）或 Kafka（生态）
+业务事务消息 → RabbitMQ/RocketMQ
+云原生多租户大平台 → Pulsar
+服务间调用 → NATS Request-Reply / gRPC
+```
+
+## NATS 监控与告警
+
+```yaml
+# NATS 监控配置
+monitoring:
+  endpoint: "http://localhost:8222"
+  
+  metrics:
+    - name: "nats_connections"
+      description: "当前连接数"
+    
+    - name: "nats_messages_received"
+      description: "接收消息数"
+    
+    - name: "nats_messages_sent"
+      description: "发送消息数"
+    
+    - name: "nats_bytes_received"
+      description: "接收字节数"
+    
+    - name: "nats_bytes_sent"
+      description: "发送字节数"
+  
+  alerts:
+    - name: "nats_connections_high"
+      condition: "nats_connections > 10000"
+      severity: "warning"
+    
+    - name: "nats_message_loss"
+      condition: "rate(nats_messages_dropped[5m]) > 0"
+      severity: "critical"
+    
+    - name: "nats_slow_consumers"
+      condition: "nats_slow_consumers > 100"
+      severity: "warning"
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| 连接数 | 当前连接数 | >10000 |
+| 消息丢失 | 丢弃消息数 | >0 |
+| 慢消费者 | 慢消费者数量 | >100 |
+| 内存使用 | 内存使用率 | >80% |
+
+## NATS 最佳实践
+
+```text
+NATS 生产最佳实践：
+
+1. JetStream 持久化
+   - 生产环境必须启用 JetStream
+   - Stream 使用 File 存储（持久化）
+   - 重要流配置 Replicas≥3
+
+2. AckPolicy 选择
+   - 关键业务 → Explicit（精确控制，防重复）
+   - 批量处理 → All（高吞吐）
+   - 日志采集 → None（允许丢失）
+
+3. 账号隔离
+   - 生产必开 Accounts（隔离 + JWT 认证）
+   - 每个业务线一个 Account
+   - 权限最小化（publish/subscribe 白名单）
+
+4. 集群配置
+   - 奇数节点（3/5）
+   - Raft 选举（JetStream 流复制）
+   - 网关跨集群连接（多数据中心）
+
+5. 监控告警
+   - 内置 `nats top` + Prometheus exporter
+   - 关键指标：连接数、消息丢失、慢消费者
+   - 阈值告警：连接数>10000、消息丢失>0
+```
+
+## NATS 故障排查
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 连接失败 | 网络问题 | 检查网络连通性 | 修复网络 |
+| 消息丢失 | 没有持久化 | 检查JetStream配置 | 启用JetStream |
+| 消费延迟 | 消费者性能 | 检查消费者配置 | 扩容消费者 |
+| 集群不同步 | 网络分区 | 检查集群状态 | 修复网络 |
+| 内存溢出 | 消息堆积 | 检查消息保留策略 | 限制消息数 |
+| 认证失败 | 账号配置 | 检查账号配置 | 修正账号 |
+
+## NATS 性能调优
+
+```text
+性能调优要点：
+
+1. 连接优化
+   - 使用连接池（减少连接数）
+   - 启用压缩（减少带宽）
+   - 调整缓冲区大小
+
+2. 消息优化
+   - 批量发送（减少网络往返）
+   - 消息压缩（减少传输大小）
+   - 合理设置 TTL（避免堆积）
+
+3. 消费者优化
+   - Pull Consumer 批量拉取
+   - 合理设置 MaxWaiting
+   - 避免频繁 Ack
+
+4. 集群优化
+   - 奇数节点（3/5）
+   - 跨可用区部署
+   - 网关跨集群连接
+```
+
+## NATS 架构设计
+
+```mermaid
+graph TB
+    subgraph 生产者
+        P1[Publisher 1]
+        P2[Publisher 2]
+    end
+    subgraph NATS集群
+        N1[NATS Server 1]
+        N2[NATS Server 2]
+        N3[NATS Server 3]
+    end
+    subgraph JetStream
+        JS[Stream + Consumer]
+    end
+    subgraph 消费者
+        C1[Consumer 1]
+        C2[Consumer 2]
+    end
+    P1 --> N1
+    P2 --> N2
+    N1 --> JS
+    N2 --> JS
+    N3 --> JS
+    JS --> C1
+    JS --> C2
+```
+
+```text
+架构要点：
+  核心 NATS：纯内存路由，微秒级延迟
+  JetStream：持久化流，支持 Exactly-once 语义
+  Leaf Node：边缘节点，离线缓存
+  Gateway：跨集群连接，多数据中心
+  Account：多租户隔离，权限控制
+```
+
+---
+
 ## 与其他板块的关系
 
 - Kafka 对比见「[Kafka](./Kafka.md)」；

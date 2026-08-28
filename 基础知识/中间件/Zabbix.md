@@ -1744,6 +1744,144 @@ UserParameter=http.status[*],curl -s -o /dev/null -w "%{http_code}" -m 5 $1
 
 > 一句话：**Zabbix = 采集（Agent/SNMP/主动）+ 触发器（阈值）+ 告警（升级/媒介）+ 报表——传统企业监控闭环；选型先看「环境（传统机房→Zabbix，云原生→Prometheus）」，再定「部署（多机房→Proxy 级联 + Server HA）」，最后配「模板批量 + 告警收敛 + 分级采集频率 + 数据保留策略」**。
 
+## Zabbix 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 主从模式 | 中小规模 | 2 | 主写从读 |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| Proxy模式 | 多机房 | 多Proxy | 跨机房 |
+
+```mermaid
+graph TB
+    subgraph Zabbix集群架构
+        PROXY1[Proxy 1] --> SERVER[Zabbix Server]
+        PROXY2[Proxy 2] --> SERVER
+        SERVER --> DB[(MySQL集群)]
+        SERVER --> CACHE[(Redis缓存)]
+        SERVER --> FE[Web Frontend]
+        FE --> LB[负载均衡]
+        LB --> FE1[Frontend 1]
+        LB --> FE2[Frontend 2]
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Server CPU | 主机数 × 监控项数 × 采集频率 / 1000 | 8-16核 |
+| Server 内存 | 主机数 × 5MB + 历史缓存 | 16-32GB |
+| Database CPU | 主机数 × 监控项数 × 采集频率 / 500 | 16-32核 |
+| Database 内存 | 主机数 × 监控项数 × 100B × 保留天数 | 64-128GB |
+| Proxy CPU | 主机数 × 监控项数 × 采集频率 / 2000 | 4-8核 |
+| Proxy 内存 | 主机数 × 2MB | 8-16GB |
+
+### 监控告警配置
+
+```yaml
+# Zabbix告警配置
+groups:
+  - name: zabbix-alerts
+    rules:
+      - alert: ZabbixServerDown
+        expr: up{job="zabbix-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zabbix Server宕机"
+
+      - alert: ZabbixHighCPUIsage
+        expr: zabbix_server_cpu_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zabbix Server CPU使用率过高"
+
+      - alert: ZabbixProxyDown
+        expr: up{job="zabbix-proxy"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zabbix Proxy宕机"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 配置数据库 | mysqldump | 每日 | 30天 |
+| 历史数据 | 数据库备份 | 每日 | 90天 |
+| 模板配置 | API导出 | 每次变更 | 永久 |
+| 告警规则 | 配置文件 | 每次变更 | 永久 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Server宕机 | 停止Server | HA自动切换 | <30s |
+| Database故障 | 模拟数据库故障 | 监控降级 | <5min |
+| Proxy故障 | 停止Proxy | 数据丢失 | <1min |
+| 网络分区 | 模拟网络隔离 | 监控中断 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级监控配置
+hosts:
+  - host: "tenant-a-server"
+    groups:
+      - "Tenant A"
+    templates:
+      - "Template OS Linux"
+      - "Template App MySQL"
+    macros:
+      - macro: "{$TENANT}"
+        value: "tenant-a"
+
+  - host: "tenant-b-server"
+    groups:
+      - "Tenant B"
+    templates:
+      - "Template OS Linux"
+      - "Template App MySQL"
+    macros:
+      - macro: "{$TENANT}"
+        value: "tenant-b"
+```
+
+### 与云原生监控集成
+
+```yaml
+# Prometheus + Zabbix混合监控
+scrape_configs:
+  - job_name: 'zabbix'
+    static_configs:
+      - targets: ['zabbix-server:10051']
+    
+  - job_name: 'zabbix-proxy'
+    static_configs:
+      - targets: ['zabbix-proxy:10051']
+
+# Grafana数据源配置
+apiVersion: 1
+datasources:
+  - name: Zabbix
+    type: alexanderzobnin-zabbix-app
+    access: proxy
+    url: http://zabbix:8080
+    jsonData:
+      zabbixApiUrl: http://zabbix:80/api_jsonrpc.php
+```
+
+## 与其他板块的关系
+
 ## Zabbix API 自动化运维
 
 ### 常用 API 接口

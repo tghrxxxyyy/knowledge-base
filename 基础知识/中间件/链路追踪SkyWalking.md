@@ -1931,3 +1931,276 @@ flowchart TD
 - 指标监控见「[Prometheus](../时序库/Prometheus.md)」；
 - 微服务网关见「[Spring Cloud Gateway](./SpringCloudGateway.md)」；
 - 服务网格见「[Istio](../../云原生/ServiceMesh.md)」。
+
+## SkyWalking OAP 集群部署
+
+### OAP 集群配置
+
+```yaml
+# OAP 集群配置
+cluster:
+  enable: true
+  type: zookeeper
+  zookeeper:
+    host_list: zk1:2181,zk2:2181,zk3:2181
+    baseSleepTimeMs: 1000
+    maxRetries: 3
+
+storage:
+  elasticsearch:
+    nameSpace: ${SW_NAMESPACE:""}
+    clusterNodes: ${SW_STORAGE_ES_CLUSTER_NODES:"es1:9200,es2:9200,es3:9200"}
+    protocol: ${SW_STORAGE_ES_PROTOCOL:"http"}
+    indexShardsNumber: ${SW_STORAGE_ES_INDEX_SHARDS_NUMBER:2}
+    indexReplicasNumber: ${SW_STORAGE_ES_INDEX_REPLICAS_NUMBER:1}
+    bulkActions: ${SW_STORAGE_ES_BULK_ACTIONS:2000}
+    flushInterval: ${SW_STORAGE_ES_FLUSH_INTERVAL:10s}
+```
+
+| 组件 | 集群规模 | 说明 |
+|------|----------|------|
+| OAP | 3节点+ | 高可用 |
+| ES | 3节点+ | 数据存储 |
+| UI | 2节点+ | 负载均衡 |
+| Agent | 采样100 | 生产采样 |
+
+## SkyWalking Trace 分析
+
+### Trace 查询与分析
+
+```sql
+-- 查询慢Trace
+SELECT * FROM traces 
+WHERE duration > 1000 
+AND start_time > NOW() - INTERVAL 1 HOUR
+ORDER BY duration DESC
+LIMIT 100;
+
+-- 查询特定服务Trace
+SELECT * FROM traces 
+WHERE service_name = 'order-service'
+AND start_time > NOW() - INTERVAL 1 HOUR;
+
+-- 分析Trace拓扑
+SELECT service_name, operation_name, COUNT(*), AVG(duration)
+FROM traces 
+WHERE start_time > NOW() - INTERVAL 1 HOUR
+GROUP BY service_name, operation_name
+ORDER BY COUNT(*) DESC;
+```
+
+### Trace 可视化
+
+```text
+Trace 分析维度：
+  1. 服务拓扑图
+     - 服务间依赖关系
+     - 调用链路
+     - 响应时间分布
+
+  2. Trace 详情
+     - Span 时间线
+     - 调用栈
+     - 异常信息
+
+  3. 性能分析
+     - 慢查询识别
+     - 瓶颈定位
+     - 资源消耗分析
+
+  4. 告警规则
+     - 响应时间阈值
+     - 错误率阈值
+     - 慢查询阈值
+```
+
+## SkyWalking 告警规则配置
+
+```yaml
+# 告警规则配置
+rules:
+  - name: service_resp_time_rule
+    metrics: service_resp_time
+    op: ">"
+    threshold: 1000
+    period: 5
+    count: 3
+    message: "服务 {name} 响应时间超过阈值"
+
+  - name: service_sla_rule
+    metrics: service_sla
+    op: "<"
+    threshold: 99.9
+    period: 5
+    count: 3
+    message: "服务 {name} 可用性低于阈值"
+
+  - name: service_p99_rule
+    metrics: service_p99
+    op: ">"
+    threshold: 2000
+    period: 5
+    count: 3
+    message: "服务 {name} P99延迟超过阈值"
+```
+
+| 告警规则 | 指标 | 阈值 | 说明 |
+|----------|------|------|------|
+| 响应时间 | service_resp_time | >1000ms | 服务响应时间 |
+| 可用性 | service_sla | <99.9% | 服务可用性 |
+| P99延迟 | service_p99 | >2000ms | P99延迟 |
+| 错误率 | service_error_rate | >1% | 错误率 |
+| 慢查询 | service_slow_query | >5000ms | 慢查询 |
+
+## SkyWalking 日志关联
+
+### 日志与Trace关联
+
+```yaml
+# 日志配置
+logging:
+  level: INFO
+  file:
+    name: logs/skywalking.log
+  pattern:
+    msg: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - [%traceId] %msg%n"
+```
+
+```text
+日志关联原理：
+  1. TraceID 注入日志
+     - MDC 注入 traceId
+     - 日志格式包含 traceId
+
+  2. 日志查询
+     - 按 traceId 查询日志
+     - 按服务名查询日志
+     - 按时间范围查询日志
+
+  3. 日志分析
+     - 错误日志统计
+     - 异常堆栈分析
+     - 日志趋势分析
+```
+
+## SkyWalking Istio 集成
+
+```yaml
+# Istio 配置
+apiVersion: networking.istio.io/v1beta1
+kind: EnvoyFilter
+metadata:
+  name: skywalking
+  namespace: istio-system
+spec:
+  workloadSelector:
+    labels:
+      app: myapp
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.skywalking
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.skywalking.v3.SkyWalking
+            service_name: myapp
+            collector:
+              address: skywalking-oap:11800
+              grpc_envoy:
+                cluster: skywalking-oap
+                timeout: 1s
+```
+
+## SkyWalking Agent 性能优化
+
+### Agent 配置优化
+
+```yaml
+# agent.config
+# 采样率
+agent.sample_n_per_3_secs=100
+
+# 队列大小
+agent.span_collect_queue_size=300
+
+# 批量发送大小
+agent.span_batch_size=100
+
+# 异步发送
+agent.span_async_send=true
+```
+
+### Agent 性能指标
+
+| 指标 | 说明 | 健康范围 |
+|------|------|----------|
+| Agent CPU使用率 | 采集开销 | <5% |
+| Agent内存使用 | 内存占用 | <100MB |
+| 网络带宽 | 传输开销 | <10MB/s |
+| 延迟影响 | 对业务的影响 | <1ms |
+
+## SkyWalking vs 其他追踪系统
+
+| 维度 | SkyWalking | Jaeger | Zipkin |
+|------|-----------|--------|--------|
+| 语言 | Java/Go | Go | Java |
+| 性能 | 高 | 中 | 中 |
+| 功能 | 全面 | 基础 | 基础 |
+| 生态 | 丰富 | 中等 | 中等 |
+| 学习曲线 | 中 | 低 | 低 |
+
+```text
+选型建议：
+  Java生态 → SkyWalking
+  Go生态 → Jaeger
+  轻量级 → Zipkin
+  全面功能 → SkyWalking
+```
+
+## SkyWalking 最佳实践
+
+```text
+SkyWalking 最佳实践：
+
+1. Agent 部署
+   - 使用 Java Agent（-javaagent）
+   - 配置合理的采样率
+   - 启用异步发送
+
+2. OAP 部署
+   - 集群部署（3节点+）
+   - 配置 ES 集群
+   - 启用 HA 模式
+
+3. 告警配置
+   - 配置关键指标告警
+   - 设置合理的阈值
+   - 接入企业告警系统
+
+4. 性能优化
+   - 调整采样率
+   - 优化 Agent 配置
+   - 监控 Agent 开销
+
+5. 日志关联
+   - TraceID 注入日志
+   - 日志与 Trace 关联
+   - 错误日志分析
+```
+
+## SkyWalking 故障排查
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Agent连接失败 | OAP不可用 | 检查OAP状态 | 重启OAP |
+| Trace丢失 | 采样率低 | 检查采样配置 | 调整采样率 |
+| 性能下降 | Agent开销大 | 检查Agent配置 | 优化Agent |
+| ES写入失败 | ES集群问题 | 检查ES状态 | 重启ES |
+| 告警延迟 | 告警规则问题 | 检查告警配置 | 优化规则 |

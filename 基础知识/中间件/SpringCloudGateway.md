@@ -1839,4 +1839,167 @@ public class Resilience4jFilter implements GlobalFilter, Ordered {
        logging.level.org.springframework.cloud.gateway: DEBUG
 ```
 
+## Spring Cloud Gateway 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| 多机房模式 | 多机房 | 多集群 | 跨机房 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph SCG集群架构
+        CLIENT[客户端] --> LB[负载均衡]
+        LB --> GW1[Gateway 1]
+        LB --> GW2[Gateway 2]
+        GW1 --> SVC1[服务1]
+        GW2 --> SVC2[服务2]
+        GW1 --> REDIS[(Redis集群)]
+        GW2 --> REDIS
+        GW1 --> NACOS[Nacos集群]
+        GW2 --> NACOS
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Gateway CPU | QPS × 0.001 | 4-8核 |
+| Gateway 内存 | 并发连接数 × 10KB | 4-8GB |
+| 连接池大小 | QPS / 响应时间 | 1000+ |
+| Redis连接 | Gateway数 × 10 | 100+ |
+| 网络带宽 | QPS × 请求大小 × 2 | 10Gbps+ |
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: scg-alerts
+    rules:
+      - alert: SCGHighLatency
+        expr: histogram_quantile(0.99, rate(gateway_requests_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SCG P99延迟过高"
+
+      - alert: SCGHighErrorRate
+        expr: rate(gateway_requests_seconds_count{status=~"5.."}[5m]) / rate(gateway_requests_seconds_count[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SCG错误率过高"
+
+      - alert: CircuitBreakerOpen
+        expr: circuitbreaker_state == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "熔断器打开"
+
+      - alert: SCGHighConnections
+        expr: gateway_connections > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SCG连接数过高"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 路由配置 | 配置中心 | 每次变更 | 永久 |
+| 证书文件 | 密钥管理服务 | 每次变更 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+| 日志数据 | 文件归档 | 每日 | 30天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Gateway宕机 | 停止Gateway | HA自动切换 | <30s |
+| Redis故障 | 模拟Redis故障 | 本地缓存降级 | <1min |
+| 上游故障 | 模拟上游不可用 | 熔断降级 | <10s |
+| 证书过期 | 模拟证书过期 | 自动续期 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级路由配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: tenant-a-route
+          uri: lb://tenant-a-service
+          predicates:
+            - Path=/api/tenant-a/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+                key-resolver: "#{@tenantKeyResolver}"
+
+        - id: tenant-b-route
+          uri: lb://tenant-b-service
+          predicates:
+            - Path=/api/tenant-b/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 200
+                redis-rate-limiter.burstCapacity: 400
+                key-resolver: "#{@tenantKeyResolver}"
+```
+
+### 与微服务生态集成
+
+```yaml
+# Spring Cloud Gateway + Nacos配置
+spring:
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/users/**
+          filters:
+            - StripPrefix=1
+            - name: CircuitBreaker
+              args:
+                name: userCB
+                fallbackUri: forward:/fallback
+
+# Resilience4j熔断配置
+resilience4j:
+  circuitbreaker:
+    instances:
+      userCB:
+        slidingWindowSize: 100
+        minimumNumberOfCalls: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+  timelimiter:
+    instances:
+      userCB:
+        timeoutDuration: 3s
+```
+
 ## 二十二、与其他板块的关系

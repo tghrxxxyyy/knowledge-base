@@ -1826,6 +1826,162 @@ public class OrderMessageListener {
 | DUPS_OK_ACKNOWLEDGE | 延迟确认 | 中 | 高 | 允许重复 |
 | SESSION_TRANSACTED | 事务确认 | 最高 | 低 | 金融级场景 |
 
+## ActiveMQ 生产运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 主从模式 | 中小规模 | 2 | 主写从读 |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| 网络连接器 | 多机房 | 多集群 | 跨机房同步 |
+
+```mermaid
+graph TB
+    subgraph ActiveMQ集群架构
+        PROD[生产者集群] --> LB[负载均衡]
+        LB --> MASTER1[Master 1]
+        LB --> MASTER2[Master 2]
+        MASTER1 --> SLAVE1[Slave 1]
+        MASTER2 --> SLAVE2[Slave 2]
+        MASTER1 <--> MASTER2
+        SLAVE1 <--> SLAVE2
+        MASTER1 --> KAHADB[(KahaDB)]
+        MASTER2 --> KAHADB
+        MASTER1 --> JDBC[(JDBC)]
+        MASTER2 --> JDBC
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Broker CPU | 消息TPS × 0.001 | 4-8核 |
+| Broker 内存 | 队列深度 × 消息大小 × 2 | 8-32GB |
+| 磁盘IO | 消息TPS × 消息大小 | 500MB/s+ |
+| 网络带宽 | 消息TPS × 消息大小 × 副本数 | 1Gbps+ |
+| 连接数 | 消费者数 + 生产者数 | 10000+ |
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: activemq-alerts
+    rules:
+      - alert: ActiveMQBrokerDown
+        expr: up{job="activemq"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ActiveMQ Broker 宕机"
+
+      - alert: ActiveMQQueueDepthHigh
+        expr: activemq_queue_queue_size > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "队列积压超过10000条"
+
+      - alert: ActiveMQMemoryHigh
+        expr: activemq_broker_memory_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率超过80%"
+```
+
+### 性能压测与调优
+
+| 压测场景 | 压测指标 | 目标值 | 调优方向 |
+|----------|---------|--------|---------|
+| 高并发写入 | 消息TPS | 10000+ | Broker水平扩展 |
+| 消费延迟 | 端到端延迟 | <10ms | 消费者并发优化 |
+| 消息堆积 | 堆积恢复时间 | <1h | 消费者扩容 |
+| 持久化性能 | 写入吞吐 | 50000+ msg/s | KahaDB优化 |
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 消息数据 | KahaDB/JDBC | 实时 | 7天 |
+| 配置文件 | Git版本控制 | 每次变更 | 永久 |
+| 消费进度 | ZooKeeper | 实时 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Broker宕机 | 停止Broker | Slave自动提升 | <30s |
+| 网络分区 | 模拟网络隔离 | 消息不丢失 | <1min |
+| 磁盘满 | 模拟磁盘满 | 旧消息自动清理 | <5min |
+| 消费者崩溃 | 停止消费者 | 消息重投 | <10s |
+
+### 多租户资源隔离
+
+```text
+ActiveMQ多租户隔离策略：
+
+  虚拟主机隔离：
+    ├── 独立vhost：每个租户独立vhost
+    ├── 资源限制：CPU/内存/连接数限制
+    └── 权限控制：用户级权限管理
+
+  队列隔离：
+    ├── 命名规范：tenant.queue.name
+    ├── 资源配额：队列深度/消费者数限制
+    └── 优先级：按租户优先级调度
+
+  网络隔离：
+    ├── 网络连接器：租户级网络隔离
+    ├── 负载均衡：租户级负载均衡
+    └── 流量控制：租户级限流
+```
+
+### 与Spring生态集成
+
+```java
+// Spring Boot ActiveMQ配置
+@Configuration
+@EnableJms
+public class ActiveMQConfig {
+    @Bean
+    public ActiveMQConnectionFactory connectionFactory() {
+        ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory();
+        factory.setBrokerURL("tcp://localhost:61616");
+        factory.setUserName("admin");
+        factory.setPassword("admin");
+        
+        // 连接池配置
+        factory.setUseCompression(true);
+        factory.setDispatchAsync(true);
+        
+        // 重连配置
+        factory.setReconnectOnException(true);
+        factory.setInitialReconnectDelay(1000);
+        factory.setReconnectDelay(1000);
+        factory.setMaxReconnectAttempts(-1);
+        
+        return factory;
+    }
+    
+    @Bean
+    public JmsTemplate jmsTemplate() {
+        JmsTemplate template = new JmsTemplate();
+        template.setConnectionFactory(connectionFactory());
+        template.setDeliveryPersistent(true);
+        template.setSessionTransacted(true);
+        return template;
+    }
+}
+```
+
 ## 与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；

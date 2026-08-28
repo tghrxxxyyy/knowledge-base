@@ -1957,6 +1957,131 @@ dependency_scanning:
 | 扫描报告归档 | `artifacts: reports` 收集报告 | 安全审计 |
 | 定期扫描 | scheduled pipeline 定期全量扫描 | 持续安全 |
 
+## GitLab CI深度优化与高级实践
+
+### 变量管理最佳实践
+
+| 变量类型 | 作用域 | 优先级 | 安全性 |
+|----------|--------|--------|--------|
+| Global | 全局 | 低 | 中 |
+| Group | 组级别 | 中 | 中 |
+| Project | 项目级别 | 高 | 中 |
+| Protected | 受保护分支 | 最高 | 高 |
+| File | 文件变量 | - | 高 |
+
+### Runner选型与运维
+
+| Runner类型 | 适用场景 | 性能 | 成本 |
+|------------|----------|------|------|
+| Shell | 简单构建 | 高 | 低 |
+| Docker | 隔离构建 | 中 | 中 |
+| Kubernetes | 弹性构建 | 高 | 中 |
+| VM | 特殊环境 | 中 | 高 |
+
+### GitLab Pages部署
+
+```yaml
+# Pages部署配置
+pages:
+  stage: deploy
+  script:
+    - mkdir public
+    - cp -r dist/* public/
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+```
+
+### Container Registry使用
+
+```yaml
+# 镜像构建与推送
+build:
+  stage: build
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_DRIVER: overlay2
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+```
+
+### GitLab CI vs Jenkins对比
+
+| 维度 | GitLab CI | Jenkins |
+|------|-----------|---------|
+| 配置方式 | YAML | Groovy |
+| 存储 | Git | 文件系统 |
+| 插件 | 内置功能 | 插件丰富 |
+| UI | 现代 | 传统 |
+| 性能 | 中 | 低 |
+| 维护 | 低 | 高 |
+
+### 缓存策略深度配置
+
+| 缓存类型 | 作用 | 配置 |
+|----------|------|------|
+| pull缓存 | 拉取缓存 | cache: pull |
+| push缓存 | 推送缓存 | cache: push |
+| key缓存 | 自定义key | cache: key |
+| 路径缓存 | 指定路径 | cache: paths |
+
+### Include模板复用
+
+| 模板类型 | 说明 | 使用方式 |
+|----------|------|----------|
+| project | 项目模板 | include: project |
+| template | 内置模板 | include: template |
+| remote | 远程URL | include: remote |
+| local | 本地文件 | include: local |
+
+### 性能优化
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| needs | DAG并行 | 快 |
+| cache | 缓存依赖 | 快 |
+| artifacts | 缩小产物 | 快 |
+| parallel | 并行任务 | 快 |
+| interruptible | 可中断 | 省资源 |
+
+### 安全扫描集成
+
+| 扫描类型 | 工具 | 用途 |
+|----------|------|------|
+| SAST | Semgrep | 静态代码分析 |
+| DAST | OWASP ZAP | 动态安全扫描 |
+| 依赖扫描 | Trivy | 依赖漏洞 |
+| 容器扫描 | Trivy | 镜像漏洞 |
+| Secret扫描 | Gitleaks | 敏感信息 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| Runner离线 | 网络/服务异常 | 检查Runner状态 |
+| 作业超时 | 执行时间过长 | 增加timeout |
+| 缓存失效 | key不匹配 | 检查缓存key |
+| 镜像拉取失败 | Registry问题 | 检查凭证 |
+| 变量未定义 | 作用域问题 | 检查变量配置 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| YAML验证 | 本地验证语法 | 高 |
+| 缓存策略 | 合理使用缓存 | 高 |
+| 并行优化 | 使用needs | 中 |
+| 安全扫描 | 集成安全工具 | 高 |
+| 日志清理 | 定期清理日志 | 中 |
+| Runner维护 | 定期更新Runner | 中 |
+
 ## 本篇补充 Checklist
 
 - [ ] 大仓/多服务用 parent-child `trigger`+`include`+`changes` 拆分。

@@ -1814,6 +1814,154 @@ client:
 
 ---
 
+## Seata 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | TC高可用 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+| 混合模式 | 大规模 | 多集群 | 多租户隔离 |
+
+```mermaid
+graph TB
+    subgraph Seata集群架构
+        APP1[应用1] --> TC1[TC 1]
+        APP2[应用2] --> TC1
+        APP3[应用3] --> TC2[TC 2]
+        APP1 --> TC2
+        APP2 --> TC2
+        APP3 --> TC2
+        TC1 <--> TC2
+        TC1 --> NACOS[Nacos集群]
+        TC2 --> NACOS
+        TC1 --> DB[(MySQL集群)]
+        TC2 --> DB
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| TC CPU | TPS × 0.001 | 4-8核 |
+| TC 内存 | 并发事务数 × 1MB | 8-16GB |
+| 数据库连接 | TC数 × 20 | 100+ |
+| Nacos连接 | TC数 + 应用数 | 500+ |
+| 磁盘IO | TPS × 1KB | 100MB/s+ |
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: seata-alerts
+    rules:
+      - alert: SeataTCHigh
+        expr: seata_transaction_committed_total_rate > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "事务提交率过高"
+
+      - alert: SeataRollbackHigh
+        expr: rate(seata_transaction_rollback_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "事务回滚率过高"
+
+      - alert: SeataTCDown
+        expr: up{job="seata-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Seata TC 节点宕机"
+```
+
+### 性能压测与调优
+
+| 压测场景 | 压测指标 | 目标值 | 调优方向 |
+|----------|---------|--------|---------|
+| 高并发事务 | 事务TPS | 5000+ | TC水平扩展 |
+| 大事务 | 事务延迟 | <100ms | 分支事务优化 |
+| 事务回滚 | 回滚成功率 | >99.9% | 重试策略优化 |
+| 锁竞争 | 锁等待时间 | <10ms | 锁粒度优化 |
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 事务日志 | MySQL binlog | 实时 | 7天 |
+| undo_log | 定时清理 | 每日 | 3天 |
+| 配置文件 | Git版本控制 | 每次变更 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| TC宕机 | 停止TC节点 | 事务自动恢复 | <30s |
+| 数据库故障 | 模拟数据库故障 | 事务降级 | <5min |
+| 网络分区 | 模拟网络隔离 | 事务超时回滚 | <1min |
+| 锁冲突 | 模拟锁竞争 | 事务等待重试 | <10s |
+
+### 多租户资源隔离
+
+```text
+Seata多租户隔离策略：
+
+  事务隔离：
+    ├── 独立TC集群：每个租户独立TC
+    ├── 事务组：按租户隔离事务组
+    └── 锁资源：按租户隔离锁
+
+  数据隔离：
+    ├── 数据库：按租户隔离数据库
+    ├── 表前缀：按租户隔离表
+    └── undo_log：按租户隔离日志
+
+  性能隔离：
+    ├── 资源配额：按租户限制资源
+    ├── 限流：按租户限制TPS
+    └── 优先级：按租户优先级调度
+```
+
+### 与微服务生态集成
+
+```java
+// Spring Cloud Seata配置
+@Configuration
+public class SeataConfig {
+    @PostConstruct
+    public void initSeata() {
+        // 初始化Seata配置
+        RootContext.bind(XID.generateXID());
+        
+        // 注册事务监听器
+        TransactionManager.registerTransactionListener(new TransactionListener() {
+            @Override
+            public String branchRegistered(BranchRegisterRequest request) {
+                // 分支注册回调
+                log.info("Branch registered: {}", request.getXid());
+                return null;
+            }
+            
+            @Override
+            public void branchReport(BranchReportRequest request) {
+                // 分支报告回调
+                log.info("Branch reported: {}", request.getXid());
+            }
+        });
+    }
+}
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

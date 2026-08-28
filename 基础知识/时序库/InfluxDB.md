@@ -1882,6 +1882,114 @@ CPU = 写入QPS / 单核处理能力
 
 ---
 
+## InfluxDB深度优化与高级特性
+
+### TSM引擎详解
+
+| 组件 | 作用 | 说明 |
+|------|------|------|
+| WAL | 预写日志 | 保证数据持久性 |
+| TSM文件 | 存储数据 | 列式存储 |
+| Cache | 内存缓存 | 提高查询性能 |
+| Compactor | 数据压缩 | 合并TSM文件 |
+
+### Continuous Queries vs Tasks
+
+| 维度 | Continuous Queries | Tasks |
+|------|-------------------|-------|
+| 版本 | 1.x | 2.x+ |
+| 语法 | InfluxQL | Flux |
+| 功能 | 聚合降采样 | 复杂数据处理 |
+| 灵活性 | 低 | 高 |
+| 性能 | 高 | 中 |
+
+### 高可用架构配置
+
+```yaml
+# InfluxDB集群配置示例
+data:
+  dir: /var/lib/influxdb2
+  wal-dir: /var/lib/influxdb2/wal
+http:
+  bind-address: ":8086"
+  tls-cert: /etc/ssl/certs/influxdb.crt
+  tls-key: /etc/ssl/private/influxdb.key
+```
+
+### 数据导入导出
+
+| 工具 | 格式 | 适用场景 |
+|------|------|----------|
+| influx CLI | Line Protocol | 通用 |
+| Telegraf | 多种格式 | 监控采集 |
+| CSV导入 | CSV | 批量导入 |
+| 备份恢复 | 二进制 | 全量备份 |
+
+### Grafana集成配置
+
+```json
+{
+  "name": "InfluxDB",
+  "type": "influxdb",
+  "url": "http://influxdb:8086",
+  "database": "mydb",
+  "access": "proxy",
+  "jsonData": {
+    "httpMode": "GET",
+    "fluxQuery": true
+  }
+}
+```
+
+### IoT场景优化
+
+| 优化项 | 说明 | 配置 |
+|--------|------|------|
+| 批量写入 | 合并写入请求 | batch size: 5000 |
+| 降采样 | 减少数据量 | 连续查询 |
+| 数据保留 | 自动清理旧数据 | retention policy |
+| 压缩 | 同类数据压缩 | TSM压缩 |
+
+### InfluxDB vs Prometheus vs TDengine对比
+
+| 维度 | InfluxDB | Prometheus | TDengine |
+|------|----------|------------|----------|
+| 数据模型 | 时间序列 | 时间序列 | 超级表 |
+| 查询语言 | Flux/InfluxQL | PromQL | SQL |
+| 高可用 | 集群支持 | 需Thanos | 集群支持 |
+| 生态 | 丰富 | 丰富 | 中文生态 |
+| 适用场景 | 通用 | 监控 | IoT |
+
+### 容量规划
+
+| 指标 | 计算方式 | 示例 |
+|------|----------|------|
+| 存储需求 | 写入速率×保留期×压缩比 | 10万×30天×0.1=30GB |
+| 内存需求 | series数×每series内存 | 10万×4KB=400MB |
+| CPU需求 | 写入QPS×每QPS CPU | 10万×0.01=1核 |
+| 网络带宽 | 写入速率×数据包大小 | 10万×200B×8=160Mbps |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 数据模型 | 合理设计measurement | 高 |
+| 降采样 | 配置连续查询 | 高 |
+| 数据保留 | 设置retention policy | 高 |
+| 监控告警 | InfluxDB监控 | 高 |
+| 备份策略 | 定期备份 | 高 |
+| 性能调优 | 批量写入优化 | 中 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 写入失败 | 磁盘空间不足 | 扩容/清理数据 |
+| 查询缓慢 | 数据量大/无索引 | 降采样/优化查询 |
+| 内存溢出 | 数据量大 | 增加内存/降采样 |
+| 复制延迟 | 网络问题 | 检查网络 |
+| 连接数耗尽 | 连接泄漏 | 检查连接池 |
+
 ## 二十四、InfluxDB监控与告警
 
 ### 24.1 监控指标

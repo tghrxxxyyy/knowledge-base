@@ -1297,6 +1297,193 @@ flowchart LR
 | Elasticsearch | 存储、查询 | 增加节点 |
 | Jaeger Query | 查询、可视化 | 水平扩展 |
 
+## Jaeger 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 组件配置 | 说明 |
+|----------|---------|----------|------|
+| 单机模式 | 开发测试 | All-in-One | 所有组件合一 |
+| 生产模式 | 生产环境 | Agent+Collector+Query | 组件分离 |
+| 高可用模式 | 多机房 | 多副本+负载均衡 | 高可用 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph 生产部署架构
+        APP1[应用1] --> AGENT1[Agent 1]
+        APP2[应用2] --> AGENT1
+        APP3[应用3] --> AGENT2[Agent 2]
+        AGENT1 --> KAFKA[Kafka集群]
+        AGENT2 --> KAFKA
+        KAFKA --> COLLECTOR1[Collector 1]
+        KAFKA --> COLLECTOR2[Collector 2]
+        COLLECTOR1 --> ES[Elasticsearch集群]
+        COLLECTOR2 --> ES
+        ES --> QUERY1[Query 1]
+        ES --> QUERY2[Query 2]
+        QUERY1 --> UI[Jaeger UI]
+        QUERY2 --> UI
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Agent CPU | 应用数 × 0.1核 | 1-2核/节点 |
+| Agent 内存 | 应用数 × 10MB | 100-256MB |
+| Collector CPU | QPS × 0.001 | 4-8核 |
+| Collector 内存 | QPS × 0.01MB | 4-8GB |
+| Query CPU | 并发查询数 × 1 | 2-4核 |
+| Query 内存 | 并发查询数 × 100MB | 2-4GB |
+| ES节点 | 存储量 / 50GB | 3+节点 |
+
+### 采样策略生产配置
+
+```yaml
+# 生产环境采样策略
+sampling:
+  default_strategy:
+    type: probabilistic
+    param: 0.01  # 默认1%采样率
+    
+  service_strategies:
+    # 核心服务100%采样
+    - service: order-service
+      type: probabilistic
+      param: 1.0
+      
+    # 一般服务10%采样
+    - service: user-service
+      type: probabilistic
+      param: 0.1
+      
+    # 高吞吐服务1%采样
+    - service: log-service
+      type: probabilistic
+      param: 0.01
+      
+    # 错误请求100%采样
+    - service: payment-service
+      type: probabilistic
+      param: 1.0
+      operation: processPayment
+```
+
+### 存储后端优化
+
+| 存储类型 | 优化配置 | 说明 |
+|----------|---------|------|
+| Elasticsearch | 分片数=节点数×2 | 写入性能 |
+| Elasticsearch | 副本数=1 | 读取性能 |
+| Cassandra | 复制因子=3 | 高可用 |
+| ClickHouse | 分区键=日期 | 查询性能 |
+
+```yaml
+# Elasticsearch 存储优化
+es:
+  server_urls: ["http://es1:9200", "http://es2:9200"]
+  index_prefix: "jaeger"
+  num_shards: 6
+  num_replicas: 1
+  refresh_interval: "30s"
+ Translog.durability: async
+  Translog.sync_interval: "30s"
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: jaeger-alerts
+    rules:
+      - alert: JaegerCollectorDown
+        expr: up{job="jaeger-collector"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Jaeger Collector 宕机"
+
+      - alert: JaegerHighLatency
+        expr: histogram_quantile(0.99, rate(jaeger_query_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jaeger 查询延迟过高"
+
+      - alert: JaegerSpanDropRate
+        expr: rate(jaeger_collector_spans_dropped_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jaeger Span 丢弃率过高"
+```
+
+### 性能压测与调优
+
+| 压测场景 | 压测指标 | 目标值 | 调优方向 |
+|----------|---------|--------|---------|
+| 高并发写入 | Span写入TPS | 100000+ | Collector水平扩展 |
+| 大规模查询 | 查询延迟 | <1s | ES索引优化 |
+| 采样决策 | 采样延迟 | <1ms | 本地采样策略 |
+| 存储压缩 | 压缩比 | >5:1 | 存储格式优化 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Agent宕机 | 停止Agent | 应用自动重连 | <10s |
+| Collector故障 | 停止Collector | Kafka缓冲+自动恢复 | <30s |
+| ES集群故障 | 停止ES节点 | 查询降级+数据不丢失 | <5min |
+| Kafka故障 | 停止Kafka | Collector直连ES | <1min |
+
+### 多租户隔离
+
+```text
+Jaeger 多租户隔离策略：
+
+  命名空间隔离：
+    ├── 按团队：team-a, team-b
+    ├── 按环境：prod, staging, dev
+    └── 按区域：us-east, eu-west
+
+  资源隔离：
+    ├── 采样率：按租户独立配置
+    ├── 存储配额：按租户限制存储空间
+    └── 查询限制：按租户限制查询QPS
+
+  安全隔离：
+    ├── 认证：OAuth2/API Key
+    ├── 授权：RBAC权限控制
+    └── 审计：操作日志记录
+```
+
+### 与OpenTelemetry生态集成
+
+```mermaid
+graph LR
+    subgraph OpenTelemetry生态
+        APP[应用] --> OTelSDK[OTel SDK]
+        OTelSDK --> OTelCollector[OTel Collector]
+        OTelCollector --> JAEGER[Jaeger]
+        OTelCollector --> PROM[Prometheus]
+        OTelCollector --> TEMPO[Tempo]
+        OTelCollector --> LOG[Loki]
+    end
+    
+    subgraph 可观测性平台
+        JAEGER --> GRAFANA[Grafana]
+        PROM --> GRAFANA
+        TEMPO --> GRAFANA
+        LOG --> GRAFANA
+    end
+```
+
 ## 七、与其他板块的关系
 
 - 链路追踪原理（SkyWalking）见「[链路追踪 SkyWalking](./链路追踪SkyWalking.md)」；

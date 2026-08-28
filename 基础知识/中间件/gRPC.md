@@ -1842,6 +1842,161 @@ protoc --grpc-gateway_out=. \
 go run main.go --grpc-server-endpoint=localhost:8080 --http-server-port=8081
 ```
 
+## gRPC 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 组件配置 | 说明 |
+|----------|---------|----------|------|
+| 单机模式 | 开发测试 | All-in-One | 所有组件合一 |
+| 集群模式 | 生产环境 | 多副本+负载均衡 | 高可用 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+| 服务网格 | 微服务 | Istio/Envoy | 流量治理 |
+
+```mermaid
+graph TB
+    subgraph gRPC集群架构
+        CLIENT[客户端] --> LB[负载均衡]
+        LB --> SVC1[服务1]
+        LB --> SVC2[服务2]
+        LB --> SVC3[服务3]
+        SVC1 --> DB[(数据库)]
+        SVC2 --> DB
+        SVC3 --> DB
+        
+        subgraph 服务网格
+            ISTIO[Istio Sidecar] --> SVC1
+            ISTIO --> SVC2
+            ISTIO --> SVC3
+        end
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| 服务CPU | QPS × 0.001 | 4-8核 |
+| 服务内存 | 并发连接数 × 1MB | 4-8GB |
+| 连接池大小 | QPS / 响应时间 | 100+ |
+| 线程池大小 | CPU核数 × 2 | 8-16 |
+| 超时时间 | 业务容忍度 | 1-30s |
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: grpc-alerts
+    rules:
+      - alert: GRPCHighLatency
+        expr: histogram_quantile(0.99, rate(grpc_server_handling_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "gRPC请求延迟过高"
+
+      - alert: GRPCHighErrorRate
+        expr: rate(grpc_server_handled_total{grpc_code!="OK"}[5m]) / rate(grpc_server_handled_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "gRPC错误率过高"
+
+      - alert: GRPCHighConnectionCount
+        expr: grpc_server_connections > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "gRPC连接数过高"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| Proto文件 | Git版本控制 | 每次变更 | 永久 |
+| 服务配置 | 配置中心 | 每次变更 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+| 日志数据 | 文件归档 | 每日 | 30天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| 服务宕机 | 停止服务 | 负载均衡摘除 | <30s |
+| 连接池耗尽 | 模拟连接池满 | 自动扩容 | <1min |
+| 超时故障 | 模拟超时 | 重试机制生效 | <10s |
+| 网络分区 | 模拟网络隔离 | 服务降级 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级gRPC配置
+tenants:
+  - name: "tenant-a"
+    grpc:
+      max-connections: 1000
+      max-concurrent-rpcs: 100
+      timeout: 5s
+      keepalive:
+        time: 30s
+        timeout: 10s
+
+  - name: "tenant-b"
+    grpc:
+      max-connections: 2000
+      max-concurrent-rpcs: 200
+      timeout: 10s
+      keepalive:
+        time: 60s
+        timeout: 20s
+```
+
+### 与微服务生态集成
+
+```yaml
+# Istio gRPC配置
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: grpc-service
+spec:
+  hosts:
+  - grpc-service
+  http:
+  - route:
+    - destination:
+        host: grpc-service
+        port:
+          number: 50051
+    timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: grpc-service
+spec:
+  host: grpc-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: DEFAULT
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    loadBalancer:
+      simple: ROUND_ROBIN
+```
+
 ## 十二、与其他板块的关系（扩展）
 
 - Dubbo 对比见「[Apache Dubbo RPC 框架](./ApacheDubboRPC框架.md)」；

@@ -1837,6 +1837,169 @@ ruler:
 
 ---
 
+## Loki 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 组件配置 | 说明 |
+|----------|---------|----------|------|
+| 单机模式 | 开发测试 | All-in-One | 所有组件合一 |
+| 生产模式 | 生产环境 | Agent+Gateway+Distributor+Ingester+Querier | 组件分离 |
+| 高可用模式 | 多机房 | 多副本+负载均衡 | 高可用 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph Loki集群架构
+        PROMTAIL[Promtail] --> AGENT[Agent]
+        AGENT --> GATEWAY[Gateway]
+        GATEWAY --> DIST[Distributor]
+        DIST --> INGESTER1[Ingester 1]
+        DIST --> INGESTER2[Ingester 2]
+        INGESTER1 --> S3[(S3对象存储)]
+        INGESTER2 --> S3
+        QUERIER[Querier] --> S3
+        QUERIER --> INDEX[(索引存储)]
+        API[API] --> QUERIER
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Agent CPU | 日志量 / 1GB × 0.1 | 1-2核/节点 |
+| Agent 内存 | 日志量 / 1GB × 10MB | 100-256MB |
+| Ingester CPU | 日志TPS × 0.001 | 4-8核 |
+| Ingester 内存 | 日志TPS × 1MB | 4-8GB |
+| Querier CPU | 并发查询数 × 2 | 4-8核 |
+| Querier 内存 | 并发查询数 × 4GB | 8-16GB |
+| 存储空间 | 日志量 × 保留天数 × 0.3 | 按需 |
+
+### LogQL查询优化
+
+```logql
+# 1. 使用标签过滤
+{app="nginx"} |= "error"  # 好
+{app="nginx"} | logfmt | level="error"  # 更好
+
+# 2. 使用正则过滤
+{app="nginx"} |~ "error|warn"  # 好
+{app="nginx"} |~ "(error|warn)"  # 更好
+
+# 3. 使用聚合函数
+sum(rate({app="nginx"} |= "error" [5m])) by (instance)
+
+# 4. 使用日志管线
+{app="nginx"} 
+| logfmt 
+| line_format "{{.level}} {{.message}}"
+| json "level", "message"
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: loki-alerts
+    rules:
+      - alert: LokiIngesterHighMemory
+        expr: loki_ingester_memory_chunks > 1000000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki Ingester内存使用过高"
+
+      - alert: LokiIngesterHighStreamCount
+        expr: loki_ingester_streams_created_total > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki Ingester流数量过多"
+
+      - alert: LokiQuerySlow
+        expr: histogram_quantile(0.99, rate(loki_query_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki查询延迟过高"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 日志数据 | S3版本控制 | 实时 | 30天 |
+| 索引数据 | 数据库备份 | 每日 | 30天 |
+| 配置文件 | Git版本控制 | 每次变更 | 永久 |
+| 告警规则 | 配置文件 | 每次变更 | 永久 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Ingester宕机 | 停止Ingester | 日志写入降级 | <1min |
+| Querier故障 | 停止Querier | 查询降级 | <30s |
+| 存储故障 | 模拟S3故障 | 日志写入失败 | <5min |
+| 索引故障 | 模拟索引故障 | 查询失败 | <1min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级配置
+auth_enabled: true
+
+limits_config:
+  max_entries_limit_per_query: 5000
+  max_query_length: 721h
+  max_query_parallelism: 32
+
+# 租户级存储
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+  filesystem:
+    directory: /loki/chunks
+
+# 租户级保留
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 744h
+```
+
+### 与可观测性生态集成
+
+```yaml
+# Grafana配置
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      maxLines: 1000
+      timeout: 60
+
+# Tempo配置
+metrics_generator:
+  ring:
+    kvstore:
+      store: memberlist
+  processor:
+    service_graphs:
+      dimensions:
+        - service_name
+    span_metrics:
+      dimensions:
+        - service_name
+```
+
 ## 与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；

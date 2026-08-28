@@ -1904,6 +1904,501 @@ MAT分析要点：
   缓存：无限缓存未设置过期
 ```
 
+## GC 日志分析深度实战
+
+### GC 日志关键指标监控
+
+```text
+GC 日志核心指标：
+┌──────────────────────┬────────────────────────────────────────────┐
+│ 指标                  │ 健康基线                                    │
+├──────────────────────┼────────────────────────────────────────────┤
+│ Young GC 频率         │ < 10次/分钟                                │
+│ Young GC 暂停时间     │ < 50ms                                     │
+│ Full GC 频率          │ < 1次/小时                                 │
+│ Full GC 暂停时间      │ < 200ms                                    │
+│ GC 时间占比           │ < 5%                                       │
+│ 内存回收效率          │ 每次 GC 回收 > 30% 使用空间                │
+│ 晋升速率              │ < 100MB/分钟                               │
+│ Humongous 分配        │ 接近 0                                     │
+└──────────────────────┴────────────────────────────────────────────┘
+```
+
+### GC 日志分析工具对比
+
+| 工具 | 类型 | 特点 | 适用 |
+|------|------|------|------|
+| GCViewer | 本地 GUI | 免费、可视化好 | 开发环境 |
+| GCEasy | Web | 在线分析、报告详细 | 快速诊断 |
+| HPjmeter | 本地 GUI | IBM 出品、功能全面 | 大型应用 |
+| Garbagecat | 命令行 | 日志解析、批量分析 | 自动化 |
+| JClarity Censum | 本地 GUI | 专注低延迟分析 | ZGC/Shenandoah |
+
+```bash
+# GCViewer 分析 GC 日志
+java -jar gcviewer.jar gc.log gc-report.html
+
+# GCEasy 在线分析
+# 上传 gc.log 到 https://gceasy.io
+# 查看：GC 暂停时间、内存使用趋势、分配速率
+```
+
+## JVM 内存布局深度分析
+
+### 对象内存布局计算
+
+```java
+// 对象大小计算示例
+class User {
+    private long id;          // 8 bytes
+    private int age;          // 4 bytes
+    private boolean active;   // 1 byte
+    private String name;      // 4 bytes（引用）
+}
+
+// 对象头：12 bytes（64位 JVM）
+// 对齐填充：4 bytes（总大小 24 bytes）
+```
+
+### 内存分配策略
+
+```text
+内存分配优化：
+  1. 对象优先在 Eden 分配
+     - 大对象直接进入老年代
+     - 避免在 Eden 区来回复制
+
+  2. 大对象直接进入老年代
+     - -XX:PretenureSizeThreshold
+     - 避免大对象在 Eden 区分配
+
+  3. 长期存活的对象进入老年代
+     - -XX:MaxTenuringThreshold
+     - 默认 15 次 GC 后进入老年代
+
+  4. 动态对象年龄判断
+     - 相同年龄所有对象大小 > Survivor 空间一半
+     - 该年龄或以上对象进入老年代
+```
+
+## JIT 编译优化
+
+### JIT 编译策略
+
+```text
+JIT 编译优化：
+  1. 方法内联
+     - 小方法直接内联
+     - 减少方法调用开销
+     - -XX:MaxInlineSize
+
+  2. 逃逸分析
+     - 栈上分配（对象未逃逸）
+     - 标量替换（拆分为基本类型）
+     - 锁消除（无竞争锁）
+
+  3. 循环展开
+     - 减少循环次数
+     - 提高缓存命中率
+
+  4. 公共子表达式消除
+     - 重复计算只算一次
+     - 编译期优化
+```
+
+### JIT 编译监控
+
+```bash
+# 查看 JIT 编译日志
+-XX:+PrintCompilation
+
+# 查看内联决策
+-XX:+UnlockDiagnosticVMOptions
+-XX:+PrintInlining
+
+# 查看编译统计
+-XX:+UnlockDiagnosticVMOptions
+-XX:+PrintCompilationStatistics
+```
+
+## JVM Crash 排查
+
+### JVM Crash 常见原因
+
+```text
+JVM Crash 原因：
+  1. 内存溢出
+     - OOM 导致 JVM 退出
+     - 检查堆内存配置
+
+  2. 栈溢出
+     - 递归过深
+     - 检查 -Xss 配置
+
+  3. JNI 错误
+     - 本地代码错误
+     - 检查 JNI 调用
+
+  4. JVM Bug
+     - 已知 JVM Bug
+     - 升级 JVM 版本
+
+  5. 资源耗尽
+     - 文件描述符不足
+     - 线程数过多
+```
+
+### JVM Crash 排查步骤
+
+```bash
+# 1. 查看 crash 日志
+cat hs_err_pid<pid>.log
+
+# 2. 分析关键信息
+# - 崩溃原因
+# - 崩溃位置
+# - 寄存器状态
+# - 堆栈信息
+
+# 3. 检查 JVM 配置
+# - 堆内存大小
+# - GC 配置
+# - 线程配置
+
+# 4. 检查代码
+# - JNI 调用
+# - 本地代码
+# - 资源管理
+```
+
+## 容器环境 JVM 调优
+
+### 容器 JVM 配置
+
+```bash
+# Docker 容器 JVM 配置
+java -XX:+UseContainerSupport \
+     -XX:MaxRAMPercentage=75.0 \
+     -XX:InitialRAMPercentage=50.0 \
+     -XX:+UseG1GC \
+     -XX:MaxGCPauseMillis=200 \
+     -jar app.jar
+
+# Kubernetes Pod 资源限制
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+  limits:
+    memory: "1Gi"
+    cpu: "1000m"
+```
+
+### 容器 JVM 调优要点
+
+```text
+容器环境调优：
+  1. 内存感知
+     - -XX:+UseContainerSupport
+     - -XX:MaxRAMPercentage
+     - 避免固定堆大小
+
+  2. CPU 感知
+     - -XX:ActiveProcessorCount
+     - GC 线程数调整
+
+  3. 文件系统
+     - 使用 tmpfs（/dev/shm）
+     - 避免磁盘 IO 瓶颈
+
+  4. 网络
+     - 使用 host 网络（高性能）
+     - 避免 NAT 开销
+```
+
+## ZGC/Shenandoah 调优参数
+
+### ZGC 调优参数
+
+```bash
+# ZGC 配置
+java -XX:+UseZGC \
+     -XX:SoftMaxHeapSize=2g \
+     -XX:ZAllocationSpikeTolerance=2.0 \
+     -XX:ZCollectionInterval=5 \
+     -Xmx4g \
+     -Xms4g \
+     -jar app.jar
+```
+
+### Shenandoah 调优参数
+
+```bash
+# Shenandoah 配置
+java -XX:+UseShenandoahGC \
+     -XX:ShenandoahGCHeuristics=compact \
+     -XX:ShenandoahMinFreeThreshold=10 \
+     -XX:ShenandoahUncommitDelay=1000 \
+     -Xmx4g \
+     -Xms4g \
+     -jar app.jar
+```
+
+### 低延迟 GC 参数对比
+
+| 参数 | ZGC | Shenandoah |
+|------|-----|------------|
+| 目标暂停时间 | < 10ms | < 10ms |
+| 堆大小支持 | 8MB - 16TB | 8MB - 16TB |
+| 并发阶段 | 几乎全部 | 几乎全部 |
+| 内存开销 | 中等 | 中等 |
+| 适用场景 | 超大堆/低延迟 | 超大堆/低延迟 |
+
+## async-profiler 性能分析
+
+### async-profiler 使用
+
+```bash
+# CPU 采样
+./profiler.sh -d 30 -e cpu -f cpu_profile.html <pid>
+
+# 内存分配分析
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# 锁分析
+./profiler.sh -d 30 -e lock -f lock_profile.html <pid>
+```
+
+### 性能分析工具对比
+
+| 工具 | 采样方式 | 开销 | 适用场景 |
+|------|---------|------|---------|
+| async-profiler | JVMTI | 低 | 生产环境 |
+| JProfiler | JVMTI | 中 | 开发/测试 |
+| YourKit | JVMTI | 中 | 开发/测试 |
+| JVisualVM | JMX | 中 | 开发/测试 |
+| Arthas | JVMTI | 低 | 生产环境 |
+
+## JFR（Java Flight Recorder）
+
+### JFR 配置
+
+```bash
+# 启动JFR
+java -XX:+FlightRecorder \
+  -XX:StartFlightRecording=duration=60s,filename=recording.jfr \
+  -jar app.jar
+
+# 运行时开启JFR
+jcmd 1 JFR.start duration=60s filename=recording.jfr
+
+# 持续录制
+jcmd 1 JFR.start settings=default filename=continuous.jfr
+jcmd 1 JFR.stop
+```
+
+### JFR 事件分析
+
+```text
+JFR关键事件：
+  GC事件：G1GarbageCollection、ZGCCycle
+  CPU事件：MethodProfilingSample、ExecutionSample
+  内存事件：ObjectAllocationInNewTLAB、ObjectAllocationOutsideTLAB
+  I/O事件：FileRead、FileWrite、SocketRead、SocketWrite
+  锁事件：JavaMonitorEnter、JavaMonitorBlocked
+```
+
+## 内存泄漏排查（LeakCanary/Dominator Tree）
+
+### 内存泄漏排查步骤
+
+```text
+内存泄漏排查步骤：
+  1. 确认泄漏
+     - 观察堆内存增长趋势
+     - Full GC后内存不下降
+     - OOM频繁发生
+  
+  2. 生成堆转储
+     - jmap -dump:format=b,file=dump.hprof <pid>
+     - 或 -XX:+HeapDumpOnOutOfMemoryError
+  
+  3. 分析堆转储
+     - MAT（Memory Analyzer Tool）
+     - VisualVM
+     - JProfiler
+  
+  4. 查找泄漏点
+     - Dominator Tree：查看最大对象
+     - Leak Suspects：自动分析报告
+     - Reference Tree：查看引用链
+  
+  5. 定位代码
+     - 查看对象创建位置
+     - 分析引用链
+     - 找到GC Root
+  
+  6. 修复验证
+     - 修复代码
+     - 重新测试
+     - 验证内存不再增长
+```
+
+### MAT 分析示例
+
+```text
+MAT分析要点：
+  Leak Suspects Report：
+    自动识别可疑泄漏对象
+    显示对象大小和引用链
+  
+  Dominator Tree：
+    按对象大小排序
+    查看最大对象的GC Root
+  
+  Histogram：
+    按类统计对象数量
+    查找对象异常增长
+  
+  OQL（Object Query Language）：
+    SELECT * FROM java.lang.String s WHERE s.count > 1000
+    查找大字符串对象
+
+常见泄漏模式：
+  静态集合：static Map/List不断增长
+  ThreadLocal：未清理的ThreadLocal
+  未关闭资源：数据库/文件连接未关闭
+  监听器：注册后未注销
+  缓存：无限缓存未设置过期
+```
+
+## JVM 调优参数速查
+
+### 内存参数
+
+```bash
+# 堆内存
+-Xms4g                    # 初始堆大小
+-Xmx4g                    # 最大堆大小
+-Xmn2g                    # 新生代大小
+-Xss512k                  # 线程栈大小
+
+# 元空间
+-XX:MetaspaceSize=256m
+-XX:MaxMetaspaceSize=512m
+
+# 直接内存
+-XX:MaxDirectMemorySize=1g
+```
+
+### GC 参数
+
+```bash
+# G1 GC
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:G1HeapRegionSize=16m
+-XX:InitiatingHeapOccupancyPercent=45
+
+# ZGC
+-XX:+UseZGC
+-XX:SoftMaxHeapSize=2g
+-XX:ZAllocationSpikeTolerance=2.0
+
+# Shenandoah
+-XX:+UseShenandoahGC
+-XX:ShenandoahGCHeuristics=compact
+```
+
+### 调试参数
+
+```bash
+# GC 日志
+-XX:+PrintGCDetails
+-XX:+PrintGCDateStamps
+-Xloggc:gc.log
+
+# Heap Dump
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/tmp/dump.hprof
+
+# JFR
+-XX:+FlightRecorder
+-XX:StartFlightRecording=duration=60s,filename=recording.jfr
+```
+
+## JVM 监控与告警
+
+### 监控指标
+
+```yaml
+# JVM 监控配置
+jvm_monitoring:
+  metrics:
+    - name: "jvm_heap_memory_used"
+      description: "堆内存使用量"
+      threshold: 0.8
+    
+    - name: "jvm_heap_memory_max"
+      description: "堆内存最大值"
+      threshold: 0.9
+    
+    - name: "jvm_gc_pause_count"
+      description: "GC暂停次数"
+      threshold: 100
+    
+    - name: "jvm_gc_pause_duration"
+      description: "GC暂停时间"
+      threshold: 200
+    
+    - name: "jvm_thread_count"
+      description: "线程数"
+      threshold: 500
+    
+    - name: "jvm_class_count"
+      description: "类加载数"
+      threshold: 10000
+```
+
+| 监控指标 | 说明 | 告警阈值 |
+|----------|------|----------|
+| 堆内存使用率 | 堆内存使用量/最大值 | >80% |
+| GC暂停时间 | 单次GC暂停时间 | >200ms |
+| GC频率 | 每分钟GC次数 | >10次 |
+| 线程数 | 活跃线程数 | >500 |
+| 类加载数 | 已加载类数量 | >10000 |
+
+### JVM 最佳实践
+
+```text
+JVM 调优最佳实践：
+
+1. 先监控后调优
+   - 部署监控（Prometheus + Grafana）
+   - 收集基线数据
+   - 识别瓶颈
+
+2. 选择合适的 GC
+   - 通用场景：G1 GC
+   - 低延迟场景：ZGC/Shenandoah
+   - 小内存场景：Serial GC
+
+3. 合理配置内存
+   - 堆大小：-Xms = -Xmx
+   - 新生代：-Xmn = 1/3 堆大小
+   - 元空间：根据类加载数调整
+
+4. 优化代码
+   - 减少对象创建
+   - 避免内存泄漏
+   - 使用对象池
+
+5. 持续监控
+   - 实时监控 GC
+   - 关注内存趋势
+   - 定期调优
+```
+
 ## 十七、与其他板块的关联
 
 - JVM 原理见「[Java 虚拟机](../基础知识/Java虚拟机.md)」；

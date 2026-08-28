@@ -1863,6 +1863,204 @@ spec:
 | minAvailable | 2 | 最少保留 2 个 Pod |
 | maxUnavailable | 1 | 最多允许 1 个 Pod 不可用 |
 
+## Docker多阶段构建深度优化
+
+### 构建缓存策略
+
+| 缓存策略 | 说明 | 优化效果 |
+|----------|------|----------|
+| 层缓存 | 利用Docker层缓存机制 | 快 |
+| BuildKit缓存 | 使用--mount=type=cache | 快 |
+| 多阶段构建 | 隔离构建环境 | 中 |
+| .dockerignore | 排除不需要的文件 | 快 |
+
+```dockerfile
+# 多阶段构建示例
+FROM golang:1.21 AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /app/server .
+
+FROM alpine:3.18
+RUN apk --no-cache add ca-certificates
+COPY --from=builder /app/server /server
+ENTRYPOINT ["/server"]
+```
+
+### K8s Pod生命周期详解
+
+| 阶段 | 说明 | 配置 |
+|------|------|------|
+| Pending | 等待调度 | - |
+| Running | 容器运行中 | - |
+| Succeeded | 正常退出 | restartPolicy: Never |
+| Failed | 异常退出 | restartPolicy: Never |
+| Unknown | 状态未知 | - |
+
+### Pod生命周期钩子
+
+| 钩子 | 用途 | 示例 |
+|------|------|------|
+| postStart | 容器启动后执行 | 初始化/注册服务 |
+| preStop | 容器停止前执行 | 优雅关闭/清理 |
+
+```yaml
+# Pod生命周期钩子示例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lifecycle-demo
+spec:
+  containers:
+  - name: lifecycle-demo-container
+    image: nginx
+    lifecycle:
+      postStart:
+        exec:
+          command: ["/bin/sh", "-c", "echo Started > /tmp/started"]
+      preStop:
+        exec:
+          command: ["/bin/sh", "-c", "nginx -s quit; sleep 15"]
+```
+
+### Helm Chart最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 模板化 | 使用values.yaml参数化 | 高 |
+| 版本管理 | 语义化版本号 | 高 |
+| 测试 | helm test验证部署 | 高 |
+| 回滚 | helm rollback支持 | 高 |
+| 依赖管理 | Chart.yaml声明依赖 | 中 |
+
+### K8s Service类型对比
+
+| Service类型 | 说明 | 适用场景 | 负载均衡 |
+|-------------|------|----------|----------|
+| ClusterIP | 集群内访问 | 内部服务 | K8s |
+| NodePort | 节点端口暴露 | 开发测试 | K8s |
+| LoadBalancer | 云LB暴露 | 生产环境 | 云厂商 |
+| ExternalName | DNS别名 | 外部服务 | - |
+
+### PV/PVC/StorageClass
+
+| 组件 | 作用 | 说明 |
+|------|------|------|
+| PV | 持久化存储 | 管理员创建 |
+| PVC | 存储请求 | 用户创建 |
+| StorageClass | 存储类别 | 动态供给 |
+| StoragePod | 存储服务 | CSI驱动 |
+
+### 网络策略配置
+
+```yaml
+# 网络策略示例
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: allowed
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: allowed
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+```
+
+### HPA自动扩缩配置
+
+```yaml
+# HPA配置示例
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+### PDB（Pod Disruption Budget）
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| minAvailable | 最少可用Pod数 | 1 |
+| maxUnavailable | 最多不可用Pod数 | 1 |
+| selector | Pod选择器 | 匹配目标Pod |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 资源限制 | 设置requests/limits | 高 |
+| 健康检查 | liveness/readiness探针 | 高 |
+| 滚动更新 | maxSurge/maxUnavailable | 高 |
+| 镜像拉取 | 使用imagePullPolicy | 高 |
+| 标签管理 | 规范化标签 | 中 |
+| 命名空间 | 隔离不同环境 | 中 |
+| RBAC | 最小权限原则 | 高 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| Pod CrashLoopBackOff | 启动失败/健康检查失败 | 检查日志/调整探针 |
+| Pod Pending | 资源不足/节点亲和 | 检查资源/调整调度 |
+| Service无法访问 | 端口不匹配/标签错误 | 检查Service配置 |
+| PVC绑定失败 | StorageClass/权限 | 检查存储配置 |
+| OOMKilled | 内存不足 | 增加内存限制 |
+
 ## 二十二、与其他板块的关系
 
 ```text

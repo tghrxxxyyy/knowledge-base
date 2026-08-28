@@ -1930,3 +1930,268 @@ Delegation Token机制：
 - 数据湖见「[数据湖格式](./05-列式存储与数据湖格式.md)」；
 - 资源调度见「[YARN与Kubernetes](./10-资源调度：YARN与Kubernetes.md)」；
 - 云存储见「[云上存储](../中间件/云上存储体系.md)」。
+
+## HDFS 纠删码（Erasure Coding）
+
+### 纠删码配置
+
+```bash
+# 启用纠删码策略
+hdfs ec -enablePolicy -policy RS-6-3-1024k
+
+# 设置目录使用纠删码
+hdfs ec -setPolicy -path /data/cold -policy RS-6-3-1024k
+
+# 查看纠删码策略
+hdfs ec -listPolicies
+
+# 查看目录纠删码状态
+hdfs ec -getPolicy -path /data/cold
+```
+
+| 纠删码策略 | 数据块 | 校验块 | 容错 | 适用场景 |
+|-----------|--------|--------|------|----------|
+| RS-6-3-1024k | 6 | 3 | 3块故障 | 温数据 |
+| RS-3-2-1024k | 3 | 2 | 2块故障 | 冷数据 |
+| RS-10-4-1024k | 10 | 4 | 4块故障 | 大规模存储 |
+
+### 纠删码 vs 副本
+
+| 维度 | 3副本 | RS-6-3纠删码 |
+|------|-------|-------------|
+| 存储开销 | 300% | 150% |
+| 写性能 | 高 | 中 |
+| 读性能 | 高 | 中 |
+| 容错 | 2块故障 | 3块故障 |
+| 适用 | 热数据 | 温/冷数据 |
+
+## HDFS 存储分层
+
+```bash
+# 配置存储策略
+hdfs storagepolicies -setStoragePolicy -path /data/hot -policy ALL_SSD
+hdfs storagepolicies -setStoragePolicy -path /data/warm -policy ONE_SSD
+hdfs storagepolicies -setStoragePolicy -path /data/cold -policy COLD
+
+# 查看存储策略
+hdfs storagepolicies -getStoragePolicy -path /data
+
+# 迁移数据
+hdfs mover -p /data
+```
+
+| 存储策略 | 存储介质 | 适用场景 |
+|----------|----------|----------|
+| ALL_SSD | SSD | 热数据/低延迟 |
+| ONE_SSD | SSD+HDD | 温数据 |
+| ALL_DISK | HDD | 冷数据 |
+| COLD | 归档存储 | 极冷数据 |
+
+## HDFS Balancer 平衡器
+
+```bash
+# 运行平衡器
+hdfs balancer -threshold 5
+
+# 指定带宽
+hdfs dfsadmin -setBalancerBandwidth 104857600  # 100MB/s
+
+# 查看平衡状态
+hdfs dfsadmin -printTopology
+```
+
+```text
+平衡器工作原理：
+  1. 计算各节点磁盘使用率
+  2. 找到高于/低于阈值的节点
+  3. 选择数据块进行迁移
+  4. 限制迁移带宽（避免影响业务）
+
+阈值设置：
+  threshold=5：磁盘使用率差异>5%触发
+  建议：生产环境5-10%
+```
+
+## HDFS NameNode RPC 优化
+
+```xml
+<!-- NameNode RPC 配置 -->
+<property>
+  <name>dfs.namenode.handler.count</name>
+  <value>100</value>
+</property>
+<property>
+  <name>dfs.namenode.service.handler.count</name>
+  <value>100</value>
+</property>
+<property>
+  <name>ipc.server.max.pending.requests</name>
+  <value>1000</value>
+</property>
+```
+
+```text
+RPC优化要点：
+  1. Handler数量：根据并发请求数调整
+  2. 队列深度：避免请求堆积
+  3. 超时设置：合理设置RPC超时
+  4. 连接复用：减少连接建立开销
+```
+
+## HDFS 云对象存储集成
+
+```xml
+<!-- S3A 配置 -->
+<property>
+  <name>fs.s3a.endpoint</name>
+  <value>https://s3.amazonaws.com</value>
+</property>
+<property>
+  <name>fs.s3a.access.key</name>
+  <value>${AWS_ACCESS_KEY_ID}</value>
+</property>
+<property>
+  <name>fs.s3a.secret.key</name>
+  <value>${AWS_SECRET_ACCESS_KEY}</value>
+</property>
+<property>
+  <name>fs.s3a.impl</name>
+  <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+</property>
+```
+
+```text
+云存储集成：
+  S3A：AWS S3 原生支持
+  ABFS：Azure Blob Storage
+  GCSFS：Google Cloud Storage
+
+优势：
+  弹性扩展：按需付费
+  高可用：99.999999999% 持久性
+  低成本：比本地存储便宜
+```
+
+## HDFS Federation 联邦
+
+```xml
+<!-- Federation 配置 -->
+<property>
+  <name>dfs.nameservices</name>
+  <value>ns1,ns2</value>
+</property>
+<property>
+  <name>dfs.namenode.rpc-address.ns1</name>
+  <value>nn1:8020</value>
+</property>
+<property>
+  <name>dfs.namenode.rpc-address.ns2</name>
+  <value>nn2:8020</value>
+</property>
+```
+
+```text
+Federation 优势：
+  水平扩展：多个NameNode独立管理
+  命名空间隔离：不同业务独立
+  性能提升：并发处理能力增强
+```
+
+## HDFS HA（高可用）
+
+```xml
+<!-- HA 配置 -->
+<property>
+  <name>dfs.nameservices</name>
+  <value>mycluster</value>
+</property>
+<property>
+  <name>dfs.ha.namenodes.mycluster</name>
+  <value>nn1,nn2</value>
+</property>
+<property>
+  <name>dfs.namenode.shared.edits.dir</name>
+  <value>qjournal://jn1:8485;jn2:8485;jn3:8485/mycluster</value>
+</property>
+```
+
+```text
+HA 故障转移：
+  1. ZKFC 监控 NameNode 状态
+  2. NameNode 故障时自动切换
+  3. JournalNode 保证编辑日志一致
+  4. 客户端自动重试
+```
+
+## HDFS 快照（Snapshot）
+
+```bash
+# 启用快照
+hdfs dfsadmin -allowSnapshot /data
+
+# 创建快照
+hdfs dfs -createSnapshot /data snap-20240101
+
+# 查看快照
+hdfs lsSnapshots /data
+
+# 比较快照差异
+hdfs dfs -diffSnapshot /data/.snapshot/snap1 /data/.snapshot/snap2
+```
+
+## HDFS 缓存（Centralized Cache Management）
+
+```bash
+# 缓存文件
+hdfs cacheadmin -addDirective -path /data/hot -pool default
+
+# 缓存目录
+hdfs cacheadmin -addDirective -path /data/critical -replication 2
+
+# 查看缓存状态
+hdfs cacheadmin -listDirectives
+
+# 删除缓存
+hdfs cacheadmin -removeDirective 1
+```
+
+## HDFS 最佳实践
+
+```text
+HDFS 最佳实践：
+
+1. 目录结构
+   - 按业务域划分目录
+   - 按数据层级划分（raw/cleaned/curated）
+   - 避免小文件（合并小文件）
+
+2. 文件大小
+   - 建议文件大小：128MB - 1GB
+   - 避免大量小文件（NameNode压力）
+   - 使用SequenceFile/Parquet合并
+
+3. 副本策略
+   - 热数据：3副本
+   - 温数据：2副本
+   - 冷数据：纠删码
+
+4. 压缩
+   - 列式存储+压缩（Parquet+Snappy）
+   - 减少存储空间
+   - 提高查询性能
+
+5. 权限管理
+   - 按业务域分配权限
+   - 敏感数据脱敏
+   - 审计日志
+```
+
+## HDFS 故障排查
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| NameNode启动失败 | 编辑日志损坏 | 检查日志 | 修复日志 |
+| DataNode连接失败 | 网络问题 | 检查网络 | 修复网络 |
+| 块损坏 | 磁盘故障 | 检查磁盘 | 更换磁盘 |
+| 写入失败 | 副本不足 | 检查副本数 | 调整副本数 |
+| 读取延迟 | 网络拥塞 | 检查网络 | 优化网络 |

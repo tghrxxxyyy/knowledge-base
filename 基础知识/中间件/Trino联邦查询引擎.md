@@ -1833,6 +1833,156 @@ connection-password=trino-password
 
 ---
 
+## Trino 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | Coordinator+Worker |
+| 云原生模式 | K8s | 弹性 | Operator部署 |
+| 混合模式 | 大规模 | 10+ | 多集群 |
+
+```mermaid
+graph TB
+    subgraph Trino集群架构
+        CLIENT[客户端] --> COORD[Coordinator]
+        COORD --> WORKER1[Worker 1]
+        COORD --> WORKER2[Worker 2]
+        COORD --> WORKER3[Worker 3]
+        WORKER1 --> HIVE[(Hive)]
+        WORKER2 --> MYSQL[(MySQL)]
+        WORKER3 --> PG[(PostgreSQL)]
+        COORD --> CATALOG[Catalog]
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Coordinator CPU | 并发查询数 × 2 | 8-16核 |
+| Coordinator 内存 | 并发查询数 × 4GB | 16-32GB |
+| Worker CPU | 并发查询数 × 4 | 16-32核 |
+| Worker 内存 | 并发查询数 × 8GB | 32-64GB |
+| 网络带宽 | 查询数据量 / 时间 | 10Gbps+ |
+
+### 查询性能优化
+
+```sql
+-- 1. 使用谓词下推
+SELECT * FROM hive.default.orders 
+WHERE order_date = '2024-01-01'  -- 谓词下推到Hive
+AND amount > 100;
+
+-- 2. 使用分区裁剪
+SELECT * FROM hive.default.events 
+WHERE dt = '2024-01-01'  -- 分区裁剪
+AND event_type = 'click';
+
+-- 3. 使用列裁剪
+SELECT order_id, amount FROM hive.default.orders  -- 只查询需要的列
+WHERE order_date = '2024-01-01';
+
+-- 4. 使用CTE优化复杂查询
+WITH monthly_sales AS (
+    SELECT 
+        DATE_TRUNC('month', order_date) as month,
+        SUM(amount) as total
+    FROM hive.default.orders
+    GROUP BY 1
+)
+SELECT * FROM monthly_sales 
+WHERE total > 1000000;
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: trino-alerts
+    rules:
+      - alert: TrinoQuerySlow
+        expr: histogram_quantile(0.99, rate(trino_query_duration_seconds_bucket[5m])) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trino查询延迟过高"
+
+      - alert: TrinoWorkerDown
+        expr: up{job="trino-worker"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trino Worker节点宕机"
+
+      - alert: TrinoQueryFailure
+        expr: rate(trino_query_failures_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trino查询失败率过高"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| Catalog配置 | Git版本控制 | 每次变更 | 永久 |
+| 查询历史 | 数据库导出 | 每日 | 30天 |
+| 资源队列 | 配置文件 | 每次变更 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Worker宕机 | 停止Worker | 查询自动重试 | <30s |
+| Coordinator故障 | 停止Coordinator | 新查询路由到其他节点 | <1min |
+| Catalog故障 | 模拟Catalog故障 | 查询降级 | <5min |
+| 网络分区 | 模拟网络隔离 | 查询超时失败 | <1min |
+
+### 多租户资源隔离
+
+```sql
+-- 1. 创建资源队列
+CREATE RESOURCE QUEUE analytics_queue WITH (
+    max_memory = '80%',
+    max_concurrent_queries = 20
+);
+
+-- 2. 分配资源队列
+ALTER USER analytics_user SET RESOURCE QUEUE analytics_queue;
+
+-- 3. 查询优先级
+SET SESSION query_priority = 'HIGH';
+
+-- 4. 会话限制
+SET SESSION max_memory_per_node = '16GB';
+```
+
+### 与数据湖生态集成
+
+```yaml
+# Iceberg Catalog配置
+connector.name=iceberg
+iceberg.catalog-type=hive_metastore
+hive.metastore.uri=thrift://metastore:9083
+
+# Delta Lake Catalog配置
+connector.name=delta_lake
+delta_lake.hadoop.config.resources=/etc/trino/core-site.xml,/etc/trino/hdfs-site.xml
+
+# Hudi Catalog配置
+connector.name=hudi
+hudi.table-type=COPY_ON_WRITE
+```
+
 ## 二十六、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../大数据/05-列式存储与数据湖格式.md)」；

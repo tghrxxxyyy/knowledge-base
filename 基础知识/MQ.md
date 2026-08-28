@@ -1855,3 +1855,144 @@ auto.offset.reset=latest      # 初始偏移策略
   2. 消费能力 = 预期峰值 × 1.5
   3. 缓冲空间 = 预期峰值 × 消息大小 × 保留时间 × 2
 ```
+
+## 消息队列生产运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| 多机房模式 | 多机房 | 多集群 | 跨机房 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph 消息队列集群架构
+        PROD[生产者集群] --> LB[负载均衡]
+        LB --> BROKER1[Broker 1]
+        LB --> BROKER2[Broker 2]
+        LB --> BROKER3[Broker 3]
+        BROKER1 <--> ZK[ZooKeeper]
+        BROKER2 <--> ZK
+        BROKER3 <--> ZK
+        BROKER1 --> DISK[(磁盘集群)]
+        BROKER2 --> DISK
+        BROKER3 --> DISK
+        CONSUMER1[消费者1] --> BROKER1
+        CONSUMER2[消费者2] --> BROKER2
+    end
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: mq-alerts
+    rules:
+      - alert: MQHighLag
+        expr: kafka_consumer_group_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "消息积压超过10000条"
+
+      - alert: MQHighCPU
+        expr: kafka_broker_cpu_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Broker CPU使用率过高"
+
+      - alert: MQHighDisk
+        expr: kafka_broker_disk_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Broker磁盘使用率过高"
+
+      - alert: MQBrokerDown
+        expr: up{job="kafka"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka Broker宕机"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| Topic配置 | 命令行导出 | 每次变更 | 永久 |
+| 消费进度 | 自动提交 | 实时 | 永久 |
+| 消息数据 | 副本复制 | 实时 | 7天 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Broker宕机 | 停止Broker | 副本自动接管 | <30s |
+| 分区Leader故障 | 模拟Leader故障 | 自动选举 | <1min |
+| 消费者崩溃 | 停止消费者 | 消费进度保留 | <5min |
+| 磁盘满 | 模拟磁盘满 | 旧消息自动清理 | <10min |
+
+### 多租户资源隔离
+
+```bash
+# Kafka多租户配置
+# 1. 创建租户Topic
+kafka-topics.sh --create --topic tenant-a-orders \
+  --bootstrap-server localhost:9092 \
+  --partitions 12 \
+  --replication-factor 3 \
+  --config retention.bytes=107374182400  # 100GB
+
+# 2. 配置租户配额
+kafka-configs.sh --alter --add-config \
+  'producer_byte_rate=10485760,consumer_byte_rate=20971520' \
+  --entity-type users --entity-name tenant-a \
+  --bootstrap-server localhost:9092
+
+# 3. 配置访问控制
+kafka-acls.sh --add --allow-principal User:tenant-a \
+  --operation Read --operation Write \
+  --topic tenant-a-* \
+  --bootstrap-server localhost:9092
+```
+
+### 与微服务生态集成
+
+```java
+// Spring Cloud Stream配置
+spring:
+  cloud:
+    stream:
+      kafka:
+        binder:
+          brokers: localhost:9092
+          auto-create-topics: true
+          auto-add-partitions: true
+      bindings:
+        order-out:
+          destination: order-topic
+          content-type: application/json
+          producer:
+            partition-key-expression: headers['partitionKey']
+            partition-count: 12
+        order-in:
+          destination: order-topic
+          content-type: application/json
+          group: order-consumer-group
+          consumer:
+            max-attempts: 3
+            back-off-initial-interval: 1000
+            back-off-max-interval: 10000
+            back-off-multiplier: 2.0
+```

@@ -1953,4 +1953,139 @@ try {
 }
 ```
 
+## MongoDB深度优化与运维实战
+
+### Shard Key选择策略
+
+| 策略 | 适用场景 | 优点 | 缺点 |
+|------|----------|------|------|
+| 哈希分片 | 写入密集 | 均匀分布 | 范围查询差 |
+| 范围分片 | 查询密集 | 范围查询好 | 热点风险 |
+| 复合分片 | 混合负载 | 灵活 | 配置复杂 |
+
+### Change Streams实战
+
+```javascript
+// Change Streams使用示例
+const changeStream = collection.watch();
+changeStream.on('change', (next) => {
+  console.log('变更事件:', next);
+  // 处理变更
+});
+
+// 带过滤的Change Streams
+const pipeline = [
+  { $match: { 'operationType': 'insert' } },
+  { $match: { 'fullDocument.status': 'active' } }
+];
+const changeStream = collection.watch(pipeline);
+```
+
+### Atlas Search全文检索
+
+```javascript
+// Atlas Search索引创建
+db.collection.createSearchIndex({
+  name: "default",
+  definition: {
+    mappings: {
+      dynamic: true,
+      fields: {
+        title: { type: "string" },
+        content: { type: "string" }
+      }
+    }
+  }
+});
+
+// 全文检索查询
+db.collection.aggregate([
+  {
+    $search: {
+      index: "default",
+      text: {
+        query: "搜索关键词",
+        path: ["title", "content"]
+      }
+    }
+  }
+]);
+```
+
+### 聚合管道优化
+
+| 阶段 | 作用 | 性能影响 |
+|------|------|----------|
+| $match | 过滤 | 高（尽早使用） |
+| $project | 字段投影 | 中 |
+| $group | 分组聚合 | 高（避免大结果集） |
+| $sort | 排序 | 高（配合索引） |
+| $limit | 限制结果数 | 低 |
+| $lookup | 关联查询 | 高（避免大表关联） |
+
+### 事务限制与最佳实践
+
+| 限制 | 说明 | 解决方案 |
+|------|------|----------|
+| 16MB事务大小 | 单事务最大16MB | 拆分事务 |
+| 事务超时 | 默认60秒 | 调整超时时间 |
+| 文档锁定 | 事务内文档锁定 | 缩短事务 |
+| 副本集要求 | 必须副本集 | 部署副本集 |
+
+### 备份策略
+
+| 备份方式 | RPO | RTO | 存储 | 适用场景 |
+|----------|-----|-----|------|----------|
+| 文件系统快照 | 秒级 | 分钟级 | 低 | 一般业务 |
+| mongodump | 分钟级 | 小时级 | 中 | 跨版本 |
+| OPS Manager | 秒级 | 分钟级 | 高 | 企业级 |
+| 云备份 | 秒级 | 分钟级 | 高 | 云环境 |
+
+### 分片集群监控
+
+```javascript
+// 分片状态查看
+sh.status()
+
+// 查看分片数据分布
+db.stats()
+
+// 查看慢查询
+db.setProfilingLevel(1, { slowms: 100 });
+db.system.profile.find().sort({ ts: -1 }).limit(10);
+```
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 分片热点 | Shard Key选择不当 | 重新选择Shard Key |
+| 查询缓慢 | 缺少索引 | 创建索引 |
+| 连接数耗尽 | 连接泄漏 | 检查连接池 |
+| 内存不足 | 工作集过大 | 增加内存/分片 |
+| 复制延迟 | 网络问题 | 检查网络/副本集 |
+
+### MongoDB vs 其他数据库对比
+
+| 维度 | MongoDB | PostgreSQL | MySQL |
+|------|---------|------------|-------|
+| 数据模型 | 文档型 | 关系型 | 关系型 |
+| 查询语言 | MQL | SQL | SQL |
+| 索引 | 丰富 | 丰富 | 丰富 |
+| 事务 | 支持 | 支持 | 支持 |
+| 分片 | 原生 | 需扩展 | 需扩展 |
+| 生态 | 丰富 | 丰富 | 丰富 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 索引优化 | 定期分析索引使用 | 高 |
+| 连接池 | 使用连接池 | 高 |
+| 分片策略 | 合理选择Shard Key | 高 |
+| 备份策略 | 定期备份 | 高 |
+| 监控告警 | 副本集/分片监控 | 高 |
+| 版本升级 | 测试后升级 | 中 |
+| 安全配置 | 认证/授权/加密 | 高 |
+
 ## 二十六、与其他板块的关系

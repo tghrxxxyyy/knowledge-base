@@ -1860,6 +1860,158 @@ SELECT blocked.pid AS blocked_pid, blocked.query AS blocked_query,
   JOIN pg_stat_activity blocking ON gl.pid = blocking.pid;
 ```
 
+## PostgreSQL高级特性与深度调优
+
+### MVCC实现原理
+
+```mermaid
+flowchart LR
+    A[事务开始] --> B[创建快照]
+    B --> C[读取数据]
+    C --> D{版本可见?}
+    D -->|是| E[返回数据]
+    D -->|否| F[查找旧版本]
+    F --> D
+```
+
+| MVCC组件 | 作用 | 配置 |
+|----------|------|------|
+| xmin | 创建版本的事务ID | 自动 |
+| xmax | 删除/更新版本的事务ID | 自动 |
+| cmin | 命令序号（同一事务内） | 自动 |
+| cmax | 删除命令序号 | 自动 |
+| ctid | 版本物理位置 | 自动 |
+
+### 分区表高级策略
+
+| 分区类型 | 适用场景 | 性能特点 | 维护成本 |
+|----------|----------|----------|----------|
+| 范围分区 | 时间序列数据 | 查询快 | 中 |
+| 列表分区 | 枚举值数据 | 查询快 | 低 |
+| 哈希分区 | 均匀分布 | 写入快 | 低 |
+| 多级分区 | 复杂场景 | 灵活 | 高 |
+
+```sql
+-- 分区表创建示例
+CREATE TABLE orders (
+    id BIGSERIAL,
+    created_at TIMESTAMP,
+    amount DECIMAL(10,2),
+    region VARCHAR(20)
+) PARTITION BY RANGE (created_at);
+
+-- 创建月度分区
+CREATE TABLE orders_2024_01 PARTITION OF orders
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+-- 自动分区创建（pg_partman）
+SELECT partman.create_parent('public.orders', 'created_at', 'native', 'monthly');
+```
+
+### JSONB高级查询与索引
+
+| JSONB操作符 | 功能 | 示例 |
+|------------|------|------|
+| -> | 获取JSON对象字段 | data->'name' |
+| ->> | 获取JSON对象字段（文本） | data->>'name' |
+| #> | 获取嵌套字段路径 | data#>'{address,city}' |
+| @> | 包含查询 | data@>'{"status":"active"}' |
+| ? | 键存在 | data?'name' |
+| ?\| | 任一键存在 | data?|'{"name","email"}' |
+| ?& | 所有键存在 | data?&'{"name","email"}' |
+
+```sql
+-- JSONB GIN索引
+CREATE INDEX idx_data ON table_name USING gin(data);
+CREATE INDEX idx_data_path ON table_name USING gin(data->'tags');
+
+-- JSONB部分索引
+CREATE INDEX idx_active_users ON users USING gin(profile)
+    WHERE status = 'active';
+```
+
+### 连接池调优
+
+| 参数 | HikariCP | PgBouncer | 说明 |
+|------|----------|-----------|------|
+| 最小连接 | minimumIdle | default_pool_size | 最小空闲连接 |
+| 最大连接 | maximumPoolSize | max_client_conn | 最大连接数 |
+| 超时时间 | connectionTimeout | query_wait_timeout | 连接超时 |
+| 空闲超时 | idleTimeout | client_idle_timeout | 空闲连接超时 |
+| 连接验证 | connectionTestQuery | server_check_query | 连接有效性检查 |
+
+### 复制与高可用
+
+| 复制模式 | RPO | RTO | 复杂度 | 适用场景 |
+|----------|-----|-----|--------|----------|
+| 异步复制 | 秒级 | 分钟级 | 低 | 读多写少 |
+| 同步复制 | 0 | 分钟级 | 中 | 数据强一致 |
+| 级联复制 | 秒级 | 分钟级 | 中 | 大规模只读 |
+| 逻辑复制 | 秒级 | 分钟级 | 高 | 跨版本升级 |
+
+### 慢查询深度分析
+
+```sql
+-- 开启慢查询日志
+SET log_min_duration_statement = 1000;  -- 1秒
+SET log_statement = 'none';
+SET log_duration = off;
+
+-- 查询执行计划
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders WHERE created_at > '2024-01-01';
+
+-- 查看索引使用情况
+SELECT schemaname, tablename, indexname, idx_scan, idx_tup_read
+FROM pg_stat_user_indexes
+ORDER BY idx_scan DESC;
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| shared_buffers | 128MB | 系统内存25% | 共享缓冲区 |
+| effective_cache_size | 4GB | 系统内存75% | 预期缓存大小 |
+| work_mem | 4MB | 64MB | 排序/哈希操作内存 |
+| maintenance_work_mem | 64MB | 512MB | 维护操作内存 |
+| max_connections | 100 | 200-500 | 最大连接数 |
+| wal_buffers | -1 | 64MB | WAL缓冲区 |
+| checkpoint_completion_target | 0.5 | 0.9 | 检查点完成目标 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 索引优化 | 定期分析索引使用情况 | 高 |
+| 查询优化 | 使用EXPLAIN ANALYZE分析 | 高 |
+| 连接池 | 使用PgBouncer/HikariCP | 高 |
+| 备份策略 | pg_basebackup+ WAL归档 | 高 |
+| 监控告警 | pg_stat_*视图监控 | 高 |
+| 版本升级 | 大版本升级测试 | 中 |
+| 分区表 | 大表分区管理 | 中 |
+| vacuum调优 | autovacuum参数优化 | 中 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 连接数耗尽 | 连接泄漏/配置过低 | 检查连接池/增加max_connections |
+| 查询缓慢 | 缺少索引/统计信息过期 | 创建索引/ANALYZE |
+| 锁等待 | 长事务/未提交 | 检查pg_locks/优化事务 |
+| WAL堆积 | 归档失败/复制延迟 | 检查归档/复制状态 |
+| 磁盘空间不足 | WAL/临时文件 | 清理WAL/调整参数 |
+
+### PostgreSQL 16新特性
+
+| 特性 | 说明 | 适用场景 |
+|------|------|----------|
+| 逻辑复制 | 支持原地升级 | 大版本升级 |
+| 并行查询 | 增强并行聚合 | 复杂查询 |
+| JSON_TABLE | JSON转关系表 | JSONB查询 |
+| incrementally | 增量备份 | 备份优化 |
+| pg_stat_io | I/O统计 | 性能监控 |
+
 ## 十五、速查表（扩展）
 
 | 项 | 结论 |

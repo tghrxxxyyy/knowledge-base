@@ -1868,6 +1868,380 @@ scrape_configs:
     metrics_path: '/metrics'
 ```
 
+## API 网关缓存策略
+
+```yaml
+# Kong 缓存配置
+plugins:
+  - name: proxy-cache
+    config:
+      response_code:
+        - 200
+      request_method:
+        - GET
+      content_type:
+        - application/json
+      cache_ttl: 300
+      storage: redis
+      redis:
+        host: redis-cluster
+        port: 6379
+        database: 0
+```
+
+| 缓存维度 | 说明 | 适用场景 |
+|----------|------|----------|
+| 全局缓存 | 所有响应缓存 | 静态资源 |
+| 路由缓存 | 特定路由缓存 | 热点API |
+| 用户缓存 | 按用户缓存 | 个性化数据 |
+| 查询缓存 | 参数相同缓存 | 查询接口 |
+
+## API 网关限流策略
+
+```lua
+-- Redis Lua 脚本：滑动窗口限流
+local key = KEYS[1]
+local window = tonumber(ARGV[1])    -- 窗口大小（秒）
+local limit = tonumber(ARGV[2])     -- 请求数上限
+local now = tonumber(ARGV[3])       -- 当前时间戳（ms）
+local window_start = now - window * 1000
+
+-- 移除窗口外的请求
+redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
+
+-- 获取窗口内请求数
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+    -- 未超限，添加当前请求
+    redis.call('ZADD', key, now, now .. '-' .. math.random(1000000))
+    redis.call('PEXPIRE', key, window * 1000)
+    return {1, limit - count - 1}  -- allowed, remaining
+else
+    return {0, 0}  -- rejected, remaining=0
+end
+```
+
+| 限流算法 | 说明 | 适用场景 |
+|----------|------|----------|
+| 固定窗口 | 简单计数 | 通用 |
+| 滑动窗口 | 平滑限流 | 高并发 |
+| 令牌桶 | 允许突发 | API限流 |
+| 漏桶 | 平滑输出 | 流量控制 |
+
+## API 版本管理
+
+```yaml
+# 版本化路由配置
+services:
+  - name: order-service-v1
+    url: http://order-service-v1:8080
+    routes:
+      - name: order-v1
+        paths:
+          - /api/v1/orders
+        strip_path: false
+
+  - name: order-service-v2
+    url: http://order-service-v2:8080
+    routes:
+      - name: order-v2
+        paths:
+          - /api/v2/orders
+        strip_path: false
+```
+
+| 版本策略 | 说明 | 适用场景 |
+|----------|------|----------|
+| URL版本 | /api/v1/xxx | 简单直观 |
+| Header版本 | X-API-Version:1 | 灵活 |
+| 查询参数 | ?version=1 | 临时测试 |
+| 内容协商 | Accept: application/vnd.api.v1+json | RESTful |
+
+## API 网关高可用
+
+```text
+高可用设计：
+  1. 多实例部署
+     - 至少3个实例
+     - 跨可用区部署
+     - 无状态设计
+
+  2. 负载均衡
+     - DNS轮询
+     - 云负载均衡器
+     - 健康检查
+
+  3. 故障转移
+     - 自动健康检查
+     - 流量自动切换
+     - 降级策略
+
+  4. 监控告警
+     - 实时监控
+     - 异常告警
+     - 容量预警
+```
+
+```yaml
+# 健康检查配置
+plugins:
+  - name: healthcheck
+    config:
+      active:
+        http_path: /health
+        healthy:
+          interval: 5
+          successes: 3
+        unhealthy:
+          interval: 5
+          http_failures: 3
+      passive:
+        healthy:
+          successes: 3
+        unhealthy:
+          http_failures: 3
+          tcp_failures: 3
+```
+
+## API 网关选型对比
+
+| 维度 | Kong | APISIX | Spring Cloud Gateway | Envoy |
+|------|------|--------|---------------------|-------|
+| 语言 | Lua/OpenResty | Lua/OpenResty | Java | C++ |
+| 性能 | 高 | 最高 | 中 | 高 |
+| 插件生态 | 丰富 | 丰富 | 中等 | 丰富 |
+| 配置方式 | Admin API | Admin API | 配置文件 | xDS API |
+| 服务发现 | DNS/Consul | DNS/Consul/Eureka | Eureka/Consul | EDS |
+| 灰度发布 | 插件 | 插件 | 内置 | 内置 |
+| 适用场景 | 通用 | 高性能 | Java生态 | Service Mesh |
+
+## API 网关与 Service Mesh 集成
+
+```text
+集成方案：
+  1. 网关作为 Mesh 入口
+     - 网关处理外部流量
+     - Mesh 处理内部流量
+     - 统一认证授权
+
+  2. 网关作为 Mesh 数据面
+     - 网关作为 Sidecar
+     - 处理南北向+东西向流量
+     - 统一治理
+
+  3. 网关与 Mesh 协同
+     - 网关处理 API 管理
+     - Mesh 处理服务通信
+     - 统一监控
+```
+
+```yaml
+# Istio 网关配置
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: api-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: api-gateway-cert
+      hosts:
+        - "api.example.com"
+```
+
+## API 网关安全防护
+
+```yaml
+# 安全插件配置
+plugins:
+  - name: cors
+    config:
+      origins:
+        - "https://example.com"
+      methods:
+        - GET
+        - POST
+      headers:
+        - Authorization
+        - Content-Type
+
+  - name: bot-detection
+    config:
+      deny:
+        - "badbot"
+      allow:
+        - "googlebot"
+
+  - name: ip-restriction
+    config:
+      allow:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+```
+
+| 安全措施 | 说明 | 适用场景 |
+|----------|------|----------|
+| CORS | 跨域控制 | Web应用 |
+| 机器人检测 | 恶意请求拦截 | 防爬虫 |
+| IP限制 | IP白名单 | 内部服务 |
+| WAF | Web应用防火墙 | 高安全 |
+| mTLS | 双向TLS | 服务间通信 |
+
+## API 网关性能优化
+
+```text
+性能优化要点：
+
+1. 连接优化
+   - 连接池复用
+   - HTTP/2 支持
+   - Keep-Alive
+
+2. 缓存优化
+   - 响应缓存
+   - 查询缓存
+   - 静态资源缓存
+
+3. 限流优化
+   - 本地限流（减少Redis调用）
+   - 分布式限流（全局控制）
+   - 动态限流（自适应）
+
+4. 负载均衡
+   - 加权轮询
+   - 最少连接
+   - 一致性哈希
+```
+
+## API 网关监控与可观测性
+
+```text
+监控指标：
+  请求指标：
+    请求总数
+    成功/失败数
+    QPS/TPS
+    延迟分布（P50/P95/P99）
+  
+  连接指标：
+    活跃连接数
+    等待连接数
+    连接超时数
+  
+  资源指标：
+    CPU使用率
+    内存使用率
+    线程池使用率
+  
+  业务指标：
+    限流触发次数
+    熔断触发次数
+    缓存命中率
+```
+
+```yaml
+# Prometheus指标暴露
+scrape_configs:
+  - job_name: 'kong-gateway'
+    static_configs:
+      - targets: ['kong:8444']
+    metrics_path: '/metrics'
+```
+
+## API 网关最佳实践
+
+```text
+最佳实践：
+
+1. 路由设计
+   - RESTful 风格路由
+   - 版本化管理
+   - 路径清晰
+
+2. 认证授权
+   - 统一认证入口
+   - JWT 验证
+   - 权限控制
+
+3. 限流熔断
+   - 多维度限流
+   - 熔断降级
+   - 降级策略
+
+4. 监控告警
+   - 实时监控
+   - 异常告警
+   - 容量预警
+
+5. 安全防护
+   - WAF 防护
+   - DDoS 防护
+   - 审计日志
+```
+
+## API 网关故障排查
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 502错误 | 后端服务不可用 | 检查后端健康 | 重启服务 |
+| 504错误 | 后端响应超时 | 检查超时设置 | 调整超时 |
+| 429错误 | 限流触发 | 检查限流配置 | 调整阈值 |
+| 连接失败 | 网络问题 | 检查网络 | 修复网络 |
+| 认证失败 | Token错误 | 检查Token | 刷新Token |
+
+## API 网关架构设计
+
+```mermaid
+graph TB
+    subgraph 客户端
+        C1[Web App]
+        C2[Mobile App]
+        C3[第三方应用]
+    end
+    subgraph 负载均衡
+        LB[Load Balancer]
+    end
+    subgraph API网关
+        G1[Gateway 1]
+        G2[Gateway 2]
+        G3[Gateway 3]
+    end
+    subgraph 后端服务
+        S1[用户服务]
+        S2[订单服务]
+        S3[商品服务]
+    end
+    C1 --> LB
+    C2 --> LB
+    C3 --> LB
+    LB --> G1
+    LB --> G2
+    LB --> G3
+    G1 --> S1
+    G1 --> S2
+    G2 --> S1
+    G2 --> S3
+    G3 --> S2
+    G3 --> S3
+```
+
+```text
+架构要点：
+  客户端：Web/Mobile/第三方
+  负载均衡：DNS轮询/云LB
+  网关层：无状态，多实例
+  后端服务：微服务架构
+  监控：Metrics/Logging/Tracing
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

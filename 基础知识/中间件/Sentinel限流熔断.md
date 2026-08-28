@@ -1839,3 +1839,163 @@ exporters:
 | 匀速队列 | 匀速通过 | 消息队列消费 | 高 |
 
 > 一句话：**Sentinel = 限流（QPS/线程/匀速/WarmUp）+ 熔断（慢调用/异常）+ 热点参数 + 系统保护 + 授权 + 控制台动态规则；选型先看「生态（Spring Cloud Alibaba → Sentinel）」，再定「规则持久化（Nacos）」，最后配「控制台监控」**。
+
+## Sentinel 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 组件配置 | 说明 |
+|----------|---------|----------|------|
+| 嵌入模式 | 开发测试 | 客户端内嵌 | 所有组件合一 |
+| 独立部署 | 生产环境 | 控制台独立 | 组件分离 |
+| 高可用模式 | 多机房 | 多副本+负载均衡 | 高可用 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph Sentinel集群架构
+        APP1[应用1] --> SENTINEL1[Sentinel客户端]
+        APP2[应用2] --> SENTINEL1
+        SENTINEL1 --> NACOS[Nacos集群]
+        SENTINEL1 --> DASHBOARD[Sentinel Dashboard]
+        DASHBOARD --> PROM[Prometheus]
+        PROM --> GRAFANA[Grafana]
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Dashboard CPU | 应用数 × 0.1 | 4-8核 |
+| Dashboard 内存 | 应用数 × 10MB | 4-8GB |
+| Nacos连接 | 应用数 × 10 | 1000+ |
+| 规则存储 | 规则数 × 1KB | 按需 |
+| 监控数据 | 指标数 × 保留天数 | 按需 |
+
+### 规则配置最佳实践
+
+```yaml
+# 流控规则配置
+flow_rules:
+  - resource: "order-api"
+    grade: 1  # QPS限流
+    count: 100
+    strategy: 0  # 直接限流
+    controlBehavior: 0  # 快速失败
+    warmUpPeriodSec: 10  # 预热时长
+
+# 熔断规则配置
+degrade_rules:
+  - resource: "order-api"
+    grade: 0  # 慢调用比例
+    count: 1000  # 慢调用RT阈值(ms)
+    slowRatioThreshold: 0.5  # 慢调用比例阈值
+    minRequestAmount: 10  # 最小请求数
+    statIntervalMs: 10000  # 统计时间窗口
+    timeWindow: 10  # 熔断时长(s)
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: sentinel-alerts
+    rules:
+      - alert: SentinelHighBlockCount
+        expr: rate(sentinel_block_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sentinel限流次数过多"
+
+      - alert: SentinelCircuitBreakerOpen
+        expr: sentinel_circuitbreaker_open_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sentinel熔断器打开"
+
+      - alert: SentinelHighExceptionRate
+        expr: rate(sentinel_exception_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sentinel异常率过高"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 规则配置 | Nacos快照 | 每次变更 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+| Dashboard配置 | 配置文件 | 每次变更 | 永久 |
+| 日志数据 | 文件归档 | 每日 | 30天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Dashboard宕机 | 停止Dashboard | 规则继续生效 | <10s |
+| Nacos故障 | 模拟Nacos故障 | 规则缓存降级 | <1min |
+| 规则推送失败 | 模拟推送失败 | 本地规则生效 | <30s |
+| 监控数据丢失 | 模拟监控丢失 | 规则继续生效 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级规则配置
+tenant_rules:
+  tenant-a:
+    flow_rules:
+      - resource: "order-api"
+        count: 100
+    degrade_rules:
+      - resource: "order-api"
+        slowRatioThreshold: 0.5
+
+  tenant-b:
+    flow_rules:
+      - resource: "order-api"
+        count: 200
+    degrade_rules:
+      - resource: "order-api"
+        slowRatioThreshold: 0.3
+```
+
+### 与微服务生态集成
+
+```java
+// Spring Cloud Sentinel配置
+@Configuration
+public class SentinelConfig {
+    @PostConstruct
+    public void initSentinelRules() {
+        // 流控规则
+        List<FlowRule> flowRules = new ArrayList<>();
+        FlowRule orderRule = new FlowRule();
+        orderRule.setResource("order-api");
+        orderRule.setGrade(RuleConstant.FLOW_GRADE_QPS);
+        orderRule.setCount(100);
+        flowRules.add(orderRule);
+        FlowRuleManager.loadRules(flowRules);
+
+        // 熔断规则
+        List<DegradeRule> degradeRules = new ArrayList<>();
+        DegradeRule orderDegrade = new DegradeRule();
+        orderDegrade.setResource("order-api");
+        orderDegrade.setGrade(RuleConstant.DEGRADE_GRADE_RT);
+        orderDegrade.setCount(1000);
+        orderDegrade.setSlowRatioThreshold(0.5);
+        degradeRules.add(orderDegrade);
+        DegradeRuleManager.loadRules(degradeRules);
+    }
+}
+```
+
+## 与其他板块的关系

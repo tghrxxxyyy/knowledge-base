@@ -1873,4 +1873,204 @@ resources:
 
 ---
 
+## VictoriaMetrics集群运维深度实战
+
+### 集群部署架构
+
+```mermaid
+flowchart TB
+    subgraph vminsert
+        A1[vminsert-0] --> A2[vminsert-1]
+    end
+    subgraph vmstorage
+        B1[vmstorage-0] --> B2[vmstorage-1]
+        B2 --> B3[vmstorage-2]
+    end
+    subgraph vmselect
+        C1[vmselect-0] --> C2[vmselect-1]
+    end
+    vminsert --> vmstorage
+    vmselect --> vmstorage
+```
+
+### 集群组件资源规划
+
+| 组件 | CPU建议 | 内存建议 | 磁盘建议 | 副本数 |
+|------|---------|----------|----------|--------|
+| vminsert | 2-4核 | 2-4GB | 无需持久化 | 2+ |
+| vmstorage | 4-8核 | 16-32GB | SSD 500GB+ | 3+ |
+| vmselect | 2-4核 | 8-16GB | 本地缓存 | 2+ |
+| vmagent | 1-2核 | 1-2GB | 50GB+ | 2+ |
+
+### 去重机制详解
+
+| 去重模式 | 配置 | 适用场景 | 数据安全 |
+|----------|------|----------|----------|
+| 源端去重 | vminsert去重 | 多副本写入 | 高 |
+| 存储端去重 | vmstorage去重 | 单副本写入 | 中 |
+| 查询端去重 | vmselect去重 | 多源查询 | 低 |
+
+### 降采样策略配置
+
+```yaml
+# 降采样配置示例
+retentionPolicies:
+  - retention: 30d
+    resolution: 1m
+  - retention: 90d
+    resolution: 5m
+  - retention: 365d
+    resolution: 1h
+```
+
+| 降采样周期 | 原始数据 | 降采样后 | 压缩比 |
+|------------|----------|----------|--------|
+| 1m→5m | 100% | 20% | 5:1 |
+| 1m→1h | 100% | 1.7% | 60:1 |
+| 5m→1h | 20% | 3.3% | 6:1 |
+
+### 多租户资源隔离
+
+| 隔离维度 | 实现方式 | 配置示例 |
+|----------|----------|----------|
+| 写入隔离 | accountId区分 | vmagent多租户 |
+| 存储隔离 | 独立vmstorage | 集群部署 |
+| 查询隔离 | 独立vmselect | 集群部署 |
+| 网络隔离 | VPC/安全组 | 云平台配置 |
+
+### 远程写入最佳实践
+
+```yaml
+# vmagent远程写入配置
+remoteWrite:
+  - url: "http://vmstorage:8428/api/v1/write"
+    queueMaxSize: 100000
+    queueMinSize: 10000
+    maxRowsPerBlock: 10000
+    bitrateLimit: 100MB
+```
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| queueMaxSize | 100000 | 队列最大容量 |
+| queueMinSize | 10000 | 队列最小容量 |
+| maxRowsPerBlock | 10000 | 每批最大行数 |
+| bitrateLimit | 100MB | 速率限制 |
+
+### K8s部署方案
+
+```yaml
+# vmagent Deployment示例
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmagent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vmagent
+  template:
+    spec:
+      containers:
+      - name: vmagent
+        image: victoriametrics/vmagent:v1.100.0
+        args:
+        - "-promscrape.config=/config/scrape.yml"
+        - "-remoteWrite.url=http://vmstorage:8428/api/v1/write"
+        - "-remoteWrite.tmpDataPath=/tmpData"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: tmpdata
+          mountPath: /tmpData
+      volumes:
+      - name: config
+        configMap:
+          name: vmagent-config
+      - name: tmpdata
+        emptyDir: {}
+```
+
+### 容量规划
+
+| 指标 | 计算方式 | 示例 |
+|------|----------|------|
+| 存储需求 | 写入速率×保留期×压缩比 | 10万 series × 30天 × 0.1 = 30GB |
+| 内存需求 | series数×每series内存 | 10万 × 4KB = 400MB |
+| CPU需求 | 写入QPS×每QPS CPU | 10万 × 0.01 = 1核 |
+| 网络带宽 | 写入速率×数据包大小 | 10万 × 200B × 8 = 160Mbps |
+
+### VictoriaMetrics vs Prometheus对比
+
+| 维度 | VictoriaMetrics | Prometheus |
+|------|-----------------|------------|
+| 单机性能 | 100万series | 10万series |
+| 存储压缩比 | 7-10倍 | 2-3倍 |
+| 查询性能 | 比Prom快2-10倍 | 基准 |
+| 集群支持 | 原生支持 | 需要Thanos |
+| 资源消耗 | 内存少50% | 基准 |
+| 兼容性 | 100%兼容PromQL | 原生 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 多副本部署 | 至少2副本 | 高 |
+| 降采样配置 | 30天后5m，90天后1h | 高 |
+| 资源限制 | K8s设置requests/limits | 高 |
+| 监控告警 | 监控vm组件健康 | 高 |
+| 备份策略 | 定期备份vmstorage | 中 |
+| 版本升级 | 滚动升级策略 | 中 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 写入延迟高 | vmstorage负载高 | 增加副本/扩容 |
+| 查询超时 | 查询范围过大 | 缩小时间范围/增加vmselect |
+| 磁盘空间不足 | 保留期过长 | 配置降采样/缩短保留期 |
+| OOM | 内存不足 | 增加内存/减少并发 |
+| 数据丢失 | 副本数不足 | 增加副本数 |
+
+### 监控告警配置
+
+```yaml
+# VictoriaMetrics监控告警规则
+groups:
+- name: vm-alerts
+  rules:
+  - alert: VMSlowQueries
+    expr: vm_slow_queries_total > 100
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "VictoriaMetrics查询缓慢"
+  - alert: VMHighMemoryUsage
+    expr: vm_memory_usage_bytes / vm_memory_limit_bytes > 0.8
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "VictoriaMetrics内存使用率过高"
+  - alert: VMStorageDiskSpaceLow
+    expr: vm_disk_space_available_bytes < 10737418240
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "VictoriaMetrics磁盘空间不足10GB"
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| -search.maxPointsPerTimeseries | 30000 | 100000 | 每时间序列最大点数 |
+| -search.maxQueryDuration | 30s | 60s | 查询最大耗时 |
+| -search.maxConcurrentRequests | 16 | 32 | 并发查询数 |
+| -storage.maxRowsPerInsertBlock | 10000 | 50000 | 每插入块最大行数 |
+| -storage.retentionPeriod | 1 | 6 | 数据保留月数 |
+
 ## 二十四、与其他板块的关系

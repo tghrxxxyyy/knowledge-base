@@ -1843,6 +1843,170 @@ EMQX 是基于 Erlang 构建的高性能 MQTT Broker，以百万级连接、分�
 
 ---
 
+## EMQX 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| 多集群模式 | 多机房 | 多集群 | 跨机房 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph EMQX集群架构
+        DEVICE1[设备1] --> GW1[网关1]
+        DEVICE2[设备2] --> GW1
+        DEVICE3[设备3] --> GW2[网关2]
+        GW1 --> EMQX1[EMQX 1]
+        GW2 --> EMQX2[EMQX 2]
+        EMQX1 <--> EMQX2
+        EMQX1 --> RULE[规则引擎]
+        EMQX2 --> RULE
+        RULE --> KAFKA[Kafka]
+        RULE --> DB[(数据库)]
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Broker CPU | 连接数 × 0.001 | 8-16核 |
+| Broker 内存 | 连接数 × 1KB | 16-64GB |
+| 网络带宽 | 消息TPS × 消息大小 × 2 | 10Gbps+ |
+| 磁盘IO | 消息TPS × 消息大小 | 500MB/s+ |
+| 连接数 | 节点数 × 100万 | 100万+ |
+
+### 规则引擎配置
+
+```yaml
+# 规则引擎配置
+rules:
+  - name: "device-data-to-kafka"
+    sql: "SELECT * FROM \"device/+/data\""
+    actions:
+      - type: "kafka"
+        config:
+          bootstrap.servers: "kafka:9092"
+          topic: "device-data"
+          acks: "all"
+          batch.size: 16384
+
+  - name: "alert-to-webhook"
+    sql: "SELECT * FROM \"device/+/alert\" WHERE payload.level = 'critical'"
+    actions:
+      - type: "webhook"
+        config:
+          url: "https://alert.example.com/webhook"
+          method: "POST"
+          headers:
+            Content-Type: "application/json"
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: emqx-alerts
+    rules:
+      - alert: EMQXHighConnections
+        expr: emqx_connections_count > 1000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EMQX连接数过高"
+
+      - alert: EMQXHighMessageRate
+        expr: rate(emqx_messages_received[5m]) > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EMQX消息接收速率过高"
+
+      - alert: EMQXNodeDown
+        expr: up{job="emqx"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EMQX节点宕机"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 配置文件 | Git版本控制 | 每次变更 | 永久 |
+| 规则引擎 | 数据库备份 | 每日 | 30天 |
+| 认证数据 | 数据库备份 | 每日 | 30天 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| 节点宕机 | 停止节点 | 自动重连 | <30s |
+| 集群分裂 | 模拟网络分区 | 自动恢复 | <1min |
+| 规则引擎故障 | 模拟故障 | 消息丢失 | <5min |
+| 存储故障 | 模拟存储故障 | 消息丢失 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级认证配置
+authentication:
+  - mechanism: password_based
+    backend: http
+    config:
+      url: "http://auth-service:8080/auth"
+      method: "post"
+      body:
+        username: "${username}"
+        password: "${password}"
+      headers:
+        X-Tenant-ID: "${tenant_id}"
+
+# 租户级授权配置
+authorization:
+  - allow:
+      - topics:
+          - "device/${tenant_id}/#"
+        action: all
+```
+
+### 与IoT生态集成
+
+```yaml
+# MQTT 5.0配置
+mqtt:
+  max_packet_size: 1048576
+  max_clientid_len: 65535
+  max_topic_alias: 65535
+  max_qos: 2
+  max_session_expiry_interval: 86400
+
+# Webhook配置
+webhook:
+  actions:
+    - url: "http://iot-platform:8080/webhook"
+      method: "POST"
+      headers:
+        Content-Type: "application/json"
+      body:
+        clientid: "${clientid}"
+        username: "${username}"
+        event: "${event}"
+        payload: "${payload}"
+```
+
+---
+
 ## 参考资料
 
 - [EMQX 官方文档](https://www.emqx.io/docs/en/latest/)

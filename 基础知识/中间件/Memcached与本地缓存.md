@@ -1868,3 +1868,155 @@ public void setWithRandomExpire(String key, Object value) {
 }
 ```
 | 数据不一致 | 缓存与 DB 不同步 | 延迟双删/Canal |
+
+## 本地缓存生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 组件配置 | 说明 |
+|----------|---------|----------|------|
+| 单机模式 | 开发测试 | 本地缓存 | 所有组件合一 |
+| 集群模式 | 生产环境 | 多实例缓存 | 分布式缓存 |
+| 多级缓存 | 高性能场景 | L1+L2+L3 | 多级缓存 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph 多级缓存架构
+        APP[应用] --> L1[本地缓存]
+        L1 --> L2[Redis集群]
+        L2 --> L3[数据库集群]
+        
+        subgraph 缓存组件
+            CAFFEINE[Caffeine]
+            GUAVA[Guava]
+            REDIS[Redis]
+        end
+        
+        L1 --> CAFFEINE
+        L2 --> REDIS
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| 本地缓存内存 | 热点数据量 × 2 | 按需 |
+| Redis内存 | 总数据量 × 1.5 | 按需 |
+| 连接池大小 | QPS / 响应时间 | 100+ |
+| 缓存命中率 | 目标命中率 | >99% |
+| 缓存过期时间 | 业务容忍度 | 5-30分钟 |
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: cache-alerts
+    rules:
+      - alert: CacheHitRateLow
+        expr: cache_hit_rate < 0.95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存命中率过低"
+
+      - alert: CacheHighMemoryUsage
+        expr: cache_memory_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存内存使用率过高"
+
+      - alert: CacheHighEvictionRate
+        expr: rate(cache_eviction_total[5m]) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存淘汰率过高"
+
+      - alert: CacheRedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis缓存宕机"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 缓存配置 | Git版本控制 | 每次变更 | 永久 |
+| 热点数据 | Redis RDB | 每日 | 7天 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+| 日志数据 | 文件归档 | 每日 | 30天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| 本地缓存故障 | 模拟故障 | 降级到Redis | <10s |
+| Redis故障 | 模拟Redis故障 | 降级到数据库 | <1min |
+| 缓存雪崩 | 模拟大量Key过期 | 随机过期+互斥锁 | <5min |
+| 缓存穿透 | 模拟不存在Key | 布隆过滤器+空值缓存 | <10s |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级缓存配置
+tenants:
+  - name: "tenant-a"
+    cache:
+      local:
+        max-size: 10000
+        expire-after-write: 300s
+      redis:
+        key-prefix: "tenant-a:"
+        max-memory: 1GB
+
+  - name: "tenant-b"
+    cache:
+      local:
+        max-size: 20000
+        expire-after-write: 600s
+      redis:
+        key-prefix: "tenant-b:"
+        max-memory: 2GB
+```
+
+### 与微服务生态集成
+
+```yaml
+# Spring Cache配置
+spring:
+  cache:
+    type: composite
+    composite:
+      caches:
+        - name: localCache
+          target: caffeine
+          caffeine:
+            maximum-size: 10000
+            expire-after-write: 300s
+        - name: distributedCache
+          target: redis
+          redis:
+            time-to-live: 600000
+            cache-null-values: false
+
+# 缓存配置
+cache:
+  config:
+    caffeine:
+      spec: maximumSize=10000,expireAfterWrite=5m
+    redis:
+      time-to-live: 600000
+      use-key-prefix: true
+      key-prefix: "cache:"
+```

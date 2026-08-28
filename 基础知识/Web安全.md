@@ -1848,6 +1848,198 @@ Web 安全测试清单：
    - 错误信息泄露
 ```
 
+## Web安全 生产部署与运维最佳实践
+
+### 安全架构选型
+
+| 安全层级 | 适用场景 | 技术方案 | 说明 |
+|----------|---------|----------|------|
+| 网络层 | 边界防护 | WAF/防火墙 | 第一道防线 |
+| 应用层 | 代码安全 | SAST/DAST | 代码审计 |
+| 数据层 | 数据保护 | 加密/脱敏 | 数据安全 |
+| 运维层 | 安全运维 | SIEM/SOC | 安全监控 |
+
+```mermaid
+graph TB
+    subgraph Web安全架构
+        USER[用户] --> WAF[WAF]
+        WAF --> LB[负载均衡]
+        LB --> APP[应用服务]
+        APP --> CACHE[(缓存)]
+        APP --> DB[(数据库)]
+        
+        subgraph 安全组件
+            SAST[SAST扫描]
+            DAST[DAST扫描]
+            SCA[SCA依赖检查]
+            SIEM[SIEM监控]
+        end
+        
+        APP --> SIEM
+    end
+```
+
+### 安全测试检查清单
+
+```text
+Web安全测试清单：
+
+1. 认证安全
+   - 密码强度策略验证
+   - 暴力破解防护（限流/锁定）
+   - MFA双因素认证
+   - Session固定攻击
+   - JWT安全（alg:none/混淆攻击）
+
+2. 授权安全
+   - 水平越权（A访问B数据）
+   - 垂直越权（普通用户访问管理员功能）
+   - 对象级别越权（多租户隔离）
+   - 功能级别越权（未授权功能访问）
+
+3. 注入防护
+   - SQL注入（参数化查询验证）
+   - 命令注入（系统命令调用）
+   - XXE（XML外部实体）
+   - SpEL/OGNL表达式注入
+   - LDAP注入
+
+4. XSS防护
+   - 存储型XSS（数据库存储）
+   - 反射型XSS（URL参数）
+   - DOM型XSS（前端操作）
+   - CSP配置验证
+
+5. CSRF防护
+   - Token验证
+   - SameSite Cookie配置
+   - Referer/Origin校验
+
+6. SSRF防护
+   - 协议限制（http/https）
+   - 内网IP禁止
+   - DNS重绑定防护
+   - 云元数据访问
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: web-security-alerts
+    rules:
+      - alert: HighSQLInjectionAttempts
+        expr: rate(web_security_sql_injection_attempts_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SQL注入攻击尝试过多"
+
+      - alert: HighXSSAttempts
+        expr: rate(web_security_xss_attempts_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "XSS攻击尝试过多"
+
+      - alert: HighCSRFAttempts
+        expr: rate(web_security_csrf_attempts_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CSRF攻击尝试过多"
+
+      - alert: HighAuthenticationFailures
+        expr: rate(web_security_auth_failures_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "认证失败次数过多"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 安全配置 | Git版本控制 | 每次变更 | 永久 |
+| 证书文件 | 密钥管理服务 | 每次变更 | 永久 |
+| 审计日志 | SIEM系统 | 实时 | 1年 |
+| 安全规则 | 配置文件 | 每次变更 | 永久 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| WAF故障 | 模拟WAF故障 | 应用层防护生效 | <5min |
+| 证书过期 | 模拟证书过期 | 自动续期 | <5min |
+| DDoS攻击 | 模拟DDoS攻击 | 流量清洗生效 | <1min |
+| 数据泄露 | 模拟数据泄露 | 告警+阻断 | <30s |
+
+### 多租户安全隔离
+
+```yaml
+# 租户级安全配置
+tenants:
+  - name: "tenant-a"
+    security:
+      authentication:
+        type: "oauth2"
+        issuer: "https://auth-tenant-a.example.com"
+      authorization:
+        rbac:
+          enabled: true
+      encryption:
+        algorithm: "AES-256"
+        key: "tenant-a-key"
+
+  - name: "tenant-b"
+    security:
+      authentication:
+        type: "saml"
+        issuer: "https://auth-tenant-b.example.com"
+      authorization:
+        abac:
+          enabled: true
+      encryption:
+        algorithm: "RSA-2048"
+        key: "tenant-b-key"
+```
+
+### 与DevSecOps集成
+
+```yaml
+# CI/CD安全扫描
+stages:
+  - security-scan
+  - build
+  - test
+  - deploy
+
+security-scan:
+  stage: security-scan
+  script:
+    # SAST扫描
+    - sonar-scanner
+    
+    # SCA依赖检查
+    - dependency-check --project "My Project" --scan .
+    
+    # 容器镜像扫描
+    - trivy image myapp:latest
+    
+    # DAST扫描
+    - zap-cli quick-scan -r http://localhost:8080
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency扫描-report.json
+      sast: gl-sast-report.json
+```
+
 ## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；

@@ -1856,6 +1856,104 @@ spec:
       app: spark-driver
 ```
 
+## 资源调度深度优化与对比
+
+### Fair vs Capacity调度器对比
+
+| 维度 | Fair Scheduler | Capacity Scheduler |
+|------|----------------|---------------------|
+| 资源分配 | 公平分配 | 容量预留 |
+| 队列管理 | 层级队列 | 层级队列 |
+| 抢占 | 支持 | 不支持 |
+| 资源借用 | 动态 | 静态 |
+| 适用场景 | 多租户 | 混合负载 |
+
+### K8s调度扩展机制
+
+| 扩展机制 | 说明 | 适用场景 |
+|----------|------|----------|
+| Scheduler Framework | 调度框架扩展 | 自定义调度策略 |
+| 自定义调度器 | 独立调度器 | 特殊调度需求 |
+| 调度器配置 | Policy配置 | 策略调整 |
+
+### 资源模型对比
+
+| 维度 | YARN | K8s |
+|------|------|-----|
+| 资源单位 | vcore+内存 | CPU+内存 |
+| 请求方式 | ContainerRequest | Pod requests |
+| 限制方式 | ContainerLimits | Pod limits |
+| 资源队列 | Queue | Namespace+ResourceQuota |
+| 资源类型 | CPU/内存 | CPU/内存/GPU/自定义 |
+
+### Pod优先级与抢占
+
+```yaml
+# PriorityClass配置
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "高优先级Pod"
+preemptionPolicy: PreemptLowerPriority
+---
+# Pod使用PriorityClass
+apiVersion: v1
+kind: Pod
+metadata:
+  name: high-priority-pod
+spec:
+  priorityClassName: high-priority
+  containers:
+  - name: nginx
+    image: nginx
+```
+
+### YARN → K8s迁移路线图
+
+```mermaid
+flowchart TD
+    A[评估阶段] --> B{迁移策略?}
+    B -->|先批后流| C[第一批作业迁移]
+    B -->|共存策略| D[YARN+K8s共存]
+    C --> E[验证稳定性]
+    D --> E
+    E --> F[迁移流式作业]
+    F --> G[下线YARN集群]
+```
+
+### 迁移成本对比
+
+| 成本项 | YARN | K8s | 说明 |
+|--------|------|-----|------|
+| 硬件成本 | 高 | 中 | K8s资源利用率高 |
+| 运维成本 | 高 | 中 | K8s生态成熟 |
+| 学习成本 | 低 | 高 | K8s学习曲线陡峭 |
+| 迁移成本 | - | 高 | 初期投入大 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 资源配额 | 设置requests/limits | 高 |
+| 调度策略 | 合理配置调度器 | 高 |
+| 监控告警 | 资源使用监控 | 高 |
+| 弹性伸缩 | HPA/VPA配置 | 中 |
+| 优先级管理 | Pod优先级配置 | 中 |
+| 资源隔离 | Namespace隔离 | 高 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| Pod Pending | 资源不足/调度失败 | 检查资源/调度策略 |
+| 资源浪费 | requests设置过高 | 调整requests |
+| OOMKilled | limits设置过低 | 增加limits |
+| 调度延迟 | 调度器负载高 | 增加调度器副本 |
+| 资源竞争 | 多租户竞争 | 资源配额隔离 |
+
 ## YARN → K8s 迁移成本分析
 
 ### 迁移成本对比

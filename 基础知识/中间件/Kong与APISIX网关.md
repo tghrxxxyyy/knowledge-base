@@ -1836,6 +1836,214 @@ wrk.headers["Content-Type"] = "application/json"
 
 ---
 
+## Kong/APISIX 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| 云原生模式 | K8s | Operator部署 | 弹性伸缩 |
+| 混合模式 | 大规模 | 10+ | 多集群 |
+
+```mermaid
+graph TB
+    subgraph 网关集群架构
+        CLIENT[客户端] --> LB[负载均衡]
+        LB --> GW1[网关1]
+        LB --> GW2[网关2]
+        LB --> GW3[网关3]
+        GW1 --> UP1[上游1]
+        GW2 --> UP2[上游2]
+        GW3 --> UP3[上游3]
+        GW1 --> REDIS[(Redis集群)]
+        GW2 --> REDIS
+        GW3 --> REDIS
+        GW1 --> DB[(数据库)]
+        GW2 --> DB
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| 网关CPU | QPS × 0.001 | 4-8核 |
+| 网关内存 | 并发连接数 × 10KB | 4-8GB |
+| 连接池 | QPS / 响应时间 | 1000+ |
+| Redis连接 | 网关数 × 10 | 100+ |
+| 网络带宽 | QPS × 请求大小 × 2 | 10Gbps+ |
+
+### 插件配置优化
+
+```yaml
+# Kong插件配置
+plugins:
+  - name: rate-limiting
+    config:
+      second: 100
+      hour: 1000000
+      policy: redis
+      redis_host: redis-cluster
+      redis_port: 6379
+
+  - name: key-auth
+    config:
+      key_names:
+        - apikey
+        - x-api-key
+      hide_credentials: true
+
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid#counter
+      echo_downstream: true
+
+  - name: prometheus
+    config:
+      per_consumer: true
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: kong-alerts
+    rules:
+      - alert: KongHighLatency
+        expr: histogram_quantile(0.99, rate(kong_request_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kong请求延迟过高"
+
+      - alert: KongHighErrorRate
+        expr: rate(kong_requests_total{status=~"5.."}[5m]) / rate(kong_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kong错误率过高"
+
+      - alert: KongWorkerDown
+        expr: up{job="kong"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kong Worker节点宕机"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 路由配置 | 数据库快照 | 每日 | 30天 |
+| 插件配置 | Git版本控制 | 每次变更 | 永久 |
+| 证书文件 | 密钥管理服务 | 每次变更 | 永久 |
+| 监控数据 | Prometheus | 15天 | 15天 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| 网关宕机 | 停止网关节点 | 负载均衡自动摘除 | <30s |
+| Redis故障 | 模拟Redis故障 | 本地缓存降级 | <1min |
+| 上游故障 | 模拟上游不可用 | 熔断降级 | <10s |
+| 证书过期 | 模拟证书过期 | 自动续期 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级路由配置
+services:
+  - name: tenant-a-service
+    url: http://service-a:8080
+    routes:
+      - name: tenant-a-route
+        paths:
+          - /api/tenant-a/**
+        plugins:
+          - name: key-auth
+            config:
+              key_names:
+                - x-tenant-key
+          - name: rate-limiting
+            config:
+              second: 100
+              policy: redis
+
+  - name: tenant-b-service
+    url: http://service-b:8080
+    routes:
+      - name: tenant-b-route
+        paths:
+          - /api/tenant-b/**
+        plugins:
+          - name: key-auth
+            config:
+              key_names:
+                - x-tenant-key
+          - name: rate-limiting
+            config:
+              second: 200
+              policy: redis
+```
+
+### 与微服务生态集成
+
+```yaml
+# 服务发现配置
+plugins:
+  - name: dns
+    config:
+      resolver:
+        nameservers:
+          - 10.0.0.10
+        valid_ttl: 10
+        keepalive: 60
+
+  - name: upstream-keepalive
+    config:
+      keepalive: 300
+      keepalive_requests: 1000
+      keepalive_timeout: 60
+
+# 健康检查配置
+upstreams:
+  - name: my-upstream
+    targets:
+      - target: service1:8080
+        weight: 100
+      - target: service2:8080
+        weight: 100
+    healthchecks:
+      active:
+        http_path: /health
+        healthy:
+          interval: 5
+          successes: 2
+        unhealthy:
+          interval: 5
+          http_failures: 3
+          tcp_failures: 3
+          timeouts: 3
+      passive:
+        healthy:
+          successes: 5
+        unhealthy:
+          http_failures: 5
+          tcp_failures: 5
+          timeouts: 5
+```
+
 ## 与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；

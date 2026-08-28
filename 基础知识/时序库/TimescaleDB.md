@@ -1896,6 +1896,149 @@ CREATE INDEX idx_device_time ON device_data (device_id, time DESC);
 
 ---
 
+## TimescaleDB深度优化与高级特性
+
+### 连续聚合详解
+
+| 概念 | 说明 | 用途 |
+|------|------|------|
+| Continuous Aggregate | 连续聚合 | 物化视图自动刷新 |
+| Refresh Policy | 刷新策略 | 控制刷新频率 |
+| Compression Policy | 压缩策略 | 数据压缩 |
+| Retention Policy | 保留策略 | 数据清理 |
+
+### 压缩策略调优
+
+```sql
+-- 创建压缩策略
+SELECT add_compression_policy('sensors', INTERVAL '7 days');
+
+-- 压缩配置
+ALTER TABLE sensors SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+```
+
+| 压缩策略 | 说明 | 压缩比 |
+|----------|------|--------|
+| segmentby | 按字段分段 | 中 |
+| orderby | 按字段排序 | 高 |
+| 两者结合 | 分段+排序 | 最高 |
+
+### 多节点部署架构
+
+```mermaid
+flowchart TB
+    subgraph Access Node
+        A1[access-1]
+        A2[access-2]
+    end
+    subgraph Data Node
+        B1[data-1]
+        B2[data-2]
+        B3[data-3]
+    end
+    Access Node --> Data Node
+```
+
+| 节点类型 | 说明 | 资源需求 |
+|----------|------|----------|
+| Access Node | 接入节点 | CPU高/内存中 |
+| Data Node | 数据节点 | CPU中/内存高/磁盘高 |
+
+### PostgreSQL生态兼容
+
+| 特性 | 支持 | 说明 |
+|------|------|------|
+| SQL标准 | 完全支持 | 标准SQL |
+| 扩展 | 完全支持 | pg_stat等 |
+| 连接池 | 支持 | PgBouncer |
+| 逻辑复制 | 支持 | PG逻辑复制 |
+| 外部表 | 支持 | FDW |
+
+### IoT数据平台应用
+
+| 应用场景 | 说明 | 技术点 |
+|----------|------|--------|
+| 设备监控 | 实时设备状态 | 连续聚合 |
+| 数据采集 | 时序数据写入 | 批量写入 |
+| 告警规则 | 异常检测 | 压缩+查询 |
+| 历史分析 | 历史数据分析 | 压缩+降采样 |
+
+### TimescaleDB vs InfluxDB vs TDengine对比
+
+| 维度 | TimescaleDB | InfluxDB | TDengine |
+|------|-------------|----------|----------|
+| 数据模型 | 关系型+时序 | 时间序列 | 超级表 |
+| 查询语言 | SQL | Flux/InfluxQL | SQL |
+| 生态 | PostgreSQL生态 | 独立生态 | 独立生态 |
+| 扩展性 | 多节点 | 集群 | 集群 |
+| 适用场景 | 复杂查询 | 通用 | IoT |
+
+### 容量规划
+
+| 指标 | 计算方式 | 示例 |
+|------|----------|------|
+| 存储需求 | 原始数据×压缩比×保留期 | 100GB×0.1×365天=3.65TB |
+| 内存需求 | 热数据量×10% | 1TB×10%=100GB |
+| CPU需求 | 写入QPS×0.01+查询QPS×0.1 | 10万×0.01+1万×0.1=20核 |
+| 磁盘IOPS | 写入IOPS+查询IOPS | 10万+1万=11万 |
+
+### 性能调优
+
+| 调优项 | 说明 | 配置 |
+|--------|------|------|
+| chunk大小 | 合理设置chunk间隔 | 7天 |
+| 并行查询 | 启用并行查询 | max_parallel_workers |
+| 连接池 | 使用连接池 | PgBouncer |
+| 索引优化 | 创建合适索引 | BRIN索引 |
+
+### 监控告警配置
+
+```yaml
+# TimescaleDB监控告警
+groups:
+- name: timescaledb-alerts
+  rules:
+  - alert: TimescaleDBHighWriteLatency
+    expr: timescaledb_write_latency_seconds > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "TimescaleDB写入延迟过高"
+  - alert: TimescaleDBHighCompressionRatio
+    expr: timescaledb_compression_ratio > 0.9
+    for: 5m
+    labels:
+      severity: info
+    annotations:
+      summary: "TimescaleDB压缩率过高"
+```
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 写入延迟 | chunk过大/索引缺失 | 调整chunk大小/创建索引 |
+| 查询缓慢 | 数据量大/无压缩 | 启用压缩/降采样 |
+| 压缩失败 | 内存不足 | 增加内存 |
+| 复制延迟 | 网络问题 | 检查网络 |
+| 磁盘空间不足 | 数据增长 | 压缩/保留策略 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 数据模型 | 合理设计hypertable | 高 |
+| 压缩策略 | 启用压缩 | 高 |
+| 连续聚合 | 配置连续聚合 | 高 |
+| 保留策略 | 设置数据保留 | 高 |
+| 监控告警 | TimescaleDB监控 | 高 |
+| 备份策略 | 定期备份 | 高 |
+
 ## 二十五、TimescaleDB监控与告警
 
 ### 25.1 监控指标

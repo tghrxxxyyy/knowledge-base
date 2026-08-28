@@ -472,6 +472,178 @@ docker run -d --name jenkins-dr \
 
 > 口诀：**JCasC 保"形"，ThinBackup 保"忆"；没有做过恢复演练的灾备方案只是心理安慰。**
 
+## Jenkins 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|---------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 主从模式 | 中小规模 | 2 | Controller+Agent |
+| 集群模式 | 生产环境 | 3+ | 高可用 |
+| K8s模式 | 云原生 | 弹性 | Pod Agent |
+
+```mermaid
+graph TB
+    subgraph Jenkins集群架构
+        USER[用户] --> LB[负载均衡]
+        LB --> CTRL1[Controller 1]
+        LB --> CTRL2[Controller 2]
+        CTRL1 <--> DB[(数据库)]
+        CTRL2 <--> DB
+        CTRL1 --> AGENT1[Agent 1]
+        CTRL1 --> AGENT2[Agent 2]
+        CTRL2 --> AGENT1
+        CTRL2 --> AGENT2
+        AGENT1 --> K8S[K8s Pod Agent]
+        AGENT2 --> K8S
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Controller CPU | 并发构建数 × 2 | 4-8核 |
+| Controller 内存 | 并发构建数 × 4GB | 8-16GB |
+| Agent CPU | 构建任务数 × 4 | 8-16核 |
+| Agent 内存 | 构建任务数 × 8GB | 16-32GB |
+| 磁盘空间 | 构建历史 × 平均大小 | 按需 |
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: jenkins-alerts
+    rules:
+      - alert: JenkinsHighCPU
+        expr: jenkins_cpu_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins CPU使用率过高"
+
+      - alert: JenkinsHighMemory
+        expr: jenkins_memory_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins内存使用率过高"
+
+      - alert: JenkinsHighQueueSize
+        expr: jenkins_queue_size > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins队列积压过多"
+
+      - alert: JenkinsDown
+        expr: up{job="jenkins"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Jenkins宕机"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| JENKINS_HOME | ThinBackup | 每日 | 30天 |
+| JCasC配置 | Git版本控制 | 每次变更 | 永久 |
+| Pipeline定义 | Git版本控制 | 每次变更 | 永久 |
+| 凭据数据 | 加密备份 | 每日 | 永久 |
+| 插件列表 | plugins.txt | 每次变更 | 永久 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Controller宕机 | 停止Controller | HA自动切换 | <5min |
+| Agent故障 | 停止Agent | 任务重新分配 | <1min |
+| 磁盘满 | 模拟磁盘满 | 清理旧构建 | <5min |
+| 数据库故障 | 模拟数据库故障 | Jenkins降级 | <10min |
+
+### 多租户资源隔离
+
+```yaml
+# 租户级Jenkins配置
+jenkins:
+  securityRealm:
+    ldap:
+      configurations:
+        - server: "ldap.example.com"
+          rootDN: "dc=example,dc=com"
+          userSearchBase: "ou=tenant-a"
+          
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "tenant-a-admin"
+            permissions: ["Overall/Administer"]
+            entries:
+              - group: "tenant-a-admins"
+          - name: "tenant-a-developer"
+            permissions: ["Job/Read", "Job/Build"]
+            entries:
+              - group: "tenant-a-developers"
+```
+
+### 与CI/CD生态集成
+
+```yaml
+# Jenkins + Docker + K8s CI/CD
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: maven
+    image: maven:3.9-eclipse-temurin-21
+    command: ['sleep']
+    args: ['infinity']
+  - name: docker
+    image: docker:24-dind
+    securityContext:
+      privileged: true
+"""
+        }
+    }
+    stages {
+        stage('Build') {
+            steps {
+                container('maven') {
+                    sh 'mvn clean package'
+                }
+            }
+        }
+        stage('Docker Build') {
+            steps {
+                container('docker') {
+                    sh 'docker build -t myapp:latest .'
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                container('kubectl') {
+                    sh 'kubectl set image deployment/myapp myapp=myapp:latest'
+                }
+            }
+        }
+    }
+}
+```
+
 ## 三十一、与其他模块的关联
 
 - [01-概述与核心概念](01-概述与核心概念.md)：CI/CD 总览、流水线 stages 定义，本文架构是其运行时底座。

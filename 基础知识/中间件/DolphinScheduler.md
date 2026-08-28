@@ -1561,6 +1561,207 @@ task-plugins:
 | 内存溢出 | 任务内存不足 | 增加 Worker 内存 |
 | 连接超时 | 网络问题 | 检查网络配置 |
 
+## DolphinScheduler 生产部署最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | 节点数 | 说明 |
+|----------|----------|--------|------|
+| 单机模式 | 开发测试 | 1 | 所有组件合一 |
+| 集群模式 | 生产环境 | 3+ | Master/Worker 分离 |
+| K8s 模式 | 云原生 | 弹性 | Operator 部署 |
+| 混合模式 | 大规模 | 10+ | 多租户隔离 |
+
+```mermaid
+graph TB
+    subgraph 生产部署架构
+        LB[负载均衡] --> M1[Master 1]
+        LB --> M2[Master 2]
+        LB --> M3[Master 3]
+        M1 --> ZK[ZooKeeper集群]
+        M2 --> ZK
+        M3 --> ZK
+        ZK --> W1[Worker 1]
+        ZK --> W2[Worker 2]
+        ZK --> W3[Worker 3]
+        W1 --> DB[(MySQL集群)]
+        W2 --> DB
+        W3 --> DB
+        W1 --> HDFS[HDFS/OSS]
+        W2 --> HDFS
+        W3 --> HDFS
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|----------|--------|
+| Master CPU | 任务数 × 0.01 | 4-8 核 |
+| Master 内存 | 任务数 × 0.5MB | 8-16GB |
+| Worker CPU | 并发任务数 × 2 | 8-16 核 |
+| Worker 内存 | 并发任务数 × 4GB | 16-64GB |
+| 数据库连接 | Worker数 × 20 | 200+ |
+| ZK 连接 | Master数 + Worker数 | 50+ |
+
+### 监控告警配置
+
+```yaml
+# DolphinScheduler 监控指标
+metrics:
+  enabled: true
+  port: 12345
+
+# Prometheus 告警规则
+groups:
+  - name: dolphinscheduler-alerts
+    rules:
+      - alert: MasterDown
+        expr: up{job="dolphinscheduler-master"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DolphinScheduler Master 节点宕机"
+
+      - alert: TaskFailureRateHigh
+        expr: rate(dolphinscheduler_task_failure_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "任务失败率超过5%"
+
+      - alert: WorkerCPUHigh
+        expr: dolphinscheduler_worker_cpu_usage > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker CPU使用率超过80%"
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 数据库 | mysqldump + binlog | 每日全量 + 实时增量 | 30天 |
+| 工作流定义 | API导出 + Git | 每次变更 | 永久 |
+| 资源文件 | HDFS快照 | 每周 | 90天 |
+| 配置文件 | 配置中心快照 | 每次变更 | 永久 |
+
+```bash
+# 数据库备份脚本
+#!/bin/bash
+DATE=$(date +%Y%m%d_%H%M%S)
+mysqldump -u root -p${MYSQL_PASS} \
+  --single-transaction \
+  --routines \
+  --triggers \
+  dolphinscheduler | gzip > /backup/ds_${DATE}.sql.gz
+
+# 保留最近30天
+find /backup -name "ds_*.sql.gz" -mtime +30 -delete
+```
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Master 宕机 | 停止1个Master | ZK自动选举 | <30s |
+| Worker 宕机 | 停止1个Worker | 任务自动转移 | <60s |
+| 数据库故障 | 切换主从 | 服务自动恢复 | <5min |
+| ZK 集群故障 | 停止2个ZK节点 | 服务降级 | <2min |
+
+### 多租户资源隔离
+
+```text
+多租户资源隔离策略：
+
+  计算资源隔离：
+    ├── Worker分组：按租户分配Worker节点
+    ├── 资源队列：按优先级分配CPU/内存
+    └── 任务限制：限制并发任务数
+
+  存储资源隔离：
+    ├── 资源目录：每个租户独立目录
+    ├── 数据源：按租户隔离数据源
+    └── 日志存储：按租户隔离日志
+
+  网络资源隔离：
+    ├── 网络策略：K8s NetworkPolicy
+    ├── 服务隔离：独立Service
+    └── 流量控制：按租户限流
+```
+
+### 性能压测与调优
+
+| 压测场景 | 压测指标 | 目标值 | 调优方向 |
+|----------|---------|--------|---------|
+| 单工作流 | 调度延迟 | <1s | Master调度线程池 |
+| 大规模任务 | 并发数 | 10000+ | Worker水平扩展 |
+| 高频调度 | 调度TPS | 1000+ | ZK性能优化 |
+| 数据倾斜 | 负载均衡 | <10%偏差 | Worker分组策略 |
+
+```java
+// 性能压测脚本
+public class DolphinSchedulerStressTest {
+    public void testHighConcurrency() {
+        // 1. 创建10000个任务
+        for (int i = 0; i < 10000; i++) {
+            createTask("stress-test-" + i, "shell", "echo hello");
+        }
+        
+        // 2. 同时触发所有任务
+        long start = System.currentTimeMillis();
+        triggerAllTasks();
+        
+        // 3. 监控执行情况
+        while (getRunningTaskCount() > 0) {
+            Thread.sleep(1000);
+            log.info("Running tasks: {}", getRunningTaskCount());
+        }
+        
+        long duration = System.currentTimeMillis() - start;
+        log.info("Total duration: {}ms, avg: {}ms/task", 
+            duration, duration / 10000);
+    }
+}
+```
+
+### 生产环境安全加固
+
+| 安全措施 | 配置方式 | 说明 |
+|----------|---------|------|
+| HTTPS | Nginx反向代理 | 加密传输 |
+| 认证授权 | LDAP/OAuth2 | 统一认证 |
+| 网络隔离 | VPC/安全组 | 网络隔离 |
+| 审计日志 | 操作日志 | 行为审计 |
+| 数据加密 | 敏感字段加密 | 数据安全 |
+
+### 与数据平台集成
+
+```mermaid
+graph LR
+    subgraph 数据平台架构
+        DS[DolphinScheduler] --> HIVE[Hive数据仓库]
+        DS --> SPARK[Spark计算]
+        DS --> FLINK[Flink流处理]
+        DS --> PRESTO[Presto查询]
+        DS --> CLICK[ClickHouse分析]
+        DS --> ES[Elasticsearch搜索]
+        DS --> REDIS[Redis缓存]
+        DS --> KAFKA[Kafka消息]
+    end
+    
+    subgraph 数据源
+        MYSQL[(MySQL)] --> DS
+        POSTGRES[(PostgreSQL)] --> DS
+        HDFS[HDFS] --> DS
+        OSS[对象存储] --> DS
+    end
+```
+
 ### 19.6 与其他板块的关系
 
 - 定时任务对比见「[分布式任务调度对比](./分布式任务调度对比.md)」；

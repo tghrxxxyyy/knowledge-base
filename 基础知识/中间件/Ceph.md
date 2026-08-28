@@ -1945,6 +1945,126 @@ ceph osd thrash 10
 | 复杂度 | 高 | 低 | 中 |
 | 生态 | OpenStack | K8s | 通用 |
 
+## Ceph存储架构深度解析
+
+### CRUSH Map详解
+
+| 组件 | 作用 | 配置 |
+|------|------|------|
+| OSD | 对象存储守护进程 | 每磁盘一个 |
+| MON | 监控器 | 3+节点 |
+| MDS | 元数据服务器 | CephFS需要 |
+| MGR | 管理器 | 增强监控 |
+
+### CRUSH规则配置
+
+```
+# CRUSH规则示例
+rule replicated_rule {
+    id 0
+    type replicated
+    step take default class hdd
+    step chooseleaf firstn 0 type host
+    step emit
+}
+```
+
+### Pool配置优化
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| pg_num | 128 | 256-1024 | PG数量 |
+| pgp_num | 128 | 256-1024 | PGP数量 |
+| size | 3 | 3 | 副本数 |
+| min_size | 1 | 2 | 最小副本数 |
+| crush_rule | replicated_rule | - | CRUSH规则 |
+
+### RBD缓存优化
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| rbd_cache | true | true | 启用缓存 |
+| rbd_cache_size | 32MB | 256MB | 缓存大小 |
+| rbd_cache_max_dirty | 24MB | 192MB | 脏数据上限 |
+| rbd_cache_target_dirty | 16MB | 128MB | 脏数据目标 |
+
+### MDS调优
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| mds_cache_memory_limit | 1GB | 4GB | 元数据缓存 |
+| mds_balancer_interval | 300s | 60s | 负载均衡间隔 |
+| mds_log_max_segments | 128 | 256 | 日志段数 |
+
+### 监控与告警
+
+```yaml
+# Ceph监控告警规则
+groups:
+- name: ceph-alerts
+  rules:
+  - alert: CephOSDDown
+    expr: ceph_osd_up == 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Ceph OSD节点宕机"
+  - alert: CephPGDegraded
+    expr: ceph_pg_degraded > 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Ceph PG降级"
+  - alert: CephDiskSpaceLow
+    expr: ceph_disk_avail_bytes < 10737418240
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Ceph磁盘空间不足10GB"
+```
+
+### 故障排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| OSD down | 磁盘故障/网络问题 | 检查磁盘/网络 |
+| PG不一致 | 网络分区/OSD异常 | peering/recovery |
+| 性能下降 | OSD负载高/网络拥塞 | 扩容/优化网络 |
+| 空间不足 | 数据增长 | 扩容/清理数据 |
+
+### OpenStack集成
+
+| 组件 | Ceph集成 | 说明 |
+|------|----------|------|
+| Nova | RBD | 虚拟机磁盘 |
+| Cinder | RBD | 块存储 |
+| Glance | RBD | 镜像存储 |
+| Swift | RGW | 对象存储 |
+
+### Ceph vs 其他存储对比
+
+| 维度 | Ceph | GlusterFS | MinIO |
+|------|------|-----------|-------|
+| 架构 | 分布式 | 分布式 | 单机/集群 |
+| 协议 | RADOS | Gluster | S3 |
+| 性能 | 高 | 中 | 高 |
+| 复杂度 | 高 | 中 | 低 |
+| 适用场景 | 通用 | 文件存储 | 对象存储 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 多副本 | 至少3副本 | 高 |
+| 混合存储 | HDD+SSD分层 | 高 |
+| 监控告警 | OSD/PG/空间监控 | 高 |
+| 定期清理 | scrub/compact | 中 |
+| 网络规划 | 专用存储网络 | 高 |
+| 容量规划 | 预留30%空间 | 高 |
+
 ## 十六、与其他板块的关系
 
 - 分布式存储原理见「[分布式存储与HDFS](../大数据/04-分布式存储与HDFS.md)」；

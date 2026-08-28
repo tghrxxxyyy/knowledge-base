@@ -1844,4 +1844,172 @@ jobs:
 
 ---
 
+## GitHub Actions 生产部署与运维最佳实践
+
+### 部署架构选型
+
+| 架构模式 | 适用场景 | Runner配置 | 说明 |
+|----------|---------|------------|------|
+| 托管Runner | 免费开源项目 | GitHub托管 | 零运维 |
+| 自托管Runner | 企业私有项目 | 自建服务器 | 完全控制 |
+| 混合Runner | 混合场景 | 托管+自建 | 灵活选择 |
+| K8s Runner | 云原生环境 | K8s Pod | 弹性伸缩 |
+
+```mermaid
+graph TB
+    subgraph GitHub Actions架构
+        TRIGGER[触发器] --> WORKFLOW[Workflow]
+        WORKFLOW --> JOB1[Job 1]
+        WORKFLOW --> JOB2[Job 2]
+        JOB1 --> RUNNER1[Runner 1]
+        JOB2 --> RUNNER2[Runner 2]
+        RUNNER1 --> ACTIONS[Actions]
+        RUNNER2 --> ACTIONS
+        ACTIONS --> CACHE[Cache]
+        ACTIONS --> SECRETS[Secrets]
+    end
+```
+
+### 资源规划公式
+
+| 资源类型 | 计算公式 | 推荐值 |
+|----------|---------|--------|
+| Runner CPU | 构建任务数 × 2 | 4-8核 |
+| Runner 内存 | 构建任务数 × 4GB | 8-16GB |
+| 存储空间 | 制品大小 × 保留天数 | 按需 |
+| 网络带宽 | 制品大小 × 传输次数 | 按需 |
+| 并发任务 | 团队规模 × 2 | 10+ |
+
+### 监控告警配置
+
+```yaml
+# 工作流监控
+name: Monitor Workflow
+on:
+  workflow_run:
+    workflows: ["*"]
+    types: [completed]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check workflow status
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const workflow = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.payload.workflow_run.id
+            });
+            
+            if (workflow.data.conclusion === 'failure') {
+              // 发送失败告警
+              console.log('Workflow failed:', workflow.data.name);
+            }
+```
+
+### 容灾备份策略
+
+| 备份内容 | 备份方式 | 频率 | 保留期 |
+|----------|---------|------|--------|
+| 工作流配置 | Git版本控制 | 每次变更 | 永久 |
+| Secrets | GitHub加密 | 实时 | 永久 |
+| 缓存数据 | GitHub Cache | 7天 | 7天 |
+| 制品数据 | GitHub Packages | 按需 | 按需 |
+
+### 故障恢复演练
+
+| 演练场景 | 演练步骤 | 预期结果 | RTO |
+|----------|---------|----------|-----|
+| Runner故障 | 停止Runner | 任务自动重试 | <5min |
+| Workflow失败 | 模拟失败 | 自动回滚 | <10min |
+| Secrets泄露 | 模拟泄露 | 轮换密钥 | <1min |
+| 缓存失效 | 清除缓存 | 重新构建 | <5min |
+
+### 多租户资源隔离
+
+```yaml
+# 组织级工作流隔离
+name: Organization Workflow
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Deploy to environment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const env = '${{ github.event.inputs.environment }}';
+            console.log(`Deploying to ${env}`);
+```
+
+### 与CI/CD生态集成
+
+```yaml
+# 完整CI/CD工作流
+name: CI/CD Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Lint
+        run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v3
+      - name: Test
+        run: npm test
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: npm run build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: dist
+          path: dist/
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+      - name: Deploy
+        run: echo "Deploying to production"
+```
+
 ## 本篇补充 Checklist

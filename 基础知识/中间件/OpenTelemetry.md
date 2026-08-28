@@ -1853,6 +1853,186 @@ service:
       exporters: [otlp/profiler]
 ```
 
+## OpenTelemetry深度优化与高级特性
+
+### Collector配置详解
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+      - job_name: 'otel-collector'
+        scrape_interval: 10s
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+  memory_limiter:
+    limit_mib: 400
+    spike_limit_mib: 100
+  attributes:
+    actions:
+    - key: environment
+      value: production
+      action: upsert
+
+exporters:
+  otlp:
+    endpoint: jaeger:4317
+    tls:
+      cert_file: /etc/ssl/certs/otel.crt
+      key_file: /etc/ssl/private/otel.key
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, memory_limiter]
+      exporters: [otlp]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [batch]
+      exporters: [prometheus]
+```
+
+### Resource Attributes最佳实践
+
+| 属性 | 说明 | 示例 |
+|------|------|------|
+| service.name | 服务名称 | my-api |
+| service.version | 服务版本 | 1.0.0 |
+| service.environment | 部署环境 | production |
+| service.instance.id | 实例ID | instance-001 |
+| host.name | 主机名 | web-server-01 |
+
+### 上下文传播配置
+
+| 传播器 | 协议 | 适用场景 |
+|--------|------|----------|
+| tracecontext | W3C Trace Context | 通用 |
+| baggage | W3C Baggage | 通用 |
+| b3 | B3 (Zipkin) | Zipkin兼容 |
+| jaeger | Jaeger | Jaeger兼容 |
+| xray | AWS X-Ray | AWS环境 |
+
+### SDK自动注入
+
+```java
+// Java SDK自动注入配置
+OpenTelemetry otel = OpenTelemetrySdk.builder()
+    .setResource(Resource.getDefault().merge(
+        Resource.builder()
+            .put("service.name", "my-service")
+            .put("service.version", "1.0.0")
+            .build()))
+    .setTracerProvider(SdkTracerProvider.builder()
+        .setSampler(Sampler.parentBased(Sampler.traceIdRatioBased(0.1)))
+        .addSpanProcessor(BatchSpanProcessor.builder(
+            OtlpGrpcSpanExporter.builder()
+                .setEndpoint("otel-collector:4317")
+                .build())
+            .build())
+        .build())
+    .setMeterProvider(SdkMeterProvider.builder()
+        .registerMetricReader(PeriodicMetricReader.builder(
+            OtlpGrpcMetricExporter.builder()
+                .setEndpoint("otel-collector:4317")
+                .build())
+            .build())
+        .build())
+    .build();
+```
+
+### 采样策略配置
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| alwaysOn | 全部采样 | 开发环境 |
+| alwaysOff | 全部不采样 | 测试环境 |
+| traceIdRatioBased | 按比例采样 | 生产环境 |
+| parentBased | 父级决定 | 分布式追踪 |
+
+### OTel Metrics类型深入
+
+| 类型 | 说明 | 用途 |
+|------|------|------|
+| Counter | 单调递增计数器 | 请求数/错误数 |
+| Gauge | 可增可减仪表盘 | 内存/CPU使用 |
+| Histogram | 直方图 | 延迟分布 |
+| Summary | 摘要 | 百分位数 |
+
+### OTel Logs配置
+
+```yaml
+# OTel Logs配置
+receivers:
+  filelog:
+    include:
+    - /var/log/*.log
+    operators:
+    - type: json_parser
+      timestamp:
+        parse_from: attributes.time
+        layout: RFC3339
+
+processors:
+  batch:
+    timeout: 5s
+
+exporters:
+  elasticsearch:
+    endpoints:
+    - http://elasticsearch:9200
+    index: otel-logs
+
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [batch]
+      exporters: [elasticsearch]
+```
+
+### 部署模式对比
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| Agent | 边车模式 | K8s环境 |
+| Gateway | 集中式 | 大规模集群 |
+| Combined | 混合模式 | 小规模集群 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 采样策略 | 生产环境按比例采样 | 高 |
+| 资源属性 | 设置service.name等 | 高 |
+| 批处理 | 配置batch处理器 | 高 |
+| 内存限制 | 配置memory_limiter | 高 |
+| 安全传输 | TLS加密 | 高 |
+| 监控Collector | Collector自身监控 | 高 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 数据丢失 | 网络/队列满 | 检查网络/增加队列 |
+| 延迟高 | 批处理配置 | 调整batch参数 |
+| 内存溢出 | 数据量大 | 增加内存/调整采样 |
+| 连接失败 | 网络/认证 | 检查网络/证书 |
+| 格式错误 | 数据格式不匹配 | 检查数据格式 |
+
 ## 与其他板块的关系
 - 监控指标见「[Prometheus 与 Grafana 监控](./Prometheus与Grafana监控.md)」；
 - 日志体系见「[ELK 日志体系](./ELK日志体系.md)」与「[Loki](./Loki.md)」；

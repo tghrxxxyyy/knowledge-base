@@ -1950,6 +1950,125 @@ mvn -PnativeTest native:test
 
 ---
 
+## Spring深度优化与高级特性
+
+### 事务传播行为详解
+
+| 传播行为 | 说明 | 适用场景 |
+|----------|------|----------|
+| REQUIRED | 默认，有则加入，无则新建 | 一般业务 |
+| REQUIRES_NEW | 总是新建事务 | 日志记录 |
+| NESTED | 嵌套事务（保存点） | 部分回滚 |
+| SUPPORTS | 有则加入，无则非事务 | 查询操作 |
+| NOT_SUPPORTED | 非事务执行 | 长时间操作 |
+| MANDATORY | 必须有事务 | 强制事务 |
+| NEVER | 必须无事务 | 非事务操作 |
+
+### @Cacheable缓存抽象
+
+```java
+// @Cacheable使用示例
+@Cacheable(value = "users", key = "#id")
+public User getUserById(Long id) {
+    return userRepository.findById(id).orElse(null);
+}
+
+// @CacheEvict清除缓存
+@CacheEvict(value = "users", key = "#id")
+public void updateUser(Long id, User user) {
+    userRepository.save(user);
+}
+
+// @CachePut更新缓存
+@CachePut(value = "users", key = "#id")
+public User updateUser(Long id) {
+    User user = userRepository.findById(id).orElse(null);
+    // 更新用户逻辑
+    return userRepository.save(user);
+}
+```
+
+### Spring Boot AutoConfiguration
+
+| 自动配置 | 说明 | 条件注解 |
+|----------|------|----------|
+| DataSourceAutoConfiguration | 数据源配置 | @ConditionalOnClass |
+| JdbcTemplateAutoConfiguration | JDBC模板 | @ConditionalOnClass |
+| RedisAutoConfiguration | Redis配置 | @ConditionalOnClass |
+| WebMvcAutoConfiguration | Web MVC | @ConditionalOnWebApplication |
+
+### WebFlux vs MVC选型
+
+| 维度 | WebFlux | MVC |
+|------|---------|-----|
+| 编程模型 | 响应式 | 命令式 |
+| 阻塞 | 非阻塞 | 阻塞 |
+| 吞吐量 | 高 | 中 |
+| 学习曲线 | 陡峭 | 平缓 |
+| 生态 | 丰富 | 更丰富 |
+| 适用场景 | 高并发/IO密集 | 一般业务 |
+
+### Spring Security Filter Chain
+
+| 过滤器 | 作用 | 执行顺序 |
+|--------|------|----------|
+| SecurityContextPersistenceFilter | 安全上下文 | 1 |
+| UsernamePasswordAuthenticationFilter | 用户名密码认证 | 5 |
+| BasicAuthenticationFilter | Basic认证 | 7 |
+| ExceptionTranslationFilter | 异常转换 | 11 |
+| FilterSecurityInterceptor | 权限拦截 | 13 |
+
+### @Scheduled定时任务
+
+```java
+// @Scheduled使用示例
+@Scheduled(fixedRate = 5000) // 每5秒执行一次
+public void fixedRateTask() {
+    // 固定频率任务
+}
+
+@Scheduled(fixedDelay = 5000) // 上次执行完成后5秒执行
+public void fixedDelayTask() {
+    // 固定延迟任务
+}
+
+@Scheduled(cron = "0 0 2 * * ?") // 每天凌晨2点执行
+public void cronTask() {
+    // Cron表达式任务
+}
+```
+
+### Spring Boot 3.x核心新特性
+
+| 特性 | 说明 | 影响 |
+|------|------|------|
+| GraalVM原生镜像 | AOT编译 | 启动快/内存少 |
+| 虚拟线程 | Java 21虚拟线程 | 高并发 |
+| Observation API | 统一可观测性 | 监控增强 |
+| ServiceConnection | 服务连接管理 | 配置简化 |
+| SSL bundles | SSL证书管理 | 安全增强 |
+
+### 最佳实践清单
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 配置管理 | 使用@Value或@ConfigurationProperties | 高 |
+| 异常处理 | 使用@ControllerAdvice | 高 |
+| 缓存使用 | 合理使用@Cacheable | 中 |
+| 事务管理 | 合理使用@Transactional | 高 |
+| 安全配置 | 使用Spring Security | 高 |
+| 监控告警 | 使用Actuator | 中 |
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 启动失败 | 配置错误/依赖缺失 | 检查配置/依赖 |
+| 事务失效 | 代理问题/自调用 | 使用代理调用 |
+| 缓存不生效 | 缓存配置错误 | 检查缓存配置 |
+| 404错误 | 路由配置错误 | 检查@RequestMapping |
+| 连接超时 | 连接池配置不当 | 调整连接池参数 |
+
 ## Spring 故障排查
 
 ### 常见故障处理
