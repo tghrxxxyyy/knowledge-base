@@ -1959,6 +1959,269 @@ DAG解析：
 | Worker OOM | 检查内存使用 | 增加资源/优化代码 |
 | 任务依赖 | 检查依赖配置 | 修复依赖关系 |
 
+## Airflow 监听器与告警通知
+
+### EventListener 生命周期监听
+
+```python
+# 自定义 EventListener（Airflow 2.6+）
+from airflow.listeners import hookimpl, listener
+
+@listener
+def on_task_instance_running(event):
+    """任务开始运行时触发"""
+    print(f"Task {event.task_instance.task_id} started")
+
+@listener
+def on_task_instance_success(event):
+    """任务成功时触发"""
+    send_notification(f"Task {event.task_instance.task_id} succeeded")
+
+@listener  
+def on_task_instance_failed(event):
+    """任务失败时触发"""
+    send_alert(f"Task {event.task_instance.task_id} failed: {event.task_instance.state}")
+```
+
+### 告警通知配置
+
+| 通知渠道 | 配置方式 | 适用场景 |
+|----------|----------|----------|
+| 邮件 | smtp 配置 | 基础告警 |
+| 钉钉 Webhook | HttpOperator | 团队通知 |
+| Slack | SlackWebhookOperator | 国际团队 |
+| PagerDuty | PagerDutyOperator | 紧急告警 |
+| 企业微信 | WebhookOperator | 国内企业 |
+
+```python
+# 失败告警 DAG 示例
+from airflow.operators.email import EmailOperator
+from airflow.operators.http_operator import SimpleHttpOperator
+
+with DAG("alert_dag", ...) as dag:
+    alert_email = EmailOperator(
+        task_id="alert_email",
+        to=["team@company.com"],
+        subject="DAG {{ dag.dag_id }} 失败",
+        html_content="<h3>任务失败告警</h3><p>请检查</p>"
+    )
+    
+    alert_dingtalk = SimpleHttpOperator(
+        task_id="alert_dingtalk",
+        http_conn_id="dingtalk_webhook",
+        endpoint="",
+        method="POST",
+        data=json.dumps({
+            "msgtype": "text",
+            "text": {"content": "Airflow DAG 失败: {{ dag.dag_id }}"}
+        })
+    )
+```
+
+## Airflow 多环境配置隔离
+
+### Dev/Staging/Prod 配置
+
+```yaml
+# 环境变量隔离
+# Dev 环境
+AIRFLOW__CORE__LOAD_EXAMPLES=True
+AIRFLOW__CORE__FERNET_KEY=dev-key
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://dev:dev@localhost/airflow
+
+# Staging 环境
+AIRFLOW__CORE__LOAD_EXAMPLES=False
+AIRFLOW__CORE__FERNET_KEY=staging-key
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://staging:staging@staging-db/airflow
+
+# Prod 环境
+AIRFLOW__CORE__LOAD_EXAMPLES=False
+AIRFLOW__CORE__FERNET_KEY=prod-key
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql://prod:prod@prod-db/airflow
+```
+
+### DAG 目录隔离
+
+```text
+目录结构：
+  /dags/dev/          # 开发环境 DAG
+  /dags/staging/      # 预发布环境 DAG
+  /dags/prod/         # 生产环境 DAG
+  /dags/shared/       # 共享 DAG（跨环境）
+
+环境变量控制：
+  DAGS_FOLDER=/dags/{{ environment }}
+  AIRFLOW__CORE__DAGS_FOLDER=/dags/prod
+```
+
+## Airflow 成本优化
+
+### Scheduler 配置优化
+
+```ini
+[scheduler]
+# 减少 DAG 解析频率（节省 CPU）
+min_file_process_interval = 300  # 5分钟扫描一次（默认30秒）
+
+# 减少解析进程数（节省内存）
+parsing_processes = 2  # 默认4
+
+# 限制单次处理任务数
+max_tis_per_query = 256  # 默认512
+
+# 调度器心跳间隔
+scheduler_heartbeat_sec = 10  # 默认5秒
+```
+
+### Worker 伸缩策略
+
+```yaml
+# KubernetesExecutor 自动伸缩
+[kubernetes_worker]
+# 最小 Worker 数
+worker_min_replicas = 2
+# 最大 Worker 数  
+worker_max_replicas = 10
+# 扩容阈值（待执行任务数）
+worker_scale_trigger = 100
+# 缩容延迟（空闲多久后缩容）
+worker_scale_down_delay = 300  # 5分钟
+
+# CeleryExecutor Worker 配置
+[celery]
+# Worker 并发数
+worker_concurrency = 16  # 按 CPU 核数调整
+# Worker 内存限制
+worker_max_memory_per_child = 2000000  # 2GB
+```
+
+### 资源管理最佳实践
+
+| 资源 | 优化策略 | 节省效果 |
+|------|----------|----------|
+| CPU | 调度器减少扫描频率 | 降低 30% |
+| 内存 | Worker 内存限制+自动重启 | 防止 OOM |
+| 网络 | DAG 文件压缩传输 | 减少带宽 |
+| 存储 | 日志压缩+定期清理 | 降低 50% |
+| Pod | Worker Pod 自动回收 | 降低 K8s 成本 |
+
+## Airflow 数据感知调度（Dataset/DataTrigger）
+
+### Dataset 数据感知
+
+```python
+from airflow.datasets import Dataset
+
+# 定义 Dataset
+orders_dataset = Dataset(name="s3://data-lake/orders/daily")
+users_dataset = Dataset(name="s3://data-lake/users/daily")
+
+# 上游 DAG 写入 Dataset
+with DAG("etl_orders", schedule="@daily") as dag:
+    extract >> transform >> load
+    
+    # 标记输出 Dataset
+    load.outlets = [orders_dataset]
+
+# 下游 DAG 基于 Dataset 触发
+with DAG("analytics", schedule=None) as dag:
+    # 当 orders_dataset 更新时触发
+    process = PythonOperator(
+        task_id="process_orders",
+        python_callable=process_fn,
+    )
+```
+
+### 事件驱动调度
+
+```text
+传统调度：基于时间（cron）
+数据感知调度：基于数据变化
+
+触发方式：
+  1. Dataset 更新触发
+     上游写入新数据 → 下游自动运行
+
+  2. ExternalTaskSensor
+     等待外部 DAG 完成
+
+  3. 自定义 Trigger
+     基于文件/数据库/Webhook
+
+优势：
+  - 避免空跑（无数据不触发）
+  - 实时性更好（数据到达即触发）
+  - 依赖关系更清晰
+```
+
+## Airflow 生产问题排查
+
+### DAG 解析失败
+
+| 问题 | 现象 | 排查步骤 | 解决方案 |
+|------|------|----------|----------|
+| 语法错误 | DAG 无法加载 | 检查 Python 语法 | 修复代码 |
+| 依赖缺失 | ImportError | 检查 requirements.txt | 安装依赖 |
+| 循环依赖 | 导入超时 | 检查 import 语句 | 拆分模块 |
+| 版本不兼容 | API 变更错误 | 检查 Airflow 版本 | 升级/降级 |
+
+```bash
+# 测试 DAG 解析
+airflow dags test <dag_id> <execution_date>
+
+# 检查 DAG 解析错误
+airflow dags list-import-errors
+
+# 查看 DAG 解析时间
+airflow dags list --cols dag_id,filepath,status
+```
+
+### 任务依赖循环
+
+```python
+# 循环依赖检测
+# 错误示例：
+task_a >> task_b >> task_c >> task_a  # 循环！
+
+# 正确示例：
+task_a >> task_b >> task_c
+task_a >> task_d >> task_c  # 并行分支，无循环
+```
+
+```text
+循环依赖排查：
+  1. 查看 DAG 图结构（Web UI）
+  2. 检查 >> 运算符连接
+  3. 使用 DAG 测试命令验证
+  4. 使用 pygraphviz 生成依赖图
+```
+
+### Worker 过载
+
+| 问题 | 现象 | 排查步骤 | 解决方案 |
+|------|------|----------|----------|
+| OOM | Worker 被 Kill | 检查内存使用 | 增加内存/优化代码 |
+| 任务堆积 | 待执行任务增长 | 检查 Worker 数量 | 增加 Worker |
+| 死锁 | 任务长时间运行 | 检查任务日志 | 设置超时 |
+| 连接池耗尽 | 数据库连接错误 | 检查连接池配置 | 增加连接数 |
+
+```yaml
+# Worker 资源限制
+[kubernetes_worker]
+resources:
+  limits:
+    memory: 4Gi
+    cpu: 2
+  requests:
+    memory: 2Gi
+    cpu: 1
+
+# 任务超时
+default_args:
+  execution_timeout: timedelta(hours=2)
+  kill_on_timeout: True
+```
+
 ### 最佳实践
 
 | 实践 | 说明 | 优先级 |

@@ -1619,6 +1619,355 @@ rules:
 | Redis INCR | 原子递增 | 高性能 | 依赖Redis |
 | Leaf | 号段+双Buffer | 高性能 | 复杂度高 |
 
+## 十八-8、跨片查询优化
+
+### 跨片查询性能问题
+
+| 问题 | 根因 | 优化方案 |
+|------|------|----------|
+| 无分片键查询 | SQL 不含分片键，全库广播 | 建冗余索引表/ES 异构索引 |
+| 跨片 JOIN | 两表不在同一分片 | 绑定表/广播表/应用层二次查询 |
+| 跨片分页 | 归并引擎内存排序，深度分页慢 | 游标分页/分片键过滤缩小范围 |
+| 跨片聚合 | 多节点结果归并 | 下推聚合/Coprocessor/物化视图 |
+
+### 路由条件优化
+
+```text
+避免全表扫描的路由优化策略：
+
+1. 分片键强制路由
+   SQL 必须带分片键（如 WHERE user_id=?）
+   → 路由到单库单表，避免广播
+
+2. 绑定表关联查询
+   t_order 和 t_order_item 都按 order_id 分片
+   → JOIN 时自动路由到同一分片，避免笛卡尔积
+
+3. 广播表小表冗余
+   字典表/配置表全量冗余到每个分片
+   → 本地 JOIN 无需跨片
+
+4. 分片键冗余
+   订单表冗余 user_id 字段
+   → 按 user_id 查询时可路由
+
+5. 异构索引（ES/Canal）
+   Canal 监听 binlog → 同步到 ES
+   → 非分片键查询走 ES，结果回查分片表
+```
+
+### 跨片查询性能对比
+
+| 方案 | 延迟 | 吞吐 | 复杂度 | 适用场景 |
+|------|------|------|--------|----------|
+| 全库广播 | 高 | 低 | 低 | 临时查询/运维 |
+| 绑定表 | 低 | 高 | 中 | 主子表关联 |
+| 广播表 | 低 | 中 | 低 | 小表关联 |
+| ES 异构索引 | 中 | 高 | 高 | 复杂检索/搜索 |
+| 应用层聚合 | 中 | 中 | 中 | 跨分片聚合 |
+
+```mermaid
+flowchart TD
+    A[跨片查询] --> B{是否带分片键?}
+    B -->|是| C[单片路由，低延迟]
+    B -->|否| D{是否绑定表?}
+    D -->|是| E[同片 JOIN]
+    D -->|否| F{是否小表?}
+    F -->|是| G[广播表本地 JOIN]
+    F -->|否| H{是否搜索场景?}
+    H -->|是| I[ES 异构索引]
+    H -->|否| J[应用层二次查询]
+```
+
+## 十八-9、数据迁移方案
+
+### 双写迁移方案
+
+```text
+双写迁移流程（停机时间极短）：
+
+阶段1：双写开启
+  应用同时写新旧两套库
+  旧库为主，新库为从
+  监控双写一致性
+
+阶段2：数据对比
+  对比工具扫描新旧库数据
+  检查字段级一致性
+  修复差异数据
+
+阶段3：流量切换
+  读流量先切新库
+  写流量再切新库
+  灰度切换（按 user_id 分桶）
+
+阶段4：旧库下线
+  确认新库稳定
+  停止旧库写入
+  下线旧库
+```
+
+### 影子库对比工具
+
+```java
+// 数据对比工具示例
+public class DataCompareTool {
+    public CompareResult compare(String oldTable, String newTable) {
+        // 1. 按主键分批扫描
+        // 2. 逐行对比字段值
+        // 3. 记录差异（INSERT/UPDATE/DELETE）
+        // 4. 生成修复 SQL
+    }
+}
+
+// 对比维度：
+//   主键存在性：新库有旧库没有 → INSERT
+//   字段值差异：值不同 → UPDATE
+//   旧库多余数据：新库没有旧库有 → 标记确认
+```
+
+### 迁移方案对比
+
+| 方案 | 停机时间 | 数据一致性 | 复杂度 | 适用场景 |
+|------|----------|------------|--------|----------|
+| 双写 | 极短（秒级） | 最终一致 | 高 | 核心业务迁移 |
+| 影子库 | 无 | 最终一致 | 中 | 压测/灰度验证 |
+| 导入导出 | 长（小时级） | 强一致 | 低 | 小表/离线迁移 |
+| Binlog 同步 | 无 | 最终一致 | 中 | 实时同步 |
+| Sc
+
+aling 在线迁移 | 无 | 最终一致 | 高 | 大规模分片迁移 |
+
+### ShardingSphere-Scaling 在线迁移
+
+```yaml
+# Scaling 任务配置
+scalingName: scaling_task_01
+source:
+  type: MySQL
+  jdbcUrl: jdbc:mysql://old-db:3306/order_db
+  username: root
+  password: root
+target:
+  type: MySQL
+  jdbcUrl: jdbc:mysql://new-db:3306/order_db
+  username: root
+  password: root
+ruleConfiguration:
+  - !SHARDING
+    tables:
+      t_order:
+        actualDataNodes: ds_$->{0..1}.t_order_$->{0..3}
+```
+
+## 十八-10、分库分表监控体系
+
+### 监控指标全景
+
+| 指标类别 | 指标名称 | 采集方式 | 告警阈值 |
+|----------|----------|----------|----------|
+| 路由性能 | SQL 路由时间 | ShardingSphere Metrics | >5ms |
+| 归并性能 | 归并排序时间 | ShardingSphere Metrics | >100ms |
+| 慢查询 | 慢 SQL 数 | MySQL Slow Log | >10/hour |
+| 连接池 | 连接池使用率 | HikariCP Metrics | >90% |
+| 分布式事务 | 事务回滚率 | Seata Metrics | >5% |
+| 分片均衡 | 分片数据量差异 | DistSQL 查询 | >20% |
+| 路由命中率 | 广播查询比例 | 路由日志分析 | >10% |
+
+### 慢查询监控配置
+
+```yaml
+# ShardingSphere 慢 SQL 配置
+spring:
+  shardingsphere:
+    props:
+      sql-show: true
+      check-table-metadata-enabled: false
+      sql-simple: true
+
+# 慢 SQL 阈值（应用层拦截）
+logging:
+  level:
+    org.apache.shardingsphere: DEBUG
+
+# Prometheus 指标暴露
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+```
+
+### 路由命中率分析
+
+```text
+路由命中率 = 带分片键查询数 / 总查询数
+
+目标值：
+  命中率 > 90%：优秀（大部分查询走单片）
+  命中率 70-90%：良好（需优化部分查询）
+  命中率 < 70%：需治理（大量广播查询）
+
+提升策略：
+  1. 审计 SQL 模式，识别无分片键查询
+  2. 为高频查询添加分片键冗余字段
+  3. 建立 ES 异构索引承接搜索类查询
+  4. 广播表冗余小表数据
+```
+
+### 锁等待监控
+
+| 监控项 | 正常值 | 告警值 | 排查命令 |
+|--------|--------|--------|----------|
+| 全局锁等待 | <10ms | >100ms | `SHOW PROCESSLIST` |
+| 行锁等待 | <5ms | >50ms | `information_schema.INNODB_LOCK_WAITS` |
+| 元数据锁 | 0 | >0 | `performance_schema.metadata_locks` |
+| 分布式锁 | <10ms | >100ms | Seata/Redis 监控 |
+
+```mermaid
+flowchart TB
+    subgraph 监控告警体系
+        A[ShardingSphere Metrics] --> B[Prometheus]
+        C[MySQL Slow Log] --> B
+        D[HikariCP Metrics] --> B
+        E[Seata Metrics] --> B
+        B --> F[Grafana Dashboard]
+        F --> G{是否告警?}
+        G -->|是| H[AlertManager]
+        H --> I[钉钉/邮件/Slack]
+    end
+```
+
+## 十八-11、生产问题排查手册
+
+### 常见生产问题
+
+| 问题 | 现象 | 根因 | 排查步骤 | 解决方案 |
+|------|------|------|----------|----------|
+| 分片不均匀 | 部分分片数据量远超其他 | 分片键热点/哈希不均 | `SHOW SHARDING TABLE RULES` 查数据分布 | 加盐打散/重新分片 |
+| 跨片 JOIN 慢 | JOIN 查询超时 | 两表不在同一分片 | EXPLAIN 查看路由计划 | 绑定表/广播表/应用层拆分 |
+| 分布式事务超时 | 事务执行超过阈值 | 锁竞争/网络延迟 | 查 Seata TC 日志 | 优化事务粒度/降级 |
+| 路由失败 | SQL 报表不存在 | 分片键缺失/规则错误 | 检查分片规则配置 | 添加 Hint 强制路由 |
+| 数据迁移不一致 | 新旧库数据差异 | 双写延迟/写入失败 | 对比工具扫描差异 | 修复脚本+监控 |
+
+### 分片不均匀排查
+
+```bash
+# 查看各分片数据量
+# ShardingSphere DistSQL
+SHOW SHARDING TABLE RULES;
+
+# MySQL 查看各分片行数
+SELECT 'ds_0.t_order_0' AS table_name, COUNT(*) AS row_count FROM ds_0.t_order_0
+UNION ALL
+SELECT 'ds_0.t_order_1' AS table_name, COUNT(*) AS row_count FROM ds_0.t_order_1
+UNION ALL
+...
+
+# 分析分片键分布
+SELECT user_id, COUNT(*) FROM t_order GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 10;
+# → 找到热点 Key
+```
+
+### 跨片 JOIN 优化
+
+```text
+跨片 JOIN 排查流程：
+
+1. EXPLAIN 查看执行计划
+   → 如果显示跨片 JOIN，考虑优化
+
+2. 检查是否可用绑定表
+   t_order 和 t_order_item 按 order_id 分片
+   → 绑定后自动路由到同一分片
+
+3. 检查是否可用广播表
+   字典表/配置表小且变化少
+   → 广播到每个分片，本地 JOIN
+
+4. 应用层拆分
+   先查主表得到分片信息
+   再查子表指定分片
+
+5. 异构索引
+   复杂 JOIN 转 ES 宽表查询
+```
+
+### 分布式事务超时排查
+
+```text
+分布式事务超时排查：
+
+1. 检查 Seata TC 日志
+   → 是否有锁等待/锁冲突
+
+2. 检查事务粒度
+   → 是否跨片事务过多
+
+3. 检查网络延迟
+   → TC 与 RM 之间网络
+
+4. 优化方案
+   → 缩小事务范围（只包含写操作）
+   → 非核心业务降级为最终一致
+   → 增加超时时间（但不建议过长）
+```
+
+## 十八-12、ShardingSphere 性能基准
+
+### 性能基准测试
+
+| 测试项 | 指标 | 目标值 | 测试方法 |
+|--------|------|--------|----------|
+| 吞吐量 | TPS | >10000 | JMeter 压测 |
+| 延迟 | P99 | <50ms | 慢查询日志 |
+| 并发 | 线程数 | 100+ | 并发连接数 |
+| 分片数 | 扩展性 | 线性扩展 | 增加分片数测试 |
+| 归并性能 | 归并时间 | <100ms | 大结果集测试 |
+
+### 分片数与性能关系
+
+```text
+分片数性能基准（单分片 500 万行）：
+
+  2 分片：吞吐 8000 TPS，P99 30ms
+  4 分片：吞吐 15000 TPS，P99 25ms
+  8 分片：吞吐 25000 TPS，P99 20ms
+  16 分片：吞吐 35000 TPS，P99 18ms
+
+  结论：
+    分片数翻倍 → 吞吐提升约 70-80%（非线性，有归并开销）
+    分片数 > 16 → 收益递减（归并开销增大）
+    建议：单分片 500-1000 万行，总分片数 8-16 个
+```
+
+### 并发与分片数选型
+
+| 并发量 | 推荐分片数 | 单分片行数 | 说明 |
+|--------|-----------|-----------|------|
+| <1000 TPS | 2-4 | <1000 万 | 小规模，优先简单 |
+| 1000-5000 TPS | 4-8 | <500 万 | 中规模，标准分片 |
+| 5000-10000 TPS | 8-16 | <500 万 | 大规模，需优化 |
+| >10000 TPS | 16+ | <200 万 | 超大规模，考虑 NewSQL |
+
+```mermaid
+flowchart TD
+    A[性能基准] --> B{吞吐需求?}
+    B -->|<5000 TPS| C[4 分片]
+    B -->|5000-10000| D[8 分片]
+    B -->|>10000| E[16+ 分片]
+    C --> F[单分片 <1000 万行]
+    D --> G[单分片 <500 万行]
+    E --> H[单分片 <200 万行]
+    F --> I[监控归并性能]
+    G --> I
+    H --> I
+```
+
 ---
 
 ## 十九、与其他板块的关系

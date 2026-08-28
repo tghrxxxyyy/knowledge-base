@@ -1954,19 +1954,281 @@ state.backend.rocksdb.memory.managed: true
 | RPC加密 | SASL | 传输加密 |
 | 授权模型 | Simple/Authorization | 访问控制 |
 
-### 44. HBase备份恢复
+## 四十五、HBase Region Split策略详解
+
+### 自动分裂策略
+
+| 策略 | 触发条件 | 适用场景 | 优缺点 |
+|------|----------|----------|--------|
+| ConstantSizeRegionSplitPolicy | Region 达 max.filesize（10GB） | 均匀写入 | 简单但不考虑数据分布 |
+| IncreasingToUpperBoundRegionSplitPolicy | 文件数递增到阈值 | 默认策略 | 自适应但初期分裂频繁 |
+| KeyPrefixRegionSplitPolicy | 按前缀分裂 | 前缀查询场景 | 同前缀数据在同一 Region |
+| SteppingSplitPolicy | 两步分裂 | 新表默认 | 前两个 Region 快速分裂 |
+
+### 预分裂策略
+
+```text
+预分裂 = 建表时预先切分 Region，避免上线后热点
+
+方案1：手动指定 Split Points
+  create 'orders', 'info', {SPLITS => ['1000','2000','3000','4000']}
+
+方案2：自动计算 Split Points
+  create 'orders', 'info', {NUMREGIONS => 15, SPLITALGO => 'HexStringSplit'}
+  create 'orders', 'info', {NUMREGIONS => 15, SPLITALGO => 'UniformSplit'}
+
+方案3：基于 RowKey 前缀
+  create 'orders', 'info', {SPLITS => ['A','B','C','D','E','F']}
+
+方案4：基于 Hex 编码
+  create 't1', 'cf', {NUMREGIONS => 8, SPLITALGO => 'HexStringSplit'}
+  → 自动生成 00, 10, 20, 30, 40, 50, 60, 70, 80, 90, A0, B0, C0, D0, E0, F0
+```
+
+### Merge 策略
+
+```text
+Region Merge = 合并过小的 Region，减少管理开销
+
+触发条件：
+  Region 数量过多（> 300/RS）
+  删除大量数据后 Region 过小
+  负载均衡需要
+
+操作方式：
+  # 手动合并两个 Region
+  hbase shell> merge_region 'encodedRegionA', 'encodedRegionB'
+
+  # 自动合并（需开启）
+  hbase.master.loadbalance.by.table=true
+
+合并风险：
+  合并期间 Region 不可用
+  合并后数据重新分布
+  大 Region 合并耗时长
+```
+
+## 四十六、HBase与Kafka集成
+
+### 实时数据同步架构
+
+```mermaid
+flowchart LR
+    A[MySQL] -->|Binlog| B[Canal]
+    B -->|JSON| C[Kafka]
+    C -->|消费| D[Flink/HBase Sink]
+    D -->|写入| E[HBase]
+    E -->|查询| F[在线服务]
+```
+
+### CDC 实时同步方案
+
+```text
+方案1：Canal + Kafka + Flink → HBase
+  Canal 监听 MySQL Binlog
+  Kafka 缓冲变更事件
+  Flink 消费并写入 HBase
+  延迟：秒级
+
+方案2：Debezium + Kafka + HBase Sink Connector
+  Debezium 直接读 Binlog
+  Kafka Connect HBase Sink
+  延迟：秒级
+
+方案3：MaxWell + Kafka + Flink
+  MaxWell 轻量级 Binlog 读取
+  Flink 处理后写入 HBase
+  延迟：秒级
+```
+
+### Kafka到HBase写入配置
+
+```java
+// Flink HBase Sink 示例
+public class HBaseSinkFunction extends RichSinkFunction<Row> {
+    private transient Connection connection;
+    private transient BufferedMutator<Row> mutator;
+    
+    @Override
+    public void open(Configuration parameters) {
+        Configuration conf = HBaseConfiguration.create();
+        connection = ConnectionFactory.createConnection(conf);
+        BufferedMutatorParams params = new BufferedMutatorParams(tableName);
+        params.writeBufferSize(5 * 1024 * 1024); // 5MB 缓冲
+        mutator = connection.getBufferedMutator(params);
+    }
+    
+    @Override
+    public void invoke(Row row, Context context) {
+        Put put = new Put(row.getFieldAs("rowkey"));
+        put.addColumn(family, qualifier, value);
+        mutator.mutate(put);
+    }
+}
+```
+
+## 四十七、HBase容量规划
+
+### 容量估算公式
+
+```text
+存储量估算：
+  存储量 = 行数 × 列数 × 平均列值大小 × 副本数（默认3）
+  压缩后 = 存储量 × 压缩比（Snappy ~0.5，ZSTD ~0.3）
+
+RegionServer 数量：
+  RS数量 = 总存储量 / 单节点容量（建议 ≤ 500GB/节点）
+  考虑 30% 冗余（Compaction/GC 等）
+
+Region 数量规划：
+  每个 Region：10GB~20GB
+  每个 RS：100~200 个 Region
+  总 Region 数 = 总存储量 / 单 Region 大小
+```
+
+### QPS 容量规划
+
+| 场景 | 单节点读 QPS | 单节点写 QPS | 所需节点数 |
+|------|-------------|-------------|-----------|
+| 1000 读 QPS | 1000~5000 | — | 1~2 |
+| 5000 写 QPS | — | 5000~20000 | 1~2 |
+| 10000 读 QPS | — | — | 2~5 |
+| 50000 写 QPS | — | — | 3~10 |
+| 混合读写 | 3000 | 8000 | 3~5 |
+
+### 内存规划
+
+```text
+RegionServer 内存分配：
+
+  读多写少：
+    BlockCache: 40%（hfile.block.cache.size=0.4）
+    MemStore: 30%（hbase.regionserver.global.memstore.size=0.3）
+    其他: 30%
+
+  写多读少：
+    BlockCache: 30%
+    MemStore: 40%
+    其他: 30%
+
+  堆大小建议：
+    小集群: 16GB/RS
+    中集群: 32GB/RS
+    大集群: 64GB/RS
+```
+
+## 四十八、HBase安全机制
+
+### Kerberos 认证
+
+```xml
+<!-- hbase-site.xml -->
+<property>
+  <name>hbase.security.authentication</name>
+  <value>kerberos</value>
+</property>
+<property>
+  <name>hbase.master.kerberos.principal</name>
+  <value>hbase/_HOST@REALM.COM</value>
+</property>
+```
+
+### ACL 权限控制
 
 ```bash
-# ExportTable全量备份
-hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/path
+# 授予用户权限
+hbase shell> grant 'user1', 'RW', 'table1'
 
-# ImportTable恢复
-hbase org.apache.hadoop.hbase.mapreduce.Import tableName /backup/path
+# 权限类型
+# R: READ, W: WRITE, C: CREATE, A: ADMIN
+# 列族级权限
+hbase shell> grant 'user1', 'RW', 'table1', 'cf1'
 
-# 增量备份脚本
+# 撤销权限
+hbase shell> revoke 'user1', 'table1'
+
+# 查看权限
+hbase shell> user_permission 'table1'
+```
+
+### RPC 加密
+
+```xml
+<!-- 启用 SASL 加密 -->
+<property>
+  <name>hbase.rpc.protection</name>
+  <value>privacy</value>
+</property>
+
+<!-- 配置 Kerberos -->
+<property>
+  <name>hbase.master.keytab.file</name>
+  <value>/etc/hbase/conf/hbase.keytab</value>
+</property>
+<property>
+  <name>hbase.master.kerberos.principal</name>
+  <value>hbase/_HOST@HADOOP.COM</value>
+</property>
+```
+
+## 四十九、HBase备份恢复
+
+### ExportTable全量备份
+
+```bash
+# 全量导出
+hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/full
+
+# 指定版本导出
+hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/full 1234567890
+
+# 增量导出（基于时间戳）
+hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/incr $(date -d '1 day ago' +%s)000
+```
+
+### ImportTable恢复
+
+```bash
+# 全量恢复
+hbase org.apache.hadoop.hbase.mapreduce.Import tableName /backup/full
+
+# 增量恢复
+hbase org.apache.hadoop.hbase.mapreduce.Import tableName /backup/incr
+```
+
+### 增量备份策略
+
+```bash
 #!/bin/bash
-DATE=$(date +%Y%m%d)
-hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/$DATE
-# 保留最近7天备份
-find /backup -mtime +7 -delete
+# 增量备份脚本
+TABLE=$1
+BACKUP_DIR=/backup/hbase/$(date +%Y%m%d)
+RETENTION_DAYS=7
+
+# 增量导出
+hbase org.apache.hadoop.hbase.mapreduce.Export $TABLE $BACKUP_DIR 1234567890
+
+# 清理过期备份
+find /backup/hbase -mtime +$RETENTION_DAYS -exec rm -rf {} \;
+```
+
+### 恢复测试
+
+```text
+恢复测试流程：
+
+1. 恢复到测试集群
+   hbase org.apache.hadoop.hbase.mapreduce.Import test_table /backup/full
+
+2. 验证数据完整性
+   hbase shell> count 'test_table'
+   → 对比源表行数
+
+3. 验证数据正确性
+   hbase shell> scan 'test_table', {LIMIT => 10}
+   → 抽样检查数据
+
+4. 验证性能
+   从恢复的表读取数据
+   → 对比原始查询性能
 ```
