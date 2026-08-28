@@ -1712,6 +1712,217 @@ flowchart LR
 
 ---
 
+## HDFS 3.x Erasure Coding vs RAID深度对比
+
+| 维度 | HDFS EC (RS-6-3) | RAID 5 | RAID 6 | 3副本 |
+|------|------------------|--------|--------|-------|
+| 存储效率 | 66.7% | 75% | 80% | 33.3% |
+| 容错能力 | 3块丢失 | 1块丢失 | 2块丢失 | 2块丢失 |
+| 写放大 | 1.5x+CPU | 1.33x | 1.25x | 3x |
+| 恢复时间 | 分钟级 | 秒级 | 秒级 | 秒级 |
+| 扩展性 | 横向无限 | 受限于控制器 | 受限于控制器 | 横向扩展 |
+
+```
+EC重建开销：
+  丢失1块：读5块 + RS计算恢复
+  丢失2块：读4块 + RS计算恢复
+  丢失3块：读3块 + RS计算恢复（极限）
+
+EC vs RAID选型：
+  HDFS集群 → EC（原生支持，横向扩展）
+  本地存储 → RAID（低延迟重建）
+  冷数据目录 → EC（存储效率高）
+  热数据 → 副本（低延迟读取）
+```
+
+## HDFS存储策略自动化管理
+
+### HOT/WARM/COLD/ALL_SSD策略
+
+```mermaid
+flowchart TD
+    A[数据写入] --> B{访问频率}
+    B -->|日/小时| C[HOT: SSD/高性能]
+    B -->|周/月| D[WARM: 标准存储]
+    B -->|季度/年| E[COLD: 低频存储]
+    B -->|极少| F[ALL_SSD: 归档]
+    C -->|30天未访问| D
+    D -->|90天未访问| E
+    E -->|1年未访问| F
+    F -->|合规到期| G[删除]
+```
+
+```bash
+# 设置存储策略
+hdfs storagepolicies -setStoragePolicy -path /data -policy WARM
+
+# 触发数据迁移
+hdfs mover -p /data
+
+# 查看存储策略
+hdfs storagepolicies -getStoragePolicy -path /data
+```
+
+## Balancer最佳实践
+
+| 参数 | 默认值 | 生产建议 | 说明 |
+|------|--------|----------|------|
+| bandwidthPerSec | 10MB/s | 100MB/s | 迁移带宽 |
+| threshold | 10% | 5% | 均衡阈值 |
+| max-size-to-move | 2GB | 10GB | 单次迁移量 |
+
+```bash
+# 运行Balancer
+hdfs balancer -threshold 5 -policy datanode \
+  -Ddfs.datanode.balance.bandwidthPerSec=104857600
+
+# 监控Balancer状态
+hdfs dfsadmin -report | grep "DFS Used%"
+```
+
+## NameNode RPC优化
+
+### handler.count调优
+
+```
+NameNode RPC瓶颈：单线程处理所有元数据请求
+
+调优公式：
+  handler.count = 预期并发连接数 × 1.5
+  1000主机：handler.count = 150~200
+  5000主机：handler.count = 200~300
+  10000主机：handler.count = 300~500
+```
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| dfs.namenode.handler.count | 10 | 100~300 | RPC处理线程数 |
+| dfs.namenode.service.handler.count | 10 | 100~200 | 服务RPC线程数 |
+| dfs.namenode.max-extra-delay | 2s | 2~5s | 超时延迟 |
+
+## 云对象存储替代HDFS（S3A/GCS）
+
+| 维度 | HDFS | S3A | GCS |
+|------|------|-----|-----|
+| 延迟 | 毫秒级 | 十毫秒级 | 十毫秒级 |
+| 成本 | 高 | 低 | 低 |
+| 扩展性 | 有限 | 无限 | 无限 |
+| 一致性 | 强一致 | 最终一致 | 强一致 |
+| 运维 | 复杂 | 托管 | 托管 |
+
+```xml
+<!-- S3A客户端配置 -->
+<property>
+  <name>fs.s3a.impl</name>
+  <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+</property>
+<property>
+  <name>fs.s3a.fast.upload</name>
+  <value>true</value>
+</property>
+```
+
+## 数据治理（Atlas/DataHub）
+
+| 治理维度 | 工具 | 实现方式 |
+|----------|------|---------|
+| 元数据管理 | Atlas/DataHub | 自动采集HDFS表/列元数据 |
+| 数据血缘 | Atlas | ETL任务血缘自动关联 |
+| 数据分类 | Atlas | 敏感数据自动分类标签 |
+| 数据质量 | Great Expectations | 数据质量规则校验 |
+| 生命周期 | HDFS策略 | HOT/WARM/COLD自动迁移 |
+
+## HDFS Federation（Router）
+
+```
+Federation架构：
+  多NameService（NN1、NN2...）横向扩展
+  每个NN管理独立命名空间（/data/a、/data/b）
+  共享底层DataNode存储池
+  客户端挂载表（Mount Table）统一入口
+
+Federation + Router：
+  Router提供统一挂载表
+  支持跨NS操作
+  简化客户端配置
+
+适用：超大集群（万级节点）、多租户隔离
+```
+
+## NameNode HA（QJM/ZKFC）
+
+```xml
+<!-- NameNode HA配置 -->
+<property>
+  <name>dfs.nameservices</name>
+  <value>mycluster</value>
+</property>
+<property>
+  <name>dfs.ha.namenodes.mycluster</name>
+  <value>nn1,nn2</value>
+</property>
+<property>
+  <name>dfs.namenode.shared.edits.dir</name>
+  <value>qjournal://jn1:8485;jn2:8485;jn3:8485/mycluster</value>
+</property>
+<property>
+  <name>dfs.ha.automatic-failover.enabled</name>
+  <value>true</value>
+</property>
+```
+
+## HDFS快照（Snapshot）
+
+```bash
+# 启用快照
+hdfs dfsadmin -allowSnapshot /data
+
+# 创建快照
+hdfs dfs -createSnapshot /data snap-20240101
+
+# 查看快照
+hdfs lsSnapshots /data
+
+# 比较快照差异
+hdfs dfs -diffSnapshot /data/.snapshot/snap1 /data/.snapshot/snap2
+```
+
+## HDFS缓存（Centralized Cache Management）
+
+```bash
+# 缓存文件
+hdfs cacheadmin -addDirective -path /data/hot -pool default
+
+# 缓存目录
+hdfs cacheadmin -addDirective -path /data/critical -replication 2
+
+# 查看缓存状态
+hdfs cacheadmin -listDirectives
+
+# 删除缓存
+hdfs cacheadmin -removeDirective 1
+```
+
+## HDFS Delegation Token（Kerberos认证）
+
+```
+Delegation Token机制：
+  1. 客户端向NameNode认证（Kerberos）
+  2. NameNode颁发Delegation Token
+  3. 客户端用Token访问DataNode
+  4. Token定期续期
+  5. Token过期需重新认证
+
+优势：
+  避免每个操作都Kerberos认证
+  降低KDC压力
+  支持跨节点委托
+
+配置：
+  hadoop.security.authentication = kerberos
+  hadoop.security.authorization = true
+```
+
 ## 三十、与其他板块的关系
 
 - 分布式存储原理见「[分布式存储原理](./分布式存储原理.md)」；

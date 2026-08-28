@@ -1717,6 +1717,278 @@ scrape_configs:
 
 ---
 
+## 配置中心对比（Config Server/Consul/Nacos）
+
+| 维度 | Config Server | Consul | Nacos |
+|------|---------------|--------|-------|
+| 配置格式 | Git/文件 | KV存储 | 多格式 |
+| 动态推送 | Webhook | Long Polling | 长轮询+推送 |
+| 历史版本 | Git版本 | 不支持 | 原生支持 |
+| 权限控制 | Git权限 | ACL | RBAC |
+| 集群模式 | 多实例 | Raft | Raft |
+| 适用场景 | Git生态 | Service Mesh | 阿里生态 |
+
+```yaml
+# Nacos配置示例
+spring.cloud.nacos.config.server-addr: nacos:8848
+spring.cloud.nacos.config.shared-configs[0]:
+  data-id: common.yaml
+  group: DEFAULT_GROUP
+  refresh: true
+```
+
+## Gateway路由（谓词/过滤器/限流）
+
+### Gateway核心概念
+
+```mermaid
+flowchart LR
+    A[客户端] --> B[Route 路由]
+    B --> C[Predicate 谓词]
+    C --> D[Filter 过滤器]
+    D --> E[Service 上游服务]
+```
+
+| 谓词 | 说明 | 示例 |
+|------|------|------|
+| Path | 路径匹配 | Path('/api/**') |
+| Host | 主机匹配 | Host('**.example.com') |
+| Method | HTTP方法 | Method(GET,POST) |
+| Header | 请求头匹配 | Header('X-Token','xxx') |
+| After | 时间之后 | After(2024-01-01T00:00:00) |
+
+### Gateway限流配置
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+      - id: user-service
+        uri: lb://user-service
+        predicates:
+        - Path=/api/user/**
+        filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100
+            redis-rate-limiter.burstCapacity: 200
+            key-resolver: "#{@userKeyResolver}"
+```
+
+## OpenFeign底层（InvocationHandler/负载均衡/熔断）
+
+### OpenFeign执行流程
+
+```
+调用流程：
+  1. @FeignClient接口 → JDK动态代理
+  2. InvocationHandler.invoke() → MethodMetadata解析
+  3. SynchronousMethodHandler处理 → 拼装HTTP请求
+  4. Client执行 → LoadBalancer负载均衡
+  5. ResponseDecoder解码 → 返回结果
+
+关键组件：
+  InvocationHandler：动态代理处理器
+  SynchronousMethodHandler：方法调用处理器
+  Client：HTTP执行器（OkHttp/Apache）
+  LoadBalancer：负载均衡（Ribbon/LoadBalancer）
+```
+
+### 熔断集成
+
+```java
+// OpenFeign + Sentinel熔断
+@FeignClient(
+    name = "user-service",
+    fallback = UserServiceFallback.class
+)
+public interface UserService {
+    @GetMapping("/user/{id}")
+    User getUser(@PathVariable Long id);
+}
+
+// Fallback实现
+@Component
+public class UserServiceFallback implements UserService {
+    @Override
+    public User getUser(Long id) {
+        return new User(id, "降级用户");
+    }
+}
+```
+
+## Stream消息驱动（Binder）
+
+### Stream架构
+
+```mermaid
+flowchart LR
+    A[生产者] -->|Binder| B[消息中间件]
+    B -->|Binder| C[消费者]
+```
+
+| Binder | 中间件 | 适用场景 |
+|--------|--------|----------|
+| Kafka | Kafka | 大数据生态 |
+| RabbitMQ | RabbitMQ | 企业级消息 |
+| RocketMQ | RocketMQ | 阿里生态 |
+
+```java
+// Stream生产者
+@EnableBinding(Source.class)
+public class EventProducer {
+    @Autowired
+    private Source source;
+
+    public void sendOrder(Order order) {
+        source.output().send(
+            MessageBuilder.withPayload(order).build());
+    }
+}
+
+// Stream消费者
+@EnableBinding(Sink.class)
+public class EventConsumer {
+    @StreamListener(Sink.INPUT)
+    public void handleOrder(Order order) {
+        // 处理订单
+    }
+}
+```
+
+## Circuit Breaker（Resilience4j）
+
+### Resilience4j核心组件
+
+| 组件 | 说明 | 配置 |
+|------|------|------|
+| CircuitBreaker | 熔断器 | 滑动窗口/阈值 |
+| RateLimiter | 限流器 | 令牌桶 |
+| Retry | 重试 | 指数退避 |
+| Bulkhead | 隔离舱 | 信号量/线程池 |
+| TimeLimiter | 超时 | 超时控制 |
+
+```java
+// CircuitBreaker配置
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)
+    .waitDurationInOpenState(Duration.ofMillis(1000))
+    .slidingWindowSize(10)
+    .build();
+
+CircuitBreaker cb = CircuitBreaker.of("userService", config);
+
+// 使用
+Supplier<User> decoratedSupplier = Decorators
+    .ofSupplier(() -> userService.getUser(id))
+    .withCircuitBreaker(cb)
+    .decorate();
+
+Try<User> result = Try.ofSupplier(decoratedSupplier);
+```
+
+## 微服务间通信（HTTP/gRPC/MQ对比）
+
+| 维度 | HTTP/REST | gRPC | MQ |
+|------|-----------|------|-----|
+| 协议 | HTTP/1.1 | HTTP/2 | 自定义 |
+| 序列化 | JSON | Protobuf | 多种 |
+| 性能 | 中 | 高 | 高 |
+| 流式 | 有限 | 原生支持 | 原生支持 |
+| 跨语言 | 通用 | 多语言 | 多语言 |
+| 适用 | 对外API | 内部RPC | 异步解耦 |
+
+## 服务网格（Istio sidecar）
+
+### Istio架构
+
+```mermaid
+flowchart TB
+    A[Pod] --> B[Sidecar Proxy]
+    B --> C[Istio控制平面]
+    C --> D[Pilot: 流量管理]
+    C --> E[Security: 安全]
+    C --> F[Telemetry: 可观测]
+```
+
+| 功能 | 说明 |
+|------|------|
+| 流量管理 | 路由、限流、熔断 |
+| 安全 | mTLS、认证、授权 |
+| 可观测 | 链路追踪、指标、日志 |
+| 策略 | 限流、配额、访问控制 |
+
+## 微服务拆分（DDD/限界上下文/领域事件）
+
+### DDD拆分原则
+
+```
+DDD核心概念：
+  领域（Domain）：业务领域
+  限界上下文（Bounded Context）：业务边界
+  领域事件（Domain Event）：业务事件
+
+拆分步骤：
+  1. 识别领域：梳理业务能力
+  2. 划分限界上下文：确定服务边界
+  3. 定义领域事件：服务间通信
+  4. 确定聚合根：数据一致性边界
+
+示例：
+  电商领域：
+    用户上下文（User Context）
+    商品上下文（Product Context）
+    订单上下文（Order Context）
+    支付上下文（Payment Context）
+    物流上下文（Logistics Context）
+```
+
+## 微服务监控（链路追踪/日志聚合/指标采集）
+
+### 监控三大支柱
+
+| 支柱 | 工具 | 说明 |
+|------|------|------|
+| 链路追踪 | SkyWalking/Jaeger | 请求链路追踪 |
+| 日志聚合 | ELK/Loki | 统一日志管理 |
+| 指标采集 | Prometheus/Grafana | 系统指标监控 |
+
+```yaml
+# Micrometer + Prometheus
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    export:
+      prometheus:
+        enabled: true
+```
+
+## 微服务安全（OAuth2/JWT/HTTPS）
+
+### 安全架构
+
+```mermaid
+flowchart LR
+    A[客户端] -->|OAuth2| B[授权服务器]
+    B -->|JWT Token| A
+    A -->|Token| C[API网关]
+    C -->|验证Token| D[资源服务]
+```
+
+| 安全机制 | 说明 | 适用场景 |
+|----------|------|----------|
+| OAuth2 | 授权框架 | 第三方登录 |
+| JWT | 令牌格式 | 无状态认证 |
+| HTTPS | 传输加密 | 所有场景 |
+| mTLS | 双向认证 | 服务间安全 |
+| RBAC | 角色权限 | 细粒度控制 |
+
 ## 二十八、与其他板块的关系
 
 - Redis 知识见「[基础知识/redis知识](redis知识.md)」；

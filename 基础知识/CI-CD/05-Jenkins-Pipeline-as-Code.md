@@ -1793,3 +1793,374 @@ spec:
     }
 }
 ```
+
+## 共享库（vars/src版本化）
+
+### 共享库结构
+
+```
+shared-library/
+├── vars/                    # 全局变量/函数
+│   ├── buildDocker.groovy   # 可直接调用
+│   ├── notifySlack.groovy
+│   └── deployK8s.groovy
+├── src/                     # Groovy类库
+│   └── com/example/
+│       ├── Utils.groovy
+│       └── Deployer.groovy
+├── resources/               # 资源文件
+└── test/                    # 单元测试
+```
+
+### 共享库使用
+
+```groovy
+// Jenkinsfile中引用
+@Library('my-shared-lib@main') _
+
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                buildDocker image: 'myapp', tag: env.BUILD_NUMBER
+            }
+        }
+        stage('Deploy') {
+            steps {
+                deployK8s namespace: 'prod', replicas: 3
+            }
+        }
+    }
+}
+```
+
+## 错误处理（try/catch/retry/timeout/when）
+
+### 错误处理策略
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                retry(3) {
+                    sh 'make build'
+                }
+            }
+        }
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    sh 'kubectl apply -f k8s/'
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    slackSend channel: '#alerts',
+                        message: "Build failed: ${env.JOB_NAME}"
+                }
+            }
+        }
+    }
+}
+```
+
+## Credential（withCredentials）
+
+```groovy
+// 凭据使用
+pipeline {
+    agent any
+    environment {
+        AWS_CREDS = credentials('aws-credentials')
+        SSH_KEY = credentials('deploy-key')
+    }
+    stages {
+        stage('Deploy') {
+            steps {
+                // AWS凭据
+                sh 'aws s3 sync ./dist s3://mybucket'
+
+                // SSH密钥
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'deploy-key',
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh 'ssh -i $SSH_KEY $SSH_USER@server "deploy.sh"'
+                }
+
+                // 用户名密码
+                withCredentials([usernamePassword(
+                    credentialsId: 'db-creds',
+                    usernameVariable: 'DB_USER',
+                    passwordVariable: 'DB_PASS'
+                )]) {
+                    sh 'mysql -u$DB_USER -p$DB_PASS < schema.sql'
+                }
+            }
+        }
+    }
+}
+```
+
+## Pipeline测试（Pipeline Unit/linter）
+
+### Pipeline Unit测试
+
+```groovy
+// 测试文件
+import com.lesfurets.jenkins.unit.BasePipelineTest
+
+class PipelineTest extends BasePipelineTest {
+    @Override
+    @Before
+    void setUp() throws Exception {
+        super.setUp()
+        loadScript("Jenkinsfile")
+    }
+
+    @Test
+    void shouldBuildDocker() {
+        runScript("Jenkinsfile")
+        assertJobStatusSuccess()
+        assertCallStack().contains("buildDocker")
+    }
+}
+```
+
+### Jenkinsfile Linter
+
+```bash
+# 语法检查
+curl -X POST -u admin:token \
+  http://jenkins:8080/job/pipeline-linter/submit \
+  -d "jenkinsfile=< Jenkinsfile"
+
+# 命令行检查
+java -jar jenkins-cli.jar -s http://jenkins:8080 \
+  declarative-linter < Jenkinsfile
+```
+
+## Pipeline优化（parallel/WS清理/stash）
+
+### 并行执行
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Parallel Build') {
+            parallel {
+                stage('Unit Test') {
+                    steps { sh 'mvn test' }
+                }
+                stage('Integration Test') {
+                    steps { sh 'mvn verify' }
+                }
+                stage('Security Scan') {
+                    steps { sh 'trivy image myapp:latest' }
+                }
+            }
+        }
+    }
+}
+```
+
+### Workspace清理
+
+```groovy
+post {
+    always {
+        cleanWs()                    // 清理工作空间
+        cleanWs(patterns: [
+            [pattern: 'target/', type: 'INCLUDE'],
+            [pattern: '.gradle/', type: 'INCLUDE']
+        ])
+    }
+}
+```
+
+## Docker Pipeline（docker.build/kaniko）
+
+### Docker构建方式
+
+```groovy
+// 方式1：docker.build（需要Docker daemon）
+pipeline {
+    agent { label 'docker' }
+    stages {
+        stage('Build') {
+            steps {
+                script {
+                    docker.build('myapp:${BUILD_NUMBER}')
+                }
+            }
+        }
+        stage('Push') {
+            steps {
+                script {
+                    docker.withRegistry('https://registry.example.com',
+                        'registry-creds') {
+                        docker.image('myapp:${BUILD_NUMBER}').push()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 方式2：Kaniko（无Docker daemon，K8s推荐）
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:latest
+    args: ["--version"]
+'''
+        }
+    }
+    stages {
+        stage('Build with Kaniko') {
+            steps {
+                container('kaniko') {
+                    sh '''
+                        /kaniko/executor \
+                            --context=${WORKSPACE} \
+                            --destination=registry/myapp:${BUILD_NUMBER}
+                    '''
+                }
+            }
+        }
+    }
+}
+```
+
+## Pipeline可视化（Blue Ocean/Stage View）
+
+| 工具 | 说明 | 安装方式 |
+|------|------|----------|
+| Blue Ocean | 现代化UI | 插件安装 |
+| Stage View | Stage可视化 | 插件安装 |
+| Pipeline Graph | 流程图 | 内置 |
+
+```
+Blue Ocean特点：
+  - 可视化Pipeline编辑
+  - 实时构建日志
+  - 分支构建可视化
+  - PR集成
+```
+
+## Pipeline模板化（Shared Library）
+
+### 模板化最佳实践
+
+```groovy
+// vars/standardPipeline.groovy
+def call(Map config) {
+    pipeline {
+        agent any
+        stages {
+            stage('Checkout') {
+                steps { checkout scm }
+            }
+            stage('Build') {
+                steps { sh config.buildCommand ?: 'make' }
+            }
+            stage('Test') {
+                steps { sh config.testCommand ?: 'make test' }
+            }
+            stage('Deploy') {
+                when { branch 'main' }
+                steps { sh config.deployCommand ?: 'make deploy' }
+            }
+        }
+    }
+}
+
+// Jenkinsfile中使用
+@Library('my-shared-lib') _
+
+standardPipeline(
+    buildCommand: 'mvn clean package',
+    testCommand: 'mvn test',
+    deployCommand: 'kubectl apply -f k8s/'
+)
+```
+
+## Pipeline安全（Secret扫描/SCA）
+
+### 安全扫描配置
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Secret Scan') {
+            steps {
+                // GitLeaks扫描
+                sh 'gitleaks detect --source . --report-format json'
+
+                // Trivy文件扫描
+                sh 'trivy fs --security-checks secret .'
+            }
+        }
+        stage('SCA') {
+            steps {
+                // OWASP依赖检查
+                sh 'dependency-check --project "MyApp" --scan .'
+
+                // Snyk扫描
+                sh 'snyk test --all-projects'
+            }
+        }
+        stage('Container Scan') {
+            steps {
+                sh 'trivy image --severity HIGH,CRITICAL myapp:${BUILD_NUMBER}'
+            }
+        }
+    }
+}
+```
+
+## Pipeline性能（构建缓存/依赖缓存/增量构建）
+
+### 缓存优化
+
+```groovy
+pipeline {
+    agent any
+    options {
+        // 构建历史保留
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // 跳过重复构建
+        disableConcurrentBuilds()
+    }
+    stages {
+        stage('Build') {
+            steps {
+                script {
+                    // Docker层缓存
+                    docker.build('myapp', '--cache-from myapp:latest .')
+                }
+            }
+        }
+    }
+}
+```
+```

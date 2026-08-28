@@ -712,6 +712,348 @@ Temporal Join（实时维表关联）：
   ON A.user_id = B.user_id
 ```
 
+## Flink 深度运维与调优
+
+### 水位线周期性Assigner实现
+
+```java
+// 周期性水位线生成器（Periodic Assigner）
+public class BoundedOutOfOrdernessWatermark
+        implements WatermarkGenerator<Event> {
+
+    private long maxTimestamp = Long.MIN_VALUE;
+    private final long outOfOrdernessMillis;
+
+    public BoundedOutOfOrdernessWatermark(Duration outOfOrderness) {
+        this.outOfOrdernessMillis = outOfOrderness.toMillis();
+    }
+
+    @Override
+    public void onEvent(Event event, long eventTimestamp,
+            WatermarkOutput output) {
+        maxTimestamp = Math.max(maxTimestamp, event.getTimestamp());
+    }
+
+    @Override
+    public void onPeriodicEmit(WatermarkOutput output) {
+        output.emitWatermark(new Watermark(
+            maxTimestamp - outOfOrdernessMillis - 1));
+    }
+}
+
+// 配置周期性发射间隔
+env.getConfig().setAutoWatermarkInterval(200); // 200ms
+```
+
+### 水位线对齐与Punctuation策略
+
+| 策略 | 实现 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|----------|
+| 周期性（Periodic） | 定时器触发 | 简单高效 | 可能漏判延迟事件 | 通用流处理 |
+| 对齐（Aligned） | 多输入取最小 | 保证数据到齐 | 一个流停滞卡住全局 | 双流JOIN |
+| 自定义（Punctuated） | 每条数据检查 | 灵活 | CPU开销大 | 复杂事件 |
+
+```java
+// Punctuated策略：检测到特定标记时生成水位线
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withTimestampAssigner((event, ts) -> event.getTimestamp())
+    .withIdleness(Duration.ofMinutes(1)); // 空闲流超时
+```
+
+### Side Output分流与延迟数据处理
+
+```java
+// 侧输出标签定义
+OutputTag<Event> lateTag = new OutputTag<Event>("late-data"){};
+OutputTag<Event> highTag = new OutputTag<Event>("high-priority"){};
+OutputTag<Event> lowTag = new OutputTag<Event>("low-priority"){};
+
+SingleOutputStreamOperator<Event> result = stream
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(1))
+    .sideOutputLateData(lateTag)
+    .process(new ProcessWindowFunction<Event, Event, String, TimeWindow>() {
+        @Override
+        public void process(String key, Context ctx,
+                Iterable<Event> elements, Collector<Event> out) {
+            for (Event e : elements) {
+                if (e.getPriority() == Priority.HIGH) {
+                    ctx.output(highTag, e);
+                } else {
+                    ctx.output(lowTag, e);
+                }
+                out.collect(e);
+            }
+        }
+    });
+
+// 获取侧输出
+DataStream<Event> lateData = result.getSideOutput(lateTag);
+lateData.addSink(new LateDataAlertSink());
+```
+
+| 场景 | 说明 |
+|------|------|
+| 迟到数据 | 超过allowedLateness的数据走侧输出 |
+| 数据分流 | 正常/异常/黑名单数据多路输出 |
+| 多路写入 | 一个算子产生多种结果到不同Sink |
+| 监控告警 | 异常数据实时告警 |
+
+### Async I/O异步请求与状态管理
+
+```java
+public class AsyncDimLookup
+        extends RichAsyncFunction<Event, EnrichedEvent> {
+
+    private transient RedisAsyncCommands<String, String> asyncCmd;
+    private transient StateTtlConfig ttlConfig;
+
+    @Override
+    public void open(Configuration parameters) {
+        // 连接池初始化
+        StateTtlConfig ttl = StateTtlConfig.newBuilder(Time.hours(24))
+            .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+            .cleanupFullSnapshot()
+            .build();
+    }
+
+    @Override
+    public void asyncInvoke(Event input,
+            ResultFuture<EnrichedEvent> resultFuture) {
+        CompletableFuture<Result> future =
+            CompletableFuture.supplyAsync(() -> queryDim(input));
+        future.whenComplete((result, ex) -> {
+            if (ex != null) {
+                // 超时降级：使用默认值
+                resultFuture.complete(
+                    Collections.singleton(defaultEnriched(input)));
+            } else {
+                resultFuture.complete(
+                    Collections.singleton(merge(input, result)));
+            }
+        });
+    }
+
+    @Override
+    public void timeout(Event input,
+            ResultFuture<EnrichedEvent> resultFuture) {
+        // 超时处理：侧输出或降级
+        resultFuture.complete(
+            Collections.singleton(defaultEnriched(input)));
+    }
+}
+
+// 使用：最大并发100，超时30秒
+AsyncDataStream.unorderedWait(stream,
+    new AsyncDimLookup(), 30, TimeUnit.SECONDS, 100);
+```
+
+### Exactly-Once两阶段提交（TwoPhaseCommitSinkFunction）
+
+```mermaid
+sequenceDiagram
+    participant S as Sink算子
+    participant E as 外部系统(Kafka/DB)
+    participant JM as JobManager
+    S->>S: 1. preCommit: 写入临时数据
+    S->>E: 2. 打开事务
+    Note over S,E: Checkpoint Barrier到达
+    S->>S: 3. 状态记录事务句柄
+    S->>JM: 4. Checkpoint完成
+    JM->>S: 5. commit通知
+    S->>E: 6. 提交事务
+    Note over S,E: 故障时
+    S->>E: 7. rollback回滚
+```
+
+```
+两阶段提交流程：
+  Step 1 - 预提交（Pre-commit）：
+    Checkpoint Barrier到达Sink → 开启事务 → 写入数据（未提交）
+    状态后端记录事务句柄（transaction handle）
+
+  Step 2 - 提交（Commit）：
+    所有算子Checkpoint完成 → JobManager通知Sink → 正式提交
+
+  Step 3 - 回滚（Rollback）：
+    Checkpoint失败 → 回滚未提交事务 → 下次Checkpoint重新预提交
+
+支持TwoPhaseCommitSinkFunction的Sink：
+  - Kafka Sink（TransactionalId）
+  - JDBC Sink（XA事务）
+  - 文件系统Sink（临时目录+原子重命名）
+```
+
+### Flink on K8s部署模式对比
+
+| 模式 | 资源隔离 | 资源利用率 | 故障影响 | 适用场景 |
+|------|----------|------------|----------|----------|
+| Session Mode | 共享 | 高 | 全局影响 | 开发测试 |
+| Per-Job Mode | 独立 | 中 | 单作业 | 已废弃 |
+| Application Mode | 独立 | 高 | 单作业 | 生产首选 |
+
+```yaml
+# Flink Operator Application Mode配置
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: realtime-etl
+spec:
+  image: flink:1.17
+  flinkVersion: v1_17
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend: rocksdb
+    state.checkpoints.dir: s3://bucket/checkpoints
+    state.backend.incremental: "true"
+    high-availability: kubernetes
+    high-availability.storageDir: s3://bucket/ha
+  jobManager:
+    replicas: 1
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    replicas: 3
+    resource:
+      memory: "8192m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/etl-job.jar
+    parallelism: 12
+    upgradeMode: savepoint
+```
+
+### Flink SQL窗口Join语义
+
+```sql
+-- Interval Join：基于时间区间的关联
+SELECT o.order_id, o.amount, p.pay_time
+FROM orders o
+JOIN payments p
+  ON o.order_id = p.order_id
+  AND p.pay_time BETWEEN o.order_time
+    AND o.order_time + INTERVAL '24' HOUR;
+
+-- Temporal Join：版本化维度表关联
+SELECT o.order_id, o.amount, r.rate,
+       o.amount * r.rate AS amount_usd
+FROM orders o
+JOIN exchange_rates FOR SYSTEM_TIME AS OF o.proc_time r
+  ON o.currency = r.currency;
+
+-- Window Join：相同窗口内的关联
+SELECT o.order_id, p.payment_id
+FROM (SELECT *, TUMBLE_START(ts, INTERVAL '1' HOUR) AS w FROM orders) o
+JOIN (SELECT *, TUMBLE_START(ts, INTERVAL '1' HOUR) AS w FROM payments) p
+  ON o.order_id = p.order_id AND o.w = p.w;
+```
+
+| Join类型 | 时间语义 | 状态管理 | 适用场景 |
+|----------|----------|----------|----------|
+| Interval Join | 时间区间 | 自动清理 | 事件关联 |
+| Temporal Join | 版本化表 | 需TTL | 维度关联 |
+| Window Join | 对齐窗口 | 窗口关闭清理 | 批量分析 |
+
+### Flink运维：反压排查与Checkpoint超时处理
+
+```
+反压（Backpressure）排查流程：
+  1. Flink Web UI → Backpressure标签 → 找到高反压算子
+  2. 检查数据倾斜：某个分区数据量远超其他
+  3. 检查外部系统：数据库/消息队列响应慢
+  4. 检查资源：CPU/内存/网络使用率
+
+解决方案：
+  - 增加并行度
+  - 优化数据分布（加盐/两阶段聚合）
+  - 增加外部系统连接池/缓存
+  - 启用非对齐Checkpoint
+
+Checkpoint超时处理：
+  原因：状态过大/网络慢/外部系统阻塞
+  方案：
+    1. 增大timeout（默认600s→1200s）
+    2. 启用增量Checkpoint（RocksDB）
+    3. 启用非对齐Checkpoint
+    4. 减小Checkpoint间隔
+```
+
+### Flink OOM排查与处理
+
+| 现象 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| TaskManager频繁重启 | 堆内存不足 | 增加TM内存/使用RocksDB |
+| Checkpoint失败 | 状态过大 | 增量Checkpoint+RocksDB |
+| 数据倾斜 | Key分布不均 | 加盐/两阶段聚合 |
+| GC频繁 | 堆过大/对象过多 | 调整堆大小/优化代码 |
+
+```
+OOM排查步骤：
+  1. 查看TaskManager日志 → 找OutOfMemoryError
+  2. 检查状态大小 → RocksDB+增量Checkpoint
+  3. 检查数据倾斜 → 某分区数据量异常
+  4. 检查外部调用 → Async I/O+连接池
+  5. 调整内存配置：
+     taskmanager.memory.process.size: 8192m
+     taskmanager.memory.managed.fraction: 0.4
+```
+
+### Flink状态管理深入（Operator State/Keyed State）
+
+| 状态类型 | 说明 | 使用场景 |
+|----------|------|----------|
+| Operator State | 算子级别，每个并行度独立 | Source Offset、Sink事务 |
+| Keyed State | Key级别，按key分区 | 聚合、窗口、去重 |
+| Broadcast State | 广播到所有并行度 | 规则引擎、配置表 |
+
+```
+Keyed State API：
+  ValueState<T>         单值状态
+  ListState<T>          列表状态
+  ReducingState<T>      归约状态
+  AggregatingState<I,O> 聚合状态
+  MapState<K,V>         映射状态
+
+Operator State API：
+  ListState<T>          并行度变化时自动重分配
+  UnionListState<T>     并行度变化时全量重分配
+
+Checkpoint机制：
+  1. JobManager定期触发Checkpoint
+  2. Source注入Barrier到数据流
+  3. Barrier随数据流向下游传播
+  4. 算子收到所有Barrier后 → 本地状态快照
+  5. 所有算子完成 → Checkpoint完成
+  6. 故障恢复：从最近Checkpoint恢复+重放数据
+```
+
+### Flink优化策略
+
+| 优化项 | 配置 | 效果 |
+|--------|------|------|
+| Mini-batch聚合 | table.exec.mini-batch.enabled=true | 降低状态更新频率 |
+| 异步IO维表查询 | AsyncDataStream.unorderedWait | 减少IO等待 |
+| 状态TTL | table.exec.state.ttl=24h | 自动清理过期状态 |
+| 增量Checkpoint | state.backend.incremental=true | 减少Checkpoint数据量 |
+| 非对齐Checkpoint | execution.checkpointing.unaligned=true | 反压下不超时 |
+| 本地恢复 | state.backend.local-recovery=true | 故障快速恢复 |
+
+```sql
+-- Mini-batch + 状态TTL配置
+SET table.exec.mini-batch.enabled = true;
+SET table.exec.mini-batch.allow-latency = '5s';
+SET table.exec.mini-batch.size = '1000';
+SET table.exec.state.ttl = '24h';
+
+-- 开启维表JOIN缓存
+SET table.exec维表.cache.max-rows = 10000;
+SET table.exec维表.cache.ttl = '10min';
+```
+
 ## 十六、与其他板块的关系
 
 - Kafka（Flink 的 Source/Sink 核心）见「[Kafka](./Kafka.md)」；

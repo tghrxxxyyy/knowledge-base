@@ -1721,6 +1721,281 @@ Neo4j 部署架构：
 
 ---
 
+## 集群架构（Core/Read Replica）
+
+### Neo4j集群模式
+
+| 节点类型 | 说明 | 用途 |
+|----------|------|------|
+| Core | 核心节点（Raft复制） | 写入/读取 |
+| Read Replica | 只读副本 | 读扩展 |
+
+```mermaid
+flowchart TB
+    LB[负载均衡器] --> C1[Core Node1]
+    LB --> C2[Core Node2]
+    LB --> C3[Core Node3]
+    LB --> R1[Read Replica1]
+    LB --> R2[Read Replica2]
+    C1 <--> C2
+    C2 <--> C3
+    C1 <--> C3
+    C1 -->|复制| R1
+    C2 -->|复制| R2
+```
+
+```bash
+# 集群配置（neo4j.conf）
+causal_clustering.initial_discovery_members=core1:5000,core2:5000,core3:5000
+causal_clustering.server_id=1
+dbms.mode=CORE
+```
+
+## Cypher优化（EXPLAIN/PROFILE/索引提示）
+
+### 查询计划分析
+
+```cypher
+// EXPLAIN：查看执行计划（不执行）
+EXPLAIN MATCH (p:Person)-[:FRIEND]->(f:Person)
+WHERE p.name = '张三'
+RETURN f.name;
+
+// PROFILE：执行并统计实际开销
+PROFILE MATCH (p:Person)-[:FRIEND]->(f:Person)
+WHERE p.name = '张三'
+RETURN f.name;
+
+// 索引提示
+MATCH (p:Person) USING INDEX p:Person(name)
+WHERE p.name = '张三'
+RETURN p;
+```
+
+### 执行计划关键指标
+
+| 指标 | 说明 | 优化方向 |
+|------|------|----------|
+| db hits | 数据库访问次数 | 建索引 |
+| rows | 返回行数 | 优化过滤 |
+| page cache hits | 缓存命中率 | 增加内存 |
+| estimated rows | 优化器估算行数 | 更新统计信息 |
+
+## 内存配置（heap/pagecache）
+
+```
+内存配置建议：
+
+堆内存（heap）：
+  dbms.memory.heap.initial_size=4G
+  dbms.memory.heap.max_size=8G
+  建议：总内存的50%~70%
+
+页缓存（pagecache）：
+  dbms.memory.pagecache.size=8G
+  建议：剩余内存分配给pagecache
+
+总内存分配：
+  16GB机器：heap=6G, pagecache=8G
+  32GB机器：heap=12G, pagecache=16G
+  64GB机器：heap=24G, pagecache=32G
+```
+
+## 数据导入（neo4j-admin import）
+
+### 批量导入方法
+
+```bash
+# neo4j-admin import（最快）
+neo4j-admin database import full \
+  --nodes=Person=persons.csv \
+  --nodes=Company=companies.csv \
+  --relationships=WORKS_AT=employment.csv \
+  --overwrite-destination
+
+# CSV格式
+# persons.csv:
+# :ID,name,age
+# 1,张三,30
+# 2,李四,25
+```
+
+### 导入性能优化
+
+| 参数 | 说明 | 优化值 |
+|------|------|--------|
+| --skip-bad-entries | 跳过错误行 | true |
+| --overwrite-destination | 覆盖已有数据 | true |
+| --delimiter | 分隔符 | , |
+| --array-delimiter | 数组分隔符 | ; |
+
+## 应用集成（Spring Data Neo4j）
+
+```java
+// Spring Data Neo4j
+@Node
+public class Person {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+
+    @Relationship(type = "FRIEND", direction = Direction.OUTGOING)
+    private Set<Person> friends;
+}
+
+// Repository
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    @Query("MATCH (p:Person)-[:FRIEND]->(f:Person) WHERE p.name = $name RETURN f")
+    List<Person> findFriendsByName(String name);
+}
+```
+
+## 知识图谱应用（实体抽取/关系推理）
+
+### 知识图谱架构
+
+```mermaid
+flowchart LR
+    A[文本数据] --> B[实体抽取]
+    B --> C[关系抽取]
+    C --> D[Neo4j存储]
+    D --> E[图查询/推理]
+    E --> F[应用展示]
+```
+
+### 实体抽取示例
+
+```
+输入文本："张三在北京某科技公司担任Java工程师"
+
+实体识别：
+  人名：张三
+  地点：北京
+  公司：某科技公司
+  职位：Java工程师
+
+关系抽取：
+  (张三)-[:WORKS_AT]->(某科技公司)
+  (张三)-[:LOCATED_IN]->(北京)
+  (张三)-[:HAS_POSITION]->(Java工程师)
+```
+
+## 推荐系统（相似度/协同过滤/PageRank）
+
+### 图算法推荐
+
+```cypher
+// PageRank：发现重要节点
+CALL gds.pageRank.stream('person-graph')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).name AS name, score
+ORDER BY score DESC LIMIT 10;
+
+// 相似度计算
+CALL gds.nodeSimilarity.stream('person-graph')
+YIELD node1, node2, similarity
+RETURN gds.util.asNode(node1).name AS user1,
+       gds.util.asNode(node2).name AS user2,
+       similarity
+ORDER BY similarity DESC LIMIT 10;
+
+// 协同过滤
+MATCH (u:Person {name: '张三'})-[:PURCHASED]->(p:Product)<-[:PURCHASED]-(other:Person)
+WHERE other <> u
+WITH other, COUNT(p) AS common
+RETURN other.name, common
+ORDER BY common DESC LIMIT 5;
+```
+
+## Neo4j vs MySQL/ES联合查询
+
+| 维度 | Neo4j | MySQL | ES |
+|------|-------|-------|-----|
+| 查询模式 | 图遍历 | JOIN | 全文搜索 |
+| 多跳查询 | O(1)/跳 | 指数级 | 不支持 |
+| 全文搜索 | 有限 | LIKE（慢） | 强 |
+| 聚合分析 | 图算法 | SQL聚合 | 聚合查询 |
+| 适用 | 关系密集 | 结构化 | 文本搜索 |
+
+```
+联合查询方案：
+  Neo4j（图遍历）+ MySQL（结构化存储）
+  Neo4j（关系查询）+ ES（全文搜索）
+
+  应用层：先用Neo4j查关系，再用MySQL/ES补充数据
+  数据同步：CDC/Kafka同步Neo4j数据到ES
+```
+
+## Neo4j性能调优（索引/查询缓存/内存）
+
+### 索引优化
+
+```cypher
+// 创建索引
+CREATE INDEX FOR (p:Person) ON (p.name);
+CREATE INDEX FOR (p:Person) ON (p.age);
+
+// 复合索引
+CREATE INDEX FOR (p:Person) ON (p.name, p.city);
+
+// 全文索引
+CREATE FULLTEXT INDEX person_fulltext
+FOR (p:Person) ON EACH [p.name, p.bio];
+
+// 约束
+CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE;
+```
+
+### 缓存与内存优化
+
+| 优化项 | 配置 | 效果 |
+|--------|------|------|
+| 页面缓存 | pagecache.size=物理内存×50% | 减少磁盘IO |
+| 堆内存 | heap.max_size=物理内存×65% | 提升查询性能 |
+| 查询缓存 | dbms.query_cache_size=1000 | 缓存热点查询 |
+| 索引缓存 | dbms.index.sample_background_sampling_enabled | 后台更新索引 |
+
+## Neo4j运维（备份恢复/版本升级/监控）
+
+### 备份恢复
+
+```bash
+# 备份
+neo4j-admin database dump neo4j --to-path=/backup/neo4j.dump
+
+# 恢复
+neo4j-admin database load neo4j --from-path=/backup/neo4j.dump --overwrite-destination
+
+# 在线备份（企业版）
+neo4j-admin database backup neo4j --backup-dir=/backup
+```
+
+### 版本升级
+
+```
+升级步骤：
+  1. 备份数据（neo4j-admin dump）
+  2. 停止旧版本
+  3. 安装新版本
+  4. 启动新版本（自动升级）
+  5. 验证数据完整性
+
+注意：
+  - 跨大版本升级需逐步升级（3.x→4.x→5.x）
+  - 升级前测试环境验证
+  - 升级期间无法写入
+```
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 页面缓存命中率 | 缓存效率 | < 95% |
+| 查询延迟 | P99延迟 | > 1s |
+| 连接数 | 当前连接 | > 80%最大 |
+| 内存使用率 | 堆/页面缓存 | > 85% |
+| 磁盘使用率 | 存储空间 | > 80% |
+
 ## 十三、与其他板块的关系
 
 - 图数据库选型见「[图数据库对比](./图数据库对比.md)」；

@@ -959,6 +959,326 @@ Cassandra 性能调优关键参数：
 | 双向同步 | CDC + Sink | 数据迁移 |
 | 事件溯源 | Kafka + Cassandra | 事件存储 |
 
+## CDC与Kafka集成方案
+
+### CDC集成架构
+
+```mermaid
+flowchart TB
+    subgraph 写入层
+        APP[应用] --> CASSANDRA[Cassandra]
+    end
+    subgraph CDC层
+        CASSANDRA --> DEBEZIUM[Debezium/CDC Agent]
+        DEBEZIUM --> KAFKA_CONNECT[Kafka Connect]
+    end
+    subgraph 消费层
+        KAFKA_CONNECT --> TOPIC[CDC Topic]
+        TOPIC --> ES[Elasticsearch]
+        TOPIC --> CACHE[Redis]
+        TOPIC --> DL[Data Lake]
+    end
+```
+
+### Cassandra Kafka Connector配置
+
+```json
+{
+  "name": "cassandra-source",
+  "config": {
+    "connector.class": "io.confluent.connect.cassandra.CassandraSourceConnector",
+    "tasks.max": "3",
+    "keyspace": "my_keyspace",
+    "table": "user_events",
+    "topic.prefix": "cdc_",
+    "consistency.level": "LOCAL_QUORUM",
+    "poll.interval.ms": "1000",
+    "cassandra.contact.points": "cass1,cass2,cass3",
+    "cassandra.port": "9042",
+    "cassandra.ssl.enabled": "true",
+    "cassandra.protocol.version": "4"
+  }
+}
+```
+
+| CDC方案 | 实时性 | 一致性 | 复杂度 | 适用场景 |
+|---------|--------|--------|--------|----------|
+| Kafka Connect Source | 秒级 | 最终一致 | 低 | 标准同步 |
+| Debezium | 秒级 | 最终一致 | 中 | 多源汇聚 |
+| 自定义CDC | 秒级 | 可控 | 高 | 特殊需求 |
+| 定时全量 | 分钟级 | 强一致 | 低 | 离线分析 |
+
+## 分区键设计与PACSCAL原则
+
+### PACSCAL设计框架
+
+```
+PACSCAL = Partition + Access pattern + Clustering + Sort + Consistency + Application
+
+设计步骤：
+  1. Partition Key：决定数据分布（哈希/复合）
+  2. Access Pattern：明确查询模式（等值/范围）
+  3. Clustering Key：分区内排序（ASC/DESC）
+  4. Sort：排序方向与查询匹配
+  5. Consistency：一致性级别选择
+  6. Application：业务约束（TTL/计数器）
+```
+
+| 设计原则 | 说明 | 示例 |
+|----------|------|------|
+| 高基数 | 分区键唯一值足够多 | user_id(好), status(差) |
+| 均匀分布 | 避免热点分区 | Murmur3Hash分布 |
+| 查询友好 | 按查询模式设计 | 时间序列: device_id+date |
+| 分区大小 | 单分区<100MB | 拆分大分区 |
+
+```sql
+-- 错误：单调递增分区键（热点）
+CREATE TABLE bad_design (
+    user_id UUID PRIMARY KEY,
+    created_time TIMESTAMP
+);
+
+-- 正确：复合分区键（分散）
+CREATE TABLE good_design (
+    user_id UUID,
+    bucket INT,
+    created_time TIMESTAMP,
+    PRIMARY KEY ((user_id, bucket), created_time DESC)
+);
+-- bucket = user_id.hashCode() % 16
+
+-- Time Bucket模式（时序推荐）
+CREATE TABLE sensor_readings (
+    sensor_id UUID,
+    bucket TIMESTAMP,
+    event_time TIMESTAMP,
+    value DOUBLE,
+    PRIMARY KEY ((sensor_id, bucket), event_time DESC)
+) WITH default_time_to_live = 7776000  -- 90天TTL
+  AND compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_size': 1,
+    'compaction_window_unit': 'HOURS'
+  };
+```
+
+## TTL与墓碑机制深入
+
+### gc_grace_seconds配置
+
+```
+gc_grace_seconds = Tombstone在被清理前保留的时间窗口
+
+场景配置：
+  生产环境：默认10天（864000秒）
+  低延迟场景：3-5天（确保复制延迟<1天）
+  开发环境：1天（便于测试）
+  跨DC场景：适当延长（考虑网络延迟）
+
+TTL自动过期：
+  INSERT INTO data (k, v) VALUES ('key', 'value') USING TTL 3600;
+  -- 1小时后自动删除，不产生Tombstone
+
+墓碑处理：
+  tombstone_warning_threshold: 1000
+  tombstone_failure_threshold: 100000
+  gc_grace_seconds: 864000 (10天)
+```
+
+### 墓碑问题排查流程
+
+```mermaid
+flowchart TD
+    A[查询超时] --> B{检查Tombstone数量}
+    B -->|>1000| C[分析DELETE操作]
+    B -->|正常| D[检查其他因素]
+    C --> E[设置TTL替代DELETE]
+    C --> F[缩短gc_grace_seconds]
+    C --> G[强制compact]
+    E --> H[监控Tombstone趋势]
+    F --> H
+    G --> H
+```
+
+## 监控与运维
+
+### nodetool运维命令
+
+```bash
+# 集群状态
+nodetool status
+
+# 线程池状态
+nodetool tpstats
+
+# Compaction状态
+nodetool compactionstats
+
+# 修复数据
+nodetool repair keyspace.table
+
+# 清理数据
+nodetool cleanup keyspace
+
+# 压缩表
+nodetool compact keyspace.table
+
+# 截断表（危险）
+nodetool truncate keyspace.table
+
+# 查看表 histograms
+nodetool tablehistories keyspace.table
+```
+
+| 监控指标 | 告警阈值 | 说明 |
+|----------|----------|------|
+| Read Latency P99 | > 100ms | 读延迟过高 |
+| Write Latency P99 | > 50ms | 写延迟过高 |
+| Pending Compactions | > 10 | 压缩任务堆积 |
+| Tombstone数量 | > 1000 | 墓碑过多 |
+| Dropped Messages | > 0 | 消息丢失 |
+| ThreadPool Blocked | > 0 | 线程池阻塞 |
+
+## 多数据中心NetworkTopologyStrategy
+
+### 一致性级别选择矩阵
+
+| 场景 | 写一致性 | 读一致性 | 说明 |
+|------|----------|----------|------|
+| 写多读少 | ONE | QUORUM | 读保证最新 |
+| 读多写少 | QUORUM | ONE | 写保证持久 |
+| 强一致 | QUORUM | QUORUM | W+R>N |
+| 低延迟 | ONE | ONE | 最终一致 |
+| 灾备 | LOCAL_QUORUM | LOCAL_QUORUM | 本地DC优先 |
+
+```sql
+-- 多DC配置
+CREATE KEYSPACE my_keyspace WITH replication = {
+    'class': 'NetworkTopologyStrategy',
+    'dc_bj': 3,
+    'dc_sh': 3,
+    'dc_gz': 3
+};
+
+-- 本地优先查询
+CONSISTENCY LOCAL_QUORUM;
+SELECT * FROM users WHERE user_id = 123;
+```
+
+## 性能调优
+
+### 读写一致性调优
+
+```
+写优化：
+  1. 同一分区内批量写（原子性+性能）
+  2. 降低一致性：写ONE（非QUORUM）
+  3. 增加Commit Log缓冲：commitlog_sync=batch
+  4. 使用TWCS（写放大最低）
+
+读优化：
+  1. SELECT指定列，避免SELECT *
+  2. WHERE带Partition Key（分区裁剪）
+  3. LIMIT限制返回行数
+  4. 布隆过滤器拦截不存在分区
+
+压缩策略选择：
+  STCS：写密集（按大小合并，写放大低）
+  LCS：读密集（层内无重叠，读性能好）
+  TWCS：时序数据（按时间窗口，写放大最低）
+```
+
+### 缓存与压缩配置
+
+```
+缓存配置：
+  key_cache_size: 5% 堆内存（热键缓存）
+  row_cache_size: 0（禁用，推荐用外部缓存）
+  counter_cache_size: 5% 堆内存
+
+压缩配置：
+  sstable_compression: LZ4Compressor（默认）
+  compaction_throughput_mb_per_sec: 16~64
+  compaction_large_partition_warning_threshold_mb: 100
+```
+
+## Cassandra vs HBase vs MongoDB对比
+
+| 维度 | Cassandra | HBase | MongoDB |
+|------|-----------|-------|---------|
+| 数据模型 | 宽列 | 宽列 | 文档 |
+| 一致性 | 可调 | 强一致 | 最终一致 |
+| 扩展性 | 线性扩展 | 区域扩展 | 分片 |
+| 写性能 | 极高 | 高 | 中 |
+| 读性能 | 中（需分区键） | 高 | 高 |
+| 运维复杂度 | 中 | 高 | 低 |
+| 适用场景 | 时序/日志 | 大数据宽表 | 文档存储 |
+
+## Cassandra运维（repair/compact/truncate）
+
+### 运维操作清单
+
+| 操作 | 命令 | 频率 | 说明 |
+|------|------|------|------|
+| 修复 | nodetool repair | 每周 | 修复副本不一致 |
+| 压缩 | nodetool compact | 按需 | 合并SSTable |
+| 清理 | nodetool cleanup | 扩容后 | 清理旧节点数据 |
+| 截断 | nodetool truncate | 慎用 | 清空表数据 |
+| 快照 | nodetool snapshot | 每天 | 备份数据 |
+
+### repair操作详解
+
+```bash
+# 全量修复
+nodetool repair keyspace.table
+
+# 并行修复
+nodetool repair -pr keyspace.table
+
+# 修复进度监控
+nodetool tpstats | grep -i repair
+
+# 修复最佳实践：
+# 1. 生产环境每周执行一次
+# 2. 避开业务高峰期
+# 3. 使用-paralle选项加速
+# 4. 监控修复期间的IO和网络
+```
+
+## Cassandra与Spark集成
+
+### Spark Cassandra Connector配置
+
+```scala
+// Spark读取Cassandra
+val rdd = sc.cassandraTable("keyspace", "table")
+  .select("col1", "col2")
+  .where("key = ?", value)
+
+// Spark写入Cassandra
+rdd.saveToCassandra("keyspace", "table",
+  SomeColumns("col1", "col2"))
+
+// DataFrame方式
+val df = spark.read
+  .format("org.apache.spark.sql.cassandra")
+  .options(table="table", keyspace="keyspace")
+  .load()
+
+df.write
+  .format("org.apache.spark.sql.cassandra")
+  .options(table="output", keyspace="keyspace")
+  .mode(SaveMode.Append)
+  .save()
+```
+
+| 集成维度 | 配置 |
+|----------|------|
+| 连接池 | spark.cassandra.connection.pool.size |
+| 批量写入 | spark.cassandra.output.batch.size |
+| 并行度 | spark.cassandra.output.concurrent.writes |
+| 压缩 | spark.cassandra.output.compression.level |
+
 ## 十四、与其他板块的关系
 
 - HBase 对比见「[HBase 列式存储](./HBase列式存储.md)」；

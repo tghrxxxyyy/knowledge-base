@@ -1722,6 +1722,305 @@ spark.scheduler.allocation.file: fair-scheduler.xml
 
 ---
 
+## Shuffle内存管理（ExternalSorter spill）
+
+### Shuffle过程详解
+
+```
+Map端Shuffle：
+  map输出 → 内存环形缓冲（spark.shuffle.sort.bypassMergeThreshold）
+  → 溢出写（spill）到本地磁盘（按分区+排序）
+  → merge合并排序
+
+Reduce端Shuffle：
+  从各Map拉取对应分区数据（fetch）
+  归并排序 → 分组 → reduce函数
+
+内存管理参数：
+  spark.shuffle.memoryFraction: 0.2（默认，Shuffle占堆比例）
+  spark.shuffle.spill.compress: true（溢出压缩）
+  spark.shuffle.compress: true（Shuffle文件压缩）
+  spark.io.compression.codec: lz4（压缩编码）
+```
+
+### ExternalSorter溢写机制
+
+```
+ExternalSorter流程：
+  1. 内存中累积kv对
+  2. 内存不足时 → spill到磁盘
+  3. 每次spill生成一个临时文件
+  4. 最终merge所有临时文件 + 内存数据
+
+优化配置：
+  spark.shuffle.spill.numElementsForceSpillThreshold: 无限
+  spark.shuffle.sort.bypassMergeThreshold: 400
+    → 分区数<400时，跳过排序直接合并
+  spark.shuffle.sort.io.plugin.class: 自定义IO插件
+```
+
+## 广播Join适用条件
+
+| 条件 | 说明 | 阈值 |
+|------|------|------|
+| 表大小 | 小表广播 | < spark.sql.autoBroadcastJoinThreshold |
+| 内存 | Executor内存足够 | 小表< Executor内存×30% |
+| 并行度 | 大表分区数 | 不影响广播 |
+
+```scala
+// 手动广播
+val smallDF = spark.table("small_table")
+val broadcastDF = broadcast(smallDF)
+largeDF.join(broadcastDF, "join_key")
+
+// 配置自动广播阈值
+spark.sql.autoBroadcastJoinThreshold = 10 * 1024 * 1024 // 10MB
+```
+
+## AQE动态合并小分区
+
+```
+AQE（Adaptive Query Execution）动态优化：
+
+1. 动态合并小分区（coalesceShufflePartitions）：
+   → 自动合并Shuffle后的小分区
+   → 减少任务数和调度开销
+
+2. 动态调整Join策略：
+   → 运行时统计信息 → 广播Join切换
+
+3. 动态优化Skew Join：
+   → 检测数据倾斜 → 自动拆分大分区
+
+配置：
+  spark.sql.adaptive.enabled: true（开启AQE）
+  spark.sql.adaptive.coalescePartitions.enabled: true
+  spark.sql.adaptive.skewJoin.enabled: true
+  spark.sql.adaptive.skewJoin.skewedPartitionFactor: 5
+  spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes: 256MB
+```
+
+## 推测执行配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.speculation | false | 开启推测执行 |
+| spark.speculation.multiplier | 1.5 | 任务耗时超过中位数1.5倍 |
+| spark.speculation.quantile | 0.75 | 75%任务完成时触发 |
+
+```
+推测执行原理：
+  1. 某任务执行时间超过中位数×multiplier
+  2. 在另一个节点启动相同任务的备份
+  3. 先完成的结果生效，后完成的取消
+
+注意：
+  - 不适合写外部系统（可能重复写入）
+  - 不适合有状态计算（状态可能冲突）
+  - 适合无副作用的纯计算任务
+```
+
+## Spark on K8s资源分配
+
+```yaml
+# Spark on K8s配置
+spark.kubernetes.driver.request.cores: 1
+spark.kubernetes.executor.request.cores: 2
+spark.kubernetes.executor.limits.cores: 4
+spark.kubernetes.driver.request.memory: 2g
+spark.kubernetes.executor.request.memory: 4g
+
+# 资源分配策略
+spark.dynamicAllocation.enabled: true
+spark.dynamicAllocation.minExecutors: 2
+spark.dynamicAllocation.maxExecutors: 20
+spark.dynamicAllocation.executorIdleTimeout: 60s
+spark.dynamicAllocation.schedulerBacklogTimeout: 1s
+```
+
+## 动态资源分配（shuffle tracking）
+
+```
+动态资源分配（Shuffle Tracking）：
+
+原理：
+  1. Executor空闲 → 释放资源
+  2. 有新任务 → 申请新Executor
+  3. Shuffle阶段 → 保留持有Shuffle数据的Executor
+
+配置：
+  spark.dynamicAllocation.enabled: true
+  spark.dynamicAllocation.shuffleTracking.enabled: true
+  spark.dynamicAllocation.shuffleTracking.timeout: 300s
+
+优势：
+  - 弹性扩缩容，节省资源
+  - 避免Shuffle数据丢失
+  - 适合资源紧张的集群
+```
+
+## 历史服务器排查
+
+```bash
+# 启动历史服务器
+./sbin/start-history-server.sh
+
+# 查看历史应用
+http://history-server:18080
+
+# 常用排查：
+# 1. 查看Stage详情 → 找到慢Stage
+# 2. 查看Task分布 → 找到数据倾斜
+# 3. 查看Shuffle Read/Write → 找到IO瓶颈
+# 4. 查看GC时间 → 找到内存问题
+
+# 日志位置
+spark.eventLog.dir: hdfs:///spark/history
+spark.history.fs.logDirectory: hdfs:///spark/history
+```
+
+## Spark 3.x新特性
+
+### Adaptive Skew Join
+
+```scala
+// 自动检测并处理数据倾斜
+spark.sql.adaptive.enabled = true
+spark.sql.adaptive.skewJoin.enabled = true
+spark.sql.adaptive.skewJoin.skewedPartitionFactor = 5
+spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes = 256MB
+
+// 效果：
+// 自动识别倾斜分区 → 拆分大分区 → 并行处理
+```
+
+### DPP（动态分区裁剪）
+
+```
+DPP原理：
+  Join时自动利用小表的分区信息裁剪大表的分区
+  减少Shuffle数据量
+
+示例：
+  SELECT * FROM fact_sales f
+  JOIN dim_date d ON f.date_key = d.date_key
+  WHERE d.year = 2024;
+
+  DPP自动裁剪：fact_sales只读取2024年的分区
+
+配置：
+  spark.sql.sources.partitionOverwriteMode: dynamic
+  spark.sql.adaptive.enabled: true（DPP依赖AQE）
+```
+
+## Spark SQL BroadcastJoin阈值
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.sql.autoBroadcastJoinThreshold | 10MB | 自动广播阈值 |
+| spark.sql.broadcastTimeout | 300s | 广播超时 |
+| spark.sql.adaptive.autoBroadcastJoinThreshold | 动态 | AQE动态调整 |
+
+```
+BroadcastJoin原理：
+  1. 小表广播到所有Executor
+  2. 大表每个分区与小表本地Join
+  3. 避免Shuffle
+
+适用条件：
+  - 一张表远小于另一张表
+  - 内存足够容纳广播表
+  - Join条件是等值Join
+
+不适合：
+  - 两张表都很大
+  - 内存不足
+  - 非等值Join
+```
+
+## 广播变量
+
+```scala
+// 广播大变量（避免每个Task序列化一份）
+val broadcastVar = sc.broadcast(lookupTable)
+rdd.map(x => broadcastVar.get(x.id))
+
+// 广播DataFrame
+import org.apache.spark.sql.functions.broadcast
+df1.join(broadcast(df2), "key")
+```
+
+## Spark性能调优最佳实践
+
+### 数据倾斜处理
+
+```
+数据倾斜方案：
+  1. 加盐打散：给倾斜Key加随机后缀
+     rdd.map(x => (x.key + "_" + random(0,9), x.value))
+       .reduceByKey(_ + _)
+       .map(x => (x._1.split("_")(0), x._2))
+
+  2. 两阶段聚合：先局部聚合再全局聚合
+     rdd.map(x => (x.key, 1))
+       .reduceByKey(_ + _)  // 局部聚合
+       .map(x => (x._1, x._2))
+       .reduceByKey(_ + _)  // 全局聚合
+
+  3. 广播Join：小表广播避免Shuffle
+
+  4. AQE自动处理：spark.sql.adaptive.skewJoin.enabled=true
+```
+
+### 小文件问题
+
+```
+小文件成因：
+  1. 分区过细（按小时/分钟分区）
+  2. 并行度太高
+  3. 动态分区写入
+
+解决方案：
+  1. 调整分区数：spark.sql.shuffle.partitions=200
+  2. 合并小文件：coalesce/repartition
+  3. 控制输出文件大小：spark.sql.files.maxRecordsPerFile
+  4. AQE动态合并：spark.sql.adaptive.coalescePartitions.enabled
+```
+
+### 分区策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 默认分区 | Hash分区 | 通用 |
+| Range分区 | 范围分区 | 有序数据 |
+| 自定义分区 | 自定义Partitioner | 特殊需求 |
+| Coalesce | 减少分区数 | 合并小文件 |
+| Repartition | 增加分区数 | 提高并行度 |
+
+## Spark监控（Ganglia/Prometheus/Spark UI）
+
+### 监控架构
+
+```mermaid
+flowchart LR
+    S[Spark Application] -->|Metrics| P[Prometheus]
+    P --> G[Grafana]
+    S -->|EventLog| H[History Server]
+    H --> UI[Spark UI]
+    S -->|Metrics| G2[Ganglia]
+```
+
+### 关键监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| GC Time | GC耗时占比 | > 10% |
+| Shuffle Read | Shuffle读取量 | > 1GB/Task |
+| Shuffle Write | Shuffle写入量 | > 1GB/Task |
+| Task Duration | Task执行时间 | > 10min |
+| Failed Tasks | 失败Task数 | > 5% |
+| Peak Execution Memory | 峰值内存 | > 80%堆 |
+
 ## 三十、与其他板块的关系
 
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；

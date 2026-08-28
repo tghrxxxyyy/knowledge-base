@@ -1768,6 +1768,261 @@ sysctl -w net.ipv4.tcp_fin_timeout=15
 
 ---
 
+## MQTT 5.0特性详解
+
+### Properties/Session Expiry/Topic Alias/Shared Subscription
+
+| 特性 | 说明 | 适用场景 |
+|------|------|----------|
+| Properties | 可变头部扩展属性 | 传递用户数据 |
+| Session Expiry | 会话过期时间 | 离线消息保留 |
+| Topic Alias | 主题别名 | 减少协议开销 |
+| Shared Subscription | 共享订阅 | 负载均衡消费 |
+| Message Expiry | 消息过期时间 | 防止过期消息投递 |
+| Response Information | 响应信息 | 请求-响应模式 |
+
+```java
+// MQTT 5.0连接配置
+MqttConnectionOptions options = new MqttConnectionOptions();
+options.setSessionExpiryInterval(3600L); // 1小时会话过期
+options.setKeepAliveInterval(30);
+
+// 发布时设置Topic Alias
+MqttPublishProperties props = new MqttPublishProperties();
+props.setTopicAlias(1); // 使用别名1代表主题
+```
+
+### 共享订阅（Shared Subscription）
+
+```
+共享订阅格式：$share/{group}/{topic}
+
+示例：
+  $share/sensor-group/temperature/#
+  $share/sensor-group/humidity/#
+
+负载均衡策略：
+  RoundRobin（轮询）：均匀分配
+  Random（随机）：随机分配
+  Sticky（粘性）：同一消息到同一消费者
+  HashBased（哈希）：按消息键哈希分配
+```
+
+## 认证方式（Username/Password/Client Certificate/ACL）
+
+### 认证方式对比
+
+| 方式 | 安全性 | 复杂度 | 适用场景 |
+|------|--------|--------|----------|
+| Username/Password | 中 | 低 | 简单场景 |
+| Client Certificate | 高 | 高 | 企业级 |
+| Token（JWT） | 高 | 中 | OAuth集成 |
+| ACL | 中 | 中 | 细粒度控制 |
+
+```java
+// ACL配置示例（EMQX）
+// 允许设备发布自己的遥测数据
+allow = {
+  topic = "devices/${username}/telemetry"
+  action = publish
+  user = "${username}"
+}
+
+// 允许服务端订阅所有设备遥测
+allow = {
+  topic = "devices/#"
+  action = subscribe
+  user = "server"
+}
+```
+
+## QoS选择（0/1/2性能可靠性权衡）
+
+| QoS | 投递保证 | 网络开销 | 延迟 | 适用场景 |
+|-----|----------|----------|------|----------|
+| 0 | 最多一次 | 最低 | 最低 | 传感器数据（允许丢失） |
+| 1 | 至少一次 | 中 | 中 | 命令下发（允许重复） |
+| 2 | 恰好一次 | 最高 | 最高 | 金融交易（不可丢失/重复） |
+
+```
+QoS选择指南：
+  环境监测/传感器数据 → QoS 0（允许丢失）
+  设备控制/命令下发 → QoS 1（允许重复）
+  计费/交易数据 → QoS 2（精确一次）
+  遥测聚合 → QoS 0（批量数据丢失可接受）
+  告警通知 → QoS 1（必须送达）
+```
+
+## MQTT与Kafka集成
+
+### MQTT Proxy/Kafka Connect方案
+
+```mermaid
+flowchart LR
+    D[设备] -->|MQTT| B[EMQX Broker]
+    B -->|MQTT Proxy| K[Kafka]
+    B -->|Kafka Connect| K
+    K --> F[Flink/Spark处理]
+    K --> C[ClickHouse/ES]
+```
+
+| 集成方式 | 说明 | 适用场景 |
+|----------|------|----------|
+| MQTT Proxy | Broker直接转发到Kafka | 高吞吐/低延迟 |
+| Kafka Connect | MQTT Source Connector | 标准化集成 |
+| 自定义桥接 | 应用层转发 | 特殊需求 |
+
+```json
+{
+  "name": "mqtt-source",
+  "config": {
+    "connector.class": "io.confluent.connect.mqtt.MqttSourceConnector",
+    "tasks.max": "3",
+    "mqtt.server.uri": "tcp://emqx:1883",
+    "mqtt.topics": "sensors/#",
+    "kafka.topic": "mqtt-sensors",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter"
+  }
+}
+```
+
+## IoT应用模式（设备影子/遥测/命令/OTA）
+
+### 设备影子模式
+
+```json
+// 设备影子JSON结构
+{
+  "state": {
+    "desired": {
+      "temperature": 25,
+      "humidity": 60
+    },
+    "reported": {
+      "temperature": 23,
+      "humidity": 55,
+      "battery": 80
+    }
+  },
+  "metadata": {
+    "temperature": {
+      "timestamp": 1700000000
+    }
+  },
+  "version": 42
+}
+```
+
+### IoT消息模式
+
+| 模式 | 方向 | Topic示例 | 说明 |
+|------|------|-----------|------|
+| 遥测 | 设备→云 | devices/{id}/telemetry | 周期性数据上报 |
+| 命令 | 云→设备 | devices/{id}/commands | 远程控制 |
+| 状态 | 设备→云 | devices/{id}/status | 在线/离线状态 |
+| OTA | 云→设备 | devices/{id}/ota | 固件升级 |
+| 影子 | 双向 | devices/{id}/shadow | 设备期望/报告状态 |
+
+## EMQX vs Mosquitto vs HiveMQ对比
+
+| 维度 | EMQX | Mosquitto | HiveMQ |
+|------|------|-----------|--------|
+| 语言 | Erlang | C | Java |
+| 性能 | 百万级连接 | 万级连接 | 十万级连接 |
+| 集群 | 原生集群 | 单节点 | 原生集群 |
+| 协议 | MQTT 3.1.1/5.0 | MQTT 3.1.1/5.0 | MQTT 3.1.1/5.0 |
+| 插件 | 丰富（Dashboard/规则引擎） | 有限 | 丰富 |
+| 开源 | 开源+企业版 | 完全开源 | 商业+社区版 |
+| 适用 | 大规模IoT平台 | 嵌入式/测试 | 企业级IoT |
+
+## 消息持久化（离线消息/遗嘱消息）
+
+### 遗嘱消息（Last Will）
+
+```
+遗嘱消息 = 客户端连接时预设的"遗言"
+
+触发条件：
+  1. 客户端未正常断开连接（网络异常）
+  2. Keep Alive超时
+  3. 客户端发送DISCONNECT前异常退出
+
+使用场景：
+  设备离线通知：发布离线消息到 devices/{id}/status
+  负载均衡：其他消费者接管该设备订阅
+```
+
+### 离线消息保留
+
+| 机制 | 说明 | 配置 |
+|------|------|------|
+| Clean Session=false | 保留订阅和未确认消息 | 客户端连接时设置 |
+| Session Expiry | 会话过期时间（v5.0） | 连接属性设置 |
+| Retain Message | 保留最新消息 | 发布时设置retain标志 |
+| QoS 1/2 | 消息持久化 | QoS级别设置 |
+
+## MQTT集群架构（EMQX Cluster/负载均衡）
+
+### EMQX集群架构
+
+```mermaid
+flowchart TB
+    LB[负载均衡器] --> N1[EMQX Node1]
+    LB --> N2[EMQX Node2]
+    LB --> N3[EMQX Node3]
+    N1 <--> N2
+    N2 <--> N3
+    N1 <--> N3
+    D1[设备群1] --> LB
+    D2[设备群2] --> LB
+```
+
+| 集成组件 | 说明 |
+|----------|------|
+| 负载均衡 | HAProxy/Nginx/云LB |
+| 服务发现 | DNS/etcd/K8s Service |
+| 数据库 | PostgreSQL/MySQL（认证） |
+| 缓存 | Redis（会话/订阅） |
+| 消息桥接 | Kafka/RabbitMQ/EMQX Gateway |
+
+## MQTT性能调优（连接数/消息吞吐/QoS开销）
+
+### 性能调优参数
+
+| 参数 | 默认值 | 优化值 | 说明 |
+|------|--------|--------|------|
+| max_connections | 1024000 | 按需 | 最大连接数 |
+| max_mqueue_len | 1000 | 10000 | 消息队列长度 |
+| max_mqueue_dropped | 0 | 按需 | 丢弃消息数 |
+| listener.tcp.max_conns | 1024 | 10000 | TCP监听最大连接 |
+| broker.max_topic_levels | 5 | 按需 | 最大主题层级 |
+
+### QoS开销分析
+
+```
+QoS 0开销：
+  1次PUBLISH → 无确认
+  延迟：最低
+  吞吐：最高
+
+QoS 1开销：
+  1次PUBLISH → 1次PUBACK
+  延迟：+1次RTT
+  吞吐：降低约30%
+
+QoS 2开销：
+  1次PUBLISH → PUBREC → PUBREL → PUBCOMP
+  延迟：+3次RTT
+  吞吐：降低约60%
+
+优化建议：
+  - 混合使用不同QoS级别
+  - 高频低价值数据用QoS 0
+  - 关键数据用QoS 1
+  - 极端可靠性用QoS 2
+```
+
 ## 十、与其他板块的关系
 
 - MQTT 协议规范见「[MQTT v5.0 规范](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)」；

@@ -1469,6 +1469,389 @@ K8s 原生 + 自动证书 + 动态环境 → Traefik
 轻量级微服务网关 → Traefik
 ```
 
+## IngressRoute CRD（Kubernetes部署）
+
+### IngressRoute配置
+
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: web-ingress
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`example.com`) && PathPrefix(`/api`)
+      kind: Rule
+      services:
+        - name: api-service
+          port: 80
+          weight: 100
+      middlewares:
+        - name: rate-limit
+    - match: Host(`example.com`)
+      kind: Rule
+      services:
+        - name: web-service
+          port: 80
+```
+
+### IngressRoute优势
+
+| 特性 | IngressRoute | 传统Ingress |
+|------|-------------|-------------|
+| 验证 | CRD校验 | 有限校验 |
+| 功能 | 支持中间件 | 功能有限 |
+| 更新 | 动态更新 | 需要重载 |
+| 扩展 | 支持插件 | 有限扩展 |
+
+## 中间件链（Rate Limit/Auth/Headers）
+
+### 常用中间件
+
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+spec:
+  rateLimit:
+    average: 100
+    burst: 50
+    period: 1s
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-basic
+spec:
+  basicAuth:
+    secret: auth-secret
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+spec:
+  headers:
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    frameDeny: true
+    contentTypeNosniff: true
+    browserXssFilter: true
+```
+
+### 中间件组合
+
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: chain
+spec:
+  chain:
+    middlewares:
+      - name: rate-limit
+      - name: auth-basic
+      - name: security-headers
+```
+
+## Gateway API（Kubernetes网关标准）
+
+### Gateway API资源
+
+| 资源 | 说明 |
+|------|------|
+| GatewayClass | 网关类定义（类似StorageClass） |
+| Gateway | 网关实例（监听器配置） |
+| HTTPRoute | HTTP路由规则 |
+| GRPCRoute | gRPC路由规则 |
+| TCPRoute | TCP路由规则 |
+| TLSRoute | TLS路由规则 |
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: production-gateway
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: tls-cert
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+spec:
+  parentRefs:
+    - name: production-gateway
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: api-v1
+          port: 80
+```
+
+## Kubernetes Ingress对比
+
+| 维度 | Traefik Ingress | Nginx Ingress | HAProxy Ingress |
+|------|----------------|---------------|-----------------|
+| 配置方式 | CRD + 注解 | 注解 | ConfigMap |
+| 动态更新 | 原生支持 | 部分支持 | 部分支持 |
+| 中间件 | 丰富 | 有限 | 有限 |
+| 服务发现 | 原生支持 | 原生支持 | 原生支持 |
+| 性能 | 高 | 最高 | 高 |
+| 生态 | 插件丰富 | 最成熟 | 稳定 |
+
+## 负载均衡策略（WRR/镜像/Sticky）
+
+### 负载均衡配置
+
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: ServersTransport
+metadata:
+  name: my-transport
+spec:
+  serverName: example.com
+  insecureSkipVerify: true
+---
+# 加权轮询（Weighted Round Robin）
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: weighted-route
+spec:
+  routes:
+    - match: Host(`example.com`)
+      kind: Rule
+      services:
+        - name: v1-service
+          port: 80
+          weight: 90
+        - name: v2-service
+          port: 80
+          weight: 10
+```
+
+### 镜像流量
+
+```yaml
+# 流量镜像（Shadow Traffic）
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mirror-route
+spec:
+  routes:
+    - match: Host(`example.com`)
+      kind: Rule
+      middlewares:
+        - name: traffic-mirror
+      services:
+        - name: main-service
+          port: 80
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: traffic-mirror
+spec:
+  mirroring:
+    name: main-service
+    percentage: 10
+    mirrors:
+      - name: canary-service
+        port: 80
+```
+
+## TLS配置（Let's Encrypt/证书管理）
+
+### 自动TLS配置
+
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: secure-route
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`example.com`)
+      kind: Rule
+      services:
+        - name: web-service
+          port: 80
+  tls:
+    certResolver: letsencrypt
+    domains:
+      - main: example.com
+        sans:
+          - "*.example.com"
+---
+# ACME配置
+apiVersion: traefik.containo.us/v1alpha1
+kind: CertStore
+metadata:
+  name: default
+spec:
+  kind: ClusterStore
+  vault:
+    server: https://vault.example.com
+    path: pki
+    role: traefik
+```
+
+## Traefik Enterprise（Service Mesh/RBAC/Metrics）
+
+### Traefik企业版功能
+
+| 功能 | 社区版 | 企业版 |
+|------|--------|--------|
+| 路由/负载均衡 | ✅ | ✅ |
+| 中间件 | 基础 | 高级 |
+| Service Mesh | ❌ | ✅ |
+| RBAC | ❌ | ✅ |
+| 高级监控 | ❌ | ✅ |
+| 企业支持 | ❌ | ✅ |
+
+### Service Mesh配置
+
+```yaml
+# Traefik Mesh配置
+apiVersion: traefik.containo.us/v1alpha1
+kind: ServiceMesh
+metadata:
+  name: default
+spec:
+  enableTracing: true
+  enableStats: true
+  meshGateway:
+    port: 8080
+```
+
+## Traefik vs Nginx vs HAProxy vs Envoy
+
+| 维度 | Traefik | Nginx | HAProxy | Envoy |
+|------|---------|-------|---------|-------|
+| 语言 | Go | C | C | C++ |
+| 配置 | 动态 | 静态/动态 | 静态 | 动态 |
+| 服务发现 | 原生 | 模块 | 模块 | xDS |
+| 可观测 | 内置Dashboard | 需要扩展 | 基础 | 强大 |
+| 适用 | K8s/云原生 | Web服务 | TCP负载 | Service Mesh |
+| 性能 | 高 | 最高 | 高 | 高 |
+
+## 运维管理（Dashboard/Prometheus/日志）
+
+### Dashboard配置
+
+```yaml
+# Dashboard配置
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: traefik-dashboard
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`traefik.example.com`)
+      kind: Rule
+      services:
+        - name: api@internal
+          kind: TraefikService
+      middlewares:
+        - name: basic-auth
+```
+
+### Prometheus监控
+
+```yaml
+# 启用Prometheus metrics
+apiVersion: traefik.containo.us/v1alpha1
+kind: ServersTransport
+metadata:
+  name: prometheus
+spec:
+  forwardAuth:
+    address: http://auth-service:8080
+---
+# 配置文件
+[metrics]
+  [metrics.prometheus]
+    buckets = [0.1, 0.3, 1.2, 5.0]
+    entryPoint = "metrics"
+```
+
+## 最佳实践（生产环境/安全/性能调优）
+
+### 生产环境配置
+
+```yaml
+# 生产环境配置要点
+1. 高可用部署：
+   - Deployment replicas >= 3
+   - Pod反亲和性
+   - PodDisruptionBudget
+
+2. 资源限制：
+   resources:
+     requests:
+       cpu: 100m
+       memory: 128Mi
+     limits:
+       cpu: 1000m
+       memory: 512Mi
+
+3. 健康检查：
+   livenessProbe:
+     httpGet:
+       path: /ping
+       port: 8080
+     initialDelaySeconds: 10
+   readinessProbe:
+     httpGet:
+       path: /ping
+       port: 8080
+```
+
+### 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| HTTPS强制 | 所有入口启用TLS |
+| HSTS | 启用Strict-Transport-Security |
+| 限流 | 配置rateLimit中间件 |
+| 认证 | 启用认证中间件 |
+| WAF | 集成ModSecurity或云WAF |
+| 网络策略 | K8s NetworkPolicy限制流量 |
+
+### 性能调优
+
+| 参数 | 说明 | 优化值 |
+|------|------|--------|
+| maxIdleConns | 最大空闲连接 | 按需 |
+| IdleConnTimeout | 空闲连接超时 | 90s |
+| forwardingTimeout | 转发超时 | 30s |
+| ContentLengthStrict | 严格内容长度 | 按需 |
+
 ## 与其他板块的关系
 
 - 网关选型总览见「[API 网关](./API网关.md)」；

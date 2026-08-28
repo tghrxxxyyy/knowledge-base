@@ -1696,6 +1696,403 @@ jfr print --events GC pause recording.jfr
 | 平顶 | CPU 密集 | 算法优化 |
 | 碎片帧 | 间接调用 | 减少虚函数/反射 |
 
+## JMM详解（主内存/工作内存/happens-before）
+
+### 主内存与工作内存
+
+```
+JMM定义了线程与内存之间的抽象关系：
+
+主内存（Main Memory）：
+  所有线程共享的内存区域
+  存储类的实例变量、静态变量、常量
+
+工作内存（Working Memory）：
+  每个线程私有的内存区域
+  存储主内存变量的副本
+  线程只能操作工作内存中的变量
+
+交互流程：
+  1. read：从主内存读取变量到工作内存
+  2. load：将read的值放入工作内存副本
+  3. use：执行引擎使用工作内存中的变量
+  4. assign：执行引擎将结果赋值给工作内存变量
+  5. store：将工作内存变量传送到主内存
+  6. write：将store的值写入主内存变量
+```
+
+### happens-before完整规则
+
+| 规则 | 说明 |
+|------|------|
+| 程序顺序规则 | 同一线程中，前面的操作happens-before后面的操作 |
+| 锁规则 | unlock操作happens-before后续的lock操作 |
+| volatile规则 | volatile写操作happens-before后续的volatile读 |
+| 线程启动规则 | Thread.start() happens-before子线程的每个操作 |
+| 线程终止规则 | 线程的所有操作happens-before其他线程检测到终止 |
+| 线程中断规则 | 调用interrupt() happens-before检测到中断 |
+| 终结器规则 | 对象构造函数happens-before finalize() |
+| 传递性规则 | 如果A hb B，B hb C，则A hb C |
+
+## 类加载（双亲委派/打破SPI/Tomcat）
+
+### 双亲委派模型
+
+```
+Bootstrap ClassLoader（启动类加载器）
+  加载：JAVA_HOME/lib（rt.jar等）
+  实现：C++代码
+
+Extension ClassLoader（扩展类加载器）
+  加载：JAVA_HOME/lib/ext（扩展类）
+  实现：Java代码
+
+Application ClassLoader（应用类加载器）
+  加载：classpath（用户代码）
+  实现：Java代码
+
+User ClassLoader（自定义类加载器）
+  加载：自定义路径
+  实现：Java代码
+
+委派流程：
+  1. 收到类加载请求
+  2. 先委托父加载器加载
+  3. 父加载器无法加载时，自己尝试加载
+  4. 保证核心类不被篡改
+```
+
+### 打破双亲委派
+
+```java
+// SPI打破双亲委派（ServiceLoader）
+// JDBC驱动：rt.jar中 DriverManager 在Bootstrap ClassLoader加载
+// 但驱动实现jar在classpath，需线程上下文类加载器
+
+Thread.currentThread().getContextClassLoader()
+    .loadClass("com.mysql.cj.jdbc.Driver");
+
+// Tomcat打破双亲委派
+// 每个Web应用有自己的WebAppClassLoader
+// 先自己加载，无法加载再委托父加载器（与双亲委派相反）
+
+// OSGi模块化
+// 网状委派模型，模块间按依赖关系加载
+```
+
+| 打破场景 | 原因 | 实现方式 |
+|----------|------|----------|
+| SPI（JDBC） | 核心类需要加载实现类 | 线程上下文类加载器 |
+| Tomcat | 不同应用类隔离 | WebAppClassLoader优先自己 |
+| OSGi | 模块化热部署 | 网状类加载模型 |
+| 热部署 | 修改代码不重启 | 自定义ClassLoader重载 |
+
+## GC日志分析（-Xlog:gc*）
+
+### JDK 11+ GC日志配置
+
+```bash
+# 统一日志框架配置
+-Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=100m
+
+# G1 GC日志
+-Xlog:gc*,gc+age=trace,gc+phases=debug:file=g1gc.log:time,tags:filecount=5,filesize=100m
+
+# ZGC日志
+-Xlog:gc*:file=zgc.log:time,uptime,level,tags:filecount=5,filesize=100m
+```
+
+### GC日志关键字段解读
+
+```
+[2024-01-15T10:30:00.123+0800][0.456s][info][gc] GC(12) Pause Young (Normal)
+  → GC编号：12
+  → 阶段：Pause Young
+  → 类型：Normal
+
+[2024-01-15T10:30:00.123+0800][0.456s][info][gc] GC(12) Using 4 workers
+  → GC线程数：4
+
+[2024-01-15T10:30:00.125+0800][0.458s][info][gc] GC(12) Eden regions: 12->2
+  → Eden区：12个Region→2个
+
+[2024-01-15T10:30:00.125+0800][0.458s][info][gc] GC(12) Old regions: 5->6
+  → Old区：5个Region→6个
+
+[2024-01-15T10:30:00.125+0800][0.458s][info][gc] GC(12) Pause Young 2.123ms
+  → Young GC停顿时间：2.123ms
+```
+
+## Crash分析（hs_err_pid.log）
+
+### Crash日志关键信息
+
+```
+hs_err_pid12345.log 关键信息：
+
+1. 崩溃原因：
+   # A fatal error has been detected by the Java Runtime Environment:
+   # SIGSEGV (0xb) at pc=0x00007f..., pid=12345, tid=12346
+
+2. 崩溃线程：
+   # Problematic frame:
+   # V  [libjvm.so+0x...]  JVM_GetArrayClass ComponentType+0x...
+
+3. 寄存器状态：
+   rax=0x... rbx=0x... rcx=0x...
+
+4. 内存映射：
+   [0x00007f...] 0x000000 ... libjvm.so
+
+5. JVM版本：
+   JRE (17.0.2+8-86) Java HotSpot(TM) 64-Bit Server VM
+
+6. 崩溃前操作：
+   Current thread: ... java.lang.Thread
+   Java frames: ...
+```
+
+### Crash排查步骤
+
+| 步骤 | 命令 | 说明 |
+|------|------|------|
+| 1. 获取crash日志 | 查找hs_err_pid*.log | 定位崩溃原因 |
+| 2. 分析crash类型 | SIGSEGV/SIGBUS/OutOfMemoryError | 确定问题类别 |
+| 3. 检查crash帧 | Problematic frame | 找到问题代码 |
+| 4. 检查内存状态 | 内存映射、寄存器 | 判断内存问题 |
+| 5. 检查JVM参数 | JVM启动参数 | 排除配置问题 |
+
+## 容器调优（MaxRAMPercentage）
+
+### 容器环境JVM配置
+
+```bash
+# JDK 11+ 容器感知配置
+-XX:+UseContainerSupport
+-XX:MaxRAMPercentage=75.0
+-XX:InitialRAMPercentage=50.0
+-XX:MinRAMPercentage=25.0
+
+# 内存限制
+-Xmx2g
+-Xms2g
+-XX:MaxMetaspaceSize=256m
+-XX:ReservedCodeCacheSize=128m
+
+# CPU感知
+-XX:ActiveProcessorCount=2
+-XX:CICompilerCount=2
+-XX:ParallelGCThreads=2
+-XX:ConcGCThreads=1
+```
+
+### 容器调优陷阱
+
+| 陷阱 | 原因 | 解决方案 |
+|------|------|----------|
+| OOMKill | 堆设太大超过容器limit | -XX:MaxRAMPercentage=75% |
+| CPU争抢 | GC线程数过多 | -XX:ActiveProcessorCount=2 |
+| 启动慢 | 堆初始值太小 | -XX:InitialRAMPercentage=50% |
+| 频繁Full GC | 堆太小 | 调整堆大小/使用ZGC |
+
+## ZGC/Shenandoah参数
+
+### ZGC参数配置
+
+```bash
+# ZGC基础配置
+-XX:+UseZGC
+-XX:+ZGenerational        # JDK 21+分代ZGC
+-XX:SoftMaxHeapSize=4g    # 软堆上限
+-XX:ConcGCThreads=2       # 并发GC线程
+-XX:ZCollectionInterval=1 # 主动回收间隔（秒）
+
+# ZGC调优
+-XX:ZAllocationSpikeTolerance=2  # 分配尖峰容忍度
+-XX:ZCollectionInterval=5        # 回收间隔
+```
+
+### Shenandoah参数配置
+
+```bash
+# Shenandoah配置
+-XX:+UseShenandoahGC
+-XX:ShenandoahGCHeuristics=compact  # 启发式策略
+-XX:ShenandoahMinFreeThreshold=10   # 最小空闲阈值
+-XX:ShenandoahGuaranteedGCInterval=300000  # 保证GC间隔
+
+# 启发式策略
+adaptive  自适应（默认）
+compact    紧凑（尽量回收更多空间）
+aggressive 激进（频繁回收）
+passive    被动（仅Full GC时）
+```
+
+## async-profiler火焰图/JFR深度分析
+
+### async-profiler使用
+
+```bash
+# CPU采样（生成火焰图）
+./profiler.sh -d 30 -f cpu_profile.html -o flamegraph <pid>
+
+# 内存分配分析
+./profiler.sh -d 30 -e alloc -f alloc_profile.html <pid>
+
+# 锁竞争分析
+./profiler.sh -d 30 -e lock -f lock_profile.html <pid>
+
+# Wall-clock分析
+./profiler.sh -d 30 -e wall -f wall_profile.html <pid>
+```
+
+### JFR深度分析
+
+```bash
+# 启动JFR
+jcmd <pid> JFR.start name=profile duration=60s filename=profile.jfr
+
+# 连续录制
+jcmd <pid> JFR.start name=continuous settings=profile filename=continuous.jfr
+
+# 分析JFR文件
+jfr print --events GCAllocation profile.jfr
+jfr print --events jvm.Information profile.jfr
+```
+
+## 内存泄漏排查（MAT/VisualVM/OQL）
+
+### MAT分析流程
+
+```
+1. 导出堆转储：
+   jmap -dump:format=b,file=heap.hprof <pid>
+
+2. MAT打开heap.hprof：
+   Leak Suspects Report → 自动检测泄漏
+   Histogram → 按类统计对象数量
+   Dominator Tree → 按内存占用排序
+
+3. OQL查询：
+   SELECT s.toString() FROM java.lang.String s
+   WHERE s.count > 1000
+
+   SELECT * FROM java.util.HashMap$Node
+   WHERE this.value > 1000000
+```
+
+### 内存泄漏常见原因
+
+| 原因 | 现象 | 解决方案 |
+|------|------|----------|
+| 静态集合 | 类持有大量对象引用 | 使用WeakHashMap |
+| 未关闭资源 | Connection/Stream未关闭 | try-with-resources |
+| ThreadLocal | 线程池中ThreadLocal未清理 | 使用后remove |
+| 缓存泄漏 | 缓存无上限/无过期 | LRU/软引用 |
+| 类加载器泄漏 | 动态类无法卸载 | 减少自定义类加载器 |
+
+## JVM参数速查表
+
+### 常用GC参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| -XX:+UseG1GC | 使用G1 | JDK9+默认 |
+| -XX:MaxGCPauseMillis | 最大GC停顿 | 200ms |
+| -XX:G1HeapRegionSize | Region大小 | 16m |
+| -XX:InitiatingHeapOccupancyPercent | 触发GC阈值 | 45% |
+| -XX:G1ReservePercent | 保留空间 | 10% |
+
+### 常用内存参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| -Xms | 初始堆大小 | 与-Xmx相同 |
+| -Xmx | 最大堆大小 | 容器75% |
+| -Xmn | 新生代大小 | 堆的1/3~1/2 |
+| -XX:MetaspaceSize | 元空间初始 | 256m |
+| -XX:MaxMetaspaceSize | 元空间最大 | 512m |
+| -XX:MaxDirectMemorySize | 堆外内存 | 按需 |
+
+### 常用调试参数
+
+| 参数 | 说明 |
+|------|------|
+| -XX:+HeapDumpOnOutOfMemoryError | OOM时自动dump |
+| -XX:HeapDumpPath | dump文件路径 |
+| -XX:+PrintGCDetails | 打印GC详情 |
+| -Xlog:gc* | JDK11+GC日志 |
+| -XX:+PrintCommandLineFlags | 打印JVM参数 |
+| -XX:+PrintFlagsFinal | 打印所有参数 |
+
+## JVM性能监控（jstack/jmap/jstat/Grafana JVM Dashboard）
+
+### jstack线程分析
+
+```bash
+# 导出线程栈
+jstack <pid> > thread_dump.txt
+
+# 查看死锁
+jstack -l <pid> | grep -A 20 "deadlock"
+
+# 高CPU排查
+top -Hp <pid>  # 找到高CPU线程ID
+printf '%x\n' <tid>  # 转换为16进制
+jstack <pid> | grep -A 30 "<16进制tid>"
+```
+
+### jmap内存分析
+
+```bash
+# 导出堆转储
+jmap -dump:format=b,file=heap.hprof <pid>
+
+# 查看堆内存使用
+jmap -heap <pid>
+
+# 查看对象统计
+jmap -histo <pid> | head -50
+```
+
+### jstat GC监控
+
+```bash
+# GC统计（每1000ms采样）
+jstat -gc <pid> 1000
+
+# GC百分比
+jstat -gcutil <pid> 1000
+
+# 输出列说明：
+#   S0/S1: Survivor区使用率
+#   E: Eden区使用率
+#   O: Old区使用率
+#   M: 元空间使用率
+#   YGC/YGCT: Young GC次数/耗时
+#   FGC/FGCT: Full GC次数/耗时
+#   GCT: GC总耗时
+```
+
+### Grafana JVM Dashboard
+
+```
+关键监控指标：
+  JVM Heap Memory Used：堆内存使用量
+  JVM Non-Heap Memory Used：非堆内存使用量
+  GC Count：GC次数
+  GC Time：GC耗时
+  Thread Count：线程数
+  Class Load Count：类加载数
+  Buffer Pool Used：堆外缓冲使用
+
+告警规则：
+  堆使用率 > 80% → 告警
+  Full GC频率 > 1次/分钟 → 严重
+  线程数 > 500 → 告警
+  类加载数持续增长 → 可能类加载泄漏
+```
+
 ## GC 选型决策树
 
 ```mermaid

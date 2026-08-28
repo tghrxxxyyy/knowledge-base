@@ -1615,6 +1615,370 @@ ByteBuf slice = buf.slice(readerIndex, readableBytes);
 -Dio.netty.leakDetection.level=DISABLED  // 关闭（生产）
 ```
 
+## ByteBuf深度解析（Pooled/Unpooled/CompositeByteBuf）
+
+### ByteBuf类型对比
+
+| 类型 | 说明 | 适用场景 | 性能 |
+|------|------|----------|------|
+| PooledByteBuf | 内存池化（默认） | 高频读写 | 最高 |
+| UnpooledByteBuf | 非池化分配 | 低频/测试 | 低 |
+| CompositeByteBuf | 组合多个ByteBuf | 协议拼装 | 中 |
+| WrappedByteBuf | 包装已有ByteBuf | 序列化适配 | 高 |
+
+### 内存池化原理
+
+```
+PooledByteBufAllocator：
+  Arena：内存分配区域（多个Chunk）
+  Chunk：连续内存块（默认16MB）
+  Page：内存页（默认8KB）
+  Subpage：细分页（用于小对象）
+
+分配策略：
+  Tiny：≤256B → 从Subpage分配
+  Small：256B~8MB → 从Page分配
+  Normal：8MB~16MB → 从Chunk分配
+  Huge：>16MB → 直接分配Unpooled
+
+回收策略：
+  直接内存：JVM GC时回收（慢）
+  堆内存：JVM GC时回收
+  池化内存：引用计数归零后回收到Pool
+```
+
+```java
+// ByteBuf使用示例
+ByteBuf buf = Unpooled.buffer(1024);
+try {
+    buf.writeBytes(data);
+    // 处理buf
+} finally {
+    ReferenceCountUtil.release(buf); // 引用计数-1
+}
+```
+
+## ChannelPipeline事件传播
+
+### 入站/出站处理器链
+
+```mermaid
+flowchart LR
+    subgraph 入站
+        I1[Decoder] --> I2[Business] --> I3[Handler]
+    end
+    subgraph 出站
+        O1[Encoder] --> O2[Handler]
+    end
+```
+
+| 处理方向 | 说明 | 常用处理器 |
+|----------|------|------------|
+| 入站（Inbound） | 数据从网络到应用 | Decoder、BusinessHandler |
+| 出站（Outbound） | 数据从应用到网络 | Encoder、FlushHandler |
+
+```java
+// Pipeline配置
+ch.pipeline()
+    .addLast("decoder", new LengthFieldBasedFrameDecoder(1024, 0, 4))
+    .addLast("encoder", new LengthFieldPrepender(4))
+    .addLast("handler", new BusinessHandler());
+
+// 事件传播
+ctx.fireChannelRead(msg);     // 传递给下一个入站处理器
+ctx.writeAndFlush(msg);       // 触发出站处理器链
+```
+
+## 心跳检测（IdleStateHandler）
+
+### 超时检测机制
+
+```java
+// IdleStateHandler配置
+ch.pipeline().addLast(
+    new IdleStateHandler(
+        60,  // readerIdleTime：读超时（秒）
+        30,  // writerIdleTime：写超时（秒）
+        0    // allIdleTime：全部超时
+    )
+);
+
+// 心跳处理器
+public class HeartbeatHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+        if (evt instanceof IdleStateEvent) {
+            IdleStateEvent event = (IdleStateEvent) evt;
+            if (event.state() == IdleState.READER_IDLE) {
+                // 读超时 → 关闭连接
+                ctx.close();
+            } else if (event.state() == IdleState.WRITER_IDLE) {
+                // 写超时 → 发送心跳
+                ctx.writeAndFlush(new HeartbeatMessage());
+            }
+        }
+    }
+}
+```
+
+| 超时类型 | 检测方向 | 典型动作 |
+|----------|----------|----------|
+| READER_IDLE | 长时间无数据 | 关闭连接 |
+| WRITER_IDLE | 长时间未写 | 发送心跳 |
+| ALL_IDLE | 读写都空闲 | 发送心跳/关闭 |
+
+## 编解码器（LengthFieldBasedFrameDecoder）
+
+### 粘包拆包处理
+
+```java
+// LengthFieldBasedFrameDecoder参数
+// maxFrameLength：最大帧长度
+// lengthFieldOffset：长度字段偏移
+// lengthFieldLength：长度字段字节数
+// lengthAdjustment：长度调整
+// initialBytesToStrip：跳过字节数
+
+// 协议：[4字节长度][1字节类型][N字节数据]
+ch.pipeline().addLast(
+    new LengthFieldBasedFrameDecoder(
+        1024,    // 最大帧1024
+        0,       // 长度字段偏移0
+        4,       // 长度字段4字节
+        0,       // 长度调整0
+        4        // 跳过4字节长度字段
+    )
+);
+```
+
+### 自定义协议编解码
+
+```java
+// 编码器
+public class MyEncoder extends MessageToByteEncoder<MyMessage> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, MyMessage msg, ByteBuf out) {
+        out.writeInt(msg.getLength());
+        out.writeByte(msg.getType());
+        out.writeBytes(msg.getData());
+    }
+}
+
+// 解码器
+public class MyDecoder extends ByteToMessageDecoder {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        if (in.readableBytes() < 5) return; // 不够最小长度
+        in.markReaderIndex();
+        int length = in.readInt();
+        byte type = in.readByte();
+        if (in.readableBytes() < length) {
+            in.resetReaderIndex();
+            return;
+        }
+        byte[] data = new byte[length];
+        in.readBytes(data);
+        out.add(new MyMessage(length, type, data));
+    }
+}
+```
+
+## 零拷贝（FileRegion/CompositeByteBuf）
+
+### 零拷贝实现
+
+```
+传统IO：
+  磁盘 → 内核缓冲 → 用户缓冲 → 内核Socket缓冲 → 网卡
+  4次拷贝，4次上下文切换
+
+零拷贝（sendfile）：
+  磁盘 → 内核缓冲 → 网卡
+  2次拷贝，2次上下文切换
+
+Netty零拷贝：
+  1. FileRegion：文件传输直接走sendfile
+  2. CompositeByteBuf：组合多个ByteBuf无需拷贝
+  3. ByteBuf.slice：切片视图无需拷贝
+  4. DirectByteBuffer：堆外内存减少拷贝
+```
+
+```java
+// FileRegion零拷贝传输
+RandomAccessFile raf = new RandomAccessFile("file.txt", "r");
+FileRegion region = new DefaultFileRegion(
+    raf.getChannel(), 0, raf.length());
+ch.writeAndFlush(region);
+
+// CompositeByteBuf组合
+CompositeByteBuf composite = Unpooled.compositeBuffer();
+composite.addComponent(true, buf1); // true自动更新readerIndex
+composite.addComponent(true, buf2);
+```
+
+## 生产调优（workerGroup/option/内存泄漏检测）
+
+### 关键配置参数
+
+| 参数 | 默认值 | 说明 | 推荐值 |
+|------|--------|------|--------|
+| bossGroup线程数 | 1 | Accept线程 | 1 |
+| workerGroup线程数 | CPU×2 | IO线程 | CPU×2 |
+| SO_BACKLOG | 128 | 连接队列 | 1024 |
+| TCP_NODELAY | false | 禁用Nagle | true |
+| SO_KEEPALIVE | false | TCP保活 | true |
+| WRITE_BUFFER_WATER_MARK | 32KB | 写缓冲 | 64KB |
+| CONNECT_TIMEOUT_MILLIS | 30000 | 连接超时 | 5000 |
+
+### 内存泄漏检测
+
+```java
+// 泄漏检测级别
+-Dio.netty.leakDetection.level=PARANOID  // 最严格（开发）
+-Dio.netty.leakDetection.level=ADVANCED  // 高级（测试）
+-Dio.netty.leakDetection.level=SIMPLE    // 简单（预发）
+-Dio.netty.leakDetection.level=DISABLED  // 关闭（生产）
+
+// 泄漏报告示例
+LEAK: ByteBuf.release() was not called before it's garbage-collected.
+  Recent access records: 1
+  #1: io.netty.buffer.AdvancedLeakAwareByteBuf...
+```
+
+## Netty线程模型（Reactor单线程/多线程/主从）
+
+| 模型 | 说明 | Netty实现 | 适用 |
+|------|------|-----------|------|
+| 单Reactor单线程 | 一个线程处理所有IO | 不推荐 | 低并发 |
+| 单Reactor多线程 | Reactor+线程池 | WorkerGroup | 一般场景 |
+| 主从Reactor | Boss+Worker | BossGroup+WorkerGroup | 高并发（默认） |
+
+```
+主从Reactor模型：
+  BossGroup（1线程）：
+    → 接收新连接
+    → 注册到WorkerGroup的EventLoop
+
+  WorkerGroup（CPU×2线程）：
+    → 每个EventLoop处理一组Channel
+    → 读取数据 → Pipeline处理 → 写回数据
+
+  优势：
+    → Boss只处理Accept，不阻塞
+    → Worker单线程无锁，高性能
+    → EventLoop绑定线程，避免上下文切换
+```
+
+## Netty在RPC中的应用（gRPC/Dubbo底层）
+
+### gRPC底层Netty使用
+
+```
+gRPC传输层：
+  Netty作为默认传输层（NettyServerHandler/NettyClientHandler）
+
+  服务端：
+    ServerBootstrap → NioServerSocketChannel
+    → Http2MultiplexHandler（HTTP/2多路复用）
+    → NettyServerHandler（gRPC处理）
+
+  客户端：
+    Bootstrap → NioSocketChannel
+    → Http2MultiplexHandler
+    → NettyClientHandler（gRPC调用）
+```
+
+### Dubbo底层Netty使用
+
+```
+Dubbo传输层：
+  Netty作为默认传输层
+
+  服务端：
+    NettyServer → ServerBootstrap
+    → NettyServerHandler（Dubbo协议处理）
+
+  客户端：
+    NettyClient → Bootstrap
+    → NettyClientHandler（Dubbo协议调用）
+
+  协议：
+    Dubbo协议头（16字节）+ 消息体
+    Magic(2B) + Flag(1B) + Status(1B) + ...
+```
+
+## Netty性能基准（QPS/延迟/内存）
+
+### 性能参考值
+
+| 指标 | 参考值 | 说明 |
+|------|--------|------|
+| QPS | 10万+/秒 | 单节点echo服务器 |
+| 延迟 | P99 < 1ms | 同机房 |
+| 内存 | 1KB/连接 | 空闲连接 |
+| 吞吐 | 1GB/s | 大消息传输 |
+
+### 性能优化要点
+
+```
+1. 内存管理：
+   - 使用PooledByteBufAllocator（默认）
+   - 减少对象创建和GC
+   - 直接内存用于网络IO
+
+2. 线程模型：
+   - 主从Reactor分离
+   - 业务线程池隔离
+   - EventLoop单线程无锁
+
+3. 网络优化：
+   - TCP_NODELAY（禁用Nagle）
+   - SO_BACKLOG（调大连接队列）
+   - WRITE_BUFFER_WATER_MARK（调整写缓冲）
+
+4. 协议优化：
+   - 自定义协议（避免HTTP开销）
+   - 编解码器优化
+   - 合并小包发送
+```
+
+## Netty最佳实践（内存泄漏排查/ByteBuf使用规范）
+
+### ByteBuf使用规范
+
+```
+规则1：始终释放ByteBuf
+  ReferenceCountUtil.release(buf) 或 try-with-resources
+
+规则2：使用堆外内存时注意GC
+  DirectByteBuf需要手动释放或等待GC
+
+规则3：避免内存拷贝
+  使用slice()、CompositeByteBuf
+
+规则4：池化复用
+  PooledByteBufAllocator自动管理
+
+规则5：检查引用计数
+  refCnt()检查是否已释放
+```
+
+### 内存泄漏排查流程
+
+```mermaid
+flowchart TD
+    A[怀疑泄漏] --> B[开启PARANOID检测]
+    B --> C[分析泄漏报告]
+    C --> D{泄漏位置}
+    D -->|Pipeline| E[检查处理器释放]
+    D -->|Buffer| E2[检查ByteBuf释放]
+    D -->|Channel| E3[检查Channel关闭]
+    E --> F[添加release逻辑]
+    E2 --> F
+    E3 --> F
+    F --> G[验证修复]
+```
+
 ## 十五、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；
