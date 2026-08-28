@@ -1886,3 +1886,161 @@ HAProxy 性能优化：
   9. 启用内核优化（net.core.somaxconn）
   10. 监控关键指标（连接数、会话率、错误率）
 ```
+
+### HAProxy vs Nginx vs Envoy对比
+
+| 特性 | HAProxy | Nginx | Envoy |
+|------|---------|-------|-------|
+| 性能 | 极高（L4） | 高 | 高 |
+| 功能 | 负载均衡 | Web服务器+LB | 服务网格 |
+| 适用场景 | TCP/HTTP LB | Web应用 | 微服务 |
+| 运维 | 配置文件 | 配置文件 | API管理 |
+| 生态 | 专注LB | 丰富 | 云原生 |
+
+### 健康检查配置
+
+```bash
+# HTTP健康检查
+option httpchk GET /healthz
+http-check expect status 200
+
+# TCP健康检查
+option tcp-check
+
+# 自定义健康检查脚本
+option httpchk
+http-check send meth GET uri /health ver HTTP/1.1 hdr Host localhost
+```
+
+### 连接管理
+
+```text
+maxconn: 最大连接数
+timeout connect: 连接后端超时
+timeout client: 客户端超时
+timeout server: 后端超时
+option http-keep-alive: 启用长连接
+```
+
+### SSL终结
+
+```bash
+# TLS 1.3配置
+bind *:443 ssl crt /etc/ssl/cert.pem alpn h2,http/1.1
+ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+ssl-default-bind-options ssl-min-ver TLSv1.3
+
+# 会话缓存
+tune.ssl.cachesize 20000
+tune.ssl.lifetime 300
+```
+
+### 日志分析
+
+```bash
+# 全局日志
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+
+# 本地日志
+frontend http-in
+    log global
+    option httplog
+    option dontlognull
+    option logasap
+```
+
+### K8s集成
+
+```yaml
+# Ingress Controller
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    haproxy.org/check: "true"
+    haproxy.org/load-balance: "roundrobin"
+spec:
+  rules:
+  - host: example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: my-service
+            port:
+              number: 80
+```
+
+### 最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 负载均衡 | 合理分配流量 | 高 |
+| 健康检查 | 及时剔除故障节点 | 高 |
+| 超时设置 | 避免资源耗尽 | 高 |
+| 安全配置 | ACL+SSL | 高 |
+
+### 生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 连接数暴涨 | 检查连接数配置 | 增加maxconn |
+| 502错误 | 检查后端健康 | 检查服务状态 |
+| 超时 | 检查超时配置 | 调整timeout |
+| 内存不足 | 检查内存使用 | 优化配置 |
+
+### 监控
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 连接数 | 当前连接数 | >maxconn*0.8 |
+| QPS | 每秒请求数 | >10000 |
+| 延迟 | 响应时间 | >1s |
+| 错误率 | 5xx错误率 | >1% |
+
+### HAProxy配置管理
+
+```bash
+# 热重载
+haproxy -f /etc/haproxy/haproxy.cfg -p /var/run/haproxy.pid -sf $(cat /var/run/haproxy.pid)
+
+# 配置检查
+haproxy -c -f /etc/haproxy/haproxy.cfg
+```
+
+### HAProxy安全
+
+```bash
+# ACL配置
+acl is_websocket hdr(Upgrade) -i WebSocket
+use_backend ws_backend if is_websocket
+
+# Rate Limiting
+stick-table type ip size 100k expire 30s store http_req_rate(10s)
+http-request deny deny_status 429 if { http_req_rate(10s) gt 100 }
+
+# SSL认证
+bind *:443 ssl crt /etc/ssl/cert.pem verify optional ca-file /etc/ssl/ca.pem
+http-request deny unless { ssl_fc_verify 0 }
+```
+
+### HAProxy性能调优
+
+```text
+缓冲区：
+  tune.bufsize 32768      # 缓冲区大小
+  tune.maxrewrite 1024    # 重写缓冲区
+
+连接池：
+  option http-keep-alive
+  timeout http-keep-alive 60s
+
+零拷贝：
+  option splice-request
+  option splice-response
+```

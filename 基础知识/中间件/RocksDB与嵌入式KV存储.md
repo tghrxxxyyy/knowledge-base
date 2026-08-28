@@ -1861,6 +1861,151 @@ int main() {
 }
 ```
 
+### LSM-Tree架构详解
+
+```text
+写入流程：
+  Write → MemTable → WAL → 返回成功
+  MemTable满 → Flush到SSTable（L0）
+  L0 SSTable满 → Compaction到L1
+  L1 SSTable满 → Compaction到L2
+  ...
+
+Compaction策略：
+  Level Compaction：每层大小递增10倍
+  Tiered Compaction：同层多文件合并
+  FIFO Compaction：按时间删除旧文件
+```
+
+### 写放大优化
+
+| 策略 | 写放大 | 读放大 | 空间放大 |
+|------|--------|--------|----------|
+| Leveled | 高（10-30x） | 低（1-2x） | 低（1.1x） |
+| Tiered | 低（2-5x） | 高（10-100x） | 高（2x） |
+| Universal | 低 | 中 | 中 |
+
+### Prefix Seek/范围查询
+
+```cpp
+// 前缀查询优化
+ReadOptions options;
+options.prefix_same_as_forward = true;
+options.total_order_seek = false;
+
+// 范围查询
+Iterator* it = db_->NewIterator(options);
+for (it->Seek(start_key); it->Valid() && it->key() < end_key; it->Next()) {
+    // 处理数据
+}
+```
+
+### TTL配置
+
+```cpp
+// 列族TTL
+ColumnFamilyOptions cf_options;
+cf_options.ttl = 3600;  // 1小时过期
+cf_options.periodic_compaction_seconds = 86400;
+
+// 写入带TTL
+WriteOptions write_options;
+write_options.timestamp = &now;
+```
+
+### RocksDB调优
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| BlockCache | 8MB | 128-512MB | 缓存大小 |
+| WriteBuffer | 64MB | 128-256MB | 写缓冲区 |
+| Compaction线程 | 1 | 4-8 | 并行Compaction |
+| MaxOpenFiles | -1 | 1000 | 文件句柄数 |
+
+### 嵌入式KV对比
+
+| 特性 | RocksDB | BoltDB | LevelDB | BadgerDB |
+|------|---------|--------|---------|----------|
+| 架构 | LSM | B+树 | LSM | LSM |
+| 写入性能 | 极高 | 低 | 高 | 高 |
+| 读取性能 | 高 | 高 | 高 | 高 |
+| 事务 | 支持 | 支持 | 不支持 | 支持 |
+| 适用场景 | 通用 | 小数据 | 简单KV | Go应用 |
+
+### RocksDB在Kafka中的应用
+
+```text
+Log存储：
+  消息存储在RocksDB中
+  支持高效顺序读写
+
+索引存储：
+  消息偏移量索引
+  时间戳索引
+```
+
+### RocksDB在MyRocks中的应用
+
+```text
+MyRocks：
+  MySQL存储引擎
+  基于RocksDB
+  优势：
+    1. 写入性能高
+    2. 存储效率高（压缩）
+    3. 事务支持
+```
+
+### 监控
+
+```cpp
+// 获取统计信息
+std::string stats;
+db_->GetProperty("rocksdb.stats", &stats);
+
+// 获取压缩统计
+std::string compaction_stats;
+db_->GetProperty("rocksdb.cfstats", &compaction_stats);
+
+// 性能上下文
+perf_context.Reset();
+// 执行操作
+uint64_t elapsed = perf_context.user_key_comparison_count;
+```
+
+### 备份恢复
+
+```cpp
+// 快照备份
+Snapshot* snapshot = db_->GetSnapshot();
+ReadOptions options;
+options.snapshot = snapshot;
+// 读取数据...
+
+// CheckPoint备份
+Checkpoint* checkpoint;
+Checkpoint::Create(db_, &checkpoint);
+checkpoint->CreateCheckpoint("/backup/path");
+```
+
+### RocksDB最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 写优化 | 调整WriteBuffer | 高 |
+| 读优化 | 调整BlockCache | 高 |
+| 内存管理 | 限制内存使用 | 高 |
+| Compaction调优 | 调整线程数 | 中 |
+
+### RocksDB生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 写放大 | 检查Compaction统计 | 调整策略 |
+| 空间放大 | 检查压缩比 | 启用压缩 |
+| Compaction堆积 | 检查线程数 | 增加线程 |
+| 读性能 | 检查缓存命中率 | 增加BlockCache |
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

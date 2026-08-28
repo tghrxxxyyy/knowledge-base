@@ -1800,3 +1800,173 @@ IoT宽表查询模式：
     使用Column Prefix：只读必要列
     使用Cache：缓存热点数据
 ```
+
+### 35. Compaction策略详解
+
+| 策略类型 | 触发条件 | 执行内容 | 影响 |
+|----------|----------|----------|------|
+| Minor Compaction | StoreFile数量达到阈值 | 合并小文件为大文件 | 读放大降低 |
+| Major Compaction | 手动/定时触发 | 合并所有StoreFile | 写放大最高 |
+| 异步Compaction | 后台线程自动执行 | 合并超过阈值的文件 | 均衡策略 |
+
+```text
+Compaction配置示例：
+  hbase.hstore.compactionThreshold=3    # Minor触发阈值
+  hbase.hstore.compaction.max=10        # 单次最大文件数
+  hbase.hregion.max.filesize=10GB       # Region最大大小
+  hbase.hstore.compaction.max.size=2GB  # 单文件最大大小
+
+读放大分析：
+  1个文件读1次 → 2个文件读2次 → N个文件读N次
+  Major Compaction后：1个文件只读1次
+```
+
+### 36. Region热点处理
+
+```text
+热点检测方法：
+  1. HBase Master WebUI → Regions标签
+  2. 检查Request/Size是否均匀分布
+  3. 使用hbase balancer查看Region分布
+
+自动分裂：
+  hbase.hregion.max.filesize=10GB
+  hbase.hregion分裂策略=自动分裂
+
+手动预分裂：
+  create 't1', 'cf', SPLITS => ['10', '20', '30', '40']
+  create 't1', 'cf', {NUMREGIONS => 15, SPLITALGO => 'HexStringSplit'}
+
+热点缓解：
+  1. 加盐：在RowKey前加随机前缀
+  2. 哈希：对RowKey进行哈希
+  3. 反转：反转固定前缀的RowKey
+  4. 预分裂：提前创建Region
+```
+
+### 37. HBase监控体系
+
+| 指标类别 | 指标名称 | 采集方式 | 告警阈值 |
+|----------|----------|----------|----------|
+| RegionServer | regionCount | JMX Exporter | >300 |
+| RegionServer | storeFileCount | JMX Exporter | >10 |
+| RegionServer | storeFileSize | JMX Exporter | >10GB |
+| BlockCache | hitRatio | JMX Exporter | <80% |
+| MemStore | memStoreSize | JMX Exporter | >128MB |
+
+```yaml
+# Prometheus JMX Exporter配置
+jmx_exporter:
+  host_port: "localhost:9999"
+  rules:
+    - pattern: "Hadoop<name=Hadoop:service=HBase,name=RegionServerStats><>regionCount"
+      name: "hbase_region_count"
+    - pattern: "Hadoop<name=Hadoop:service=HBase,name=RegionServerStats><>storeFileCount"
+      name: "hbase_store_file_count"
+```
+
+### 38. HBase vs Cassandra vs MongoDB对比
+
+| 特性 | HBase | Cassandra | MongoDB |
+|------|-------|-----------|---------|
+| 架构 | Master-Slave | P2P去中心化 | 主从复制 |
+| 数据模型 | Column-Family | Wide-Column | Document |
+| 查询语言 | HBase Shell | CQL | MQL |
+| 一致性 | 强一致性 | 最终一致性 | 可调一致性 |
+| 写入性能 | 高 | 极高 | 中等 |
+| 读取性能 | 中等 | 中等 | 高 |
+| 扩展性 | 水平扩展 | 水平扩展 | 水平扩展 |
+| 适用场景 | Hadoop生态 | IoT/时序数据 | 灵活Schema |
+
+### 39. HBase运维操作
+
+```bash
+# Region Split
+hbase shell> split 'tableName', 'splitKey'
+
+# Region Merge
+hbase shell> merge_region 'encodedRegionA', 'encodedRegionB'
+
+# 手动Balance
+hbase shell> balancer_switch true
+
+# 触发Major Compaction
+hbase shell> compact 'tableName'
+
+# 查看Region分布
+hbase shell> status 'detail'
+```
+
+### 40. HBase最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 表设计 | RowKey长度控制在20字节内 | 高 |
+| 预分区 | 根据数据量预估分区数 | 高 |
+| 批量操作 | 使用put(List)批量写入 | 高 |
+| Scan优化 | 设置startRow/endRow限定范围 | 高 |
+| TTL | 设置合理的过期时间 | 中 |
+| 列族数量 | 控制在2-3个 | 中 |
+| 压缩算法 | 使用Snappy/ZSTD | 中 |
+
+### 41. HBase生产问题排查
+
+| 问题类型 | 排查步骤 | 解决方案 |
+|----------|----------|----------|
+| RPC超时 | 检查RegionServer负载 | 增加超时/扩容 |
+| Region热点 | 查看WebUI Region分布 | 手动split/加盐 |
+| Compaction风暴 | 检查Compaction队列 | 调整参数/限流 |
+| OOM | 检查MemStore/BlockCache | 调整内存比例 |
+
+### 42. HBase与Flink集成
+
+```java
+// Flink HBase Sink批量写入
+public class HBaseSinkFunction extends RichSinkFunction<Row> {
+    private Connection connection;
+    private BufferedMutator<Row> mutator;
+    
+    @Override
+    public void open(Configuration parameters) {
+        connection = ConnectionFactory.createConnection(config);
+        mutator = connection.getBufferedMutator(tableName);
+    }
+    
+    @Override
+    public void invoke(Row row, Context context) {
+        Put put = new Put(row.getField("rowkey"));
+        put.addColumn(family, qualifier, value);
+        mutator.mutate(put);
+    }
+}
+
+// Flink状态后端配置
+state.backend: rocksdb
+state.backend.rocksdb.memory.managed: true
+```
+
+### 43. HBase安全机制
+
+| 安全措施 | 配置方式 | 说明 |
+|----------|----------|------|
+| Kerberos | hbase-site.xml | 认证 |
+| ACL | grant/revoke | 列族级权限 |
+| RPC加密 | SASL | 传输加密 |
+| 授权模型 | Simple/Authorization | 访问控制 |
+
+### 44. HBase备份恢复
+
+```bash
+# ExportTable全量备份
+hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/path
+
+# ImportTable恢复
+hbase org.apache.hadoop.hbase.mapreduce.Import tableName /backup/path
+
+# 增量备份脚本
+#!/bin/bash
+DATE=$(date +%Y%m%d)
+hbase org.apache.hadoop.hbase.mapreduce.Export tableName /backup/$DATE
+# 保留最近7天备份
+find /backup -mtime +7 -delete
+```

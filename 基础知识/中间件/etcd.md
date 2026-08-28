@@ -1994,3 +1994,150 @@ monitoring:
 | 状态 | 废弃 | 推荐 |
 
 | 一句话 | 「K8s 的大脑」——云原生协调的事实标准，Raft 工程范式 |
+
+### 多集群管理
+
+```bash
+# multi-cluster配置
+etcdctl --endpoints=http://cluster1:2379,http://cluster2:2379 \
+  --cacert=/etc/etcd/ca.crt \
+  --cert=/etc/etcd/server.crt \
+  --key=/etc/etcd/server.key \
+  member list
+
+# gateway配置
+etcdctl gateway list
+etcdctl endpoint health --cluster
+```
+
+### 监控
+
+```yaml
+# Prometheus指标
+- job_name: 'etcd'
+  static_configs:
+    - targets: ['etcd1:2379','etcd2:2379','etcd3:2379']
+  
+  # 告警规则
+  - alert: etcd_leader_changes
+    expr: rate(etcd_server_leader_changes_seen_total[5m]) > 0
+    for: 5m
+    labels:
+      severity: critical
+```
+
+### 备份恢复
+
+```bash
+# 快照备份
+etcdctl snapshot save /backup/etcd-$(date +%Y%m%d).db
+
+# 恢复
+etcdctl snapshot restore /backup/etcd-20240101.db --data-dir=/var/lib/etcd-restore
+
+# 增量备份脚本
+#!/bin/bash
+DATE=$(date +%Y%m%d)
+etcdctl snapshot save /backup/etcd-$DATE.db
+# 保留最近7天
+find /backup -mtime +7 -delete
+```
+
+### 性能调优
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| snapshot-count | 10000 | 10000 | 快照间隔 |
+| heartbeat-interval | 100 | 100 | 心跳间隔(ms) |
+| election-timeout | 1000 | 1000 | 选举超时(ms) |
+| quota-backend-bytes | 2GB | 8GB | 存储配额 |
+
+### 安全
+
+```yaml
+# 认证
+auth:
+  enable: true
+  token:
+    signer: /etc/etcd/jwt-public.pem
+    ttl: "30m"
+
+# 授权
+RBAC:
+  enable: true
+  role: root
+
+# TLS
+client-transport:
+  cert-file: /etc/etcd/server.crt
+  key-file: /etc/etcd/server.key
+  trusted-ca-file: /etc/etcd/ca.crt
+```
+
+### etcd vs Consul vs ZooKeeper对比
+
+| 特性 | etcd | Consul | ZooKeeper |
+|------|------|--------|-----------|
+| 架构 | Raft | Raft | ZAB |
+| 语言 | Go | Go | Java |
+| 一致性 | 强一致 | 强一致 | 强一致 |
+| Watch | 流式推送 | 长轮询 | 事件回调 |
+| 生态 | K8s原生 | 服务网格 | Hadoop生态 |
+
+### 最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 集群部署 | 3或5节点 | 高 |
+| 备份策略 | 定期快照 | 高 |
+| 监控告警 | Leader切换/延迟 | 高 |
+| 性能调优 | 磁盘/网络优化 | 中 |
+
+### 生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 延迟高 | 检查磁盘IO | 升级SSD |
+| 磁盘IO | 检查WAL写入 | 优化写入 |
+| 网络分区 | 检查节点连通 | 修复网络 |
+| 脑裂 | 检查Leader状态 | 恢复仲裁 |
+
+### etcd架构
+
+```text
+Raft协议：
+  Leader → Follower → Candidate
+  日志复制：Leader复制到多数派
+  Leader选举：多数派投票
+  
+快照：
+  定期快照，压缩日志
+  减少恢复时间
+```
+
+### etcd运维
+
+```bash
+# 成员管理
+etcdctl member add node3 --peer-urls=http://node3:2380
+etcdctl member remove <member-id>
+
+# 碎片整理
+etcdctl defrag
+
+# 版本升级
+etcdctl member update <member-id> --peer-urls=http://node3:2380
+
+# 健康检查
+etcdctl endpoint health --cluster
+etcdctl endpoint status --cluster
+```
+
+### etcd安全
+
+| 措施 | 说明 |
+|------|------|
+| 认证授权 | 用户认证+RBAC |
+| 加密传输 | TLS加密 |
+| 加密存储 | 数据加密 |
+| 审计日志 | 操作审计 |

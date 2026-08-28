@@ -1991,3 +1991,174 @@ spec:
 - [ ] 镜像多阶段 + distroless + `.dockerignore` + 非 root + digest。
 - [ ] 滚动更新 `maxUnavailable:0` + 探针 + `revisionHistoryLimit` 保回滚。
 - [ ] 集成测试用 ephemeral 集群/命名空间，用完即销，控成本。
+
+### Docker多阶段构建
+
+```dockerfile
+# AS builder多阶段构建
+FROM node:18 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:18-slim
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+CMD ["node", "dist/index.js"]
+
+# 多平台构建
+docker buildx build --platform linux/amd64,linux/arm64 -t myapp:latest .
+```
+
+### K8s CronJob
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: my-cronjob
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid  # Allow/Forbid/Replace
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          containers:
+          - name: job
+            image: myjob:latest
+            command: ["python", "job.py"]
+          restartPolicy: Never
+```
+
+### Helm Chart
+
+```yaml
+# values.yaml
+replicaCount: 3
+image:
+  repository: myapp
+  tag: latest
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+### 镜像安全Trivy扫描
+
+```bash
+# 漏洞扫描
+trivy image myapp:latest
+
+# 严重漏洞阻断
+trivy image --severity HIGH,CRITICAL --exit-code 1 myapp:latest
+
+# SBOM生成
+trivy image --format spdx-json myapp:latest > sbom.json
+```
+
+### K8s资源管理
+
+```yaml
+# ResourceQuota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: compute-quota
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+
+# LimitRange
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: cpu-limit-range
+spec:
+  limits:
+  - default:
+      cpu: 500m
+      memory: 256Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    type: Container
+```
+
+### CI-CD集成
+
+```yaml
+# GitLab Runner K8s executor
+[[runners]]
+  [runners.kubernetes]
+    namespace = "gitlab-ci"
+    image = "alpine:latest"
+    cpu_request = "500m"
+    memory_request = "1Gi"
+```
+
+### 容器最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 镜像瘦身 | 使用slim/distroless | 高 |
+| 多阶段构建 | 减少镜像体积 | 高 |
+| 安全扫描 | 漏洞扫描 | 高 |
+| 最小权限 | 非root运行 | 高 |
+
+### 容器生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| ImagePullBackOff | 检查镜像名/仓库 | 修复镜像配置 |
+| CrashLoopBackOff | 检查容器日志 | 修复启动命令 |
+| OOMKilled | 检查内存使用 | 增加内存限制 |
+| Pending | 检查资源配额 | 增加资源 |
+
+### 容器监控
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| CPU使用率 | CPU使用比例 | >80% |
+| 内存使用率 | 内存使用比例 | >80% |
+| 重启次数 | 容器重启次数 | >3 |
+| 网络流量 | 网络IO | 异常波动 |
+
+### 容器安全
+
+| 措施 | 说明 |
+|------|------|
+| Pod Security Standards | Pod安全策略 |
+| NetworkPolicy | 网络策略 |
+| RBAC | 角色权限 |
+| OPA | 策略引擎 |
+
+### 容器网络
+
+| 网络模式 | 说明 |
+|----------|------|
+| Service网络 | ClusterIP/NodePort |
+| Pod网络 | Pod间通信 |
+| CNI选择 | Calico/Flannel/Cilium |
+
+### 容器存储
+
+| 资源 | 说明 |
+|------|------|
+| PV | 持久卷 |
+| PVC | 持久卷声明 |
+| StorageClass | 存储类 |
+| 本地存储 | hostPath/emptyDir |

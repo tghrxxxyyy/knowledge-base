@@ -1820,9 +1820,199 @@ public User selectFromSecondary(Long id) {
      - Seata（AT/TCC/SAGA 模式）
      - 消息最终一致性方案
 
-  3. 手动管理
-     - 编程式事务控制
-     - 每个数据源独立事务
+   3. 手动管理
+      - 编程式事务控制
+      - 每个数据源独立事务
 ```
 
-## 与其他板块的关系
+### PageHelper分页原理
+
+```java
+// ThreadLocal + SQL改写
+PageHelper.startPage(1, 10);
+List<User> users = userMapper.selectAll();
+
+// PageHelper原理
+// 1. ThreadLocal保存分页参数
+// 2. 拦截器获取参数，改写SQL
+// 3. 执行Count SQL获取总数
+// 4. 执行分页SQL获取数据
+// 5. 清除ThreadLocal
+
+// CountSQL生成
+SELECT COUNT(*) FROM (原SQL) _page_helper_count_table
+```
+
+### 拦截器链
+
+```java
+// 执行顺序
+Executor → StatementHandler → ParameterHandler → ResultSetHandler
+
+// 自定义拦截器
+@Intercepts({
+    @Signature(type = Executor.class, method = "query", 
+        args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})
+})
+public class MyInterceptor implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        // 前置处理
+        Object result = invocation.proceed();
+        // 后置处理
+        return result;
+    }
+}
+```
+
+### Plus条件构造器
+
+```java
+// LambdaQueryWrapper
+QueryWrapper<User> wrapper = new QueryWrapper<>();
+wrapper.lambda()
+    .eq(User::getAge, 18)
+    .like(User::getName, "张")
+    .orderByDesc(User::getCreateTime);
+
+// UpdateWrapper
+UpdateWrapper<User> updateWrapper = new UpdateWrapper<>();
+updateWrapper.lambda()
+    .set(User::getStatus, 1)
+    .eq(User::getId, 1L);
+```
+
+### TransactionManager交互
+
+```java
+// 编程式事务
+@Autowired
+private PlatformTransactionManager transactionManager;
+
+public void execute() {
+    TransactionStatus status = transactionManager.getTransaction(new DefaultTransactionDefinition());
+    try {
+        // 业务逻辑
+        transactionManager.commit(status);
+    } catch (Exception e) {
+        transactionManager.rollback(status);
+        throw e;
+    }
+}
+
+// 声明式事务
+@Transactional(propagation = Propagation.REQUIRED)
+public void execute() {
+    // 业务逻辑
+}
+
+// 嵌套事务
+@Transactional
+public void outer() {
+    inner(); // 同类调用不会触发代理
+}
+
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void inner() {
+    // 独立事务
+}
+```
+
+### 延迟加载
+
+```xml
+<!-- 全局配置 -->
+<setting name="lazyLoadingEnabled" value="true"/>
+<setting name="aggressiveLazyLoading" value="false"/>
+
+<!-- 按需加载 -->
+<resultMap id="userWithOrders" type="User">
+    <collection property="orders" ofType="Order" 
+        select="selectOrdersByUserId" lazyLoadTriggerMethods="toString"/>
+</resultMap>
+```
+
+### N+1问题规避
+
+| 方案 | 说明 | 适用场景 |
+|------|------|----------|
+| JoinFetch | 联表查询 | 简单关联 |
+| SubQuery | 子查询 | 复杂关联 |
+| 批量查询 | IN查询 | 1:N关联 |
+| 启用缓存 | 二级缓存 | 频繁查询 |
+
+### 多数据源
+
+```java
+// 动态路由
+public class DynamicDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return DataSourceContextHolder.getDataSourceType();
+    }
+}
+
+// 注解使用
+@DataSource("secondary")
+public User selectFromSecondary(Long id) {
+    return userMapper.selectById(id);
+}
+```
+
+### 动态SQL
+
+```xml
+<!-- choose/when/otherwise -->
+<choose>
+    <when test="name != null">AND name = #{name}</when>
+    <when test="age != null">AND age = #{age}</when>
+    <otherwise>AND status = 1</otherwise>
+</choose>
+
+<!-- foreach -->
+<foreach collection="ids" item="id" open="(" separator="," close=")">
+    #{id}
+</foreach>
+
+<!-- bind -->
+<bind name="pattern" value="'%' + name + '%'"/>
+```
+
+### MyBatis与Spring Boot自动配置
+
+```yaml
+# application.yml
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.example.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    cache-enabled: true
+```
+
+### 缓存机制
+
+| 缓存类型 | 作用域 | 说明 |
+|----------|--------|------|
+| 一级缓存 | SqlSession | 默认开启 |
+| 二级缓存 | namespace | 需手动开启 |
+| 第三方缓存 | 全局 | Redis/Ehcache |
+
+### 最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 分页 | 使用PageHelper | 高 |
+| 多数据源 | AbstractRoutingDataSource | 高 |
+| 性能优化 | 批量操作+缓存 | 高 |
+| SQL注入防护 | 使用#{} | 高 |
+| 日志 | 开启慢SQL日志 | 中 |
+
+### 生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| SQL异常 | 检查SQL语法/参数 | 修复SQL |
+| N+1 | 检查查询次数 | 使用JoinFetch |
+| 缓存失效 | 检查缓存配置 | 调整缓存策略 |
+| 连接泄漏 | 检查连接池配置 | 修复连接释放 |

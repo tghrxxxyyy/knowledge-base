@@ -1811,6 +1811,138 @@ flowchart TB
     end
 ```
 
+### 分片算法详解
+
+| 算法类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| Standard | 单分片键 | 通用场景 |
+| Complex | 多分片键 | 复杂查询 |
+| Hint | 强制路由 | 指定数据源 |
+
+```java
+// 自定义分片算法
+public class MyShardingAlgorithm implements StandardShardingAlg {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, 
+        ShardingValue shardingValue) {
+        Long value = (Long) shardingValue.getValue();
+        return "ds_" + (value % 4);
+    }
+}
+```
+
+### 读写分离+分库分表组合
+
+| 配置 | 说明 | 注意事项 |
+|------|------|----------|
+| 主从路由 | 写主库，读从库 | 事务内读主库 |
+| 分库分表 | 按分片键路由 | 跨片查询聚合 |
+| 组合配置 | 先分片后读写分离 | 考虑数据一致性 |
+
+### 分布式事务
+
+| 方案 | 一致性 | 性能 | 适用场景 |
+|------|--------|------|----------|
+| XA | 强一致 | 低 | 金融交易 |
+| Saga | 最终一致 | 高 | 长事务 |
+| Seata | 可调 | 中 | 微服务 |
+| 柔性事务 | 最终一致 | 高 | 异步场景 |
+
+### Proxy vs JDBC选型
+
+| 维度 | ShardingSphere-JDBC | ShardingSphere-Proxy |
+|------|---------------------|----------------------|
+| 性能 | 高（客户端） | 中（代理层） |
+| 运维 | 简单 | 复杂 |
+| 架构 | 耦合应用 | 独立部署 |
+| 语言 | Java | 任意 |
+
+### 数据加密
+
+```yaml
+# 加密配置
+encryptRule:
+  tables:
+    t_user:
+      columns:
+        pwd:
+          cipher: pwd_cipher
+          plain: pwd_plain
+  encryptors:
+    md5:
+      type: MD5
+    aes:
+      type: AES
+      props:
+        aes.key.value: 12345678
+```
+
+### 生产调优
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| showSql | false | true | 调试时开启 |
+| executorSize | 10 | 20 | 执行器线程数 |
+| SQL解析缓存 | 开启 | 保持 | 减少解析开销 |
+| 归并排序缓冲 | 8KB | 64KB | 大结果集优化 |
+
+### 分布式ID
+
+| 方案 | 优势 | 劣势 | 适用场景 |
+|------|------|------|----------|
+| Snowflake | 有序递增 | 依赖时钟 | 通用 |
+| UUID | 无依赖 | 无序 | 非排序场景 |
+| Leaf | 美团方案 | 复杂 | 高性能场景 |
+
+### 读写分离负载均衡
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| round-robin | 轮询 | 均匀负载 |
+| random | 随机 | 简单场景 |
+| 权重 | 按权重分配 | 异构机器 |
+
+### 影子库压测
+
+```yaml
+# 影子库配置
+shadowRule:
+  dataSources:
+    ds_0:
+      sourceDataSourceName: ds
+      shadowDataSourceName: ds_shadow
+  tables:
+    t_user:
+      sourceDataSourceName: ds
+      shadowDataSourceName: ds_shadow
+```
+
+### 性能基准测试
+
+| 测试项 | 指标 | 目标值 |
+|--------|------|--------|
+| 吞吐 | TPS | >10000 |
+| 延迟 | P99 | <50ms |
+| 并发 | 线程数 | 100+ |
+| 分片数 | 扩展性 | 线性扩展 |
+
+### 最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 分片策略 | 合理选择分片键 | 高 |
+| 读写分离 | 主从路由 | 高 |
+| 事务 | XA/Seata | 高 |
+| 监控 | 慢SQL告警 | 高 |
+
+### 生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 跨片查询 | 检查分片键 | 优化查询 |
+| 分布式事务 | 检查事务配置 | 使用Seata |
+| 数据迁移 | 检查数据一致性 | 双写验证 |
+
 ## 十五、速查表（扩展）
 
 | 项 | 结论 |

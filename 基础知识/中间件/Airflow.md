@@ -1827,4 +1827,146 @@ delete_worker_pods_on_failure = false
   3. 外部依赖：传感器检测文件/数据到达
 ```
 
+### Sensor vs Deferrable Operator
+
+| 特性 | Sensor | Deferrable Operator |
+|------|--------|---------------------|
+| 触发方式 | 轮询 | 异步回调 |
+| 资源占用 | 高（轮询） | 低（等待回调） |
+| 超时处理 | timeout参数 | timeout + retries |
+| 重试机制 | retries参数 | 指数退避 |
+| 适用场景 | 简单等待 | 复杂等待 |
+
+### Variable加密
+
+```python
+# fernet key配置
+from cryptography.fernet import Fernet
+key = Fernet.generate_key()
+# 存入Variable:加密key
+
+# 加密敏感变量
+from airflow.models import Variable
+Variable.set("api_key", "secret_value", serialize_json=True)
+```
+
+### Pool/Slot资源管理
+
+```python
+# Pool配置
+pool = Pool(
+    name="data_pool",
+    slots=10,  # 并发数
+    description="数据处理资源池"
+)
+
+# 任务使用Pool
+task = PythonOperator(
+    task_id="process_data",
+    pool="data_pool",
+    pool_slots=1,
+    ...
+)
+```
+
+### Trigger Rule配置
+
+```python
+# 触发规则
+task = PythonOperator(
+    task_id="final_task",
+    trigger_rule=TriggerRule.ALL_SUCCESS,  # 默认
+    # TriggerRule.ALL_FAILED: 所有上游失败
+    # TriggerRule.ONE_SUCCESS: 一个成功即可
+    # TriggerRule.NONE_FAILED: 所有成功或跳过
+)
+```
+
+### 与dbt集成
+
+```python
+# dbt-airflow-providers
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+
+dbt_task = DbtCloudRunJobOperator(
+    task_id="dbt_run",
+    job_id=12345,
+    ...
+)
+```
+
+### K8s部署
+
+```yaml
+# Helm部署
+helm install airflow apache-airflow/airflow \
+  --set executor=KubernetesExecutor \
+  --set workers.persistence.enabled=false
+
+# KubernetesPodOperator
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+
+pod_task = KubernetesPodOperator(
+    task_id="pod_task",
+    image="my-image:latest",
+    namespace="airflow",
+    cmds=["python", "script.py"],
+    ...
+)
+```
+
+### Airflow vs Dagster vs Prefect对比
+
+| 特性 | Airflow | Dagster | Prefect |
+|------|---------|---------|---------|
+| 架构 | Scheduler+Executor | DAGster + Dagit | Orion+Agent |
+| 调度 | Cron/时间 | Cron/传感器 | Cron/传感器 |
+| API | REST API | GraphQL | REST API |
+| DAG定义 | Python | Python | Python |
+| 社区 | 最大 | 增长快 | 中等 |
+| 学习曲线 | 中等 | 较陡 | 中等 |
+
+### 运维管理
+
+```text
+运维关注点：
+  Webserver: 日志访问、DAG管理、任务监控
+  Scheduler: 调度稳定性、资源占用
+  Worker: 任务执行、资源使用
+  日志: 集中化、可检索
+  Flower: Celery监控
+```
+
+### 性能调优
+
+```text
+Scheduler配置：
+  parallelism: 32        # 并行度
+  dag_concurrency: 16    # DAG并发数
+  max_active_runs: 16    # 最大活跃运行
+
+DAG解析：
+  min_serialized_dag_fetch_interval: 10  # 秒
+  serialize_dag_dependencies: true
+```
+
+### 生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| DAG解析慢 | 检查解析时间 | 优化DAG结构 |
+| 调度延迟 | 检查Scheduler日志 | 调整并行度 |
+| Worker OOM | 检查内存使用 | 增加资源/优化代码 |
+| 任务依赖 | 检查依赖配置 | 修复依赖关系 |
+
+### 最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 任务依赖 | 明确依赖关系 | 高 |
+| DAG设计 | 单一职责 | 高 |
+| 错误处理 | 异常捕获+重试 | 高 |
+| 重试策略 | 指数退避 | 高 |
+| 监控告警 | 任务失败告警 | 高 |
+
 > 一句话：**Airflow = DAG 即代码（Python）+ Scheduler 调度 + Executor 执行（Celery/K8s）+ 回填/传感器/Dataset 触发——数据工程编排事实标准；选型先看「团队（Python/数据工程→Airflow，可视化中文→DS）」，再定「执行器（K8s 动态→KubernetesExecutor）」，最后配「幂等任务 + 调度器高可用 + 监控告警」**。

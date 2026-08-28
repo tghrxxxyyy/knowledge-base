@@ -1977,6 +1977,189 @@ flowchart LR
 | JVM OOM | 堆内存不足 | 增加堆内存 |
 | 集群黄色 | 副本未分配 | 检查副本配置 |
 
+### Elasticsearch索引管理
+
+```bash
+# ILM策略
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_size": "50gb",
+            "max_age": "1d"
+          }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          }
+        }
+      },
+      "delete": {
+        "min_age": "30d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+
+# 索引模板
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1
+    }
+  }
+}
+```
+
+### Logstash Filter
+
+```ruby
+# grok解析
+filter {
+  grok {
+    match => { "message" => "%{COMBINEDAPACHELOG}" }
+  }
+}
+
+# dissect解析
+filter {
+  dissect {
+    mapper => {
+      "message" => "%{time} %{level} %{message}"
+    }
+  }
+}
+
+# mutate转换
+filter {
+  mutate {
+    convert => { "status" => "integer" }
+    rename => { "host" => "hostname" }
+    remove_field => ["debug"]
+  }
+}
+
+# 条件过滤
+filter {
+  if [level] == "ERROR" {
+    mutate { add_tag => ["error"] }
+  }
+}
+```
+
+### Kibana Dashboard
+
+| 功能 | 说明 |
+|------|------|
+| Discover | 日志查询 |
+| Visualize | 图表可视化 |
+| Lens | 拖拽式分析 |
+| Alert | 告警规则 |
+
+### 性能调优
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| JVM堆 | 1g | 16-32g | 堆内存 |
+| 分片大小 | 50gb | 20-40gb | 单分片大小 |
+| 刷新间隔 | 1s | 30s | 刷新频率 |
+| 内存缓存 | 10% | 15% | 缓存大小 |
+
+### 安全配置
+
+```yaml
+# X-Pack SSL
+xpack.security.transport.ssl.enabled: true
+xpack.security.transport.ssl.verification_mode: certificate
+xpack.security.transport.ssl.keystore.path: certs/transport.p12
+xpack.security.transport.ssl.truststore.path: certs/transport.p12
+
+# RBAC
+xpack.security.enabled: true
+xpack.security.authc.realms.native.native1:
+  order: 0
+```
+
+### vs Loki对比
+
+| 特性 | Elasticsearch | Loki |
+|------|---------------|------|
+| 架构 | 分布式搜索 | 轻量级日志 |
+| 查询 | DSL查询 | LogQL |
+| 存储成本 | 高 | 低 |
+| 运维复杂度 | 高 | 低 |
+
+### 集群架构
+
+```text
+热温冷架构：
+  热数据：SSD，高性能节点
+  温数据：HDD，历史数据
+  冷数据：对象存储，归档数据
+
+跨集群复制：
+  主集群 → 从集群
+  异地容灾
+```
+
+### 最佳实践
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 索引设计 | 按天索引+ILM | 高 |
+| 查询优化 | 避免全量扫描 | 高 |
+| 安全配置 | SSL+RBAC | 高 |
+| 监控告警 | 集群健康监控 | 高 |
+
+### 生产问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 查询慢 | 检查查询语句 | 优化查询 |
+| 集群RED | 检查节点状态 | 重启节点 |
+| 分片分配异常 | 检查磁盘空间 | 清理磁盘 |
+| OOM | 检查内存使用 | 增加内存 |
+
+### 监控
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 集群健康 | green/yellow/red | 不是green |
+| 索引健康 | 索引状态 | 不健康 |
+| Shard分配 | 分片分配 | 未分配 |
+| 慢查询 | 查询耗时 | >5s |
+
+### 成本优化
+
+| 优化点 | 说明 |
+|--------|------|
+| 索引生命周期 | ILM自动删除 |
+| 冷数据归档 | 迁移到对象存储 |
+| 压缩 | 启用压缩 |
+| 副本数 | 适当减少副本 |
+
+### ELK vs Loki选型
+
+| 维度 | ELK | Loki |
+|------|-----|------|
+| 成本 | 高 | 低 |
+| 功能 | 强大 | 轻量 |
+| 实时性 | 高 | 高 |
+| 生态 | 丰富 | 增长中 |
+
 ## 七、速查表
 
 | 项 | 结论 |
