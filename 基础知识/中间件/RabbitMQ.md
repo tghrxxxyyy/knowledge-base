@@ -1778,3 +1778,263 @@ args.put("x-max-length-bytes", 1073741824);  // 1GB
 args.put("x-stream-max-segment-size-bytes", 104857600);  // 100MB
 channel.queueDeclare("stream-queue", true, false, false, args);
 ```
+
+---
+
+## 二十六、Quorum Queue 深度配置
+
+### 26.1 Quorum Queue 架构原理
+
+```mermaid
+graph TB
+    subgraph "Quorum Queue 集群"
+        L[Leader Node] -->|Raft复制| F1[Follower Node 1]
+        L -->|Raft复制| F2[Follower Node 2]
+        L -->|Raft复制| F3[Follower Node 3]
+    end
+    subgraph "客户端"
+        P[Producer] --> L
+        C[Consumer] --> L
+    end
+    subgraph "存储层"
+        L --> WAL1[WAL Node 1]
+        F1 --> WAL2[WAL Node 2]
+        F2 --> WAL3[WAL Node 3]
+    end
+```
+
+### 26.2 Quorum Queue 配置参数
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| x-quorum-initial-group-size | 3 | 初始集群大小 | 生产环境设为3或5 |
+| x-delivery-limit | 20 | 投递次数限制 | 防止死循环 |
+| x-queue-leader-locator | balanced | Leader定位策略 | balanced或min-masters |
+| x-quorum-cleanup-interval | 10000 | 清理间隔 | 根据消息量调整 |
+
+```yaml
+# Quorum Queue 高级配置
+quorum_queue:
+  # 集群配置
+  cluster_formation:
+    peer_discovery_backend: classic_config
+    classic_config:
+      nodes:
+        - rabbit@node1
+        - rabbit@node2
+        - rabbit@node3
+  
+  # 复制配置
+  replication_factor: 3
+  quorum_cluster_size: 3
+  
+  # 日志配置
+  wal_dir: /var/lib/rabbitmq/quorum/wal
+  segment_dir: /var/lib/rabbitmq/quorum/segments
+  
+  # 性能配置
+  wal_max_size_bytes: 1073741824  # 1GB
+  segment_max_entries: 32768
+```
+
+---
+
+## 二十七、惰性队列与优先级队列
+
+### 27.1 惰性队列（Lazy Queue）
+
+```java
+// 声明惰性队列
+Map<String, Object> args = new HashMap<>();
+args.put("x-queue-mode", "lazy");
+args.put("x-max-length", 1000000);  // 最大消息数
+channel.queueDeclare("lazy-queue", true, false, false, args);
+
+// 惰性队列特性：
+// 1. 消息直接写入磁盘
+// 2. 内存占用极低
+// 3. 消费时从磁盘读取
+// 4. 适合大量积压场景
+```
+
+### 27.2 优先级队列（Priority Queue）
+
+```java
+// 声明优先级队列
+Map<String, Object> args = new HashMap<>();
+args.put("x-max-priority", 10);  // 最大优先级
+channel.queueDeclare("priority-queue", true, false, false, args);
+
+// 发送带优先级的消息
+AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+    .priority(5)  // 优先级0-10
+    .build();
+channel.basicPublish("", "priority-queue", props, message.getBytes());
+```
+
+### 27.3 队列类型对比
+
+| 队列类型 | 消息顺序 | 内存占用 | 磁盘使用 | 适用场景 |
+|---------|---------|---------|---------|---------|
+| Classic | FIFO | 高 | 可选 | 通用场景 |
+| Quorum | FIFO | 中 | 必须 | 高可用 |
+| Lazy | FIFO | 低 | 必须 | 大量积压 |
+| Priority | 优先级 | 高 | 可选 | 任务调度 |
+| Stream | Append-only | 低 | 必须 | 事件溯源 |
+
+---
+
+## 二十八、Federation 与 Shovel
+
+### 28.1 Federation 配置
+
+```ini
+# federation-upstream 配置
+ federation-upstream:
+   uri: amqp://user:password@remote-host:5672/vhost
+   prefetch-count: 1000
+   reconnect-delay: 5
+   ack-mode: on-confirm
+   trust-user-id: false
+   exchange: my-exchange
+
+# federation-exchange 配置
+ federation-exchange:
+   upstream: my-upstream
+   prefetch-count: 1000
+```
+
+### 28.2 Shovel 配置
+
+```json
+{
+  "my-shovel": {
+    "src-protocol": "amqp091",
+    "src-uri": "amqp://user:password@source-host:5672",
+    "src-queue": "source-queue",
+    "dest-protocol": "amqp091",
+    "dest-uri": "amqp://user:password@dest-host:5672",
+    "dest-exchange": "dest-exchange",
+    "dest-queue": "dest-queue",
+    "prefetch-count": 1000,
+    "reconnect-delay": 5,
+    "ack-mode": "on-confirm"
+  }
+}
+```
+
+### 28.3 Federation vs Shovel 对比
+
+| 特性 | Federation | Shovel | 适用场景 |
+|------|-----------|--------|---------|
+| 拓扑 | Exchange级别 | Queue/Exchange级别 | 根据需求选择 |
+| 路由 | 自动路由 | 手动配置 | Federation更灵活 |
+| 延迟 | 较高 | 较低 | Shovel更适合低延迟 |
+| 复杂度 | 中等 | 较低 | Shovel更简单 |
+| 跨集群 | 支持 | 支持 | 都支持 |
+
+---
+
+## 二十九、Prometheus 监控集成
+
+### 29.1 RabbitMQ Prometheus 配置
+
+```yaml
+# rabbitmq.conf
+management.prometheus.return_per_object_metrics = true
+management.prometheus.content_type = text/plain
+
+# 启用插件
+rabbitmq-plugins enable rabbitmq_prometheus
+```
+
+### 29.2 关键监控指标
+
+| 指标类别 | 具体指标 | 说明 | 告警阈值 |
+|---------|---------|------|---------|
+| 消息速率 | rabbitmq_queue_messages_published_total | 发布速率 | 异常波动 |
+| 消息速率 | rabbitmq_queue_messages_delivered_total | 投递速率 | 异常波动 |
+| 队列深度 | rabbitmq_queue_messages | 队列消息数 | > 10000 |
+| 内存使用 | rabbitmq_process_resident_memory_bytes | 内存使用 | > 80% |
+| 连接数 | rabbitmq_connections | 连接数 | > 1000 |
+| 通道数 | rabbitmq_channels | 通道数 | > 1000 |
+
+### 29.3 Grafana 仪表板配置
+
+```json
+{
+  "dashboard": {
+    "title": "RabbitMQ Dashboard",
+    "panels": [
+      {
+        "title": "Queue Depth",
+        "type": "graph",
+        "targets": [{
+          "expr": "rabbitmq_queue_messages",
+          "legendFormat": "{{queue}}"
+        }]
+      },
+      {
+        "title": "Message Rate",
+        "type": "graph",
+        "targets": [{
+          "expr": "rate(rabbitmq_queue_messages_published_total[5m])",
+          "legendFormat": "Publish Rate"
+        }]
+      }
+    ]
+  }
+}
+```
+
+---
+
+## 三十、生产环境排查手册
+
+### 30.1 常见问题诊断
+
+| 问题现象 | 可能原因 | 诊断命令 | 解决方案 |
+|---------|---------|---------|---------|
+| 消息堆积 | 消费者慢/崩溃 | `rabbitmqctl list_queues` | 增加消费者/优化代码 |
+| 连接拒绝 | 资源限制 | `rabbitmqctl list_connections` | 调整限制/扩容 |
+| 内存告警 | 消息积压 | `rabbitmqctl status` | 启用惰性队列/扩容 |
+| 磁盘告警 | 磁盘空间不足 | `df -h` | 清理磁盘/扩容 |
+| 网络分区 | 网络不稳定 | `rabbitmqctl cluster_status` | 修复网络/手动恢复 |
+
+### 30.2 运维命令速查
+
+```bash
+# 集群状态
+rabbitmqctl cluster_status
+
+# 队列列表
+rabbitmqctl list_queues name messages consumers memory
+
+# 连接列表
+rabbitmqctl list_connections name peer_host state
+
+# 通道列表
+rabbitmqctl list_channels name connection_number consumer_count
+
+# 用户管理
+rabbitmqctl add_user myuser mypassword
+rabbitmqctl set_user_tags myuser administrator
+rabbitmqctl set_permissions -p / myuser ".*" ".*" ".*"
+
+# 策略管理
+rabbitmqctl set_policy ha-all "^" '{"ha-mode":"all","ha-sync-mode":"automatic"}'
+```
+
+### 30.3 性能调优建议
+
+| 调优项 | 配置参数 | 推荐值 | 说明 |
+|--------|---------|--------|------|
+| 内存限制 | vm_memory_high_watermark | 0.6 | 内存使用上限 |
+| 磁盘限制 | disk_free_limit | 2GB | 磁盘空间下限 |
+| 消费者预取 | prefetch_count | 100-1000 | 根据消息大小调整 |
+| 连接限制 | channel_max | 2048 | 最大通道数 |
+| 心跳间隔 | heartbeat | 60 | 心跳检测间隔 |
+
+---
+
+## 三十一、与其他板块的关系

@@ -1990,10 +1990,540 @@ func TestGetUser(t *testing.T) {
 }
 ```
 
-- etcd 源码见「[etcd 源码](../源码系列/etcd源码.md)」；
-- Kubernetes 见「[Kubernetes 核心](../云原生/Kubernetes核心.md)」；
-- gRPC 见「[gRPC](../基础知识/中间件/gRPC.md)」；
-- 并发编程（Java）见「[并发编程](../基础知识/并发编程.md)」；
-- Docker 与 Kubernetes 见「[Docker与Kubernetes](../基础知识/Docker与Kubernetes.md)」。
+---
 
-> 一句话：**Go = goroutine（轻量并发）+ channel（通信）+ 标准库（net/http 原生生产级）+ 云原生生态最强——学习从 goroutine/channel/context 三板斧入手，工程从 go mod + testing + pprof 入手，调优从 GOGC + GOMEMLIMIT 入手**。
+## 二十五、GC 调优深度指南
+
+### 25.1 GC 参数调优
+
+| 参数 | 默认值 | 调优范围 | 说明 | 适用场景 |
+|------|--------|---------|------|---------|
+| GOGC | 100 | 50-200 | GC触发频率 | 内存敏感调低 |
+| GOMEMLIMIT | 无 | 实际内存80% | 内存软限制 | 容器环境必设 |
+| GOMAXPROCS | CPU核数 | 1-N | 并行度 | 根据负载调整 |
+| GOTRACEBACK | 0 | 0/1/2/crash | 堆栈级别 | 调试时设为2 |
+
+```go
+// GC 调优配置
+func init() {
+    // 设置 GOGC（GC触发频率）
+    debug.SetGCPercent(50)  // 内存增长50%时触发GC
+    
+    // 设置 GOMEMLIMIT（内存软限制）
+    debug.SetMemoryLimit(1 << 30)  // 1GB
+    
+    // 设置 GOMAXPROCS
+    runtime.GOMAXPROCS(4)
+    
+    // 强制触发 GC
+    runtime.GC()
+    
+    // 获取 GC 统计
+    var m runtime.MemStats
+    runtime.ReadMemStats(&m)
+    fmt.Printf("GC次数: %d, 暂停时间: %v\n", m.NumGC, m.PauseTotalNs)
+}
+```
+
+### 25.2 GC 暂停优化
+
+```go
+// 减少 GC 暂停的技巧
+func reduceGCPause() {
+    // 1. 使用 sync.Pool 复用对象
+    pool := &sync.Pool{
+        New: func() interface{} {
+            return make([]byte, 1024)
+        },
+    }
+    
+    // 2. 预分配内存
+    slice := make([]int, 0, 1000)
+    
+    // 3. 避免内存逃逸
+    // 使用 go build -gcflags="-m" 检查逃逸分析
+    
+    // 4. 使用 unsafe.Pointer 减少拷贝
+    // 5. 使用strings.Builder 避免字符串拼接
+}
+```
+
+### 25.3 GC 监控与分析
+
+| 工具 | 用途 | 使用方式 | 输出 |
+|------|------|---------|------|
+| runtime.ReadMemStats | 内存统计 | 代码内调用 | GC次数、暂停时间 |
+| debug.ReadGCStats | GC详细统计 | 代码内调用 | 暂停历史 |
+| pprof | 性能分析 | HTTP接口 | CPU/内存/goroutine |
+| trace | 执行跟踪 | go tool trace | 时间线可视化 |
+| GODEBUG=gctrace=1 | GC日志 | 环境变量 | GC事件日志 |
+
+---
+
+## 二十六、goroutine 泄漏检测与修复
+
+### 26.1 常见泄漏场景
+
+| 泄漏类型 | 原因 | 检测方式 | 修复方案 |
+|---------|------|---------|---------|
+| channel阻塞 | 无人读写 | pprof goroutine | 添加超时/关闭 |
+| 死锁 | 互相等待 | runtime报错 | 重新设计锁顺序 |
+| 资源未释放 | 文件/连接 | pprof fd | defer Close |
+| 无限循环 | 退出条件缺失 | CPU使用率 | 添加退出条件 |
+
+```go
+// goroutine 泄漏检测示例
+func detectGoroutineLeak() {
+    // 方法1：监控 goroutine 数量
+    ticker := time.NewTicker(time.Second)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        fmt.Printf("Goroutine数量: %d\n", runtime.NumGoroutine())
+    }
+    
+    // 方法2：使用 pprof
+    // curl http://localhost:6060/debug/pprof/goroutine?debug=1
+}
+```
+
+### 26.2 安全的 goroutine 模式
+
+```go
+// 带超时的 goroutine
+func safeGoroutine(ctx context.Context, fn func()) {
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                log.Printf("goroutine panic: %v", r)
+            }
+        }()
+        
+        select {
+        case <-ctx.Done():
+            return
+        default:
+            fn()
+        }
+    }()
+}
+
+// 带退出信号的 goroutine
+func worker(done chan struct{}) {
+    defer close(done)
+    
+    for {
+        select {
+        case <-done:
+            return
+        default:
+            // 工作逻辑
+        }
+    }
+}
+```
+
+---
+
+## 二十七、channel 模式大全
+
+### 27.1 channel 模式对比
+
+| 模式 | 实现方式 | 适用场景 | 优点 | 缺点 |
+|------|---------|---------|------|------|
+| Fan-out | 多个goroutine读同一channel | 并行处理 | 简单 | 负载不均 |
+| Fan-in | 多个channel写入同一channel | 合并结果 | 灵活 | 复杂 |
+| Pipeline | channel串联 | 流式处理 | 可组合 | 延迟增加 |
+| Or-channel | 多个channel任一完成 | 竞争条件 | 快速 | 资源浪费 |
+| Tee-channel | 一个channel分发到两个 | 数据复制 | 简单 | 内存翻倍 |
+
+### 27.2 channel 实现示例
+
+```go
+// Fan-out/Fan-in 模式
+func fanOutFanIn(input <-chan int) <-chan int {
+    // Fan-out: 启动多个worker
+    workers := make([]<-chan int, 5)
+    for i := 0; i < 5; i++ {
+        workers[i] = process(input)
+    }
+    
+    // Fan-in: 合并结果
+    return merge(workers...)
+}
+
+func process(input <-chan int) <-chan int {
+    output := make(chan int)
+    go func() {
+        defer close(output)
+        for v := range input {
+            output <- v * 2
+        }
+    }()
+    return output
+}
+
+func merge(channels ...<-chan int) <-chan int {
+    output := make(chan int)
+    var wg sync.WaitGroup
+    
+    for _, ch := range channels {
+        wg.Add(1)
+        go func(c <-chan int) {
+            defer wg.Done()
+            for v := range c {
+                output <- v
+            }
+        }(ch)
+    }
+    
+    go func() {
+        wg.Wait()
+        close(output)
+    }()
+    
+    return output
+}
+```
+
+---
+
+## 二十八、interface 高级用法
+
+### 28.1 interface 设计原则
+
+| 原则 | 描述 | 示例 | 说明 |
+|------|------|------|------|
+| 小接口 | 接口方法不超过3个 | io.Reader | 更易实现 |
+| 隐式实现 | 无需显式声明 | var _ io.Reader = (*MyType)(nil) | 解耦 |
+| 接口组合 | 小接口组合大接口 | io.ReadWriter | 灵活 |
+| 空接口 | interface{} | 任意类型 | 谨慎使用 |
+
+### 28.2 interface 高级模式
+
+```go
+// 接口组合
+type ReadWriter interface {
+    Reader
+    Writer
+}
+
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+
+type Writer interface {
+    Write(p []byte) (n int, err error)
+}
+
+// 类型断言
+func process(r io.Reader) {
+    if w, ok := r.(io.Writer); ok {
+        w.Write([]byte("hello"))
+    }
+}
+
+// 空接口类型开关
+func describe(i interface{}) {
+    switch v := i.(type) {
+    case int:
+        fmt.Printf("int: %v\n", v)
+    case string:
+        fmt.Printf("string: %v\n", v)
+    default:
+        fmt.Printf("other: %T\n", v)
+    }
+}
+```
+
+---
+
+## 二十九、Go 测试最佳实践
+
+### 29.1 测试类型对比
+
+| 测试类型 | 命令 | 用途 | 执行速度 | 资源消耗 |
+|---------|------|------|---------|---------|
+| 单元测试 | go test | 函数/方法 | 快 | 低 |
+| 集成测试 | go test -tags=integration | 外部依赖 | 中 | 中 |
+| 基准测试 | go test -bench | 性能分析 | 慢 | 高 |
+| 模糊测试 | go test -fuzz | 边界测试 | 慢 | 高 |
+| 端到端测试 | go test -tags=e2e | 完整流程 | 很慢 | 高 |
+
+### 29.2 测试覆盖率
+
+```go
+// 测试覆盖率命令
+// 生成覆盖率报告
+// go test -coverprofile=coverage.out ./...
+// go tool cover -html=coverage.out
+
+// 查看覆盖率
+// go tool cover -func=coverage.out
+```
+
+### 29.3 测试最佳实践
+
+| 实践 | 描述 | 优先级 |
+|------|------|--------|
+| 表驱动测试 | 使用slice of struct | 高 |
+| 测试隔离 | 每个测试独立 | 高 |
+| 并行测试 | t.Parallel() | 中 |
+| 测试清理 | t.Cleanup() | 中 |
+| 测试辅助 | t.Helper() | 中 |
+
+---
+
+## 三十、Go 1.21+ 新特性
+
+### 30.1 新特性概览
+
+| 版本 | 新特性 | 说明 | 适用场景 |
+|------|--------|------|---------|
+| 1.21 | slog | 结构化日志 | 日志记录 |
+| 1.21 | slices | 切片操作 | 数据处理 |
+| 1.21 | maps | map操作 | 数据处理 |
+| 1.22 | for-range整数 | 简化循环 | 通用 |
+| 1.22 | 增强路由 | HTTP路由增强 | Web开发 |
+
+### 30.2 slog 结构化日志
+
+```go
+import "log/slog"
+
+// 基础用法
+logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+logger.Info("user logged in", 
+    slog.String("user_id", "123"),
+    slog.Duration("latency", time.Millisecond*50),
+)
+
+// 自定义handler
+handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+    AddSource: true,
+})
+logger := slog.New(handler)
+```
+
+### 30.3 slices 和 maps 包
+
+```go
+import "slices"
+import "maps"
+
+// slices 包
+s := []int{3, 1, 4, 1, 5}
+slices.Sort(s)           // [1, 1, 3, 4, 5]
+slices.Reverse(s)        // [5, 4, 3, 1, 1]
+slices.Compact(s)        // 去重
+slices.Contains(s, 3)    // true
+slices.Index(s, 4)       // 1
+
+// maps 包
+m := map[string]int{"a": 1, "b": 2}
+keys := maps.Keys(m)     // 迭代器
+values := maps.Values(m) // 迭代器
+copies := maps.Clone(m)  // 克隆
+```
+
+---
+
+## 三十一、并发原语深度解析
+
+### 31.1 sync 包原语
+
+| 原语 | 用途 | 性能 | 适用场景 |
+|------|------|------|---------|
+| Mutex | 互斥锁 | 高 | 临界区保护 |
+| RWMutex | 读写锁 | 中 | 读多写少 |
+| WaitGroup | 等待组 | 高 | 并发等待 |
+| Once | 单次执行 | 最高 | 初始化 |
+| Pool | 对象池 | 高 | 频繁分配 |
+| Map | 并发map | 中 | 并发读写 |
+
+### 31.2 并发模式
+
+```go
+// 工作池模式
+func workerPool(numWorkers int, jobs <-chan Job) <-chan Result {
+    results := make(chan Result, numWorkers)
+    var wg sync.WaitGroup
+    
+    for i := 0; i < numWorkers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for job := range jobs {
+                results <- process(job)
+            }
+        }()
+    }
+    
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+    
+    return results
+}
+
+// 限流器
+func rateLimiter(rps int) <-chan struct{} {
+    ticker := time.NewTicker(time.Second / time.Duration(rps))
+    limiter := make(chan struct{})
+    
+    go func() {
+        for range ticker.C {
+            select {
+            case limiter <- struct{}{}:
+            default:
+            }
+        }
+    }()
+    
+    return limiter
+}
+```
+
+---
+
+## 三十二、性能优化技巧
+
+### 32.1 性能分析工具
+
+| 工具 | 用途 | 使用方式 | 输出 |
+|------|------|---------|------|
+| pprof | CPU/内存分析 | HTTP接口 | 火焰图 |
+| trace | 执行跟踪 | go tool trace | 时间线 |
+| benchstat | 基准测试比较 | 命令行 | 统计对比 |
+| go tool compile | 编译优化 | 编译选项 | 优化建议 |
+
+### 32.2 性能优化技巧
+
+```go
+// 1. 避免内存逃逸
+// 使用 go build -gcflags="-m" 检查
+
+// 2. 预分配内存
+slice := make([]int, 0, 1000)
+
+// 3. 使用 sync.Pool
+var pool = sync.Pool{
+    New: func() interface{} {
+        return new(bytes.Buffer)
+    },
+}
+
+// 4. 避免字符串拼接
+var builder strings.Builder
+for i := 0; i < 1000; i++ {
+    builder.WriteString("hello")
+}
+
+// 5. 使用 atomic 操作
+var counter int64
+atomic.AddInt64(&counter, 1)
+```
+
+---
+
+## 三十三、Go vs Java vs Rust 性能对比
+
+### 33.1 性能对比
+
+| 指标 | Go | Java | Rust | 说明 |
+|------|-----|------|------|------|
+| 启动时间 | < 100ms | > 1s | < 10ms | Rust最快 |
+| 内存占用 | 中等 | 高 | 低 | Rust最省 |
+| CPU效率 | 高 | 中 | 最高 | Rust最快 |
+| 并发性能 | 高 | 中 | 高 | Go最简单 |
+| 开发效率 | 高 | 高 | 中 | Go/Java较高 |
+
+### 33.2 适用场景对比
+
+| 场景 | 推荐语言 | 理由 |
+|------|---------|------|
+| 微服务 | Go | 并发简单、部署方便 |
+| 云原生 | Go | 生态最强 |
+| 系统编程 | Rust | 性能最高、内存安全 |
+| 大数据 | Java | 生态成熟 |
+| CLI工具 | Go/Rust | 编译简单 |
+
+---
+
+## 三十四、微服务框架选型
+
+### 34.1 Go 微服务框架对比
+
+| 框架 | 特点 | 性能 | 生态 | 适用场景 |
+|------|------|------|------|---------|
+| Gin | 轻量、高性能 | 高 | 高 | Web API |
+| Echo | 轻量、优雅 | 高 | 中 | Web API |
+| Kratos | B站开源、微服务全栈 | 中 | 高 | 微服务 |
+| Go-zero | 智好衣云开源 | 中 | 高 | 微服务 |
+| Fiber | Express风格 | 高 | 中 | Web API |
+
+### 34.2 框架选型决策
+
+```go
+// Kratos 微服务示例
+package main
+
+import (
+    "context"
+    "github.com/go-kratos/kratos/v2"
+    "github.com/go-kratos/kratos/v2/transport/http"
+)
+
+func main() {
+    httpSrv := http.NewServer(http.Address(":8080"))
+    
+    app := kratos.New(
+        kratos.Name("my-service"),
+        kratos.Server(httpSrv),
+    )
+    
+    if err := app.Run(); err != nil {
+        panic(err)
+    }
+}
+```
+
+---
+
+## 三十五、数据库操作最佳实践
+
+### 35.1 数据库驱动对比
+
+| 驱动 | 特点 | 性能 | 适用场景 |
+|------|------|------|---------|
+| database/sql | 标准库 | 中 | 通用 |
+| GORM | ORM | 中 | 快速开发 |
+| sqlx | 增强标准库 | 高 | 性能敏感 |
+| Ent | ORM+代码生成 | 中 | 复杂模型 |
+
+### 35.2 数据库连接池配置
+
+```go
+import "database/sql"
+
+func initDB() (*sql.DB, error) {
+    db, err := sql.Open("mysql", "user:password@tcp(localhost:3306)/dbname")
+    if err != nil {
+        return nil, err
+    }
+    
+    // 连接池配置
+    db.SetMaxOpenConns(25)
+    db.SetMaxIdleConns(25)
+    db.SetConnMaxLifetime(5 * time.Minute)
+    db.SetConnMaxIdleTime(1 * time.Minute)
+    
+    return db, nil
+}
+```
+
+---
+
+## 三十六、与其他板块的关系

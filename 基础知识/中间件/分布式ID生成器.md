@@ -1687,7 +1687,604 @@ curl -X POST http://localhost:8080/actuator/segment/refresh
 
 ---
 
-## 二十、与其他板块的关系
+## 二十、UUID v7 深度解析
+
+### 20.1 UUID v7 结构与优势
+
+| 字段 | 位数 | 说明 | 优势 |
+|------|------|------|------|
+| Unix时间戳 | 48位 | 毫秒级时间 | 全局有序 |
+| 随机位 | 74位 | 随机生成 | 唯一性 |
+| 版本号 | 4位 | UUID v7 | 标准化 |
+| 变体位 | 2位 | RFC 9562 | 兼容性 |
+
+```java
+// UUID v7 生成示例
+import java.util.UUID;
+
+public class UUIDv7Generator {
+    private long lastTimestamp = -1L;
+    private int sequence = 0;
+    
+    public UUID generate() {
+        long timestamp = System.currentTimeMillis();
+        
+        // 处理时钟回拨
+        if (timestamp == lastTimestamp) {
+            sequence++;
+            if (sequence > 0x3FFF) { // 14位序列号最大值
+                timestamp++;
+                sequence = 0;
+            }
+        } else {
+            sequence = 0;
+        }
+        lastTimestamp = timestamp;
+        
+        // 构建 UUID v7
+        long msb = (timestamp << 16) | (sequence & 0x3FFF);
+        long lsb = 0x8000000000000000L | (ThreadLocalRandom.current().nextLong() & 0x3FFFFFFFFFFFFFFFL);
+        
+        return new UUID(msb, lsb);
+    }
+}
+```
+
+### 20.2 UUID v7 vs 其他 ID 方案对比
+
+| 方案 | 有序性 | 长度 | 存储 | 性能 | 适用场景 |
+|------|--------|------|------|------|---------|
+| UUID v4 | 无序 | 128位 | 16字节 | 低 | 非关键系统 |
+| UUID v7 | 有序 | 128位 | 16字节 | 中 | 分布式系统 |
+| Snowflake | 有序 | 64位 | 8字节 | 高 | 高并发场景 |
+| 号段模式 | 有序 | 64位 | 8字节 | 高 | 单点生成 |
+| 自增ID | 有序 | 64位 | 8字节 | 最高 | 单机系统 |
+
+### 20.3 UUID v7 在分库分表中的应用
+
+```sql
+-- 使用 UUID v7 作为分片键
+CREATE TABLE orders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 按时间范围分片（利用 UUID v7 的时间有序性）
+CREATE TABLE orders_2024_01 PARTITION OF orders
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE orders_2024_02 PARTITION OF orders
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- 查询利用时间范围剪裁
+SELECT * FROM orders 
+WHERE id >= 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+  AND id < 'b2c3d4e5-f6a7-8901-bcde-f12345678901';
+```
+
+---
+
+## 二十一、分库分表路由策略
+
+### 21.1 路由算法对比
+
+| 算法 | 原理 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|---------|
+| 取模 | hash % 分片数 | 均匀分布 | 扩容困难 | 稳定分片数 |
+| 范围 | 按ID范围划分 | 扩容容易 | 数据倾斜 | 数据量增长快 |
+| 一致性哈希 | 环形哈希 | 扩容平滑 | 实现复杂 | 动态扩缩容 |
+| 查表法 | 路由表映射 | 灵活 | 维护成本高 | 复杂路由 |
+
+### 21.2 一致性哈希实现
+
+```java
+public class ConsistentHash<T> {
+    private final TreeMap<Long, T> ring = new TreeMap<>();
+    private final int virtualNodes;
+    
+    public ConsistentHash(int virtualNodes) {
+        this.virtualNodes = virtualNodes;
+    }
+    
+    public void addNode(T node) {
+        for (int i = 0; i < virtualNodes; i++) {
+            long hash = hash(node.toString() + "#" + i);
+            ring.put(hash, node);
+        }
+    }
+    
+    public void removeNode(T node) {
+        for (int i = 0; i < virtualNodes; i++) {
+            long hash = hash(node.toString() + "#" + i);
+            ring.remove(hash);
+        }
+    }
+    
+    public T getNode(String key) {
+        if (ring.isEmpty()) return null;
+        long hash = hash(key);
+        Map.Entry<Long, T> entry = ring.ceilingEntry(hash);
+        if (entry == null) {
+            entry = ring.firstEntry();
+        }
+        return entry.getValue();
+    }
+    
+    private long hash(String key) {
+        return Math.abs(key.hashCode() & 0xFFFFFFFFL);
+    }
+}
+```
+
+### 21.3 分片策略配置
+
+```yaml
+# 分库分表配置示例
+sharding:
+  # 分片键
+  sharding-key: user_id
+  # 分片算法
+  algorithm: consistent-hash
+  # 虚拟节点数
+  virtual-nodes: 150
+  # 数据源列表
+  data-sources:
+    - name: ds_0
+      url: jdbc:mysql://db0:3306/order_db
+    - name: ds_1
+      url: jdbc:mysql://db1:3306/order_db
+  # 分表规则
+  tables:
+    orders:
+      actual-data-nodes: ds_$->{0..1}.orders_$->{0..15}
+      table-strategy:
+        standard:
+          sharding-column: order_id
+          algorithm-class: com.example.ModShardingAlgorithm
+```
+
+---
+
+## 二十二、高可用设计
+
+### 22.1 高可用架构
+
+```mermaid
+graph TB
+    subgraph "ID生成服务集群"
+        N1[ID生成器-1]
+        N2[ID生成器-2]
+        N3[ID生成器-3]
+    end
+    subgraph "协调层"
+        Z1[ZooKeeper 集群]
+        E1[Etcd 集群]
+    end
+    subgraph "存储层"
+        M1[MySQL 主库]
+        M2[MySQL 从库]
+        R1[Redis 集群]
+    end
+    subgraph "监控层"
+        P1[Prometheus]
+        G1[Grafana]
+        A1[AlertManager]
+    end
+    N1 --> Z1
+    N2 --> Z1
+    N3 --> Z1
+    N1 --> M1
+    N2 --> M1
+    N3 --> M1
+    M1 --> M2
+    N1 --> R1
+    N2 --> R1
+    N3 --> R1
+    N1 --> P1
+    N2 --> P1
+    N3 --> P1
+    P1 --> G1
+    P1 --> A1
+```
+
+### 22.2 故障转移机制
+
+| 故障类型 | 检测方式 | 转移策略 | 恢复时间 | 数据一致性 |
+|---------|---------|---------|---------|-----------|
+| 节点宕机 | 心跳检测 | 自动切换 | < 30s | 强一致 |
+| 网络分区 | 多数派投票 | 脑裂防护 | < 60s | 最终一致 |
+| 时钟回拨 | 时间戳校验 | 等待恢复 | 依赖NTP | 强一致 |
+| 存储故障 | 写入失败检测 | 降级内存 | < 10s | 最终一致 |
+
+### 22.3 降级策略
+
+```java
+public class IDGeneratorService {
+    private final Snowflake snowflake;
+    private final SegmentService segmentService;
+    private final LocalCache localCache;
+    
+    public Long generateId() {
+        try {
+            // 优先 Snowflake
+            return snowflake.nextId();
+        } catch (ClockBackwardException e) {
+            try {
+                // 降级到号段模式
+                return segmentService.nextId();
+            } catch (Exception ex) {
+                // 降级到本地缓存
+                return localCache.nextId();
+            }
+        }
+    }
+}
+```
+
+---
+
+## 二十三、ID 长度与性能分析
+
+### 23.1 ID 方案性能对比
+
+| 方案 | 生成耗时 | 吞吐量 | 存储空间 | 索引效率 | 适用QPS |
+|------|---------|--------|---------|---------|--------|
+| UUID v4 | < 1μs | 100万/s | 16字节 | 低 | 10万+ |
+| UUID v7 | < 1μs | 100万/s | 16字节 | 中 | 10万+ |
+| Snowflake | < 1μs | 400万/s | 8字节 | 高 | 100万+ |
+| 号段模式 | < 10μs | 100万/s | 8字节 | 高 | 50万+ |
+| 自增ID | < 1μs | 10万/s | 8字节 | 最高 | 10万+ |
+
+### 23.2 索引性能影响
+
+```sql
+-- UUID v4 索引性能（B+树）
+-- 无序插入导致频繁页分裂
+INSERT INTO users (id, name) VALUES (uuid_generate_v4(), 'test');
+-- 索引碎片率: 30-50%
+-- 查询性能: 中等
+
+-- UUID v7 索引性能（B+树）
+-- 有序插入，页分裂少
+INSERT INTO users (id, name) VALUES (uuid_generate_v7(), 'test');
+-- 索引碎片率: 5-10%
+-- 查询性能: 高
+
+-- Snowflake 索引性能（B+树）
+-- 完全有序，无页分裂
+INSERT INTO users (id, name) VALUES (snowflake_next_id(), 'test');
+-- 索引碎片率: < 5%
+-- 查询性能: 最高
+```
+
+### 23.3 ID 长度对存储的影响
+
+| ID类型 | 长度 | 每行存储 | 1亿行存储 | 索引大小 | 说明 |
+|--------|------|---------|----------|---------|------|
+| INT BIGINT | 8字节 | 8字节 | 8GB | 2GB | 最紧凑 |
+| Snowflake | 8字节 | 8字节 | 8GB | 2GB | 推荐 |
+| UUID v7 | 16字节 | 16字节 | 16GB | 4GB | 可接受 |
+| UUID v4 | 16字节 | 16字节 | 16GB | 4GB | 不推荐 |
+| 字符串UUID | 36字节 | 36字节 | 36GB | 9GB | 不推荐 |
+
+---
+
+## 二十四、监控与运维体系
+
+### 24.1 监控指标体系
+
+| 指标类型 | 具体指标 | 采集方式 | 告警阈值 | 处理建议 |
+|---------|---------|---------|---------|---------|
+| 性能指标 | 生成延迟 | Prometheus | > 10ms | 优化算法 |
+| 性能指标 | 吞吐量 | Prometheus | < 10万/s | 扩容节点 |
+| 资源指标 | CPU使用率 | Node Exporter | > 80% | 扩容 |
+| 资源指标 | 内存使用率 | Node Exporter | > 80% | 扩容 |
+| 业务指标 | 重复ID率 | 自定义监控 | > 0 | 立即处理 |
+| 业务指标 | 时钟回拨次数 | 自定义监控 | > 0 | 检查NTP |
+
+### 24.2 监控架构
+
+```mermaid
+graph TB
+    subgraph "ID生成服务"
+        S1[Snowflake]
+        S2[号段模式]
+        S3[UUID v7]
+    end
+    subgraph "指标采集"
+        E1[Spring Actuator]
+        E2[Micrometer]
+        E3[自定义Exporter]
+    end
+    subgraph "指标存储"
+        P1[Prometheus]
+        I1[InfluxDB]
+    end
+    subgraph "可视化"
+        G1[Grafana]
+        D1[Dashboard]
+    end
+    subgraph "告警"
+        A1[AlertManager]
+        A2[PagerDuty]
+        A3[Slack]
+    end
+    S1 --> E1
+    S2 --> E1
+    S3 --> E1
+    E1 --> E2
+    E2 --> E3
+    E3 --> P1
+    E3 --> I1
+    P1 --> G1
+    P1 --> D1
+    P1 --> A1
+    A1 --> A2
+    A1 --> A3
+```
+
+### 24.3 运维命令手册
+
+```bash
+# Snowflake 节点状态检查
+curl http://localhost:8080/actuator/snowflake/status
+
+# 号段模式状态检查
+curl http://localhost:8080/actuator/segment/status
+
+# 手动触发号段加载
+curl -X POST http://localhost:8080/actuator/segment/refresh
+
+# 查看ID生成统计
+curl http://localhost:8080/actuator/metrics/id.generate
+
+# 查看时钟偏移
+curl http://localhost:8080/actuator/snowflake/clock-offset
+
+# 压力测试
+ab -n 100000 -c 100 http://localhost:8080/api/generate
+```
+
+---
+
+## 二十五、Snowflake 时钟回拨深度解析
+
+### 25.1 时钟回拨原因分析
+
+| 原因 | 发生概率 | 影响范围 | 解决方案 |
+|------|---------|---------|---------|
+| NTP同步 | 高 | 全局 | 配置NTP源、增大容忍时间 |
+| 闰秒 | 低 | 全局 | 闰秒处理机制 |
+| 虚拟机迁移 | 中 | 单节点 | 锁定时间源 |
+| 硬件时钟漂移 | 低 | 单节点 | 更换硬件、NTP校准 |
+
+### 25.2 时钟回拨检测与处理
+
+```java
+public class SnowflakeIdGenerator {
+    private long lastTimestamp = -1L;
+    private int sequence = 0;
+    private final long workerId;
+    private final long datacenterId;
+    
+    private static final long WORKER_ID_BITS = 5L;
+    private static final long DATACENTER_ID_BITS = 5L;
+    private static final long SEQUENCE_BITS = 12L;
+    
+    private static final long MAX_WORKER_ID = ~(-1L << WORKER_ID_BITS);
+    private static final long MAX_DATACENTER_ID = ~(-1L << DATACENTER_ID_BITS);
+    
+    private static final long WORKER_ID_SHIFT = SEQUENCE_BITS;
+    private static final long DATACENTER_ID_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS;
+    private static final long TIMESTAMP_LEFT_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS + DATACENTER_ID_BITS;
+    private static final long SEQUENCE_MASK = ~(-1L << SEQUENCE_BITS);
+    
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+        
+        // 检测时钟回拨
+        if (timestamp < lastTimestamp) {
+            long offset = lastTimestamp - timestamp;
+            if (offset <= 5) {
+                // 小范围回拨，等待时钟追上
+                try {
+                    Thread.sleep(offset << 1);
+                    timestamp = System.currentTimeMillis();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("时钟回拨等待被中断", e);
+                }
+            } else {
+                // 大范围回拨，抛出异常
+                throw new ClockBackwardException(
+                    "时钟回拨超过5ms，当前时间：" + timestamp + 
+                    "，最后时间：" + lastTimestamp
+                );
+            }
+        }
+        
+        // 处理同一毫秒内的序列号
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & SEQUENCE_MASK;
+            if (sequence == 0) {
+                // 序列号用尽，等待下一毫秒
+                timestamp = waitNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        return ((timestamp - EPOCH) << TIMESTAMP_LEFT_SHIFT) 
+                | (datacenterId << DATACENTER_ID_SHIFT) 
+                | (workerId << WORKER_ID_SHIFT) 
+                | sequence;
+    }
+    
+    private long waitNextMillis(long lastTimestamp) {
+        long timestamp = System.currentTimeMillis();
+        while (timestamp <= lastTimestamp) {
+            timestamp = System.currentTimeMillis();
+        }
+        return timestamp;
+    }
+}
+```
+
+### 25.3 时钟回拨预防措施
+
+| 措施 | 实现方式 | 效果 | 成本 |
+|------|---------|------|------|
+| NTP优化 | 使用本地NTP源 | 减少回拨 | 低 |
+| 闰秒处理 | 闰秒偏移 | 避免回拨 | 中 |
+| 虚拟机锁定 | 锁定时间源 | 避免迁移回拨 | 中 |
+| 硬件升级 | 高精度时钟 | 减少漂移 | 高 |
+| 降级策略 | 内存降级 | 保证可用性 | 低 |
+
+---
+
+## 二十六、号段模式深度调优
+
+### 26.1 号段模式原理
+
+```mermaid
+graph TB
+    subgraph "号段模式工作流程"
+        A[应用请求ID] --> B{本地号段可用?}
+        B -->|是| C[返回本地ID]
+        B -->|否| D[向DB申请新号段]
+        D --> E[DB分配号段]
+        E --> F[更新本地号段]
+        F --> C
+    end
+    subgraph "号段配置"
+        G[初始号段大小: 1000]
+        H[扩容因子: 1.5]
+        I[最大号段: 10000]
+        J[预加载阈值: 200]
+    end
+```
+
+### 26.2 号段模式配置优化
+
+```yaml
+# 号段模式配置
+segment:
+  # 初始号段大小
+  initial-size: 1000
+  # 扩容因子（当前号段使用率超过阈值时）
+  expansion-factor: 1.5
+  # 最大号段大小
+  max-size: 10000
+  # 预加载阈值（剩余ID数低于此值时预加载）
+  preload-threshold: 200
+  # 数据源配置
+  data-source:
+    url: jdbc:mysql://localhost:3306/id_generator
+    username: root
+    password: password
+    # 连接池配置
+    pool-size: 10
+    max-wait: 5000
+```
+
+### 26.3 号段模式性能优化
+
+| 优化策略 | 实现方式 | 效果 | 适用场景 |
+|---------|---------|------|---------|
+| 双Buffer | 两个号段交替使用 | 减少DB访问 | 高并发 |
+| 异步预加载 | 后台线程预加载 | 减少延迟 | 高吞吐 |
+| 号段缓存 | 本地缓存号段 | 减少网络 | 远程DB |
+| 动态调整 | 根据使用率调整号段大小 | 平衡性能 | 负载波动 |
+
+```java
+// 双Buffer实现
+public class SegmentIdGenerator {
+    private volatile Segment currentSegment;
+    private volatile Segment nextSegment;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    
+    public void init() {
+        currentSegment = loadSegment();
+        nextSegment = loadSegment();
+    }
+    
+    public synchronized long nextId() {
+        if (currentSegment.hasRemaining()) {
+            return currentSegment.nextId();
+        } else {
+            // 切换到下一个号段
+            currentSegment = nextSegment;
+            // 异步加载下一个号段
+            executor.submit(this::asyncLoadNextSegment);
+            return currentSegment.nextId();
+        }
+    }
+    
+    private void asyncLoadNextSegment() {
+        nextSegment = loadSegment();
+    }
+}
+```
+
+---
+
+## 二十七、分布式 ID 安全性
+
+### 27.1 安全风险分析
+
+| 风险类型 | 影响 | 防护措施 | 实现复杂度 |
+|---------|------|---------|-----------|
+| ID碰撞 | 数据混乱 | 全局唯一性校验 | 低 |
+| ID预测 | 安全漏洞 | 随机化+加密 | 中 |
+| 时钟攻击 | ID异常 | 时间源可信 | 中 |
+| 重放攻击 | 数据重复 | 幂等性设计 | 高 |
+
+### 27.2 安全ID生成方案
+
+```java
+// 安全ID生成（带随机化）
+public class SecureIdGenerator {
+    private final Snowflake snowflake;
+    private final SecureRandom random = new SecureRandom();
+    
+    public long generateSecureId() {
+        long baseId = snowflake.nextId();
+        
+        // 添加随机扰动（保持有序性）
+        long randomBits = random.nextLong() & 0x3FF; // 10位随机数
+        return (baseId << 10) | randomBits;
+    }
+    
+    // 验证ID有效性
+    public boolean validateId(long id) {
+        long timestamp = (id >> 22) + EPOCH;
+        long workerId = (id >> 17) & 0x1F;
+        long datacenterId = (id >> 12) & 0x1F;
+        
+        return timestamp <= System.currentTimeMillis() 
+            && workerId >= 0 && workerId <= 31
+            && datacenterId >= 0 && datacenterId <= 31;
+    }
+}
+```
+
+### 27.3 安全最佳实践
+
+| 实践 | 描述 | 优先级 |
+|------|------|--------|
+| 使用可信时间源 | NTP同步、本地时钟 | 高 |
+| 避免暴露ID生成规则 | 接口不返回ID生成逻辑 | 高 |
+| 实现幂等性 | 业务层去重 | 高 |
+| 监控异常模式 | 重复ID、时钟异常 | 中 |
+| 定期审计 | ID使用情况审计 | 中 |
+
+---
+
+## 二十八、与其他板块的关系
 
 - 分布式锁见「[分布式锁](../../场景设计/分布式锁.md)」；
 - 分布式事务见「[分布式事务](./分布式事务Seata.md)」；

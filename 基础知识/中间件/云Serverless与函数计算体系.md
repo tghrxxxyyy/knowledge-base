@@ -1701,7 +1701,379 @@ Serverless成本构成：
     定期审查成本
 ```
 
-## 三十二、与其他板块的关系
+---
+
+## 三十二、Lambda 事件源配置
+
+### 32.1 事件源类型对比
+
+| 事件源 | 触发方式 | 延迟 | 适用场景 | 配置复杂度 |
+|--------|---------|------|---------|-----------|
+| API Gateway | HTTP请求 | 毫秒级 | REST API | 低 |
+| S3 | 对象创建/删除 | 秒级 | 文件处理 | 低 |
+| DynamoDB | 数据变更 | 秒级 | 数据同步 | 中 |
+| SQS | 消息到达 | 秒级 | 异步处理 | 低 |
+| SNS | 通知发布 | 秒级 | 事件广播 | 低 |
+| EventBridge | 事件匹配 | 秒级 | 事件路由 | 中 |
+| Kinesis | 数据流 | 秒级 | 流处理 | 高 |
+
+### 32.2 事件源配置示例
+
+```yaml
+# Serverless Framework 配置
+functions:
+  processImage:
+    handler: handler.processImage
+    events:
+      # S3 事件源
+      - s3:
+          bucket: my-bucket
+          event: s3:ObjectCreated:*
+          rules:
+            - suffix: .jpg
+      
+      # API Gateway 事件源
+      - http:
+          path: /process
+          method: post
+      
+      # SQS 事件源
+      - sqs:
+          arn: arn:aws:sqs:us-east-1:123456789012:my-queue
+          batchSize: 10
+      
+      # DynamoDB 事件源
+      - stream:
+          type: dynamodb
+          arn: arn:aws:dynamodb:us-east-1:123456789012:table/my-table/stream/2024-01-01T00:00:00.000
+          batchSize: 100
+          startingPosition: TRIM_HORIZON
+```
+
+---
+
+## 三十三、Step Functions 工作流
+
+### 33.1 工作流模式
+
+| 模式 | 说明 | 适用场景 | 复杂度 |
+|------|------|---------|--------|
+| 顺序执行 | 步骤依次执行 | 简单流程 | 低 |
+| 并行执行 | 多步骤并行 | 批量处理 | 中 |
+| 条件分支 | 根据条件选择 | 决策逻辑 | 中 |
+| 错误处理 | 重试和回滚 | 可靠性要求高 | 中 |
+| 人工审批 | 等待人工介入 | 审批流程 | 高 |
+
+### 33.2 Step Functions 配置
+
+```json
+{
+  "Comment": "图片处理工作流",
+  "StartAt": "DownloadImage",
+  "States": {
+    "DownloadImage": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:download-image",
+      "Next": "ProcessImage",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ]
+    },
+    "ProcessImage": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Resize",
+          "States": {
+            "Resize": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:123456789012:function:resize-image",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Compress",
+          "States": {
+            "Compress": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:123456789012:function:compress-image",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "UploadImage"
+    },
+    "UploadImage": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:upload-image",
+      "End": true
+    }
+  }
+}
+```
+
+---
+
+## 三十四、Knative 部署配置
+
+### 34.1 Knative Serving 配置
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: my-service
+  namespace: default
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        autoscaling.knative.dev/target: "5"
+    spec:
+      containers:
+        - image: my-image:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+```
+
+### 34.2 Knative Eventing 配置
+
+```yaml
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: default
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: my-trigger
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: com.example.myevent
+  subscriber:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: my-service
+```
+
+---
+
+## 三十五、冷启动优化策略
+
+### 35.1 冷启动优化方案
+
+| 方案 | 原理 | 效果 | 成本 | 适用场景 |
+|------|------|------|------|---------|
+| 预置并发 | 保持实例运行 | 最好 | 高 | 核心服务 |
+| SnapStart | 快照恢复 | 好 | 中 | Java函数 |
+| 依赖精简 | 减少包大小 | 中 | 低 | 所有函数 |
+| 连接池复用 | 复用连接 | 中 | 低 | 数据库操作 |
+| 代码优化 | 减少初始化 | 中 | 低 | 所有函数 |
+
+### 35.2 优化配置示例
+
+```yaml
+# 预置并发配置
+functions:
+  myFunction:
+    handler: handler.main
+    provisionedConcurrency: 5  # 预置5个实例
+    reservedConcurrency: 100   # 保留100个并发
+
+# SnapStart 配置（Java）
+functions:
+  myJavaFunction:
+    handler: com.example.Handler::handleRequest
+    runtime: java17
+    snapStart: true
+    memorySize: 1024
+```
+
+---
+
+## 三十六、EventBridge 事件总线
+
+### 36.1 EventBridge 配置
+
+```yaml
+# 事件总线配置
+Resources:
+  MyEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: my-event-bus
+  
+  # 事件规则
+  MyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: my-event-bus
+      EventPattern:
+        source: ["my.source"]
+        detail-type: ["MyEvent"]
+      Targets:
+        - Arn: arn:aws:lambda:us-east-1:123456789012:function:my-function
+          Id: my-target
+```
+
+### 36.2 事件模式
+
+```json
+{
+  "source": ["my.source"],
+  "detail-type": ["MyEvent"],
+  "detail": {
+    "eventType": ["ORDER_CREATED"],
+    "amount": [{"numeric": [">", 100]}]
+  }
+}
+```
+
+---
+
+## 三十七、Serverless 成本优化
+
+### 37.1 成本对比
+
+| 方案 | 月成本（100万次调用） | 适用场景 | 说明 |
+|------|---------------------|---------|------|
+| Lambda（128MB） | $20-30 | 低频调用 | 按需付费 |
+| Lambda（512MB） | $40-60 | 中频调用 | 按需付费 |
+| Fargate | $50-100 | 持续运行 | 按秒计费 |
+| EC2 | $30-80 | 高频调用 | 包月/预留 |
+| 预置并发 | $100-200 | 低延迟要求 | 固定成本 |
+
+### 37.2 成本优化策略
+
+```yaml
+# 成本优化配置
+functions:
+  myFunction:
+    handler: handler.main
+    # 内存优化
+    memorySize: 256  # 根据实际需求调整
+    # 超时优化
+    timeout: 30
+    # 并发控制
+    reservedConcurrency: 50
+    # 环境变量
+    environment:
+      variables:
+        NODE_ENV: production
+```
+
+---
+
+## 三十八、Serverless 安全最佳实践
+
+### 38.1 安全检查清单
+
+| 检查项 | 描述 | 优先级 | 实现方式 |
+|--------|------|--------|---------|
+| IAM权限 | 最小权限原则 | 高 | IAM Policy |
+| 环境变量 | 敏感信息加密 | 高 | KMS/SSM |
+| 网络隔离 | VPC配置 | 高 | Security Group |
+| 依赖扫描 | 第三方库安全 | 中 | Snyk/Trivy |
+| 日志审计 | 操作日志 | 中 | CloudTrail |
+| 输入验证 | 参数校验 | 高 | 代码层 |
+
+### 38.2 安全配置示例
+
+```yaml
+# 安全配置
+functions:
+  myFunction:
+    handler: handler.main
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource: "arn:aws:s3:::my-bucket/*"
+    environment:
+      variables:
+        DB_PASSWORD: ${ssm:/my-app/db-password~true}
+    vpc:
+      securityGroupIds:
+        - sg-12345678
+      subnetIds:
+        - subnet-12345678
+        - subnet-87654321
+```
+
+---
+
+## 三十九、Serverless 监控与告警
+
+### 39.1 监控指标
+
+| 指标 | 说明 | 告警阈值 | 监控工具 |
+|------|------|---------|---------|
+| 调用次数 | 函数调用次数 | 异常波动 | CloudWatch |
+| 错误率 | 错误调用比例 | > 5% | CloudWatch |
+| 延迟 | 函数执行时间 | > 10s | CloudWatch |
+| 冷启动率 | 冷启动比例 | > 20% | CloudWatch |
+| 并发数 | 并发执行数 | > 80% | CloudWatch |
+| 成本 | 每日成本 | > 预算 | Cost Explorer |
+
+### 39.2 告警配置
+
+```yaml
+# CloudWatch 告警
+Resources:
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: LambdaErrorAlarm
+      AlarmDescription: Lambda函数错误率过高
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: my-function
+  
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: LambdaLatencyAlarm
+      AlarmDescription: Lambda函数延迟过高
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+```
+
+---
+
+## 三十九、与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；
 - 云上消息（事件源）见「[云上消息与集成生态](./云上消息与集成生态.md)」；

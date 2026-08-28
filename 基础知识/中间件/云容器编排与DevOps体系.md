@@ -1701,7 +1701,510 @@ spec:
 
 > 核心原则：**CNI网络模型灵活，Helm Chart参数化，Argo CD声明式，容器安全多层防护，多租户资源隔离**。
 
-## 二十二、与其他板块的关系
+---
+
+## 二十二、CNI 网络插件深度对比
+
+### 22.1 CNI 插件对比
+
+| 插件 | 性能 | 功能 | 复杂度 | 适用场景 |
+|------|------|------|--------|---------|
+| Calico | 高 | 网络策略、BGP | 中 | 企业级 |
+| Cilium | 最高 | eBPF、可观测性 | 高 | 高性能 |
+| Flannel | 中 | 基础网络 | 低 | 测试环境 |
+| Weave | 中 | 加密、多播 | 中 | 多云 |
+| Antrea | 高 | OpenFlow | 中 | VMware |
+
+### 22.2 Calico 配置
+
+```yaml
+# Calico 网络策略
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+  namespace: default
+spec:
+  selector: all()
+  types:
+    - Ingress
+    - Egress
+---
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: default
+spec:
+  selector: app == 'frontend'
+  types:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: frontend
+      ports:
+        - protocol: TCP
+          port: 80
+```
+
+### 22.3 Cilium eBPF 配置
+
+```yaml
+# Cilium 网络策略
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: frontend
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: backend
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+```
+
+---
+
+## 二十三、Helm Chart 管理
+
+### 23.1 Helm Chart 结构
+
+```
+mychart/
+  Chart.yaml          # Chart元数据
+  values.yaml         # 默认配置
+  charts/             # 依赖Chart
+  templates/          # 模板文件
+    deployment.yaml
+    service.yaml
+    ingress.yaml
+    configmap.yaml
+    _helpers.tpl      # 辅助模板
+  .helmignore         # 忽略文件
+```
+
+### 23.2 Helm Chart 配置
+
+```yaml
+# values.yaml
+replicaCount: 3
+
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls:
+    - secretName: chart-example-tls
+      hosts:
+        - chart-example.local
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 250m
+    memory: 64Mi
+```
+
+### 23.3 Helm 操作命令
+
+```bash
+# 安装Chart
+helm install my-release ./mychart
+
+# 升级Chart
+helm upgrade my-release ./mychart --set replicaCount=5
+
+# 回滚
+helm rollback my-release 1
+
+# 查看历史
+helm history my-release
+
+# 卸载
+helm uninstall my-release
+```
+
+---
+
+## 二十四、Argo CD GitOps 配置
+
+### 24.1 Argo CD Application 配置
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/my-app.git
+    targetRevision: HEAD
+    path: k8s/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### 24.2 Argo CD 配置
+
+```yaml
+# argocd-cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  url: https://argocd.example.com
+  admin.enabled: "false"
+  dex.config: |
+    connectors:
+      - type: github
+        id: github
+        name: GitHub
+        config:
+          clientID: $dex.github.clientID
+          clientSecret: $dex.github.clientSecret
+          orgs:
+            - name: my-org
+```
+
+---
+
+## 二十五、容器安全多层防护
+
+### 25.1 安全层级
+
+| 层级 | 措施 | 工具 | 优先级 |
+|------|------|------|--------|
+| 镜像层 | 扫描漏洞 | Trivy/Snyk | 高 |
+| 运行时层 | 行为监控 | Falco | 高 |
+| 网络层 | 网络策略 | Calico/Cilium | 高 |
+| 存储层 | 加密存储 | Vault | 中 |
+| 身份层 | RBAC | K8s RBAC | 高 |
+
+### 25.2 镜像扫描配置
+
+```yaml
+# Trivy 扫描配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-config
+data:
+  trivy.yaml: |
+    scan:
+      scanners:
+        - vuln
+        - misconfig
+        - secret
+    vulnerability:
+      severity:
+        - CRITICAL
+        - HIGH
+      ignoreUnfixed: true
+```
+
+### 25.3 Falco 规则配置
+
+```yaml
+# falco-rules.yaml
+- rule: Terminal shell in container
+  desc: A shell was used as the entrypoint/exec point into a container
+  condition: >
+    spawned_process and container and shell_procs and proc.tty != 0
+  output: >
+    Shell spawned in container (user=%user.name container=%container.name
+    shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+  priority: WARNING
+  tags: [container, shell, mitre_execution]
+```
+
+---
+
+## 二十六、多租户资源隔离
+
+### 26.1 多租户隔离方案
+
+| 方案 | 隔离级别 | 资源开销 | 适用场景 |
+|------|---------|---------|---------|
+| Namespace | 中 | 低 | 软隔离 |
+| ResourceQuota | 高 | 低 | 资源限制 |
+| NetworkPolicy | 高 | 低 | 网络隔离 |
+| Virtual Cluster | 最高 | 高 | 硬隔离 |
+| Node Pool | 最高 | 高 | 物理隔离 |
+
+### 26.2 多租户配置
+
+```yaml
+# Namespace 资源配额
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-quota
+  namespace: tenant-a
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    services: "20"
+---
+# LimitRange
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-limit
+  namespace: tenant-a
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: 2
+        memory: 4Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+```
+
+---
+
+## 二十七、多集群管理
+
+### 27.1 多集群方案
+
+| 方案 | 管理复杂度 | 功能 | 适用场景 |
+|------|-----------|------|---------|
+| Kubefed | 中 | 联邦管理 | 多区域 |
+| Rancher | 低 | 统一管理 | 多集群 |
+| Argo CD | 低 | GitOps | 多环境 |
+| Cluster API | 高 | 生命周期 | 多云 |
+| Liqo | 中 | 资源共享 | 混合云 |
+
+### 27.2 多集群配置
+
+```yaml
+# Kubefed 配置
+apiVersion: core.kubefed.io/v1beta1
+kind: KubeFedCluster
+metadata:
+  name: cluster-b
+  namespace: kube-federation-system
+spec:
+  apiEndpoint: https://cluster-b.example.com
+  secretRef:
+    name: cluster-b-secret
+---
+# 联邦资源
+apiVersion: types.kubefed.io/v1beta1
+kind: FederatedDeployment
+metadata:
+  name: my-app
+  namespace: federation
+spec:
+  template:
+    spec:
+      replicas: 3
+      template:
+        spec:
+          containers:
+            - name: my-app
+              image: my-app:latest
+  placement:
+    clusters:
+      - name: cluster-a
+      - name: cluster-b
+```
+
+---
+
+## 二十八、成本优化策略
+
+### 28.1 成本优化方案
+
+| 方案 | 节省比例 | 实施难度 | 适用场景 |
+|------|---------|---------|---------|
+| Spot实例 | 70-90% | 低 | 无状态服务 |
+| 自动扩缩容 | 30-50% | 低 | 负载波动 |
+| 资源预留 | 30-40% | 中 | 稳定负载 |
+| 右sizing | 20-40% | 中 | 资源浪费 |
+| 混合策略 | 50-70% | 高 | 复杂场景 |
+
+### 28.2 自动扩缩容配置
+
+```yaml
+# HPA 配置
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+```
+
+---
+
+## 二十九、调试与故障排查
+
+### 29.1 常见问题排查
+
+| 问题 | 排查步骤 | 常见原因 | 解决方案 |
+|------|---------|---------|---------|
+| Pod CrashLoopBackOff | kubectl logs | 配置错误/资源不足 | 修正配置/调整资源 |
+| Service无法访问 | kubectl describe svc | 端口不匹配/标签错误 | 修正端口/标签 |
+| PVC绑定失败 | kubectl describe pvc | StorageClass错误 | 检查StorageClass |
+| 节点NotReady | kubectl describe node | 资源压力/网络问题 | 清理资源/修复网络 |
+
+### 29.2 调试命令
+
+```bash
+# Pod调试
+kubectl logs <pod> --previous
+kubectl describe pod <pod>
+kubectl exec -it <pod> -- /bin/sh
+
+# 服务调试
+kubectl get endpoints <service>
+kubectl port-forward <pod> 8080:80
+
+# 网络调试
+kubectl run debug --image=nicolaka/netshoot -it --rm -- /bin/bash
+
+# 资源监控
+kubectl top nodes
+kubectl top pods
+```
+
+---
+
+## 三十、网络策略配置
+
+### 30.1 网络策略类型
+
+| 策略类型 | 方向 | 用途 | 示例 |
+|---------|------|------|------|
+| Ingress | 入站 | 控制入站流量 | 允许前端访问后端 |
+| Egress | 出站 | 控制出站流量 | 限制访问外部 |
+| Both | 双向 | 完全隔离 | 租户隔离 |
+
+### 30.2 网络策略配置
+
+```yaml
+# 允许前端访问后端
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# 禁止所有入站流量
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-ingress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+```
+
+---
+
+## 三十一、与其他板块的关系
 
 - K8s 原理见「[云原生/Kubernetes核心](../../云原生/Kubernetes核心.md)」；
 - CI/CD 原理见「[基础知识/CI-CD](../../基础知识/CI-CD/README.md)」；
