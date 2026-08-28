@@ -1238,7 +1238,254 @@ Redis Streams（5.0+）= 持久化消息队列
 
 ---
 
-## 十五、bigkey/hotkey 治理与高阶实战（第三轮深度补充）
+## 二十三、Redis 事务与 Lua 脚本
+
+### 事务命令
+
+```bash
+# 事务基本用法
+MULTI
+SET key1 value1
+SET key2 value2
+EXEC
+
+# 事务取消
+MULTI
+SET key1 value1
+DISCARD
+
+# 乐观锁
+WATCH key1
+MULTI
+SET key1 newvalue
+EXEC
+# 如果 key1 被修改，EXEC 返回 nil
+```
+
+### Lua 脚本
+
+```lua
+-- 原子操作：扣减库存
+local stock = tonumber(redis.call('get', KEYS[1]))
+if stock and stock >= tonumber(ARGV[1]) then
+    redis.call('decrby', KEYS[1], ARGV[1])
+    return 1
+else
+    return 0
+end
+```
+
+### 事务 vs Lua 脚本
+
+| 维度 | 事务 | Lua 脚本 |
+|------|------|----------|
+| 原子性 | 部分原子 | 完全原子 |
+| 性能 | 高 | 中 |
+| 复杂度 | 低 | 中 |
+| 适用场景 | 简单原子操作 | 复杂业务逻辑 |
+| 调试 | 简单 | 较复杂 |
+
+---
+
+## 二十四、Redis Pub/Sub 与 Streams
+
+### Pub/Sub 对比 Streams
+
+| 维度 | Pub/Sub | Streams |
+|------|---------|---------|
+| 消息持久化 | 不支持 | 支持 |
+| 消息回溯 | 不支持 | 支持 |
+| 消费者组 | 不支持 | 支持 |
+| 消息确认 | 不支持 | 支持 |
+| 消息积压 | 丢失 | 保留 |
+| 适用场景 | 实时通知 | 消息队列 |
+
+### Streams 基本操作
+
+```bash
+# 添加消息
+XADD mystream * field1 value1 field2 value2
+
+# 读取消息
+XREAD COUNT 10 STREAMS mystream 0
+
+# 消费者组
+XGROUP CREATE mystream mygroup 0
+XREADGROUP GROUP mygroup consumer1 COUNT 1 STREAMS mystream >
+
+# 确认消息
+XACK mystream mygroup 1234567890-0
+```
+
+---
+
+## 二十五、Redis 安全配置
+
+### 安全配置清单
+
+| 配置项 | 默认值 | 推荐值 | 说明 |
+|--------|--------|--------|------|
+| requirepass | 无 | 强密码 | 密码认证 |
+| bind | 127.0.0.1 | 内网IP | 绑定地址 |
+| protected-mode | yes | yes | 保护模式 |
+| rename-command | 无 | 禁用危险命令 | 命令重命名 |
+| timeout | 0 | 300 | 空闲超时 |
+| maxmemory | 无 | 物理内存70% | 内存限制 |
+
+### 安全配置
+
+```bash
+# redis.conf
+requirepass your_strong_password_here
+bind 127.0.0.1 10.0.0.1
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command CONFIG "CONFIG_b82c7f3a"
+rename-command DEBUG ""
+```
+
+---
+
+## 二十六、Redis 7.x 新特性
+
+### 新特性概览
+
+| 特性 | 说明 | 适用场景 |
+|------|------|----------|
+| Functions | 服务端 Lua 函数 | 复杂业务逻辑 |
+| Shared Pub/Sub | 共享订阅 | 集群消息 |
+| ACL v2 | 增强权限控制 | 多租户 |
+| Client-side Caching | 客户端缓存 | 高性能 |
+| Multi-part AOF | 多文件 AOF | 性能优化 |
+
+### Functions 示例
+
+```lua
+#!lua name=mylib
+local function my_hset(keys, args)
+    local hash = keys[1]
+    local field = args[1]
+    local value = args[2]
+    return redis.call('hset', hash, field, value)
+end
+redis.register_function('my_hset', my_hset)
+```
+
+---
+
+## 二十七、Redis 集群运维
+
+### 集群管理命令
+
+```bash
+# 创建集群
+redis-cli --cluster create \\
+  127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \\
+  127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005 \\
+  --cluster-replicas 1
+
+# 查看集群状态
+redis-cli -c -h 127.0.0.1 -p 7000 cluster info
+
+# 添加节点
+redis-cli --cluster add-node 127.0.0.1:7006 127.0.0.1:7000
+
+# 重新分片
+redis-cli --cluster reshard 127.0.0.1:7000
+```
+
+### 集群故障处理
+
+| 故障类型 | 现象 | 处理方式 |
+|----------|------|----------|
+| 主节点故障 | 从节点提升 | 自动故障转移 |
+| 从节点故障 | 只读不可用 | 检查复制 |
+| 网络分区 | 部分节点不可用 | 等待恢复 |
+| 数据不一致 | key 冲突 | 修复数据 |
+
+---
+
+## 二十八、Redis 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| used_memory | 内存使用 | > maxmemory 80% |
+| connected_clients | 客户端连接数 | > maxclients 80% |
+| rejected_connections | 拒绝连接数 | > 0 |
+| instantaneous_ops_per_sec | 每秒操作数 | > 阈值 |
+| hit_rate | 命中率 | < 90% |
+| latest_fork_usec | fork 耗时 | > 1s |
+
+### 监控脚本
+
+```python
+import redis
+import time
+
+r = redis.Redis()
+
+def monitor_redis():
+    while True:
+        info = r.info()
+        used_memory = info['used_memory']
+        max_memory = info.get('maxmemory', float('inf'))
+        if used_memory > max_memory * 0.8:
+            alert(f"内存使用过高: {used_memory/max_memory*100:.1f}%")
+        hits = info['keyspace_hits']
+        misses = info['keyspace_misses']
+        hit_rate = hits / (hits + misses) * 100
+        if hit_rate < 90:
+            alert(f"命中率过低: {hit_rate:.1f}%")
+        time.sleep(10)
+```
+
+---
+
+## 二十九、Redis 性能调优
+
+### 调优清单
+
+| 调优项 | 配置 | 效果 |
+|--------|------|------|
+| 禁用危险命令 | rename-command | 安全 |
+| 调整 maxmemory-policy | allkeys-lru | 内存优化 |
+| 启用tcp-keepalive | tcp-keepalive 60 | 连接稳定 |
+| 调整 timeout | timeout 300 | 释放连接 |
+| 启用 lazyfree | lazyfree yes | 异步删除 |
+| 调整 hz | hz 10 | 定时任务频率 |
+
+### 性能测试
+
+```bash
+redis-benchmark -h 127.0.0.1 -p 6379 -c 50 -n 100000 -d 256
+```
+
+---
+
+## 三十、Redis 最佳实践
+
+### 开发最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| 使用连接池 | 复用连接 | 减少开销 |
+| 批量操作 | Pipeline/MGET | 减少网络往返 |
+| 合理设置过期 | 避免内存溢出 | 自动清理 |
+| 避免大 key | 拆分大对象 | 避免阻塞 |
+| 使用合适数据结构 | 选择最优结构 | 节省内存 |
+| 监控慢查询 | 分析性能瓶颈 | 持续优化 |
+
+### 运维最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| 定期备份 | RDB/AOF | 数据安全 |
+| 主从分离 | 读写分离 | 提升性能 |
+| 集群部署 | 分布式 | 高可用 |
+| 监控告警 | 实时监控 | 及时发现问题 |
+| 滚动升级 | 零停机 | 高可用 |
 
 ### 15.1 bigkey / hotkey 线上定位与治理全流程
 
@@ -1778,3 +2025,562 @@ redis-cli --latency
   需要新特性 → Redis 7.x
   需要稳定性 → Redis 6.x
 ```
+
+---
+
+## Redis 持久化机制详解
+
+### RDB vs AOB 对比
+
+| 维度 | RDB | AOF | 混合模式 |
+|------|-----|-----|----------|
+| 触发方式 | 定时快照 | 每条命令追加 | RDB+AOF |
+| 恢复速度 | 快 | 慢 | 中 |
+| 数据安全 | 可能丢失 | 基本不丢 | 基本不丢 |
+| 文件大小 | 小 | 大 | 中 |
+| CPU 开销 | 低 | 中 | 中 |
+| 适用场景 | 备份/快照 | 数据安全 | 生产推荐 |
+
+### RDB 配置
+
+```bash
+# redis.conf
+# RDB 快照配置
+save 900 1        # 900秒内1次修改
+save 300 10       # 300秒内10次修改
+save 60 10000     # 60秒内10000次修改
+
+# 压缩配置
+rdbcompression yes
+rdbchecksum yes
+
+# 文件名
+dbfilename dump.rdb
+
+# 工作目录
+dir /var/lib/redis
+```
+
+### AOF 配置
+
+```bash
+# redis.conf
+# AOF 配置
+appendonly yes
+appendfilename "appendonly.aof"
+
+# 同步策略
+appendfsync everysec    # 每秒同步（推荐）
+# appendfsync always    # 每次写同步
+# appendfsync no        # 由OS决定
+
+# AOF 重写配置
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# 混合持久化（Redis 4.0+）
+aof-use-rdb-preamble yes
+```
+
+### 持久化最佳实践
+
+```bash
+# 生产环境推荐配置
+# 1. 开启混合持久化
+aof-use-rdb-preamble yes
+
+# 2. AOF 同步策略
+appendfsync everysec
+
+# 3. AOF 重写控制
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# 4. 备份策略
+# 每天凌晨执行 RDB 快照
+0 0 * * * redis-cli bgsave
+
+# 5. 备份验证
+redis-cli lastsave
+```
+
+---
+
+## Redis 内存优化策略
+
+### 内存分析
+
+```bash
+# 查看内存使用
+redis-cli info memory
+
+# 分析大 key
+redis-cli --bigkeys
+
+# 内存分析
+redis-cli memory usage <key>
+
+# 内存统计
+redis-cli memory stats
+```
+
+### 内存优化技巧
+
+| 技巧 | 效果 | 适用场景 |
+|------|------|----------|
+| 使用 Hash | 节省 50%+ | 对象存储 |
+| 使用 ziplist | 节省 70%+ | 小列表/集合 |
+| 使用 intset | 节省 80%+ | 整数集合 |
+| 压缩 value | 节省 30-50% | 大文本 |
+| 设置过期 | 自动清理 | 缓存数据 |
+| 使用共享对象 | 节省内存 | 小整数 |
+
+### 内存优化代码
+
+```python
+# Redis 内存优化示例
+import redis
+import json
+import zlib
+
+r = redis.Redis()
+
+# 1. 使用 Hash 存储对象
+def store_user_hash(user_id, user_data):
+    key = f"user:{user_id}"
+    r.hset(key, mapping=user_data)
+    r.expire(key, 3600)
+
+# 2. 压缩大 value
+def store_compressed(key, data):
+    compressed = zlib.compress(json.dumps(data).encode())
+    r.set(key, compressed)
+
+def get_compressed(key):
+    compressed = r.get(key)
+    if compressed:
+        return json.loads(zlib.decompress(compressed))
+    return None
+
+# 3. 使用 HyperLogLog 统计
+def count_unique_users(user_ids):
+    for uid in user_ids:
+        r.pfadd("unique_users", uid)
+    return r.pfcount("unique_users")
+```
+
+### 内存碎片处理
+
+```bash
+# 查看碎片率
+redis-cli info memory | grep mem_fragmentation_ratio
+
+# 碎片率说明
+# mem_fragmentation_ratio > 1.5: 碎片严重
+# mem_fragmentation_ratio < 1.0: 使用了swap
+
+# 启用自动碎片整理
+redis-cli config set activedefrag yes
+
+# 手动碎片整理
+redis-cli memory purge
+```
+
+---
+
+## Redis 事务与 Lua 脚本
+
+### 事务命令
+
+```bash
+# 事务基本用法
+MULTI
+SET key1 value1
+SET key2 value2
+EXEC
+
+# 事务取消
+MULTI
+SET key1 value1
+DISCARD
+
+# 乐观锁
+WATCH key1
+MULTI
+SET key1 newvalue
+EXEC
+# 如果 key1 被修改，EXEC 返回 nil
+```
+
+### Lua 脚本
+
+```lua
+-- 原子操作：扣减库存
+local stock = tonumber(redis.call('get', KEYS[1]))
+if stock and stock >= tonumber(ARGV[1]) then
+    redis.call('decrby', KEYS[1], ARGV[1])
+    return 1
+else
+    return 0
+end
+```
+
+```python
+# 执行 Lua 脚本
+import redis
+
+r = redis.Redis()
+
+# 注册 Lua 脚本
+DEDUCT_STOCK = """
+local stock = tonumber(redis.call('get', KEYS[1]))
+if stock and stock >= tonumber(ARGV[1]) then
+    redis.call('decrby', KEYS[1], ARGV[1])
+    return 1
+else
+    return 0
+end
+"""
+
+# 执行
+script = r.register_script(DEDUCT_STOCK)
+result = script(keys=['product:1001:stock'], args=[2])
+print(f"扣减结果: {result}")
+```
+
+### 事务 vs Lua 脚本
+
+| 维度 | 事务 | Lua 脚本 |
+|------|------|----------|
+| 原子性 | 部分原子 | 完全原子 |
+| 性能 | 高 | 中 |
+| 复杂度 | 低 | 中 |
+| 适用场景 | 简单原子操作 | 复杂业务逻辑 |
+| 调试 | 简单 | 较复杂 |
+
+---
+
+## Redis Pub/Sub 与 Streams
+
+### Pub/Sub 对比 Streams
+
+| 维度 | Pub/Sub | Streams |
+|------|---------|---------|
+| 消息持久化 | 不支持 | 支持 |
+| 消息回溯 | 不支持 | 支持 |
+| 消费者组 | 不支持 | 支持 |
+| 消息确认 | 不支持 | 支持 |
+| 消息积压 | 丢失 | 保留 |
+| 适用场景 | 实时通知 | 消息队列 |
+
+### Streams 基本操作
+
+```bash
+# 添加消息
+XADD mystream * field1 value1 field2 value2
+
+# 读取消息
+XREAD COUNT 10 STREAMS mystream 0
+
+# 消费者组
+XGROUP CREATE mystream mygroup 0
+XREADGROUP GROUP mygroup consumer1 COUNT 1 STREAMS mystream >
+
+# 确认消息
+XACK mystream mygroup 1234567890-0
+
+# 查看未确认消息
+XPENDING mystream mygroup
+```
+
+### Streams 消费者组
+
+```python
+import redis
+
+r = redis.Redis()
+
+# 创建消费者组
+r.xgroup_create("mystream", "mygroup", 0, mkstream=True)
+
+# 消费消息
+while True:
+    messages = r.xreadgroup(
+        "mygroup", "consumer1",
+        {"mystream": ">"},
+        count=10,
+        block=5000
+    )
+    for stream_name, msgs in messages:
+        for msg_id, data in msgs:
+            # 处理消息
+            process(data)
+            # 确认消息
+            r.xack("mystream", "mygroup", msg_id)
+```
+
+---
+
+## Redis 安全配置
+
+### 安全配置清单
+
+| 配置项 | 默认值 | 推荐值 | 说明 |
+|--------|--------|--------|------|
+| requirepass | 无 | 强密码 | 密码认证 |
+| bind | 127.0.0.1 | 内网IP | 绑定地址 |
+| protected-mode | yes | yes | 保护模式 |
+| rename-command | 无 | 禁用危险命令 | 命令重命名 |
+| timeout | 0 | 300 | 空闲超时 |
+| maxmemory | 无 | 物理内存70% | 内存限制 |
+
+### 安全配置
+
+```bash
+# redis.conf
+# 密码认证
+requirepass your_strong_password_here
+
+# 绑定地址
+bind 127.0.0.1 10.0.0.1
+
+# 禁用危险命令
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command CONFIG "CONFIG_b82c7f3a"
+rename-command DEBUG ""
+
+# TLS 加密
+tls-port 6380
+tls-cert-file /path/to/redis.crt
+tls-key-file /path/to/redis.key
+tls-ca-cert-file /path/to/ca.crt
+```
+
+---
+
+## Redis 7.x 新特性
+
+### 新特性概览
+
+| 特性 | 说明 | 适用场景 |
+|------|------|----------|
+| Functions | 服务端 Lua 函数 | 复杂业务逻辑 |
+| Shared Pub/Sub | 共享订阅 | 集群消息 |
+| ACL v2 | 增强权限控制 | 多租户 |
+| Client-side Caching | 客户端缓存 | 高性能 |
+| Wait AOF | 等待 AOF 写入 | 数据安全 |
+| Multi-part AOF | 多文件 AOF | 性能优化 |
+
+### Functions 示例
+
+```lua
+-- 定义函数
+#!lua name=mylib
+
+local function my_hset(keys, args)
+    local hash = keys[1]
+    local field = args[1]
+    local value = args[2]
+    return redis.call('hset', hash, field, value)
+end
+
+redis.register_function('my_hset', my_hset)
+```
+
+```bash
+# 加载函数
+cat mylib.lua | redis-cli -x FUNCTION LOAD REPLACE
+
+# 调用函数
+FCALL my_hset 1 myhash field1 value1
+```
+
+### Client-side Caching
+
+```python
+import redis
+
+r = redis.Redis()
+
+# 启用客户端缓存
+r.client_tracking(on=True)
+
+# 获取数据（自动缓存）
+value = r.get("mykey")
+
+# 服务端更新时自动失效
+r.set("mykey", "newvalue")
+# 客户端缓存自动失效
+```
+
+---
+
+## Redis 集群运维
+
+### 集群管理命令
+
+```bash
+# 创建集群
+redis-cli --cluster create \\
+  127.0.0.1:7000 \\
+  127.0.0.1:7001 \\
+  127.0.0.1:7002 \\
+  127.0.0.1:7003 \\
+  127.0.0.1:7004 \\
+  127.0.0.1:7005 \\
+  --cluster-replicas 1
+
+# 查看集群状态
+redis-cli -c -h 127.0.0.1 -p 7000 cluster info
+
+# 查看集群节点
+redis-cli -c -h 127.0.0.1 -p 7000 cluster nodes
+
+# 添加节点
+redis-cli --cluster add-node 127.0.0.1:7006 127.0.0.1:7000
+
+# 删除节点
+redis-cli --cluster del-node 127.0.0.1:7000 <node-id>
+
+# 重新分片
+redis-cli --cluster reshard 127.0.0.1:7000
+```
+
+### 集群故障处理
+
+| 故障类型 | 现象 | 处理方式 |
+|----------|------|----------|
+| 主节点故障 | 从节点提升 | 自动故障转移 |
+| 从节点故障 | 只读不可用 | 检查复制 |
+| 网络分区 | 部分节点不可用 | 等待恢复 |
+| 数据不一致 | key 冲突 | 修复数据 |
+| 集群 down | 全部不可用 | 检查配置 |
+
+### 集群监控
+
+```bash
+# 监控脚本
+#!/bin/bash
+# 检查集群状态
+redis-cli -c -h 127.0.0.1 -p 7000 cluster info | grep cluster_state
+
+# 检查节点状态
+redis-cli -c -h 127.0.0.1 -p 7000 cluster nodes | grep fail
+
+# 检查内存使用
+for port in 7000 7001 7002 7003 7004 7005; do
+  echo "Port $port:"
+  redis-cli -h 127.0.0.1 -p $port info memory | grep used_memory_human
+done
+```
+
+---
+
+## Redis 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| used_memory | 内存使用 | > maxmemory 80% |
+| connected_clients | 客户端连接数 | > maxclients 80% |
+| rejected_connections | 拒绝连接数 | > 0 |
+| instantaneous_ops_per_sec | 每秒操作数 | > 阈值 |
+| hit_rate | 命中率 | < 90% |
+| latest_fork_usec | fork 耗时 | > 1s |
+| connected_slaves | 从节点数 | < 预期数 |
+
+### 监控脚本
+
+```python
+import redis
+import time
+
+r = redis.Redis()
+
+def monitor_redis():
+    while True:
+        info = r.info()
+        
+        # 内存监控
+        used_memory = info['used_memory']
+        max_memory = info.get('maxmemory', float('inf'))
+        if used_memory > max_memory * 0.8:
+            alert(f"内存使用过高: {used_memory/max_memory*100:.1f}%")
+        
+        # 命中率监控
+        hits = info['keyspace_hits']
+        misses = info['keyspace_misses']
+        hit_rate = hits / (hits + misses) * 100
+        if hit_rate < 90:
+            alert(f"命中率过低: {hit_rate:.1f}%")
+        
+        # 连接数监控
+        clients = info['connected_clients']
+        max_clients = info.get('maxclients', 10000)
+        if clients > max_clients * 0.8:
+            alert(f"连接数过高: {clients}/{max_clients}")
+        
+        time.sleep(10)
+
+def alert(message):
+    print(f"[ALERT] {message}")
+    # 发送告警通知
+```
+
+---
+
+## Redis 性能调优
+
+### 性能调优清单
+
+| 调优项 | 配置 | 效果 |
+|--------|------|------|
+| 禁用危险命令 | rename-command | 安全 |
+| 调整 maxmemory-policy | allkeys-lru | 内存优化 |
+| 启用tcp-keepalive | tcp-keepalive 60 | 连接稳定 |
+| 调整 timeout | timeout 300 | 释放连接 |
+| 启用 lazyfree | lazyfree yes | 异步删除 |
+| 调整 hz | hz 10 | 定时任务频率 |
+
+### 性能测试
+
+```bash
+# 使用 redis-benchmark 测试
+redis-benchmark -h 127.0.0.1 -p 6379 -c 50 -n 100000 -d 256
+
+# 测试结果分析
+# 1. QPS: 每秒查询数
+# 2. 延迟: P50, P99, P999
+# 3. 吞吐量: MB/s
+
+# 自定义测试
+redis-benchmark -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset -n 100000 -q
+```
+
+---
+
+## Redis 最佳实践
+
+### 开发最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| 使用连接池 | 复用连接 | 减少开销 |
+| 批量操作 | Pipeline/MGET | 减少网络往返 |
+| 合理设置过期 | 避免内存溢出 | 自动清理 |
+| 避免大 key | 拆分大对象 | 避免阻塞 |
+| 使用合适数据结构 | 选择最优结构 | 节省内存 |
+| 监控慢查询 | 分析性能瓶颈 | 持续优化 |
+
+### 运维最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| 定期备份 | RDB/AOF | 数据安全 |
+| 主从分离 | 读写分离 | 提升性能 |
+| 集群部署 | 分布式 | 高可用 |
+| 监控告警 | 实时监控 | 及时发现问题 |
+| 滚动升级 | 零停机 | 高可用 |
+| 定期演练 | 故障演练 | 提升容灾能力 |

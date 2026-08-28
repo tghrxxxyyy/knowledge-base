@@ -1756,16 +1756,320 @@ optimization:
 
 > 核心原则：**Watermark策略精准，RocksDB调优到位，CDC实时同步，SQL性能优化，K8s弹性部署，监控告警完善**。
 
-        processedCount.inc();
-        latency.update(System.currentTimeMillis() - event.getTimestamp());
-        return event;
-    }
-}
+---
+
+## 二十四、Watermark 策略详解
+
+### Watermark 类型
+
+| 类型 | 说明 | 适用场景 | 代码示例 |
+|------|------|----------|----------|
+| 周期性 | 定时生成 | 通用 | forBoundedOutOfOrderness |
+| 递增式 | 递增时间戳 | 无乱序 | forMonotonousTimestamps |
+| 乱序容忍 | 允许乱序 | 事件流 | withTimestampAssigner |
+
+### Watermark 配置
+
+```java
+// 乱序容忍 Watermark
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((event, timestamp) -> event.getTimestamp());
+
+// 递增式 Watermark
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .<Event>forMonotonousTimestamps()
+    .withTimestampAssigner((event, timestamp) -> event.getTimestamp());
+
+// 应用到流
+DataStream<Event> stream = input
+    .assignTimestampsAndWatermarks(strategy);
 ```
 
-- 批处理对比见「[07-批处理计算：MapReduce与Spark](07-批处理计算：MapReduce与Spark.md)」；
-- 实时数仓见「[11-实时数仓与湖仓一体](11-实时数仓与湖仓一体.md)」；
-- Flink 中间件深挖见「[中间件/ApacheFlink流处理](../中间件/ApacheFlink流处理.md)」；
-- 调度部署见「[10-资源调度：YARN与Kubernetes](10-资源调度：YARN与Kubernetes.md)」。
+### Watermark 传递
 
-> 一句话：**Flink = 事件时间（Event Time + Watermark）+ 窗口（滚动/滑动/会话）+ 状态（RocksDB + TTL）+ Checkpoint（Chandy-Lamport barrier → Exactly-Once）——生产四守则：Watermark 按 P99 迟到调、状态后端按规模选、端到端精确一次靠 Sink 事务/幂等、反压先看 UI 红算子**。
+```mermaid
+graph LR
+    A[Source] -->|Watermark| B[Map]
+    B -->|Watermark| C[Filter]
+    C -->|Watermark| D[Window]
+    D -->|Watermark| E[Sink]
+    style A fill:#99ccff
+    style B fill:#99ccff
+    style C fill:#99ccff
+    style D fill:#99ff99
+    style E fill:#99ff99
+```
+
+---
+
+## 二十五、RocksDB 状态后端
+
+### RocksDB 配置
+
+```java
+// RocksDB 状态后端配置
+RocksDBStateBackend rocksDB = new RocksDBStateBackend("hdfs:///flink/rocksdb", true);
+
+// 配置选项
+Configuration config = new Configuration();
+config.setBoolean("state.backend.rocksdb.memory.managed", true);
+config.setLong("state.backend.rocksdb.block.cache-size", 256 * 1024 * 1024L);
+config.setInteger("state.backend.rocksdb.writebuffer.count", 4);
+config.setLong("state.backend.rocksdb.writebuffer.size", 64 * 1024 * 1024L);
+```
+
+### RocksDB 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| state.backend.rocksdb.memory.managed | true | true | 内存管理 |
+| state.backend.rocksdb.block.cache-size | 256MB | 512MB | 缓存大小 |
+| state.backend.rocksdb.writebuffer.count | 2 | 4 | 写缓冲数 |
+| state.backend.rocksdb.writebuffer.size | 64MB | 128MB | 写缓冲大小 |
+| state.backend.rocksdb.compaction.style | LEVEL | LEVEL | 压缩策略 |
+
+---
+
+## 二十六、CDC 实时同步
+
+### CDC 工具对比
+
+| 工具 | 数据库 | 延迟 | 特点 |
+|------|--------|------|------|
+| Debezium | MySQL/PG | 毫秒级 | 功能丰富 |
+| Canal | MySQL | 毫秒级 | 阿里开源 |
+| Flink CDC | 多种 | 毫秒级 | Flink原生 |
+| Maxwell | MySQL | 毫秒级 | 轻量级 |
+
+### Flink CDC 示例
+
+```java
+// MySQL CDC Source
+MySqlSource<String> mySqlSource = MySqlSource.<String>builder()
+    .hostname("localhost")
+    .port(3306)
+    .databaseList("mydb")
+    .tableList("mydb.users")
+    .username("root")
+    .password("password")
+    .deserializer(new CustomerDeserializer())
+    .build();
+
+// 应用到流
+DataStream<String> stream = env
+    .fromSource(mySqlSource, WatermarkStrategy.noWatermarks(), "MySQL Source");
+```
+
+---
+
+## 二十七、Flink SQL 调优
+
+### SQL 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| table.exec.resource.default-parallelism | 1 | 按需 | 并行度 |
+| table.exec.state.ttl | 0 | 86400000 | 状态TTL |
+| table.exec.mini-batch.enabled | false | true | 微批处理 |
+| table.exec.mini-batch.allow-latency | 0 | 5s | 微批延迟 |
+| table.exec.mini-batch.size | 0 | 1000 | 微批大小 |
+
+### SQL 调优示例
+
+```sql
+-- 启用微批处理
+SET table.exec.mini-batch.enabled = true;
+SET table.exec.mini-batch.allow-latency = '5s';
+SET table.exec.mini-batch.size = 1000;
+
+-- 状态TTL
+SET table.exec.state.ttl = 86400000;
+
+-- 并行度
+SET table.exec.resource.default-parallelism = 8;
+```
+
+---
+
+## 二十八、Flink on K8s
+
+### K8s 部署模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| Session | 共享集群 | 开发测试 |
+| Application | 独立应用 | 生产环境 |
+| Reactive | 响应式 | 动态资源 |
+
+### K8s 部署配置
+
+```yaml
+# flink-config.yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-flink-app
+spec:
+  image: flink:1.17
+  flinkVersion: v1_17
+  serviceAccount: flink
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+    replicas: 3
+  job:
+    jarURI: local:///opt/flink/examples/streaming/WordCount.jar
+    parallelism: 8
+    upgradeMode: last-state
+```
+
+---
+
+## 二十九、Flink 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 作业延迟 | 处理延迟 | >1s |
+| Checkpoint时间 | 检查点耗时 | >5min |
+| Checkpoint失败 | 检查点失败 | >0 |
+| 反压 | 反压算子 | 存在反压 |
+| 消费延迟 | 消费者延迟 | >1000条 |
+
+### 监控配置
+
+```yaml
+# Prometheus 配置
+metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
+metrics.reporter.prom.port: 9249
+
+# Grafana 仪表板
+# Flink Dashboard: 18526
+# Flink Metrics: 14541
+```
+
+---
+
+## 三十、Exactly-Once 实现
+
+### 端到端 Exactly-Once
+
+| 组件 | 语义 | 实现方式 |
+|------|------|----------|
+| Source | At-Least-Once | 重放 |
+| Processor | Exactly-Once | Checkpoint |
+| Sink | Exactly-Once | 事务/幂等 |
+
+### Sink 事务配置
+
+```java
+// Kafka Sink 事务
+KafkaSink<String> sink = KafkaSink.<String>builder()
+    .setBootstrapServers("localhost:9092")
+    .setRecordSerializer(...)
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-")
+    .build();
+
+// JDBC Sink 事务
+JdbcSink.sink(
+    "INSERT INTO users (id, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = ?",
+    (ps, user) -> {
+        ps.setInt(1, user.getId());
+        ps.setString(2, user.getName());
+        ps.setString(3, user.getName());
+    },
+    JdbcExecutionOptions.builder()
+        .withBatchSize(1000)
+        .build()
+);
+```
+
+---
+
+## 三十一、Savepoint 管理
+
+### Savepoint 操作
+
+```bash
+# 触发Savepoint
+bin/flink savepoint <jobId> hdfs:///flink/savepoints
+
+# 从Savepoint恢复
+bin/flink run -s hdfs:///flink/savepoints/savepoint-123456 -c com.example.Main my-app.jar
+
+# 取消作业并触发Savepoint
+bin/flink cancel -s hdfs:///flink/savepoints <jobId>
+```
+
+### Savepoint 最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| 定期触发 | 周期性Savepoint | 快速恢复 |
+| 停机触发 | 停机前触发 | 平滑升级 |
+| 验证恢复 | 测试恢复流程 | 确保可用 |
+| 清理旧Savepoint | 删除旧Savepoint | 节省存储 |
+
+---
+
+## 三十二、Flink 故障排查
+
+### 常见故障
+
+| 故障 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| Checkpoint失败 | 查看失败原因 | 调整超时/重试 |
+| 反压 | 查看反压算子 | 优化算子/增加资源 |
+| 延迟高 | 查看Watermark | 调整Watermark策略 |
+| 状态膨胀 | 查看状态大小 | 设置TTL/优化状态 |
+| OOM | 查看内存使用 | 增加内存/调整配置 |
+
+### 排查工具
+
+```bash
+# 查看作业状态
+bin/flink list
+
+# 查看作业详情
+bin/flink list -r
+
+# 取消作业
+bin/flink cancel <jobId>
+
+# 使用Arthas诊断
+java -jar arthas-boot.jar
+# dashboard  # 查看线程和内存
+# thread -n 3  # 查看最忙线程
+```
+
+---
+
+## 三十三、Flink 最佳实践
+
+### 开发最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| 使用状态 | 利用State | 恢复性 |
+| 合理分区 | 避免热点 | 性能 |
+| 幂等设计 | 重复处理 | 正确性 |
+| 资源隔离 | TaskSlot | 稳定性 |
+| 异步IO | 非阻塞 | 性能 |
+
+### 生产最佳实践
+
+| 实践 | 说明 | 原因 |
+|------|------|------|
+| Checkpoint | 定期检查点 | 恢复性 |
+| 监控告警 | 完善监控 | 及时发现 |
+| 容量规划 | 合理资源 | 稳定性 |
+| 版本管理 | 版本兼容 | 平滑升级 |
+| 定期演练 | 故障演练 | 容灾能力 |

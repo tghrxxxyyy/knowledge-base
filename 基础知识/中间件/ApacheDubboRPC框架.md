@@ -886,7 +886,343 @@ dubbo:
 
 ---
 
-## 九、Dubbo Filter 机制（拦截器/扩展点）
+## Dubbo 负载均衡策略
+
+### 策略对比
+
+| 策略 | 说明 | 适用场景 | 配置 |
+|------|------|----------|------|
+| random | 随机（默认） | 通用场景 | loadbalance=random |
+| roundRobin | 轮询 | 节点性能一致 | loadbalance=roundRobin |
+| leastActive | 最少活跃 | 慢节点规避 | loadbalance=leastActive |
+| consistentHash | 一致性哈希 | 有状态服务 | loadbalance=consistentHash |
+| shortestResponse | 最短响应 | 低延迟优先 | loadbalance=shortestResponse |
+
+### 负载均衡配置
+
+```java
+// 服务端配置
+@DubboService(loadbalance = "roundRobin")
+public class UserServiceImpl implements UserService {
+    // ...
+}
+
+// 客户端配置
+@DubboReference(loadbalance = "leastActive")
+private UserService userService;
+
+// 配置文件方式
+dubbo:
+  consumer:
+    loadbalance: roundRobin
+  provider:
+    loadbalance: roundRobin
+```
+
+### 一致性哈希原理
+
+```mermaid
+graph TB
+    A[请求] --> B{一致性哈希环}
+    B --> C[节点A]
+    B --> D[节点B]
+    B --> E[节点C]
+    B --> F[虚拟节点]
+    style B fill:#ffcc99
+    style C fill:#99ccff
+    style D fill:#99ccff
+    style E fill:#99ccff
+    style F fill:#99ff99
+```
+
+---
+
+## Dubbo 超时与重试机制
+
+### 超时配置
+
+| 配置层级 | 参数 | 说明 |
+|----------|------|------|
+| 消费者 | timeout | 消费者超时 |
+| 提供者 | timeout | 提供者超时 |
+| 方法级 | methods.timeout | 特定方法超时 |
+| 全局 | dubbo.consumer.timeout | 全局默认 |
+
+### 重试配置
+
+```java
+// 消费者配置
+@DubboReference(timeout = 5000, retries = 3)
+private UserService userService;
+
+// 提供者配置
+@DubboService(timeout = 5000)
+public class UserServiceImpl implements UserService {
+    // ...
+}
+
+// 幂等性考虑
+// GET/查询：可以重试
+// POST/UPDATE：需要幂等设计
+// DELETE：可以重试
+```
+
+### 超时链路
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant P as Provider
+    C->>P: 调用请求
+    Note right of P: timeout=5000ms
+    P-->>C: 响应
+    alt 超时
+        Note left of C: 重试(最多3次)
+    end
+```
+
+---
+
+## Dubbo 集群容错
+
+### 容错策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| failover | 失败自动切换 | 读操作 |
+| failfast | 快速失败 | 写操作 |
+| failsafe | 失败安全 | 日志记录 |
+| failback | 失败自动恢复 | 通知操作 |
+| forking | 并行调用 | 高可用场景 |
+
+### 容错配置
+
+```java
+// 消费者配置
+@DubboReference(cluster = "failover", retries = 2)
+private UserService userService;
+
+// 提供者配置
+@DubboService(cluster = "failfast")
+public class UserServiceImpl implements UserService {
+    // ...
+}
+```
+
+---
+
+## Dubbo 路由规则
+
+### 路由类型
+
+| 路由类型 | 说明 | 适用场景 |
+|----------|------|----------|
+| 条件路由 | 基于条件表达式 | 简单路由 |
+| 脚本路由 | 基于脚本 | 复杂路由 |
+| 标签路由 | 基于标签 | 灰度发布 |
+| 动态路由 | 动态变更 | 实时调整 |
+
+### 路由配置
+
+```yaml
+# 条件路由
+conditions:
+  - force: false
+    runtime: false
+    conditions:
+      - "arguments[0].version == '1.0' => address != '10.20.153.10'"
+    key: com.example.UserService
+    value: "10.20.153.10"
+
+# 标签路由
+tags:
+  - name: gray
+    addresses:
+      - "10.20.153.11"
+    force: false
+    enabled: true
+```
+
+---
+
+## Dubbo 三方协议（Triple）
+
+### Triple 协议特性
+
+| 特性 | Dubbo协议 | Triple协议 | 说明 |
+|------|-----------|------------|------|
+| 传输层 | TCP | HTTP/2 | 穿透性 |
+| 序列化 | Hessian2 | Protobuf | 跨语言 |
+| 流式 | 不支持 | 支持 | 双向流 |
+| 网关 | 需适配 | 原生支持 | 网关穿透 |
+| 兼容性 | 仅Dubbo | gRPC兼容 | 互操作 |
+
+### Triple 使用示例
+
+```protobuf
+// triple.proto
+syntax = "proto3";
+package com.example;
+option java_package = "com.example";
+
+service UserService {
+    rpc GetUser (GetUserRequest) returns (User);
+    rpc ListUsers (ListUsersRequest) returns (stream User);
+}
+```
+
+```java
+// Triple 服务端
+@DubboService(protocol = "tri")
+public class UserServiceImpl extends UserServiceTriple.UserServiceImplBase {
+    @Override
+    public User getUser(GetUserRequest request) {
+        return User.newBuilder().setName("test").build();
+    }
+}
+
+// Triple 客户端
+@DubboReference(protocol = "tri")
+private UserService userService;
+```
+
+---
+
+## Dubbo 云原生支持
+
+### 应用级服务发现
+
+| 维度 | 接口级 | 应用级 |
+|------|--------|--------|
+| 注册量 | 多（接口×方法） | 少（仅应用） |
+| 性能 | 低 | 高 |
+| 兼容性 | 好 | 需改造 |
+| 适用 | 传统架构 | 云原生 |
+
+### Dubbo Mesh
+
+```mermaid
+graph TB
+    subgraph 应用层
+        A1[Consumer App]
+        A2[Provider App]
+    end
+    subgraph Sidecar
+        S1[Envoy]
+        S2[Envoy]
+    end
+    subgraph 控制面
+        C1[Dubbo Control]
+    end
+    A1 --> S1
+    A2 --> S2
+    S1 <--> S2
+    C1 --> S1
+    C1 --> S2
+    style A1 fill:#99ccff
+    style A2 fill:#99ccff
+    style S1 fill:#99ff99
+    style S2 fill:#99ff99
+    style C1 fill:#ffcc99
+```
+
+---
+
+## Dubbo 线程模型
+
+### 线程池配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| threads | 200 | 线程池大小 |
+| queues | 0 | 队列大小 |
+| threadpool | fixed | 线程池类型 |
+| iothreads | CPU+1 | IO线程数 |
+
+### 线程模型配置
+
+```yaml
+dubbo:
+  protocol:
+    name: dubbo
+    port: 20880
+    threads: 200
+    threadpool: fixed
+    queues: 0
+  provider:
+    dispatcher: message
+    threadpool: fixed
+    threads: 200
+```
+
+---
+
+## Dubbo 监控与运维
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 调用次数 | 成功/失败次数 | 失败率>1% |
+| 响应时间 | P50/P99/P999 | P99>1s |
+| 活跃线程数 | 当前线程使用 | >80% |
+| 连接数 | 消费者连接 | >1000 |
+| 注册中心 | 注册/订阅状态 | 异常 |
+
+### 监控配置
+
+```yaml
+dubbo:
+  metrics:
+    enabled: true
+    port: 22222
+    protocol: prometheus
+```
+
+---
+
+## Dubbo 排查指南
+
+### 常见问题排查
+
+| 问题 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 服务调用超时 | 检查网络/线程池 | 增加超时/优化服务 |
+| 注册失败 | 检查注册中心 | 检查配置/网络 |
+| 反序列化异常 | 检查序列化配置 | 统一序列化方式 |
+| 连接拒绝 | 检查端口/防火墙 | 开放端口 |
+| 内存溢出 | 检查线程池 | 调整线程数 |
+
+### 排查命令
+
+```bash
+# 检查Dubbo服务
+dubbo list
+
+# 检查注册中心
+dubbo registry list
+
+# 检查服务状态
+dubbo status
+
+# 检查线程池
+dubbo thread pool status
+```
+
+---
+
+## Dubbo 最佳实践
+
+| 类别 | 最佳实践 | 原因 |
+|------|----------|------|
+| 接口设计 | 粗粒度接口 | 减少网络开销 |
+| 序列化 | Protobuf/Kryo | 高性能 |
+| 超时设置 | 合理超时 | 避免线程堆积 |
+| 重试策略 | 幂等性考虑 | 避免重复操作 |
+| 负载均衡 | 根据场景选择 | 最优性能 |
+| 集群容错 | 合理配置 | 高可用 |
+| 监控告警 | 完善监控 | 及时发现问题 |
+| 版本管理 | 版本兼容 | 平滑升级 |
 
 Dubbo 的 Filter 是请求处理链的拦截器，类似 Servlet Filter / Spring Interceptor：
 

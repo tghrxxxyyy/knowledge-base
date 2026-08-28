@@ -1206,7 +1206,387 @@ Executor 内存布局：
 
 ---
 
-## 八、Spark 生产配置清单
+## 二十三、Shuffle 管理
+
+### Shuffle 架构
+
+```mermaid
+graph TB
+    subgraph Map
+        M1[Map Task 1]
+        M2[Map Task 2]
+        M3[Map Task 3]
+    end
+    subgraph Shuffle
+        S1[Shuffle Write]
+        S2[Shuffle Read]
+        S3[Sort/Merge]
+    end
+    subgraph Reduce
+        R1[Reduce Task 1]
+        R2[Reduce Task 2]
+    end
+    M1 --> S1
+    M2 --> S1
+    M3 --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 --> R1
+    S3 --> R2
+    style S1 fill:#ffcc99
+    style S2 fill:#99ccff
+    style S3 fill:#99ff99
+```
+
+### Shuffle 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| spark.sql.shuffle.partitions | 200 | 数据量/128MB | 分区数 |
+| spark.shuffle.compress | true | true | 压缩 |
+| spark.shuffle.spill.compress | true | true | 溢出压缩 |
+| spark.reducer.maxSizeInFlight | 48m | 96m | 读缓冲 |
+| spark.shuffle.file.buffer | 32k | 64k | 写缓冲 |
+
+---
+
+## 二十四、数据倾斜处理
+
+### 倾斜检测
+
+```sql
+-- 检测数据倾斜
+SELECT key, COUNT(*) as cnt
+FROM data
+GROUP BY key
+ORDER BY cnt DESC
+LIMIT 10;
+
+-- 输出示例：
+-- key    | cnt
+-- -------+-------
+-- normal | 1000
+-- skew   | 1000000  -- 倾斜key
+```
+
+### 倾斜解决方案
+
+| 方案 | 说明 | 适用场景 |
+|------|------|----------|
+| Salting | 加盐分散key | 倾斜不严重 |
+| 两阶段聚合 | 先局部聚合 | 可聚合场景 |
+| 广播Join | 小表广播 | 大小表Join |
+| 自适应合并 | AQE自动处理 | Spark 3.0+ |
+
+### Salting 实现
+
+```python
+# Salting 处理数据倾斜
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("skew").getOrCreate()
+
+# 添加随机后缀
+df_with_salt = df.withColumn(
+    "salted_key",
+    F.concat(col("key"), F.lit("_"), (F.rand() * 10).cast("int"))
+)
+
+# 第一次聚合（局部）
+partial_agg = df_with_salt.groupBy("salted_key").agg(F.sum("value").alias("partial_sum"))
+
+# 第二次聚合（全局）
+final_agg = partial_agg.withColumn(
+    "original_key",
+    F.split(col("salted_key"), "_")[0]
+).groupBy("original_key").agg(F.sum("partial_sum").alias("total_sum"))
+```
+
+---
+
+## 二十五、推测执行
+
+### 推测执行原理
+
+```mermaid
+graph TB
+    A[任务提交] --> B{检测慢任务}
+    B -->|是| C[启动推测任务]
+    B -->|否| D[正常执行]
+    C --> E[两个任务同时执行]
+    E --> F[先完成的结果]
+    D --> G[结果输出]
+    style C fill:#ffcc99
+    style E fill:#99ccff
+```
+
+### 推测执行配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.speculation | false | 启用推测 |
+| spark.speculation.interval | 100ms | 检测间隔 |
+| spark.speculation.multiplier | 1.5 | 倍数阈值 |
+| spark.speculation.quantile | 0.75 | 分位数 |
+
+---
+
+## 二十六、Spark on K8s
+
+### K8s 部署架构
+
+```mermaid
+graph TB
+    subgraph K8s
+        M[Master]
+        W1[Worker Pod 1]
+        W2[Worker Pod 2]
+        W3[Worker Pod 3]
+    end
+    subgraph 资源
+        R1[CPU]
+        R2[Memory]
+        R3[GPU]
+    end
+    M --> W1
+    M --> W2
+    M --> W3
+    W1 --> R1
+    W1 --> R2
+    W2 --> R1
+    W2 --> R3
+    style M fill:#99ccff
+    style W1 fill:#99ff99
+    style W2 fill:#99ff99
+    style W3 fill:#99ff99
+```
+
+### K8s 部署命令
+
+```bash
+# 提交Spark应用到K8s
+spark-submit \\
+  --master k8s://https://kubernetes:6443 \\
+  --deploy-mode cluster \\
+  --name my-spark-app \\
+  --class com.example.Main \\
+  --conf spark.kubernetes.container.image=my-spark:latest \\
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \\
+  --conf spark.dynamicAllocation.enabled=true \\
+  --conf spark.dynamicAllocation.shuffleTracking.enabled=true \\
+  local:///opt/spark/examples/jars/spark-examples.jar
+```
+
+---
+
+## 二十七、动态资源分配
+
+### 动态分配原理
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| spark.dynamicAllocation.enabled | false | 启用动态分配 |
+| spark.dynamicAllocation.minExecutors | 0 | 最小Executor |
+| spark.dynamicAllocation.maxExecutors | ∞ | 最大Executor |
+| spark.dynamicAllocation.initialExecutors | 0 | 初始Executor |
+| spark.dynamicAllocation.executorIdleTimeout | 60s | 空闲超时 |
+
+### Shuffle Tracking
+
+```yaml
+# 启用Shuffle Tracking
+spark:
+  dynamicAllocation:
+    enabled: true
+    shuffleTracking:
+      enabled: true
+      timeout: 3600s
+```
+
+---
+
+## 二十八、Spark History Server
+
+### History Server 配置
+
+```properties
+# spark-defaults.conf
+spark.eventLog.enabled=true
+spark.eventLog.dir=hdfs:///spark-logs
+spark.history.fs.logDirectory=hdfs:///spark-logs
+spark.history.ui.port=18080
+spark.history.retainedApplications=50
+spark.history.fs.cleaner.enabled=true
+spark.history.fs.cleaner.interval=1d
+spark.history.fs.cleaner.maxAge=7d
+```
+
+### History Server 启动
+
+```bash
+# 启动History Server
+$SPARK_HOME/sbin/start-history-server.sh
+
+# 停止History Server
+$SPARK_HOME/sbin/stop-history-server.sh
+```
+
+---
+
+## 二十九、Spark 3.x 新特性
+
+### 新特性概览
+
+| 特性 | 说明 | 适用场景 |
+|------|------|----------|
+| AQE | 自适应查询执行 | 动态优化 |
+| Dynamic Partition Pruning | 动态分区裁剪 | Join优化 |
+| Structured Streaming UI | 流处理UI | 监控 |
+| Vectorized UDF | 向量化UDF | 性能提升 |
+| CDC Support | CDC支持 | 数据同步 |
+
+### AQE 配置
+
+```properties
+spark.sql.adaptive.enabled=true
+spark.sql.adaptive.coalescePartitions.enabled=true
+spark.sql.adaptive.skewJoin.enabled=true
+spark.sql.adaptive.skewJoin.skewedPartitionFactor=5
+spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256m
+```
+
+---
+
+## 三十、广播 Join
+
+### 广播 Join 原理
+
+```mermaid
+graph TB
+    subgraph 大表
+        L1[分片1]
+        L2[分片2]
+        L3[分片3]
+    end
+    subgraph 小表广播
+        S[小表]
+    end
+    subgraph 执行
+        E1[每个分片join小表]
+    end
+    L1 --> E1
+    L2 --> E1
+    L3 --> E1
+    S --> E1
+    style S fill:#ffcc99
+    style E1 fill:#99ff99
+```
+
+### 广播 Join 配置
+
+```sql
+-- SQL广播Hint
+SELECT /*+ BROADCAST(dim) */ *
+FROM fact
+JOIN dim ON fact.id = dim.id;
+
+-- 配置广播阈值
+spark.sql.autoBroadcastJoinThreshold=10m
+```
+
+---
+
+## 三十一、Spark 调优清单
+
+### 调优检查项
+
+| 检查项 | 检查方法 | 优化方向 |
+|--------|----------|----------|
+| 数据倾斜 | 查看Stage时长 | Salting/AQE |
+| Shuffle过多 | 查看Shuffle写量 | 减少Shuffle |
+| 分区不合理 | 查看分区大小 | 调整分区数 |
+| 内存溢出 | 查看GC日志 | 增加内存 |
+| 序列化慢 | 查看序列化时间 | Kryo优化 |
+
+### 调优脚本
+
+```python
+# Spark性能监控
+from pyspark import SparkContext
+
+def monitor_job(sc):
+    # 获取Job信息
+    status = sc.statusTracker()
+    
+    # 获取Stage信息
+    for stage_id in status.getStageIds():
+        stage_info = status.getStageInfo(stage_id)
+        print(f"Stage {stage_id}: {stage_info.numTasks} tasks, "
+              f"{stage_info.executorRunTime}ms runtime")
+    
+    # 获取Executor信息
+    for executor_id, info in status.getExecutorInfos().items():
+        print(f"Executor {executor_id}: {info.host}, "
+              f"{info.maxMemory} max memory")
+```
+
+---
+
+## 三十二、Spark 监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| Job执行时间 | Job总时长 | >预期2倍 |
+| Stage失败数 | 失败Stage数 | >0 |
+| Shuffle溢出 | Shuffle溢出量 | >0 |
+| GC时间占比 | GC时间 | >10% |
+| 数据倾斜度 | 分区大小差异 | >10倍 |
+
+### 告警配置
+
+```yaml
+alerts:
+  - name: spark_job_slow
+    condition: job_duration > expected * 2
+    severity: warning
+    description: "Spark Job执行时间过长"
+  
+  - name: spark_stage_failure
+    condition: stage_failures > 0
+    severity: critical
+    description: "Spark Stage失败"
+  
+  - name: spark_data_skew
+    condition: partition_size_ratio > 10
+    severity: warning
+    description: "数据倾斜"
+```
+
+---
+
+## 三十三、Spark 参数速查表
+
+### 核心参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| spark.executor.instances | 2 | 按需 | Executor数量 |
+| spark.executor.memory | 1g | 4-8g | Executor内存 |
+| spark.executor.cores | 1 | 4-5 | Executor核数 |
+| spark.driver.memory | 1g | 2-4g | Driver内存 |
+| spark.sql.shuffle.partitions | 200 | 按数据量 | Shuffle分区 |
+
+### 性能参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| spark.serializer | Java | Kryo | 序列化 |
+| spark.sql.adaptive.enabled | false | true | AQE |
+| spark.shuffle.compress | true | true | 压缩 |
+| spark.memory.fraction | 0.6 | 0.75 | 内存比例 |
+| spark.memory.storageFraction | 0.5 | 0.3 | 存储比例 |
 
 ### 8.1 spark-defaults.conf 关键配置
 

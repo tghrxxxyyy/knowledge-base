@@ -1298,6 +1298,308 @@ Lindorm 搜索引擎（Lindorm Search）：
 - Lindorm 与 ClickHouse 对比见「[中间件/ClickHouse](../中间件/ClickHouse.md)」；
 - Lindorm 与 InfluxDB 对比见「[时序库/InfluxDB](./InfluxDB.md)」。
 
+---
+
+## 时序数据库关键概念速查表
+
+| 概念 | 说明 | 示例 |
+|------|------|------|
+| 时间序列 | 按时间顺序排列的数据点集合 | 温度传感器每秒采集一次 |
+| 数据点 | 一个时间戳+一个或多个值 | `1699900000,25.3` |
+| 标签/维度 | 用于标识数据来源的元数据 | `device_id=abc,region=cn` |
+| 度量/指标 | 实际存储的数值型数据 | `cpu_usage=75.5` |
+| 降采样 | 将高频数据聚合为低频数据 | 1秒→1分钟→1小时 |
+| 保留策略 | 自动清理过期数据 | 保留90天 |
+| 写入吞吐 | 单位时间写入的数据量 | 100万点/秒 |
+| 查询延迟 | 从发出请求到返回结果的时间 | P99 < 50ms |
+
+## 时序数据库与其他数据库对比
+
+| 维度 | 时序DB | 关系型DB | NoSQL | 专用时序 |
+|------|--------|----------|-------|----------|
+| 写入优化 | 极高 | 低 | 中 | 极高 |
+| 压缩率 | 极高 | 低 | 中 | 极高 |
+| 聚合查询 | 原生支持 | 需优化 | 需优化 | 原生支持 |
+| 数据模型 | 时序专用 | 通用 | 通用 | 时序专用 |
+| 运维复杂度 | 中 | 低 | 中 | 高 |
+| 生态成熟度 | 中 | 高 | 高 | 低 |
+| 成本 | 中 | 高 | 中 | 中 |
+
+---
+
+## 时序数据模型设计
+
+```sql
+-- Lindorm 时序表创建
+CREATE TABLE sensor_data (
+  device_id VARCHAR(64) NOT NULL,
+  metric_name VARCHAR(128) NOT NULL,
+  ts TIMESTAMP(6) NOT NULL,
+  value DOUBLE,
+  quality INT DEFAULT 0,
+  PRIMARY KEY (device_id, metric_name, ts)
+) ENGINE=TS;
+
+-- 标签表（低基数维度）
+CREATE TABLE device_info (
+  device_id VARCHAR(64) PRIMARY KEY,
+  device_name VARCHAR(256),
+  location VARCHAR(128),
+  device_type VARCHAR(64),
+  install_date DATE
+) ENGINE=Lindorm;
+
+-- 宽表模式（多指标同步采集）
+CREATE TABLE sensor_wide (
+  device_id VARCHAR(64) NOT NULL,
+  ts TIMESTAMP(6) NOT NULL,
+  temperature DOUBLE,
+  humidity DOUBLE,
+  pressure DOUBLE,
+  battery_level DOUBLE,
+  PRIMARY KEY (device_id, ts)
+) ENGINE=TS;
+```
+
+## 时序数据建模最佳实践
+
+| 场景 | 推荐模型 | 原因 |
+|------|----------|------|
+| 单指标高频采集 | 窄表 | 写入性能最优 |
+| 多指标同步采集 | 宽表 | 减少写入次数 |
+| 低基数维度 | 标签表 | 查询灵活 |
+| 高基数维度 | 独立表+JOIN | 避免膨胀 |
+| 历史数据归档 | 降采样表 | 节省存储 |
+
+## 数据降采样策略
+
+```sql
+-- 创建降采样任务
+CREATE DOWNSAMPLE TASK downsample_1m
+ON sensor_data
+GROUP BY device_id, metric_name, DATE_TRUNC('minute', ts)
+SELECT AVG(value) AS avg_value,
+       MAX(value) AS max_value,
+       MIN(value) AS min_value
+INTO sensor_data_1m
+WHERE ts >= NOW() - INTERVAL 7 DAY;
+```
+
+```mermaid
+graph LR
+    A[原始数据<br/>1秒精度<br/>7天] -->|降采样| B[1分钟聚合<br/>30天]
+    B -->|降采样| C[1小时聚合<br/>1年]
+    C -->|降采样| D[1天聚合<br/>永久]
+    style A fill:#ff9999
+    style B fill:#ffcc99
+    style C fill:#99ccff
+    style D fill:#99ff99
+```
+
+## 宽表引擎详解
+
+```sql
+-- 宽表写入（一次写入多个指标）
+INSERT INTO sensor_wide VALUES
+('device_001', '2024-01-15 10:00:00.000000', 25.3, 60.2, 1013.25, 85.5),
+('device_001', '2024-01-15 10:00:01.000000', 25.4, 60.1, 1013.20, 85.4);
+
+-- 宽表 vs 窄表性能对比
+-- 宽表：单次写入4个指标，压缩后约200字节
+-- 窄表：单次写入1个指标，4次写入压缩后约240字节
+-- 结论：宽表写入性能提升约4倍
+```
+
+## 搜索引擎在时序场景的应用
+
+```sql
+-- Lindorm 搜索引擎用于日志/事件型时序数据
+CREATE TABLE log_events (
+  log_id VARCHAR(64) PRIMARY KEY,
+  ts TIMESTAMP(6) NOT NULL,
+  service VARCHAR(128),
+  level VARCHAR(16),
+  message TEXT,
+  INDEX idx_service_ts (service, ts),
+  INDEX idx_level (level)
+) ENGINE=LSEARCH;
+
+-- 全文检索查询
+SELECT * FROM log_events
+WHERE message MATCH 'timeout OR connection refused'
+  AND ts >= NOW() - INTERVAL 1 HOUR;
+```
+
+## 存算分离架构
+
+```mermaid
+graph TB
+    subgraph 计算层
+        C1[计算节点1]
+        C2[计算节点2]
+        C3[计算节点3]
+    end
+    subgraph 存储层
+        S1[对象存储 OSS]
+        S2[本地缓存 SSD]
+        S3[元数据存储]
+    end
+    C1 -->|读写| S1
+    C2 -->|读写| S1
+    C3 -->|读写| S1
+    C1 -->|缓存| S2
+    C2 -->|缓存| S2
+    C3 -->|缓存| S2
+    C1 -->|元数据| S3
+    C2 -->|元数据| S3
+    C3 -->|元数据| S3
+    style C1 fill:#99ccff
+    style C2 fill:#99ccff
+    style C3 fill:#99ccff
+    style S1 fill:#99ff99
+    style S2 fill:#ffcc99
+    style S3 fill:#ff9999
+```
+
+| 架构特性 | 传统架构 | 存算分离 |
+|----------|----------|----------|
+| 计算存储绑定 | 是 | 否 |
+| 弹性扩缩容 | 受限 | 灵活 |
+| 存储成本 | 高（SSD） | 低（对象存储） |
+| 故障恢复 | 慢 | 快（重启即可） |
+| 数据局部性 | 高 | 中（依赖缓存） |
+
+## IoT 场景最佳实践
+
+| 场景 | 推荐配置 | 优化要点 |
+|------|----------|----------|
+| 车联网 | 宽表+降采样 | 高吞吐写入 |
+| 智慧城市 | 多租户+地理索引 | 海量设备管理 |
+| 工业物联网 | 边缘预处理+中心聚合 | 降低带宽成本 |
+| 能源监控 | 时序+关系混合 | 实时+分析 |
+| 智能家居 | 轻量级+低延迟 | 本地优先 |
+
+## IoT 数据采集架构
+
+```mermaid
+graph LR
+    subgraph 边缘层
+        E1[传感器]
+        E2[网关]
+        E3[边缘计算]
+    end
+    subgraph 云端
+        C1[Lindorm 时序]
+        C2[Lindorm 宽表]
+        C3[分析引擎]
+    end
+    E1 -->|原始数据| E2
+    E2 -->|预处理| E3
+    E3 -->|聚合数据| C1
+    E3 -->|事件数据| C2
+    C1 -->|分析查询| C3
+    style E1 fill:#ffcc99
+    style E2 fill:#ffcc99
+    style E3 fill:#ffcc99
+    style C1 fill:#99ccff
+    style C2 fill:#99ccff
+    style C3 fill:#99ccff
+```
+
+## 成本优化方案
+
+| 优化策略 | 预期节省 | 实施难度 | 适用场景 |
+|----------|----------|----------|----------|
+| 降采样 | 60-80% | 低 | 所有时序场景 |
+| 冷热分离 | 40-60% | 中 | 有明显冷热周期 |
+| 压缩调优 | 20-40% | 低 | 写入密集型 |
+| 按需实例 | 30-50% | 中 | 访问量波动大 |
+| 存算分离 | 30-50% | 高 | 大规模部署 |
+
+## Lindorm vs InfluxDB vs TimescaleDB
+
+| 维度 | Lindorm | InfluxDB | TimescaleDB |
+|------|---------|----------|-------------|
+| 架构 | 分布式云原生 | 单机/集群 | PostgreSQL扩展 |
+| 写入性能 | 极高 | 高 | 中 |
+| 查询能力 | SQL+时序 | Flux | SQL |
+| 扩展性 | 水平无限 | 有限 | 受限于单机 |
+| 运维成本 | 低（云服务） | 中 | 高 |
+| 生态集成 | 云生态 | 独立 | PG生态 |
+| 适用规模 | 企业级 | 中小规模 | 中小规模 |
+
+## 时序数据库运维监控
+
+```yaml
+metrics:
+  write_throughput:
+    alert: 写入吞吐低于阈值
+    threshold: 100000 points/sec
+  query_latency:
+    alert: 查询延迟过高
+    threshold: P99 > 500ms
+  storage_usage:
+    alert: 存储使用率过高
+    threshold: > 80%
+  replication_lag:
+    alert: 主从延迟过大
+    threshold: > 10s
+```
+
+## 时序数据库性能调优
+
+```sql
+-- 1. 批量写入：减少网络往返
+INSERT INTO sensor_data VALUES
+('d1', 'temp', NOW(), 25.0),
+('d1', 'humid', NOW(), 60.0),
+('d2', 'temp', NOW(), 26.0);
+
+-- 2. 使用时间分区裁剪
+SELECT * FROM sensor_data
+WHERE device_id = 'd1'
+  AND ts BETWEEN '2024-01-15 10:00:00' AND '2024-01-15 11:00:00';
+
+-- 3. 为常用查询创建复合索引
+CREATE INDEX idx_device_time ON sensor_data(device_id, ts);
+```
+
+## 时序数据库故障排查
+
+| 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 写入超时 | 写入队列满 | 检查队列长度 | 增加写入节点 |
+| 查询慢 | 缺少索引 | 检查查询计划 | 创建索引 |
+| 存储满 | 数据未清理 | 检查保留策略 | 设置降采样 |
+| 节点离线 | 网络/磁盘故障 | 检查系统日志 | 恢复节点 |
+| 数据不一致 | 主从延迟 | 检查复制状态 | 调整参数 |
+
+```mermaid
+graph TD
+    A[发现故障] --> B{故障类型}
+    B -->|写入故障| C[检查写入队列]
+    B -->|查询故障| D[检查查询计划]
+    B -->|存储故障| E[检查存储使用]
+    B -->|节点故障| F[检查节点状态]
+    C --> C1{队列满?}
+    C1 -->|是| C2[增加写入节点]
+    C1 -->|否| C3[检查网络]
+    D --> D1[缺索引?]
+    D1 -->|是| D2[创建索引]
+    D1 -->|否| D3[优化查询]
+    E --> E1[使用率>80%?]
+    E1 -->|是| E2[清理数据]
+    E1 -->|否| E3[检查增长趋势]
+    F --> F1[节点离线?]
+    F1 -->|是| F2[恢复节点]
+    F1 -->|否| F3[检查负载]
+    style A fill:#ff9999
+    style C2 fill:#99ff99
+    style D2 fill:#99ff99
+    style E2 fill:#99ff99
+    style F2 fill:#99ff99
+```
+
 ## Lindorm 最佳实践
 
 ### 数据模型设计

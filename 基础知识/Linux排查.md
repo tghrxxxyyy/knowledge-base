@@ -1713,3 +1713,400 @@ flowchart TD
 - 容器排查见「[K8s排查](./云原生/排查.md)」；
 - 数据库排查见「[MySQL排查](./数据库/MySQL排查.md)」；
 - JVM 排查见「[JVM调优](./基础知识/JVM.md)」。
+
+---
+
+## 三十五、CPU 定位全流程
+
+### CPU 高排查步骤
+
+```mermaid
+graph TD
+    A[CPU 100%] --> B[top -c]
+    B --> C{找到高CPU进程}
+    C -->|Java| D[获取线程ID]
+    C -->|非Java| E[strace -p PID]
+    D --> F[printf '%x' TID]
+    F --> G[jstack PID | grep TID]
+    G --> H[分析线程堆栈]
+    H --> I{阻塞原因}
+    I -->|锁竞争| J[优化锁]
+    I -->|死循环| K[修复循环]
+    I -->|GC| L[调整JVM]
+    style A fill:#ff9999
+    style H fill:#99ccff
+```
+
+### Java 线程分析
+
+```bash
+# 1. 找到Java进程
+jps -l
+
+# 2. 查看线程CPU使用
+top -Hp <PID>
+
+# 3. 线程ID转16进制
+printf '%x\n' <TID>
+
+# 4. 导出线程堆栈
+jstack <PID> | grep <TID_16进制> -A 30
+
+# 5. 使用Arthas在线诊断
+java -jar arthas-boot.jar
+thread -n 3  # 查看最忙的3个线程
+thread <TID>  # 查看指定线程
+```
+
+### CPU 分析工具
+
+| 工具 | 说明 | 适用场景 |
+|------|------|----------|
+| top | 实时进程监控 | 快速定位 |
+| pidstat | 进程级详细统计 | 线程级分析 |
+| perf | 性能计数器 | 热点函数 |
+| async-profiler | 异步采样 | 生产环境 |
+| Arthas | 在线诊断 | Java应用 |
+
+---
+
+## 三十六、内存泄漏判别
+
+### 内存泄漏排查流程
+
+```mermaid
+graph TD
+    A[内存持续增长] --> B[free -h]
+    B --> C{物理内存不足?}
+    C -->|是| D[检查swap]
+    C -->|否| E[jmap -heap PID]
+    D --> F[检查内存分布]
+    E --> F
+    F --> G{老年代持续增长?}
+    G -->|是| H[jmap -dump:format=b,file=heap.dump PID]
+    G -->|否| I[检查Metaspace]
+    H --> J[MAT/VisualVM分析]
+    J --> K{找到泄漏对象}
+    K -->|是| L[分析引用链]
+    K -->|否| M[调整GC参数]
+    style A fill:#ff9999
+    style J fill:#99ccff
+```
+
+### 内存分析命令
+
+```bash
+# 查看JVM内存分布
+jmap -heap <PID>
+
+# 查看对象直方图
+jmap -histo <PID> | head -20
+
+# 堆转储
+jmap -dump:format=b,file=heap.hprof <PID>
+
+# 使用Eclipse MAT分析
+# 1. 打开heap.hprof
+# 2. Leak Suspects Report
+# 3. 查看Dominator Tree
+
+# 使用VisualVM分析
+jvisualvm  # 打开VisualVM
+# 连接进程 -> Heap Dump -> 查看对象
+```
+
+### 内存泄漏类型
+
+| 类型 | 症状 | 常见原因 |
+|------|------|----------|
+| 堆内存泄漏 | 老年代持续增长 | 对象未释放 |
+| Metaspace泄漏 | 类加载持续增长 | 动态类生成 |
+| 线程泄漏 | 线程数持续增长 | 线程池配置不当 |
+| Native泄漏 | JVM堆正常，RSS增长 | JNI代码 |
+| 文件描述符泄漏 | fd数持续增长 | 文件未关闭 |
+
+---
+
+## 三十七、io_wait 分析
+
+### io_wait 排查
+
+```bash
+# 查看IO状态
+iostat -x 1 5
+
+# 关键指标
+# %util: 磁盘利用率（>80%需关注）
+# await: 平均IO等待时间（>10ms需优化）
+# r/s, w/s: 每秒读写次数
+
+# 查看哪个进程在IO
+iotop -o
+
+# 查看进程IO详情
+pidstat -d -p <PID> 1
+
+# 查看文件IO
+strace -p <PID> -e trace=read,write
+```
+
+### IO 优化方案
+
+| 问题 | 优化方案 | 效果 |
+|------|----------|------|
+| 随机读写多 | 使用SSD | 10x提升 |
+| 顺序读写瓶颈 | 增加IO线程 | 线性提升 |
+| 日志写入慢 | 异步写入/批量 | 显著提升 |
+| 数据库慢 | 增加Buffer Pool | 显著提升 |
+
+---
+
+## 三十八、网络丢包排查
+
+### 丢包排查流程
+
+```bash
+# 1. 查看网络统计
+netstat -s | grep -i "drop\|error\|retransmit"
+
+# 2. 查看网卡丢包
+ifconfig eth0 | grep errors
+
+# 3. 查看TCP重传
+netstat -an | grep SYN_RECV | wc -l
+
+# 4. 使用tcpdump抓包
+tcpdump -i eth0 -w capture.pcap
+
+# 5. 分析网络质量
+ping -c 100 -i 0.01 <host>
+
+# 6. 查看路由
+traceroute <host>
+```
+
+### 丢包原因分析
+
+| 原因 | 现象 | 解决方案 |
+|------|------|----------|
+| 网卡溢出 | ifconfig errors增加 | 增加网卡缓冲区 |
+| 队列满 | SYN_RECV堆积 | 调整tcp_backlog |
+| MTU不匹配 | 分片丢失 | 调整MTU |
+| 路由问题 | traceroute超时 | 检查路由 |
+| 防火墙 | 特定端口丢包 | 检查iptables |
+
+---
+
+## 三十九、OOM 排查
+
+### OOM 排查流程
+
+```mermaid
+graph TD
+    A[OOM] --> B{OOM类型}
+    B -->|Java堆| C[jmap -dump]
+    B -->|Metaspace| D[检查类加载]
+    B -->|栈溢出| E[检查递归]
+    B -->|直接内存| F[检查NIO]
+    C --> G[MAT分析]
+    G --> H{泄漏类型}
+    H -->|内存泄漏| I[修复代码]
+    H -->|内存不足| J[调整参数]
+    style A fill:#ff9999
+    style G fill:#99ccff
+```
+
+### OOM 日志分析
+
+```bash
+# 查看OOM日志
+grep -A 50 "java.lang.OutOfMemoryError" /path/to/log
+
+# 常见OOM类型
+# Java heap space: 堆内存不足
+# Metaspace: 类元数据空间不足
+# GC overhead limit exceeded: GC时间过长
+# Direct buffer memory: 直接内存不足
+# unable to create new native thread: 线程创建失败
+```
+
+### OOM 解决方案
+
+| OOM类型 | 原因 | 解决方案 |
+|---------|------|----------|
+| Java heap space | 堆内存不足 | 增大-Xmx |
+| Metaspace | 类加载过多 | 增大MaxMetaspaceSize |
+| Direct buffer | NIO缓冲区不足 | 增大-XX:MaxDirectMemorySize |
+| unable to create thread | 线程数过多 | 减少线程数/增大ulimit |
+| GC overhead | GC频繁 | 优化内存使用 |
+
+---
+
+## 四十、perf 火焰图
+
+### 火焰图生成
+
+```bash
+# 安装perf
+apt-get install linux-tools-common
+
+# 采集数据
+perf record -g -p <PID> -- sleep 30
+
+# 生成火焰图
+perf script | stackcollapse-perf.pl | flamegraph.pl > flamegraph.svg
+
+# 使用Arthas生成
+profiler start  # 开始采样
+profiler stop --format html  # 生成火焰图
+```
+
+### 火焰图分析
+
+| 区域 | 说明 | 优化方向 |
+|------|------|----------|
+| 宽平台 | 热点函数 | 优化该函数 |
+| 深调用栈 | 深层调用 | 减少调用层级 |
+| 不规则形状 | 不稳定代码 | 分析原因 |
+| 平坦区域 | CPU密集 | 并行化/算法优化 |
+
+---
+
+## 四十一、strace 排查
+
+### strace 使用
+
+```bash
+# 跟踪系统调用
+strace -p <PID>
+
+# 跟踪特定系统调用
+strace -e trace=open,read,write -p <PID>
+
+# 跟踪网络调用
+strace -e trace=network -p <PID>
+
+# 统计系统调用
+strace -c -p <PID>
+
+# 输出到文件
+strace -o trace.log -p <PID>
+```
+
+### strace 输出分析
+
+```
+# 示例输出
+read(3, "hello", 5) = 5      # 读取5字节成功
+write(4, "world", 5) = -1 EAGAIN  # 写入失败，资源不可用
+open("/tmp/test", O_RDONLY) = 5    # 打开文件成功
+close(5) = 0                       # 关闭文件成功
+```
+
+---
+
+## 四十二、网络排查实战
+
+### 网络连通性测试
+
+```bash
+# 测试TCP连通性
+nc -zv <host> <port>
+
+# 测试HTTP连通性
+curl -v http://<host>:<port>
+
+# 测试DNS解析
+dig <domain>
+nslookup <domain>
+
+# 测试路由
+traceroute <host>
+mtr <host>
+
+# 测试带宽
+iperf3 -c <host>
+```
+
+### 网络问题定位
+
+| 问题 | 排查命令 | 可能原因 |
+|------|----------|----------|
+| 连接超时 | telnet/traceroute | 防火墙/路由 |
+| 连接拒绝 | netstat -lntp | 服务未监听 |
+| 延迟高 | ping/mtr | 网络质量 |
+| 丢包 | ping -f/iperf | 网络拥塞 |
+| DNS失败 | dig/nslookup | DNS配置 |
+
+---
+
+## 四十三、磁盘排查
+
+### 磁盘空间排查
+
+```bash
+# 查看磁盘使用
+df -h
+
+# 查看大文件
+du -sh /* | sort -rh | head -10
+
+# 查找大文件
+find / -type f -size +100M -exec ls -lh {} \;
+
+# 查看inode使用
+df -i
+
+# 清理日志
+find /var/log -name "*.log" -mtime +30 -delete
+```
+
+### 磁盘IO排查
+
+```bash
+# 查看磁盘IO
+iostat -x 1 5
+
+# 查看哪个进程在IO
+iotop -o
+
+# 查看文件被谁占用
+lsof +D /path/to/dir
+
+# 查看磁盘健康
+smartctl -a /dev/sda
+```
+
+---
+
+## 四十四、进程排查
+
+### 进程状态排查
+
+```bash
+# 查看进程状态
+ps aux | grep java
+
+# 查看进程树
+pstree -p <PID>
+
+# 查看进程打开的文件
+lsof -p <PID>
+
+# 查看进程网络连接
+netstat -anp | grep <PID>
+
+# 查看进程资源限制
+ulimit -a
+cat /proc/<PID>/limits
+```
+
+### 进程异常排查
+
+| 异常 | 排查命令 | 解决方案 |
+|------|----------|----------|
+| 进程消失 | dmesg | OOM Killed |
+| 僵尸进程 | ps aux \| grep Z | kill父进程 |
+| 文件泄漏 | lsof -p PID | 关闭文件 |
+| 端口占用 | netstat -anp | 重启服务 |
+| CPU高 | top -Hp PID | 分析线程 |

@@ -1098,7 +1098,376 @@ flink run -c org.apache.flink.streaming.connectors.pulsar.FlinkPulsarProducer fl
 
 ---
 
-## 八、速查表
+## Pulsar IO 框架
+
+### IO 架构
+
+```mermaid
+graph TB
+    subgraph Source Connector
+        S1[数据库]
+        S2[文件]
+        S3[消息队列]
+    end
+    subgraph Pulsar IO
+        IO1[Source Worker]
+        IO2[Sink Worker]
+    end
+    subgraph Pulsar
+        T1[Topic]
+    end
+    subgraph Sink Connector
+        K1[Elasticsearch]
+        K2[数据库]
+        K3[数据湖]
+    end
+    S1 --> IO1
+    S2 --> IO1
+    S3 --> IO1
+    IO1 --> T1
+    T1 --> IO2
+    IO2 --> K1
+    IO2 --> K2
+    IO2 --> K3
+    style IO1 fill:#99ccff
+    style IO2 fill:#99ccff
+    style T1 fill:#99ff99
+```
+
+### IO Connector 示例
+
+```bash
+# 创建 Source Connector
+bin/pulsar-admin sources create \\
+  --source-config-file debezium-mysql-source-config.yaml
+
+# 创建 Sink Connector
+bin/pulsar-admin sinks create \\
+  --sink-config-file elasticsearch-sink-config.yaml
+
+# 查看 Connector 状态
+bin/pulsar-admin sources status --name my-source
+bin/pulsar-admin sinks status --name my-sink
+```
+
+### Source Connector 配置
+
+```yaml
+configs:
+  hostname: "localhost"
+  port: 3306
+  username: "user"
+  password: "password"
+  database: "mydb"
+  table: "users"
+  topic: "persistent://public/default/mysql-users"
+  plugin.name: "mysql"
+  snapshot.mode: "initial"
+```
+
+---
+
+## Pulsar Functions
+
+### Functions 架构
+
+| 特性 | 说明 |
+|------|------|
+| 轻量级 | 无需独立集群 |
+| 事件驱动 | 按消息触发 |
+| 状态管理 | 内置键值存储 |
+| 多语言 | Java/Python/Go |
+| 容错 | 自动故障转移 |
+
+### Functions 示例
+
+```java
+// Java Functions
+public class ExclamationFunction implements Function<String, String> {
+    @Override
+    public String process(String input) throws Exception {
+        return input + "!";
+    }
+}
+
+// Python Functions
+def process(input):
+    return input + "!"
+```
+
+### Functions 部署
+
+```bash
+# 部署 Java Function
+bin/pulsar-admin functions create \\
+  --jar my-function.jar \\
+  --class ExclamationFunction \\
+  --name my-function \\
+  --input-topic persistent://public/default/input \\
+  --output-topic persistent://public/default/output
+
+# 部署 Python Function
+bin/pulsar-admin functions create \\
+  --py my_function.py \\
+  --function process \\
+  --name my-function \\
+  --input-topic persistent://public/default/input \\
+  --output-topic persistent://public/default/output
+```
+
+---
+
+## Pulsar 分层存储
+
+### 分层存储架构
+
+```mermaid
+graph TB
+    subgraph 热数据
+        H[BookKeeper SSD]
+    end
+    subgraph 温数据
+        W[BookKeeper HDD]
+    end
+    subgraph 冷数据
+        C[对象存储 S3/GCS]
+    end
+    H -->|降级| W
+    W -->|降级| C
+    C -->|升级| W
+    W -->|升级| H
+    style H fill:#ff9999
+    style W fill:#ffcc99
+    style C fill:#99ff99
+```
+
+### 分层存储配置
+
+```yaml
+# 分层存储策略
+managedLedger:
+  offloadThreshold: 0
+  offloadDeletionLagMs: 86400000
+  offloadAutoTieredTriggerIntervalMs: 3600000
+
+# S3 存储配置
+s3ManagedLedgerOffloadRegion: us-east-1
+s3ManagedLedgerOffloadBucket: my-bucket
+```
+
+---
+
+## Pulsar 多租户管理
+
+### 租户架构
+
+```mermaid
+graph TB
+    subgraph 租户
+        T1[Tenant A]
+        T2[Tenant B]
+    end
+    subgraph 命名空间
+        N1[Namespace A1]
+        N2[Namespace A2]
+        N3[Namespace B1]
+    end
+    subgraph Topic
+        T1[Topic 1]
+        T2[Topic 2]
+        T3[Topic 3]
+    end
+    T1 --> N1
+    T1 --> N2
+    T2 --> N3
+    N1 --> T1
+    N1 --> T2
+    N3 --> T3
+    style T1 fill:#99ccff
+    style T2 fill:#99ccff
+    style N1 fill:#99ff99
+    style N2 fill:#99ff99
+    style N3 fill:#99ff99
+```
+
+### 多租户配置
+
+```bash
+# 创建租户
+bin/pulsar-admin tenants create my-tenant
+
+# 创建命名空间
+bin/pulsar-admin namespaces create my-tenant/my-namespace
+
+# 设置命名空间策略
+bin/pulsar-admin namespaces set-retention my-tenant/my-namespace \\
+  --time 7d --size 10G
+
+# 设置命名空间授权
+bin/pulsar-admin namespaces grant-permission my-tenant/my-namespace \\
+  --role my-role --actions produce,consume
+```
+
+---
+
+## Pulsar Geo-Replication
+
+### 跨地域复制架构
+
+```mermaid
+graph LR
+    subgraph 集群A
+        A[Broker]
+        BK1[BookKeeper]
+    end
+    subgraph 集群B
+        B[Broker]
+        BK2[BookKeeper]
+    end
+    subgraph 集群C
+        C[Broker]
+        BK3[BookKeeper]
+    end
+    A <--> B
+    B <--> C
+    A <--> C
+    BK1 <--> BK2
+    BK2 <--> BK3
+    BK1 <--> BK3
+    style A fill:#99ccff
+    style B fill:#99ccff
+    style C fill:#99ccff
+    style BK1 fill:#99ff99
+    style BK2 fill:#99ff99
+    style BK3 fill:#99ff99
+```
+
+### 跨地域配置
+
+```bash
+# 创建跨地域 Topic
+bin/pulsar-admin topics create-partitioned-topic \\
+  persistent://public/default/my-topic \\
+  --partitions 3
+
+# 配置 Geo-Replication
+bin/pulsar-admin topics set-clusters \\
+  persistent://public/default/my-topic \\
+  --clusters cluster-a,cluster-b,cluster-c
+
+# 查看复制状态
+bin/pulsar-admin topics stats persistent://public/default/my-topic
+```
+
+---
+
+## Pulsar SQL
+
+### Pulsar SQL 架构
+
+```mermaid
+graph TB
+    subgraph 用户
+        U[SQL查询]
+    end
+    subgraph Pulsar SQL
+        P[Presto/Pulsar]
+    end
+    subgraph 数据
+        T1[Topic数据]
+        T2[分层存储]
+    end
+    U --> P
+    P --> T1
+    P --> T2
+    style U fill:#ffcc99
+    style P fill:#99ccff
+    style T1 fill:#99ff99
+    style T2 fill:#99ff99
+```
+
+### SQL 查询示例
+
+```sql
+-- 查询 Topic 数据
+SELECT * FROM "persistent://public/default/my-topic"
+WHERE event_type = 'purchase'
+AND amount > 100;
+
+-- 聚合查询
+SELECT event_type, COUNT(*), AVG(amount)
+FROM "persistent://public/default/my-topic"
+GROUP BY event_type;
+```
+
+---
+
+## Pulsar WebSocket
+
+### WebSocket 配置
+
+```yaml
+# WebSocket 服务端配置
+websocketEnabled: true
+websocketPort: 8080
+websocketMaxTextFrameSize: 1048576
+```
+
+### WebSocket 客户端示例
+
+```javascript
+// JavaScript WebSocket 客户端
+const ws = new WebSocket('ws://localhost:8080/ws/v2/producer/persistent/public/default/my-topic');
+
+ws.onopen = function() {
+  ws.send(JSON.stringify({
+    payload: 'Hello World',
+    properties: {},
+    eventTime: Date.now()
+  }));
+};
+
+ws.onmessage = function(event) {
+  console.log('Received:', event.data);
+};
+```
+
+---
+
+## Pulsar 监控与调优
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 消息吞吐 | 消息/秒 | 低于预期 |
+| 延迟 | P99延迟 | >100ms |
+| 订阅延迟 | 消费者延迟 | >1000条 |
+| BookKeeper写入 | 写入延迟 | >50ms |
+| BookKeeper存储 | 存储使用 | >80% |
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| brokerServiceConnectionsPerBroker | 1 | 5 | 连接数 |
+| maxConcurrentLookupRequests | 25000 | 50000 | 并发查询 |
+| maxConcurrentTopicLoadRequests | 128 | 256 | 并发加载 |
+| managedLedgerMaxEntriesPerLedger | 50000 | 100000 | 每Ledger条目 |
+
+---
+
+## Pulsar 故障排查
+
+### 常见故障
+
+| 故障 | 排查步骤 | 解决方案 |
+|------|----------|----------|
+| 消息丢失 | 检查确认机制 | 开启持久化 |
+| 延迟高 | 检查BookKeeper | 增加Broker |
+| 订阅积压 | 检查消费者 | 增加消费者 |
+| 跨地域延迟 | 检查网络 | 优化链路 |
+| 存储满 | 检查分层存储 | 配置降级 |
 
 | 项 | 结论 |
 |----|------|

@@ -1718,7 +1718,441 @@ Flink 适用场景：
 
 ---
 
-## 十五、与其他板块的关系
+## 十五、窗口操作详解
+
+### 窗口类型
+
+| 窗口类型 | 特点 | 适用场景 | 示例 |
+|----------|------|----------|------|
+| 滚动窗口 | 固定大小，无重叠 | 统计聚合 | 每分钟点击量 |
+| 滑动窗口 | 固定大小，有重叠 | 趋势分析 | 最近5分钟平均值 |
+| 会话窗口 | 按活跃期分组 | 用户行为分析 | 用户会话统计 |
+| 滚动+跳变 | 固定大小，可跳变 | 批处理 | 每小时报表 |
+
+### 窗口操作示例
+
+```java
+// Kafka Streams 窗口操作
+KStream<String, Long> stream = builder.stream("topic");
+
+// 滚动窗口（每分钟）
+KTable<Windowed<String>, Long> tumblingWindow = stream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+    .count();
+
+// 滑动窗口（5分钟窗口，1分钟滑动）
+KTable<Windowed<String>, Long> slidingWindow = stream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5))
+        .advanceBy(Duration.ofMinutes(1)))
+    .count();
+
+// 会话窗口（30分钟超时）
+KTable<Windowed<String>, Long> sessionWindow = stream
+    .groupByKey()
+    .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(Duration.ofMinutes(30)))
+    .count();
+```
+
+### 窗口聚合函数
+
+```java
+// 自定义窗口聚合
+KTable<Windowed<String>, Double> avgWindow = stream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+    .aggregate(
+        () -> new AvgAggregator(),
+        (key, value, aggregator) -> aggregator.add(value),
+        Materialized.as("avg-store")
+    );
+
+// AvgAggregator 实现
+public class AvgAggregator {
+    private double sum = 0;
+    private long count = 0;
+    
+    public AvgAggregator add(double value) {
+        sum += value;
+        count++;
+        return this;
+    }
+    
+    public double getAverage() {
+        return count > 0 ? sum / count : 0;
+    }
+}
+```
+
+---
+
+## 十六、Join 操作详解
+
+### Join 类型
+
+| Join 类型 | 说明 | 适用场景 | 示例 |
+|-----------|------|----------|------|
+| KStream-KStream | 两个流 Join | 事件关联 | 订单+支付 |
+| KStream-KTable | 流+表 Join | 流+维度 | 事件+用户信息 |
+| KStream-GlobalKTable | 流+全局表 Join | 广播维度 | 事件+配置 |
+| KTable-KTable | 两个表 Join | 维度关联 | 用户+订单 |
+
+### Join 操作示例
+
+```java
+// KStream-KStream Join
+KStream<String, Order> orders = builder.stream("orders");
+KStream<String, Payment> payments = builder.stream("payments");
+
+KStream<String, OrderPayment> joined = orders.join(
+    payments,
+    (order, payment) -> new OrderPayment(order, payment),
+    Joined.with(Serdes.String(), orderSerde, paymentSerde)
+);
+
+// KStream-KTable Join
+KStream<String, Event> events = builder.stream("events");
+KTable<String, User> users = builder.table("users");
+
+KStream<String, EventWithUser> enriched = events.join(
+    users,
+    (event, user) -> new EventWithUser(event, user)
+);
+
+// KStream-GlobalKTable Join
+KStream<String, Order> orders = builder.stream("orders");
+GlobalKTable<String, Product> products = builder.globalTable("products");
+
+KStream<String, OrderWithProduct> enriched = orders.join(
+    products,
+    (order, product) -> new OrderWithProduct(order, product),
+    KeyValue.with(orderKeyMapper, productKeyMapper)
+);
+```
+
+### Join 配置
+
+```java
+// Join 配置选项
+Joined.with(
+    Serdes.String(),           // Key 序列化
+    orderSerde,                // 左 Value 序列化
+    paymentSerde               // 右 Value 序列化
+)
+.withWindowStoreName("join-window-store")  // 窗口存储名
+.withLeftJoinExternalStoreName("left-external");  // 外部存储
+
+// Join 容错配置
+properties.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, 
+    "exactly_once_v2");
+```
+
+---
+
+## 十七、State Store 详解
+
+### State Store 类型
+
+| Store 类型 | 说明 | 适用场景 | 特性 |
+|------------|------|----------|------|
+| KeyValueStore | 键值存储 | 通用 | 高性能 |
+| WindowStore | 窗口存储 | 窗口聚合 | 时间索引 |
+| SessionStore | 会话存储 | 会话分析 | 活跃期索引 |
+| VersionedStore | 版本存储 | 时序数据 | 版本控制 |
+
+### State Store 操作
+
+```java
+// 创建 State Store
+StoreBuilder<KeyValueStore<String, Long>> storeBuilder = 
+    Stores.keyValueStoreBuilder(
+        Stores.persistentKeyValueStore("my-store"),
+        Serdes.String(),
+        Serdes.Long()
+    );
+
+// 使用 State Store
+KStream<String, Long> stream = builder.stream("topic");
+stream.process(() -> new Processor<String, Long, String, Long>() {
+    private KeyValueStore<String, Long> store;
+    
+    @Override
+    public void init(ProcessorContext<String, Long> context) {
+        this.store = context.getStateStore("my-store");
+    }
+    
+    @Override
+    public void process(Record<String, Long> record) {
+        Long current = store.get(record.key());
+        if (current == null) current = 0L;
+        store.put(record.key(), current + record.value());
+        context.forward(new Record<>(record.key(), 
+            current + record.value(), record.timestamp()));
+    }
+}, "my-store");
+```
+
+### State Store 配置
+
+```java
+// State Store 配置
+Properties props = new Properties();
+props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-streams");
+props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 4);
+props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 30000);
+props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 10485760L);
+
+// RocksDB 配置
+props.put("rocksdb.block.cache.size", 256 * 1024 * 1024L);
+props.put("rocksdb.write.buffer.size", 64 * 1024 * 1024);
+props.put("rocksdb.max.write.buffer.number", 3);
+```
+
+---
+
+## 十八、Exactly-Once 语义
+
+### 语义对比
+
+| 语义 | 说明 | 实现方式 | 适用场景 |
+|------|------|----------|----------|
+| At-Most-Once | 最多一次 | 自动提交 | 日志收集 |
+| At-Least-Once | 至少一次 | 手动提交 | 数据重要 |
+| Exactly-Once | 精确一次 | 事务 | 金融交易 |
+
+### Exactly-Once 实现
+
+```java
+// Kafka Streams Exactly-Once
+Properties props = new Properties();
+props.put(StreamsConfig.APPLICATION_ID_CONFIG, "my-app");
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, 
+    "exactly_once_v2");
+props.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 3);
+
+// 事务配置
+props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "my-transactional-id");
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+
+// Exactly-Once 流处理
+KStream<String, Long> stream = builder.stream("input");
+stream
+    .groupByKey()
+    .count()
+    .toStream()
+    .to("output");
+```
+
+### 事务配置
+
+```java
+// 事务配置详解
+Properties props = new Properties();
+props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "my-tx-id");
+props.put(ProducerConfig.ACKS_CONFIG, "all");
+props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
+props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+
+// 事务边界
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, 
+    "exactly_once_v2");
+props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 30000);
+```
+
+---
+
+## 十九、ksqlDB 物化视图
+
+### 物化视图操作
+
+```sql
+-- 创建物化视图
+CREATE MATERIALIZED VIEW click_counts AS
+SELECT user_id, COUNT(*) AS click_count
+FROM clickstream
+GROUP BY user_id;
+
+-- 查询物化视图
+SELECT * FROM click_counts;
+
+-- 删除物化视图
+DROP MATERIALIZED VIEW click_counts;
+```
+
+### 物化视图配置
+
+```sql
+-- 物化视图配置
+CREATE MATERIALIZED VIEW click_counts
+  WITH (KAFKA_TOPIC = 'click_counts', 
+        PARTITIONS = 6,
+        REPLICAS = 3)
+AS
+SELECT user_id, COUNT(*) AS click_count
+FROM clickstream
+GROUP BY user_id;
+```
+
+### 物化视图 vs 普通查询
+
+| 维度 | 物化视图 | 普通查询 |
+|------|----------|----------|
+| 性能 | 高（预计算） | 低（实时计算） |
+| 存储 | 需要额外存储 | 无额外存储 |
+| 实时性 | 准实时 | 实时 |
+| 适用场景 | 高频查询 | 低频查询 |
+
+---
+
+## 二十、ksqlDB 与 Kafka Connect
+
+### 集成架构
+
+```mermaid
+graph TB
+    subgraph 数据源
+        S1[数据库]
+        S2[文件]
+        S3[消息队列]
+    end
+    subgraph Kafka Connect
+        C1[Source Connector]
+        C2[Sink Connector]
+    end
+    subgraph Kafka
+        T1[Topic]
+    end
+    subgraph ksqlDB
+        K1[流处理]
+        K2[物化视图]
+    end
+    S1 --> C1
+    S2 --> C1
+    S3 --> C1
+    C1 --> T1
+    T1 --> K1
+    K1 --> K2
+    K2 --> C2
+    C2 --> S1
+    style C1 fill:#99ccff
+    style C2 fill:#99ccff
+    style K1 fill:#99ff99
+    style K2 fill:#99ff99
+```
+
+### 集成配置
+
+```sql
+-- 创建 Kafka Connect Source
+CREATE SOURCE CONNECTOR mysql-source WITH (
+    'connector.class' = 'io.confluent.connect.mysql.MySqlSourceConnector',
+    'connection.url' = 'jdbc:mysql://localhost:3306/mydb',
+    'connection.user' = 'user',
+    'connection.password' = 'password',
+    'topic.prefix' = 'mysql-',
+    'table.whitelist' = 'users,orders'
+);
+
+-- 创建 Kafka Connect Sink
+CREATE SINK CONNECTOR elasticsearch-sink WITH (
+    'connector.class' = 'io.confluent.connect.elasticsearch.ElasticsearchSinkConnector',
+    'connection.url' = 'http://localhost:9200',
+    'topics' = 'user-events',
+    'type.name' = '_doc'
+);
+```
+
+---
+
+## 二十一、Kafka Streams 调优
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| num.stream.threads | 1 | CPU核心数 | 流线程数 |
+| num.iterations | 1 | 100 | 迭代次数 |
+| commit.interval.ms | 30000 | 1000 | 提交间隔 |
+| cache.max.bytes.buffering | 10MB | 50MB | 缓冲区大小 |
+| state.dir | /tmp | SSD路径 | 状态目录 |
+
+### 调优配置
+
+```java
+Properties props = new Properties();
+props.put(StreamsConfig.APPLICATION_ID_CONFIG, "my-app");
+props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 8);
+props.put(StreamsConfig.NUM_ITERATIONS_CONFIG, 100);
+props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);
+props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 52428800L);
+props.put(StreamsConfig.STATE_DIR_CONFIG, "/ssd/kafka-streams");
+props.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 3);
+
+// RocksDB 调优
+props.put("rocksdb.block.cache.size", 512 * 1024 * 1024L);
+props.put("rocksdb.write.buffer.size", 128 * 1024 * 1024);
+props.put("rocksdb.max.write.buffer.number", 4);
+props.put("rocksdb.level0_file_num_compaction_trigger", 4);
+```
+
+### 性能监控
+
+```java
+// 性能监控指标
+Metrics metrics = new Metrics();
+MetricName processRate = new MetricName("process-rate", "streams");
+MetricName pollRate = new MetricName("poll-rate", "streams");
+MetricName commitRate = new MetricName("commit-rate", "streams");
+
+// 注册指标
+metrics.addMetric(processRate, (config, now) -> {
+    return new Gauge<>(() -> getProcessRate());
+});
+```
+
+---
+
+## 二十二、Kafka Connect 调优
+
+### 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| tasks.max | 1 | 数据源数量 | 任务数 |
+| batch.size | 1000 | 5000 | 批量大小 |
+| flush.timeout.ms | 60000 | 30000 | 刷新超时 |
+| max.retries | 3 | 10 | 最大重试 |
+| retry.backoff.ms | 30000 | 5000 | 重试间隔 |
+
+### 调优配置
+
+```properties
+# Source Connector 调优
+tasks.max=8
+batch.size=5000
+poll.interval.ms=100
+table.poll.interval.ms=1000
+topic.prefix=my-topic-
+
+# Sink Connector 调优
+tasks.max=8
+batch.size=5000
+flush.timeout.ms=30000
+max.retries=10
+retry.backoff.ms=5000
+
+# Kafka Connect Worker 调优
+config.storage.topic=my-configs
+offset.storage.topic=my-offsets
+status.storage.topic=my-status
+```
+
+---
+
+## 二十三、与其他板块的关系
 
 - Kafka 基础见「[Kafka](./Kafka.md)」；
 - 流处理见「[Flink](../大数据/08-流处理计算：Flink.md)」；
