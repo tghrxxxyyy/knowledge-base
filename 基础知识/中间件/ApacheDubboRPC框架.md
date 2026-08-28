@@ -788,6 +788,92 @@ K8s 注册中心配置：
   dubbo.application.metadata-service.port=20880
 ```
 
+## 二十七、Dubbo 与 gRPC/Thrift 深度对比
+
+### 27.1 协议与序列化对比
+
+| 特性 | Dubbo | gRPC | Thrift |
+|------|-------|------|--------|
+| 协议 | Dubbo协议 | HTTP/2 | Thrift协议 |
+| 序列化 | Hessian2/Protobuf | Protobuf | Thrift二进制 |
+| 传输 | Netty | Netty | Netty/MINA |
+| 性能 | 高 | 极高 | 高 |
+| 学习曲线 | 中 | 陡峭 | 陡峭 |
+| 生态 | 丰富 | 中等 | 中等 |
+| 多语言 | Java为主 | 多语言 | 多语言 |
+
+### 27.2 Dubbo vs gRPC 选型建议
+
+```text
+选型决策树：
+
+  语言环境？
+    Java → 需要丰富生态？
+      是 → Dubbo
+      否 → gRPC
+
+    多语言 → 需要多语言支持？
+      是 → gRPC
+      否 → Dubbo
+
+  性能要求？
+    极高 → gRPC
+    高 → Dubbo
+
+  功能需求？
+    需要服务治理 → Dubbo
+    只需RPC调用 → gRPC
+
+  团队熟悉度？
+    熟悉Java → Dubbo
+    熟悉Go → gRPC
+```
+
+### 27.3 Dubbo 协议优化配置
+
+```yaml
+# Dubbo 协议优化
+dubbo:
+  protocol:
+    name: dubbo
+    port: 20880
+    # 序列化优化
+    serializer: hessian2
+    # 压缩优化
+    gzip: true
+    # 连接优化
+    connections: 200
+    # 超时优化
+    timeout: 5000
+    # 重试优化
+    retries: 3
+
+  # 注册中心优化
+  registry:
+    address: nacos://127.0.0.1:8848
+    # 连接超时
+    timeout: 5000
+    # 注册超时
+    register-timeout: 3000
+    # 订阅超时
+    subscribe-timeout: 3000
+```
+
+### 27.4 Dubbo 微服务治理能力对比
+
+| 治理能力 | Dubbo | gRPC | 说明 |
+|----------|-------|------|------|
+| 服务注册 | 支持 | 不支持 | 需要额外组件 |
+| 服务发现 | 支持 | 不支持 | 需要额外组件 |
+| 负载均衡 | 支持 | 支持 | Dubbo更丰富 |
+| 熔断降级 | 支持 | 不支持 | 需要额外组件 |
+| 限流 | 支持 | 不支持 | 需要额外组件 |
+| 链路追踪 | 支持 | 不支持 | 需要额外组件 |
+| 配置中心 | 支持 | 不支持 | 需要额外组件 |
+| 灰度发布 | 支持 | 不支持 | 需要额外组件 |
+
+---
+
 ## 与其他板块的关系（扩展）
 
 - 源码精读见「[源码系列/Dubbo 源码](../../源码系列/Dubbo源码.md)」；

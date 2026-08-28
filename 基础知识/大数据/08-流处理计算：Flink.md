@@ -1630,6 +1630,88 @@ monitoring:
 | 延迟高 | 窗口太大 | 检查窗口配置 | 优化窗口 |
 | 吞吐低 | 并行度低 | 检查并行度 | 增加并行度 |
 
+## 三十七、Flink 状态管理深度解析
+
+### 37.1 State Backend 选型对比
+
+| Backend | 存储位置 | 容量上限 | 读写性能 | Checkpoint | 适用场景 |
+|---------|---------|---------|---------|------------|---------|
+| HashMapStateBackend | JVM堆 | 内存限制 | 极快 | 全量快照 | 小状态/测试 |
+| EmbeddedRocksDBStateBackend | 本地磁盘 | TB级 | 中等 | 增量快照 | 大状态/生产 |
+
+### 37.2 RocksDB 调优参数
+
+```yaml
+# RocksDB State Backend 深度调优
+state.backend: rocksdb
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.fixed-per-slot: 256mb
+state.backend.rocksdb.writebuffer.size: 64mb
+state.backend.rocksdb.writebuffer.count: 4
+state.backend.rocksdb.writebuffer.number-to-merge: 2
+state.backend.rocksdb.block.cache-size: 256mb
+state.backend.rocksdb.block.cache-shared: true
+state.backend.rocksdb.writeaheadlog: enabled
+state.backend.incremental: true
+```
+
+### 37.3 Flink 反压分析与优化
+
+```mermaid
+graph LR
+    A[Source] --> B[Map]
+    B --> C[Filter]
+    C --> D[KeyBy]
+    D --> E[Window]
+    E --> F[Agg]
+    F --> G[Sink]
+
+    subgraph "反压链路"
+        D -.->|反压| C
+        E -.->|反压| D
+    end
+
+    H[反压检测] --> I[UI监控面板]
+    H --> J[日志分析]
+    H --> K[Metrics指标]
+```
+
+### 37.4 Flink 容错机制
+
+```text
+Flink 容错三板斧：
+
+  Checkpoint（状态快照）：
+    ① 周期性触发（默认5分钟）
+    ② Chandy-Lamport 分布式快照
+    ③ Exactly-Once 语义保证
+    ④ 失败时自动回滚到最近成功Checkpoint
+
+  Savepoint（手动快照）：
+    ① 手动触发，用于版本升级
+    ② 与Checkpoint格式相同
+    ③ 需要手动保存和恢复
+    ④ 用于代码变更后的状态迁移
+
+  端到端 Exactly-Once：
+    ① Source：可重放（Kafka offset回滚）
+    ② Processing：Checkpoint保证状态一致
+    ③ Sink：事务写入（2PC）或幂等写入
+    ④ 组合：Source重放 + Sink事务 = 端到端精确一次
+```
+
+### 37.5 Flink SQL 性能优化技巧
+
+| 优化项 | 优化前 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| 维表JOIN | 异步Lookup | 缓存+异步 | 延迟降低80% |
+| 窗口聚合 | 逐条处理 | 增量聚合 | 吞吐提升5倍 |
+| 数据倾斜 | 无处理 | 加盐+两阶段 | 均匀分布 |
+| 状态TTL | 无TTL | 合理TTL | 状态缩小90% |
+| 反压处理 | 无优化 | 调整并行度 | 吞吐提升3倍 |
+
+---
+
 ### Flink性能优化
 
 ```yaml

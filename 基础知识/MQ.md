@@ -1645,7 +1645,185 @@ capacity_planning:
 | 缓冲空间 | 预期峰值 × 消息大小 × 保留时间 × 2 | 12GB |
 | 存储空间 | 缓冲空间 × 副本数 | 36GB |
 
-### MQ故障排查手册
+### 二十七、消息队列高可用架构深度对比
+
+### 27.1 Kafka 分区副本机制
+
+```text
+Kafka 分区副本机制：
+
+  Leader-Follower 架构：
+    ① 每个分区有一个 Leader 和多个 Follower
+    ② 生产者只写入 Leader
+    ③ Follower 从 Leader 同步数据
+    ④ ISR（In-Sync Replicas）保持同步的副本集
+
+  副本同步流程：
+    ① Leader 写入本地日志
+    ② Follower 拉取数据（Pull模式）
+    ③ Follower 写入本地日志
+    ④ Follower 发送 ACK 给 Leader
+    ⑤ Leader 收到所有 ISR 的 ACK 后返回生产者 ACK
+
+  ISR 动态调整：
+    sync.time.ms：同步超时时间（默认 10s）
+    replica.lag.time.max.ms：最大延迟时间（默认 30s）
+    replica.fetch.wait.max.ms：最大等待时间（默认 500ms）
+```
+
+### 27.2 RabbitMQ Quorum Queue 与镜像队列
+
+| 特性 | Quorum Queue | 镜像队列 |
+|------|-------------|---------|
+| 一致性 | 强一致（Raft） | 最终一致 |
+| 性能 | 高 | 中 |
+| 恢复速度 | 快 | 慢 |
+| 网络开销 | 中 | 高 |
+| 推荐版本 | 3.8+ | 已废弃 |
+| 适用场景 | 新项目 | 旧项目迁移 |
+
+### 27.3 RocketMQ 主从同步机制
+
+```text
+RocketMQ 主从同步流程：
+
+  同步双写（SYNC_MASTER）：
+    ① 生产者发送消息到 Master
+    ② Master 写入本地 CommitLog
+    ③ Master 同步数据到 Slave
+    ④ Slave 写入本地 CommitLog
+    ⑤ Master 返回生产者 ACK
+
+  异步复制（ASYNC_MASTER）：
+    ① 生产者发送消息到 Master
+    ② Master 写入本地 CommitLog
+    ③ Master 立即返回生产者 ACK
+    ④ 后台异步同步数据到 Slave
+
+  刷盘策略：
+    同步刷盘：消息写入磁盘后返回ACK（可靠性高）
+    异步刷盘：消息写入PageCache后返回ACK（性能高）
+```
+
+### 27.4 消息队列高可用架构对比
+
+```mermaid
+graph TB
+    subgraph "Kafka 高可用"
+        K1[Producer] --> K2[Broker Cluster]
+        K2 --> K3[Controller]
+        K2 --> K4[ISR 集群]
+        K4 --> K5[Leader 分区]
+        K4 --> K6[Follower 分区]
+    end
+
+    subgraph "RabbitMQ 高可用"
+        R1[Producer] --> R2[Queue Cluster]
+        R2 --> R3[Quorum Queue]
+        R3 --> R4[Leader 节点]
+        R3 --> R5[Follower 节点]
+    end
+
+    subgraph "RocketMQ 高可用"
+        Q1[Producer] --> Q2[Broker Cluster]
+        Q2 --> Q3[Master 节点]
+        Q2 --> Q4[Slave 节点]
+        Q3 --> Q5[CommitLog]
+        Q4 --> Q5
+    end
+```
+
+### 27.5 消息队列吞吐量与延迟对比
+
+| 指标 | Kafka | RabbitMQ | RocketMQ | 说明 |
+|------|-------|----------|----------|------|
+| 单机吞吐量 | 100万+ msg/s | 3万 msg/s | 10万+ msg/s | 纯消息处理 |
+| 端到端延迟 | 2-10ms | 1-5ms | 1-5ms | 生产到消费 |
+| 批量延迟 | 1-2ms | N/A | 1-2ms | 批量发送 |
+| 吞吐量优先 | Kafka | RabbitMQ | RocketMQ | 按吞吐量排序 |
+| 延迟优先 | RabbitMQ | RocketMQ | Kafka | 按延迟排序 |
+
+---
+
+## 二十八、消息队列生产调优实战
+
+### 28.1 Kafka 消费者组调优
+
+```properties
+# Kafka 消费者调优配置
+# 并行度优化
+max.poll.records=500          # 单次poll最大记录数
+max.poll.interval.ms=300000   # 两次poll最大间隔
+session.timeout.ms=30000      # 会话超时时间
+heartbeat.interval.ms=10000   # 心跳间隔
+
+# 拉取优化
+fetch.min.bytes=1             # 最小拉取字节
+fetch.max.wait.ms=500         # 最大等待时间
+max.partition.fetch.bytes=1048576  # 单分区最大拉取
+
+# 提交优化
+enable.auto.commit=false      # 禁用自动提交
+auto.offset.reset=latest      # 初始偏移策略
+```
+
+### 28.2 消息积压应急处理
+
+```text
+消息积压应急处理流程：
+
+  ① 评估积压程度
+    积压消息数 / 消费速率 = 预计恢复时间
+
+  ② 短期应急（30分钟内）
+    增加消费者实例（扩容）
+    提高消费并行度（增加线程数）
+    跳过非关键消息（降级处理）
+
+  ③ 中期优化（24小时内）
+    优化消费逻辑（减少耗时）
+    批量消费（合并消息）
+    异步处理（解耦非关键逻辑）
+
+  ④ 长期方案（1周内）
+    优化架构（事件驱动）
+    消息分级（不同队列）
+    流量控制（限流+降级）
+
+  ⑤ 监控告警
+    积压阈值：> 10000 条告警
+    消费延迟：> 1分钟告警
+    消费失败率：> 1% 告警
+```
+
+### 28.3 消息队列容量规划公式
+
+```text
+容量规划计算公式：
+
+  生产能力：
+    生产 QPS = 预期峰值消息量 / 时间窗口（秒）
+    生产带宽 = 消息大小（字节） × 生产 QPS
+    示例：10万条/分钟 × 1KB = 1.67 MB/s
+
+  消费能力：
+    消费 QPS = 消费者数量 × 单消费者 QPS
+    消费带宽 = 消息大小（字节） × 消费 QPS
+    示例：10个消费者 × 1万条/秒 × 1KB = 100 MB/s
+
+  缓冲空间：
+    缓冲时间 = 消息保留时间（Kafka默认7天）
+    缓冲空间 = 生产 QPS × 消息大小 × 保留时间
+    示例：1万条/秒 × 1KB × 7天 = 5.76 GB
+
+  存储空间：
+    存储空间 = 缓冲空间 × 副本数 × 压缩比
+    示例：5.76 GB × 3 × 0.3 = 5.18 GB
+```
+
+---
+
+## MQ故障排查手册
 
 | 故障现象 | 可能原因 | 排查步骤 | 解决方案 |
 |----------|----------|----------|----------|

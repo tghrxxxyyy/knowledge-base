@@ -1661,7 +1661,92 @@ groups:
 
 ---
 
-## 二十三、Stream Queue 深入
+## 二十四、RabbitMQ 集群架构与高可用
+
+### 24.1 集群架构对比
+
+| 模式 | 一致性 | 性能 | 脑裂恢复 | 适用场景 |
+|------|--------|------|---------|---------|
+| 普通集群 | 无 | 高 | 不自动 | 开发测试 |
+| Quorum Queue | 强 | 中 | 自动 | 生产环境 |
+| Federation | 最终 | 中 | 手动 | 跨集群 |
+| Shovel | 最终 | 高 | 手动 | 跨集群 |
+
+### 24.2 Quorum Queue 深度配置
+
+```yaml
+# Quorum Queue 集群配置
+cluster_formation.peer_discovery_backend: classic_config
+cluster_formation.classic_config.nodes:
+  - rabbit@node1
+  - rabbit@node2
+  - rabbit@node3
+
+# Quorum Queue 参数
+quorum_queue:
+  # 初始集群成员
+  default_quorum集群: 3
+  # 复制因子
+  replication_factor: 3
+  # 投票成员数
+  quorum_cluster_size: 3
+  # 日志目录
+  wal_dir: /var/lib/rabbitmq/quorum/wal
+  # 段文件目录
+  segment_dir: /var/lib/rabbitmq/quorum/segments
+```
+
+### 24.3 RabbitMQ 三种集群模式
+
+```mermaid
+graph TB
+    subgraph "普通集群"
+        A1[Node1] -.->|Federation| A2[Node2]
+        A2 -.->|Federation| A3[Node3]
+    end
+
+    subgraph "Quorum Queue 集群"
+        B1[Node1 Leader] -->|Raft| B2[Node2 Follower]
+        B1 -->|Raft| B3[Node3 Follower]
+    end
+
+    subgraph "Shovel 跨集群"
+        C1[集群A] -->|Shovel| C2[集群B]
+    end
+```
+
+### 24.4 RabbitMQ 集群故障恢复流程
+
+```text
+集群故障恢复流程：
+
+  节点宕机：
+    ① 检测：心跳超时（默认60s）
+    ② 通知：告警系统
+    ③ 恢复：重启节点
+    ④ 验证：消息同步完成
+
+  网络分区：
+    ① 检测：自动检测或手动检测
+    ② 选择：自动恢复或手动恢复
+    ③ 恢复：网络修复后自动恢复
+    ④ 验证：队列状态正常
+
+  脑裂处理：
+    ① 监控：网络分区检测
+    ② 判定：选择少数派分区
+    ③ 处理：重启少数派节点
+    ④ 验证：消息无丢失
+
+  数据恢复：
+    ① 备份：定期备份数据
+    ② 恢复：使用备份恢复
+    ③ 验证：消息完整性
+```
+
+---
+
+## 二十五、Stream Queue 深入
 
 ### 23.1 Stream Queue 特性
 

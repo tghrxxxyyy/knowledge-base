@@ -1649,6 +1649,171 @@ Seata 高可用部署：
 
 ---
 
+## 二十六、Seata 高级模式与生产实践
+
+### 26.1 TCC 模式三阶段详解
+
+```text
+TCC（Try-Confirm-Cancel）三阶段流程：
+
+  Try 阶段（资源预留）：
+    ① 检查业务可行性（Check）
+    ② 预留业务资源（Reserve）
+    ③ 不直接扣减，只做标记
+    示例：冻结金额 = 订单金额，可用余额减少
+
+  Confirm 阶段（确认提交）：
+    ① 确认业务操作（Confirm）
+    ② 消耗预留资源
+    ③ 不做任何业务检查
+    示例：正式扣减冻结金额
+
+  Cancel 阶段（回滚释放）：
+    ① 释放预留资源（Cancel）
+    ② 恢复到初始状态
+    ③ 释放冻结金额回可用余额
+
+  异常处理：
+    Try 失败 → 直接返回，无需回滚
+    Confirm 失败 → 重试直至成功（空回滚+悬挂防护）
+    Cancel 失败 → 重试直至成功
+```
+
+### 26.2 Seata 回滚策略配置
+
+```java
+// 自定义全局事务回滚策略
+@GlobalLock
+public class CustomRollbackStrategy implements RollbackStrategy {
+
+    @Override
+    public void rollback(GlobalTransactionContext context) {
+        // 1. 按逆序回滚分支事务
+        List<BranchTransaction> branches = context.getBranches();
+        for (int i = branches.size() - 1; i >= 0; i--) {
+            BranchTransaction branch = branches.get(i);
+            try {
+                branch.rollback();
+            } catch (Exception e) {
+                // 2. 记录回滚失败日志
+                log.error("Branch rollback failed: {}", branch.getXid(), e);
+                // 3. 加入重试队列
+                retryQueue.add(branch);
+            }
+        }
+
+        // 4. 检查是否有未回滚成功的分支
+        if (!retryQueue.isEmpty()) {
+            // 5. 触发告警通知运维
+            alertService.send("Global rollback partially failed");
+            // 6. 启动定时重试任务
+            scheduleRetryTask(retryQueue);
+        }
+    }
+}
+```
+
+### 26.3 Seata 异常处理规则
+
+| 异常类型 | 处理方式 | 重试策略 | 通知方式 |
+|----------|----------|----------|----------|
+| 网络超时 | 自动重试 | 指数退避，最多3次 | 告警 |
+| 分支事务失败 | 全局回滚 | 立即重试 | 告警 |
+| 协调器不可用 | 本地缓存 | 持续重试 | 告警+人工介入 |
+| 空回滚 | 忽略 | 无需重试 | 日志记录 |
+| 悬挂事务 | 清理 | 定时扫描 | 告警 |
+| 超时未完成 | 自动回滚 | 无需重试 | 告警 |
+
+### 26.4 Seata 与分布式锁协同
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant S as Seata TC
+    participant A as 服务A
+    participant B as 服务B
+    participant Redis as Redis锁
+
+    C->>S: 开启全局事务
+    S-->>C: 返回 XID
+    C->>A: 调用服务A（携带XID）
+    A->>Redis: 获取分布式锁
+    Redis-->>A: 锁获取成功
+    A->>A: 执行本地事务
+    A->>S: 注册分支事务
+    S-->>A: 分支注册成功
+    A-->>C: 返回成功
+
+    C->>B: 调用服务B（携带XID）
+    B->>Redis: 获取分布式锁
+    Note over B: 锁冲突，等待重试
+    Redis-->>B: 锁获取成功
+    B->>B: 执行本地事务
+    B->>S: 注册分支事务
+    S-->>B: 分支注册成功
+
+    S->>A: 提交全局事务
+    S->>B: 提交全局事务
+    A->>Redis: 释放锁
+    B->>Redis: 释放锁
+```
+
+### 26.5 Seata 性能调优参数
+
+```yaml
+# Seata Server 调优配置
+server:
+  # 线程池配置
+  thread-pool:
+    core-size: 16
+    max-size: 64
+    queue-capacity: 1000
+    keep-alive: 60
+
+  # 数据库连接池
+  datasource:
+    hikari:
+      maximum-pool-size: 30
+      minimum-idle: 10
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  # 会话存储
+  session:
+    store-mode: db
+    db:
+      max-branch-session-size: 5000
+      max-global-session-size: 500
+      global-session-reload-interval: 1000
+
+# 客户端调优
+client:
+  # TM 配置
+  tm:
+    default-global-transaction-timeout: 60000
+    commit-retry-count: 5
+    rollback-retry-count: 5
+
+  # RM 配置
+  rm:
+    async-commit-buffer-limit: 10000
+    report-retry-count: 5
+    table-meta-check-enable: false
+    sqlParserType: druid
+```
+
+### 26.6 Seata 模式性能对比
+
+| 模式 | 吞吐量(TPS) | 延迟(ms) | 一致性 | 资源锁定 | 适用场景 |
+|------|------------|---------|--------|----------|---------|
+| AT | 5000 | 10-50 | 最终一致 | 自动 | 常规业务 |
+| TCC | 8000 | 5-20 | 强一致 | 手动 | 高性能场景 |
+| Saga | 3000 | 20-100 | 最终一致 | 无 | 长事务 |
+| XA | 2000 | 30-80 | 强一致 | 数据库级 | 强一致要求 |
+
+---
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

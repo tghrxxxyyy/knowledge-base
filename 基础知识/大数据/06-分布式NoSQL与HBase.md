@@ -1597,7 +1597,120 @@ hbase shell> remove_peer 'peer1'
 | SnapShot | 快照恢复 | 快速恢复 | 中 |
 | BulkLoad | 大批量导入 | 高性能导入 | 高 |
 
-## 三十四、HBase在IoT宽表中的rowkey设计模式
+## 三十五、HBase 二级索引与协处理器
+
+### 35.1 二级索引方案对比
+
+| 方案 | 实时性 | 一致性 | 复杂度 | 适用场景 |
+|------|--------|--------|--------|---------|
+| 表索引 | 高 | 强 | 低 | 小规模 |
+| 协处理器索引 | 高 | 强 | 中 | 中规模 |
+| Phoenix索引 | 高 | 强 | 低 | 通用场景 |
+| Solr索引 | 中 | 最终 | 高 | 全文检索 |
+| ES索引 | 中 | 最终 | 高 | 复杂查询 |
+
+### 35.2 Phoenix 二级索引配置
+
+```sql
+-- Phoenix 全局索引
+CREATE INDEX idx_user_name ON users (name) INCLUDE (email, phone);
+
+-- Phoenix 函数索引
+CREATE INDEX idx_upper_name ON users (UPPER(name));
+
+-- Phoenix 部分索引（条件索引）
+CREATE INDEX idx_active_users ON users (name) WHERE status = 'active';
+
+-- Phoenix 覆盖索引（INCLUDE列不存储在索引中，直接从索引获取）
+CREATE INDEX idx_order_status ON orders (status) INCLUDE (amount, customer_id);
+
+-- 索引维护
+-- 自动维护：写入时同步更新索引
+-- 异步维护：写入后异步更新索引（性能更高）
+```
+
+### 35.3 协处理器 IndexObserver 示例
+
+```java
+// 协处理器：自动维护二级索引
+public class IndexObserver implements RegionObserver {
+
+    @Override
+    public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                       Put put, WALEdit edit, Durability durability) {
+        // 1. 获取原始数据
+        byte[] row = put.getRow();
+        byte[] name = put.getValue(Bytes.toBytes("cf"), Bytes.toBytes("name"));
+        byte[] email = put.getValue(Bytes.toBytes("cf"), Bytes.toBytes("email"));
+
+        // 2. 构建索引Put
+        Put indexPut = new Put(name);  // 以name为rowkey
+        indexPut.addColumn(Bytes.toBytes("idx"), Bytes.toBytes("row"), row);
+        indexPut.addColumn(Bytes.toBytes("idx"), Bytes.toBytes("email"), email);
+
+        // 3. 写入索引表
+        Table indexTable = getTable("users_index");
+        indexTable.put(indexPut);
+    }
+
+    @Override
+    public void preDelete(ObserverContext<RegionCoprocessorEnvironment> e,
+                          Delete delete, WALEdit edit, Durability durability) {
+        // 删除时同步清理索引
+        byte[] row = delete.getRow();
+        // 查询索引表获取name
+        byte[] name = getNameByRow(row);
+        if (name != null) {
+            Delete indexDelete = new Delete(name);
+            Table indexTable = getTable("users_index");
+            indexTable.delete(indexDelete);
+        }
+    }
+}
+```
+
+### 35.4 HBase 监控指标体系
+
+```mermaid
+graph TB
+    subgraph "HBase 监控指标"
+        A[RegionServer 指标] --> B[Region 数量]
+        A --> C[Store 文件大小]
+        A --> D[MemStore 大小]
+        A --> E[Compaction 队列]
+        
+        F[Region 指标] --> G[读请求延迟]
+        F --> H[写请求延迟]
+        F --> I[Store 文件数量]
+        F --> J[Region 大小]
+        
+        K[RegionServer JVM] --> L[GC 频率]
+        K --> M[堆内存使用]
+        K --> N[线程数]
+    end
+
+    subgraph "告警规则"
+        O[Region数量 > 300] --> P[告警]
+        Q[Store文件 > 10GB] --> R[告警]
+        S[读延迟 > 100ms] --> T[告警]
+    end
+```
+
+### 35.5 HBase 性能调优清单
+
+| 调优项 | 配置参数 | 推荐值 | 说明 |
+|--------|----------|--------|------|
+| 写缓存 | hfile.block.cache.size | 0.4 | 堆内存40% |
+| MemStore | hbase.regionserver.global.memstore.size | 0.4 | 堆内存40% |
+| Bloom Filter | compaction.store.file.max | 3 | 减少读放大 |
+| 压缩 | hbase.regionserver compaction throughput cap | 20MB/s | 控制IO |
+| 并行Compaction | hbase.regionserver.compacting.large.thread.count | 3 | 大文件 |
+| 并行Compaction | hbase.regionserver.compacting.small.thread.count | 5 | 小文件 |
+| Split | hbase.regionserver.region.split.policy | SteppingSplitPolicy | 自动分裂 |
+
+---
+
+## 三十六、HBase在IoT宽表中的rowkey设计模式
 
 ### 34.1 IoT宽表rowkey设计
 
