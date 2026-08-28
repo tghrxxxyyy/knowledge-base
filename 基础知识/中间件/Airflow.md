@@ -1759,4 +1759,72 @@ def test_dag_structure():
 | 数据库 | 连接池 + 索引优化 | 查询性能提升 3x |
 | 日志 | 异步日志 + 压缩 | IO 减少 50% |
 
+## Airflow 在数据平台中的角色
+
+### 数据平台架构
+
+```mermaid
+flowchart TB
+    subgraph 数据采集层
+        A1[MySQL] --> KAFKA
+        A2[API] --> KAFKA
+    end
+    subgraph 数据处理层
+        KAFKA --> AIRFLOW[Airflow编排]
+        AIRFLOW --> SPARK[Spark处理]
+        AIRFLOW --> FLINK[Flink处理]
+    end
+    subgraph 数据存储层
+        SPARK --> HDFS[HDFS]
+        FLINK --> HBASE[HBase]
+    end
+    subgraph 数据服务层
+        HDFS --> HIVE[Hive]
+        HBASE --> PHOENIX[Phoenix]
+    end
+```
+
+### Airflow Operator 支持矩阵
+
+| Operator | 目标系统 | 执行方式 | 适用场景 |
+|----------|----------|----------|----------|
+| BashOperator | 本地Shell | 本地执行 | 简单脚本 |
+| PythonOperator | Python函数 | 本地执行 | 数据处理 |
+| SparkSubmitOperator | Spark | 集群提交 | 批处理 |
+| KubernetesPodOperator | K8s Pod | 容器执行 | 隔离环境 |
+| S3ToRedshiftOperator | Redshift | SQL执行 | 数据仓库加载 |
+| BigQueryOperator | BigQuery | API调用 | 云数仓 |
+
+### Airflow 与 Kubernetes 集成
+
+```yaml
+# KubernetesExecutor 配置
+[core]
+executor = KubernetesExecutor
+
+[kubernetes]
+namespace = airflow
+worker_container_repository = apache/airflow
+worker_container_tag = 2.7.0
+worker_container_image_pull_policy = IfNotPresent
+delete_worker_pods = true
+delete_worker_pods_on_failure = false
+```
+
+### 任务依赖管理最佳实践
+
+```text
+任务依赖设计原则：
+  1. 幂等性：任务可重复执行，结果一致
+  2. 数据分区：按日期分区，避免全表扫描
+  3. 重试机制：配置重试间隔和次数
+  4. 超时控制：设置任务最大执行时间
+  5. 告警通知：失败时发送告警
+
+依赖关系设计：
+  1. 同层依赖：数据准备 → 数据校验 → 数据加载
+  2. 跨层依赖：ODS → DWD → DWS → ADS
+  3. 外部依赖：传感器检测文件/数据到达
+```
+
 > 一句话：**Airflow = DAG 即代码（Python）+ Scheduler 调度 + Executor 执行（Celery/K8s）+ 回填/传感器/Dataset 触发——数据工程编排事实标准；选型先看「团队（Python/数据工程→Airflow，可视化中文→DS）」，再定「执行器（K8s 动态→KubernetesExecutor）」，最后配「幂等任务 + 调度器高可用 + 监控告警」**。

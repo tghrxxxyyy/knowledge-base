@@ -1158,6 +1158,117 @@ public class SentinelMetricsExporter {
 
 > 核心原则：**监控先行，规则适中，日志分析，持续优化**。
 
+## Sentinel 在微服务链路中的限流策略
+
+### 全链路限流架构
+
+```mermaid
+flowchart TB
+    A[用户请求] --> B[API Gateway限流]
+    B --> C[Sentinel网关限流]
+    C --> D[微服务A限流]
+    D --> E[微服务B限流]
+    E --> F[数据库/缓存]
+```
+
+### 限流降级策略矩阵
+
+| 场景 | 限流策略 | 熔断策略 | 降级方案 |
+|------|----------|----------|----------|
+| 热点接口 | QPS限流 | 慢调用熔断 | 返回缓存数据 |
+| 查询接口 | 并发线程限流 | 异常比例熔断 | 返回默认值 |
+| 下游服务 | QPS限流 | 异常数熔断 | 降级到备选服务 |
+| 写入接口 | 匀速队列 | 慢调用熔断 | 异步重试/排队 |
+| 定时任务 | 并发控制 | 无 | 跳过本次执行 |
+
+### Sentinel 规则持久化方案对比
+
+| 方案 | 推送方式 | 一致性 | 实时性 | 适用场景 |
+|------|----------|--------|--------|----------|
+| Nacos Push | 配置中心推送 | 强一致 | 实时 | 生产环境首选 |
+| Apollo Push | 配置中心推送 | 强一致 | 实时 | 已用Apollo |
+| ZooKeeper Watch | Watcher通知 | 强一致 | 实时 | 已用ZK |
+| 文件推送 | 本地文件 | 最终一致 | 延迟 | 开发测试 |
+
+```yaml
+# Nacos 持久化配置示例
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        flow:
+          nacos:
+            server-addr: ${nacos.server-addr}
+            data-id: ${spring.application.name}-flow-rules
+            group-id: SENTINEL_GROUP
+            rule-type: flow
+        degrade:
+          nacos:
+            server-addr: ${nacos.server-addr}
+            data-id: ${spring.application.name}-degrade-rules
+            group-id: SENTINEL_GROUP
+            rule-type: degrade
+```
+
+## Sentinel 与 Spring Cloud Alibaba 集成
+
+### 自动配置流程
+
+```mermaid
+flowchart TD
+    A[Spring Boot启动] --> B[自动配置Sentinel]
+    B --> C[加载限流规则]
+    C --> D[注册SentinelClient]
+    D --> E[拦截器生效]
+    E --> F[限流/熔断生效]
+```
+
+### 关键配置项
+
+```yaml
+spring:
+  application:
+    name: my-service
+  cloud:
+    sentinel:
+      transport:
+        dashboard: localhost:8080
+        port: 8719
+      eager: true
+      web-context-unify: false
+      filter:
+        url-patterns: /*
+      datasource:
+        flow:
+          nacos:
+            server-addr: localhost:8848
+            data-id: my-service-flow-rules.json
+            group-id: SENTINEL_GROUP
+            rule-type: flow
+```
+
+### 与 Feign 集成降级
+
+```java
+// Feign 客户端降级
+@FeignClient(value = "user-service", fallbackFactory = UserServiceFallback.class)
+public interface UserServiceClient {
+    @GetMapping("/user/{id}")
+    User getUser(@PathVariable Long id);
+}
+
+@Component
+public class UserServiceFallback implements FallbackFactory<UserServiceClient> {
+    @Override
+    public UserServiceClient create(Throwable cause) {
+        return id -> {
+            // 降级逻辑：返回缓存数据
+            return cacheService.getUserFromCache(id);
+        };
+    }
+}
+```
+
 ## 十五、与其他板块的关系
 
 - 限流原理（令牌桶/漏桶/滑动窗口）见「[场景设计/稳定性三板斧](../../场景设计/稳定性三板斧：限流-熔断-降级.md)」；

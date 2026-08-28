@@ -1712,3 +1712,117 @@ for (User user : users) {
     </where>
 </select>
 ```
+
+## MyBatis 批量操作性能优化
+
+### 批量插入性能对比
+
+| 方式 | SQL 数量 | 耗时（1万条） | 适用场景 |
+|------|----------|--------------|----------|
+| 循环单条插入 | 10000 | ~8s | 不推荐 |
+| BatchExecutor | 1（分批） | ~1.5s | 通用 |
+| INSERT INTO 多值 | 1 | ~0.3s | 大批量 |
+| LOAD DATA | 1 | ~0.1s | 极致性能 |
+
+```java
+// 方式一：SqlSession Batch 模式
+SqlSession session = sqlSessionFactory.openSession(ExecutorType.BATCH);
+UserMapper mapper = session.getMapper(UserMapper.class);
+for (User user : users) {
+    mapper.insert(user);
+}
+session.flushStatements();
+session.commit();
+
+// 方式二：MyBatis-Plus 批量插入
+@Service
+public class UserServiceImpl {
+    @Autowired
+    private UserMapper userMapper;
+    
+    public void batchInsert(List<User> users) {
+        // 每 1000 条一批
+        Lists.partition(users, 1000).forEach(batch -> {
+            userMapper.insertBatch(batch);
+        });
+    }
+}
+```
+
+### 动态 SQL 批量生成
+
+```xml
+<!-- 动态批量插入 -->
+<insert id="batchInsert" parameterType="list">
+    INSERT INTO user (name, age, email) VALUES
+    <foreach collection="list" item="user" separator=",">
+        (#{user.name}, #{user.age}, #{user.email})
+    </foreach>
+</insert>
+
+<!-- 动态批量更新 -->
+<update id="batchUpdate" parameterType="list">
+    <foreach collection="list" item="user" separator=";">
+        UPDATE user SET name = #{user.name}, age = #{user.age}
+        WHERE id = #{user.id}
+    </foreach>
+</update>
+```
+
+## MyBatis 多数据源路由策略
+
+### 动态数据源路由实现
+
+```mermaid
+flowchart TD
+    A[业务方法调用] --> B{检查注解}
+    B -->|@DataSource注解| C[获取数据源类型]
+    B -->|无注解| D[使用默认数据源]
+    C --> E[设置ThreadLocal]
+    E --> F[执行SQL]
+    F --> G[清除ThreadLocal]
+```
+
+```java
+// 数据源路由切面
+@Aspect
+@Component
+public class DataSourceAspect {
+    @Around("@annotation(dataSource)")
+    public Object around(ProceedingJoinPoint point, DataSource dataSource) throws Throwable {
+        try {
+            DataSourceContextHolder.setDataSourceType(dataSource.value());
+            return point.proceed();
+        } finally {
+            DataSourceContextHolder.clear();
+        }
+    }
+}
+
+// 使用
+@DataSource("secondary")
+public User selectFromSecondary(Long id) {
+    return userMapper.selectById(id);
+}
+```
+
+### 多数据源事务处理
+
+```text
+挑战：跨数据源事务无法使用本地 @Transactional
+
+解决方案：
+  1. 避免跨库事务（推荐）
+     - 同一业务操作使用同一数据源
+     - 通过消息队列实现最终一致
+
+  2. 分布式事务框架
+     - Seata（AT/TCC/SAGA 模式）
+     - 消息最终一致性方案
+
+  3. 手动管理
+     - 编程式事务控制
+     - 每个数据源独立事务
+```
+
+## 与其他板块的关系

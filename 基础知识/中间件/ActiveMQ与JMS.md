@@ -1755,7 +1755,78 @@ spring:
 | 重复消费 | ACK 未正确处理 | 幂等处理+事务 |
 | 磁盘满 | 持久化消息堆积 | 监控磁盘+清理策略 |
 
-## 三十、与其他板块的关系
+## ActiveMQ 与 Spring Boot 集成最佳实践
+
+### Spring Boot 自动配置
+
+```java
+// Spring Boot ActiveMQ 配置
+@Configuration
+@EnableJms
+public class ActiveMQConfig {
+    @Bean
+    public ActiveMQConnectionFactory activeMQConnectionFactory() {
+        ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory();
+        factory.setBrokerURL("tcp://localhost:61616");
+        factory.setUserName("admin");
+        factory.setPassword("admin");
+        
+        // 连接池配置
+        factory.setPrefetchPolicy(new PrefetchPolicy());
+        factory.getPrefetchPolicy().setQueuePrefetch(1000);
+        factory.getPrefetchPolicy().setTopicPrefetch(1000);
+        
+        return factory;
+    }
+    
+    @Bean
+    public DefaultJmsListenerContainerFactory jmsListenerContainerFactory(
+            ConnectionFactory connectionFactory) {
+        DefaultJmsListenerContainerFactory factory = new DefaultJmsListenerContainerFactory();
+        factory.setConnectionFactory(connectionFactory);
+        factory.setConcurrency("5-10");
+        factory.setRecoveryInterval(5000L);
+        return factory;
+    }
+}
+```
+
+### JMS 监听器配置
+
+```java
+@Component
+public class OrderMessageListener {
+    @JmsListener(destination = "order.queue", containerFactory = "jmsListenerContainerFactory")
+    @Transactional
+    public void processOrder(Message message, Session session) throws JMSException {
+        try {
+            TextMessage textMessage = (TextMessage) message;
+            String orderJson = textMessage.getText();
+            
+            // 业务处理
+            Order order = objectMapper.readValue(orderJson, Order.class);
+            orderService.process(order);
+            
+            // 确认消息
+            message.acknowledge();
+        } catch (Exception e) {
+            // 重新投递
+            throw new JMSException("处理失败: " + e.getMessage());
+        }
+    }
+}
+```
+
+### 消息确认模式对比
+
+| 模式 | 确认方式 | 可靠性 | 性能 | 适用场景 |
+|------|----------|--------|------|----------|
+| AUTO_ACKNOWLEDGE | 自动确认 | 低 | 高 | 非关键消息 |
+| CLIENT_ACKNOWLEDGE | 手动确认 | 高 | 中 | 关键业务 |
+| DUPS_OK_ACKNOWLEDGE | 延迟确认 | 中 | 高 | 允许重复 |
+| SESSION_TRANSACTED | 事务确认 | 最高 | 低 | 金融级场景 |
+
+## 与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；
 - AMQP 协议生态见「[RabbitMQ](./RabbitMQ.md)」；

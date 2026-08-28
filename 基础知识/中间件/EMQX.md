@@ -1732,6 +1732,101 @@ performance:
 
 > 核心原则：**集群通信Gossip，认证授权多方式，规则引擎数据桥接，Prometheus监控，Grafana可视化，车联网场景优化**。
 
+## EMQX 在 IoT 平台中的集成架构
+
+### IoT 平台分层架构
+
+```mermaid
+flowchart TB
+    subgraph 设备层
+        D1[传感器] --> EMQX
+        D2[网关] --> EMQX
+        D3[摄像头] --> EMQX
+    end
+    subgraph 消息层
+        EMQX --> KAFKA[Kafka]
+        EMQX --> REDIS[Redis]
+    end
+    subgraph 处理层
+        KAFKA --> FLINK[Flink]
+        FLINK --> TSDB[时序库]
+    end
+    subgraph 应用层
+        TSDB --> APP[业务应用]
+        TSDB --> AI[AI分析]
+    end
+```
+
+### EMQX 规则引擎数据桥接
+
+```yaml
+# Kafka 桥接配置示例
+{
+  "actions": [
+    {
+      "function": "kafka:produce",
+      "args": {
+        "bootstrap_hosts": "kafka1:9092,kafka2:9092",
+        "topic": "device_data",
+        "parameters": {
+          "compression": "snappy",
+          "acks": "-1"
+        }
+      }
+    }
+  ],
+  "sql": "SELECT clientid, payload.device_id, payload.temperature, payload.timestamp FROM \"devices/+/telemetry\""
+}
+```
+
+### IoT 协议支持对比
+
+| 协议 | 端口 | 适用场景 | EMQX 支持 |
+|------|------|----------|-----------|
+| MQTT 3.1.1 | 1883 | 轻量IoT | 原生 |
+| MQTT 5.0 | 1883 | 新IoT特性 | 原生 |
+| CoAP | 5683 | 资源受限设备 | 插件 |
+| LwM2M | 5683 | 设备管理 | 插件 |
+| WebSocket | 8083 | 浏览器/前端 | 原生 |
+| TCP/UDP | 自定义 | 私有协议 | 原生 |
+
+## EMQX 集群运维与监控
+
+### 集群健康检查脚本
+
+```bash
+#!/bin/bash
+# EMQX 集群健康检查
+
+# 1. 检查节点状态
+for node in emqx1 emqx2 emqx3; do
+  status=$(curl -s http://$node:18083/api/v5/nodes | jq -r '.[0].status')
+  echo "$node: $status"
+done
+
+# 2. 检查连接数
+connections=$(curl -s http://emqx1:18083/api/v5/stats | jq '.connections.count')
+echo "Total connections: $connections"
+
+# 3. 检查消息吞吐
+msg_in=$(curl -s http://emqx1:18083/api/v5/stats | jq '.messages.received')
+msg_out=$(curl -s http://emqx1:18083/api/v5/stats | jq '.messages.sent')
+echo "Messages in: $msg_in, out: $msg_out"
+```
+
+### 关键监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| connections.count | 当前连接数 | > 80% 最大连接 |
+| messages.received | 消息接收速率 | 基线对比 |
+| messages.sent | 消息发送速率 | 基线对比 |
+| messages.dropped | 丢弃消息数 | > 0 |
+| topics.count | Topic 数量 | > 100万 |
+| subscriptions.count | 订阅数量 | > 1000万 |
+| memory.used | 内存使用 | > 80% |
+| disk.used | 磁盘使用 | > 80% |
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

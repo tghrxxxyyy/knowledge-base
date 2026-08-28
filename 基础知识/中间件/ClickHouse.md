@@ -1689,6 +1689,64 @@ WHERE _shard_num = 1;
     调整 max_memory_usage 限制内存
 ```
 
+## ClickHouse 在实时数仓中的架构角色
+
+### 实时数仓分层架构
+
+```mermaid
+flowchart TB
+    A[数据源] --> B[ODS层-原始数据]
+    B --> C[DWD层-明细数据]
+    C --> D[DWS层-汇总数据]
+    D --> E[ADS层-应用数据]
+    E --> F[报表/API]
+```
+
+### ClickHouse 与 Kafka 集成
+
+```sql
+-- Kafka Engine 表定义
+CREATE TABLE kafka_queue (
+    timestamp DateTime,
+    level String,
+    message String,
+    service String
+) ENGINE = Kafka
+SETTINGS
+    kafka_broker_list = 'kafka1:9092,kafka2:9092',
+    kafka_topic_list = 'app_logs',
+    kafka_group_name = 'clickhouse_consumer',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 3;
+
+-- 物化视图自动消费
+CREATE MATERIALIZED VIEW kafka_logs TO logs_table AS
+SELECT * FROM kafka_queue;
+```
+
+### ClickHouse 物化视图模式
+
+| 引擎类型 | 聚合方式 | 适用场景 | 查询性能 |
+|----------|----------|----------|----------|
+| SummingMergeTree | 求和 | 计数/求和 | 极高 |
+| AggregatingMergeTree | 聚合函数 | 复杂聚合 | 极高 |
+|ReplacingMergeTree | 去重 | 最新状态 | 高 |
+| CollapsingMergeTree | 折叠 | 更新/删除 | 高 |
+
+```sql
+-- SummingMergeTree 物化视图
+CREATE MATERIALIZED VIEW daily_stats
+ENGINE = SummingMergeTree()
+ORDER BY (service, date)
+AS SELECT
+    service,
+    toDate(timestamp) as date,
+    count() as request_count,
+    sum(duration) as total_duration
+FROM raw_logs
+GROUP BY service, date;
+```
+
 ## 与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。

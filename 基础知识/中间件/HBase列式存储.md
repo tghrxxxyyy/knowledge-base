@@ -1201,6 +1201,64 @@ set_quota 'TABLE', 'tenant_b:order_table', LIMIT => {'REGION_COUNT' => '50'}
 
 ---
 
+## HBase 在大数据生态中的定位
+
+### HBase 与 Hadoop 组件集成
+
+```mermaid
+flowchart LR
+    A[数据源] --> B[HDFS]
+    B --> C[HBase]
+    C --> D[Phoenix SQL]
+    C --> E[Spark on HBase]
+    C --> F[MapReduce]
+    F --> G[HDFS输出]
+    E --> H[分析结果]
+```
+
+### HBase + Spark 集成模式
+
+| 模式 | 实现方式 | 适用场景 | 性能 |
+|------|----------|----------|------|
+| HBase-Spark-Connector | DataSource API | 批量读取 | 高 |
+| Phoenix-Spark | JDBC | SQL查询 | 中 |
+| Scan 优化 | Scan 限定范围 | 增量读取 | 高 |
+| BulkLoad | HFile导入 | 大批量写入 | 极高 |
+
+```scala
+// Spark 读取 HBase
+val conf = HBaseConfiguration.create()
+conf.set("hbase.zookeeper.quorum", "zk1,zk2,zk3")
+
+val df = spark.read
+  .format("org.apache.hadoop.hbase.spark")
+  .option("hbase.zookeeper.quorum", "zk1,zk2,zk3")
+  .option("hbase.table", "user_table")
+  .option("hbase.columns", "cf:name,cf:age,cf:email")
+  .load()
+
+df.show()
+```
+
+### HBase 在数据湖架构中的角色
+
+```text
+数据湖分层：
+  原始层（Raw Zone）：HDFS 原始文件
+  标准层（Standard Zone）：HBase 结构化存储
+  服务层（Serving Zone）：Phoenix/Spark SQL 查询
+  应用层（Application Zone）：业务应用
+
+HBase 定位：
+  ✓ 适合：实时随机读写、宽表查询、时序数据
+  ✗ 不适合：复杂 JOIN、全文检索、OLAP 分析
+
+替代方案对比：
+  HBase vs Cassandra：HBase 强一致、Cassandra 高可用
+  HBase vs ClickHouse：HBase 实时写、ClickHouse 分析查
+  HBase vs MongoDB：HBase 列存、MongoDB 文档存
+```
+
 ## 与其他板块的关系
 
 - 大数据存储见「[基础知识/大数据](../大数据/README.md)」；

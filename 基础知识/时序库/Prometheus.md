@@ -1739,6 +1739,81 @@ groups:
 
 ---
 
+## Prometheus 与 Prometheus Federation 联邦
+
+### 联邦架构设计
+
+```mermaid
+flowchart TB
+    subgraph 边缘集群
+        P1[Prometheus 1] --> F[联邦Prometheus]
+        P2[Prometheus 2] --> F
+    end
+    subgraph 中心集群
+        F --> TH[Thanos/Mimir]
+        TH --> GRAFANA[Grafana]
+    end
+```
+
+### 联邦配置示例
+
+```yaml
+# 联邦 Prometheus 配置
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job=~".+"}'
+        - '{__name__=~"job:.*"}'
+    static_configs:
+      - targets:
+        - 'prometheus-1:9090'
+        - 'prometheus-2:9090'
+```
+
+### 指标聚合规则
+
+```yaml
+# 联邦聚合规则
+groups:
+  - name: federated_rules
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
+      
+      - record: instance:node_cpu:avg5m
+        expr: avg(rate(node_cpu_seconds_total[5m])) by (instance)
+```
+
+## Prometheus 高可用部署方案
+
+### Thanos 架构
+
+```text
+Thanos 组件：
+  Sidecar：上传 Prometheus 数据到对象存储
+  Store Gateway：查询对象存储中的历史数据
+  Query：聚合多 Prometheus 数据源
+  Compactor：压缩和降采样历史数据
+  Ruler：全局告警规则评估
+
+数据流：
+  Prometheus → Sidecar → 对象存储（S3/GCS）
+  Thanos Query → Store Gateway → 对象存储
+  Grafana → Thanos Query
+```
+
+### 高可用方案对比
+
+| 方案 | 数据冗余 | 查询高可用 | 历史数据 | 复杂度 |
+|------|----------|-----------|----------|--------|
+| 双写 | 有 | 有 | 有限 | 低 |
+| Thanos | 有 | 有 | 无限 | 中 |
+| Mimir | 有 | 有 | 无限 | 高 |
+| VictoriaMetrics | 有 | 有 | 无限 | 中 |
+
 ## 二十三、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](../中间件/云上可观测性体系.md)」；

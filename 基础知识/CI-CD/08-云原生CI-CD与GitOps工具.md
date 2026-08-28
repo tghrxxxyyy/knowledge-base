@@ -1713,6 +1713,106 @@ scrape_configs:
 
 ---
 
+## GitOps 安全左移实践
+
+### Supply Chain Security 全链路
+
+```mermaid
+flowchart LR
+    A[代码提交] --> B[SAST扫描]
+    B --> C[依赖检查]
+    C --> D[镜像构建]
+    D --> E[镜像签名]
+    E --> F[策略验证]
+    F --> G[部署]
+```
+
+### 安全扫描集成配置
+
+```yaml
+# GitLab CI 安全扫描配置
+stages:
+  - security-scan
+
+sast:
+  stage: security-scan
+  script:
+    - semgrep --config=auto .
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+
+dependency-check:
+  stage: security-scan
+  script:
+    - dependency-check.sh --project "myproject" --scan . -f JSON
+
+container-scanning:
+  stage: security-scan
+  script:
+    - trivy image --severity HIGH,CRITICAL myregistry/myapp:latest
+```
+
+### CI/CD 安全检查清单
+
+| 检查项 | 工具 | 阶段 | 阻断级别 |
+|--------|------|------|----------|
+| SAST | Semgrep/SonarQube | 代码提交 | HIGH+ |
+| SCA | Dependency-Check | 构建前 | CRITICAL |
+| 镜像扫描 | Trivy/Grype | 镜像构建后 | HIGH+ |
+| 镜像签名 | Cosign | 镜像推送前 | 必须 |
+| 策略验证 | OPA/Gatekeeper | 部署前 | CRITICAL |
+| Secret检测 | GitLeaks | 代码提交 | 必须 |
+
+## ArgoCD ApplicationSet 模板
+
+### 生成器配置
+
+```yaml
+# Git 目录生成器：自动发现并部署
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-apps
+spec:
+  generators:
+  - git:
+      repoURL: https://github.com/org/gitops-config
+      revision: HEAD
+      directories:
+      - path: clusters/*
+  template:
+    metadata:
+      name: '{{path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/org/gitops-config
+        targetRevision: HEAD
+        path: '{{path}}'
+      destination:
+        server: https://{{metadata.labels.cluster}}
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+```
+
+### 多环境管理策略
+
+```text
+环境分支策略：
+  main → 生产环境（严格审批）
+  staging → 预发布环境（自动同步）
+  dev → 开发环境（自动同步）
+
+ArgoCD Application 配置：
+  prod:  source.path=clusters/prod, syncPolicy.automated=false
+  stage: source.path=clusters/staging, syncPolicy.automated=true
+  dev:   source.path=clusters/dev, syncPolicy.automated=true
+```
+
 ## 十八、与其他板块的关系
 
 - 容器镜像见「[Docker](../../云原生/Docker.md)」；

@@ -944,6 +944,72 @@ thread_pool.get.queue_size: 64
 # queue_size = 预期并发 × 2（避免 rejected）
 ```
 
+## ES 在搜索架构中的分层设计
+
+### 搜索系统分层架构
+
+```mermaid
+flowchart TB
+    A[用户请求] --> B[API Gateway]
+    B --> C[查询解析]
+    C --> D[ES集群]
+    D --> E[结果排序]
+    E --> F[结果聚合]
+    F --> G[返回用户]
+```
+
+### 索引分层策略
+
+| 层级 | 数据特征 | 索引策略 | 生命周期 |
+|------|----------|----------|----------|
+| 热数据 | 最近7天 | 独立索引+ILM | NVMe SSD |
+| 温数据 | 7-30天 | 合并索引 | SATA SSD |
+| 冷数据 | 30-90天 | 只读索引 | 对象存储 |
+| 归档数据 | >90天 | 快照 | 删除/归档 |
+
+```json
+// ILM 分层配置
+PUT _ilm/policy/search_lifecycle
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": { "max_age": "7d", "max_size": "50gb" }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "freeze": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### ES 与 ClickHouse 混合架构
+
+```text
+架构模式：
+  ES：全文检索 + 聚合（小结果集）
+  ClickHouse：大规模聚合分析（大结果集）
+
+  查询路由规则：
+    关键词搜索 → ES（倒排索引优势）
+    明细查询 → ES（精确匹配）
+    统计分析 → ClickHouse（列存优势）
+    日志聚合 → ClickHouse（成本优势）
+```
+
 ## 十三、与其他板块的关系
 
 - ES 基础见「[ES 体系](../ES体系.md)」；

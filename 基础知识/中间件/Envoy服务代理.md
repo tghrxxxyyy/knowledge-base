@@ -1716,6 +1716,102 @@ static_resources:
 
 ---
 
+## Envoy 在零信任架构中的角色
+
+### mTLS 认证流程
+
+```mermaid
+flowchart LR
+    A[客户端Envoy] -->|1.SAN请求| B[服务端Envoy]
+    B -->|2.证书验证| C[CA/身份提供商]
+    C -->|3.确认身份| B
+    B -->|4.建立mTLS| A
+    A -->|5.加密通信| B
+```
+
+### 零信任网络策略配置
+
+```yaml
+# AuthorizationPolicy：零信任访问控制
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-productpage
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: productpage
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/reviews"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/reviews/*"]
+```
+
+### 身份认证方式对比
+
+| 认证方式 | 安全性 | 复杂度 | 适用场景 |
+|----------|--------|--------|----------|
+| mTLS | 高 | 高 | 服务间通信 |
+| JWT | 中 | 低 | API 网关入口 |
+| OAuth2 | 高 | 高 | 第三方接入 |
+| API Key | 低 | 低 | 内部简单鉴权 |
+
+## Envoy 与 Service Mesh 控制面集成
+
+### Istio 数据面架构
+
+```text
+Envoy 作为 Sidecar 注入到 Pod：
+  ┌─────────────────────────────┐
+  │ Pod                         │
+  │  ┌───────┐  ┌───────────┐  │
+  │  │App容器│  │Envoy Sidecar│  │
+  │  │ :8080 │←→│  :15001    │  │
+  │  └───────┘  └───────────┘  │
+  └─────────────────────────────┘
+
+  流量路径：
+    入站：Client → Envoy(:15001) → App(:8080)
+    出站：App(:15001) → Envoy → Server
+```
+
+### xDS 协议交互流程
+
+```mermaid
+flowchart TB
+    A[Envoy启动] --> B[获取LDS监听器]
+    B --> C[获取RDS路由]
+    C --> D[获取CDS集群]
+    D --> E[获取EDS端点]
+    E --> F[开始服务]
+    F --> G[定期心跳]
+```
+
+## Envoy 性能调优参数
+
+| 参数 | 默认值 | 调优建议 | 说明 |
+|------|--------|----------|------|
+| concurrency | auto | CPU核数 | 工作线程数 |
+| upstream连接超时 | 5s | 1-10s | 根据后端响应调整 |
+| 最大连接数 | 1048576 | 按需 | 单监听器最大连接 |
+| 请求超时 | 15s | 业务相关 | 全局默认超时 |
+| 重试次数 | 3 | 1-5 | 自动重试次数 |
+
+```bash
+# 热重启 Envoy（零停机）
+envoy -c /etc/envoy/envoy.yaml --restart-epoch 1
+
+# 查看 Envoy 统计信息
+curl localhost:9901/stats
+curl localhost:9901/clusters
+```
+
 ## 十八、与其他板块的关系
 
 - 服务网格见「[Istio](../../云原生/ServiceMesh.md)」；

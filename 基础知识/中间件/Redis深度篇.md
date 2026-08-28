@@ -1620,6 +1620,134 @@ Functions部署流程：
      适用：极端热key
 ```
 
+## Redis 与消息队列集成模式
+
+### Redis Streams 作为轻量 MQ
+
+```java
+// 生产者：添加消息到 Stream
+redisTemplate.opsForStream().add(
+    StreamRecords.newRecord()
+        .ofObject(orderEvent)
+        .withStreamKey("order:events"),
+    StreamAddOptions.builder().build()
+);
+
+// 消费者组：消费消息
+List<MapRecord<String, Object, Object>> records = 
+    redisTemplate.opsForStream().read(
+        Consumer.from("order-group", "consumer-1"),
+        StreamReadOptions.empty().count(10).block(Duration.ofSeconds(5)),
+        StreamOffset.create("order:events", ReadOffset.lastConsumed())
+    );
+
+// 确认消费
+redisTemplate.opsForStream().acknowledge(
+    "order:events", "order-group", recordIds
+);
+```
+
+### Redis Pub/Sub vs Streams 对比
+
+| 特性 | Pub/Sub | Streams |
+|------|---------|---------|
+| 消息持久化 | 不持久化 | 持久化到 AOF/RDB |
+| 消费者组 | 不支持 | 支持 |
+| 消息确认 | 不支持 | 支持 ACK |
+| 历史消息 | 无法回溯 | 可回溯 |
+| 背压处理 | 无 | 有（MAXLEN/MINID） |
+| 适用场景 | 实时通知 | 事件溯源、任务队列 |
+
+```text
+选型决策：
+  需要消息持久化 → Streams
+  需要消费者组 → Streams
+  仅实时广播 → Pub/Sub
+  轻量级任务队列 → Streams + XACK
+```
+
+## Redis 分布式锁最佳实践
+
+### Redlock 算法流程
+
+```mermaid
+flowchart TD
+    A[获取当前时间 T1] --> B[依次向 N 个 Redis 实例加锁]
+    B --> C{成功数 > N/2?}
+    C -->|是| D[计算耗时 T2 = now - T1]
+    C -->|否| E[向所有实例释放锁]
+    D --> F{T2 < 锁过期时间?}
+    F -->|是| G[获取锁成功]
+    F -->|否| E
+    E --> H[获取锁失败]
+```
+
+### 锁续期与看门狗
+
+```java
+// Redisson 看门狗机制（默认 30s 过期，每 10s 续期）
+RLock lock = redisson.getLock("order:lock");
+try {
+    // 看门狗自动续期
+    lock.lock();
+    // 业务处理...
+} finally {
+    if (lock.isHeldByCurrentThread()) {
+        lock.unlock();
+    }
+}
+
+// 手动设置过期时间（禁用看门狗）
+lock.lock(10, TimeUnit.SECONDS);
+```
+
+### 可重入锁实现原理
+
+```text
+加锁流程（Hash 结构）：
+  Key:    lock:order:{orderId}
+  Field:  {uuid}:{threadId}
+  Value:  1（重入次数）
+
+  第1次加锁：HSET lock:order:100 abc:thread-1 1  → OK
+  第2次加锁：HINCRBY lock:order:100 abc:thread-1 1 → 2（重入+1）
+  解锁：HINCRBY lock:order:100 abc:thread-1 -1 → 0（删除key）
+```
+
+## Redis 在微服务架构中的角色
+
+### 缓存模式对比
+
+| 模式 | 实现 | 一致性 | 复杂度 | 适用场景 |
+|------|------|--------|--------|----------|
+| Cache Aside | 应用层控制 | 最终一致 | 低 | 通用 |
+| Read/Write Through | 缓存层代理 | 强一致 | 中 | 需要统一入口 |
+| Write Behind | 异步写回 | 弱一致 | 高 | 写多读少 |
+
+### 缓存与数据库一致性方案
+
+```mermaid
+flowchart TD
+    A[更新数据库] --> B[删除缓存]
+    B --> C[读请求]
+    C --> D{缓存命中?}
+    D -->|是| E[返回缓存]
+    D -->|否| F[查询数据库]
+    F --> G[写入缓存]
+    G --> E
+```
+
+```text
+延迟双删策略：
+  1. 更新数据库
+  2. 删除缓存
+  3. 延迟 500ms
+  4. 再次删除缓存
+
+  目的：防止并发读写导致脏数据
+  延迟时间 > 主从同步延迟 + 业务处理时间
+```
+
 ## 与其他板块的关系
 
 - Redis 基础知识见「[基础知识/redis知识](../redis知识.md)」；
