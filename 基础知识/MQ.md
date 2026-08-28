@@ -1996,3 +1996,187 @@ spring:
             back-off-max-interval: 10000
             back-off-multiplier: 2.0
 ```
+
+## 三十二、消息可靠性保障与生产实践
+
+### 32.1 消息幂等性设计
+
+```
+幂等性方案：
+  1. 消息ID去重
+     → 每条消息携带唯一ID
+     → 消费端记录已处理ID
+     → 重复消息直接丢弃
+
+  2. 数据库唯一约束
+     → 利用数据库唯一索引
+     → 插入失败忽略
+     → 适用于插入操作
+
+  3. 乐观锁更新
+     → 使用版本号字段
+     → 更新失败重试
+     → 适用于更新操作
+
+  4. 状态机控制
+     → 定义状态转换
+     → 非法状态跳过
+     → 适用于复杂业务
+```
+
+```java
+// 幂等消费示例
+@Component
+public class IdempotentConsumer {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    @KafkaListener(topics = "order-topic")
+    public void consume(ConsumerRecord<String, String> record) {
+        String messageId = record.key();
+        String businessKey = extractBusinessKey(record.value());
+
+        // 1. 检查是否已处理
+        if (redisTemplate.hasKey("processed:" + businessKey)) {
+            log.info("消息已处理，跳过: {}", messageId);
+            return;
+        }
+
+        try {
+            // 2. 处理业务逻辑
+            processBusiness(record.value());
+
+            // 3. 标记已处理
+            redisTemplate.opsForValue().set(
+                "processed:" + businessKey,
+                "1",
+                24,
+                TimeUnit.HOURS
+            );
+        } catch (Exception e) {
+            log.error("处理失败: {}", messageId, e);
+            throw e;
+        }
+    }
+}
+```
+
+### 32.2 延迟消息实现
+
+```
+延迟消息方案：
+  1. RocketMQ 原生支持
+     → 设置延迟级别
+     → 自动投递
+
+  2. Kafka 延迟队列
+     → 使用 Delay Queue
+     → 定时任务投递
+
+  3. Redis 延迟队列
+     → 使用 Sorted Set
+     → 轮询消费
+
+  4. 数据库延迟队列
+     → 使用时间字段
+     → 定时扫描
+```
+
+### 32.3 CorrelationId 链路追踪
+
+```java
+// 消息链路追踪
+@Component
+public class MessageTracer {
+
+    @Autowired
+    private KafkaTemplate kafkaTemplate;
+
+    public void sendMessage(String topic, String payload) {
+        String correlationId = UUID.randomUUID().toString();
+
+        // 设置消息头
+        MessageHeaders headers = new MessageHeaders();
+        headers.put("correlationId", correlationId);
+        headers.put("timestamp", System.currentTimeMillis());
+        headers.put("source", getServiceName());
+
+        kafkaTemplate.send(topic, MessageBuilder.createMessage(
+            payload, headers
+        ));
+    }
+}
+
+// 消费端追踪
+@KafkaListener(topics = "order-topic")
+public void consume(ConsumerRecord<String, String> record) {
+    String correlationId = record.headers().lastHeader("correlationId").value();
+    String source = record.headers().lastHeader("source").value();
+
+    log.info("收到消息: correlationId={}, source={}", correlationId, source);
+
+    // 业务处理...
+}
+```
+
+### 32.4 消息积压处理策略
+
+| 积压程度 | 处理策略 | 具体措施 |
+|----------|----------|----------|
+| 轻度 (<1000) | 优化消费 | 增加并发数 |
+| 中度 (1000-10000) | 扩容消费者 | 增加消费者实例 |
+| 重度 (>10000) | 临时扩容 | 增加 Topic 分区 |
+| 严重 (>100000) | 紧急处理 | 降级 + 扩容 |
+
+```
+消息积压处理：
+  1. 紧急扩容
+     → 增加消费者实例
+     → 增加 Topic 分区
+     → 临时扩容集群
+
+  2. 消费优化
+     → 批量消费
+     → 异步消费
+     → 并行消费
+
+  3. 降级处理
+     → 跳过非关键消息
+     → 延迟处理
+     → 人工干预
+
+  4. 根因分析
+     → 分析消费逻辑
+     → 优化性能瓶颈
+     → 预防再次发生
+```
+
+### 32.5 容量规划与评估
+
+```
+容量规划公式：
+  消息量估算：
+    日均消息量 = 并发用户数 × 请求数 × 消息比例
+    峰值消息量 = 日均消息量 × 峰值系数 ÷ 峰值时长
+
+  存储容量估算：
+    存储量 = 消息量 × 消息大小 × 保留天数 × 副本数
+
+  带宽估算：
+    带宽 = 消息量 × 消息大小 ÷ 时间窗口
+
+  实例数估算：
+    实例数 = 峰值消息量 ÷ 单实例处理能力
+```
+
+### 32.6 最佳实践总结
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 消息设计 | 结构化消息 | 易于处理 |
+| 幂等消费 | 去重机制 | 避免重复 |
+| 链路追踪 | CorrelationId | 问题定位 |
+| 监控告警 | 积压监控 | 提前预警 |
+| 容量规划 | 定期评估 | 资源保障 |
+| 故障演练 | 模拟故障 | 提升能力 |

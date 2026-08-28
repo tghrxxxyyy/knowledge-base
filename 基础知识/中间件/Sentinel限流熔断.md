@@ -1998,4 +1998,227 @@ public class SentinelConfig {
 }
 ```
 
+## 二十八、Sentinel 高级特性与生产实践
+
+### 28.1 滑动窗口限流算法
+
+```
+滑动窗口原理：
+  1. 统计时间窗口
+     → 固定窗口：1秒
+     → 滑动窗口：细粒度
+
+  2. 限流计数
+     → 请求数计数
+     → 成功/失败计数
+
+  3. 限流判断
+     → 当前窗口计数
+     → 超过阈值拒绝
+
+  优点：
+    → 避免临界点突发
+    → 平滑流量
+    → 更精确控制
+```
+
+| 限流算法 | 原理 | 优点 | 缺点 | 适用场景 |
+|----------|------|------|------|----------|
+| 固定窗口 | 固定时间窗口计数 | 实现简单 | 临界点突刺 | 简单场景 |
+| 滑动窗口 | 滑动时间窗口计数 | 平滑限流 | 实现复杂 | 通用场景 |
+| 漏桶 | 固定速率处理 | 恒定速率 | 突发响应慢 | 流量整形 |
+| 令牌桶 | 固定速率生成令牌 | 支持突发 | 实现复杂 | 突发流量 |
+
+### 28.2 热点参数限流
+
+```java
+// 热点参数限流配置
+@SentinelResource(
+    value = "getOrder",
+    blockHandler = "handleBlock",
+    fallback = "handleFallback"
+)
+public Order getOrder(Long userId, String orderId) {
+    // 业务逻辑
+    return orderService.getOrder(userId, orderId);
+}
+
+// 配置热点参数规则
+ParameterFlowRule rule = new ParameterFlowRule("getOrder")
+    .setParamIdx(0)  // 第一个参数 userId
+    .setGrade(RuleConstant.FLOW_GRADE_QPS)
+    .setCount(10);  // 每个 userId 每秒最多10次
+
+// 特殊参数特殊限制
+ParamFlowItem item = new ParamFlowItem()
+    .setObject(String.valueOf(10001))  // userId=10001
+    .setClassType(long.class.getName())
+    .setCount(5);  // 该用户每秒最多5次
+
+rule.setParamFlowItemList(Collections.singletonList(item));
+ParameterFlowRuleManager.loadRules(Collections.singletonList(rule));
+```
+
+### 28.3 系统自适应限流
+
+```yaml
+# 系统自适应限流配置
+sentinel:
+  system:
+    # CPU 使用率阈值
+    cpu-usage: 0.8
+    # 系统平均负载阈值
+    system-load: 10
+    # 入口 QPS 阈值
+    qps: 1000
+    # 入口并发线程数阈值
+    thread: 200
+```
+
+```
+系统自适应限流指标：
+  CPU 使用率：
+    → 超过阈值触发限流
+    → 保护系统过载
+
+  系统负载：
+    → 基于系统负载限流
+    → 适应系统压力
+
+  入口 QPS：
+    → 全局限流
+    → 保护整体吞吐
+
+  并发线程数：
+    → 基于线程数限流
+    → 防止线程耗尽
+```
+
+### 28.4 集群流控模式
+
+```mermaid
+graph TB
+    subgraph "集群流控"
+        A[Token Server] -->|分配令牌| B[Client 1]
+        A -->|分配令牌| C[Client 2]
+        A -->|分配令牌| D[Client 3]
+    end
+
+    subgraph "本地限流"
+        B --> E[本地计数]
+        C --> F[本地计数]
+        D --> G[本地计数]
+    end
+```
+
+| 集群模式 | 说明 | 优点 | 缺点 |
+|----------|------|------|------|
+| Client 端 | 本地限流 | 简单 | 全局不一致 |
+| Server 端 | 集中限流 | 全局一致 | 单点风险 |
+| 混合模式 | 本地+服务端 | 平衡 | 实现复杂 |
+
+### 28.5 规则持久化方案
+
+```
+规则持久化策略：
+  1. 文件持久化
+     → 规则保存到文件
+     → 应用启动时加载
+     → 适用于开发环境
+
+  2. 数据库存储
+     → 规则保存到数据库
+     → 动态推送规则
+     → 适用于生产环境
+
+  3. 配置中心
+     → 规则保存到 Nacos/ZK
+     → 实时推送规则
+     → 适用于微服务架构
+
+  4. 监控系统
+     → 规则保存到 Prometheus
+     → 可视化管理
+     → 适用于运维场景
+```
+
+### 28.6 Sentinel Dashboard 实战
+
+| 功能模块 | 说明 | 使用场景 |
+|----------|------|----------|
+| 流控规则 | 限流配置 | 流量控制 |
+| 熔断规则 | 熔断配置 | 服务降级 |
+| 系统规则 | 系统保护 | 系统监控 |
+| 机器列表 | 节点管理 | 集群监控 |
+| 实时监控 | 实时指标 | 问题排查 |
+
+### 28.7 与 Spring Cloud 集成
+
+```java
+// Spring Cloud Sentinel 配置
+@Configuration
+public class SentinelConfig {
+
+    @Bean
+    public SentinelResourceAspect sentinelResourceAspect() {
+        return new SentinelResourceAspect();
+    }
+
+    @PostConstruct
+    public void init() {
+        // 注册限流规则
+        List<FlowRule> flowRules = new ArrayList<>();
+        FlowRule rule = new FlowRule();
+        rule.setResource("user-api");
+        rule.setGrade(RuleConstant.FLOW_GRADE_QPS);
+        rule.setCount(100);
+        flowRules.add(rule);
+        FlowRuleManager.loadRules(flowRules);
+
+        // 注册熔断规则
+        List<DegradeRule> degradeRules = new ArrayList<>();
+        DegradeRule degradeRule = new DegradeRule();
+        degradeRule.setResource("user-api");
+        degradeRule.setGrade(RuleConstant.DEGRADE_GRADE_RT);
+        degradeRule.setCount(1000);
+        degradeRules.add(degradeRule);
+        DegradeRuleManager.loadRules(degradeRules);
+    }
+}
+```
+
+### 28.8 生产问题排查
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 误触发限流 | 阈值设置过低 | 1.检查规则配置<br>2.分析流量 | 调整阈值 |
+| 熔断不恢复 | 阈值设置不当 | 1.检查熔断规则<br>2.分析请求 | 调整熔断策略 |
+| Dashboard 不显示 | 端口未开放 | 1.检查网络<br>2.检查配置 | 开放端口 |
+| 规则不生效 | 配置未加载 | 1.检查规则配置<br>2.检查推送 | 重新推送 |
+
+### 28.9 Sentinel 最佳实践
+
+```
+最佳实践清单：
+  1. 规则设计
+     → 合理设置阈值
+     → 分级限流策略
+     → 预留缓冲空间
+
+  2. 降级策略
+     → 快速失败
+     → Fallback 逻辑
+     → 熔断恢复
+
+  3. 监控告警
+     → 监控限流次数
+     → 监控熔断状态
+     → 设置告警阈值
+
+  4. 性能优化
+     → 异步统计
+     → 批量处理
+     → 减少锁竞争
+```
+
 ## 与其他板块的关系

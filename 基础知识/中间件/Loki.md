@@ -2000,6 +2000,193 @@ metrics_generator:
         - service_name
 ```
 
+## 二十九、Loki 多租户与生产实践
+
+### 29.1 多租户隔离策略
+
+```yaml
+# Loki 多租户配置
+auth_enabled: true
+
+# 租户限流
+limits_config:
+  max_entries_limit_per_query: 5000
+  max_query_length: 721h
+  max_query_series: 10000
+  ingestion_rate_mb: 10
+  ingestion_burst_size_mb: 20
+
+# 每租户配额
+per_tenant_overrides:
+  tenant-1:
+    max_entries_limit_per_query: 10000
+    ingestion_rate_mb: 20
+  tenant-2:
+    max_entries_limit_per_query: 2000
+    ingestion_rate_mb: 5
+```
+
+```
+多租户隔离：
+  数据隔离：
+    → 按租户标签过滤
+    → 独立存储路径
+    → 访问控制
+
+  资源隔离：
+    → 租户级限流
+    → 查询配额管理
+    → 并发控制
+
+  安全隔离：
+    → 认证授权
+    → 审计日志
+    → 数据加密
+```
+
+### 29.2 LogQL 实战查询
+
+```logql
+# 1. 基础查询
+{app="nginx"} |= "error"
+{job="api-server"} !~ "debug"
+
+# 2. 正则查询
+{app=~"api-.*"} | regexp "user_id=(?P<user_id>[0-9]+)"
+
+# 3. 日志解析
+{app="nginx"} | json | status >= 400
+{app="nginx"} | logfmt | duration > 1s
+
+# 4. 聚合查询
+sum(rate({app="nginx"} |= "error" [5m])) by (status)
+count_over_time({app="nginx"}[1h])
+quantile_over_time(0.99, {app="nginx"} |= "duration" [5m])
+
+# 5. 高级过滤
+{app="nginx"} | json | line_format "{{.status}} {{.method}} {{.path}}"
+{app="nginx"} | label_format status="{{if eq .status \"200\"}}ok{{else}}error{{end}}"
+```
+
+### 29.3 存储后端优化
+
+| 存储类型 | 优点 | 缺点 | 适用场景 |
+|----------|------|------|----------|
+| 本地文件系统 | 简单 | 不支持集群 | 开发测试 |
+| S3/GCS | 高可用 | 网络延迟 | 生产环境 |
+| Cassandra | 高性能 | 运维复杂 | 大规模 |
+| Azure Blob | 云原生 | 成本高 | Azure 环境 |
+
+```
+存储优化策略：
+  冷热分层：
+    → 热数据：本地 SSD
+    → 温数据：对象存储
+    → 冷数据：归档存储
+
+  压缩优化：
+    → 使用 Snappy 压缩
+    → 调整 chunk 大小
+    → 合并小 chunk
+
+  清理策略：
+    → 设置保留期
+    → 自动清理过期
+    → 手动清理
+```
+
+### 29.4 Grafana 集成实战
+
+```json
+{
+  "datasource": {
+    "type": "loki",
+    "uid": "P8E80F9AEF21F6940"
+  },
+  "targets": [
+    {
+      "expr": "{app=\"nginx\"} |= \"error\"",
+      "legendFormat": "{{status}}",
+      "refId": "A"
+    }
+  ],
+  "options": {
+    "showTime": true,
+    "showLabels": true,
+    "showCommonLabels": false,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "sortOrder": "Descending",
+    "dedupStrategy": "none"
+  }
+}
+```
+
+### 29.5 集群模式部署
+
+```mermaid
+graph TB
+    subgraph "Loki 集群"
+        A[Distributor] --> B[Ingester]
+        A --> C[Ingester]
+        B --> D[Compactor]
+        C --> D
+        D --> E[存储]
+    end
+
+    subgraph "客户端"
+        F[Promtail]
+        G[Grafana]
+    end
+
+    F --> A
+    G --> H[Query Frontend]
+    H --> A
+```
+
+| 组件 | 功能 | 部署方式 |
+|------|------|----------|
+| Distributor | 路由日志 | 多副本 |
+| Ingester | 写入存储 | 多副本 |
+| Querier | 查询日志 | 多副本 |
+| Query Frontend | 查询优化 | 多副本 |
+| Compactor | 数据压缩 | 单副本 |
+
+### 29.6 生产问题排查
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 日志丢失 | 采集配置错误 | 1.检查 Promtail<br>2.检查网络 | 修复配置 |
+| 查询超时 | 查询范围过大 | 1.分析查询<br>2.检查资源 | 缩小范围 |
+| 存储爆满 | 保留策略不当 | 1.检查保留配置<br>2.清理数据 | 调整策略 |
+| 内存溢出 | 查询过重 | 1.分析查询<br>2.增加资源 | 优化查询 |
+
+### 29.7 Loki 最佳实践
+
+```
+最佳实践清单：
+  1. 标签设计
+     → 低基数标签
+     → 避免高基数
+     → 统一命名
+
+  2. 采集配置
+     → 合理批处理
+     → 重试机制
+     → 缓冲配置
+
+  3. 查询优化
+     → 限制时间范围
+     → 使用聚合
+     → 避免全扫描
+
+  4. 运维管理
+     → 监控存储
+     → 定期清理
+     → 容量规划
+```
+
 ## 与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；

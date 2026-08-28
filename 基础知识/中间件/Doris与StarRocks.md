@@ -1808,3 +1808,492 @@ ALTER TABLE orders MODIFY PARTITION p202401 SET ("storage_medium" = "HDD");
 | 社区 | Apache 社区 vs 商业公司主导 |
 | 许可证 | Apache 2.0 |
 | 一句话 | 「国产 MPP 列式双雄——MySQL 协议 + 物化视图 + 多源导入」 |
+
+## 补充：函数下推
+
+### 函数下推原理
+
+```text
+函数下推原理：
+  1. 查询解析
+     ├── SQL 解析为 AST
+     ├── 分析函数调用
+     └── 识别可下推函数
+
+  2. 函数分类
+     ├── 标量函数：可下推
+     ├── 聚合函数：可下推
+     ├── 窗口函数：部分下推
+     └── UDF：需评估
+
+  3. 下推执行
+     ├── 节点本地执行
+     ├── 减少数据传输
+     └── 提升查询性能
+```
+
+### 函数下推配置
+
+```sql
+-- 查看函数下推状态
+EXPLAIN SELECT * FROM orders WHERE DATE_FORMAT(create_time, '%Y-%m') = '2026-01';
+
+-- 强制下推
+SET enable_function_pushdown = true;
+
+-- 查看下推函数列表
+SHOW FUNCTIONS WHERE is_pushdown = true;
+```
+
+### 函数下推优化
+
+| 函数类型 | 下推支持 | 优化建议 |
+|----------|----------|----------|
+| 标量函数 | 支持 | 优先使用内置函数 |
+| 聚合函数 | 支持 | 使用 Aggregate 表模型 |
+| 窗口函数 | 部分 | 避免复杂窗口函数 |
+| UDF | 需评估 | 确保 UDF 可下推 |
+
+---
+
+## 补充：存储格式
+
+### 存储格式对比
+
+| 格式 | 压缩比 | 读取速度 | 写入速度 | 适用场景 |
+|------|--------|----------|----------|----------|
+| ORC | 高 | 快 | 中 | Hive/数据湖 |
+| Parquet | 高 | 快 | 中 | Spark/数据湖 |
+| DWAL | 中 | 极快 | 快 | Doris 内部 |
+| 明细列存 | 低 | 极快 | 快 | 实时查询 |
+
+### 存储优化
+
+```sql
+-- 查看表存储信息
+SHOW TABLET FROM orders;
+
+-- 查看存储压缩比
+SHOW TABLET PROPERTIES FOR orders;
+
+-- 优化存储
+ALTER TABLE orders SET ("storage_format" = "v2");
+```
+
+---
+
+## 补充：导入调优
+
+### 导入性能对比
+
+| 导入方式 | 吞吐量 | 延迟 | 适用场景 |
+|----------|--------|------|----------|
+| Stream Load | 高 | 低 | 实时数据 |
+| Broker Load | 中 | 中 | 批量数据 |
+| Routine Load | 中 | 低 | Kafka 数据 |
+| Spark Load | 极高 | 高 | 大批量数据 |
+
+### 导入调优参数
+
+```sql
+-- Stream Load 调优
+curl -u root:password -X POST \
+  -H "format:json" \
+  -H "max_filter_ratio:0.1" \
+  -H "timeout:300" \
+  -T data.json \
+  http://fe_host:8030/api/db/orders/_stream_load
+
+-- 调优参数
+-- max_filter_ratio: 最大过滤比例（0.1=10%）
+-- timeout: 超时时间（秒）
+-- merge_type: 合并类型（APPEND/MERGE）
+-- delete: 删除条件
+```
+
+### 导入监控
+
+```sql
+-- 查看导入任务
+SHOW ROUTINE LOAD;
+SHOW BROKER LOAD;
+SHOW STREAM LOAD;
+
+-- 查看导入统计
+SELECT * FROM information_schema LOAD_STATISTICS;
+
+-- 查看导入日志
+SHOW LOAD WARNINGS;
+```
+
+---
+
+## 补充：运维操作
+
+### 集群运维
+
+```sql
+-- 查看集群状态
+SHOW PROC '/frontends';
+SHOW PROC '/backends';
+
+-- 查看分区信息
+SHOW PARTITIONS FROM orders;
+
+-- 查看副本信息
+SHOW TABLET FROM orders;
+
+-- 手动修复副本
+ADMIN REPAIR TABLE orders;
+```
+
+### 滚动重启
+
+```bash
+# 1. 停止 FE
+mysqladmin -u root -p shutdown -h fe_host
+
+# 2. 更新配置
+vim fe/conf/fe.conf
+
+# 3. 启动 FE
+fe/bin/start_fe.sh --daemon
+
+# 4. 验证集群状态
+mysql -h fe_host -u root -p -e "SHOW PROC '/frontends'"
+```
+
+### 数据备份恢复
+
+```sql
+-- 备份
+BACKUP SNAPSHOT orders_backup TO repository_local ON orders;
+
+-- 恢复
+RESTORE SNAPSHOT orders_backup FROM repository_local TO orders;
+
+-- 查看备份
+SHOW SNAPSHOT ON repository_local;
+```
+
+---
+
+## 补充：Doris vs StarRocks 对比
+
+### 功能对比
+
+| 功能 | Doris | StarRocks |
+|------|-------|-----------|
+| SQL 语法 | MySQL 兼容 | MySQL 兼容 |
+| 物化视图 | 支持 | 支持 |
+| 数据更新 | 支持 | 支持 |
+| 多表 JOIN | 支持 | 支持（CBO 优化） |
+| 窗口函数 | 支持 | 支持 |
+| UDF | 支持 | 支持 |
+| 向量化执行 | 支持 | 支持 |
+| CBO | 支持 | 支持（更优） |
+| Runtime Filter | 支持 | 支持（更优） |
+
+### 性能对比
+
+| 场景 | Doris | StarRocks | 说明 |
+|------|-------|-----------|------|
+| 单表聚合 | 快 | 极快 | StarRocks 向量化更优 |
+| 多表 JOIN | 中 | 快 | StarRocks CBO 更优 |
+| 高并发 | 快 | 快 | 性能接近 |
+| 数据更新 | 中 | 快 | StarRocks 实时更新更优 |
+| 冷数据查询 | 中 | 快 | StarRocks 冷热分层更优 |
+
+### 选型建议
+
+```text
+选型决策：
+  1. 开源优先 → Doris
+  2. 商业支持 → StarRocks
+  3. 多表 JOIN → StarRocks
+  4. 实时更新 → StarRocks
+  5. 冷热分层 → StarRocks
+  6. 生态集成 → Doris（Hive/Spark 集成更好）
+  7. 运维简单 → Doris（自动化更高）
+```
+
+---
+
+## 补充：OLAP 建模
+
+### 维度建模
+
+```sql
+-- 维度表
+CREATE TABLE dim_user (
+    user_id BIGINT,
+    user_name VARCHAR(100),
+    age INT,
+    city VARCHAR(50)
+) DUPLICATE KEY(user_id);
+
+-- 事实表
+CREATE TABLE fact_order (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    create_time DATETIME
+) DUPLICATE KEY(order_id);
+
+-- 物化视图（预聚合）
+CREATE MATERIALIZED VIEW mv_user_stats AS
+SELECT 
+    user_id,
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount
+FROM fact_order
+GROUP BY user_id;
+```
+
+### 宽表设计
+
+```sql
+-- 宽表（反规范化）
+CREATE TABLE dws_user_order (
+    user_id BIGINT,
+    user_name VARCHAR(100),
+    city VARCHAR(50),
+    order_count BIGINT,
+    total_amount DECIMAL(10,2),
+    avg_amount DECIMAL(10,2),
+    last_order_time DATETIME
+) AGGREGATE KEY(user_id, user_name, city)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16;
+```
+
+---
+
+## 补充：生产调优
+
+### 查询调优
+
+```sql
+-- 1. 使用 CBO
+SET enable_cbo = true;
+
+-- 2. 调整并行度
+SET parallel_fragment_exec_instance_num = 8;
+
+-- 3. 使用 Runtime Filter
+SET enable_runtime_filter = true;
+
+-- 4. 避免深分页
+SELECT * FROM orders ORDER BY create_time DESC LIMIT 100;
+
+-- 5. 使用 PREWHERE
+SELECT * FROM orders PREWHERE user_id = 123;
+```
+
+### 写入调优
+
+```sql
+-- 1. 批量写入
+curl -u root:password -X POST \
+  -H "format:csv_with_names" \
+  -T data.csv \
+  http://fe_host:8030/api/db/orders/_stream_load
+
+-- 2. 调整导入并行度
+SET load_parallelism = 8;
+
+-- 3. 使用合并导入
+curl -u root:password -X POST \
+  -H "merge_type:MERGE" \
+  -H "delete:flag=1" \
+  -T data.json \
+  http://fe_host:8030/api/db/orders/_stream_load
+```
+
+### 索引优化
+
+```sql
+-- 1. 创建 BloomFilter 索引
+ALTER TABLE orders SET ("bloom_filter_columns" = "user_id");
+
+-- 2. 创建 ZoneMap 索引
+ALTER TABLE orders SET ("zmap_warm_up" = "true");
+
+-- 3. 创建倒排索引
+ALTER TABLE orders ADD INDEX idx_user_id (user_id) USING BITMAP;
+
+-- 4. 查看索引信息
+SHOW TABLET PROPERTIES FOR orders;
+```
+
+---
+
+## 补充：集群架构
+
+### 集群部署
+
+```text
+Doris 集群架构：
+  FE 节点（3个）：
+    ├── Leader：处理写请求
+    ├── Follower：同步数据
+    └── Observer：只读副本
+
+  BE 节点（3+个）：
+    ├── 数据存储
+    ├── 查询执行
+    └── 副本同步
+
+  Broker 节点（1+个）：
+    ├── 外部数据访问
+    ├── HDFS/S3 访问
+    └── 文件导入
+```
+
+### 集群配置
+
+```properties
+# FE 配置
+http_port = 8030
+rpc_port = 9020
+query_port = 9030
+edit_log_port = 9010
+
+# BE 配置
+webserver_port = 8040
+heartbeat_service_port = 9050
+brpc_port = 8060
+
+# 集群配置
+priority_networks = 192.168.1.0/24
+```
+
+### 集群监控
+
+```sql
+-- 查看 FE 状态
+SHOW PROC '/frontends';
+
+-- 查看 BE 状态
+SHOW PROC '/backends';
+
+-- 查看副本状态
+SHOW TABLET FROM orders;
+
+-- 查看查询统计
+SHOW QUERY PROFILE 'query_id';
+```
+
+---
+
+## 补充：数据导入
+
+### 导入方式对比
+
+| 导入方式 | 数据源 | 吞吐量 | 延迟 | 适用场景 |
+|----------|--------|--------|------|----------|
+| Stream Load | HTTP | 高 | 低 | 实时数据 |
+| Broker Load | HDFS/S3 | 中 | 中 | 批量数据 |
+| Routine Load | Kafka | 中 | 低 | 消息数据 |
+| Spark Load | Spark | 极高 | 高 | 大批量数据 |
+| Multi-Catalog | Hive/MySQL | 中 | 高 | 数据湖集成 |
+
+### 导入配置
+
+```sql
+-- Stream Load
+curl -u root:password -X POST \
+  -H "format:json" \
+  -H "max_filter_ratio:0.1" \
+  -H "timeout:300" \
+  -T data.json \
+  http://fe_host:8030/api/db/orders/_stream_load
+
+-- Broker Load
+LOAD LABEL broker_load (
+    DATA INFILE("hdfs://namenode/path/data.csv")
+    INTO TABLE orders
+    FORMAT AS CSV
+)
+WITH BROKER "hdfs_broker";
+
+-- Routine Load
+CREATE ROUTINE LOAD kafka_load ON orders
+COLUMNS(order_id, user_id, amount, create_time)
+PROPERTIES("format" = "json")
+FROM KAFKA(
+    "kafka_broker_list" = "kafka:9092",
+    "kafka_topic" = "orders"
+);
+```
+
+---
+
+## 补充：最佳实践
+
+### 表设计最佳实践
+
+```sql
+-- 1. 选择合适的模型
+-- 明细查询：DUPLICATE KEY
+-- 聚合查询：AGGREGATE KEY
+-- 更新查询：UNIQUE KEY
+
+-- 2. 选择合适的分桶键
+-- 高频查询字段
+-- 数据分布均匀
+-- 避免热点
+
+-- 3. 合理设置副本数
+-- 生产环境：3 副本
+-- 测试环境：1 副本
+
+-- 4. 使用物化视图
+-- 预聚合常用查询
+-- 减少查询时计算
+```
+
+### 查询最佳实践
+
+```sql
+-- 1. 使用索引
+SELECT * FROM orders WHERE user_id = 123;
+
+-- 2. 避免深分页
+SELECT * FROM orders ORDER BY create_time DESC LIMIT 100;
+
+-- 3. 使用 PREWHERE
+SELECT * FROM orders PREWHERE user_id = 123;
+
+-- 4. 使用批量查询
+SELECT user_id, COUNT(*), SUM(amount) 
+FROM orders 
+GROUP BY user_id;
+
+-- 5. 避免复杂子查询
+-- 使用 JOIN 代替子查询
+```
+
+### 运维最佳实践
+
+```text
+运维建议：
+  1. 监控集群状态
+     ├── FE/BE 状态
+     ├── 副本状态
+     └── 查询统计
+
+  2. 定期维护
+     ├── 数据压缩
+     ├── 副本修复
+     └── 日志清理
+
+  3. 备份恢复
+     ├── 定期备份
+     ├── 测试恢复
+     └── 灾备演练
+
+  4. 性能优化
+     ├── 查询分析
+     ├── 索引优化
+     └── 参数调优
+```

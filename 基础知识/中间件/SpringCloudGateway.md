@@ -2002,4 +2002,146 @@ resilience4j:
         timeoutDuration: 3s
 ```
 
+## 二十三、Spring Cloud Gateway 生产实践
+
+### 23.1 Metrics 监控集成
+
+```yaml
+# Micrometer + Prometheus 配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+```
+
+```
+关键监控指标：
+  请求指标：
+    gateway.requests.total：总请求数
+    gateway.request.duration：请求耗时
+    gateway.request.size：请求大小
+
+  路由指标：
+    gateway.route.active：活跃路由数
+    gateway.route.matches：路由匹配次数
+
+  过滤器指标：
+    gateway.filter.execution.time：过滤器执行时间
+```
+
+### 23.2 会话共享与粘性会话
+
+```yaml
+# 会话共享配置
+spring:
+  session:
+    store-type: redis
+    timeout: 1800
+  redis:
+    host: localhost
+    port: 6379
+
+# 粘性会话配置
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestSession
+          args:
+            mode: sticky
+            cookieName: ROUTE_SESSION
+```
+
+### 23.3 与服务网格集成
+
+```yaml
+# Istio 集成配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: istio-route
+          uri: http://productpage.bookinfo.svc.cluster.local
+          predicates:
+            - Header=x-env, canary
+          filters:
+            - AddRequestHeader=x-canary, true
+```
+
+```mermaid
+graph TB
+    subgraph "服务网格"
+        A[Envoy Sidecar]
+        B[Istio 控制面]
+    end
+
+    subgraph "Spring Cloud Gateway"
+        C[路由管理]
+        D[过滤器链]
+    end
+
+    subgraph "微服务"
+        E[服务 A]
+        F[服务 B]
+    end
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    D --> F
+```
+
+### 23.4 限流降级策略
+
+| 策略 | 实现方式 | 适用场景 |
+|------|----------|----------|
+| 令牌桶 | RequestRateLimiter | 平滑限流 |
+| 滑动窗口 | Redis + Lua | 精确限流 |
+| 熔断 | Resilience4j | 服务降级 |
+| 超时 | TimeLimiter | 防止阻塞 |
+| 重试 | RetryGatewayFilter | 幂等操作 |
+
+### 23.5 生产问题排查
+
+```
+问题排查清单：
+  1. 路由不匹配
+     → 检查路由配置
+     → 检查 Predicate 条件
+     → 检查服务发现
+
+  2. 转发失败
+     → 检查下游服务状态
+     → 检查网络连通性
+     → 检查超时配置
+
+  3. 性能问题
+     → 检查过滤器执行时间
+     → 检查连接池配置
+     → 检查 JVM 参数
+
+  4. 内存泄漏
+     → 检查连接泄漏
+     → 检查缓冲区配置
+     → 分析堆内存
+```
+
+### 23.6 最佳实践总结
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 连接池 | 使用连接池 | 减少连接开销 |
+| 缓存 | 缓存路由规则 | 加速路由匹配 |
+| 异步 | 异步过滤器 | 提升吞吐量 |
+| 监控 | 完善监控 | 问题快速定位 |
+| 降级 | 熔断降级 | 保障系统稳定 |
+
 ## 二十二、与其他板块的关系

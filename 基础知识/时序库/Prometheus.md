@@ -1814,6 +1814,450 @@ Thanos 组件：
 | Mimir | 有 | 有 | 无限 | 高 |
 | VictoriaMetrics | 有 | 有 | 无限 | 中 |
 
+## 补充：标签命名规范
+
+### 标签命名最佳实践
+
+```text
+标签命名规则：
+  1. 使用小写字母和下划线
+     ├── ✅ http_requests_total
+     └── ❌ HTTP_Requests_Total
+
+  2. 使用有意义的名称
+     ├── ✅ http_request_duration_seconds
+     └── ❌ duration
+
+  3. 使用基础单位后缀
+     ├── _seconds：时间（秒）
+     ├── _bytes：大小（字节）
+     ├── _total：计数器
+     └── _info：信息
+
+  4. 避免高基数标签
+     ├── ✅ method, status
+     └── ❌ user_id, request_id
+```
+
+### 标签命名示例
+
+| 指标类型 | 正确命名 | 错误命名 | 说明 |
+|----------|----------|----------|------|
+| 计数器 | http_requests_total | http_requests | 使用 _total 后缀 |
+| 直方图 | http_request_duration_seconds_bucket | duration_bucket | 使用 _seconds 后缀 |
+| 仪表盘 | cpu_usage_percent | cpu_usage | 使用 _percent 后缀 |
+| 信息 | build_info | build | 使用 _info 后缀 |
+
+---
+
+## 补充：Recording Rules
+
+### Recording Rules 配置
+
+```yaml
+# recording_rules.yml
+groups:
+  - name: http_requests
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
+      
+      - record: job:http_requests:error:rate5m
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+      
+      - record: job:http_requests:duration:p99
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+```
+
+### Recording Rules 用途
+
+```text
+Recording Rules 用途：
+  1. 预计算常用查询
+     ├── 减少查询时计算
+     ├── 提高查询性能
+     └── 简化复杂查询
+
+  2. 创建聚合指标
+     ├── 跨服务聚合
+     ├── 跨时间聚合
+     └── 跨维度聚合
+
+  3. 优化告警规则
+     ├── 简化告警表达式
+     ├── 提高告警准确性
+     └── 减少告警噪音
+```
+
+---
+
+## 补充：Alerting Rules
+
+### Alerting Rules 配置
+
+```yaml
+# alerting_rules.yml
+groups:
+  - name: alerting_rules
+    rules:
+      - alert: HighErrorRate
+        expr: job:http_requests:error:rate5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      - alert: HighLatency
+        expr: job:http_requests:duration:p99 > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High latency detected"
+          description: "P99 latency is {{ $value }}s"
+
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service is down"
+          description: "Service {{ $labels.instance }} is down"
+```
+
+### Alerting Rules 最佳实践
+
+```text
+Alerting Rules 最佳实践：
+  1. 告警分级
+     ├── critical：服务不可用
+     ├── warning：性能下降
+     └── info：信息通知
+
+  2. 告警阈值
+     ├── 基于历史数据
+     ├── 考虑业务波动
+     └── 避免告警风暴
+
+  3. 告警抑制
+     ├── 相关告警合并
+     ├── 低优先级抑制
+     └── 维护窗口静默
+
+  4. 告警通知
+     ├── 多渠道通知
+     ├── 升级机制
+     └── 确认机制
+```
+
+---
+
+## 补充：Thanos Store/Compactor
+
+### Thanos Store 配置
+
+```yaml
+# Thanos Store 配置
+- type: THANOS-SIDECAR
+  name: thanos-sidecar
+  config:
+    url: http://sidecar:10901
+    min_time: 2d
+
+- type: THANOS-STORE
+  name: thanos-store
+  config:
+    url: http://store:10901
+    min_time: 2d
+    max_time: 30d
+```
+
+### Thanos Compactor 配置
+
+```yaml
+# Thanos Compactor 配置
+- type: THANOS-COMPACTOR
+  name: thanos-compactor
+  config:
+    url: http://compactor:10902
+    retention.resolution-raw: 30d
+    retention.resolution-downsampled: 1y
+    retention.deletion-delay: 48h
+```
+
+### Thanos 组件对比
+
+| 组件 | 功能 | 部署位置 | 说明 |
+|------|------|----------|------|
+| Sidecar | 上传数据 | Prometheus 旁 | 实时上传 |
+| Store Gateway | 查询历史 | 独立部署 | 查询对象存储 |
+| Query | 聚合查询 | 独立部署 | 聚合多源 |
+| Compactor | 压缩数据 | 独立部署 | 降采样压缩 |
+| Ruler | 规则评估 | 独立部署 | 全局告警 |
+
+---
+
+## 补充：容量规划
+
+### 容量规划公式
+
+```text
+容量规划公式：
+  1. 存储容量
+     ├── 原始数据 = 采样频率 × 时间跨度 × 指标数 × 样本大小
+     ├── 压缩后 = 原始数据 × 压缩比（约 10%）
+     └── 保留期 = 压缩后数据 × 保留天数
+
+  2. 内存容量
+     ├── 内存 = 并发查询数 × 单查询内存
+     └── 建议：内存 = 存储容量 × 1-2%
+
+  3. CPU 容量
+     ├── CPU = 查询 QPS × 单查询 CPU 时间
+     └── 建议：CPU = 内存（GB）× 0.5-1
+
+  4. 网络容量
+     ├── 网络 = 采样频率 × 指标数 × 样本大小
+     └── 建议：网络 = 存储容量 × 0.1-0.2
+```
+
+### 容量规划示例
+
+| 场景 | 指标数 | 采样频率 | 保留天数 | 存储容量 |
+|------|--------|----------|----------|----------|
+| 小规模 | 100 | 15s | 15天 | 10GB |
+| 中规模 | 1000 | 15s | 30天 | 100GB |
+| 大规模 | 10000 | 15s | 30天 | 1TB |
+| 超大规模 | 100000 | 15s | 30天 | 10TB |
+
+---
+
+## 补充：联邦
+
+### 联邦配置
+
+```yaml
+# 联邦配置
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job=~".+"}'
+    static_configs:
+      - targets:
+          - 'prometheus-1:9090'
+          - 'prometheus-2:9090'
+          - 'prometheus-3:9090'
+```
+
+### 联邦架构
+
+```text
+联邦架构：
+  ├── 全局 Prometheus
+  │   ├── 聚合所有子 Prometheus
+  │   ├── 全局视图
+  │   └── 全局告警
+
+  ├── 子 Prometheus
+  │   ├── 采集本地指标
+  │   ├── 本地告警
+  │   └── 数据上报
+
+  └── 数据流
+      ├── 子 Prometheus → 全局 Prometheus
+      ├── 全局 Prometheus → Grafana
+      └── 全局 Prometheus → Alertmanager
+```
+
+---
+
+## 补充：Alertmanager
+
+### Alertmanager 配置
+
+```yaml
+# alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 12h
+  receiver: 'web.hook'
+  routes:
+    - match:
+        severity: critical
+      receiver: 'pager'
+    - match:
+        severity: warning
+      receiver: 'slack'
+
+receivers:
+  - name: 'web.hook'
+    webhook_configs:
+      - url: 'http://webhook:5001/'
+  - name: 'pager'
+    pagerduty_configs:
+      - routing_key: '<key>'
+  - name: 'slack'
+    slack_configs:
+      - api_url: '<url>'
+        channel: '#alerts'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ .CommonAnnotations.description }}'
+```
+
+### Alertmanager 最佳实践
+
+```text
+Alertmanager 最佳实践：
+  1. 告警分组
+     ├── 按告警名称分组
+     ├── 按集群分组
+     └── 按服务分组
+
+  2. 告警静默
+     ├── 维护窗口静默
+     ├── 已知问题静默
+     └── 测试环境静默
+
+  3. 告警抑制
+     ├── 低优先级抑制
+     ├── 相关告警合并
+     └── 重复告警抑制
+
+  4. 告警升级
+     ├── 分级通知
+     ├── 升级机制
+     └── 确认机制
+```
+
+---
+
+## 补充：vs VictoriaMetrics 对比
+
+### 性能对比
+
+| 维度 | Prometheus | VictoriaMetrics |
+|------|------------|-----------------|
+| 存储效率 | 中 | 高（压缩比更好） |
+| 查询性能 | 中 | 高（查询更快） |
+| 内存使用 | 高 | 低 |
+| 高可用 | 需要联邦 | 原生支持 |
+| 长期存储 | 需要 Thanos | 原生支持 |
+| 云原生 | 标准 | 更好 |
+
+### 选型建议
+
+```text
+选型决策：
+  1. 标准部署 → Prometheus
+  2. 高性能需求 → VictoriaMetrics
+  3. 长期存储 → VictoriaMetrics
+  4. 高可用需求 → VictoriaMetrics
+  5. 云原生环境 → VictoriaMetrics
+  6. 成本敏感 → VictoriaMetrics
+```
+
+---
+
+## 补充：最佳实践
+
+### 监控最佳实践
+
+```text
+监控最佳实践：
+  1. 四大黄金信号
+     ├── 延迟：请求处理时间
+     ├── 流量：请求吞吐量
+     ├── 错误：错误率
+     └── 饱和度：资源使用率
+
+  2. USE 方法
+     ├── Utilization：资源使用率
+     ├── Saturation：资源饱和度
+     └── Errors：错误计数
+
+  3. RED 方法
+     ├── Rate：请求速率
+     ├── Errors：错误率
+     └── Duration：请求延迟
+
+  4. SLI/SLO/SLA
+     ├── SLI：服务级别指标
+     ├── SLO：服务级别目标
+     └── SLA：服务级别协议
+```
+
+### 告警最佳实践
+
+```text
+告警最佳实践：
+  1. 告警分级
+     ├── P0：服务不可用
+     ├── P1：性能严重下降
+     ├── P2：性能轻微下降
+     └── P3：信息通知
+
+  2. 告警阈值
+     ├── 基于历史数据
+     ├── 考虑业务波动
+     └── 避免告警风暴
+
+  3. 告警通知
+     ├── 多渠道通知
+     ├── 升级机制
+     └── 确认机制
+
+  4. 告警响应
+     ├── 响应流程
+     ├── 处理流程
+     └── 复盘流程
+```
+
+---
+
+## 补充：生产问题排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 查询超时 | 数据量大/查询复杂 | 优化查询/增加资源 |
+| 内存溢出 | 并发查询/大数据量 | 限制并发/增加内存 |
+| 磁盘满 | 数据量增长 | 扩容/清理旧数据 |
+| 告警风暴 | 阈值设置不当 | 调整阈值/抑制告警 |
+| 数据丢失 | 采集间隔/网络 | 调整采集间隔/优化网络 |
+
+### 排查流程
+
+```bash
+# 1. 检查服务状态
+curl -s http://localhost:9090/-/healthy
+
+# 2. 检查存储状态
+curl -s http://localhost:9090/api/v1/status/tsdb
+
+# 3. 检查查询性能
+curl -s 'http://localhost:9090/api/v1/query?query=up'
+
+# 4. 检查告警状态
+curl -s http://localhost:9090/api/v1/alerts
+
+# 5. 检查日志
+journalctl -u prometheus -f
+```
+
+---
+
 ## 二十三、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](../中间件/云上可观测性体系.md)」；

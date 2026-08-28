@@ -2001,6 +2001,345 @@ Master 调度优化：
      → 定期分析
 ```
 
+## 二十四、DolphinScheduler 生产实践与高级特性
+
+### 24.1 Master 资源感知与负载均衡
+
+```
+Master 资源感知机制：
+  1. Worker 上报资源
+     → CPU 使用率
+     → 内存使用率
+     → 磁盘使用率
+     → 网络 IO
+
+  2. Master 收集资源信息
+     → 存储到 ZK 节点
+     → 定期更新（30s 间隔）
+
+  3. 资源感知调度
+     → 优先选择资源空闲 Worker
+     → 避免资源过载
+     → 支持资源预留
+
+  负载均衡策略：
+    轮询调度：Round Robin
+    权重调度：Weighted Round Robin
+    最少连接：Least Connections
+    资源感知：Resource Aware
+```
+
+### 24.2 Worker 分组隔离与标签调度
+
+| 特性 | 说明 | 使用场景 |
+|------|------|----------|
+| Worker Group | Worker 物理分组 | 不同业务线隔离 |
+| 标签调度 | 按标签路由任务 | 资源隔离 |
+| 异构集群 | 不同配置 Worker | 混合部署 |
+| 任务亲和性 | 任务绑定特定 Worker | 数据本地性 |
+
+```
+标签调度配置：
+  Worker 标签：
+    worker.tags=business=line1,env=prod
+    worker.tags=business=line2,env=test
+
+  任务标签匹配：
+    task.workerGroup=line1
+    task.resourcePool=production
+
+  调度规则：
+    1. 解析任务所需标签
+    2. 匹配具备标签的 Worker
+    3. 选择资源最空闲的 Worker
+    4. 分配任务执行
+```
+
+```mermaid
+graph TB
+    subgraph "Master 节点"
+        A[任务调度器]
+        B[资源监控]
+        C[标签匹配器]
+    end
+
+    subgraph "Worker Group 1 (生产环境)"
+        D[Worker-1]
+        E[Worker-2]
+    end
+
+    subgraph "Worker Group 2 (测试环境)"
+        F[Worker-3]
+        G[Worker-4]
+    end
+
+    A --> C
+    C -->|匹配标签| D
+    C -->|匹配标签| E
+    C -->|匹配标签| F
+    C -->|匹配标签| G
+    B -->|监控资源| D
+    B -->|监控资源| E
+    B -->|监控资源| F
+    B -->|监控资源| G
+```
+
+### 24.3 告警插件开发实战
+
+```java
+// 自定义告警插件示例
+public class DingTalkAlert extends AlertPlugin {
+
+    @Override
+    public void init(AlertConfig config) {
+        this.webhook = config.getString("webhook");
+        this.secret = config.getString("secret");
+    }
+
+    @Override
+    public AlertResult send(AlertMessage message) {
+        // 1. 构建消息体
+        DingTalkMsg msg = new DingTalkMsg();
+        msg.setTitle(message.getTitle());
+        msg.setText(message.getContent());
+        msg.setMsgType("markdown");
+
+        // 2. 生成签名
+        String sign = generateSign(secret);
+        String url = webhook + "&sign=" + sign;
+
+        // 3. 发送请求
+        HttpResponse resp = HttpUtil.post(url, msg.toJson());
+
+        // 4. 解析响应
+        DingTalkResult result = JSON.parseObject(
+            resp.getBody(), DingTalkResult.class);
+
+        return new AlertResult(
+            result.getErrcode() == 0,
+            result.getErrmsg()
+        );
+    }
+
+    @Override
+    public String getPluginName() {
+        return "dingtalk";
+    }
+}
+```
+
+| 告警插件 | 配置项 | 适用场景 |
+|----------|--------|----------|
+| 钉钉 | webhook, secret | 团队通知 |
+| 企业微信 | corpId, agentId | 企业内部 |
+| 邮件 | smtp, user, password | 正式通知 |
+| 短信 | accessKey, secretKey | 紧急告警 |
+| Webhook | url, method | 自定义集成 |
+
+### 24.4 DS vs Airflow 选型决策
+
+| 维度 | DolphinScheduler | Airflow | 选型建议 |
+|------|------------------|---------|----------|
+| 架构 | 中心化 Master-Worker | 分布式 Scheduler | DS 更简单 |
+| 调度 | 可视化 DAG | Python DAG | DS 更易用 |
+| 监控 | 内置完善 | 需额外搭建 | DS 更省心 |
+| 社区 | 国内活跃 | 国际活跃 | 按团队选择 |
+| 学习曲线 | 低 | 中 | DS 更友好 |
+| 生态 | 大数据生态 | 通用生态 | 按场景选择 |
+| 性能 | 高 | 中 | DS 更优 |
+| 运维 | K8s 原生支持 | 复杂 | DS 更简单 |
+
+### 24.5 HA 部署最佳实践
+
+```
+HA 部署架构：
+  Master 节点（3个）：
+    → 主备模式
+    → ZK 选主
+    → 互为备份
+
+  Worker 节点（N个）：
+    → 负载均衡
+    → 故障自动转移
+    → 资源隔离
+
+  数据库：
+    → MySQL 主从
+    → 定期备份
+    → 读写分离
+
+  ZooKeeper：
+    → 3节点集群
+    → 保证一致性
+
+  关键配置：
+    master.ha.enable=true
+    master election strategy=tilde
+    worker.ha.enable=true
+```
+
+### 24.6 任务依赖与数据血缘
+
+```
+任务依赖类型：
+  1. 工作流依赖
+     → 上游工作流完成后触发
+     → 支持跨项目依赖
+
+  2. 任务依赖
+     → 单个任务级别依赖
+     → 更细粒度控制
+
+  3. 数据依赖
+     → 表级依赖检查
+     → 数据就绪触发
+
+  4. 时间依赖
+     → 定时触发
+     → 支持 Cron 表达式
+
+  5. 外部依赖
+     → API 回调触发
+     → 外部系统集成
+```
+
+### 24.7 监控指标与性能分析
+
+| 指标类别 | 指标名称 | 说明 | 告警阈值 |
+|----------|----------|------|----------|
+| 调度 | master.dispatch.count | 调度任务数 | > 1000/s |
+| 执行 | worker.execute.count | 执行任务数 | > 500/s |
+| 延迟 | master.dispatch.latency | 调度延迟 | > 1s |
+| 失败 | task.failure.count | 任务失败数 | > 10/h |
+| 资源 | worker.cpu.usage | CPU 使用率 | > 80% |
+| 资源 | worker.memory.usage | 内存使用率 | > 85% |
+| 资源 | worker.disk.usage | 磁盘使用率 | > 90% |
+| 队列 | master.queue.size | 待调度队列 | > 1000 |
+
+```java
+// Prometheus 监控指标
+@Component
+public class DSMetrics {
+
+    private final Counter taskCounter = Counter.builder()
+        .name("ds_task_total")
+        .help("DolphinScheduler task total")
+        .tag("status", "success")
+        .register();
+
+    private final Gauge queueGauge = Gauge.builder()
+        .name("ds_queue_size")
+        .help("DolphinScheduler queue size")
+        .register();
+
+    public void recordTask(String status) {
+        taskCounter.labels(status).inc();
+    }
+
+    public void updateQueue(int size) {
+        queueGauge.set(size);
+    }
+}
+```
+
+### 24.8 多租户隔离与资源管理
+
+```
+多租户架构：
+  租户层面：
+    → 独立资源空间
+    → 独立权限体系
+    → 独立配额管理
+
+  项目层面：
+    → 租户内项目隔离
+    → 项目级权限控制
+    → 项目级资源限制
+
+  任务层面：
+    → 任务级资源限制
+    → 任务优先级
+    → 任务超时控制
+
+  资源配额：
+    CPU 配额：限制核心数
+    内存配额：限制使用量
+    存储配额：限制存储空间
+    并发配额：限制并发任务数
+```
+
+### 24.9 自定义任务类型开发
+
+```java
+// 自定义任务类型示例
+public class CustomTask extends AbstractTask {
+
+    @Override
+    public void init() {
+        // 初始化任务参数
+        this.inputParams = getParam("input");
+        this.outputParams = getParam("output");
+    }
+
+    @Override
+    public TaskResult run() {
+        try {
+            // 1. 任务逻辑
+            doSomething(inputParams);
+
+            // 2. 保存结果
+            saveResult(outputParams);
+
+            // 3. 返回成功
+            return new TaskResult(true, "任务完成");
+        } catch (Exception e) {
+            return new TaskResult(false, e.getMessage());
+        }
+    }
+
+    @Override
+    public void cancel() {
+        // 取消任务逻辑
+        cleanup();
+    }
+}
+```
+
+### 24.10 生产问题排查手册
+
+| 问题类型 | 现象 | 排查步骤 | 解决方案 |
+|----------|------|----------|----------|
+| 调度延迟 | 任务未按时触发 | 1.检查 Master 状态<br>2.检查 ZK 连接<br>3.检查数据库 | 增加 Master 节点 |
+| 任务失败 | 任务执行失败 | 1.查看任务日志<br>2.检查资源<br>3.检查依赖 | 优化任务逻辑 |
+| Worker 离线 | Worker 不可用 | 1.检查 Worker 进程<br>2.检查网络<br>3.检查 ZK | 重启 Worker |
+| 数据库慢 | 调度变慢 | 1.检查慢查询<br>2.优化索引<br>3.增加连接 | 数据库优化 |
+| 内存溢出 | OOM 错误 | 1.分析堆内存<br>2.检查大任务<br>3.增加内存 | JVM 调优 |
+
+### 24.11 DS 最佳实践总结
+
+```
+最佳实践：
+  1. 架构设计
+     → Master 至少 3 节点
+     → Worker 按业务分组
+     → 使用标签调度
+
+  2. 任务设计
+     → 任务粒度适中
+     → 合理设置超时
+     → 使用检查点
+
+  3. 监控告警
+     → 完善监控指标
+     → 设置合理阈值
+     → 多渠道告警
+
+  4. 运维管理
+     → 定期备份
+     → 版本升级
+     → 日志清理
+```
+
 ## 二十二、DolphinScheduler 故障恢复
 
 ### 22.1 Master 故障转移

@@ -1804,3 +1804,661 @@ GC 调优参数：
 ```
 
 > 一句话：**ES 调优 = 分片（10~30GB/分片，别太多）+ JVM（堆 ≤31GB，留一半给 OS 缓存）+ 查询（filter 替代 query，避免深分页 wildcard）+ 集群（监控 health/水位线/线程池）**。
+
+## 补充：索引设计最佳实践
+
+### 字段类型选择
+
+| 数据类型 | 适用场景 | 存储开销 | 查询性能 |
+|----------|----------|----------|----------|
+| text | 全文搜索 | 高（倒排索引） | 慢（分词匹配） |
+| keyword | 精确匹配/聚合 | 低 | 快 |
+| long/integer | 数值范围查询 | 中 | 快 |
+| date | 时间范围查询 | 低 | 快 |
+| boolean | 布尔查询 | 最低 | 最快 |
+| nested | 数组/对象嵌套 | 高 | 慢 |
+| join | 父子关系 | 中 | 中 |
+
+```json
+// 推荐字段映射模板
+{
+  "mappings": {
+    "properties": {
+      "title": { "type": "text", "analyzer": "ik_max_word" },
+      "status": { "type": "keyword" },
+      "created_at": { "type": "date", "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis" },
+      "price": { "type": "scaled_float", "scaling_factor": 100 },
+      "tags": { "type": "keyword" },
+      "user_id": { "type": "keyword", "doc_values": true }
+    }
+  }
+}
+```
+
+### 索引分片策略
+
+```text
+分片公式：单个分片大小 = 文档数 × 单文档大小 ÷ 分片数
+推荐分片大小：10-50GB（建议 20-30GB）
+单分片文档数：不超过 2000 万
+
+分片数量决策：
+  单分片 < 10GB：分片过少（考虑合并）
+  单分片 > 50GB：分片过多（考虑增加分片）
+  单分片 > 100GB：严重影响性能
+
+分片分配建议：
+  50GB 数据：5-10 分片
+  500GB 数据：20-30 分片
+  1TB 数据：30-50 分片
+```
+
+### 索引模板配置
+
+```json
+// 日志索引模板
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s",
+      "codec": "best_compression"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "level": { "type": "keyword" },
+        "message": { "type": "text", "analyzer": "standard" },
+        "trace_id": { "type": "keyword" },
+        "duration_ms": { "type": "integer" }
+      }
+    }
+  }
+}
+```
+
+---
+
+## 补充：查询优化实践
+
+### 查询 DSL 优化
+
+```json
+// ❌ 低效查询（全扫描）
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "status": "active" } }
+      ]
+    }
+  }
+}
+
+// ✅ 高效查询（term + filter）
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "status": "active" } }
+      ],
+      "must": [
+        { "match": { "title": "搜索" } }
+      ]
+    }
+  }
+}
+```
+
+### 分片路由优化
+
+```json
+// 指定路由（避免跨分片查询）
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "user_id": "user123" } }
+      ]
+    }
+  },
+  "routing": "user123"
+}
+
+// 批量查询指定路由
+{
+  "ids": {
+    "values": ["doc1", "doc2"]
+  },
+  "routing": "user123"
+}
+```
+
+### 查询性能调优
+
+| 调优项 | 推荐配置 | 说明 |
+|--------|----------|------|
+| size | 10-20 | 避免深分页 |
+| from+size | < 10000 | 深分页用 search_after |
+| doc_values | true | 聚合字段启用 |
+| fielddata | false | text 字段禁用 |
+| eager_global_ordinals | true | 高基数聚合字段 |
+| index.sort.field | @timestamp | 合并时排序 |
+
+### 深分页解决方案
+
+```json
+// 方案一：search_after（推荐）
+{
+  "query": { "match_all": {} },
+  "search_after": ["2026-08-28", "doc_123"],
+  "sort": [
+    { "@timestamp": "asc" },
+    { "_id": "asc" }
+  ],
+  "size": 100
+}
+
+// 方案二：scroll（大批量导出）
+{
+  "scroll": "5m",
+  "size": 100,
+  "query": { "match_all": {} }
+}
+```
+
+---
+
+## 补充：节点角色配置
+
+### 四节点角色详解
+
+| 角色 | 功能 | 配置建议 | 数据节点数 |
+|------|------|----------|------------|
+| Master | 集群管理/索引创建/分片分配 | dedicated_master=true | 3-5 |
+| Data | 存储数据/执行查询 | node.data=true | 按数据量 |
+| Ingest | 文档预处理（Pipeline） | node.ingest=true | 1-2 |
+| Coordinating | 查询协调/结果聚合 | 可复用 Data 节点 | 1-2 |
+
+```yaml
+# Master 节点配置
+node.roles: [master]
+node.master: true
+node.data: false
+node.ingest: false
+cluster.remote_connect: false
+
+# Data 节点配置
+node.roles: [data_hot, data_warm]
+node.data: true
+node.master: false
+node.ingest: false
+
+# Ingest 节点配置
+node.roles: [ingest]
+node.data: false
+node.master: false
+node.ingest: true
+
+# Coordinating 节点配置
+node.roles: []  # 不承担其他角色
+```
+
+### 角色分离最佳实践
+
+| 场景 | 推荐拓扑 | 说明 |
+|------|----------|------|
+| 小集群（<10节点） | 混合角色 | 减少运维复杂度 |
+| 中集群（10-50节点） | Master+Data 分离 | 提高稳定性 |
+| 大集群（>50节点） | 全角色分离 | 最高可靠性 |
+
+---
+
+## 补充：分片分配策略
+
+### 分片分配算法
+
+```text
+分配算法：
+  1. 加权轮询（Weighted Round Robin）
+     ├── 按节点权重分配分片
+     └── 避免热点节点
+
+  2. 磁盘感知（Disk-aware）
+     ├── 按磁盘可用空间分配
+     └── 避免磁盘过载
+
+  3. 节点感知（Node-aware）
+     ├── 跨可用区/机架分配
+     └── 容灾考虑
+
+  4. 同分配（Same Allocation）
+     ├── 父子关系分片分配
+     └── 减少网络传输
+```
+
+### 分片分配配置
+
+```json
+// 索引级别分配策略
+{
+  "index": {
+    "routing": {
+      "allocation.require.zone": "zone-a",
+      "allocation.include._tier_preference": "data_hot,data_warm"
+    }
+  }
+}
+
+// 集群级别分配策略
+PUT /_cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.awareness.attributes": "zone",
+    "cluster.routing.allocation.disk.watermark.low": "85%",
+    "cluster.routing.allocation.disk.watermark.high": "90%"
+  }
+}
+```
+
+### 分片再平衡
+
+```json
+// 触发再平衡
+POST /_cluster/reroute
+{
+  "commands": [
+    {
+      "move": {
+        "index": "my-index",
+        "shard": 0,
+        "from_node": "node-1",
+        "to_node": "node-2"
+      }
+    }
+  ]
+}
+
+// 重试失败的分片分配
+POST /_cluster/reroute?retry_failed=true
+```
+
+---
+
+## 补充：内存管理与缓存
+
+### JVM 堆内存配置
+
+```yaml
+# 推荐配置（ES 7.x+）
+# 堆内存设置原则：
+# - 不超过物理内存的 50%
+# - 不超过 32GB（压缩指针阈值）
+# - Master/Data 节点分开配置
+
+# Master 节点（16GB 物理内存）
+- Xms: 8g
+- Xmx: 8g
+
+# Data 节点（64GB 物理内存）
+- Xms: 30g
+- Xmx: 30g
+
+# Ingest 节点（16GB 物理内存）
+- Xms: 4g
+- Xmx: 4g
+```
+
+### 缓存层级
+
+| 缓存类型 | 存储位置 | 生命周期 | 作用 |
+|----------|----------|----------|------|
+| Node Query Cache | JVM 堆 | 查询生命周期 | 缓存 filter 查询结果 |
+| Request Cache | JVM 堆 | 请求生命周期 | 缓存 分片级别结果 |
+| Fielddata Cache | JVM 堆 | JVM 生命周期 | 缓存 field data |
+| FileSystem Cache | OS 内存 | 文件存在期间 | 缓存 Lucene 段文件 |
+
+### 缓存调优
+
+```json
+// 禁用不需要的缓存
+PUT /my-index/_settings
+{
+  "index.requests.cache.enable": false
+}
+
+// 手动清除缓存
+POST /my-index/_cache/clear
+{
+  "query": true,
+  "fielddata": true,
+  "request": true
+}
+
+// 查询时使用缓存
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "status": "active" } }
+      ]
+    }
+  },
+  "request_cache": true
+}
+```
+
+---
+
+## 补充：集群健康检查
+
+### 健康指标监控
+
+| 指标 | 正常值 | 告警阈值 | 说明 |
+|------|--------|----------|------|
+| Cluster Status | green | yellow/red | 集群整体状态 |
+| Pending Tasks | 0 | > 100 | 待处理任务数 |
+| Relocating Shards | 0 | > 10 | 正在迁移的分片 |
+| Initializing Shards | 0 | > 10 | 正在初始化的分片 |
+| Unassigned Shards | 0 | > 0 | 未分配的分片 |
+
+### 健康检查脚本
+
+```bash
+#!/bin/bash
+# ES 集群健康检查脚本
+
+ES_HOST="localhost:9200"
+
+# 检查集群状态
+CLUSTER_STATUS=$(curl -s "$ES_HOST/_cluster/health" | jq -r '.status')
+if [ "$CLUSTER_STATUS" != "green" ]; then
+  echo "CRITICAL: Cluster status is $CLUSTER_STATUS"
+  exit 2
+fi
+
+# 检查未分配分片
+UNASSIGNED=$(curl -s "$ES_HOST/_cluster/health" | jq -r '.unassigned_shards')
+if [ "$UNASSIGNED" -gt 0 ]; then
+  echo "WARNING: $UNASSIGNED unassigned shards"
+  exit 1
+fi
+
+# 检查磁盘水位线
+DISK_WATERMARK=$(curl -s "$ES_HOST/_cat/allocation?v" | awk '{print $4}')
+echo "Disk watermark: $DISK_WATERMARK"
+
+echo "OK: Cluster is healthy"
+exit 0
+```
+
+### 日常维护检查
+
+```bash
+# 列出所有索引
+GET /_cat/indices?v&s=size:desc
+
+# 列出所有分片
+GET /_cat/shards?v&s=index,shard
+
+# 列出所有节点
+GET /_cat/nodes?v
+
+# 查看集群设置
+GET /_cluster/settings?include_defaults=false
+
+# 查看磁盘使用
+GET /_cat/allocation?v
+
+# 查看热/冷节点
+GET /_cat/nodeattrs?v
+```
+
+---
+
+## 补充：滚动重启流程
+
+### 标准操作流程
+
+```text
+滚动重启步骤：
+  1. 检查集群状态
+     ├── GET /_cluster/health
+     └── GET /_cat/allocation?v
+
+  2. 禁用分片分配
+     PUT /_cluster/settings
+     {"persistent":{"cluster.routing.allocation.enable":"primaries"}}
+
+  3. 执行节点重启
+     ├── 停止节点
+     ├── 更新配置
+     ├── 启动节点
+     └── 等待节点加入集群
+
+  4. 恢复分片分配
+     PUT /_cluster/settings
+     {"persistent":{"cluster.routing.allocation.enable":"all"}}
+
+  5. 等待分片恢复
+     GET /_cat/health?v
+     GET /_cat/recovery?v
+
+  6. 重复 2-5 直到所有节点重启
+```
+
+### 滚动重启配置
+
+```json
+// 临时禁用分配
+PUT /_cluster/settings
+{
+  "transient": {
+    "cluster.routing.allocation.enable": "primaries"
+  }
+}
+
+// 恢复分配
+PUT /_cluster/settings
+{
+  "transient": {
+    "cluster.routing.allocation.enable": "all"
+  }
+}
+```
+
+### 分片恢复监控
+
+```json
+// 监控恢复进度
+GET /_cat/recovery?v&active_only=true
+
+// 调整恢复速度
+PUT /_cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.node_concurrent_recoveries": 2,
+    "indices.recovery.max_bytes_per_sec": "100mb"
+  }
+}
+```
+
+---
+
+## 补充：故障排查指南
+
+### 常见故障及解决方案
+
+| 故障现象 | 可能原因 | 解决方案 |
+|----------|----------|----------|
+| 集群 RED | 主分片未分配 | 检查磁盘/节点状态，手动分配分片 |
+| 集群 YELLOW | 副本分片未分配 | 检查节点数，调整副本数 |
+| 查询超时 | 分片过大/慢查询 | 检查分片大小，优化查询 |
+| 写入拒绝 | 磁盘水位线触发 | 清理索引，扩展磁盘 |
+| GC 频繁 | JVM 内存不足 | 增加堆内存，优化查询 |
+
+### 故障排查命令
+
+```bash
+# 检查未分配分片原因
+GET /_cluster/allocation/explain
+
+# 检查分片分配决策
+GET /_cluster/reroute?explain=true
+
+# 查看慢查询日志
+GET /_nodes/hot_threads
+
+# 查看线程池状态
+GET /_cat/thread_pool?v
+
+# 查看磁盘使用
+GET /_cat/allocation?v
+
+# 查看节点统计
+GET /_nodes/stats
+```
+
+### 磁盘空间管理
+
+```json
+// 设置磁盘水位线
+PUT /_cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.disk.watermark.low": "85%",
+    "cluster.routing.allocation.disk.watermark.high": "90%",
+    "cluster.routing.allocation.disk.watermark.flood_stage": "95%"
+  }
+}
+
+// 清理磁盘
+POST /_cache/clear
+
+// 删除旧索引
+DELETE /old-index-*
+
+// 关闭索引
+POST /old-index/_close
+```
+
+---
+
+## 补充：安全配置
+
+### HTTPS 配置
+
+```yaml
+# elasticsearch.yml
+xpack.security.enabled: true
+xpack.security.transport.ssl.enabled: true
+xpack.security.transport.ssl.verification_mode: certificate
+xpack.security.transport.ssl.keystore.path: certs/transport.p12
+xpack.security.transport.ssl.truststore.path: certs/transport.p12
+xpack.security.http.ssl.enabled: true
+xpack.security.http.ssl.keystore.path: certs/http.p12
+xpack.security.http.ssl.truststore.path: certs/http.p12
+```
+
+### 用户认证配置
+
+```bash
+# 创建内置用户
+bin/elasticsearch-users useradd admin -p changeme -r superuser
+bin/elasticsearch-users useradd reader -p changeme -r reader
+
+# 修改密码
+bin/elasticsearch-users passwd admin
+
+# 查看用户
+bin/elasticsearch-users list
+```
+
+### 角色权限配置
+
+```json
+// 自定义角色
+POST /_security/role/logs_reader
+{
+  "cluster": ["monitor"],
+  "indices": [
+    {
+      "names": ["logs-*"],
+      "privileges": ["read", "view_index_metadata"]
+    }
+  ]
+}
+
+// 用户角色映射
+PUT /_security/role_mapping/logs_reader_mapping
+{
+  "roles": ["logs_reader"],
+  "enabled": true,
+  "rules": [
+    {
+      "field": {
+        "username": "reader*"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 补充：性能基准测试
+
+### 测试方法
+
+```text
+测试步骤：
+  1. 索引性能测试
+     ├── 批量写入（Bulk API）
+     ├── 监控索引速度（docs/sec）
+     ├── 监控延迟（P50/P99）
+     └── 监控资源使用（CPU/内存/磁盘）
+
+  2. 查询性能测试
+     ├── 不同查询类型（term/range/fulltext）
+     ├── 不同并发数（1/10/50/100）
+     ├── 监控延迟（P50/P99）
+     └── 监控吞吐量（QPS）
+
+  3. 混合负载测试
+     ├── 读写比例（1:1/1:10/10:1）
+     ├── 不同数据分布
+     └── 监控整体性能
+```
+
+### 性能测试配置
+
+```json
+// 测试索引配置
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "refresh_interval": "30s",
+    "translog.durability": "async"
+  },
+  "mappings": {
+    "properties": {
+      "title": { "type": "text" },
+      "status": { "type": "keyword" },
+      "timestamp": { "type": "date" }
+    }
+  }
+}
+```
+
+### 性能基准指标
+
+| 指标 | 测试环境 | 预期值 | 说明 |
+|------|----------|--------|------|
+| 索引速度 | 3节点/3分片 | > 10000 docs/sec | 单分片 |
+| 查询延迟 | 3节点/3分片 | < 50ms (P99) | 单次查询 |
+| QPS | 3节点/3分片 | > 1000 | 单次查询 |
+| 混合负载 | 3节点/3分片 | > 500 QPS | 读写混合 |

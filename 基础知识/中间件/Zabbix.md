@@ -1880,6 +1880,170 @@ datasources:
       zabbixApiUrl: http://zabbix:80/api_jsonrpc.php
 ```
 
+## 二十九、Zabbix Proxy 与分布式监控
+
+### 29.1 Proxy 同步机制
+
+```
+Proxy 同步流程：
+  1. Proxy 启动 → 连接 Server
+  2. Server 分配监控任务
+  3. Proxy 执行数据采集
+  4. 定时同步数据到 Server
+
+  同步模式：
+    模式 1：主动 Proxy
+      → Proxy 主动拉取配置
+      → 适合内网环境
+
+    模式 2：被动 Proxy
+      → Server 主动推送配置
+      → 适合跨网络环境
+
+  同步频率：
+    配置同步：5分钟
+    数据同步：1-5分钟
+    心跳检测：30秒
+```
+
+### 29.2 低级别发现（LLD）实战
+
+```json
+{
+  "data": [
+    "{#IFNAME}": "eth0",
+    "{#IFNAME}": "eth1",
+    "{#IFNAME}": "docker0",
+    "{#CPU_CORE}": "0",
+    "{#CPU_CORE}": "1",
+    "{#DISK_NAME}": "/dev/sda",
+    "{#DISK_NAME}": "/dev/sdb"
+  ]
+}
+```
+
+```
+LLD 规则配置：
+  发现类型：
+    → 网络接口：net.if.discovery
+    → CPU 核心：system.cpu.num
+    → 磁盘：vfs.dev.discovery
+    → 文件系统：vfs.fs.discovery
+
+  原型配置：
+    → 监控项原型：动态创建监控项
+    → 触发器原型：动态创建触发器
+    → 图形原型：动态创建图形
+
+  宏变量：
+    → {#IFNAME}：接口名称
+    → {#CPU_CORE}：CPU 核心
+    → {#DISK_NAME}：磁盘名称
+```
+
+### 29.3 自定义监控项开发
+
+```bash
+#!/bin/bash
+# 自定义监控项脚本
+
+# 监控 Nginx 连接数
+nginx_connections() {
+    curl -s http://localhost/nginx_status | grep 'Active connections' | awk '{print $3}'
+}
+
+# 监控队列长度
+queue_length() {
+    redis-cli LLEN task_queue
+}
+
+# 监控 JVM 内存
+jvm_memory() {
+    jstat -gc $(jps | grep Application | awk '{print $1}') | tail -1 | awk '{print $6+$8}'
+}
+
+# 返回监控值
+case "$1" in
+    nginx_connections)
+        nginx_connections
+        ;;
+    queue_length)
+        queue_length
+        ;;
+    jvm_memory)
+        jvm_memory
+        ;;
+esac
+```
+
+### 29.4 仪表板设计原则
+
+```
+仪表板设计：
+  布局原则：
+    → 按业务分组
+    → 重要指标置顶
+    → 支持下钻
+
+  图表类型：
+    → 时序图：趋势分析
+    → 仪表盘：实时状态
+    → 拓扑图：服务关系
+
+  交互功能：
+    → 时间范围选择
+    → 筛选过滤
+    → 链接跳转
+
+  告警集成：
+    → 阈值线标记
+    → 告警事件标注
+    → 颜色预警
+```
+
+| 仪表板类型 | 关键指标 | 使用场景 |
+|-----------|----------|----------|
+| 服务器监控 | CPU/内存/磁盘/网络 | 基础设施 |
+| 应用监控 | QPS/延迟/错误率 | 应用性能 |
+| 数据库监控 | 连接数/查询/锁 | 数据库运维 |
+| 中间件监控 | 队列/连接/线程 | 中间件运维 |
+| 业务监控 | 订单/用户/支付 | 业务分析 |
+
+### 29.5 容量规划与预测
+
+```
+容量规划流程：
+  1. 数据收集
+     → 历史使用数据
+     → 业务增长预测
+     → 资源使用趋势
+
+  2. 容量评估
+     → 当前容量使用率
+     → 增长率分析
+     → 瓶颈识别
+
+  3. 扩容策略
+     → 水平扩容：增加节点
+     → 垂直扩容：增加资源
+     → 弹性伸缩：自动扩缩
+
+  4. 成本优化
+     → 资源利用率分析
+     → 闲置资源回收
+     → 预留容量规划
+```
+
+### 29.6 Zabbix 最佳实践
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 模板化 | 使用模板管理监控项 | 统一管理 |
+| 自动化 | 自动发现注册 | 减少运维 |
+| 分层 | Proxy 分层部署 | 提升性能 |
+| 告警分级 | 设置告警级别 | 快速响应 |
+| 定期审查 | 定期优化配置 | 持续改进 |
+
 ## 与其他板块的关系
 
 ## Zabbix API 自动化运维

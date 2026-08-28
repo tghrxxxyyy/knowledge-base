@@ -1201,6 +1201,606 @@ set_quota 'TABLE', 'tenant_b:order_table', LIMIT => {'REGION_COUNT' => '50'}
 
 ---
 
+## 三十三、跨集群复制（Replication Endpoint）
+
+### 33.1 HBase Replication 架构
+
+```text
+跨集群复制原理：
+  ├── Source 集群：接收写入（WAL 日志）
+  ├── Peer 集群：接收复制数据（最终一致）
+  ├── Replication Endpoint：负责 WAL 日志传输
+  └── RegionServer 管理：每个 RS 负责自己的 WAL 复制
+
+复制流程：
+  1. Producer 写入 Source 集群
+  2. WAL 日志追加写入
+  3. Replication Source 读取 WAL（队列）
+  4. 传输到 Peer 集群的 Replication Sink
+  5. Sink 重放 WAL 日志到目标 RegionServer
+  6. 数据最终一致（异步复制）
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| hbase.replication | true | 启用复制 |
+| hbase.replication.peer.max.ttl | 604800000ms | 复制条目最大保留时间 |
+| replication.stats.warn.replay.queue.size | -1 | 告警阈值 |
+| replication.stats.warn.replay.queue.latency | 3600000ms | 延迟告警阈值 |
+
+### 33.2 RegionServer 管理
+
+```bash
+# 查看复制状态
+replication_status
+
+# 查看复制延迟
+hbase org.apache.hadoop.hbase.replication.regionserver.ReplicationStatus
+
+# 手动触发复制
+hbase shell
+  list_peers
+  add_peer '1', CLUSTER_KEY => 'zk1,zk2,zk3:2181:/hbase'
+```
+
+### 33.3 延迟监控
+
+| 监控指标 | 告警阈值 | 说明 |
+|----------|----------|------|
+| replication lag | > 60s | 复制延迟 |
+| replication queue size | > 1000 | 积压告警 |
+| replication source status | DOWN | 复制源异常 |
+| WAL 文件数量 | > 50 | 积压严重 |
+
+---
+
+## 三十四、HBase 二级索引深入
+
+### 34.1 二级索引方案对比
+
+| 方案 | 实现方式 | 一致性 | 性能影响 | 适用场景 |
+|------|----------|--------|----------|----------|
+| Memory-Matching-Pairs | 内存匹配对 | 强一致 | 低 | 高性能精确查询 |
+| Phoenix Global | 协处理器+索引表 | 强一致 | 中 | SQL查询+二级索引 |
+| Coprocessor 索引 | 自定义协处理器 | 强一致 | 中 | 定制化索引需求 |
+| SALB 索引 | 应用层双写 | 最终一致 | 高 | 非实时场景 |
+| ES 二级索引 | 外部ES+同步 | 最终一致 | 高 | 全文检索需求 |
+
+### 34.2 Phoenix Global 索引
+
+```sql
+-- Phoenix 全局索引（跨 Region）
+CREATE INDEX idx_user_name ON user_table (user_name)
+    INCLUDE (email, phone, age)
+    DATA_BLOCK_ENCODING='DIFF';
+
+-- Phoenix 本地索引（同 Region）
+CREATE LOCAL INDEX idx_order_time ON orders (order_time);
+
+-- Phoenix 查询自动使用索引
+SELECT name, email FROM users WHERE user_name = '张三';
+```
+
+### 34.3 索引维护策略
+
+```
+索引维护流程：
+  1. 写入主表时自动更新索引（Observer 协处理器）
+  2. 索引表与主表在同一 RegionServer
+  3. 写入开销：每次写主表 + 写索引表（双写）
+  4. 读取开销：先查索引表 → 回查主表（覆盖索引可避免）
+
+最佳实践：
+  - 读多写少场景：全局索引（直接查索引表）
+  - 写多读少场景：本地索引（同 Region 更新）
+  - 避免过多索引：每个索引增加 20% 写入开销
+```
+
+---
+
+## 三十五、协处理器实战深入
+
+### 35.1 Observer 累计实现
+
+```java
+// 自动维护二级索引 + 审计日志
+public class AuditIndexObserver extends BaseRegionObserver {
+    
+    @Override
+    public void prePut(ObserverContext<RegionCoprocessorEnvironment> e,
+                       Put put, WALEdit edit, Durability durability) {
+        // 1. 索引维护
+        byte[] row = put.getRow();
+        byte[] name = put.get(Bytes.toBytes("cf"), Bytes.toBytes("name"));
+        if (name != null) {
+            Put indexPut = new Put(name);
+            indexPut.addColumn(Bytes.toBytes("idx"), Bytes.toBytes("rowkey"), row);
+            getRegion().getTable(TableName.valueOf("t1_idx")).put(indexPut);
+        }
+        
+        // 2. 审计日志
+        AuditLog log = new AuditLog();
+        log.setOperation("PUT");
+        log.setTable(getRegion().getTableName().getNameAsString());
+        log.setRow(Bytes.toString(row));
+        log.setTimestamp(System.currentTimeMillis());
+        auditService.logAsync(log);
+    }
+    
+    @Override
+    public void preDelete(ObserverContext<RegionCoprocessorEnvironment> e,
+                          Delete delete, WALEdit edit, Durability durability) {
+        // 删除时更新索引
+        byte[] row = delete.getRow();
+        byte[] name = getRegion().get(row, Bytes.toBytes("cf"), Bytes.toBytes("name"));
+        if (name != null) {
+            getRegion().getTable(TableName.valueOf("t1_idx")).delete(new Delete(name));
+        }
+    }
+}
+```
+
+### 35.2 Endpoint 聚合
+
+```java
+// 服务端聚合（避免全表扫描）
+public class AggregateEndpoint extends BaseEndpointServer
+        implements AggregateProtocol {
+    
+    @Override
+    public Map<ByteString, Long> countByPrefix(byte[] family, byte[] qualifier, 
+                                                byte[] prefix) throws IOException {
+        Map<ByteString, Long> result = new HashMap<>();
+        Scan scan = new Scan();
+        scan.addFamily(family);
+        scan.addColumn(family, qualifier);
+        
+        try (RegionScanner scanner = getRegion().getScanner(scan)) {
+            List<Cell> cells = new ArrayList<>();
+            while (scanner.next(cells)) {
+                for (Cell cell : cells) {
+                    byte[] row = CellUtil.cloneRow(cell);
+                    if (Bytes.startsWith(row, prefix)) {
+                        ByteString prefixKey = ByteString.copyFrom(
+                            Bytes.head(row, prefix.length));
+                        result.merge(prefixKey, 1L, Long::sum);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+}
+```
+
+### 35.3 协处理器加载与卸载
+
+```bash
+# 加载协处理器（通过 shell）
+alter 'table_name', {NAME => 'cf', COPROCESSOR =>
+    'com.example.AuditIndexObserver|1001|priority=1001'}
+
+# 查看协处理器
+describe 'table_name'
+
+# 卸载协处理器
+alter 'table_name', {NAME => 'cf', COPROCESSOR => ''}
+
+# 通过配置加载（所有表生效）
+hbase-site.xml:
+  hbase.coprocessor.region.classes=com.example.AuditIndexObserver
+  hbase.coprocessor.master.classes=com.example.MasterObserver
+  hbase.coprocessor.master.observer.classes=com.example.MasterObserver
+
+# 卸载配置
+hbase-site.xml:
+  hbase.coprocessor.region.classes=
+  hbase.coprocessor.master.classes=
+```
+
+---
+
+## 三十六、Compaction 策略深入
+
+### 36.1 Minor Compaction
+
+```
+触发条件：
+  1. HFile 数量 >= hbase.hstore.compactionThreshold（默认 3）
+  2. 相邻小 HFile 优先合并
+  3. 单次合并文件数 <= hbase.hstore.compaction.max（默认 10）
+
+配置参数：
+  hbase.hstore.compactionThreshold: 3      # 触发阈值
+  hbase.hstore.compaction.max: 10          # 单次最大合并数
+  hbase.hstore.compaction.max.size: 10GB   # 单文件最大大小
+  hbase.hstore.compaction.min.size: 2MB    # 参与合并的最小文件
+```
+
+### 36.2 Major Compaction
+
+```
+触发条件：
+  1. 手动触发：major_compact 'table_name'
+  2. 自动触发：hbase.hstore.majorcompaction.period（默认 7 天）
+  3. 低峰期执行（建议凌晨 2-4 点）
+
+配置参数：
+  hbase.hstore.majorcompaction.period: 604800000  # 7 天（毫秒）
+  hbase.hstore.compaction.throughput.lower.bound: 2MB/s  # 低速限制
+  hbase.hstore.compaction.throughput.higher.limit: 200MB/s  # 高速限制
+```
+
+### 36.3 读放大分析
+
+```text
+读放大产生原因：
+  1. 多个 HFile 需要合并读取
+  2. 每个 HFile 可能包含目标数据
+  3. 需要遍历所有 HFile + BloomFilter
+
+读放大计算公式：
+  读放大倍数 = HFile 数量 × BloomFilter 误判率
+  示例：10 个 HFile，1% 误判率 → 读放大 ≈ 1.1x
+
+缓解措施：
+  1. 启用 BloomFilter（减少无效读）
+  2. 触发 Compaction（合并 HFile）
+  3. 使用覆盖索引（Phoenix）
+  4. 调整 BlockCache 大小
+```
+
+| 参数 | 默认值 | 优化建议 |
+|------|--------|----------|
+| hbase.hstore.compactionThreshold | 3 | 保持默认 |
+| hbase.hstore.compaction.max | 10 | 根据 IO 调整 |
+| hbase.hstore.blockingStoreFiles | 16 | 避免阻塞写入 |
+| hbase.hstore.compaction.throughput.lower.bound | 2MB/s | 低峰期不限速 |
+
+---
+
+## 三十七、Region 热点处理
+
+### 37.1 自动分裂
+
+```text
+自动分裂流程：
+  1. Region 大小超过阈值（默认 10GB）
+  2. HMaster 触发分裂
+  3. RegionServer 执行分裂（写时分裂/离线分裂）
+  4. 生成两个子 Region
+  5. 注册到 HMaster
+  6. 负载均衡分配
+
+分裂阈值配置：
+  hbase.hregion.max.filesize: 10737418240  # 10GB
+  hbase.hregion.split.algorithm: IncreasingToUpperBoundRegionSplitPolicy
+```
+
+### 37.2 手动预分裂
+
+```bash
+# 建表时预分裂（指定分割点）
+create 'table_name', 'cf', SPLITS => ['10', '20', '30', '40']
+
+# 按文件预分裂
+create 'table_name', 'cf', {NUMREGIONS => 15, SPLITALGO => 'HexStringSplit'}
+
+# 预分裂策略选择
+# 1. Hash 前缀：md5(userId).substring(0,4) + userId
+# 2. 时间戳反转：Long.MAX_VALUE - timestamp
+# 3. 盐值：random(0-N-1) + "_" + originalRowKey
+```
+
+### 37.3 Region Server 热点检测
+
+```bash
+# 查看 Region 分布
+hbase shell
+  status 'detailed'
+  scan 'hbase:meta', {COLUMNS => ['info:regioninfo', 'info:server']}
+
+# 查看热点 Region
+hbase org.apache.hadoop.hbase.master.RegionLoadBalancer
+
+# 手动平衡
+balance_switch true
+balancer
+
+# 监控指标
+hbase_metrics:
+  region_count: RegionServer 上的 Region 数
+  store_file_count: StoreFile 数量
+  mem_store_size: MemStore 大小
+  read_request_count: 读请求计数
+  write_request_count: 写请求计数
+```
+
+---
+
+## 三十八、HBase 监控体系
+
+### 38.1 Prometheus JMX Exporter
+
+```yaml
+# jmx_exporter 配置
+scrape_configs:
+  - job_name: 'hbase-regionserver'
+    static_configs:
+      - targets: ['regionserver:9100']
+    metrics_path: /metrics
+
+  - job_name: 'hbase-master'
+    static_configs:
+      - targets: ['master:9100']
+    metrics_path: /metrics
+
+# JMX Exporter 配置文件
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+rules:
+  - pattern: 'Hadoop<name=(.*), service=(.*),>(.*)'
+    name: hbase_$2_$1
+    labels:
+      service: $2
+```
+
+### 38.2 RegionServer GC 监控
+
+| 监控指标 | 正常范围 | 告警阈值 | 处理方案 |
+|----------|----------|----------|----------|
+| GC 时间占比 | < 5% | > 10% | 调整 JVM 参数 |
+| Full GC 频率 | < 1次/小时 | > 1次/10min | 增加堆内存 |
+| GC 暂停时间 | < 200ms | > 1s | 调整 GC 策略 |
+| 堆内存使用率 | < 70% | > 80% | 优化查询 |
+
+### 38.3 MemStore 监控
+
+```text
+MemStore 关键指标：
+  ├── MemStore 大小：全局 MemStore 总大小
+  ├── Flush 频率：MemStore 刷盘频率
+  ├── Flush 队列：待刷盘的 MemStore 数量
+  └── Flush 耗时：单次 Flush 耗时
+
+告警规则：
+  MemStore 大小 > 128MB → 警告
+  Flush 队列 > 10 → 严重
+  Flush 耗时 > 10s → 性能下降
+```
+
+### 38.4 BlockCache 监控
+
+| 监控指标 | 正常范围 | 告警阈值 | 说明 |
+|----------|----------|----------|------|
+| BlockCache 命中率 | > 80% | < 60% | 缓存效果 |
+| BlockCache 大小 | 按配置 | 接近上限 | 内存不足 |
+| BlockCache 淘汰率 | < 1% | > 5% | 缓存过小 |
+| Get 延迟 P99 | < 10ms | > 50ms | 读性能下降 |
+
+---
+
+## 三十九、HBase 备份与恢复
+
+### 39.1 Checkpoint 机制
+
+```
+HBase 备份方式：
+  1. Snapshot（推荐）
+     ├── 秒级创建，不阻塞读写
+     ├── 记录当前 Region 状态（元数据 + HFile 引用）
+     ├── 支持增量备份
+     └── 可恢复到任意时间点
+
+  2. ExportTable
+     ├── 全量导出到 HDFS
+     ├── 消耗 IO 资源
+     └── 适合小表
+
+  3. Replication
+     ├── 跨集群实时复制
+     ├── 最终一致
+     └── 适合灾备
+```
+
+### 39.2 恢复步骤
+
+```bash
+# 1. 创建快照
+snapshot 'table_name', 'snapshot_20260828'
+
+# 2. 列出快照
+list_snapshots
+
+# 3. 恢复快照
+restore_snapshot 'snapshot_20260828'
+
+# 4. 验证恢复
+scan 'table_name', LIMIT => 10
+```
+
+### 39.3 增量同步
+
+```
+增量同步流程：
+  1. 基于 WAL 日志的增量同步
+  2. 源集群写入 → WAL 日志
+  3. 复制源读取 WAL → 传输到目标集群
+  4. 目标集群重放 WAL → 数据一致
+
+同步配置：
+  hbase.replication.source.nb.perrs: 10  # 每个 RS 的复制线程数
+  hbase.replication.source.sleep.time: 1000ms  # 复制间隔
+```
+
+---
+
+## 四十、HBase 安全深入
+
+### 40.1 Kerberos 认证
+
+```xml
+<!-- 启用 Kerberos -->
+<property>
+  <name>hbase.security.authentication</name>
+  <value>kerberos</value>
+</property>
+<property>
+  <name>hbase.security.authorization</name>
+  <value>true</value>
+</property>
+<property>
+  <name>hbase.master.kerberos.principal</name>
+  <value>hbase/_HOST@REALM</value>
+</property>
+<property>
+  <name>hbase.regionserver.kerberos.principal</name>
+  <value>hbase/_HOST@REALM</value>
+</property>
+```
+
+### 40.2 ACL 权限控制
+
+```bash
+# 授权
+grant 'user1', 'RWXCA', 'table_name'
+
+# 权限说明
+R - 读
+W - 写
+X - 执行（协处理器）
+C - 创建
+A - 管理
+
+# 查看权限
+user_access 'user1'
+
+# 撤销权限
+revoke 'user1', 'table_name'
+```
+
+### 40.3 RPC 加密
+
+```xml
+<!-- 传输加密 -->
+<property>
+  <name>hbase.rpc.protection</name>
+  <value>privacy</value>  <!-- authentication/privacy/integrity -->
+</property>
+
+<!-- 存储加密 -->
+<property>
+  <name>hbase.crypto.key.provider</name>
+  <value>org.apache.hadoop.hbase.crypto.KeyProvider</value>
+</property>
+```
+
+### 40.4 安全最佳实践
+
+| 实践 | 说明 |
+|------|------|
+| 启用 Kerberos | 集群认证 |
+| ACL 最小权限 | 按用户/表授权 |
+| RPC 加密 | 传输层加密 |
+| 审计日志 | 记录所有操作 |
+| 网络隔离 | VPC/防火墙 |
+| 密钥管理 | 定期轮换密钥 |
+
+---
+
+## 四十一、HBase 与 Flink 集成
+
+### 41.1 Flink HBase Sink 批量写入
+
+```java
+// Flink SinkFunction 批量写入 HBase
+public class HBaseBulkSink extends RichSinkFunction<Row> {
+    private transient Connection connection;
+    private transient BufferedMutator mutator;
+    private transient List<Put> buffer;
+    private static final int BATCH_SIZE = 5000;
+    
+    @Override
+    public void open(Configuration parameters) {
+        Configuration conf = HBaseConfiguration.create();
+        conf.set("hbase.zookeeper.quorum", "zk1,zk2,zk3");
+        connection = ConnectionFactory.createConnection(conf);
+        
+        BufferedMutatorParams params = new BufferedMutatorParams(
+            TableName.valueOf("events"));
+        params.writeBufferSize(4 * 1024 * 1024); // 4MB 缓冲
+        params.listener((e, edit) -> {
+            log.error("HBase write failed", e);
+            // 重试逻辑
+        });
+        mutator = connection.getBufferedMutator(params);
+        buffer = new ArrayList<>();
+    }
+    
+    @Override
+    public void invoke(Row row, Context context) throws Exception {
+        Put put = new Put(row.getFieldAs("rowkey"));
+        put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("event_type"),
+                     Bytes.toBytes(row.getFieldAs("event_type")));
+        put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("event_time"),
+                     Bytes.toBytes(row.getFieldAs("event_time")));
+        put.addColumn(Bytes.toBytes("cf"), Bytes.toBytes("payload"),
+                     Bytes.toBytes(row.getFieldAs("payload")));
+        
+        buffer.add(put);
+        if (buffer.size() >= BATCH_SIZE) {
+            flushBuffer();
+        }
+    }
+    
+    private void flushBuffer() throws IOException {
+        mutator.mutate(buffer);
+        mutator.flush();
+        buffer.clear();
+    }
+    
+    @Override
+    public void close() throws Exception {
+        if (buffer != null && !buffer.isEmpty()) {
+            flushBuffer();
+        }
+        if (mutator != null) mutator.close();
+        if (connection != null) connection.close();
+    }
+}
+```
+
+### 41.2 Flink + HBase 实时同步架构
+
+```mermaid
+graph LR
+    A[数据源<br/>Kafka/MySQL] -->|CDC| B[Flink 消费]
+    B -->|转换/聚合| C[Flink 处理]
+    C -->|批量写入| D[HBase Sink]
+    C -->|实时查询| E[HBase Source]
+    D --> F[HBase 集群]
+    E --> G[实时结果]
+```
+
+| 集成模式 | 实现方式 | 适用场景 | 性能 |
+|----------|----------|----------|------|
+| Flink HBase Sink | BufferedMutator 批量写入 | 实时数据写入 | 高 |
+| Flink HBase Source | TableInputFormat 并行读取 | 增量数据读取 | 中 |
+| Flink SQL HBase | Connector | SQL 查询 | 中 |
+| Flink + Phoenix | JDBC Connector | SQL 查询 HBase | 中 |
+
+### 41.3 Flink HBase 配置最佳实践
+
+| 配置项 | 推荐值 | 说明 |
+|--------|--------|------|
+| writeBufferSize | 4MB | 写入缓冲区大小 |
+| batchSize | 5000 | 批量写入大小 |
+| connectionTimeout | 30000ms | 连接超时 |
+| autoFlush | false | 异步写入 |
+| maxKeyValueSize | 1024KB | 最大键值对大小 |
+
+---
+
 ## HBase 在大数据生态中的定位
 
 ### HBase 与 Hadoop 组件集成

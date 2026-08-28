@@ -1820,4 +1820,514 @@ SHOW PROC '/backends';
 - 联邦查询见「[中间件/Trino联邦查询引擎](../中间件/Trino联邦查询引擎.md)」；
 - 数据治理与口径见「[12-数据治理与数据质量](12-数据治理与数据质量.md)」。
 
-> 一句话：**数仓 = 分层（ODS/DWD/DWS/ADS）+ 建模（星型 + SCD）+ 口径统一（OneData）；OLAP = 列式 + 向量化 + MPP 三支柱——选型："单表极致 ClickHouse、复杂高并发 StarRocks、轻量省心 Doris"；建物化视图加速热点查询**。
+## 补充：ClickHouse vs StarRocks 物化视图
+
+### 物化视图对比
+
+| 维度 | ClickHouse | StarRocks |
+|------|------------|-----------|
+| 物化视图类型 | 普通/聚合 | 普通/聚合/同步 |
+| 自动刷新 | 触发式 | 触发式/同步式 |
+| 聚合函数 | 有限 | 丰富 |
+| 嵌套物化视图 | 不支持 | 支持 |
+| 跨库物化视图 | 不支持 | 支持 |
+
+### 物化视图配置
+
+```sql
+-- ClickHouse 物化视图
+CREATE MATERIALIZED VIEW daily_stats
+ENGINE = SummingMergeTree()
+ORDER BY (service, date)
+AS SELECT
+    service,
+    toDate(timestamp) as date,
+    count() as request_count,
+    sum(duration) as total_duration
+FROM raw_logs
+GROUP BY service, date;
+
+-- StarRocks 物化视图
+CREATE MATERIALIZED VIEW mv_user_stats AS
+SELECT 
+    user_id,
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount
+FROM orders
+GROUP BY user_id;
+```
+
+---
+
+## 补充：Doris Lakehouse
+
+### Doris Lakehouse 架构
+
+```text
+Doris Lakehouse 架构：
+  ├── 存储层
+  │   ├── 本地存储：BE 节点
+  │   ├── 对象存储：S3/OSS
+  │   └── HDFS：Hadoop 生态
+
+  ├── 计算层
+  │   ├── FE：元数据管理
+  │   ├── BE：数据存储和计算
+  │   └── Broker：外部数据访问
+
+  └── 服务层
+      ├── MySQL 协议：标准 SQL
+      ├── 多租户：资源隔离
+      └── 统一查询：跨源查询
+```
+
+### 多源接入
+
+```sql
+-- 创建 Hive Catalog
+CREATE CATALOG hive_catalog WITH TYPE HIVE (
+    "hive.metastore.uris" = "thrift://hive-metastore:9083"
+);
+
+-- 创建 MySQL Catalog
+CREATE CATALOG mysql_catalog WITH TYPE MYSQL (
+    "jdbc.url" = "jdbc:mysql://mysql:3306",
+    "user" = "root",
+    "password" = "password"
+);
+
+-- 跨源查询
+SELECT * FROM hive_catalog.db.table1 t1
+JOIN mysql_catalog.db.table2 t2 ON t1.id = t2.id;
+```
+
+---
+
+## 补充：OLAP 选型决策树
+
+### 选型决策树
+
+```text
+OLAP 选型决策：
+  数据量：
+    ├── < 100GB：PostgreSQL/MySQL
+    ├── 100GB-1TB：ClickHouse/Doris
+    └── > 1TB：ClickHouse/StarRocks
+
+  查询模式：
+    ├── 点查为主：MySQL/PostgreSQL
+    ├── 聚合为主：ClickHouse
+    ├── 多表 JOIN：StarRocks
+    └── 实时更新：Doris/StarRocks
+
+  团队能力：
+    ├── 运维能力强：ClickHouse
+    ├── 运维能力弱：Doris
+    └── 需要商业支持：StarRocks
+
+  成本考虑：
+    ├── 开源优先：ClickHouse/Doris
+    └── 商业支持：StarRocks
+```
+
+### 选型对比
+
+| 场景 | 推荐 | 备选 | 说明 |
+|------|------|------|------|
+| 日志分析 | ClickHouse | Elasticsearch | 高压缩比 |
+| 用户行为分析 | ClickHouse | StarRocks | 高性能聚合 |
+| 实时报表 | StarRocks | Doris | 高并发 |
+| 电商大屏 | StarRocks | Doris | 实时更新 |
+| 数据湖查询 | Doris | StarRocks | 多源接入 |
+
+---
+
+## 补充：导入性能对比
+
+### 导入方式对比
+
+| 方式 | 吞吐量 | 延迟 | 适用场景 |
+|------|--------|------|----------|
+| Batch Insert | 高 | 高 | 批量数据 |
+| Stream Load | 高 | 低 | 实时数据 |
+| Routine Load | 中 | 低 | Kafka 数据 |
+| Spark Load | 极高 | 高 | 大批量数据 |
+| Flink Load | 高 | 低 | 实时流数据 |
+
+### 导入调优
+
+```sql
+-- Stream Load 调优
+curl -u root:password -X POST \
+  -H "format:json" \
+  -H "max_filter_ratio:0.1" \
+  -H "timeout:300" \
+  -T data.json \
+  http://fe_host:8030/api/db/orders/_stream_load
+
+-- 导入参数调优
+-- max_filter_ratio: 最大过滤比例
+-- timeout: 超时时间
+-- merge_type: 合并类型
+-- delete: 删除条件
+```
+
+---
+
+## 补充：集群运维
+
+### 集群健康检查
+
+```sql
+-- ClickHouse 集群健康检查
+SELECT 
+  database,
+  table,
+  is_leader,
+  is_readonly,
+  future_parts,
+  queue_size,
+  inserts_in_queue,
+  merges_in_queue
+FROM system.replicas
+WHERE is_leader = 1;
+
+-- StarRocks 集群状态
+SHOW PROC '/frontends';
+SHOW PROC '/backends';
+
+-- Doris 集群状态
+SHOW PROC '/frontends';
+SHOW PROC '/backends';
+```
+
+### 故障排查
+
+| 故障 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| 查询超时 | 数据量大/慢查询 | 优化查询/增加资源 |
+| 内存溢出 | 大查询/合并 | 设置内存限制 |
+| 磁盘满 | 数据量增长 | 扩容/清理旧数据 |
+| 副本不同步 | 网络/节点故障 | 检查副本状态 |
+| 导入失败 | 数据格式错误 | 检查数据格式 |
+
+---
+
+## 补充：实时报表应用
+
+### 实时报表架构
+
+```text
+实时报表架构：
+  数据源：
+    ├── MySQL：业务数据
+    ├── Kafka：实时数据
+    └── HDFS：历史数据
+
+  计算层：
+    ├── Flink：实时计算
+    ├── Spark：批处理
+    └── Doris/StarRocks：OLAP
+
+  服务层：
+    ├── API：数据服务
+    ├── 缓存：Redis
+    └── 前端：Grafana/自研
+```
+
+### 实时报表示例
+
+```sql
+-- 实时订单统计
+SELECT 
+    DATE_FORMAT(create_time, '%Y-%m-%d %H:00:00') as hour,
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount,
+    COUNT(DISTINCT user_id) as user_count
+FROM orders
+WHERE create_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+GROUP BY hour
+ORDER BY hour;
+
+-- 实时用户行为统计
+SELECT 
+    DATE_FORMAT(event_time, '%Y-%m-%d %H:00:00') as hour,
+    event_type,
+    COUNT(*) as event_count,
+    COUNT(DISTINCT user_id) as user_count
+FROM user_events
+WHERE event_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+GROUP BY hour, event_type
+ORDER BY hour, event_count DESC;
+```
+
+---
+
+## 补充：数仓分层
+
+### 分层架构
+
+```text
+数仓分层架构：
+  ODS（原始数据层）：
+    ├── 原始数据存储
+    ├── 数据清洗
+    └── 数据标准化
+
+  DWD（明细数据层）：
+    ├── 明细数据
+    ├── 数据脱敏
+    └── 数据补全
+
+  DWS（汇总数据层）：
+    ├── 汇总数据
+    ├── 预聚合
+    └── 宽表
+
+  ADS（应用数据层）：
+    ├── 应用数据
+    ├── 报表数据
+    └── API 数据
+```
+
+### 分层最佳实践
+
+| 层级 | 数据量 | 更新频率 | 说明 |
+|------|--------|----------|------|
+| ODS | 大 | 实时/批量 | 原始数据 |
+| DWD | 中 | 批量 | 明细数据 |
+| DWS | 小 | 批量 | 汇总数据 |
+| ADS | 极小 | 实时/批量 | 应用数据 |
+
+---
+
+## 补充：维度建模
+
+### 维度建模示例
+
+```sql
+-- 维度表
+CREATE TABLE dim_user (
+    user_id BIGINT,
+    user_name VARCHAR(100),
+    age INT,
+    city VARCHAR(50)
+) DUPLICATE KEY(user_id);
+
+-- 事实表
+CREATE TABLE fact_order (
+    order_id BIGINT,
+    user_id BIGINT,
+    product_id BIGINT,
+    amount DECIMAL(10,2),
+    create_time DATETIME
+) DUPLICATE KEY(order_id);
+
+-- 宽表（反规范化）
+CREATE TABLE dws_user_order (
+    user_id BIGINT,
+    user_name VARCHAR(100),
+    city VARCHAR(50),
+    order_count BIGINT,
+    total_amount DECIMAL(10,2)
+) AGGREGATE KEY(user_id, user_name, city)
+DISTRIBUTED BY HASH(user_id) BUCKETS 16;
+```
+
+### 维度建模最佳实践
+
+```text
+维度建模最佳实践：
+  1. 选择合适的维度
+     ├── 时间维度
+     ├── 地域维度
+     ├── 用户维度
+     └── 产品维度
+
+  2. 设计事实表
+     ├── 选择合适的粒度
+     ├── 选择合适的度量
+     └── 选择合适的维度
+
+  3. 优化查询性能
+     ├── 创建物化视图
+     ├── 创建索引
+     └── 合理分区
+```
+
+---
+
+## 补充：OLAP vs 传统数仓
+
+### 对比分析
+
+| 维度 | OLAP | 传统数仓 |
+|------|------|----------|
+| 架构 | Shared-Nothing | Shared-Everything |
+| 扩展性 | 线性扩展 | 有限扩展 |
+| 性能 | 高 | 中 |
+| 成本 | 低 | 高 |
+| 易用性 | 高 | 中 |
+| 适用场景 | 实时分析 | 批处理分析 |
+
+### 选型建议
+
+```text
+选型建议：
+  1. 实时分析 → OLAP
+  2. 批处理分析 → 传统数仓
+  3. 高并发 → OLAP
+  4. 复杂查询 → 传统数仓
+  5. 成本敏感 → OLAP
+  6. 运维简单 → OLAP
+```
+
+---
+
+## 补充：最佳实践
+
+### 表设计最佳实践
+
+```sql
+-- 1. 选择合适的模型
+-- 明细查询：DUPLICATE KEY
+-- 聚合查询：AGGREGATE KEY
+-- 更新查询：UNIQUE KEY
+
+-- 2. 选择合适的分桶键
+-- 高频查询字段
+-- 数据分布均匀
+-- 避免热点
+
+-- 3. 合理设置副本数
+-- 生产环境：3 副本
+-- 测试环境：1 副本
+
+-- 4. 使用物化视图
+-- 预聚合常用查询
+-- 减少查询时计算
+```
+
+### 查询最佳实践
+
+```sql
+-- 1. 使用索引
+SELECT * FROM orders WHERE user_id = 123;
+
+-- 2. 避免深分页
+SELECT * FROM orders ORDER BY create_time DESC LIMIT 100;
+
+-- 3. 使用 PREWHERE
+SELECT * FROM orders PREWHERE user_id = 123;
+
+-- 4. 使用批量查询
+SELECT user_id, COUNT(*), SUM(amount) 
+FROM orders 
+GROUP BY user_id;
+
+-- 5. 避免复杂子查询
+-- 使用 JOIN 代替子查询
+```
+
+### 运维最佳实践
+
+```text
+运维最佳实践：
+  1. 监控集群状态
+     ├── 节点状态
+     ├── 副本状态
+     └── 查询统计
+
+  2. 定期维护
+     ├── 数据压缩
+     ├── 副本修复
+     └── 日志清理
+
+  3. 备份恢复
+     ├── 定期备份
+     ├── 测试恢复
+     └── 灾备演练
+
+  4. 性能优化
+     ├── 查询分析
+     ├── 索引优化
+     └── 参数调优
+```
+
+---
+
+## 补充：生产问题排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 查询超时 | 数据量大/慢查询 | 优化查询/增加资源 |
+| 内存溢出 | 大查询/合并 | 设置内存限制 |
+| 磁盘满 | 数据量增长 | 扩容/清理旧数据 |
+| 副本不同步 | 网络/节点故障 | 检查副本状态 |
+| 导入失败 | 数据格式错误 | 检查数据格式 |
+
+### 排查流程
+
+```bash
+# 1. 检查集群状态
+# ClickHouse
+clickhouse-client --query "SELECT * FROM system.replicas"
+
+# StarRocks
+mysql -h fe_host -u root -p -e "SHOW PROC '/frontends'"
+
+# 2. 检查查询状态
+# ClickHouse
+clickhouse-client --query "SELECT * FROM system.processes"
+
+# StarRocks
+mysql -h fe_host -u root -p -e "SHOW PROC '/current_queries'"
+
+# 3. 检查资源使用
+# ClickHouse
+clickhouse-client --query "SELECT * FROM system.metrics"
+```
+
+---
+
+## 补充：监控
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| query_count | 查询数量 | 基线对比 |
+| query_duration_ms | 查询延迟 | > 5s |
+| memory_usage | 内存使用 | > 80% |
+| disk_usage | 磁盘使用 | > 85% |
+| merge_count | 合并数量 | > 100 |
+| mutation_count | 变异数量 | > 10 |
+
+### Prometheus 告警配置
+
+```yaml
+groups:
+  - name: olap
+    rules:
+      - alert: OLAPHighMemory
+        expr: olap_memory_usage / olap_max_memory_usage > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OLAP 内存使用率过高"
+
+      - alert: OLAPHighDisk
+        expr: olap_disk_usage / olap_max_disk_usage > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OLAP 磁盘使用率过高"
+```
+
+---
+
+## 一句话：**数仓 = 分层（ODS/DWD/DWS/ADS）+ 建模（星型 + SCD）+ 口径统一（OneData）；OLAP = 列式 + 向量化 + MPP 三支柱——选型："单表极致 ClickHouse、复杂高并发 StarRocks、轻量省心 Doris"；建物化视图加速热点查询**。

@@ -1991,6 +1991,249 @@ graph TD
 | Kafka | 缓冲层 | StatefulSet |
 | ES/Cassandra | 持久化存储 | 集群部署 |
 
+## 二十五、Jaeger 高级特性与生产实践
+
+### 25.1 采样策略深度解析
+
+```
+Head-based 采样：
+  原理：在请求入口决定是否采样
+  优点：实现简单，开销低
+  缺点：可能丢失重要链路
+  适用：高吞吐场景
+
+Tail-based 采样：
+  原理：收集完整链路后决定是否采样
+  优点：可基于延迟/错误采样
+  缺点：需要完整链路数据
+  适用：问题排查场景
+
+自适应采样：
+  原理：根据流量动态调整采样率
+  优点：平衡存储和可观测性
+  缺点：实现复杂
+  适用：大规模部署
+```
+
+| 采样策略 | 配置示例 | 适用场景 | 优缺点 |
+|----------|----------|----------|--------|
+| 固定采样 | param: 0.1 | 开发/测试 | 简单但不灵活 |
+| 概率采样 | param: 0.01 | 生产环境 | 平衡存储和覆盖 |
+| 速率限制 | maxTracesPerSecond: 100 | 保护后端 | 限制存储压力 |
+| 远程采样 | endpoint: /sampling | 大规模 | 动态调整 |
+
+### 25.2 Span 模型深入理解
+
+```json
+{
+  "traceID": "abc123def456",
+  "spanID": "789012",
+  "parentSpanID": "345678",
+  "operationName": "POST /api/orders",
+  "startTime": "2024-01-15T10:30:00.000Z",
+  "duration": 156789,
+  "tags": {
+    "http.method": "POST",
+    "http.url": "/api/orders",
+    "http.status_code": 201,
+    "span.kind": "server",
+    "component": "spring-mvc",
+    "db.type": "mysql",
+    "db.statement": "INSERT INTO orders..."
+  },
+  "logs": [
+    {
+      "timestamp": "2024-01-15T10:30:00.050Z",
+      "fields": {
+        "event": "order_created",
+        "order.id": "12345",
+        "user.id": "67890"
+      }
+    }
+  ],
+  "references": [
+    {
+      "refType": "CHILD_OF",
+      "traceID": "abc123def456",
+      "spanID": "345678"
+    }
+  ],
+  "process": {
+    "serviceName": "order-service",
+    "tags": {
+      "version": "1.0.0",
+      "environment": "production"
+    }
+  }
+}
+```
+
+### 25.3 存储后端选型指南
+
+```mermaid
+graph TB
+    subgraph "写入性能"
+        A[Cassandra] -->|极高| B[大规模写入]
+        C[Elasticsearch] -->|高| D[中等规模]
+        K[Kafka] -->|极高| L[缓冲层]
+    end
+
+    subgraph "查询性能"
+        A -->|中| E[简单查询]
+        C -->|高| F[全文搜索]
+        K -->|低| G[需配合ES]
+    end
+
+    subgraph "成本"
+        A -->|中| H[中等成本]
+        C -->|高| I[高成本]
+        K -->|低| J[低成本]
+    end
+```
+
+| 存储后端 | 写入TPS | 查询延迟 | 存储成本 | 运维复杂度 | 推荐场景 |
+|----------|---------|----------|----------|------------|----------|
+| Cassandra | 10万+ | 50-200ms | 中 | 高 | 超大规模 |
+| Elasticsearch | 5-10万 | 10-100ms | 高 | 中 | 复杂查询 |
+| Kafka+ES | 20万+ | 50-200ms | 中 | 中 | 最佳实践 |
+| ClickHouse | 5-10万 | 10-50ms | 低 | 中 | OLAP分析 |
+
+### 25.4 OpenTelemetry 深度集成
+
+```go
+// 完整的 OTel + Jaeger 集成示例
+package main
+
+import (
+    "context"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/jaeger"
+    "go.opentelemetry.io/otel/propagation"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+)
+
+func initTracer() (*sdktrace.TracerProvider, error) {
+    // 1. 创建 Jaeger 导出器
+    exporter, err := jaeger.New(jaeger.WithCollectorEndpoint(
+        jaeger.WithEndpoint("http://jaeger-collector:14268/api/traces"),
+    ))
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. 创建资源
+    res, err := resource.Merge(
+        resource.Default(),
+        resource.NewWithAttributes(
+            semconv.SchemaURL,
+            semconv.ServiceName("my-service"),
+            semconv.ServiceVersion("1.0.0"),
+            semconv.DeploymentEnvironment("production"),
+        ),
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. 创建 TracerProvider
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithResource(res),
+        sdktrace.WithSampler(sdktrace.ParentBased(
+            sdktrace.TraceIDRatioBased(0.1),
+        )),
+    )
+
+    // 4. 设置全局传播器
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{},
+        propagation.Baggage{},
+    ))
+
+    return tp, nil
+}
+```
+
+### 25.5 Jaeger 集群部署最佳实践
+
+```yaml
+# Kubernetes 部署配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-collector
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jaeger-collector
+  template:
+    spec:
+      containers:
+      - name: jaeger-collector
+        image: jaegertracing/jaeger-collector:1.52
+        args:
+        - --cassandra.servers=cassandra:9042
+        - --cassandra.keyspace=jaeger_v1
+        - --kafka.brokers=kafka:9092
+        - --kafka.topic=jaeger-spans
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        ports:
+        - containerPort: 14268
+          name: http
+        - containerPort: 14269
+          name: admin
+```
+
+### 25.6 常见生产问题与排查
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Span 丢失 | 采样率过低 | 1.检查采样配置<br>2.检查网络 | 调整采样率 |
+| 查询慢 | ES 索引问题 | 1.检查索引状态<br>2.优化查询 | 重建索引 |
+| 存储爆满 | 数据保留过长 | 1.检查TTL配置<br>2.清理历史数据 | 调整保留策略 |
+| Agent 高 CPU | Span 处理压力 | 1.检查Span数量<br>2.优化处理 | 增加Agent节点 |
+| Collector OOM | 内存不足 | 1.分析内存使用<br>2.增加内存 | 增加资源限制 |
+
+### 25.7 Jaeger 性能优化策略
+
+```
+性能优化清单：
+  1. 客户端优化
+     → 使用批量上报
+     → 合理设置采样率
+     → 异步发送 Span
+
+  2. Agent 优化
+     → 使用本地 Agent
+     → 优化缓冲区大小
+     → 调整发送间隔
+
+  3. Collector 优化
+     → 增加副本数
+     → 优化写入批量
+     → 使用 Kafka 缓冲
+
+  4. 存储优化
+     → 优化索引策略
+     → 调整分片数量
+     → 使用冷热数据分层
+
+  5. 查询优化
+     → 使用索引字段
+     → 限制时间范围
+     → 使用缓存
+```
+
 ## Jaeger 性能开销实测
 
 ### 性能开销指标

@@ -2044,6 +2044,154 @@ upstreams:
           timeouts: 5
 ```
 
+## 二十八、Kong 插件开发实战
+
+### 28.1 Kong 插件开发框架
+
+```lua
+-- 自定义 Kong 插件示例
+local kong = kong
+local ngx = ngx
+
+local MyPlugin = {}
+
+MyPlugin.PRIORITY = 1000
+MyPlugin.VERSION = "1.0.0"
+
+function MyPlugin:access(config)
+  -- 1. 获取请求信息
+  local method = ngx.req.get_method()
+  local uri = ngx.var.uri
+  local headers = ngx.req.get_headers()
+
+  -- 2. 验证逻辑
+  if not self:validate_request(method, uri, headers) then
+    return kong.response.exit(403, { message = "Forbidden" })
+  end
+
+  -- 3. 添加自定义头
+  kong.service.request.set_header("X-Custom-Header", "my-value")
+
+  -- 4. 日志记录
+  kong.log.info("Request validated: ", method, " ", uri)
+end
+
+function MyPlugin:validate_request(method, uri, headers)
+  -- 验证逻辑
+  if headers["Authorization"] then
+    return true
+  end
+  return false
+end
+
+return MyPlugin
+```
+
+### 28.2 认证插件对比
+
+| 认证方式 | Kong 插件 | APISIX 插件 | 安全性 | 复杂度 |
+|----------|-----------|-------------|--------|--------|
+| API Key | key-auth | key-auth | 中 | 低 |
+| JWT | jwt | jwt-auth | 高 | 中 |
+| OAuth2 | oauth2 | - | 高 | 高 |
+| HMAC | hmac-auth | hmac-auth | 高 | 中 |
+| Basic | basic-auth | basic-auth | 低 | 低 |
+
+### 28.3 Kong 与 K8s Ingress 集成
+
+```yaml
+# Kong Ingress Controller 配置
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    konghq.com/strip-path: "true"
+    konghq.com/plugins: "rate-limiting,authentication"
+spec:
+  ingressClassName: kong
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /api/v1
+        pathType: Prefix
+        backend:
+          service:
+            name: my-service
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: tls-secret
+```
+
+```mermaid
+graph TB
+    subgraph "K8s 集群"
+        A[Ingress Controller]
+        B[Kong Service]
+        C[Upstream Service]
+    end
+
+    subgraph "Kong 插件"
+        D[Authentication]
+        E[Rate Limiting]
+        F[Logging]
+    end
+
+    A --> B
+    B --> D
+    B --> E
+    B --> F
+    B --> C
+```
+
+### 28.4 性能基准测试
+
+| 测试场景 | QPS | 延迟(P99) | 说明 |
+|----------|-----|-----------|------|
+| 纯路由转发 | 50,000 | 2ms | 无插件 |
+| JWT 认证 | 40,000 | 3ms | 认证开销 |
+| 限流 | 45,000 | 2.5ms | 限流开销 |
+| 日志记录 | 35,000 | 4ms | IO 开销 |
+| 全插件链 | 25,000 | 6ms | 全链路 |
+
+### 28.5 常见生产问题排查
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 502 Bad Gateway | 上游服务不可用 | 1.检查上游健康<br>2.检查连接 | 修复上游 |
+| 限流误触发 | 配置过严 | 1.检查限流规则<br>2.分析流量 | 调整阈值 |
+| 插件执行失败 | 插件配置错误 | 1.检查插件日志<br>2.检查配置 | 修复配置 |
+| 性能下降 | 插件链过长 | 1.分析插件执行时间<br>2.优化插件 | 精简插件 |
+
+### 28.6 Kong 最佳实践
+
+```
+最佳实践清单：
+  1. 插件管理
+     → 最小化插件
+     → 插件版本控制
+     → 定期审查
+
+  2. 性能优化
+     → 启用缓存
+     → 连接池复用
+     → 异步日志
+
+  3. 安全配置
+     → HTTPS 强制
+     → 限流前置
+     → 认证必选
+
+  4. 监控运维
+     → 完善监控指标
+     → 日志集中管理
+     → 定期健康检查
+```
+
 ## 与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；

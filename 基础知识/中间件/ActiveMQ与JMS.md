@@ -1982,6 +1982,220 @@ public class ActiveMQConfig {
 }
 ```
 
+## 二十六、ActiveMQ Artemis vs Classic 深度对比
+
+### 26.1 内核架构对比
+
+```
+Classic 内核：
+  NIO + 传统 IO 模型
+  文件存储 + KahaDB
+  JMS 1.1 实现
+  社区维护模式
+
+Artemis 内核：
+  Netty 异步 IO 模型
+  高性能 Journal 存储
+  JMS 2.0 + AMQP 支持
+  Apache 主动开发
+```
+
+| 特性 | Classic | Artemis | 选型建议 |
+|------|---------|---------|----------|
+| JMS 版本 | 1.1 | 2.0 | 新项目用 2.0 |
+| 协议支持 | OpenWire/STOMP | AMQP/MQTT/STOMP | 多协议用 Artemis |
+| 性能 | 中等 | 高 | 高吞吐用 Artemis |
+| 集群 | 网络连接器 | 原生集群 | 大规模用 Artemis |
+| 运维 | 简单 | 复杂 | 小规模用 Classic |
+
+### 26.2 网络连接器配置
+
+```xml
+<!-- ActiveMQ 网络连接器配置 -->
+<networkConnectors>
+    <!-- 单向连接 -->
+    <networkConnector name="master"
+        uri="static:(tcp://master:61616)"
+        duplex="false"
+        decreaseNetworkConsumerPriority="true"
+        networkTTL="2"
+        dynamicOnly="true">
+        <excludedQueues>
+            <queue physicalName=">"/>
+        </excludedQueues>
+    </networkConnector>
+
+    <!-- 双向连接 -->
+    <networkConnector name="bidirectional"
+        uri="static:(tcp://broker1:61616,tcp://broker2:61616)"
+        duplex="true"
+        networkTTL="3"
+        dynamicOnly="true">
+        <includedDestinations>
+            <queue physicalName="orders.>"/>
+            <topic physicalName="events.>"/>
+        </includedDestinations>
+    </networkConnector>
+</networkConnectors>
+```
+
+### 26.3 Spring JMS 实战
+
+```java
+// Spring JMS 发送者
+@Component
+public class JmsMessageSender {
+
+    @Autowired
+    private JmsTemplate jmsTemplate;
+
+    // 同步发送
+    public void sendSync(String destination, String message) {
+        jmsTemplate.convertAndSend(destination, message);
+    }
+
+    // 异步发送
+    public void sendAsync(String destination, String message) {
+        jmsTemplate.convertAndSend(destination, message, msg -> {
+            msg.setStringProperty("messageType", "async");
+            msg.setJMSDeliveryMode(JMSDeliveryMode.PERSISTENT);
+            return msg;
+        });
+    }
+
+    // 带回调发送
+    public void sendWithCallback(String destination, String message) {
+        jmsTemplate.convertAndSend(destination, message, new MessagePostProcessor() {
+            @Override
+            public Message postProcessMessage(Message msg) throws JMSException {
+                msg.setJMSCorrelationID(UUID.randomUUID().toString());
+                msg.setJMSReplyTo(new ActiveMQQueue("reply.queue"));
+                return msg;
+            }
+        });
+    }
+}
+
+// Spring JMS 接收者
+@Component
+public class JmsMessageReceiver {
+
+    @JmsListener(destination = "order.queue", concurrency = "5-10")
+    public void receiveOrder(Message message) throws JMSException {
+        String correlationId = message.getJMSCorrelationID();
+        String body = ((TextMessage) message).getText();
+
+        try {
+            // 处理业务逻辑
+            processOrder(body);
+
+            // 发送回复
+            if (message.getJMSReplyTo() != null) {
+                jmsTemplate.convertAndSend(message.getJMSReplyTo(),
+                    "Processed: " + correlationId, msg -> {
+                        msg.setJMSCorrelationID(correlationId);
+                        return msg;
+                    });
+            }
+        } catch (Exception e) {
+            // 处理失败，投递到 DLQ
+            throw e;
+        }
+    }
+}
+```
+
+### 26.4 集群部署最佳实践
+
+```mermaid
+graph TB
+    subgraph "Broker 集群"
+        B1[Broker 1]
+        B2[Broker 2]
+        B3[Broker 3]
+    end
+
+    subgraph "负载均衡"
+        LB[负载均衡器]
+    end
+
+    subgraph "客户端"
+        C1[Producer 1]
+        C2[Producer 2]
+        C3[Consumer 1]
+    end
+
+    C1 --> LB
+    C2 --> LB
+    LB --> B1
+    LB --> B2
+    LB --> B3
+    B1 --> C3
+    B2 --> C3
+    B3 --> C3
+```
+
+### 26.5 ActiveMQ 监控与告警
+
+| 监控指标 | 告警阈值 | 说明 |
+|----------|----------|------|
+| Queue 消息数 | > 10000 | 消息堆积 |
+| Consumer 数量 | < 1 | 消费者离线 |
+| 内存使用率 | > 80% | 内存压力 |
+| 磁盘使用率 | > 90% | 磁盘压力 |
+| 连接数 | > 1000 | 连接风暴 |
+| 网络延迟 | > 100ms | 网络问题 |
+
+### 26.6 常见生产问题排查
+
+```
+问题排查流程：
+  1. 消息丢失
+     → 检查持久化配置
+     → 检查确认机制
+     → 检查 DLQ
+
+  2. 消息积压
+     → 增加消费者数量
+     → 优化消费逻辑
+     → 调整预取数量
+
+  3. 消息重复
+     → 实现幂等消费
+     → 使用消息 ID 去重
+     → 业务层去重
+
+  4. 性能问题
+     → 启用异步发送
+     → 调整批量大小
+     → 优化网络配置
+```
+
+### 26.7 ActiveMQ 最佳实践总结
+
+```
+最佳实践清单：
+  1. 架构设计
+     → 使用主从模式保证高可用
+     → 网络连接器实现消息路由
+     → 分离生产和消费队列
+
+  2. 消息设计
+     → 使用标准消息格式
+     → 添加消息属性
+     → 设置合理 TTL
+
+  3. 监控运维
+     → 监控队列深度
+     → 设置 DLQ 告警
+     → 定期清理消息
+
+  4. 性能优化
+     → 使用批量发送
+     → 启用消息压缩
+     → 调整预取数量
+```
+
 ## 与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；

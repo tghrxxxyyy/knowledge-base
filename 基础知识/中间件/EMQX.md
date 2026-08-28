@@ -1827,6 +1827,183 @@ echo "Messages in: $msg_in, out: $msg_out"
 | memory.used | 内存使用 | > 80% |
 | disk.used | 磁盘使用 | > 80% |
 
+## 三十一、EMQX 集群通信与认证授权
+
+### 31.1 集群通信机制
+
+```
+EMQX 集群通信：
+  协议：Erlang Distribution Protocol
+  端口：4370（集群通信）
+  发现方式：
+    → 手动发现：指定节点列表
+    → DNS 发现：通过 DNS 记录
+    → K8s 发现：通过 K8s API
+
+  数据同步：
+    → 会话状态同步
+    → 订阅关系同步
+    → 消息路由同步
+
+  集群健康：
+    → 心跳检测
+    → 故障转移
+    → 自动恢复
+```
+
+| 集群模式 | 说明 | 优点 | 缺点 |
+|----------|------|------|------|
+| 手动发现 | 配置固定节点 | 简单 | 不灵活 |
+| DNS 发现 | DNS 轮询 | 灵活 | 依赖 DNS |
+| K8s 发现 | K8s API | 云原生 | 依赖 K8s |
+
+### 31.2 认证授权详解
+
+```
+认证方式：
+  1. 密码认证
+     → 内置数据库
+     → HTTP 后端
+     → LDAP
+
+  2. 证书认证
+     → TLS 客户端证书
+     → 双向认证
+
+  3. Token 认证
+     → JWT Token
+     → OAuth 2.0
+
+授权方式：
+  1. 基于 ACL
+     → Topic 级别控制
+     → 动作级别控制
+
+  2. 基于角色
+     → 角色定义
+     → 权限分配
+```
+
+### 31.3 规则引擎深度应用
+
+```sql
+-- 规则引擎 SQL 示例
+-- 1. 设备数据过滤
+SELECT * FROM "device/+/data" WHERE payload.temperature > 50
+
+-- 2. 数据转换
+SELECT
+  clientid as device_id,
+  payload.temperature as temp,
+  payload.humidity as humi,
+  now() as timestamp
+FROM "device/+/data"
+
+-- 3. 聚合计算
+SELECT
+  clientid,
+  avg(payload.temperature) as avg_temp,
+  max(payload.temperature) as max_temp
+FROM "device/+/data"
+WHERE timestamp > now() - 5m
+GROUP BY clientid
+```
+
+### 31.4 车联网场景实战
+
+```yaml
+# 车联网 MQTT Topic 设计
+topic_design:
+  vehicle_data:
+    pattern: "vehicle/${vehicle_id}/data"
+    payload:
+      - speed: float
+      - location: object
+      - battery: int
+      - status: enum
+
+  vehicle_command:
+    pattern: "vehicle/${vehicle_id}/command"
+    payload:
+      - action: enum
+      - params: object
+
+  vehicle_event:
+    pattern: "vehicle/${vehicle_id}/event"
+    payload:
+      - event_type: enum
+      - event_data: object
+```
+
+```mermaid
+graph TB
+    subgraph "车联网架构"
+        A[车载终端] -->|MQTT| B[EMQX Broker]
+        B --> C[规则引擎]
+        C --> D[Kafka]
+        C --> E[时序数据库]
+        D --> F[大数据平台]
+        E --> G[实时监控]
+        G --> H[告警系统]
+    end
+```
+
+### 31.5 Prometheus 监控集成
+
+```yaml
+# Prometheus 采集配置
+scrape_configs:
+  - job_name: 'emqx'
+    static_configs:
+      - targets: ['emqx1:18083', 'emqx2:18083']
+    metrics_path: '/api/v5/prometheus/stats'
+
+# 关键监控指标
+metrics:
+  - emqx_connections_count: 连接数
+  - emqx_topics_count: Topic 数量
+  - emqx_subscriptions_count: 订阅数量
+  - emqx_messages_received: 消息接收数
+  - emqx_messages_sent: 消息发送数
+  - emqx_messages_dropped: 消息丢弃数
+  - emqx_bytes_received: 接收字节数
+  - emqx_bytes_sent: 发送字节数
+```
+
+### 31.6 生产问题排查
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 连接失败 | 认证配置错误 | 1.检查认证配置<br>2.检查网络 | 修复配置 |
+| 消息丢失 | QoS 配置不当 | 1.检查 QoS<br>2.检查持久化 | 调整 QoS |
+| 集群分裂 | 网络分区 | 1.检查网络<br>2.检查节点状态 | 恢复网络 |
+| 性能下降 | 连接过载 | 1.检查连接数<br>2.检查消息量 | 扩容节点 |
+
+### 31.7 EMQX 最佳实践
+
+```
+最佳实践清单：
+  1. 架构设计
+     → 至少 3 节点集群
+     → 合理分片
+     → 跨机房部署
+
+  2. 性能优化
+     → 调整连接数限制
+     → 优化消息路由
+     → 启用消息压缩
+
+  3. 安全配置
+     → 强制 TLS
+     → 启用认证
+     → 定期轮换密钥
+
+  4. 监控运维
+     → 完善监控指标
+     → 设置告警规则
+     → 定期健康检查
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

@@ -1812,6 +1812,618 @@ curl localhost:9901/stats
 curl localhost:9901/clusters
 ```
 
+## 补充：xDS 协议详解
+
+### xDS 协议架构
+
+```text
+xDS 协议族：
+  ├── LDS（Listener Discovery Service）：监听器配置
+  │   ├── HTTP 监听器
+  │   ├── TCP 监听器
+  │   └── 过滤器链配置
+
+  ├── RDS（Route Discovery Service）：路由配置
+  │   ├── 虚拟主机
+  │   ├── 路由规则
+  │   └── 权重/重试/超时
+
+  ├── CDS（Cluster Discovery Service）：集群配置
+  │   ├── 上游集群
+  │   ├── 负载均衡
+  │   └── 熔断/超时
+
+  ├── EDS（Endpoint Discovery Service）：端点配置
+  │   ├── 服务实例
+  │   ├── 健康状态
+  │   └── 负载均衡权重
+
+  └── SDS（Secret Discovery Service）：密钥配置
+      ├── TLS 证书
+      ├── 私钥
+      └── CA 证书
+```
+
+### xDS 推送流程
+
+```text
+Envoy 启动 → 获取 LDS → 获取 RDS → 获取 CDS → 获取 EDS → 服务就绪
+
+推送机制：
+  ├── 全量推送：首次连接或配置变更
+  ├── 增量推送：仅变更部分（xDS v3+）
+  └── ACK/NACK：Envoy 确认配置生效
+
+热加载配置：
+  1. 控制面推送新配置
+  2. Envoy 接收并验证
+  3. Envoy ACK（接受）或 NACK（拒绝）
+  4. 新配置生效
+```
+
+### xDS v3 vs v2
+
+| 特性 | xDS v2 | xDS v3 |
+|------|--------|--------|
+| 协议 | gRPC/HTTP | gRPC/HTTP |
+| 增量 | 不支持 | 支持 |
+| 资源发现 | 全量 | 增量+全量 |
+| ACK/NACK | 基础 | 增强 |
+| 弃用 | 已弃用 | 推荐使用 |
+
+---
+
+## 补充：过滤器链深入
+
+### HTTP 过滤器
+
+```yaml
+# HTTP 过滤器配置
+static_resources:
+  listeners:
+    - name: listener_0
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                http_filters:
+                  - name: envoy.filters.http.cors
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+                  - name: envoy.filters.http.jwt_authn
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                      providers:
+                        auth0:
+                          issuer: https://auth.example.com/
+                          audiences: ["https://api.example.com"]
+                          remote_jwks:
+                            http_uri:
+                              uri: https://auth.example.com/.well-known/jwks.json
+                              cluster: auth_cluster
+                              timeout: 5s
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      inline_code: |
+                        function envoy_on_request(handle)
+                          handle:headers():add("x-custom-header", "value")
+                        end
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+```
+
+### 过滤器执行顺序
+
+```text
+HTTP 过滤器执行顺序：
+  1. 接收请求
+  2. 执行前置过滤器（CORS → JWT → RateLimit → Lua → Router）
+  3. 转发到上游服务
+  4. 接收响应
+  5. 执行后置过滤器（Lua → CORS）
+  6. 返回客户端
+
+TCP 过滤器执行顺序：
+  1. 接收连接
+  2. 执行过滤器链（TLS → Redis → Proxy）
+  3. 转发到上游服务
+  4. 接收响应
+  5. 返回客户端
+```
+
+---
+
+## 补充：熔断配置详解
+
+### 熔断参数
+
+```yaml
+# 熔断配置
+static_resources:
+  clusters:
+    - name: upstream_cluster
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: upstream_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: upstream
+                      port_value: 8080
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 1024
+            max_retries: 3
+            retry_budget:
+              budget_percent:
+                value: 20
+              min_retry_concurrency: 3
+```
+
+### 熔断阈值
+
+| 参数 | 默认值 | 说明 | 建议值 |
+|------|--------|------|--------|
+| max_connections | 1024 | 最大连接数 | 按需调整 |
+| max_pending_requests | 1024 | 最大等待请求数 | 按需调整 |
+| max_requests | 1024 | 最大并发请求数 | 按需调整 |
+| max_retries | 3 | 最大重试次数 | 3-5 |
+| retry_budget | 20% | 重试预算 | 10-20% |
+
+---
+
+## 补充：访问日志配置
+
+### 访问日志格式
+
+```yaml
+# 访问日志配置
+static_resources:
+  listeners:
+    - name: listener_0
+      access_log:
+        - name: envoy.access_loggers.file
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+            path: /var/log/envoy/access.log
+            log_format:
+              json_format:
+                protocol: "%PROTOCOL%"
+                duration: "%DURATION%"
+                response_flags: "%RESPONSE_FLAGS%"
+                route_name: "%ROUTE_NAME%"
+                upstream_cluster: "%UPSTREAM_CLUSTER%"
+                upstream_host: "%UPSTREAM_HOST%"
+                upstream_service_time: "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%"
+                user_agent: "%REQ(USER-AGENT)%"
+                request_id: "%REQ(X-REQUEST-ID)%"
+```
+
+### 日志字段说明
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| %PROTOCOL% | 协议版本 | HTTP/1.1 |
+| %DURATION% | 请求耗时（ms） | 123 |
+| %RESPONSE_FLAGS% | 响应标志 | - |
+| %UPSTREAM_CLUSTER% | 上游集群 | upstream_cluster |
+| %UPSTREAM_HOST% | 上游地址 | 10.0.0.1:8080 |
+| %REQ(X-REQUEST-ID)% | 请求ID | abc-123 |
+
+---
+
+## 补充：OpenTelemetry 集成
+
+### OTel 配置
+
+```yaml
+# OpenTelemetry 配置
+static_resources:
+  listeners:
+    - name: listener_0
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.tracers.opentelemetry.v3.OpenTelemetryConfig
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: otel_collector
+                          authority: otel-collector:4317
+                      resource_detectors:
+                        - name: envoy.resource_detectors.environment
+                          typed_config:
+                            "@type": type.googleapis.com/envoy.extensions.resource_detectors.environment.v3.EnvironmentResourceDetectorService
+```
+
+### 追踪传播
+
+```text
+追踪传播方式：
+  ├── W3C TraceContext（推荐）
+  │   ├── traceparent: 00-{trace_id}-{span_id}-{trace_flags}
+  │   └── tracestate: key=value
+  ├── B3（Zipkin）
+  │   ├── X-B3-TraceId: 64位 trace ID
+  │   ├── X-B3-SpanId: 64位 span ID
+  │   └── X-B3-Sampled: 是否采样
+  └── AWS X-Ray
+      ├── X-Amzn-Trace-Id: AWS 格式
+      └── X-Amzn-Sampled: 是否采样
+```
+
+---
+
+## 补充：Sidecar 部署模式
+
+### Sidecar 注入
+
+```yaml
+# 自动注入（Istio）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    metadata:
+      labels:
+        app: my-app
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+```
+
+### Sidecar 资源配置
+
+```yaml
+# Sidecar 资源限制
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+        - name: envoy-sidecar
+          image: envoyproxy/envoy:v1.28.0
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          ports:
+            - containerPort: 15001
+              name: http
+              protocol: TCP
+            - containerPort: 9901
+              name: admin
+              protocol: TCP
+```
+
+---
+
+## 补充：Envoy vs Nginx vs HAProxy
+
+| 维度 | Envoy | Nginx | HAProxy |
+|------|-------|-------|---------|
+| 架构 | 事件驱动/多线程 | 事件驱动/单线程 | 事件驱动/多进程 |
+| 配置格式 | YAML/JSON | 配置文件 | 配置文件 |
+| 动态配置 | xDS 协议 | reload | reload |
+| 服务发现 | EDS/ADS | 需要模块 | 需要脚本 |
+| 负载均衡 | 丰富算法 | 基础算法 | 丰富算法 |
+| 健康检查 | 主动+被动 | 被动 | 主动+被动 |
+| TLS | 原生支持 | 原生支持 | 原生支持 |
+| 可观测性 | 丰富指标 | 基础指标 | 基础指标 |
+| 学习曲线 | 中等 | 低 | 低 |
+| 性能 | 高 | 极高 | 高 |
+| 适用场景 | 微服务/服务网格 | Web 服务/API 网关 | TCP 负载均衡 |
+
+### 选型建议
+
+```text
+选型决策：
+  微服务/服务网格 → Envoy
+  Web 服务/API 网关 → Nginx
+  TCP 负载均衡 → HAProxy
+  混合场景 → Envoy + Nginx
+
+Envoy 优势：
+  1. 原生支持服务网格
+  2. 动态配置（无需重启）
+  3. 丰富的可观测性
+  4. 与 Istio 深度集成
+```
+
+---
+
+## 补充：Istio 集成
+
+### Istio 配置
+
+```yaml
+# Istio VirtualService
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-app
+spec:
+  hosts:
+    - my-app
+  http:
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: my-app
+            port:
+              number: 8080
+      timeout: 5s
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+      fault:
+        delay:
+          percentage:
+            value: 0.1
+          fixedDelay: 5s
+```
+
+### Istio 熔断
+
+```yaml
+# Istio DestinationRule
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-app
+spec:
+  host: my-app
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: DEFAULT
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 10
+        maxRetries: 3
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 3m
+      maxEjectionPercent: 100
+```
+
+---
+
+## 补充：性能调优
+
+### 调优参数
+
+| 参数 | 默认值 | 调优建议 | 说明 |
+|------|--------|----------|------|
+| concurrency | auto | CPU核数 | 工作线程数 |
+| upstream连接超时 | 5s | 1-10s | 根据后端响应调整 |
+| 最大连接数 | 1048576 | 按需 | 单监听器最大连接 |
+| 请求超时 | 15s | 业务相关 | 全局默认超时 |
+| 重试次数 | 3 | 1-5 | 自动重试次数 |
+
+### 性能测试
+
+```bash
+# 性能测试工具
+# 1. wrk
+wrk -t12 -c400 -d30s http://localhost:8080/
+
+# 2. ab
+ab -n 10000 -c 100 http://localhost:8080/
+
+# 3. hey
+hey -n 10000 -c 100 http://localhost:8080/
+
+# 4. vegeta
+echo "GET http://localhost:8080/" | vegeta attack -duration=30s
+```
+
+### 性能监控
+
+```bash
+# 查看 Envoy 统计信息
+curl localhost:9901/stats
+
+# 查看集群状态
+curl localhost:9901/clusters
+
+# 查看配置
+curl localhost:9901/config_dump
+```
+
+---
+
+## 补充：安全配置
+
+### mTLS 配置
+
+```yaml
+# mTLS 配置
+static_resources:
+  listeners:
+    - name: listener_0
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /etc/envoy/certs/server.crt
+                    private_key:
+                      filename: /etc/envoy/certs/server.key
+                validation_context:
+                  trusted_ca:
+                    filename: /etc/envoy/certs/ca.crt
+```
+
+### RBAC 配置
+
+```yaml
+# RBAC 配置
+http_filters:
+  - name: envoy.filters.http.rbac
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+      rules:
+        action: ALLOW
+        policies:
+          admin_policy:
+            permissions:
+              - and_rules:
+                  rules:
+                    - url_path:
+                        path: { prefix: "/admin" }
+                    - header:
+                        name: "x-admin-token"
+                        exact_match: "secret-token"
+            principals:
+              - any: true
+```
+
+---
+
+## 补充：生产问题排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 连接超时 | 上游服务不可达 | 检查服务健康状态 |
+| 502 Bad Gateway | 上游服务崩溃 | 检查服务日志 |
+| 503 Service Unavailable | 熔断触发 | 调整熔断参数 |
+| 504 Gateway Timeout | 上游响应慢 | 增加超时时间 |
+| 连接数耗尽 | 并发过高 | 增加连接数限制 |
+
+### 排查流程
+
+```bash
+# 1. 检查服务状态
+curl localhost:9901/clusters
+
+# 2. 检查统计信息
+curl localhost:9901/stats | grep error
+
+# 3. 检查配置
+curl localhost:9901/config_dump
+
+# 4. 检查日志
+tail -f /var/log/envoy/access.log
+
+# 5. 检查线程
+curl localhost:9901/threads
+```
+
+---
+
+## 补充：最佳实践
+
+### 配置管理
+
+```yaml
+# 1. 使用配置文件
+static_resources:
+  listeners:
+    - name: listener_0
+      # 配置
+---
+# 2. 使用热加载
+# 修改配置后
+# curl -X POST localhost:9901/quitquitquit
+# envoy -c /etc/envoy/envoy.yaml --restart-epoch 1
+```
+
+### 监控告警
+
+```yaml
+# 1. Prometheus 监控
+scrape_configs:
+  - job_name: 'envoy'
+    static_configs:
+      - targets: ['envoy:9901']
+    metrics_path: /stats/prometheus
+
+# 2. 告警规则
+groups:
+  - name: envoy
+    rules:
+      - alert: EnvoyHighErrorRate
+        expr: rate(envoy_http_downstream_cxx_rq_xx[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Envoy 错误率过高"
+```
+
+### 运维建议
+
+```text
+运维建议：
+  1. 监控关键指标
+     ├── 连接数
+     ├── 请求数
+     ├── 错误率
+     └── 延迟
+
+  2. 日志管理
+     ├── 访问日志
+     ├── 错误日志
+     └── 访问日志轮转
+
+  3. 配置管理
+     ├── 版本控制
+     ├── 配置验证
+     └── 热加载
+
+  4. 安全管理
+     ├── mTLS
+     ├── RBAC
+     └── 密钥管理
+```
+
+---
+
 ## 十八、与其他板块的关系
 
 - 服务网格见「[Istio](../../云原生/ServiceMesh.md)」；

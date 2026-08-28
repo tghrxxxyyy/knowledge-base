@@ -2040,6 +2040,139 @@ security-scan:
       sast: gl-sast-report.json
 ```
 
+## 二十七、CSP 与安全响应头
+
+### 27.1 Content Security Policy 配置
+
+```
+CSP 配置策略：
+  1. 默认策略
+     → default-src 'self'
+     → 只允许同源资源
+
+  2. 脚本策略
+     → script-src 'self'
+     → 禁止 inline 脚本
+     → 使用 nonce 或 hash
+
+  3. 样式策略
+     → style-src 'self'
+     → 禁止 inline 样式
+     → 使用 nonce
+
+  4. 图片策略
+     → img-src 'self' data: https:
+     → 允许 data URL
+     → 允许 HTTPS 图片
+```
+
+```
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' 'nonce-abc123' https://trusted.cdn.com;
+  style-src 'self' 'nonce-abc123';
+  img-src 'self' data: https:;
+  font-src 'self' https://fonts.gstatic.com;
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  base-uri 'self';
+  form-action 'self';
+```
+
+### 27.2 安全响应头配置
+
+| 响应头 | 作用 | 推荐值 |
+|--------|------|--------|
+| X-Content-Type-Options | 防止 MIME 类型嗅探 | nosniff |
+| X-Frame-Options | 防止点击劫持 | DENY |
+| X-XSS-Protection | 启用 XSS 过滤 | 1; mode=block |
+| Strict-Transport-Security | 强制 HTTPS | max-age=31536000 |
+| Referrer-Policy | 控制 Referrer 信息 | strict-origin-when-cross-origin |
+| Permissions-Policy | 限制浏览器功能 | camera=(), microphone=() |
+
+### 27.3 CSRF 防护实战
+
+```
+CSRF 防护方案：
+  1. Token 验证
+     → 生成随机 Token
+     → 表单中携带 Token
+     → 服务端验证 Token
+
+  2. SameSite Cookie
+     → Set-Cookie: session=abc; SameSite=Strict
+     → 防止跨站请求携带 Cookie
+
+  3. 双重 Cookie 验证
+     → 比较 Cookie 和表单值
+     → 一致性验证
+
+  4. 自定义请求头
+     → X-Requested-With: XMLHttpRequest
+     → 验证自定义头
+```
+
+### 27.4 JWT 安全最佳实践
+
+```
+JWT 安全配置：
+  签名算法：
+    → 使用 RS256（非对称）
+    → 避免使用 HS256（对称）
+
+  过期时间：
+    → Access Token: 15-30分钟
+    → Refresh Token: 7天
+
+  安全存储：
+    → HttpOnly Cookie
+    → 避免 localStorage
+
+  吊销机制：
+    → Token 黑名单
+    → 密钥轮换
+```
+
+### 27.5 OWASP Top 10 防护
+
+| 风险 | 防护措施 | 实现方式 |
+|------|----------|----------|
+| 注入 | 参数化查询 | 预编译语句 |
+| 失效认证 | 多因素认证 | 2FA/MFA |
+| 敏感数据暴露 | 数据加密 | AES/RSA |
+| XXE | 禁用外部实体 | 配置解析器 |
+| 访问控制失效 | RBAC/ABAC | 权限框架 |
+| 安全配置错误 | 安全基线 | 自动化检查 |
+| XSS | 输出编码 | 转义/编码 |
+| 不安全反序列化 | 白名单 | 类型检查 |
+| 已知漏洞组件 | 依赖检查 | SCA工具 |
+| 日志监控不足 | 安全监控 | SIEM |
+
+### 27.6 安全编码实践
+
+```
+安全编码清单：
+  输入验证：
+    → 白名单验证
+    → 长度限制
+    → 类型检查
+
+  输出编码：
+    → HTML 编码
+    → URL 编码
+    → JavaScript 编码
+
+  错误处理：
+    → 统一错误页面
+    → 不暴露内部信息
+    → 记录安全日志
+
+  密码安全：
+    → 使用 bcrypt
+    → 加盐存储
+    → 定期更换
+```
+
 ## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；

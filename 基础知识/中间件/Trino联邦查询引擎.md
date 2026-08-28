@@ -1983,6 +1983,144 @@ connector.name=hudi
 hudi.table-type=COPY_ON_WRITE
 ```
 
+## 二十七、Trino Connector 开发与扩展
+
+### 27.1 Connector 开发架构
+
+```java
+// 自定义 Connector 示例
+public class MyConnector implements Connector {
+
+    private final ConnectorMetadata metadata;
+    private final ConnectorSplitManager splitManager;
+    private final ConnectorRecordSinkProvider recordSinkProvider;
+
+    public MyConnector(MyConnectorConfig config) {
+        this.metadata = new MyConnectorMetadata(config);
+        this.splitManager = new MyConnectorSplitManager(config);
+        this.recordSinkProvider = new MyConnectorRecordSinkProvider(config);
+    }
+
+    @Override
+    public ConnectorMetadata getMetadata() {
+        return metadata;
+    }
+
+    @Override
+    public ConnectorSplitManager getSplitManager() {
+        return splitManager;
+    }
+
+    @Override
+    public ConnectorRecordSinkProvider getRecordSinkProvider() {
+        return recordSinkProvider;
+    }
+}
+```
+
+### 27.2 内存管理机制
+
+```
+内存管理架构：
+  Query Memory：
+    → 每个查询独立内存池
+    → 防止单查询 OOM
+
+  Cluster Memory：
+    → 全局内存管理
+    → 跨查询共享
+
+  Spill to Disk：
+    → 内存不足时溢写磁盘
+    → 支持复杂查询
+
+  内存分配：
+    → 源节点：读取数据
+    → 交换节点：Shuffle 数据
+    → 输出节点：聚合计算
+```
+
+| 内存类型 | 配置参数 | 默认值 | 说明 |
+|----------|----------|--------|------|
+| 查询最大内存 | query.max-memory | 20GB | 单查询内存 |
+| 节点最大内存 | query.max-memory-per-node | 2GB | 单节点内存 |
+| 源内存占比 | memory.heap-headroom-per-node | 0.4 | 堆外内存 |
+| Spill 目录 | spill.path | /tmp/spill | 溢写目录 |
+
+### 27.3 性能调优指南
+
+```
+性能调优策略：
+  1. 查询优化
+     → 谓词下推
+     → 列裁剪
+     → 投影下推
+
+  2. 并行度调整
+     → 增加 Worker 并行度
+     → 调整分区策略
+     → 优化 Shuffle
+
+  3. 内存优化
+     → 增加查询内存
+     → 启用 Spill to Disk
+     → 调整内存分配
+
+  4. 连接器优化
+     → 批量读取
+     → 并行扫描
+     → 缓存优化
+```
+
+### 27.4 安全与权限管理
+
+```sql
+-- 创建角色
+CREATE ROLE admin_role;
+GRANT ALL ON SCHEMA mydb TO admin_role;
+
+-- 创建用户
+CREATE USER analyst WITH PASSWORD 'password123';
+GRANT admin_role TO analyst;
+
+-- 行级安全
+CREATE POLICY user_filter ON mydb.users
+    FOR SELECT
+    USING (user_id = current_user);
+
+-- 列级安全
+GRANT SELECT (user_id, name) ON mydb.users TO analyst;
+```
+
+### 27.5 Catalog 管理最佳实践
+
+```
+Catalog 组织：
+  生产环境：
+    → 按数据源分类
+    → 使用 Schema 隔离
+    → 定期清理
+
+  开发环境：
+    → 使用测试 Catalog
+    → 隔离生产数据
+    → 快速原型验证
+
+  数据湖集成：
+    → Iceberg Catalog
+    → Delta Lake Catalog
+    → Hudi Catalog
+```
+
+### 27.6 常见生产问题排查
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 查询超时 | 内存不足 | 1.检查内存配置<br>2.分析查询计划 | 增加内存 |
+| OOM 错误 | 单查询内存过大 | 1.检查查询<br>2.分析数据量 | 启用 Spill |
+| 连接失败 | Catalog 配置错误 | 1.检查连接配置<br>2.测试网络 | 修复配置 |
+| 性能下降 | 数据倾斜 | 1.检查数据分布<br>2.分析执行计划 | 优化分区 |
+
 ## 二十六、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../大数据/05-列式存储与数据湖格式.md)」；

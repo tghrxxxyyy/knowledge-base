@@ -2012,4 +2012,167 @@ jobs:
         run: echo "Deploying to production"
 ```
 
+## 三十、GitHub Actions 高级特性
+
+### 30.1 缓存策略优化
+
+```yaml
+# 多层缓存配置
+- name: Cache node modules
+  uses: actions/cache@v3
+  with:
+    path: ~/.npm
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-node-
+
+- name: Cache Docker layers
+  uses: actions/cache@v3
+  with:
+    path: /tmp/.buildx-cache
+    key: ${{ runner.os }}-docker-${{ github.sha }}
+    restore-keys: |
+      ${{ runner.os }}-docker-
+
+- name: Cache Gradle
+  uses: actions/cache@v3
+  with:
+    path: |
+      ~/.gradle/caches
+      ~/.gradle/wrapper
+    key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+    restore-keys: |
+      ${{ runner.os }}-gradle-
+```
+
+### 30.2 矩阵构建策略
+
+```yaml
+# 矩阵构建示例
+strategy:
+  matrix:
+    os: [ubuntu-latest, windows-latest, macos-latest]
+    node-version: [16, 18, 20]
+    include:
+      - os: ubuntu-latest
+        node-version: 20
+        experimental: true
+    exclude:
+      - os: windows-latest
+        node-version: 16
+  fail-fast: false
+  max-parallel: 3
+
+steps:
+  - name: Use Node.js ${{ matrix.node-version }}
+    uses: actions/setup-node@v3
+    with:
+      node-version: ${{ matrix.node-version }}
+  - run: npm test
+```
+
+### 30.3 Reusable Workflow 开发
+
+```yaml
+# 可复用工作流
+name: Reusable Deploy
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+    secrets:
+      deploy-key:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Deploy
+        uses: my-org/deploy-action@v1
+        with:
+          image: ${{ inputs.image }}
+          deploy-key: ${{ secrets.deploy-key }}
+
+# 调用可复用工作流
+jobs:
+  deploy-staging:
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      image: my-app:latest
+    secrets:
+      deploy-key: ${{ secrets.STAGING_DEPLOY_KEY }}
+```
+
+### 30.4 OIDC 无密钥认证
+
+```yaml
+# OIDC 配置
+permissions:
+  id-token: write
+  contents: read
+
+steps:
+  - name: Configure AWS credentials
+    uses: aws-actions/configure-aws-credentials@v2
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/github-actions
+      aws-region: us-east-1
+
+  - name: Deploy to S3
+    run: aws s3 sync dist/ s3://my-bucket/
+```
+
+### 30.5 安全最佳实践
+
+```
+安全清单：
+  密钥管理：
+    → 使用 GitHub Secrets
+    → 避免硬编码
+    → 定期轮换
+
+  权限控制：
+    → 最小权限原则
+    → 使用 GITHUB_TOKEN
+    → 限制工作流权限
+
+  依赖安全：
+    → 使用固定版本
+    → 验证来源
+    → 定期更新
+
+  代码审查：
+    → 审查工作流变更
+    → 检查第三方 Action
+    → 验证签名
+```
+
+### 30.6 性能优化策略
+
+| 优化项 | 方法 | 效果 |
+|--------|------|------|
+| 并行执行 | 多 job 并行 | 减少总时间 |
+| 缓存依赖 | actions/cache | 加速构建 |
+| 容器化 | Docker 构建 | 环境一致 |
+| 矩阵构建 | 多平台并行 | 提升覆盖 |
+| 条件跳过 | if 条件 | 避免不必要执行 |
+
+### 30.7 常见问题排查
+
+| 问题现象 | 可能原因 | 解决方案 |
+|----------|----------|----------|
+| 工作流失败 | Action 版本不兼容 | 固定 Action 版本 |
+| 缓存未命中 | key 不匹配 | 检查缓存 key |
+| 权限不足 | GITHUB_TOKEN 权限 | 增加必要权限 |
+| 超时 | 步骤执行时间长 | 增加 timeout |
+| 磁盘空间不足 | 缓存过大 | 清理缓存 |
+
 ## 本篇补充 Checklist

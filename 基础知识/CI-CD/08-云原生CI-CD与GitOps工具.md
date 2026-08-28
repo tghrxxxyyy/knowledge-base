@@ -1813,7 +1813,525 @@ ArgoCD Application 配置：
   dev:   source.path=clusters/dev, syncPolicy.automated=true
 ```
 
-## 十八、与其他板块的关系
+## 补充：FluxCD 控制器原理
+
+### 控制器架构
+
+```text
+FluxCD 核心组件：
+  ├── Source Controller：拉取 Git/Helm 仓库
+  │   ├── GitRepository CR：管理 Git 仓库
+  │   ├── HelmRepository CR：管理 Helm 仓库
+  │   └── Bucket CR：管理 S3 存储桶
+
+  ├── Kustomize Controller：处理 Kustomize 配置
+  │   ├── Kustomization CR：Kustomize 渲染
+  │   └── 依赖管理：等待其他资源就绪
+
+  ├── Helm Controller：管理 Helm Release
+  │   ├── HelmRelease CR：Helm 部署/升级
+  │   └── Values 管理：多环境配置
+
+  ├── Notification Controller：发送通知
+  │   ├── Alert CR：告警规则
+  │   └── Provider CR：通知渠道
+
+  └── Image Automation Controllers：自动化镜像更新
+      ├── ImageRepository CR：镜像仓库监控
+      ├── ImagePolicy CR：镜像版本策略
+      └── ImageUpdateAutomation CR：自动化更新
+```
+
+### GitRepository CR 配置
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: my-app
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/org/my-app
+  ref:
+    branch: main
+  secretRef:
+    name: git-credentials
+  ignore: |
+    # 忽略测试文件
+    /tests/
+    /docs/
+```
+
+### Kustomization CR 配置
+
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: my-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: my-app
+  path: ./deploy/overlays/production
+  prune: true
+  wait: true
+  timeout: 5m
+  dependsOn:
+    - name: infrastructure
+```
+
+### FluxCD 依赖管理
+
+```yaml
+# 基础设施依赖
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+spec:
+  # ...
+---
+# 应用依赖基础设施
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: my-app
+spec:
+  dependsOn:
+    - name: infrastructure
+  # ...
+```
+
+### GitOps 原则回顾
+
+| 原则 | 说明 | FluxCD 实现 |
+|------|------|-------------|
+| 声明式 | 所有配置声明化管理 | Kustomization/HelmRelease |
+| 版本化 | Git 作为唯一来源 | GitRepository |
+| 自动化 | 自动拉取和部署 | interval 配置 |
+| 自愈性 | 偏差自动修复 | Reconcile Loop |
+
+### FluxCD vs Argo CD 对比
+
+| 维度 | FluxCD | Argo CD |
+|------|--------|---------|
+| 架构 | 原生 Kubernetes 控制器 | 独立应用 + K8s 控制器 |
+| 配置方式 | CRD + YAML | Web UI + CRD |
+| 依赖管理 | dependsOn 字段 | App of Apps |
+| 镜像自动化 | Image Automation Controllers | 需要 Image Updater |
+| 多集群 | 本地管理 | 原生多集群 UI |
+| 学习曲线 | 中（CRD 多） | 低（UI 友好） |
+| 社区生态 | CNCF 毕业项目 | CNCF 毕业项目 |
+
+---
+
+## 补充：Tekton Pipeline 深入
+
+### Pipeline CR 配置
+
+```yaml
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-and-deploy
+spec:
+  params:
+    - name: git-url
+      type: string
+    - name: image-name
+      type: string
+  workspaces:
+    - name: shared-workspace
+    - name: docker-credentials
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: url
+          value: $(params.git-url)
+
+    - name: build-image
+      taskRef:
+        name: kaniko
+      runAfter:
+        - fetch-source
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: dockerconfig
+          workspace: docker-credentials
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+
+    - name: deploy
+      taskRef:
+        name: kubectl-deploy
+      runAfter:
+        - build-image
+      params:
+        - name: MANIFEST
+          value: ./deploy/
+```
+
+### 自定义 Task
+
+```yaml
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: echo-task
+spec:
+  params:
+    - name: message
+      type: string
+  steps:
+    - name: echo
+      image: busybox
+      command: ["echo"]
+      args: ["$(params.message)"]
+```
+
+### TaskRun 和 PipelineRun
+
+```yaml
+# TaskRun
+apiVersion: tekton.dev/v1beta1
+kind: TaskRun
+metadata:
+  name: echo-task-run
+spec:
+  taskRef:
+    name: echo-task
+  params:
+    - name: message
+      value: "Hello World"
+---
+# PipelineRun
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: build-and-deploy-run
+spec:
+  pipelineRef:
+    name: build-and-deploy
+  params:
+    - name: git-url
+      value: https://github.com/org/my-app
+    - name: image-name
+      value: registry.io/my-app:latest
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+    - name: docker-credentials
+      secret:
+        secretName: docker-credentials
+```
+
+### Tekton Hub
+
+```bash
+# 搜索 Task
+tkn hub search task git-clone
+
+# 安装 Task
+tkn hub install task git-clone
+
+# 查看 Task
+tkn hub info task git-clone
+```
+
+---
+
+## 补充：Argo CD 多集群管理
+
+### 多集群配置
+
+```yaml
+# 添加远程集群
+argocd cluster add <context-name>
+
+# 列出所有集群
+argocd cluster list
+
+# 集群配置
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-production
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+type: Opaque
+stringData:
+  name: production
+  server: https://production-api-server:6443
+  config: |
+    {
+      "bearerToken": "<token>",
+      "tlsClientConfig": {
+        "insecure": false,
+        "caData": "<base64-ca>"
+      }
+    }
+```
+
+### 多集群 ApplicationSet
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-apps
+  namespace: argocd
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            env: production
+  template:
+    metadata:
+      name: 'my-app-{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/org/my-app
+        targetRevision: main
+        path: 'deploy/{{metadata.labels.env}}'
+      destination:
+        server: '{{server}}'
+        namespace: my-app
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+```
+
+### 多集群同步策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 集群级同步 | 所有集群同步同一版本 | 标准化部署 |
+| 环境级同步 | 不同环境不同版本 | 开发/测试/生产 |
+| 地域级同步 | 不同地域不同配置 | 多地域部署 |
+| 灰度同步 | 部分集群先同步 | 金丝雀发布 |
+
+---
+
+## 补充：漂移检测与自愈
+
+### 漂移检测机制
+
+```text
+漂移检测流程：
+  1. Argo CD 定期拉取 Git 仓库（默认 3 分钟）
+  2. 与集群实际状态比较
+  3. 检测到偏差 → 触发同步
+  4. 自动修复漂移（如果启用）
+
+漂移类型：
+  ├── 配置漂移：配置文件与实际状态不一致
+  ├── 版本漂移：镜像版本与期望不一致
+  └── 手动修改：kubectl edit/patch 直接修改
+
+自愈机制：
+  ├── 自动回滚：检测到错误自动回滚
+  ├── 自动修复：自动修复漂移
+  └── 告警通知：漂移发生时发送通知
+```
+
+### 漂移检测配置
+
+```yaml
+# 自动同步配置
+spec:
+  syncPolicy:
+    automated:
+      prune: true      # 删除 Git 中不存在的资源
+      selfHeal: true   # 修复手动修改的资源
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+```
+
+### 漂移检测告警
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: channel-name
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: channel-name
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: channel-name
+```
+
+---
+
+## 补充：云原生安全实践
+
+### 安全扫描集成
+
+```yaml
+# Argo CD 安全扫描
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    # 镜像扫描
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: channel-name
+spec:
+  source:
+    # 启用镜像签名验证
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+```
+
+### Pod 安全策略
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 2000
+  containers:
+    - name: my-container
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+```
+
+### 网络策略
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+```
+
+### Secret 管理
+
+```yaml
+# 使用 External Secrets Operator
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: my-secret
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: SecretStore
+  target:
+    name: my-secret
+  data:
+    - secretKey: password
+      remoteRef:
+        key: secret/data/my-app
+        property: password
+```
+
+---
+
+## 补充：CI/CD 工具演进
+
+### 工具演进路线
+
+```text
+CI/CD 工具演进：
+  第一阶段（2010-2015）：传统 CI
+    Jenkins、TeamCity、Bamboo
+    问题：单体架构、配置复杂、扩展性差
+
+  第二阶段（2015-2018）：云原生 CI
+    GitLab CI、CircleCI、Travis CI
+    改进：云原生、容器化、易扩展
+
+  第三阶段（2018-2022）：GitOps
+    Argo CD、FluxCD、Tekton
+    改进：声明式、版本化、自动化
+
+  第四阶段（2022-至今）：AI 增强
+    AI 辅助开发、智能测试、自动修复
+    趋势：智能化、自愈性、可观测性
+```
+
+### GitOps 成熟度模型
+
+| 级别 | 描述 | 特征 | 工具 |
+|------|------|------|------|
+| L0 | 手动部署 | 手动 kubectl apply | kubectl |
+| L1 | 脚本自动化 | Shell 脚本 + CI | Jenkins |
+| L2 | 基础 GitOps | Git 作为唯一来源 | Argo CD/FluxCD |
+| L3 | 高级 GitOps | 多集群 + 自动化 | Argo CD + ApplicationSet |
+| L4 | 智能 GitOps | AI 增强 + 自愈 | GitOps + AI 工具 |
+
+---
+
+## 选型建议
+
+### 云原生选型决策树
+
+```mermaid
+graph TD
+    A[团队规模] --> B{是否熟悉 Kubernetes}
+    B -- 是 --> C{是否需要 GitOps}
+    B -- 否 --> D[Jenkins]
+    C -- 是 --> E{是否需要 CI}
+    C -- 否 --> F[FluxCD + Kustomize]
+    E -- 是 --> G{团队规模}
+    E -- 否 --> H{是否需要多集群}
+    G -- I[1-5 人] --> J[FluxCD + Kustomize]
+    G -- K[5-20 人] --> L[Argo CD]
+    G -- M[>20 人] --> N[多集群 Argo CD]
+    H -- O[是] --> P[Argo CD + ApplicationSet]
+    H -- Q[否] --> R[FluxCD]
+```
+
+### 典型技术组合
+
+| 场景 | CI 工具 | CD 工具 | 仓库模式 |
+|------|---------|---------|----------|
+| 小型团队 | GitHub Actions | FluxCD | Kustomize |
+| 中型团队 | Tekton Pipelines | Argo CD | Helm |
+| 大型团队 | Jenkins + Tekton | Argo CD（多集群） | Helm + Values |
+| 复杂流水线 | Argo Events | Argo Workflows | 自定义资源 |
+| 混合云 | GitHub Actions | Argo CD + ApplicationSet | Kustomize + Helm |
+| 多地域 | Tekton | Argo CD + Multi-cluster | Helm + Values |
+
+---
+
+## 参考资料
 
 - 容器镜像见「[Docker](../../云原生/Docker.md)」；
 - Kubernetes 部署见「[K8s部署](../../云原生/部署.md)」；

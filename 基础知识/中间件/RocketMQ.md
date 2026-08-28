@@ -1814,6 +1814,431 @@ RocketMQ 是阿里巴巴开源的分布式消息中间件，以事务消息、�
 
 ---
 
+## 补充：事务消息深入
+
+### 事务消息状态机
+
+```text
+事务消息状态：
+  ├── Prepare：半消息（消费者不可见）
+  ├── Commit：提交消息（消费者可见）
+  ├── Rollback：回滚消息（丢弃）
+  └── Unknown：未知状态（回查）
+
+状态转换：
+  Producer 发送半消息 → Broker 存储半消息 → 返回 Prepare 状态
+  Producer 执行本地事务 → Commit/Rollback
+  如果 Broker 未收到确认 → 回查本地事务状态
+```
+
+### 事务消息回查
+
+```java
+// 事务消息生产者
+public class TransactionProducer implements TransactionListener {
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        // 执行本地事务
+        try {
+            // 业务逻辑
+            orderService.createOrder(msg.getKeys());
+            return LocalTransactionState.COMMIT_MESSAGE;
+        } catch (Exception e) {
+            return LocalTransactionState.ROLLBACK_MESSAGE;
+        }
+    }
+
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        // 回查本地事务状态
+        String orderId = msg.getKeys();
+        Order order = orderService.getOrder(orderId);
+        if (order != null) {
+            return LocalTransactionState.COMMIT_MESSAGE;
+        }
+        return LocalTransactionState.UNKNOW;
+    }
+}
+```
+
+### 事务消息配置
+
+```yaml
+# Broker 配置
+transactionTimeout=60000  # 事务超时时间（ms）
+transactionCheckInterval=60000  # 事务回查间隔（ms）
+transactionCheckMax=15  # 最大回查次数
+```
+
+---
+
+## 补充：延迟消息深入
+
+### 延迟级别
+
+| 延迟级别 | 延迟时间 | 适用场景 |
+|----------|----------|----------|
+| 1 | 1s | 实时性要求高 |
+| 2 | 5s | 短延迟 |
+| 3 | 10s | 中等延迟 |
+| 4 | 30s | 较长延迟 |
+| 5 | 1m | 一般延迟 |
+| 6 | 2m | 中等延迟 |
+| 7 | 3m | 较长延迟 |
+| 8 | 4m | 长延迟 |
+| 9 | 5m | 较长延迟 |
+| 10 | 6m | 长延迟 |
+| 11 | 7m | 较长延迟 |
+| 12 | 8m | 长延迟 |
+| 13 | 9m | 较长延迟 |
+| 14 | 10m | 长延迟 |
+| 15 | 20m | 较长延迟 |
+| 16 | 30m | 长延迟 |
+| 17 | 1h | 较长延迟 |
+| 18 | 2h | 长延迟 |
+
+### 延迟消息使用
+
+```java
+// 发送延迟消息
+Message msg = new Message("TopicTest", ("Hello RocketMQ " + i).getBytes());
+// 设置延迟级别
+msg.setDelayTimeLevel(3);  // 10s 延迟
+producer.send(msg);
+```
+
+### 延迟消息原理
+
+```text
+延迟消息原理：
+  1. Producer 发送延迟消息到 Broker
+  2. Broker 存储延迟消息到 Topic（SCHEDULE_TOPIC_XXXX）
+  3. Broker 根据延迟级别创建定时任务
+  4. 定时任务到期后，投递到目标 Topic
+  5. Consumer 消费目标 Topic 中的消息
+
+延迟消息存储：
+  ├── Topic：SCHEDULE_TOPIC_XXXX
+  ├── Queue：按延迟级别分配（18 个队列）
+  └── 定时任务：ScheduledExecutorService
+```
+
+---
+
+## 补充：顺序消息深入
+
+### 顺序消息原理
+
+```text
+顺序消息原理：
+  1. Producer 发送消息时指定 Queue
+  2. 同一 Key 的消息发送到同一 Queue
+  3. Broker 保证同一 Queue 中的消息有序
+  4. Consumer 消费时按顺序拉取
+
+顺序保证：
+  ├── 全局有序：单 Queue（性能差）
+  ├── 分区有序：多 Queue，按 Key 分区（推荐）
+  └── 局部有序：单 Queue 内有序
+```
+
+### 顺序消息使用
+
+```java
+// 发送顺序消息
+Message msg = new Message("TopicTest", ("Hello RocketMQ " + i).getBytes());
+msg.setKeys(orderId);
+// 使用订单 ID 作为 Key，保证同一订单的消息有序
+producer.send(msg, new MessageQueueSelector() {
+    @Override
+    public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+        String orderId = (String) arg;
+        int index = Math.abs(orderId.hashCode()) % mqs.size();
+        return mqs.get(index);
+    }
+}, orderId);
+
+// 消费顺序消息
+consumer.registerMessageListener(new MessageListenerOrderly() {
+    @Override
+    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext context) {
+        for (MessageExt msg : msgs) {
+            // 顺序处理消息
+        }
+        return ConsumeOrderlyStatus.SUCCESS;
+    }
+});
+```
+
+---
+
+## 补充：过滤机制深入
+
+### Tag 过滤
+
+```java
+// Producer 发送带 Tag 的消息
+Message msg = new Message("TopicTest", "TagA", ("Hello RocketMQ").getBytes());
+producer.send(msg);
+
+// Consumer 订阅带 Tag 的消息
+consumer.subscribe("TopicTest", "TagA || TagB");
+```
+
+### SQL92 过滤
+
+```java
+// Producer 发送带属性的消息
+Message msg = new Message("TopicTest");
+msg.putUserProperty("age", "25");
+msg.putUserProperty("city", "Beijing");
+producer.send(msg);
+
+// Consumer 使用 SQL 过滤
+consumer.subscribe("TopicTest", 
+    MessageSelector.bySql("age > 20 AND city = 'Beijing'"));
+```
+
+### 过滤原理
+
+```text
+过滤原理：
+  1. Producer 发送消息时设置 Tag 和属性
+  2. Broker 存储消息时记录 Tag 和属性
+  3. Consumer 订阅时指定过滤条件
+  4. Broker 根据过滤条件匹配消息
+  5. 只推送匹配的消息给 Consumer
+
+Tag 过滤：
+  ├── 基于 Tag 精确匹配
+  ├── 支持 || 和 && 操作符
+  └── 性能好（Broker 端过滤）
+
+SQL92 过滤：
+  ├── 基于消息属性过滤
+  ├── 支持复杂表达式
+  └── 性能较差（Broker 端过滤）
+```
+
+---
+
+## 补充：集群部署深入
+
+### 集群架构
+
+```text
+RocketMQ 集群架构：
+  ├── NameServer 集群
+  │   ├── 无状态，可水平扩展
+  │   ├── 节点间互不通信
+  │   └── 路由信息同步
+
+  ├── Broker 集群
+  │   ├── Master 节点：读写
+  │   ├── Slave 节点：只读（备份）
+  │   └── 主从同步：异步/同步
+
+  └── Producer/Consumer 集群
+      ├── 分布式部署
+      ├── 负载均衡
+      └── 故障转移
+```
+
+### 集群配置
+
+```bash
+# NameServer 配置
+namesrvAddr=192.168.1.10:9876;192.168.1.11:9876;192.168.1.12:9876
+
+# Broker Master 配置
+brokerRole=ASYNC_MASTER
+flushDiskType=ASYNC_FLUSH
+brokerId=0
+brokerClusterName=DefaultCluster
+brokerName=broker-a
+
+# Broker Slave 配置
+brokerRole=SLAVE
+flushDiskType=SYNC_FLUSH
+brokerId=1
+brokerClusterName=DefaultCluster
+brokerName=broker-a
+```
+
+### 集群监控
+
+```bash
+# 查看 Broker 状态
+mqadmin brokerStatus -n 192.168.1.10:9876 -b broker-a
+
+# 查看 Topic 状态
+mqadmin topicStatus -n 192.168.1.10:9876 -t TopicTest
+
+# 查看 Consumer Group
+mqadmin consumerProgress -n 192.168.1.10:9876 -g ConsumerGroup
+
+# 查看 Broker 配置
+mqadmin getBrokerConfig -n 192.168.1.10:9876 -b broker-a
+```
+
+---
+
+## 补充：RocketMQ Dashboard
+
+### Dashboard 功能
+
+```text
+Dashboard 功能：
+  ├── 集群管理
+  │   ├── Broker 状态
+  │   ├── Topic 列表
+  │   └── Consumer Group 列表
+
+  ├── Topic 管理
+  │   ├── Topic 详情
+  │   ├── 消息统计
+  │   └── 消息轨迹
+
+  ├── Consumer 管理
+  │   ├── Consumer Group 详情
+  │   ├── 消费进度
+  │   └── 消费延迟
+
+  └── 运维管理
+      ├── 发送消息
+      ├── 消费消息
+      └── 重置消费位点
+```
+
+### Dashboard 配置
+
+```yaml
+# Dashboard 配置
+rocketmq:
+  config:
+    namesrvAddr: 192.168.1.10:9876;192.168.1.11:9876
+    vipChannelEnabled: false
+```
+
+---
+
+## 补充：RocketMQ vs Kafka 对比
+
+| 维度 | RocketMQ | Kafka |
+|------|----------|-------|
+| 开发语言 | Java | Scala/Java |
+| 消息模型 | Queue（分区） | Partition（分区） |
+| 消息可靠性 | 高（同步刷盘） | 高（ISR+ACK） |
+| 消息顺序 | 支持（分区有序） | 支持（分区内有序） |
+| 事务消息 | 支持 | 支持（0.11+） |
+| 延迟消息 | 支持（18级） | 不支持（需自建） |
+| 消息过滤 | 支持（Tag/SQL92） | 不支持 |
+| 消息回溯 | 支持（按时间） | 支持（按offset） |
+| 管理界面 | Dashboard | 无（需第三方） |
+| 性能 | 高（10万级/秒） | 极高（百万级/秒） |
+| 适用场景 | 金融/电商/事务 | 日志/大数据/流处理 |
+
+### 选型建议
+
+```text
+选型决策：
+  金融/电商/事务 → RocketMQ
+  日志/大数据/流处理 → Kafka
+  需要事务消息 → RocketMQ
+  需要延迟消息 → RocketMQ
+  需要消息过滤 → RocketMQ
+  极致性能 → Kafka
+  大数据生态 → Kafka
+```
+
+---
+
+## 补充：最佳实践
+
+### 消息设计
+
+```text
+消息设计原则：
+  1. 消息体尽量小
+     ├── 避免大消息（>1MB）
+     ├── 引用数据而非嵌入数据
+     └── 压缩消息体
+
+  2. 消息Key设计
+     ├── 使用业务唯一标识
+     ├── 支持消息查询
+     └── 支持消息去重
+
+  3. 消息Tag设计
+     ├── 按业务分类
+     ├── 支持消息过滤
+     └── 避免过多Tag（<16）
+
+  4. 消息属性设计
+     ├── 存储业务元数据
+     ├── 支持SQL过滤
+     └── 避免敏感信息
+```
+
+### 生产者最佳实践
+
+```java
+// 1. 使用同步发送（可靠性高）
+SendResult result = producer.send(msg);
+
+// 2. 使用异步发送（性能高）
+producer.send(msg, new SendCallback() {
+    @Override
+    public void onSuccess(SendResult sendResult) {
+        // 发送成功
+    }
+    @Override
+    public void onException(Throwable e) {
+        // 发送失败，重试或记录
+    }
+});
+
+// 3. 使用单向发送（日志场景）
+producer.sendOneway(msg);
+
+// 4. 设置超时时间
+producer.send(msg, 3000);  // 3秒超时
+
+// 5. 设置重试次数
+producer.setRetryTimesWhenSendFailed(3);
+```
+
+### 消费者最佳实践
+
+```java
+// 1. 使用广播模式（全量消费）
+consumer.setMessageModel(MessageModel.BROADCASTING);
+
+// 2. 使用集群模式（负载均衡）
+consumer.setMessageModel(MessageModel.CLUSTERING);
+
+// 3. 设置消费线程数
+consumer.setConsumeThreadMin(20);
+consumer.setConsumeThreadMax(64);
+
+// 4. 设置消费批次
+consumer.setConsumeMessageBatchMaxSize(1);
+
+// 5. 设置消费超时
+consumer.setConsumeTimeout(15);
+
+// 6. 使用顺序消费
+consumer.registerMessageListener(new MessageListenerOrderly() {
+    @Override
+    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext context) {
+        // 顺序处理
+        return ConsumeOrderlyStatus.SUCCESS;
+    }
+});
+```
+
+---
+
 ## 参考资料
 
 - [Apache RocketMQ 官方文档](https://rocketmq.apache.org/docs/)

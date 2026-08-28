@@ -1805,3 +1805,604 @@ Data Stream 生命周期：
 - **脑裂（Split-Brain）**：两主并存、元数据冲突。成因：网络分区 + `minimum_master_nodes` 配错（7.x 后由奇数节点 + `cluster.initial_master_nodes` 自动仲裁，但仍需节点数为奇数）。SOP：① 确认真正的主（看 `_cat/nodes?v&h=node,node.role,master` 中 `*` 标记）；② 隔离/重启"假主"节点让其重新加入；③ 网络恢复后 `GET _cluster/health` 回到 green；④ 长期：节点数奇数、跨可用区部署 `discovery.seed_hosts`、加 `cluster.fault_detection.*` 调优心跳。
 - **磁盘水位（Disk Watermark）**：ES 三档——`low`（默认 85%，停止分配新分片）、`high`（默认 90%，触发分片迁走）、`flood_stage`（默认 95%，强制所有索引只读 `index.blocks.read_only_allow_delete`）。SOP：① `GET _cat/allocation?v` 看各节点磁盘；② 清理磁盘/扩容后**必须手动解除只读**：`PUT */_settings { "index.blocks.read_only_allow_delete": null }`（flood_stage 触发的是只读块，要清对应 block）；③ 临时上调：`cluster.routing.allocation.disk.watermark.flood_stage: 97%`；④ 长期：ILM rollover + 冷数据降配、监控磁盘曲线设 80% 预警。
 - **通用排障清单**：`_cluster/health` → `_cat/nodes?v&h=...cpu,heap...` → `_cat/thread_pool?v` → `_cat/pending_tasks?v`（堆积说明 master 忙）→ `_nodes/hot_threads` + `_cat/slow_log`；变更前先 `GET _cluster/settings` 留底，回滚有据。
+
+## 补充：索引管理 ILM
+
+### ILM 生命周期
+
+```text
+ILM 生命周期阶段：
+  ├── Hot：热数据（SSD，频繁读写）
+  │   ├── rollover：按大小/文档数/时间滚动
+  │   └── shrink：缩小分片数
+
+  ├── Warm：温数据（SSD/HDD，只读）
+    ├── force_merge：合并分片
+    └── shrink：缩小分片数
+
+  ├── Cold：冷数据（HDD，归档）
+    ├── freeze：冻结索引
+    └── searchable_snapshot：可搜索快照
+
+  └── Delete：删除
+      ├── delete：删除索引
+      └── delete_after：过期删除
+```
+
+### ILM 策略配置
+
+```json
+// ILM 策略配置
+PUT _ilm/policy/logs_policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "7d"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "warm": {
+        "min_age": "30d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          },
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "set_priority": {
+            "priority": 50
+          }
+        }
+      },
+      "cold": {
+        "min_age": "90d",
+        "actions": {
+          "freeze": {},
+          "set_priority": {
+            "priority": 0
+          }
+        }
+      },
+      "delete": {
+        "min_age": "365d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### ILM 管理
+
+```bash
+# 查看 ILM 策略
+GET _ilm/policy/logs_policy
+
+# 查看索引 ILM 状态
+GET my-index/_ilm/explain
+
+# 手动触发 ILM
+POST my-index/_ilm/force_transition?phase=hot
+
+# 查看 ILM 统计
+GET _ilm/stats
+```
+
+---
+
+## 补充：副本策略
+
+### 副本配置
+
+```json
+// 副本配置
+PUT /my-index/_settings
+{
+  "number_of_replicas": 1
+}
+
+// 动态调整副本
+PUT /my-index/_settings
+{
+  "number_of_replicas": 2
+}
+
+// 查看副本状态
+GET _cat/shards?v&h=index,shard,prirep,unassigned.reason
+```
+
+### 副本策略
+
+```text
+副本策略：
+  1. 默认策略
+     ├── 副本数：1
+     ├── 跨节点分布
+     └── 同分片不同节点
+
+  2. 高可用策略
+     ├── 副本数：2+
+     ├── 跨可用区分布
+     └── 容灾考虑
+
+  3. 读写分离策略
+     ├── 主分片：写入
+     ├── 副本分片：读取
+     └── 负载均衡
+
+  4. 成本优化策略
+     ├── 副本数：0（测试环境）
+     └── 降低存储成本
+```
+
+---
+
+## 补充：检索优化
+
+### 检索优化策略
+
+```text
+检索优化策略：
+  1. 索引优化
+     ├── 合理设计分片
+     ├── 合理设计副本
+     └── 合理设计字段
+
+  2. 查询优化
+     ├── 使用 filter 替代 query
+     ├── 避免深分页
+     └── 使用 scroll/search_after
+
+  3. 缓存优化
+     ├── 启用请求缓存
+     ├── 使用节点查询缓存
+     └── 使用文件系统缓存
+
+  4. 聚合优化
+     ├── 使用 doc_values
+     ├── 使用 global ordinals
+     └── 避免高基数聚合
+```
+
+### 检索性能对比
+
+| 查询类型 | 延迟 | 优化建议 |
+|----------|------|----------|
+| term 查询 | 1-5ms | 使用 keyword 字段 |
+| match 查询 | 5-20ms | 使用合适的分词器 |
+| range 查询 | 1-10ms | 使用数值/日期字段 |
+| 聚合查询 | 10-100ms | 使用 doc_values |
+| 全文搜索 | 10-50ms | 使用 text 字段 |
+
+---
+
+## 补充：集群架构
+
+### 集群拓扑
+
+```text
+集群拓扑：
+  小集群（<10节点）：
+    ├── 3 Master 节点
+    ├── 3 Data 节点
+    └── 1 Coordinating 节点
+
+  中集群（10-50节点）：
+    ├── 3 Master 节点
+    ├── 10+ Data 节点
+    ├── 3 Coordinating 节点
+    └── 3 Ingest 节点
+
+  大集群（>50节点）：
+    ├── 5 Master 节点
+    ├── 30+ Data 节点
+    ├── 5 Coordinating 节点
+    ├── 5 Ingest 节点
+    └── 专用 Master 节点
+```
+
+### 集群配置
+
+```yaml
+# 集群配置
+cluster.name: my-cluster
+node.name: node-1
+node.roles: [master]
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+network.host: 0.0.0.0
+discovery.seed_hosts: ["node-1", "node-2", "node-3"]
+cluster.initial_master_nodes: ["node-1", "node-2", "node-3"]
+```
+
+---
+
+## 补充：生命周期管理
+
+### 索引生命周期
+
+```text
+索引生命周期：
+  创建 → 写入 → 只读 → 归档 → 删除
+
+生命周期管理：
+  1. 自动管理
+     ├── ILM 策略
+     ├── rollover
+     └── 自动删除
+
+  2. 手动管理
+     ├── 手动创建索引
+     ├── 手动关闭索引
+     └── 手动删除索引
+
+  3. 监控管理
+     ├── 监控索引状态
+     ├── 监控存储使用
+     └── 监控性能指标
+```
+
+### 索引管理操作
+
+```bash
+# 创建索引
+PUT /my-index-000001
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1
+  }
+}
+
+# 关闭索引
+POST /my-index/_close
+
+# 打开索引
+POST /my-index/_open
+
+# 删除索引
+DELETE /my-index
+
+# 查看索引
+GET /my-index/_settings
+```
+
+---
+
+## 补充：文档管理
+
+### 文档操作
+
+```bash
+# 创建文档
+PUT /my-index/_doc/1
+{
+  "title": "Document 1",
+  "content": "This is document 1"
+}
+
+# 更新文档
+POST /my-index/_update/1
+{
+  "doc": {
+    "title": "Updated Document 1"
+  }
+}
+
+# 删除文档
+DELETE /my-index/_doc/1
+
+# 批量操作
+POST _bulk
+{"index": {"_index": "my-index", "_id": "1"}}
+{"title": "Document 1"}
+{"index": {"_index": "my-index", "_id": "2"}}
+{"title": "Document 2"}
+```
+
+### 文档最佳实践
+
+```text
+文档最佳实践：
+  1. 文档大小
+     ├── 建议：< 100KB
+     ├── 避免：> 1MB
+     └── 大文档：拆分存储
+
+  2. 文档结构
+     ├── 扁平化结构
+     ├── 避免嵌套过深
+     └── 合理使用数组
+
+  3. 文档 ID
+     ├── 自动生成：简单
+     ├── 业务ID：唯一性
+     └── 避免：过长ID
+
+  4. 文档更新
+     ├── 整体更新：PUT
+     ├── 部分更新：POST _update
+     └── 避免：频繁更新
+```
+
+---
+
+## 补充：聚合
+
+### 聚合类型
+
+```json
+// 桶聚合
+{
+  "aggs": {
+    "avg_price": {
+      "avg": {
+        "field": "price"
+      }
+    }
+  }
+}
+
+// 度量聚合
+{
+  "aggs": {
+    "price_stats": {
+      "stats": {
+        "field": "price"
+      }
+    }
+  }
+}
+
+// 管道聚合
+{
+  "aggs": {
+    "avg_price_per_category": {
+      "terms": {
+        "field": "category"
+      },
+      "aggs": {
+        "avg_price": {
+          "avg": {
+            "field": "price"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 聚合优化
+
+```text
+聚合优化：
+  1. 使用 doc_values
+     ├── 启用 doc_values
+     ├── 避免 fielddata
+     └── 优化聚合性能
+
+  2. 使用 global ordinals
+     ├── 高基数字段
+     ├── 加速聚合
+     └── 减少内存
+
+  3. 使用 filter 聚合
+     ├── 预过滤数据
+     ├── 减少聚合范围
+     └── 提高性能
+
+  4. 使用多级聚合
+     ├── 分层聚合
+     ├── 减少单次聚合量
+     └── 提高准确性
+```
+
+---
+
+## 补充：查询 DSL
+
+### 查询 DSL 示例
+
+```json
+// bool 查询
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "title": "elasticsearch" } }
+      ],
+      "filter": [
+        { "term": { "status": "published" } }
+      ],
+      "must_not": [
+        { "term": { "status": "draft" } }
+      ],
+      "should": [
+        { "match": { "content": "search engine" } }
+      ],
+      "minimum_should_match": 1
+    }
+  }
+}
+
+// 范围查询
+{
+  "query": {
+    "range": {
+      "price": {
+        "gte": 10,
+        "lte": 100
+      }
+    }
+  }
+}
+
+// 聚合查询
+{
+  "size": 0,
+  "aggs": {
+    "categories": {
+      "terms": {
+        "field": "category",
+        "size": 10
+      },
+      "aggs": {
+        "avg_price": {
+          "avg": {
+            "field": "price"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 查询最佳实践
+
+```text
+查询最佳实践：
+  1. 使用 filter 替代 query
+     ├── filter：不计算分数，可缓存
+     ├── query：计算分数，不可缓存
+     └── 优先使用 filter
+
+  2. 避免深分页
+     ├── 使用 search_after
+     ├── 使用 scroll
+     └── 限制结果大小
+
+  3. 使用 highlight
+     ├── 高亮显示
+     ├── 提高可读性
+     └── 用户体验
+
+  4. 使用 explain
+     ├── 分析查询性能
+     ├── 优化查询
+     └── 调试查询
+```
+
+---
+
+## 补充：索引设计
+
+### 索引设计原则
+
+```text
+索引设计原则：
+  1. 分片设计
+     ├── 分片大小：10-50GB
+     ├── 分片数量：按数据量计算
+     └── 避免：过多/过少分片
+
+  2. 副本设计
+     ├── 副本数量：按可用性要求
+     ├── 跨节点分布
+     └── 成本考虑
+
+  3. 字段设计
+     ├── 选择合适的字段类型
+     ├── 启用 doc_values
+     └── 避免：不必要的字段
+
+  4. 映射设计
+     ├── 合理使用分词器
+     ├── 合理使用索引选项
+     └── 避免：动态映射
+```
+
+### 索引模板设计
+
+```json
+// 索引模板设计
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "level": { "type": "keyword" },
+        "message": { "type": "text" }
+      }
+    }
+  },
+  "priority": 100
+}
+```
+
+---
+
+## 补充：健康检查
+
+### 健康检查指标
+
+| 指标 | 正常值 | 告警阈值 | 说明 |
+|------|--------|----------|------|
+| Cluster Status | green | yellow/red | 集群状态 |
+| Pending Tasks | 0 | > 100 | 待处理任务 |
+| Relocating Shards | 0 | > 10 | 迁移分片 |
+| Initializing Shards | 0 | > 10 | 初始化分片 |
+| Unassigned Shards | 0 | > 0 | 未分配分片 |
+
+### 健康检查脚本
+
+```bash
+#!/bin/bash
+# ES 集群健康检查脚本
+
+ES_HOST="localhost:9200"
+
+# 检查集群状态
+CLUSTER_STATUS=$(curl -s "$ES_HOST/_cluster/health" | jq -r '.status')
+if [ "$CLUSTER_STATUS" != "green" ]; then
+  echo "CRITICAL: Cluster status is $CLUSTER_STATUS"
+  exit 2
+fi
+
+# 检查未分配分片
+UNASSIGNED=$(curl -s "$ES_HOST/_cluster/health" | jq -r '.unassigned_shards')
+if [ "$UNASSIGNED" -gt 0 ]; then
+  echo "WARNING: $UNASSIGNED unassigned shards"
+  exit 1
+fi
+
+echo "OK: Cluster is healthy"
+exit 0
+```
+
+### 日常维护
+
+```bash
+# 列出所有索引
+GET /_cat/indices?v&s=size:desc
+
+# 列出所有分片
+GET /_cat/shards?v&s=index,shard
+
+# 列出所有节点
+GET /_cat/nodes?v
+
+# 查看集群设置
+GET /_cluster/settings?include_defaults=false
+
+# 查看磁盘使用
+GET /_cat/allocation?v
+```

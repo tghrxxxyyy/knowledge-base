@@ -1962,6 +1962,196 @@ public class SeataConfig {
 }
 ```
 
+## 二十七、Seata 高级特性与生产实践
+
+### 27.1 TCC 模式深度解析
+
+```
+TCC 模式原理：
+  Try 阶段：
+    → 资源预留
+    → 业务检查
+    → 数据冻结
+
+  Confirm 阶段：
+    → 确认提交
+    → 释放预留资源
+
+  Cancel 阶段：
+    → 取消操作
+    → 释放冻结资源
+
+  关键点：
+    → 幂等性保证
+    → 空回滚处理
+    → 悬挂解决方案
+```
+
+```java
+// TCC 模式示例
+public class OrderTccService implements TccService {
+
+    @TwoPhaseBusinessAction(name = "createOrder")
+    public boolean tryMethod(BusinessActionContext context) {
+        // Try: 预留库存和余额
+        Long orderId = context.getLong("orderId");
+        Long userId = context.getLong("userId");
+
+        // 冻结库存
+        inventoryService.freeze(orderId, getUserId());
+        // 冻结余额
+        accountService.freeze(userId, getAmount());
+
+        return true;
+    }
+
+    @BusinessAction(inputType = BusinessActionContext.class)
+    public boolean confirmMethod(BusinessActionContext context) {
+        // Confirm: 确认扣减
+        Long orderId = context.getLong("orderId");
+        Long userId = context.getLong("userId");
+
+        // 确认扣减库存
+        inventoryService.confirm(orderId);
+        // 确认扣减余额
+        accountService.confirm(userId);
+
+        return true;
+    }
+
+    @BusinessAction(inputType = BusinessActionContext.class)
+    public boolean cancelMethod(BusinessActionContext context) {
+        // Cancel: 释放预留
+        Long orderId = context.getLong("orderId");
+        Long userId = context.getLong("userId");
+
+        // 释放库存
+        inventoryService.release(orderId);
+        // 释放余额
+        accountService.release(userId);
+
+        return true;
+    }
+}
+```
+
+### 27.2 SAGA 模式详解
+
+```
+SAGA 模式流程：
+  1. 创建 SAGA 事务
+  2. 按顺序执行事务步骤
+  3. 成功：提交事务
+  4. 失败：执行补偿事务（反向执行）
+
+  SAGA 协调器：
+    → 事务编排
+    → 状态管理
+    → 补偿触发
+
+  补偿策略：
+    正向补偿：执行补偿逻辑
+    反向补偿：执行反向操作
+    混合补偿：结合多种方式
+```
+
+| SAGA 特性 | 说明 | 使用场景 |
+|-----------|------|----------|
+| 事务编排 | 定义事务步骤顺序 | 长事务 |
+| 状态管理 | 跟踪事务执行状态 | 异步事务 |
+| 补偿逻辑 | 失败时执行补偿 | 最终一致性 |
+| 超时处理 | 事务超时自动补偿 | 分布式系统 |
+
+### 27.3 AT vs TCC 选型指南
+
+| 维度 | AT 模式 | TCC 模式 | 选型建议 |
+|------|---------|----------|----------|
+| 侵入性 | 低（SQL 解析） | 高（需实现 Try/Confirm/Cancel） | 简单业务用 AT |
+| 性能 | 中（全局锁） | 高（无全局锁） | 高并发用 TCC |
+| 一致性 | 强一致 | 最终一致 | 资金类用 TCC |
+| 补偿 | 自动回滚 | 手动实现 | 复杂业务用 TCC |
+| 适用场景 | 通用业务 | 资金/库存 | 按业务选择 |
+
+### 27.4 性能优化策略
+
+```
+性能优化方案：
+  1. 连接池优化
+     → 增加连接池大小
+     → 复用数据库连接
+     → 减少连接创建开销
+
+  2. 锁优化
+     → 使用局部锁代替全局锁
+     → 减少锁粒度
+     → 乐观锁 + 重试
+
+  3. 异步化
+     → 异步执行分支事务
+     → 批量提交
+     → 异步补偿
+
+  4. 缓存优化
+     → 本地缓存热点数据
+     → 减少数据库查询
+     → Redis 缓存事务状态
+```
+
+| 优化项 | 优化前 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| 连接池 | 10 | 50 | 5x 提升 |
+| 全局锁 | 开启 | 关闭 | 3x 提升 |
+| 异步提交 | 同步 | 异步 | 2x 提升 |
+| 本地缓存 | 无 | 有 | 1.5x 提升 |
+
+### 27.5 生产问题排查手册
+
+```mermaid
+graph TB
+    A[问题发现] --> B{问题类型}
+    B -->|性能问题| C[检查锁竞争]
+    B -->|一致性问题| D[检查事务状态]
+    B -->|超时问题| E[检查网络/数据库]
+    C --> F[优化锁策略]
+    D --> G[修复补偿逻辑]
+    E --> H[增加超时时间]
+    F --> I[问题解决]
+    G --> I
+    H --> I
+```
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 事务悬挂 | Cancel 先于 Try 执行 | 1.检查事务状态<br>2.检查超时配置 | 增加悬挂检测 |
+| 空回滚 | Try 未执行就执行 Cancel | 1.检查事务日志<br>2.检查网络 | 空回滚检测 |
+| 幂等失败 | 重复提交 | 1.检查幂等表<br>2.检查重试逻辑 | 幂等性保证 |
+| 性能下降 | 全局锁竞争 | 1.检查锁等待<br>2.检查事务量 | 优化锁策略 |
+
+### 27.6 Seata 最佳实践总结
+
+```
+最佳实践清单：
+  1. 模式选择
+     → 简单业务：AT 模式
+     → 复杂业务：TCC 模式
+     → 长事务：SAGA 模式
+
+  2. 性能优化
+     → 避免大事务
+     → 减少锁竞争
+     → 异步化处理
+
+  3. 监控运维
+     → 监控事务状态
+     → 设置超时告警
+     → 定期清理日志
+
+  4. 故障处理
+     → 实现幂等性
+     → 处理空回滚
+     → 解决悬挂问题
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

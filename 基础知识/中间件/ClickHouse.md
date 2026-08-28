@@ -1747,6 +1747,607 @@ FROM raw_logs
 GROUP BY service, date;
 ```
 
+## 补充：ReplicatedMergeTree 深入
+
+### 复制原理
+
+```text
+ReplicatedMergeTree 工作原理：
+  ├── 基于 ZooKeeper/ClickHouse Keeper 的复制
+  ├── 每个分片有 Leader 和 Follower
+  ├── 写入 Leader → 写入本地日志 → 复制到 Follower
+  ├── 合并协调：Leader 发起合并请求
+  └── 数据一致性：基于日志重放（最终一致）
+
+复制流程：
+  1. 客户端写入 Leader
+  2. 写入本地日志（RAFT）
+  3. Follower 拉取日志
+  4. Follower 重放日志
+  5. Leader 协调合并
+```
+
+### 副本配置
+
+```sql
+-- 创建带副本的表
+CREATE TABLE logs_replicated ON CLUSTER cluster_3
+(
+    timestamp DateTime,
+    level String,
+    message String
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{layer}/logs', '{replica}')
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (level, timestamp);
+
+-- 参数说明
+-- /clickhouse/tables/{layer}/logs: ZK 中的路径
+-- {replica}: 每个节点的副本标识
+```
+
+### 副本管理
+
+```sql
+-- 查看副本状态
+SELECT * FROM system.replicas;
+
+-- 查看副本延迟
+SELECT 
+    database,
+    table,
+    is_leader,
+    future_parts,
+    parts_to_check,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue
+FROM system.replicas;
+
+-- 手动恢复副本
+SYSTEM RESTORE REPLICA logs_replicated;
+```
+
+---
+
+## 补充：MergeTree 引擎家族对比
+
+| 引擎 | 特点 | 适用场景 | 数据更新 |
+|------|------|----------|----------|
+| MergeTree | 基础引擎，无特殊功能 | 通用场景 | 不支持 |
+| ReplacingMergeTree | 按版本去重 | 最新状态查询 | 支持（异步去重） |
+| SummingMergeTree | 自动求和聚合 | 计数/求和统计 | 支持（异步聚合） |
+| AggregatingMergeTree | 聚合函数 | 复杂聚合分析 | 支持（异步聚合） |
+| CollapsingMergeTree | 折叠标记 | 可更新/删除 | 支持（异步折叠） |
+| VersionedCollapsingMergeTree | 版本折叠 | 有序更新 | 支持（版本折叠） |
+
+### 版本控制最佳实践
+
+```sql
+-- ReplacingMergeTree 使用版本号
+CREATE TABLE eventsReplacing
+(
+    event_id UInt64,
+    user_id UInt64,
+    event_type String,
+    event_time DateTime,
+    version UInt64  -- 版本号
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (event_id);
+
+-- 查询时获取最新版本
+SELECT * FROM eventsReplacing FINAL;  -- FINAL 强制去重
+```
+
+---
+
+## 补充：物化视图深入
+
+### 物化视图工作原理
+
+```text
+物化视图流程：
+  1. 写入源表
+  2. 触发物化视图（INSERT 触发器）
+  3. 执行 SELECT 转换
+  4. 写入目标表（物化视图存储）
+
+物化视图类型：
+  ├── 普通物化视图：数据转换后写入目标表
+  ├── 聚合物化视图：使用 AggregatingMergeTree
+  └── 可刷新物化视图：定期刷新数据
+```
+
+### 物化视图配置
+
+```sql
+-- 普通物化视图
+CREATE MATERIALIZED VIEW logs_view
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(date)
+ORDER BY (service, date)
+AS SELECT
+    service,
+    toDate(timestamp) AS date,
+    count() AS request_count,
+    sum(duration) AS total_duration
+FROM raw_logs
+GROUP BY service, date;
+
+-- 查询物化视图
+SELECT service, date, sum(request_count), sum(total_duration)
+FROM logs_view
+GROUP BY service, date;
+
+-- 查看物化视图元数据
+SELECT * FROM system.parts WHERE table = 'logs_view';
+```
+
+### 物化视图与实时表配合
+
+```sql
+-- 实时表 + 物化视图实现预聚合
+CREATE TABLE realtime_events (
+    timestamp DateTime,
+    event_type String,
+    user_id UInt64
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (event_type, timestamp);
+
+-- 物化视图自动聚合
+CREATE MATERIALIZED VIEW realtime_stats
+ENGINE = SummingMergeTree()
+ORDER BY (event_type, toDate(timestamp))
+AS SELECT
+    event_type,
+    toDate(timestamp) AS date,
+    count() AS event_count,
+    uniqState(user_id) AS unique_users
+FROM realtime_events
+GROUP BY event_type, date;
+
+-- 查询聚合结果
+SELECT 
+    event_type,
+    date,
+    event_count,
+    uniqMerge(unique_users)
+FROM realtime_stats
+GROUP BY event_type, date;
+```
+
+---
+
+## 补充：分布式表配置
+
+### 分布式表架构
+
+```text
+分布式表结构：
+  本地表（Local Table）：
+    ├── 每个节点上的实际数据存储
+    ├── 使用 MergeTree 引擎
+    └── 负责数据存储和查询
+
+  分布式表（Distributed Table）：
+    ├── 分布式查询入口
+    ├── 跨节点查询协调
+    └── 数据分片路由
+
+分片策略：
+  ├── random：随机分片
+  ├── round_robin：轮询分片
+  ├── hash：哈希分片（推荐）
+  └── 分片键：决定数据分布
+```
+
+### 分布式表配置
+
+```sql
+-- 创建分布式表
+CREATE TABLE logs_distributed ON CLUSTER cluster_3
+(
+    timestamp DateTime,
+    level String,
+    message String
+)
+ENGINE = Distributed(
+    cluster_3,           -- 集群名称
+    default,             -- 数据库名称
+    logs_local,          -- 本地表名称
+    xxHash64(level)      -- 分片键
+);
+
+-- 查询分布式表（自动路由到各节点）
+SELECT count() FROM logs_distributed 
+WHERE level = 'ERROR';
+
+-- 查看分片分布
+SELECT * FROM system.distribution;
+```
+
+---
+
+## 补充：内存管理
+
+### 内存分配
+
+```text
+ClickHouse 内存分配：
+  ├── 查询内存：每个查询分配独立内存
+  ├── 合并内存：后台合并使用
+  ├── 缓存内存：页缓存、标记缓存
+  └── 临时内存：排序、聚合使用
+
+内存限制配置：
+  max_memory_usage: 10000000000 (10GB)
+  max_threads: 16
+  max_insert_threads: 4
+  max_concurrent_queries: 100
+```
+
+### 内存优化
+
+```sql
+-- 设置查询内存限制
+SET max_memory_usage = 10000000000;  -- 10GB
+
+-- 使用外部排序（减少内存）
+SET max_bytes_before_external_sort = 1000000000;  -- 1GB
+
+-- 使用外部聚合（减少内存）
+SET max_bytes_before_external_group_by = 1000000000;  -- 1GB
+
+-- 查看当前内存使用
+SELECT 
+    query_id,
+    memory_usage,
+    peak_memory_usage,
+    query
+FROM system.processes;
+```
+
+### 内存监控
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| memory_usage | 当前内存使用 | > 80% |
+| peak_memory_usage | 峰值内存使用 | > 90% |
+| max_memory_usage | 内存限制 | 触及限制 |
+| memory_tracker | 内存跟踪器 | 异常增长 |
+
+---
+
+## 补充：集群运维
+
+### 集群状态检查
+
+```sql
+-- 检查集群状态
+SELECT * FROM system.clusters;
+
+-- 检查副本状态
+SELECT * FROM system.replicas;
+
+-- 检查分片分布
+SELECT 
+    database,
+    table,
+    shard_num,
+    replica_num,
+    host_name
+FROM system.distribution;
+
+-- 检查后台任务
+SELECT * FROM system.merges;
+SELECT * FROM system.mutations;
+```
+
+### 滚动重启
+
+```bash
+# 滚动重启步骤
+# 1. 检查集群状态
+clickhouse-client --query "SELECT * FROM system.clusters"
+
+# 2. 停止节点
+sudo systemctl stop clickhouse-server
+
+# 3. 更新配置
+sudo vim /etc/clickhouse-server/config.xml
+
+# 4. 启动节点
+sudo systemctl start clickhouse-server
+
+# 5. 验证集群状态
+clickhouse-client --query "SELECT * FROM system.replicas"
+```
+
+### 数据备份恢复
+
+```bash
+# 备份表
+clickhouse-client --query "BACKUP TABLE logs TO Disk('backups', 'logs_backup')"
+
+# 恢复表
+clickhouse-client --query "RESTORE TABLE logs FROM Disk('backups', 'logs_backup')"
+
+# 查看备份
+clickhouse-client --query "SELECT * FROM system.backups"
+```
+
+---
+
+## 补充：Flink 集成
+
+### Flink ClickHouse Connector
+
+```java
+// Flink 读取 ClickHouse
+ClickHouseOptions options = ClickHouseOptions.builder()
+    .setUrl("clickhouse://localhost:8123")
+    .setDatabase("default")
+    .setTableName("logs")
+    .build();
+
+// Flink 写入 ClickHouse
+SinkFunction<String> sinkFunction = ClickHouseSink.sink(
+    options,
+    (row, context) -> {
+        // 转换 Flink Row 为 ClickHouse 格式
+        return row.toString();
+    }
+);
+
+// Flink SQL 读取 ClickHouse
+String sql = """
+    CREATE TABLE clickhouse_logs (
+        timestamp TIMESTAMP,
+        level STRING,
+        message STRING
+    ) WITH (
+        'connector' = 'clickhouse',
+        'url' = 'clickhouse://localhost:8123',
+        'database-name' = 'default',
+        'table-name' = 'logs'
+    )
+    """;
+```
+
+### 实时同步架构
+
+```text
+实时同步方案：
+  1. Kafka → Flink → ClickHouse
+     ├── Flink 消费 Kafka
+     ├── 批量写入 ClickHouse
+     └── 适合实时分析
+
+  2. MySQL → Canal → Kafka → ClickHouse
+     ├── Canal 捕获 MySQL binlog
+     ├── Kafka 中转
+     └── ClickHouse 消费写入
+
+  3. 日志 → Filebeat → Kafka → ClickHouse
+     ├── Filebeat 采集日志
+     ├── Kafka 中转
+     └── ClickHouse 消费写入
+```
+
+---
+
+## 补充：ClickHouse vs Doris vs StarRocks 对比
+
+| 维度 | ClickHouse | Doris | StarRocks |
+|------|------------|-------|-----------|
+| 架构 | Shared-Nothing | Shared-Nothing | Shared-Nothing |
+| 协调器 | ZooKeeper | FE（自研） | FE（自研） |
+| SQL 兼容 | ClickHouse SQL | MySQL 协议 | MySQL 协议 |
+| 向量化 | 全面向量化 | 全面向量化 | 全面向量化 |
+| 物化视图 | 支持 | 支持 | 支持 |
+| 数据更新 | 异步合并 | 实时更新 | 实时更新 |
+| 多表 JOIN | 性能较差 | 性能较好 | 性能最好 |
+| 生态集成 | Kafka/S3/ES | Kafka/Hive/S3 | Kafka/Hive/S3 |
+| 社区 | 开源社区 | Apache | 商业公司 |
+
+### 选型建议
+
+```text
+选型决策树：
+  需求分析：
+    ├── 单表聚合为主 → ClickHouse
+    ├── 多表 JOIN 为主 → StarRocks
+    ├── 实时更新为主 → Doris/StarRocks
+    ├── SQL 兼容 MySQL → Doris/StarRocks
+    └── 生态集成 → ClickHouse
+
+  团队能力：
+    ├── 有 ClickHouse 经验 → ClickHouse
+    ├── 有 MySQL 经验 → Doris/StarRocks
+    └── 需要商业支持 → StarRocks
+
+  运维能力：
+    ├── 运维能力强 → ClickHouse（灵活）
+    └── 运维能力弱 → Doris/StarRocks（自动化高）
+```
+
+---
+
+## 补充：最佳实践
+
+### 表设计最佳实践
+
+```sql
+-- 1. 选择合适的排序键
+ORDER BY (user_id, event_time)  -- 高频查询字段在前
+
+-- 2. 合理使用分区键
+PARTITION BY toYYYYMM(event_time)  -- 按月分区
+
+-- 3. 使用低基数类型
+LowCardinality(String)  -- 代替 String
+
+-- 4. 启用压缩
+CODEC(LZ4)  -- 默认压缩
+CODEC(ZSTD(3))  -- 高压缩比
+
+-- 5. 使用物化视图预聚合
+CREATE MATERIALIZED VIEW stats_view
+ENGINE = SummingMergeTree()
+ORDER BY (service, date)
+AS SELECT service, toDate(timestamp) as date, count() as cnt
+FROM logs GROUP BY service, date;
+```
+
+### 查询最佳实践
+
+```sql
+-- 1. 使用 FINAL 关键字（去重）
+SELECT * FROM events FINAL;
+
+-- 2. 使用 PREWHERE 优化
+SELECT * FROM logs PREWHERE level = 'ERROR';
+
+-- 3. 使用 LIMIT 限制结果
+SELECT * FROM logs ORDER BY timestamp DESC LIMIT 1000;
+
+-- 4. 使用聚合函数
+SELECT service, count(), avg(duration) FROM logs GROUP BY service;
+
+-- 5. 使用索引
+SELECT * FROM logs WHERE level = 'ERROR' AND timestamp > now() - INTERVAL 1 DAY;
+```
+
+---
+
+## 补充：监控与告警
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| query_count | 查询数量 | 基线对比 |
+| query_duration_ms | 查询延迟 | > 5s |
+| memory_usage | 内存使用 | > 80% |
+| disk_usage | 磁盘使用 | > 85% |
+| merge_count | 合并数量 | > 100 |
+| mutation_count | 变异数量 | > 10 |
+
+### Prometheus 告警配置
+
+```yaml
+groups:
+  - name: clickhouse
+    rules:
+      - alert: ClickHouseHighMemory
+        expr: clickhouse_memory_usage / clickhouse_max_memory_usage > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse 内存使用率过高"
+
+      - alert: ClickHouseHighDisk
+        expr: clickhouse_disk_usage / clickhouse_max_disk_usage > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse 磁盘使用率过高"
+```
+
+---
+
+## 补充：生产问题排查
+
+### 常见问题及解决方案
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 查询超时 | 数据量大/索引缺失 | 添加索引/优化查询 |
+| 内存溢出 | 大查询/合并 | 设置内存限制/优化查询 |
+| 磁盘满 | 数据量增长 | 扩容/清理旧数据 |
+| 副本不同步 | 网络/节点故障 | 检查副本状态/恢复同步 |
+| 合并积压 | 后台任务过多 | 调整合并参数/增加资源 |
+
+### 问题排查流程
+
+```sql
+-- 1. 检查查询状态
+SELECT * FROM system.processes;
+
+-- 2. 检查内存使用
+SELECT * FROM system.events WHERE event LIKE '%Memory%';
+
+-- 3. 检查磁盘使用
+SELECT * FROM system.disks;
+
+-- 4. 检查副本状态
+SELECT * FROM system.replicas;
+
+-- 5. 检查后台任务
+SELECT * FROM system.merges;
+SELECT * FROM system.mutations;
+```
+
+---
+
+## 补充：性能调优
+
+### 查询优化
+
+```sql
+-- 1. 使用索引
+SELECT * FROM logs WHERE level = 'ERROR' 
+ORDER BY timestamp DESC LIMIT 1000;
+
+-- 2. 使用 PREWHERE
+SELECT * FROM logs PREWHERE level = 'ERROR';
+
+-- 3. 使用 FINAL
+SELECT * FROM events FINAL;
+
+-- 4. 使用 LIMIT
+SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100;
+
+-- 5. 使用聚合
+SELECT service, count() FROM logs GROUP BY service;
+```
+
+### 写入优化
+
+```sql
+-- 1. 批量写入
+INSERT INTO logs SELECT * FROM tmp_logs;
+
+-- 2. 使用 async_insert
+SET async_insert = 1;
+SET wait_for_async_insert = 1;
+
+-- 3. 使用分片键
+INSERT INTO logs_distributed SELECT * FROM tmp_logs;
+
+-- 4. 使用低基数类型
+LowCardinality(String)
+```
+
+### 索引优化
+
+```sql
+-- 1. 添加二级索引
+ALTER TABLE logs ADD INDEX level_idx level TYPE bloom_filter GRANULARITY 4;
+
+-- 2. 添加跳数索引
+ALTER TABLE logs ADD INDEX timestamp_idx timestamp TYPE minmax GRANULARITY 4;
+
+-- 3. 查看索引使用
+EXPLAIN SELECT * FROM logs WHERE level = 'ERROR';
+```
+
 ## 与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。
