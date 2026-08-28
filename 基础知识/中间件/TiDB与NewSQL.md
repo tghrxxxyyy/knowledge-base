@@ -1287,6 +1287,447 @@ TiDB 方案：
   查询延迟：OLTP < 10ms，OLAP < 1s
 ```
 
+## TiDB Placement Rules 深度详解（Follower/Learner 分布 + ReadFromStaleness）
+
+### Placement Rules 核心配置
+
+```
+Placement Rules 三大维度：
+  1. Role（角色）：Leader / Follower / Learner / Restricted_Follower
+  2. Count（副本数）：每种角色的数量
+  3. Location Labels（位置标签）：zone / rack / host 层级
+
+配置语法：
+  CREATE PLACEMENT POLICY policy_name
+    PRIMARY_REGION="zone1"
+    REGIONS="zone1,zone2,zone3"
+    FOLLOWERS=2
+    LEARNERS=1
+    SCHEDULE='EVEN';
+```
+
+| 角色 | 功能 | 投票权 | 数据同步 | 典型用途 |
+|------|------|--------|----------|----------|
+| Leader | 读写主副本 | 有 | 同步源 | 请求入口 |
+| Follower | 冗余副本 | 有 | 异步同步 | 高可用/读扩展 |
+| Learner | 只读副本 | 无 | 异步同步 | TiFlash 列存/异域灾备 |
+| Restricted_Follower | 受限副本 | 有 | 异步 | 特殊隔离场景 |
+
+### ReadFromStaleness 读取策略
+
+```
+ReadFromStaleness = 从 Follower/Learner 读取（允许延迟）
+
+配置方式：
+  SET GLOBAL tidb_read_staleness = '-5';  -- 允许 5 秒内延迟
+  SELECT /*+ READ_FROM_STALENESS */ * FROM t;
+
+  或在连接串配置：
+  --read-staleness=-5
+
+适用场景：
+  - 报表查询（允许秒级延迟）
+  - 读多写少场景（分流 Leader 压力）
+  - 跨地域读（就近 Follower 读取）
+
+注意事项：
+  - Follower 读可能读到旧数据
+  - 不适合需要强一致的场景
+  - Learner 读延迟更大（列存同步延迟）
+```
+
+### 跨地域部署实战
+
+```
+三地五中心部署示例：
+  zone1（北京主区）：Leader ×1 + Follower ×1
+  zone2（北京备区）：Follower ×1
+  zone3（上海）：Learner ×1（TiFlash）
+
+CREATE PLACEMENT POLICY cross_region
+  PRIMARY_REGION="zone1"
+  REGIONS="zone1,zone2,zone3"
+  FOLLOWERS=2
+  SCHEDULE='EVEN';
+
+ALTER TABLE orders PLACEMENT POLICY=cross_region;
+ALTER TABLE orders SET TIFLASH REPLICA 1;
+```
+
+## TiFlash 列存同步深度（异步/同步 HTAP）
+
+### 同步模式对比
+
+| 模式 | 延迟 | 一致性 | 适用场景 | 配置方式 |
+|------|------|--------|----------|----------|
+| Async（异步） | 1-5s | 最终一致 | 实时报表/OLAP | 默认模式 |
+| Sync（同步） | 10-50ms | 强一致 | 实时风控/强一致分析 | `SET GLOBAL tiflash_sync=true` |
+| Semi-Sync（半同步） | 1-5s | 近强一致 | 折中方案 | 需手动配置 |
+
+```
+异步同步流程：
+  TiKV Region Leader → Raft 日志 → TiFlash Learner 接收 → Apply 到 DeltaTree
+  延迟来源：网络传输 + Apply 日志 + Compact
+
+同步同步流程：
+  TiKV Region Leader → Raft 日志 → TiFlash Learner 接收并 Apply → ACK → 提交
+  延迟来源：等待 TiFlash ACK（网络往返）
+
+HTAP 查询路由决策：
+  TiDB 优化器根据表统计信息自动选择：
+    - 小表/点查 → TiKV（行存，低延迟）
+    - 大表扫描/聚合 → TiFlash（列存，高吞吐）
+    - Hint 强制：/*+ read_from_storage(tiflash[t]) */
+```
+
+### TiFlash 写放大控制
+
+```
+写放大原因：
+  TiKV 写入 → Raft 日志 → TiFlash Apply → DeltaTree Compaction
+
+控制策略：
+  1. 控制同步副本数（减少 Learner 数量）
+  2. 调整 TiFlash Compaction 频率
+  3. 非核心表不同步 TiFlash
+  4. 监控 tiflash_proxy_raft_apply_log_duration_seconds
+
+ALTER TABLE logs SET TIFLASH REPLICA 0;  -- 取消同步
+```
+
+## pd-ctl / tikv-ctl 运维命令大全
+
+### pd-ctl 核心命令
+
+```bash
+# 集群信息
+pd-ctl cluster info              # 集群基本信息
+pd-ctl member list               # PD 成员列表
+pd-ctl region status             # Region 状态统计
+
+# Store 管理
+pd-ctl store list                # 所有 TiKV 节点
+pd-ctl store stats <store_id>    # 节点详细统计
+pd-ctl store remove <store_id>   # 下线节点（先 prepare-stop）
+pd-ctl store limit <store_id> add-peer 10  # 限制调度速率
+
+# Region 调度
+pd-ctl region operator add transfer-leader <region_id> <target_store_id>
+pd-ctl region operator add scatter-region <region_id>
+pd-ctl region operator remove <region_id>
+
+# 调度器控制
+pd-ctl scheduler list
+pd-ctl scheduler pause balance-leader-scheduler
+pd-ctl scheduler resume balance-leader-scheduler
+pd-ctl scheduler config balance-leader
+
+# Placement Rules
+pd-ctl config placement-rules
+pd-ctl config placement-rules export --outpath ./rules.json
+pd-ctl config placement-rules import --inpath ./rules.json
+
+# 热点管理
+pd-ctl hot region                  # 热点 Region
+pd-ctl hot region spread <store_id>  # 热点打散
+```
+
+### tikv-ctl 核心命令
+
+```bash
+# Region 操作
+tikv-ctl --host tikv0:20160 region -r <region_id>           # 查看 Region 信息
+tikv-ctl --host tikv0:20160 region-properties -r <region_id> # Region 属性
+
+# RocksDB 维护
+tikv-ctl --host tikv0:20160 engine-info                     # RocksDB 状态
+tikv-ctl --host tikv0:20160 compact --db /var/lib/tikv/db   # 人工 Compact
+tikv-ctl --all --host tikv0:20160 compact --db /var/lib/tikv/db  # 全量 Compact
+
+# 数据扫描
+tikv-ctl --host tikv0:20160 scan --from 'key1' --to 'key2' --limit 10
+
+# 危险操作
+tikv-ctl --host tikv0:20160 recover -r <region_id>          # 恢复 Region
+tikv-ctl --host tikv0:20160 tombstone --pd http://pd:2379   # Tombstone 清理
+```
+
+| 命令 | 用途 | 注意事项 |
+|------|------|----------|
+| `store remove` | 下线节点 | 先 `prepare-stop` 再 `remove` |
+| `scatter-region` | 打散 Region | 大规模扩缩容前必做 |
+| `compact` | RocksDB 压缩 | 大版本升级后必做 |
+| `recover` | 恢复 Region | 危险操作，需确认 |
+| `balance-leader` | Leader 均衡 | 高峰期暂停避免抖动 |
+
+## MySQL 工具兼容性矩阵（ORM/连接池）
+
+| 工具类型 | 工具 | 兼容性 | 注意事项 |
+|----------|------|--------|----------|
+| ORM | MyBatis | 完全兼容 | XML 语法无差异 |
+| ORM | MyBatis-Plus | 完全兼容 | 需关闭物理分页插件 |
+| ORM | Hibernate | 完全兼容 | DDL 语法差异需测试 |
+| ORM | JPA | 完全兼容 | 自动生成 DDL 需验证 |
+| ORM | SQLAlchemy | 完全兼容 | Python 生态首选 |
+| ORM | GORM | 完全兼容 | Go 生态首选 |
+| 连接池 | HikariCP | 完全兼容 | 推荐使用 |
+| 连接池 | Druid | 完全兼容 | 需关闭监控 SQL |
+| 连接池 | c3p0 | 兼容 | 已不推荐 |
+| 连接池 | DBCP | 兼容 | 已不推荐 |
+| 客户端 | Navicat | 完全兼容 | DDL 需 PD 在线 |
+| 客户端 | DBeaver | 完全兼容 | 部分系统表差异 |
+| 客户端 | MySQL Workbench | 部分兼容 | 逆向工程可能报错 |
+| 备份工具 | mysqldump | 完全兼容 | 逻辑备份 |
+| 备份工具 | mydumper/myloader | 完全兼容 | 并行备份恢复 |
+| DDL 工具 | pt-osc | 完全兼容 | 大表 DDL 推荐 |
+| DDL 工具 | gh-ost | 完全兼容 | 无外键场景更优 |
+| CDC | Canal | 完全兼容 | 需配置 GTID 模式 |
+| CDC | Maxwell | 完全兼容 | binlog_row_image=FULL |
+| CDC | Debezium | 完全兼容 | CDC 首选 |
+
+```
+连接池配置建议（TiDB 适配）：
+  HikariCP:
+    minimum-idle: 5
+    maximum-pool-size: 20
+    connection-timeout: 30000
+    idle-timeout: 600000
+    max-lifetime: 1800000
+
+  注意事项：
+    - TiDB 连接复用率高，连接池不宜过大
+    - 建议开启 useServerPrepStmts=true
+    - 关闭 useSSL=false（内网环境）
+    - set session transaction isolation level read committed（推荐 RC）
+```
+
+## 大事务绕过方案（Batch + Pipelined）
+
+### 大事务限制与绕过
+
+```
+TiDB 大事务限制：
+  单事务 KV 数：默认 300K（5.0+ 放宽）
+  单事务大小：100MB
+  事务持锁时间：默认 10s
+  Snapshot 大小：单 Region 不超 256MB
+
+绕过策略：
+  1. Batch 模式
+     每批 1000-5000 条，每批独立事务
+     用 batch_id 做幂等
+
+  2. Pipelined 写入
+     边写边提交，减少锁持有时间
+     SET GLOBAL tidb_pipelined_txn = 1;
+
+  3. LOAD DATA INFILE
+     绕过 SQL 层，直接写入 TiKV
+     适合大批量导入
+
+  4. TiDB Lightning
+     并行导入，绕过 SQL 层
+     适合全量数据迁移
+```
+
+| 场景 | 推荐方案 | 预期效果 |
+|------|----------|----------|
+| 百万级批量插入 | Batch 5000条/批 + Pipelined | 吞吐 10w+/s |
+| 大表 DDL | pt-osc 或 gh-ost | 零锁表时间 |
+| 跨表事务 | 拆分为多事务 + 最终一致 | 避免大事务 |
+| 实时写入 | 批量攒批 + 异步提交 | 延迟 < 100ms |
+
+## 金融核心系统改造案例
+
+### 改造路径
+
+```
+某银行核心系统从 MySQL 迁移到 TiDB 的完整路径：
+
+Phase 1: 评估（2周）
+  ├── SQL 兼容性扫描（DDL/DML 差异）
+  ├── 数据量评估（当前 2TB，日增 50GB）
+  ├── 性能压测（TiDB vs MySQL 基准对比）
+  └── 应用改造清单
+
+Phase 2: 开发（4周）
+  ├── 应用适配层（兼容 MySQL + TiDB 差异）
+  ├── 双写逻辑（应用层双写 MySQL + TiDB）
+  ├── 对账脚本（定时校验数据一致性）
+  └── 监控告警（延迟/错误率/数据差异）
+
+Phase 3: 测试（3周）
+  ├── 功能测试（核心交易链路）
+  ├── 性能测试（峰值 QPS 5万）
+  ├── 压力测试（7×24 稳定性）
+  └── 故障注入（主库宕机/网络分区）
+
+Phase 4: 切换（1周）
+  ├── 灰度切换（10%→50%→100%）
+  ├── 观察期（7天）
+  └── 旧库下线
+```
+
+### 关键改造点
+
+| 改造点 | MySQL 原方案 | TiDB 新方案 | 改造内容 |
+|--------|-------------|------------|----------|
+| 主键 | 自增 ID | 雪花 ID | 改造主键生成策略 |
+| 事务模式 | RR + 乐观锁 | RC + 悲观锁 | 调整事务隔离级别 |
+| 分库分表 | MyCat 代理 | TiDB 原生 | 去除中间件层 |
+| 读写分离 | MyCat balance | TiKV + TiFlash | 自动路由 |
+| 报表查询 | T+1 数仓 | TiFlash 实时 | 去除 ETL 流程 |
+| 备份恢复 | mysqldump | BR 物理备份 | 切换备份工具 |
+
+## TiDB vs CockroachDB vs Spanner 深度对比
+
+| 维度 | TiDB | CockroachDB | Spanner |
+|------|------|-------------|---------|
+| 协议兼容 | MySQL 95%+ | PostgreSQL 95%+ | 自有（SQL 变种） |
+| 存储引擎 | RocksDB（TiKV） | Pebble | Colossus（定制） |
+| 事务模型 | Percolator 2PC | 串行化 2PC | TrueTime 事务 |
+| 时钟方案 | TSO（中心化） | 混合逻辑时钟 | TrueTime（原子钟） |
+| HTAP | TiKV + TiFlash | 无原生 | 无原生 |
+| 地理分布 | Placement Rules | 自动区域化 | 全球复制 |
+| 一致性 | Raft 强一致 | Raft 强一致 | Spanner 协议 |
+| 开源 | Apache 2.0 | BSL/Apache 2.0 | 云服务（GCP） |
+| 云托管 | TiDB Cloud | CockroachDB Cloud | GCP Spanner |
+| 学习成本 | 中（MySQL） | 中（PostgreSQL） | 高（自有语法） |
+| 生态工具 | 丰富（Lightning/CDC） | 一般 | GCP 生态 |
+| 社区 | 活跃（CNCF） | 活跃 | Google 主导 |
+
+```
+选型决策树：
+  Q1：需要 HTAP 吗？
+    是 → TiDB（唯一原生 HTAP）
+    否 → Q2
+
+  Q2：MySQL 兼容？
+    是 → TiDB
+    否 → Q3
+
+  Q3：全球分布？
+    是 → Spanner（GCP）或 CockroachDB（自建）
+    否 → Q4
+
+  Q4：开源自建？
+    是 → TiDB（MySQL）/ CockroachDB（PostgreSQL）
+    否 → Spanner（GCP 托管）
+```
+
+## NewSQL 选型决策树
+
+```
+NewSQL 选型决策流程：
+
+  ┌─ 数据量超 1TB？
+  │   ├── 否 → MySQL/PostgreSQL 优化即可
+  │   └── 是 ↓
+  │
+  ├─ 需要水平扩展？
+  │   ├── 否 → 垂直扩展 + 读写分离
+  │   └── 是 ↓
+  │
+  ├─ 需要 HTAP？
+  │   ├── 是 → TiDB（原生 TiFlash）
+  │   └── 否 ↓
+  │
+  ├─ MySQL 生态？
+  │   ├── 是 → TiDB
+  │   └── 否 → Q5
+  │
+  ├─ PostgreSQL 生态？
+  │   ├── 是 → CockroachDB
+  │   └── 否 → Q6
+  │
+  ├─ GCP 云托管？
+  │   ├── 是 → Spanner
+  │   └── 否 → TiDB / CockroachDB
+  │
+  └─ 预算有限？
+      ├── 是 → TiDB（开源免费）
+      └── 否 → TiDB Cloud / CockroachDB Cloud
+```
+
+| 场景 | 首选 | 备选 | 理由 |
+|------|------|------|------|
+| MySQL + 海量数据 | TiDB | OceanBase | MySQL 兼容 + HTAP |
+| PostgreSQL + 分布式 | CockroachDB | YugabyteDB | PG 兼容 |
+| 全球低延迟 | Spanner | CockroachDB | TrueTime 保证 |
+| 金融级强一致 | TiDB / OceanBase | Spanner | Raft / Paxos |
+| 开源自建 | TiDB | CockroachDB | 生态丰富 |
+| K8s 云原生 | TiDB Operator | CockroachDB Operator | K8s 原生支持 |
+
+## TiDB 性能调优（TiKV/RocksDB 参数/自动统计信息）
+
+### TiKV 层调优
+
+```
+RocksDB 关键参数：
+  # Block Cache（读缓存）
+  block-cache-size = "10GB"           # 建议物理内存 30-50%
+  block-size = "16KB"                 # 块大小
+
+  # Write Buffer（写缓冲）
+  write-buffer-size = "128MB"         # 写缓冲区大小
+  max-write-buffer-number = 4         # 最大写缓冲区数
+
+  # Compaction（压缩）
+  level0-slowdown-writes-trigger = 20
+  level0-stop-writes-trigger = 36
+  max-bytes-for-level-base = "512MB"
+  max-bytes-for-level-multiplier = 10
+
+  # Block 表布隆过滤器
+  bloom-filter-bits-per-key = 10
+  block-based-table-filters = true
+```
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| block-cache-size | 4GB | 物理内存 30-50% | 读缓存，越大越好 |
+| write-buffer-size | 64MB | 128-256MB | 写缓冲区 |
+| max-write-buffer-number | 2 | 4 | 写缓冲区数 |
+| max-bytes-for-level-base | 256MB | 512MB | L1 层大小 |
+| rate-limiter | 无 | 100MB/s | 限速 Compaction |
+
+### 自动统计信息
+
+```
+自动统计信息配置：
+  # 开启自动 ANALYZE
+  SET GLOBAL tidb_enable_auto_analyze = ON;
+  SET GLOBAL tidb_auto_analyze_ratio = 0.5;  -- 超过 50% 变更自动 ANALYZE
+
+  # 手动 ANALYZE
+  ANALYZE TABLE orders;
+  ANALYZE TABLE orders INDEX idx_user_id;
+
+  # 统计信息查看
+  SHOW STATS_META WHERE table_name = 'orders';
+  SHOW STATS_HISTOGRAMS WHERE table_name = 'orders';
+
+  # 监控统计信息健康
+  SELECT * FROM mysql.stats_health;
+```
+
+| 统计信息 | 作用 | 更新频率 |
+|----------|------|----------|
+| row_count | 行数估算 | 实时 |
+| modify_count | 变更行数 | 实时 |
+| histogram | 值分布 | ANALYZE 时更新 |
+| ndv | 不同值数量 | ANALYZE 时更新 |
+| collation | 排序信息 | ANALYZE 时更新 |
+
+```
+自动统计信息最佳实践：
+  1. 开启自动 ANALYZE（tidb_enable_auto_analyze = ON）
+  2. 设置合理阈值（tidb_auto_analyze_ratio = 0.5）
+  3. 监控统计信息健康度
+  4. 大表定期手动 ANALYZE
+  5. 写入高峰避免 ANALYZE（调整时间窗口）
+```
+
 ## 十一、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

@@ -483,6 +483,533 @@ IKAnalyzer（中文推荐）：
   性能调优（分片数/副本数/JVM）
 ```
 
+## Tokenizer 深度（CJK 分词/同义词/停用词/分析器链）
+
+### 分词器配置详解
+
+```xml
+<!-- 分析器链完整配置 -->
+<fieldType name="text_cn" class="solr.TextField">
+  <!-- 索引时分析器 -->
+  <analyzer type="index">
+    <!-- 第一步：分词器 -->
+    <tokenizer class="solr.IKTokenizerFactory" useSmart="false"/>
+    <!-- 第二步：过滤器链 -->
+    <filter class="solr.IKStopFilterFactory" words="stopwords.txt"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <filter class="solr.SynonymGraphFilterFactory" synonyms="synonyms.txt"
+            ignoreCase="true" expand="true"/>
+    <filter class="solr.TrimFilterFactory"/>
+  </analyzer>
+  <!-- 查询时分析器 -->
+  <analyzer type="query">
+    <tokenizer class="solr.IKTokenizerFactory" useSmart="true"/>
+    <filter class="solr.IKStopFilterFactory" words="stopwords.txt"/>
+    <filter class="solr.LowerCaseFilterFactory"/>
+    <filter class="solr.SynonymGraphFilterFactory" synonyms="synonyms.txt"
+            ignoreCase="true" expand="true"/>
+  </analyzer>
+</fieldType>
+```
+
+| 组件 | 作用 | 示例 |
+|------|------|------|
+| Tokenizer | 文本切分为词元 | IKTokenizer: "中华人民共和国" → "中华/人民/共和国" |
+| StopFilter | 移除停用词 | "的/了/是/在" 被过滤 |
+| LowerCaseFilter | 统一小写 | "Solr" → "solr" |
+| SynonymFilter | 同义词扩展 | "手机" → "手机/移动电话" |
+| TrimFilter | 去除首尾空格 | " solr " → "solr" |
+| StemmerFilter | 词干提取 | "running" → "run" |
+
+### 同义词配置
+
+```xml
+<!-- synonyms.txt -->
+# 等价同义词（双向扩展）
+手机,移动电话,智能手机
+笔记本,笔记本电脑,laptop
+
+# 不对等同义词（单向扩展）
+番茄,西红柿
+土豆,马铃薯
+
+# 包含关系同义词
+iPhone,苹果手机
+```
+
+### CJK 分词对比
+
+| 分词器 | 原理 | 优点 | 缺点 | 适用 |
+|--------|------|------|------|------|
+| IKAnalyzer | 词典分词 | 精度高、可扩展 | 词典维护 | 中文搜索 |
+| CJKAnalyzer | 二元分词 | 简单、无词典 | 粒度粗 | 中日韩通用 |
+| jieba | 概率模型 | 分词准确 | 需 Python | Python 生态 |
+| HanLP | NLP 模型 | 功能丰富 | 资源消耗大 | NLP 场景 |
+| SmartChineseAnalyzer | Lucene 内置 | 开箱即用 | 精度一般 | 快速搭建 |
+
+## 评分公式（BM25 调参 k1/b）
+
+### BM25 评分公式详解
+
+```
+BM25 评分公式：
+  score(Q, D) = Σ IDF(qi) × (f(qi, D) × (k1 + 1)) / (f(qi, D) + k1 × (1 - b + b × |D|/avgdl))
+
+参数说明：
+  k1：词频饱和参数（1.2~2.0）
+    k1=0：完全忽略词频（退化为布尔模型）
+    k1=1.2：默认值，适度饱和
+    k1=2.0：词频影响更大
+
+  b：文档长度归一化参数（0~1）
+    b=0：完全忽略文档长度
+    b=0.75：默认值，适度惩罚长文档
+    b=1.0：完全归一化（长文档严重惩罚）
+
+  avgdl：平均文档长度
+  f(qi, D)：词 qi 在文档 D 中的频率
+  IDF(qi) = log((N - n(qi) + 0.5) / (n(qi) + 0.5) + 1)
+    N：总文档数
+    n(qi)：包含词 qi 的文档数
+```
+
+### 调参建议
+
+| 场景 | k1 | b | 理由 |
+|------|----|----|------|
+| 通用搜索 | 1.2 | 0.75 | 默认值，平衡 |
+| 精确匹配 | 0.9 | 0.4 | 减少词频影响 |
+| 长文档 | 1.5 | 0.8 | 增加词频影响，适度惩罚长文档 |
+| 短文档 | 1.2 | 0.6 | 适度归一化 |
+| 日志搜索 | 1.2 | 0.5 | 日志长度差异大 |
+| 电商搜索 | 1.4 | 0.7 | 商品描述长度适中 |
+
+## Faceted Search（Range/Value/facet.method）
+
+### 分面搜索类型
+
+```
+分面搜索 = 按维度聚合统计
+
+1. Value Facet（字段分面）：
+   facet.field=brand
+   → 统计每个品牌的文档数
+
+2. Range Facet（范围分面）：
+   facet.range=price
+   f.price.facet.range.start=0
+   f.price.facet.range.end=1000
+   f.price.facet.range.gap=100
+   → 按价格区间统计
+
+3. Date Facet（日期分面）：
+   facet.date=create_time
+   f.create_time.facet.date.start=2024-01-01T00:00:00Z
+   f.create_time.facet.date.gap=+1MONTH
+   → 按月份统计
+
+4. Pivot Facet（多级分面）：
+   facet.pivot=brand,category
+   → 按品牌+分类多级统计
+```
+
+### facet.method 参数
+
+| method | 说明 | 适用 | 性能 |
+|--------|------|------|------|
+| field | 字段值直接分面 | 低基数字段（品牌/状态） | 好 |
+| enum | 枚举所有值分面 | 值域小（<1000） | 好 |
+| fc（Field Cache） | 字段缓存分面 | 高基数字段 | 中 |
+| fcs（Field Cache Sort） | 排序后分面 | 需要排序 | 差 |
+
+```json
+// 分面搜索完整示例
+{
+  "query": "*:*",
+  "facet": {
+    "brand": {
+      "type": "terms",
+      "field": "brand_s",
+      "limit": 10,
+      "mincount": 1
+    },
+    "price_range": {
+      "type": "range",
+      "field": "price_f",
+      "ranges": [
+        {"from": 0, "to": 100, "label": "0-100"},
+        {"from": 100, "to": 500, "label": "100-500"},
+        {"from": 500, "label": "500+"}
+      ]
+    },
+    "category_brand": {
+      "type": "pivot",
+      "field": ["category_s", "brand_s"],
+      "mincount": 1
+    }
+  }
+}
+```
+
+## 高亮（Unified/Snippet/Original/fragment.size）
+
+### 高亮器对比
+
+| 高亮器 | 原理 | 优点 | 缺点 | 适用 |
+|--------|------|------|------|------|
+| Original | 原始高亮 | 简单 | 效果差 | 默认 |
+| FastVector | Term Vector 高亮 | 效果好 | 需存储 TV | 通用 |
+| Postings | 倒排索引高亮 | 效果好 | 需配置 | 精确高亮 |
+| Unified | 统一高亮器 | 自动选择最佳 | 资源消耗 | 推荐 |
+| Regex | 正则高亮 | 灵活 | 性能差 | 特殊场景 |
+
+### 高亮参数
+
+```
+高亮参数详解：
+  hl=true                          # 开启高亮
+  hl.fl=title,content              # 高亮字段
+  hl.snippets=3                    # 最大片段数
+  hl.fragsize=100                  # 片段大小（字符）
+  hl.method=unified                # 高亮方法
+  hl.simple.pre=<b>                # 前缀标签
+  hl.simple.post=</b>              # 后缀标签
+  hl.requireFieldMatch=true        # 必须匹配字段
+  hl.highlightMultiTerm=true       # 高亮通配符/模糊查询
+  hl.fragmentsBuilder=single       # 片段构建器
+
+Unified 高亮器优势：
+  1. 自动选择最佳高亮算法
+  2. 支持精确短语高亮
+  3. 支持多字段高亮
+  4. 支持自定义片段
+```
+
+## CDCR 跨数据中心复制
+
+### CDCR 架构
+
+```
+CDCR（Cross Data Center Replication）= 跨数据中心复制
+
+架构模式：
+  DC1（北京） ←→ CDCR ←→ DC2（上海）
+    ├── Leader 写入 → 异步复制到 DC2
+    ├── DC2 可读取（最终一致）
+    └── 双向复制（冲突检测）
+
+冲突检测：
+  Last-Writer-Wins（最后写入者胜）
+  向量时钟（Vector Clock）
+  业务层合并
+
+带宽控制：
+  限制跨区复制流量
+  压缩传输
+  队列缓冲
+```
+
+### CDCR 配置
+
+```bash
+# 创建 CDCR 集群
+# DC1
+bin/solr create -c myindex -shards 2 -replicationFactor 2
+
+# DC2
+bin/solr create -c myindex -shards 2 -replicationFactor 2
+
+# 配置 CDCR
+# solrconfig.xml
+<requestHandler name="/cdcr" class="solr.CDCRUpdateRequestHandler">
+  <str name="collection">myindex</str>
+  <lst name="configuration">
+    <lst name="source">
+      <str name="url">http://dc1-solr:8983/solr</str>
+    </lst>
+    <lst name="target">
+      <str name="url">http://dc2-solr:8983/solr</str>
+    </lst>
+  </lst>
+</requestHandler>
+```
+
+## 电商搜索应用（同义词/纠错/高亮）
+
+### 电商搜索架构
+
+```
+电商搜索完整流程：
+  用户输入 → 分词器（IKAnalyzer）→ 同义词扩展 → Solr 查询
+    → 分面过滤（品牌/价格/分类/评分）
+    → 排序（相关度/销量/价格/上架时间）
+    → 高亮显示
+    → 拼写检查（纠错）
+    → 搜索建议（Suggest）
+    → 自动补全（Completion）
+
+核心功能：
+  1. 同义词：手机 ↔ 移动电话
+  2. 纠错：iPhone → Did you mean: iPhone?
+  3. 高亮：搜索词在结果中高亮
+  4. 分面：品牌/价格/评分多维筛选
+  5. 自动补全：输入即提示
+```
+
+### 同义词与纠错配置
+
+```xml
+<!-- synonyms.txt（同义词） -->
+# 等价同义词
+手机,移动电话,智能手机
+笔记本,笔记本电脑,laptop
+电脑,计算机,台式机
+
+<!-- stopwords.txt（停用词） -->
+的
+了
+是
+在
+我
+有
+和
+就
+不
+人
+
+<!-- 拼写检查配置 -->
+<searchComponent name="spellcheck" class="solr.SpellCheckComponent">
+  <str name="queryAnalyzerFieldType">text_general</str>
+  <lst name="spellchecker">
+    <str name="name">default</str>
+    <str name="field">content</str>
+    <str name="spellcheckIndexDir">./spellchecker</str>
+    <float name="threshold">0.5</float>
+  </lst>
+</searchComponent>
+```
+
+## Solr vs ES 对比（架构/查询/集群/生态）
+
+| 维度 | Solr | Elasticsearch |
+|------|------|---------------|
+| 架构 | Master-Slave（ZK 协调） | 去中心化（内置集群） |
+| 查询语法 | SolrQL（类 SQL） | Query DSL（JSON） |
+| 分片管理 | 手动 + 自动 | 全自动 |
+| 集群协调 | ZooKeeper（外部依赖） | 内置 Zen Discovery |
+| 生态 | 成熟、稳定 | 活跃、发展快 |
+| 监控 | Solr Admin UI（基础） | Kibana（强大） |
+| 使用场景 | 企业搜索、电商 | 日志分析、全文搜索 |
+| 社区 | 稳定但较慢 | 非常活跃 |
+| 许可证 | Apache 2.0 | SSPL/Elastic License |
+| 云服务 | 少 | AWS OpenSearch/阿里云 ES |
+
+```
+选型决策：
+  选择 Solr：
+    1. 企业搜索/电商分面搜索
+    2. 已有 ZK 基础设施
+    3. 团队熟悉 Solr
+    4. 需要 SolrQL
+
+  选择 Elasticsearch：
+    1. 日志分析/APM
+    2. 实时搜索
+    3. 需要 DSL 查询
+    4. 需要内置分布式
+    5. 云原生（K8s Operator）
+
+  混合使用：
+    Solr：企业搜索核心业务
+    ES：日志/监控
+    根据场景选择合适方案
+```
+
+## SolrCloud 集群运维（Shard 切分/副本管理/均衡）
+
+### Shard 管理
+
+```bash
+# Shard 切分
+curl "http://solr:8983/solr/admin/collections?action=SPLITSHARD&collection=products&shard=shard1"
+
+# Shard 合并
+curl "http://solr:8983/solr/admin/collections?action=MERGESHARDS&collection=products&shards=shard1,shard2"
+
+# 添加 Shard
+curl "http://solr:8983/solr/admin/collections?action=CREATESHARD&collection=products&shard=shard4"
+
+# 删除 Shard
+curl "http://solr:8983/solr/admin/collections?action=DELETESHARD&collection=products&shard=shard4"
+
+# 查看 Shard 状态
+curl "http://solr:8983/solr/admin/collections?action=CLUSTERSTATUS&collection=products"
+```
+
+### 副本管理
+
+```bash
+# 添加副本
+curl "http://solr:8983/solr/admin/collections?action=ADDREPLICA&collection=products&shard=shard1&node=192.168.1.10:8983_solr"
+
+# 删除副本
+curl "http://solr:8983/solr/admin/collections?action=DELETEREPLICA&collection=products&shard=shard1&replica=replica2"
+
+# 副本均衡
+curl "http://solr:8983/solr/admin/collections?action=CLUSTERSTATUS"
+# 检查各节点副本分布是否均匀
+```
+
+### 均衡策略
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| 哈希分片 | hash(id) % numShards | 均匀分布 |
+| 路由分片 | CompositeId 路由 | 按业务分片 |
+| 时间分片 | 按时间范围分片 | 时序数据 |
+| 手动分片 | 指定路由键 | 精确控制 |
+
+## 性能调优（filterCache/queryCache/documentCache）
+
+### 三层缓存详解
+
+```
+Solr 三层缓存：
+  filterCache → 缓存 FilterQuery 结果（fq 查询的文档 ID 集合）
+  queryResultCache → 缓存完整查询结果
+  documentCache → 缓存文档字段值
+
+filterCache 工作原理：
+  fq=category:electronics → 缓存匹配的文档 ID 集合
+  下次相同 fq → 直接取缓存（不重新查询）
+  多个 fq 组合 → 取缓存交集/并集
+
+queryResultCache 工作原理：
+  完整查询（q+fq+sort+start+rows）→ 缓存结果
+  完全相同查询 → 直接返回缓存
+
+documentCache 工作原理：
+  文档 ID → 缓存字段值
+  多个查询涉及同一文档 → 减少磁盘 I/O
+```
+
+### 调优参数
+
+| 缓存 | 参数 | 建议值 | 说明 |
+|------|------|--------|------|
+| filterCache | size | 512-1024 | 常用过滤条件数 |
+| filterCache | initialSize | 512 | 预热数量 |
+| filterCache | autowarmCount | 50-100 | 旧缓存迁移数量 |
+| queryResultCache | size | 512-1024 | 高频查询数 |
+| queryResultCache | initialSize | 512 | 预热数量 |
+| queryResultCache | autowarmCount | 50-100 | 迁移热门查询 |
+| documentCache | size | 10240 | 热门文档数 |
+
+```xml
+<!-- solrconfig.xml 缓存配置 -->
+<query>
+  <filterCache class="solr.FastLRUCache"
+    size="512"
+    initialSize="512"
+    autowarmCount="50"/>
+  <queryResultCache class="solr.LRUCache"
+    size="1024"
+    initialSize="1024"
+    autowarmCount="100"/>
+  <documentCache class="solr.LRUCache"
+    size="10240"/>
+</query>
+```
+
+## SolrJ 客户端使用
+
+### SolrJ 完整示例
+
+```java
+// 创建 SolrClient
+SolrClient client = new HttpSolrClient.Builder("http://localhost:8983/solr/mycore").build();
+
+// 构建查询
+SolrQuery query = new SolrQuery();
+query.setQuery("title:solr");
+query.addFilterQuery("price:[100 TO 500]");
+query.setFacet(true);
+query.addFacetField("brand");
+query.addFacetField("category");
+query.setHighlight(true);
+query.addHighlightField("title");
+query.setHighlightSnippets(3);
+query.setHighlightFragsize(100);
+query.setRows(10);
+query.setSort("score", SolrQuery.ORDER.desc);
+
+// 执行查询
+QueryResponse response = client.query(query);
+SolrDocumentList docs = response.getResults();
+
+// 处理结果
+for (SolrDocument doc : docs) {
+    String id = (String) doc.getFieldValue("id");
+    String title = (String) doc.getFieldValue("title");
+    Double score = (Double) doc.getFieldValue("score");
+}
+
+// 处理高亮
+Map<String, Map<String, List<String>>> highlighting = response.getHighlighting();
+for (SolrDocument doc : docs) {
+    String id = (String) doc.getFieldValue("id");
+    Map<String, List<String>> hl = highlighting.get(id);
+    if (hl != null && hl.containsKey("title")) {
+        String highlightedTitle = hl.get("title").get(0);
+    }
+}
+
+// 处理分面
+FacetField brandFacet = response.getFacetField("brand");
+if (brandFacet != null) {
+    for (Count count : brandFacet.getValues()) {
+        String brand = count.getName();
+        long docCount = count.getCount();
+    }
+}
+```
+
+### SolrJ 更新示例
+
+```java
+// 添加文档
+SolrInputDocument doc = new SolrInputDocument();
+doc.addField("id", "1");
+doc.addField("title", "测试商品");
+doc.addField("description", "这是一个测试商品");
+doc.addField("price", 99.99);
+client.add(doc);
+client.commit();
+
+// 批量添加
+List<SolrInputDocument> docs = new ArrayList<>();
+for (Product product : products) {
+    SolrInputDocument doc = new SolrInputDocument();
+    doc.addField("id", product.getId());
+    doc.addField("title", product.getName());
+    doc.addField("price", product.getPrice());
+    docs.add(doc);
+}
+client.add(docs);
+client.commit();
+
+// 删除文档
+client.deleteById("1");
+client.commit();
+
+// 原子更新
+SolrInputDocument updateDoc = new SolrInputDocument();
+updateDoc.addField("id", "1");
+updateDoc.addField("price", MapUpdateDecorator.createIncrement(10.0));
+client.add(updateDoc);
+client.commit();
+```
+
 ## 七、与其他板块的关系
 
 - Elasticsearch 见「[ES 体系](../ES体系.md)」；

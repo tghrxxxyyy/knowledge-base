@@ -1762,6 +1762,453 @@ public class SnowflakeIdGenerator {
 }
 ```
 
+## Vitess VReplication 实时同步详解
+
+### VReplication 架构
+
+```
+VReplication = Vitess 的实时数据同步引擎
+
+架构：
+  源 VTGate → Binlog 流 → VReplication 引擎 → 目标 VTGate
+                          │
+                     ① Filter（过滤规则）
+                     ② Transform（数据转换）
+                     ③ MaxReplicationLag（延迟控制）
+
+工作流程：
+  1. 全量同步：按主键分块流式拷贝（Copy 阶段）
+  2. 增量同步：binlog 持续复制（Catch up 阶段）
+  3. 流量切换：原子路由变更（Switch Traffic）
+  4. 清理：删除源数据
+
+使用场景：
+  ├── 数据迁移（MySQL → Vitess）
+  ├── 跨 Keyspace 同步
+  ├── 分片重组（Reshard）
+  └── 只读副本同步
+```
+
+### VReplication 配置示例
+
+```bash
+# 创建 VReplication 流
+vtctlclient MoveTables create \
+  --workflow=migrate_customer \
+  --source-keyspace=commerce \
+  --tables=customer,users \
+  customer
+
+# 查看 VReplication 状态
+vtctlclient Workflow --keyspace customer show migrate_customer
+# 状态: Copying → Running(已追平)
+
+# 数据校验（VDiff）
+vtctlclient VDiff create --workflow migrate_customer --target-keyspace customer
+vtctlclient VDiff show --workflow migrate_customer --target-keyspace customer
+
+# 流量切换
+vtctlclient MoveTables switchtraffic --workflow migrate_customer --keyspace customer
+# --tablet-types=rdonly 先切只读
+
+# 完成迁移
+vtctlclient MoveTables complete --workflow migrate_customer --keyspace customer
+```
+
+## Vitess Resharding（Split/Merge）
+
+### Split 操作步骤
+
+```
+水平拆分（Split）：
+  场景：单库数据量/压力大 → 按分片键拆分
+
+  步骤：
+    1. 定义新分片方案（VSchema 更新 vindex）
+       如：-80,80- → -40,40-80,80-
+    
+    2. 创建 Reshard 工作流
+       vtctlclient Reshard create --workflow=reshard_cust \
+         --source-shards='-80,80-' \
+         --target-shards='-40,40-80,80-' customer
+    
+    3. 自动执行：SplitClone 式复制 + VReplication 追增量
+    
+    4. VDiff 校验 → SwitchTraffic → Complete
+    
+    5. 旧分片持续服务读写，切换是原子路由变更，秒级完成
+```
+
+### Merge 操作步骤
+
+```
+水平合并（Merge）：
+  场景：分片过多，合并减少开销
+
+  步骤：
+    1. 定义合并方案（如 -40,40-80,80- → -80,80-）
+    
+    2. 创建 Reshard 工作流
+       vtctlclient Reshard create --workflow=merge_cust \
+         --source-shards='-40,40-80,80-' \
+         --target-shards='-80,80-' customer
+    
+    3. 自动执行：数据合并 + 增量同步
+    
+    4. VDiff 校验 → SwitchTraffic → Complete
+```
+
+### Split/Merge 对比
+
+| 操作 | 场景 | 数据流向 | 风险 | 注意事项 |
+|------|------|----------|------|----------|
+| Split | 数据量大，需要扩容 | 1 分片 → N 分片 | 中 | 避免高峰期 |
+| Merge | 分片过多，减少开销 | N 分片 → 1 分片 | 中 | 数据合并后路由重算 |
+
+## MyCat 读写分离（writeType/loadBalance）
+
+### 读写分离配置
+
+```xml
+<!-- MyCat 读写分离配置 -->
+<dataHost name="readwrite" maxCon="1000" minCon="10" balance="3"
+          writeType="0" dbType="mysql" dbDriver="native">
+  <heartbeat>select user()</heartbeat>
+  <writeHost host="hostM1" url="localhost:3306" user="root" password="password"/>
+  <readHost host="hostS1" url="localhost:3307" user="root" password="password"/>
+  <readHost host="hostS2" url="localhost:3308" user="root" password="password"/>
+</dataHost>
+```
+
+### writeType 配置
+
+| writeType | 说明 | 适用场景 |
+|-----------|------|----------|
+| 0 | 写操作只发送到写主机（推荐） | 标准读写分离 |
+| 1 | 写操作负载均衡到所有写主机 | 多写主机场景 |
+| 2 | 写操作随机发送到写主机 | 简单场景 |
+
+### balance 配置
+
+| balance | 说明 | 适用场景 |
+|---------|------|----------|
+| 0 | 不开启读写分离 | 单机场景 |
+| 1 | 所有读主机负载均衡 | 读多写少 |
+| 2 | 所有主机负载均衡 | 写少读多 |
+| 3 | 所有读主机负载均衡（推荐） | 标准读写分离 |
+
+### 负载均衡策略
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| RoundRobin | 轮询 | 从节点性能一致 |
+| 权重 | 按权重分配 | 从节点性能不同 |
+| 随机 | 随机选择 | 简单场景 |
+| 主从延迟 | 优先选延迟低的从 | 对一致性要求高 |
+
+```xml
+<!-- rule.xml 负载均衡配置 -->
+<loadBalance name="lb" class="io.mycat.loadbalance.RoundRobinLoadBalance">
+  <property name="weights">1,1,1</property>
+</loadBalance>
+```
+
+## ShardingSphere-JDBC vs MyCat 对比
+
+### 架构对比
+
+| 维度 | ShardingSphere-JDBC | MyCat |
+|------|---------------------|-------|
+| 部署模式 | SDK 内嵌（应用进程内） | 独立代理进程 |
+| 性能 | 无网络开销（进程内调用） | 有网络开销（代理层） |
+| 连接数 | 应用直连数据库 | 应用连代理，代理连数据库 |
+| 事务 | 本地事务（单分片） | 分布式事务（XA/Seata） |
+| 运维 | 需重新部署应用 | 独立运维，应用无感知 |
+| 语言支持 | Java（JDBC） | 多语言（MySQL 协议） |
+| 功能丰富度 | 高（影子库/加密/读写分离） | 中（基础分片） |
+
+### 选型决策
+
+```mermaid
+flowchart TD
+    A[分库分表需求] --> B{语言?}
+    B -->|Java| C{性能要求?}
+    B -->|非 Java| D[MyCat]
+    C -->|极致性能| E[ShardingSphere-JDBC]
+    C -->|一般性能| F{运维能力?}
+    F -->|强| G[MyCat]
+    F -->|弱| E
+    E --> H[应用内嵌，无代理开销]
+    D --> I[独立代理，多语言支持]
+```
+
+## 分库分表全局 ID（UUID/雪花）
+
+### 方案对比
+
+| 方案 | QPS | 有序性 | 依赖 | 适用场景 |
+|------|-----|--------|------|---------|
+| UUID | 无限制 | 无序 | 无 | 分布式系统唯一标识 |
+| 数据库自增 | ~10万/秒 | 严格有序 | 数据库 | 单库场景 |
+| Redis INCR | ~100万/秒 | 严格有序 | Redis | 分布式锁/计数器 |
+| 雪花算法 | ~400万/秒 | 趋势有序 | 无 | 分布式系统 |
+| Leaf-segment | ~100万/秒 | 严格有序 | 数据库 | 分布式系统 |
+| Leaf-snowflake | ~400万/秒 | 趋势有序 | ZK | 分布式系统 |
+
+### 雪花算法实现
+
+```java
+// 雪花算法实现
+public class SnowflakeIdGenerator {
+    private long workerId;
+    private long datacenterId;
+    private long sequence = 0L;
+    private long workerIdBits = 5L;
+    private long datacenterIdBits = 5L;
+    private long sequenceBits = 12L;
+    
+    private long maxWorkerId = ~(-1L << workerIdBits);
+    private long maxDatacenterId = ~(-1L << datacenterIdBits);
+    
+    private long workerIdShift = sequenceBits;
+    private long datacenterIdShift = sequenceBits + workerIdBits;
+    private long timestampLeftShift = sequenceBits + workerIdBits + datacenterIdBits;
+    private long sequenceMask = ~(-1L << sequenceBits);
+    
+    private long lastTimestamp = -1L;
+    
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+        
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("Clock moved backwards");
+        }
+        
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        return ((timestamp - epoch) << timestampLeftShift) |
+               (datacenterId << datacenterIdShift) |
+               (workerId << workerIdShift) |
+               sequence;
+    }
+    
+    private long tilNextMillis(long lastTimestamp) {
+        long timestamp = System.currentTimeMillis();
+        while (timestamp <= lastTimestamp) {
+            timestamp = System.currentTimeMillis();
+        }
+        return timestamp;
+    }
+}
+```
+
+## Vitess Tablet 类型（PRIMARY/REPLICA/RDONLY）
+
+### Tablet 类型详解
+
+```
+Vitess Tablet 类型：
+  ① PRIMARY（主节点）
+    - 处理写请求
+    - 复制源
+    - 高可用：故障时自动提升 replica
+
+  ② REPLICA（副本节点）
+    - 处理读请求
+    - 异步复制自 primary
+    - 提升读吞吐
+
+  ③ RDONLY（只读节点）
+    - 处理批量查询/分析查询
+    - 不参与复制
+    - 可用于备份/数据导出
+
+  ④ SPARE（备用节点）
+    - 预留节点
+    - 可快速提升为其他角色
+    - 用于滚动升级
+```
+
+### Tablet 状态管理
+
+```bash
+# 查看 tablet 状态
+vtctlclient ListTablets
+
+# tablet 状态：
+# - SERVING：正常服务
+# - NOT_SERVING：不服务（维护/故障）
+# - SHUTDOWN：正在关闭
+
+# 手动切换 tablet 角色
+vtctlclient PlannedReparentShard -keyspace=commerce -shard=0 -new_master=tablet-2
+
+# tablet 健康检查
+vtctlclient HealthCheck -tablet=tablet-1
+```
+
+## MyCat 分片算法源码（mod/range）
+
+### 分片算法详解
+
+```
+MyCat 分片算法：
+
+1. PartitionByMod（取模）
+   private int calculate(int segment) {
+       if (count > 0 && segment >= 0) {
+           return segment % count;  // 正数直接取模
+       }
+       // 坑1：负数取模 —— MySQL 的 % 可返回负数，源码用 Math.abs 兜底
+       // 坑2：扩容时 count 变化 → 所有 key 重算 → 全量数据迁移
+       return Math.abs(segment % count);
+   }
+
+2. PartitionByRange（范围）
+   public int calculate(String columnValue) {
+       long value = Long.parseLong(columnValue);
+       Partition p = this.getPartition(value);  // TreeMap.floorEntry O(logN)
+       if (p == null) {
+           throw new IllegalArgumentException(...);
+       }
+       return p.getNodeIndex();
+   }
+
+3. PartitionByHashString（字符串哈希）
+   public int calculate(String columnValue) {
+       int hash = hashString(columnValue);  // 逐字符 FNV/hash 计算
+       return hash % count;
+   }
+```
+
+### 算法对比
+
+| 算法 | 扩容友好 | 数据均匀 | 范围查询 | 适用 |
+|------|---------|---------|----------|------|
+| Mod | ❌ 全量迁移 | ✅ | ❌ 广播 | 点查为主 |
+| Range | ✅ 只加新区间 | ❌ 尾部热点 | ✅ 直达单片 | 时序/归档 |
+| HashString | ❌ 全量迁移 | 较均匀 | ❌ | 字符串主键 |
+
+## 跨分片 JOIN 代价
+
+```
+跨分片 JOIN 三种方案：
+
+1. 全局表广播
+   每个 shard 存全量副本
+   写放大 = 分片数
+   适用：字典表/配置表（<1万行）
+
+2. ER 分片同片
+   子表按父表分片键同片存储
+   设计期约束强
+   适用：订单↔订单项、用户↔收货地址
+
+3. 应用层组装
+   各查各的，代码内存 JOIN
+   多一次 RTT
+   适用：中小结果集
+
+代价对比：
+  全局表：写放大高，读无跨片
+  ER 分片：设计约束强，扩容需整组迁移
+  应用层：RTT 多，应用内存压力
+```
+
+## 垂直拆分实操
+
+```
+垂直拆分 = 按业务域拆分表
+
+实操路径：
+  1. 识别业务域（用户域/订单域/商品域）
+  2. 创建目标 keyspace
+  3. MoveTables 在线迁移表
+  4. VDiff 校验一致性
+  5. SwitchTraffic 原子切换
+  6. 清理旧数据
+
+Vitess 垂直拆分：
+  vtctlclient CreateKeyspace --durability-policy=none customer
+  vtctlclient MoveTables create --source-keyspace=commerce \
+    --tables='customer.*' --workflow=cust_split customer
+  vtctlclient VDiff create --workflow cust_split --target-keyspace customer
+  vtctlclient MoveTables switchtraffic --workflow cust_split --target-keyspace customer
+  vtctlclient MoveTables complete --workflow cust_split --target-keyspace customer
+```
+
+## Vitess MySQL 兼容性限制
+
+| 功能 | 兼容性 | 说明 |
+|------|--------|------|
+| SQL 语法 | 95%+ | 基础 CRUD 无差异 |
+| 存储过程 | 不支持 | VTGate 不执行存储过程 |
+| 触发器 | 不支持 | VTGate 不处理触发器 |
+| 外键 | 部分支持 | 逻辑外键，不保证原子性 |
+| 自增 ID | 需配置 | VSequence 生成全局 ID |
+| 分区表 | 不支持 | 需用 vindex 替代 |
+| 全文索引 | 不支持 | 需外部搜索引擎 |
+| 空间数据 | 不支持 | 需外部存储 |
+
+```
+MySQL 兼容性最佳实践：
+  1. 避免使用存储过程/触发器
+  2. 外键改为应用层保证
+  3. 自增 ID 改为雪花算法
+  4. 分区表改为 vindex 分片
+  5. 全文索引接入 Solr/ES
+  6. 定期测试 SQL 兼容性
+```
+
+## 生产选型案例
+
+```
+案例一：电商系统（日增 100GB）
+  需求：分库分表 + 在线扩容 + 读写分离
+  选型：Vitess
+  理由：
+    - 在线 re-shard（VReplication）
+    - 云原生（K8s Operator）
+    - YouTube 级验证
+  架构：
+    - VTGate ×3（无状态网关）
+    - VTTablet ×16（每 shard 4 节点）
+    - MySQL ×16（4 shards × 4 副本）
+
+案例二：金融系统（强一致）
+  需求：分库分表 + 分布式事务 + 强一致
+  选型：ShardingSphere-JDBC + Seata
+  理由：
+    - Java 生态
+    - XA 分布式事务
+    - 无代理开销
+  架构：
+    - ShardingSphere-JDBC 嵌入应用
+    - Seata 事务协调器
+    - MySQL 主从 ×8
+
+案例三：存量系统改造（多语言）
+  需求：分库分表 + 透明代理 + 多语言支持
+  选型：MyCat
+  理由：
+    - MySQL 协议兼容
+    - 多语言支持
+    - 运维简单
+  架构：
+    - MyCat ×2（主备）
+    - MySQL ×8（4 shards × 2 副本）
+    - VIP 高可用
+```
+
 - ShardingSphere 见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - TiDB（NewSQL）见「[TiDB 与 NewSQL](./TiDB与NewSQL.md)」；
 - 分布式事务见「[分布式事务 Seata](./分布式事务Seata.md)」；
