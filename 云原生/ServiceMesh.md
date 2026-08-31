@@ -342,6 +342,217 @@ envoy_cluster_upstream_cx_active  # Envoy 上游活跃连接
 
 ---
 
+## 十、流量管理进阶（镜像/故障注入/重试超时）
+
+### 10.1 流量镜像（Shadow / Mirror）
+
+把线上流量**复制一份**发给测试版本，不影响真实用户，用于验证新版本正确性。
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service
+spec:
+  hosts: [order-service]
+  http:
+  - route:
+    - destination: { host: order-service, subset: v1 }
+      weight: 100
+    mirror:
+      host: order-service
+      subset: v2          # 镜像到 v2，响应被丢弃
+    mirrorPercentage:
+      value: 100          # 复制 100% 流量做影子测试
+```
+
+### 10.2 故障注入（混沌/演练）
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service
+spec:
+  hosts: [order-service]
+  http:
+  - fault:
+      delay:
+        percentage: { value: 50 }     # 50% 请求注入延迟
+        fixedDelay: 3s
+      abort:
+        percentage: { value: 10 }     # 10% 请求直接返回 500
+        httpStatus: 500
+    route:
+    - destination: { host: order-service, subset: v1 }
+```
+
+### 10.3 重试与超时（防御下游抖动）
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service
+spec:
+  hosts: [order-service]
+  http:
+  - timeout: 2s
+    retries:
+      attempts: 3
+      perTryTimeout: 1s
+      retryOn: "5xx,reset,connect-failure,refused-stream"
+    route:
+    - destination: { host: order-service, subset: v1 }
+```
+
+> 经验：重试要配合**令牌桶/幂等**，避免重试风暴放大下游压力（与「[稳定性三板斧](../场景设计/稳定性三板斧：限流-熔断-降级.md)」联动）。
+
+### 10.4 路由决策图
+
+```mermaid
+flowchart TD
+    A[入口流量] --> B{VirtualService 匹配?}
+    B -- 否 --> C[默认路由 subset v1]
+    B -- Header/权重 --> D[灰度/金丝雀]
+    B -- mirror --> E[影子测试 v2]
+    D --> F[DestinationRule: 负载均衡/熔断/子集]
+    E --> F
+    F --> G[目标 Pod]
+```
+
+---
+
+## 十一、mTLS 深入（SPIFFE/SPIRE 与证书轮换）
+
+Istio 的零信任基于 **SPIFFE** 身份：每个工作负载拿到形如 `spiffe://cluster.local/ns/default/sa/order-service` 的身份，证书由 Citadel/istiod 签发并**自动轮换**（默认 24h）。
+
+| 模式 | 行为 |
+|------|------|
+| `PERMISSIVE` | 同时接受 mTLS 与明文（迁移期用） |
+| `STRICT` | 强制 mTLS（生产最终态） |
+| `DISABLE` | 关闭 mTLS |
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: default
+spec:
+  mtls:
+    mode: STRICT            # 命名空间内强制 mTLS
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: payment
+spec:
+  selector: { matchLabels: { app: payment } }
+  mtls:
+    mode: STRICT
+```
+
+证书轮换对应用**透明**（Envoy 热加载），无需重启业务容器。排查握手失败看 `istiod` 日志与 `SPIFFE` 身份匹配。
+
+---
+
+## 十二、可观测性集成（指标/追踪联动）
+
+Service Mesh 自动产生 RED 指标与分布式追踪，无需改业务代码。
+
+```yaml
+# 开启 Sidecar 访问日志与追踪采样
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+  - providers:
+    - name: otel
+    randomSamplingPercentage: 10     # 采样率 10%
+  accessLogging:
+  - providers: [{ name: envoy }]
+```
+
+关键指标（接「[可观测性](./可观测性.md)」的 Prometheus/Grafana）：
+- `istio_requests_total`：请求计数（按服务/响应码/版本）。
+- `istio_request_duration_milliseconds`：延迟分布。
+- `istio_tcp_connections_opened_total`：连接数。
+- Envoy 自带的 `envoy_cluster_upstream_cx_active` 等。
+
+---
+
+## 十三、灰度发布策略（渐进式交付）
+
+```mermaid
+flowchart LR
+    A[100% v1] --> B[95% v1 / 5% v2]
+    B --> C[80/20] --> D[50/50] --> E[100% v2]
+    C -.异常.-> F[回滚到 v1]
+    D -.异常.-> F
+```
+
+渐进式要点：
+- 先用 `weight` 小流量（5%）观察错误率/延迟。
+- 配合 `DestinationRule` 的子集做版本隔离。
+- 结合「[Argo Rollouts](../... ) / Flagger」做自动分析与自动推进/回滚（见「[GitOps](./GitOps.md)」）。
+
+---
+
+## 十四、性能调优进阶与排障流程
+
+### 14.1 调优清单
+
+| 项 | 建议 |
+|----|------|
+| Sidecar 资源 | 给 `istio-proxy` 设 requests/limits（防饿死业务） |
+| 连接池 | 调 `connectionPool` 减少握手开销 |
+| mTLS | 非敏感链路用 `PERMISSIVE` 过渡 |
+| 采样率 | trace 采样 1%~10%（详见可观测性） |
+| 注入范围 | 只给需治理的 Pod 注入 |
+| Ambient | 大集群考虑去 Sidecar（见 §五） |
+
+### 14.2 排障流程
+
+```mermaid
+flowchart TD
+    A[请求失败/503] --> B{目标有可用端点?}
+    B -- 否 --> C[查 DestinationRule subsets / Endpoints]
+    B -- 是 --> D{VirtualService 路由匹配?}
+    D -- 否 --> E[查 hosts/match 规则]
+    D -- 是 --> F{mTLS 握手?}
+    F -- 失败 --> G[查 PeerAuthentication / 证书]
+    F -- 成功 --> H[查业务容器]
+```
+
+---
+
+## 十五、迁移策略与生产 Checklist
+
+**迁移到 Mesh 的渐进路线**：
+1. 先装控制面，命名空间不打 `istio-injection`，零影响。
+2. 选一个非核心服务，开 `PERMISSIVE` 注入 Sidecar，验证流量。
+3. 逐步推广，关键服务间开启 `STRICT` mTLS + AuthorizationPolicy。
+4. 复杂路由/灰度/熔断迁移到 VirtualService/DestinationRule。
+5. 大集群评估 Ambient 降本。
+
+**生产 Checklist**：
+- [ ] Sidecar 资源已设限额
+- [ ] mTLS 最终态 `STRICT`，迁移期 `PERMISSIVE`
+- [ ] 关键服务 AuthorizationPolicy 已配（零信任）
+- [ ] 重试/超时已配且幂等
+- [ ] 指标/追踪接入 Grafana/可观测
+- [ ] 采样率合理（避免开销）
+- [ ] 排障 runbook 就绪
+
+**速记口诀**：
+> 数据面 Envoy 扛治理，控制面 istiod 下配置；iptables 拦流量，xDS 推规则；mTLS 靠 SPIFFE 自动轮换；灰度靠 VS 权重，隔离靠 AuthorizationPolicy；大集群上 Ambient 降本。
+
+---
+
 ## 九、与其他板块的关系
 
 - Kubernetes 核心见「[Kubernetes 核心](./Kubernetes核心.md)」；

@@ -157,3 +157,271 @@ Knative = 流量打 0 的 Deployment + 按请求伸缩（KPA）+ 事件总线
 12. Q：限流在 Serverless 下怎么做？ A：网关限流 + 队列削峰 + 函数并发配额控制。
 13. Q：Serverless 如何保证幂等？ A：事件去重（幂等键）+ 处理幂等化，平台只保证至少一次。
 14. Q：KEDA 是 Serverless 吗？ A：不是 FaaS，是给现有 Deployment 加事件驱动的自动伸缩。
+
+---
+
+## 八、Knative 深入（Serving + Eventing）
+
+Knative 是跑在 K8s 之上的 Serverless 层，把「缩到 0、按请求伸缩」做成标准能力，适合已有 K8s 集群又想要 Serverless 体验的团队。
+
+### 8.1 Serving 数据面架构
+
+```mermaid
+sequenceDiagram
+    participant U as 用户请求
+    participant A as Activator
+    participant Q as Queue Proxy
+    participant P as 用户容器(Revision)
+    U->>A: 请求到达（当前 0 实例）
+    A->>P: 唤醒/拉起 Pod，缓冲请求
+    P->>Q: 流量经 Queue Proxy 计量
+    Q->>P: 转发
+    Note over A,P: 空闲超时后 Autoscaler 缩到 0
+```
+
+核心组件：
+- **Activator**：缓冲请求并「唤醒」缩到 0 的 Revision（冷启动期间承接流量）。
+- **Queue Proxy**（Sidecar）：每个 Revision Pod 内的流量代理，负责请求计数、并发限制、指标上报。
+- **Autoscaler**：基于请求数（KPA，Knative Pod Autoscaler）或并发，决定 0~N 实例。
+- **Revision**：每次配置变更生成一个不可变版本，天然支持蓝绿/金丝雀。
+
+### 8.2 Service 与冷启动配置
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"        # 可缩到 0
+        autoscaling.knative.dev/maxScale: "10"
+        autoscaling.knative.dev/target: "100"        # 单实例目标并发
+        autoscaling.knative.dev/window: "60s"        # 缩容观察窗口
+    spec:
+      containers:
+      - image: myregistry/hello:1.0
+        resources:
+          requests: { cpu: "100m", memory: "128Mi" }
+```
+
+### 8.3 Eventing（事件驱动）
+
+Knative Eventing 提供 Broker/Trigger 模型，把事件源（Kafka/Cron/对象存储）与函数解耦：
+
+```yaml
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: hello-trigger
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: com.example.order.created   # 只消费该类型事件
+  subscriber:
+    ref: { apiVersion: serving.knative.dev/v1, kind: Service, name: hello }
+```
+
+---
+
+## 九、OpenFaaS 架构与 Watchdog
+
+OpenFaaS 把「任意二进制/镜像」变成可被 HTTP 触发的函数，核心是 **Watchdog** 进程。
+
+```mermaid
+flowchart LR
+    G[Gateway] --> W[Watchdog(Sidecar)]
+    W --> F[函数进程/二进制]
+    F --> W --> G
+```
+
+- **Gateway**：接收请求、做认证/伸缩/指标。
+- **Watchdog**：每个函数 Pod 内的代理，把 HTTP 请求转发给函数入口（`STDIN` 或 HTTP），并管理超时与并发。
+- 优势：不限定语言/运行时，能直接复用已有服务；适合团队自运维、轻量。
+
+---
+
+## 十、冷启动测量与优化实战（含代码）
+
+### 10.1 怎么测冷启动
+
+- Lambda：在 CloudWatch 查 `Init Duration`（初始化耗时）与 `Duration`；用 X-Ray 看分段。
+- Knative：看 Activator 唤醒延迟 + Revision Pod 启动时间（`kubectl get pods` 就绪时间差）。
+- 通用：在函数入口打点（进入时刻 - 平台注入的请求到达时刻）。
+
+### 10.2 惰性初始化（应用层免费优化）
+
+**Go 示例**（全局变量只初始化一次，复用连接/客户端）：
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+// 全局、惰性初始化：首次调用时创建，之后复用（热实例零开销）
+var (
+	s3Client *s3.Client
+	initErr  error
+	inited   bool
+)
+
+func getS3(ctx context.Context) (*s3.Client, error) {
+	if inited {
+		return s3Client, initErr
+	}
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		initErr = err
+		return nil, err
+	}
+	s3Client = s3.NewFromConfig(cfg)
+	inited = true
+	return s3Client, nil
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	client, err := getS3(ctx) // 冷启动首次慢，热调用毫秒级
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = client
+	w.Write([]byte("ok " + time.Now().String()))
+}
+
+func main() {
+	http.HandleFunc("/", handler)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+**Python 示例**（模块级 client 复用）：
+
+```python
+import json, boto3
+
+# 模块加载时初始化一次；热实例直接复用
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("orders")
+
+def handler(event, context):
+    # 冷启动：boto3 客户端已就绪；热调用直接进业务逻辑
+    table.put_item(Item={"id": event["id"]})
+    return {"statusCode": 200, "body": json.dumps({"ok": True})}
+```
+
+### 10.3 平台层优化
+
+| 手段 | 成本 | 适用 |
+|------|------|------|
+| 预留并发 / Provisioned Concurrency | 高（常驻计费） | 延迟敏感核心链路 |
+| 预热（定时触发保活） | 中 | 无预留能力的平台 |
+| 快照恢复（Firecracker snapshot / CRIU） | 低 | 平台支持时首选 |
+| 缩小包体/精简依赖 | 免费 | 所有场景 |
+
+---
+
+## 十一、事件源矩阵与状态外置
+
+```mermaid
+flowchart TD
+    subgraph 触发源
+      H[HTTP/API Gateway]
+      M[消息队列 Kafka/MQ]
+      O[对象存储上传]
+      C[定时器 Cron]
+      D[数据库 CDC]
+    end
+    触发源 --> F[函数实例]
+    F --> S[(状态外置: Redis/对象存储/DB)]
+```
+
+**状态外置三原则**：
+1. 函数实例随时创建/销毁，本地内存不可信 → 状态放外部存储。
+2. 连接池/缓存放进程外（Redis）或利用「惰性初始化 + 热实例复用」。
+3. 幂等键落库（去重表）应对「至少一次」投递（见「[幂等设计](../场景设计/幂等设计.md)」）。
+
+---
+
+## 十二、可观测性与安全
+
+- **可观测**：结构化日志 + `traceId` 透传 + 指标埋点（QPS/错误/时长）。函数粒度细，必须靠分布式追踪串起来（见「[可观测性](./可观测性.md)」）。
+- **最小权限**：函数执行角色（IAM Role / ServiceAccount）只授必需权限，避免长期凭证。
+- **密钥**：用平台密钥管理（Secret Manager / K8s Secret），**绝不**硬编码。
+- **超时与重试**：函数设合理超时；平台重试可能重复触发 → 再次强调幂等。
+
+---
+
+## 十三、本地开发与调试
+
+| 工具 | 用途 |
+|------|------|
+| AWS SAM / Serverless Framework | 本地模拟 Lambda + API Gateway，热调试 |
+| `faas-cli` | OpenFaaS 本地构建/部署/调用 |
+| `kn` + `func` | Knative 本地函数开发 |
+| 容器本地跑 | 把函数打成镜像本地 `docker run` 验证逻辑 |
+
+```bash
+# Serverless Framework 本地调用
+serverless invoke local -f orderHandler --data '{"id":1}'
+# OpenFaaS 本地构建并部署
+faas-cli build -f stack.yml && faas-cli deploy -f stack.yml
+```
+
+---
+
+## 十四、成本计算与 FinOps
+
+通用费用模型：
+
+```
+费用 = 请求次数 × 单价 + 执行时长(GB·s) × 单价 + 预留并发费用
+```
+
+**直觉对比**（定性，非精确数字）：
+- 稳态高流量（常驻打满）：Serverless 单价含托管溢价，**通常贵于**常驻容器。
+- 稀疏/波动流量：按量付费 + 可缩到 0，成本**显著低于**常驻。
+- 极端削峰（秒杀）：Serverless 弹性价值 >> 成本，常驻方案要么浪费要么撑不住。
+
+**FinOps 姿势**：稳态服务用容器/K8s；事件型、波动型、原型用函数；混合架构最经济（见「[K8s 运维实战](./K8s运维实战.md)」容量规划）。
+
+---
+
+## 十五、反模式与最佳实践
+
+**反模式**：
+- 把核心在线业务整体函数化（延迟、可观测、成本全吃亏）。
+- 在 handler 里做重初始化（每次冷启动都建连接池、加载大模型）。
+- 依赖函数本地磁盘/内存做状态。
+- 用长期凭证而非角色授权。
+
+**最佳实践**：
+- BaaS 化可托管件（DB/存储/认证）+ 函数做事件胶水 + 稳态用容器。
+- 惰性初始化 + 预留并发保关键链路。
+- 每个函数单一职责、幂等、超时可控。
+- 日志结构化、trace 透传、指标落地。
+
+---
+
+## 十六、速记口诀
+
+> 事件触发无状态，冷启动是命门；惰性初始化 + 预留并发双管齐下；状态外置靠存储，幂等去重保安全；稳态用容器，波动用函数，混合最经济。
+
+**高频面试补充**：
+1. Knative 和 Lambda 的本质区别？ 答：Knative 跑在自己 K8s 上、数据主权可控、按请求数缩到 0；Lambda 是云厂商托管、生态强但绑定。
+2. 函数为什么不能依赖本地状态？ 答：实例随机创建销毁、并发伸缩，本地状态不可靠且不可共享。
+3. 至少一次投递意味着什么？ 答：平台不保证正好一次，函数必须幂等（去重表/幂等键）。
+4. 什么时候不该用 Serverless？ 答：长连接、长任务（>15min）、强事务核心链路、延迟极敏感、超稳态大流量。
+5. KEDA 与 Knative 区别？ 答：KEDA 给普通 Deployment 加事件驱动 HPA（不缩到 0 默认）；Knative 自带缩到 0 与 Revision 治理。
