@@ -2173,6 +2173,586 @@ JWT 安全配置：
     → 定期更换
 ```
 
+## 二十七、CSP 与安全响应头
+
+### 27.1 Content Security Policy 配置
+
+```nginx
+# Nginx CSP 配置
+add_header Content-Security-Policy "
+    default-src 'self';
+    script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.example.com;
+    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+    font-src 'self' https://fonts.gstatic.com;
+    img-src 'self' data: https:;
+    connect-src 'self' https://api.example.com;
+    media-src 'self';
+    object-src 'none';
+    frame-src 'none';
+    base-uri 'self';
+    form-action 'self';
+    frame-ancestors 'none';
+    upgrade-insecure-requests;
+" always;
+
+# CSP 报告配置
+add_header Content-Security-Policy-Report-Only "
+    default-src 'self';
+    script-src 'self';
+    report-uri /csp-report;
+    report-to csp-endpoint;
+" always;
+```
+
+```java
+// Java CSP 过滤器
+@WebFilter("/*")
+public class CSPFilter implements Filter {
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // 设置 CSP 头
+        httpResponse.setHeader("Content-Security-Policy", 
+            "default-src 'self'; " +
+            "script-src 'self' 'unsafe-inline'; " +
+            "style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data: https:; " +
+            "font-src 'self' https://fonts.gstatic.com; " +
+            "connect-src 'self'; " +
+            "frame-ancestors 'none'; " +
+            "base-uri 'self'; " +
+            "form-action 'self';"
+        );
+        
+        // 设置其他安全头
+        httpResponse.setHeader("X-Content-Type-Options", "nosniff");
+        httpResponse.setHeader("X-Frame-Options", "DENY");
+        httpResponse.setHeader("X-XSS-Protection", "1; mode=block");
+        httpResponse.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+        httpResponse.setHeader("Permissions-Policy", 
+            "camera=(), microphone=(), geolocation=(), payment=()");
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+| CSP 指令 | 作用 | 推荐值 |
+|----------|------|--------|
+| default-src | 默认策略 | 'self' |
+| script-src | 脚本来源 | 'self' 'unsafe-inline' |
+| style-src | 样式来源 | 'self' 'unsafe-inline' |
+| img-src | 图片来源 | 'self' data: https: |
+| connect-src | 连接来源 | 'self' |
+| font-src | 字体来源 | 'self' https://fonts.gstatic.com |
+| object-src | 插件来源 | 'none' |
+| frame-src | 框架来源 | 'none' |
+| base-uri | 基础URL | 'self' |
+| form-action | 表单提交 | 'self' |
+| frame-ancestors | 框架祖先 | 'none' |
+
+### 27.2 安全响应头配置
+
+```nginx
+# Nginx 安全头配置
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "DENY" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+# 防止 MIME 类型嗅探
+add_header X-Content-Type-Options "nosniff" always;
+
+# 防止点击劫持
+add_header X-Frame-Options "DENY" always;
+add_header Content-Security-Policy "frame-ancestors 'none';" always;
+
+# 防止 XSS 攻击
+add_header X-XSS-Protection "1; mode=block" always;
+
+# 控制引用信息
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# 控制功能权限
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+
+# HSTS 配置
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+```
+
+```java
+// Java 安全头过滤器
+@Component
+public class SecurityHeaderFilter implements Filter {
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // 设置安全头
+        httpResponse.setHeader("X-Content-Type-Options", "nosniff");
+        httpResponse.setHeader("X-Frame-Options", "DENY");
+        httpResponse.setHeader("X-XSS-Protection", "1; mode=block");
+        httpResponse.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+        httpResponse.setHeader("Permissions-Policy", 
+            "camera=(), microphone=(), geolocation=(), payment=()");
+        httpResponse.setHeader("Strict-Transport-Security", 
+            "max-age=31536000; includeSubDomains; preload");
+        
+        // CSP 配置
+        httpResponse.setHeader("Content-Security-Policy", 
+            "default-src 'self'; " +
+            "script-src 'self'; " +
+            "style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data: https:; " +
+            "font-src 'self'; " +
+            "connect-src 'self'; " +
+            "frame-ancestors 'none';"
+        );
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+## 二十八、CSRF 防护深度实战
+
+### 28.1 CSRF Token 方案
+
+```java
+// CSRF Token 生成器
+@Component
+public class CSRFTokenManager {
+    
+    private final SecureRandom random = new SecureRandom();
+    private final TokenRepository tokenRepository;
+    
+    public String generateToken(String sessionId) {
+        String token = generateRandomToken();
+        tokenRepository.saveToken(sessionId, token);
+        return token;
+    }
+    
+    public boolean validateToken(String sessionId, String token) {
+        String storedToken = tokenRepository.getToken(sessionId);
+        return token.equals(storedToken);
+    }
+    
+    public void invalidateToken(String sessionId) {
+        tokenRepository.deleteToken(sessionId);
+    }
+    
+    private String generateRandomToken() {
+        byte[] bytes = new byte[32];
+        random.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+}
+
+// CSRF 过滤器
+@WebFilter("/*")
+public class CSRFTokenFilter implements Filter {
+    
+    @Autowired
+    private CSRFTokenManager tokenManager;
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        String sessionId = httpRequest.getSession().getId();
+        
+        if (isStateChangingMethod(httpRequest.getMethod())) {
+            // 验证 CSRF Token
+            String token = httpRequest.getHeader("X-CSRF-Token");
+            if (token == null) {
+                token = httpRequest.getParameter("_csrf");
+            }
+            
+            if (!tokenManager.validateToken(sessionId, token)) {
+                httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                httpResponse.getWriter().write("Invalid CSRF token");
+                return;
+            }
+        }
+        
+        // 生成新的 CSRF Token
+        String newToken = tokenManager.generateToken(sessionId);
+        httpResponse.setHeader("X-CSRF-Token", newToken);
+        
+        chain.doFilter(request, response);
+    }
+    
+    private boolean isStateChangingMethod(String method) {
+        return "POST".equals(method) || "PUT".equals(method) || 
+               "DELETE".equals(method) || "PATCH".equals(method);
+    }
+}
+```
+
+### 28.2 SameSite Cookie 配置
+
+```java
+// SameSite Cookie 配置
+@Component
+public class SameSiteCookieConfig {
+    
+    @Bean
+    public FilterRegistrationBean<SameSiteCookieFilter> sameSiteCookieFilter() {
+        FilterRegistrationBean<SameSiteCookieFilter> registration = 
+            new FilterRegistrationBean<>();
+        registration.setFilter(new SameSiteCookieFilter());
+        registration.addUrlPatterns("/*");
+        registration.setName("sameSiteCookieFilter");
+        registration.setOrder(1);
+        return registration;
+    }
+}
+
+public class SameSiteCookieFilter extends OncePerRequestFilter {
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                   HttpServletResponse response, 
+                                   FilterChain filterChain) throws ServletException, IOException {
+        
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // 包装响应以添加 SameSite 属性
+        HttpServletResponseWrapper wrapper = new HttpServletResponseWrapper(httpResponse) {
+            @Override
+            public void addCookie(Cookie cookie) {
+                cookie.setSecure(true);
+                cookie.setHttpOnly(true);
+                cookie.setPath("/");
+                cookie.setMaxAge(86400);
+                
+                // 添加 SameSite 属性
+                String cookieValue = cookie.getName() + "=" + cookie.getValue() + 
+                    "; Path=" + cookie.getPath() + 
+                    "; Max-Age=" + cookie.getMaxAge() + 
+                    "; HttpOnly; Secure; SameSite=Lax";
+                
+                addHeader("Set-Cookie", cookieValue);
+            }
+        };
+        
+        filterChain.doFilter(request, wrapper);
+    }
+}
+```
+
+```nginx
+# Nginx SameSite Cookie 配置
+# 添加 SameSite 属性到所有 Cookie
+add_header Set-Cookie "$upstream_cookie_name=$upstream_cookie_value; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax" always;
+
+# 或者在 proxy_pass 配置中
+location / {
+    proxy_pass http://backend;
+    proxy_cookie_path / /; 
+    proxy_cookie_flags ~ Secure httponly samesite=lax;
+}
+```
+
+## 二十九、安全测试与审计
+
+### 29.1 自动化安全测试
+
+```yaml
+# 安全测试工作流
+name: Security Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run OWASP ZAP Scan
+        uses: zaproxy/action-full-scan@v0.4.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -j'
+      
+      - name: Run Snyk Security Scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+      
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Security Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+```
+
+```python
+# 安全测试脚本
+import requests
+import json
+
+class SecurityTester:
+    
+    def test_xss(self, url, payload):
+        """测试 XSS 漏洞"""
+        response = requests.get(url, params={'input': payload})
+        if payload in response.text:
+            return True, "XSS vulnerability found"
+        return False, "No XSS vulnerability"
+    
+    def test_sql_injection(self, url, payload):
+        """测试 SQL 注入漏洞"""
+        response = requests.get(url, params={'id': payload})
+        if 'error' in response.text.lower() or 'sql' in response.text.lower():
+            return True, "SQL injection vulnerability found"
+        return False, "No SQL injection vulnerability"
+    
+    def test_csrf(self, url):
+        """测试 CSRF 漏洞"""
+        # 发送没有 CSRF Token 的 POST 请求
+        response = requests.post(url, data={'test': 'data'})
+        if response.status_code == 200:
+            return True, "CSRF vulnerability found"
+        return False, "No CSRF vulnerability"
+    
+    def test_headers(self, url):
+        """测试安全头"""
+        response = requests.get(url)
+        headers = response.headers
+        
+        missing_headers = []
+        required_headers = [
+            'X-Content-Type-Options',
+            'X-Frame-Options',
+            'X-XSS-Protection',
+            'Content-Security-Policy',
+            'Strict-Transport-Security'
+        ]
+        
+        for header in required_headers:
+            if header not in headers:
+                missing_headers.append(header)
+        
+        if missing_headers:
+            return True, f"Missing security headers: {missing_headers}"
+        return False, "All security headers present"
+    
+    def test_ssl(self, url):
+        """测试 SSL/TLS 配置"""
+        # 检查是否使用 HTTPS
+        if not url.startswith('https://'):
+            return True, "Not using HTTPS"
+        
+        # 检查 SSL 证书
+        try:
+            response = requests.get(url, verify=True)
+            return False, "SSL configuration is valid"
+        except requests.exceptions.SSLError:
+            return True, "SSL certificate error"
+```
+
+### 29.2 安全审计日志
+
+```java
+// 安全审计日志
+@Component
+public class SecurityAuditLogger {
+    
+    private static final Logger auditLogger = 
+        LoggerFactory.getLogger("SECURITY_AUDIT");
+    
+    public void logAuthentication(String userId, String ip, boolean success) {
+        auditLogger.info("Authentication attempt: userId={}, ip={}, success={}", 
+            userId, ip, success);
+    }
+    
+    public void logAuthorization(String userId, String resource, String action, boolean success) {
+        auditLogger.info("Authorization check: userId={}, resource={}, action={}, success={}", 
+            userId, resource, action, success);
+    }
+    
+    public void logDataAccess(String userId, String dataType, String operation) {
+        auditLogger.info("Data access: userId={}, dataType={}, operation={}", 
+            userId, dataType, operation);
+    }
+    
+    public void logSecurityEvent(String eventType, String details) {
+        auditLogger.warn("Security event: type={}, details={}", eventType, details);
+    }
+}
+
+// 审计日志配置
+@Configuration
+public class AuditLogConfig {
+    
+    @Bean
+    public AuditEventRepository auditEventRepository() {
+        return new InMemoryAuditEventRepository();
+    }
+    
+    @Bean
+    public AuditEventListener auditEventListener() {
+        return new AuditEventListener();
+    }
+}
+```
+
+```sql
+-- 审计日志查询
+SELECT 
+    timestamp,
+    user_id,
+    event_type,
+    resource,
+    action,
+    ip_address,
+    user_agent,
+    result
+FROM security_audit_logs
+WHERE timestamp > NOW() - INTERVAL '24 hours'
+  AND event_type = 'AUTHENTICATION'
+ORDER BY timestamp DESC;
+
+-- 安全事件统计
+SELECT 
+    DATE(timestamp) as date,
+    event_type,
+    COUNT(*) as event_count,
+    SUM(CASE WHEN result = 'FAILURE' THEN 1 ELSE 0 END) as failure_count
+FROM security_audit_logs
+WHERE timestamp > NOW() - INTERVAL '30 days'
+GROUP BY DATE(timestamp), event_type
+ORDER BY date DESC, event_count DESC;
+```
+
+## 三十、安全开发生命周期
+
+### 30.1 安全编码规范
+
+```java
+// 安全编码示例
+public class SecureCodingExample {
+    
+    // 1. 输入验证
+    public String validateInput(String input) {
+        if (input == null || input.isEmpty()) {
+            throw new IllegalArgumentException("Input cannot be null or empty");
+        }
+        
+        // 使用白名单验证
+        if (!input.matches("^[a-zA-Z0-9_]+$")) {
+            throw new IllegalArgumentException("Input contains invalid characters");
+        }
+        
+        return input;
+    }
+    
+    // 2. 参数化查询
+    public User getUserById(String userId) {
+        String sql = "SELECT * FROM users WHERE id = ?";
+        return jdbcTemplate.queryForObject(sql, new Object[]{userId}, User.class);
+    }
+    
+    // 3. 输出编码
+    public String encodeOutput(String input) {
+        return HtmlUtils.htmlEscape(input);
+    }
+    
+    // 4. 最小权限原则
+    @PreAuthorize("hasRole('USER')")
+    public void sensitiveOperation() {
+        // 只有 USER 角色才能执行
+    }
+    
+    // 5. 安全配置
+    @Configuration
+    public class SecurityConfig {
+        
+        @Bean
+        public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+            http
+                .csrf(csrf -> csrf.disable())
+                .authorizeHttpRequests(auth -> auth
+                    .requestMatchers("/public/**").permitAll()
+                    .requestMatchers("/admin/**").hasRole("ADMIN")
+                    .anyRequest().authenticated()
+                )
+                .formLogin(form -> form
+                    .loginPage("/login")
+                    .defaultSuccessUrl("/dashboard")
+                )
+                .logout(logout -> logout
+                    .logoutSuccessUrl("/login?logout")
+                );
+            
+            return http.build();
+        }
+    }
+}
+```
+
+### 30.2 安全培训与意识
+
+```yaml
+# 安全培训计划
+security_training:
+  # 新员工培训
+  new_employee:
+    - security_basics
+    - secure_coding
+    - data_protection
+    - incident_reporting
+  
+  # 定期培训
+  regular:
+    frequency: quarterly
+    topics:
+      - secure_coding
+      - threat_modeling
+      - vulnerability_management
+      - incident_response
+  
+  # 专项培训
+  specialized:
+    - advanced_web_security
+    - cloud_security
+    - container_security
+    - DevSecOps
+  
+  # 考核
+  assessment:
+    frequency: annual
+    passing_score: 80
+    retake_policy: 3 attempts
+```
+
 ## 二十六、与其他板块的关系
 
 - 认证授权见「[中间件/认证授权 JWT-OAuth2](../基础知识/中间件/认证授权JWT-OAuth2.md)」；

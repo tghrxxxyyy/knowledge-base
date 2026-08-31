@@ -2152,6 +2152,511 @@ graph TB
      → 解决悬挂问题
 ```
 
+## 补充：TCC 模式深入
+
+### TCC 事务流程
+
+```mermaid
+sequenceDiagram
+    participant TM as 事务管理器
+    participant RM1 as 资源管理器1
+    participant RM2 as 资源管理器2
+    
+    TM->>RM1: Try（预留资源）
+    RM1-->>TM: 成功
+    
+    TM->>RM2: Try（预留资源）
+    RM2-->>TM: 成功
+    
+    TM->>RM1: Confirm（确认提交）
+    RM1-->>TM: 成功
+    
+    TM->>RM2: Confirm（确认提交）
+    RM2-->>TM: 成功
+    
+    Note over TM,RM2: 所有参与者确认成功，事务完成
+```
+
+### TCC 接口实现
+
+```java
+// TCC 服务接口
+public interface TccService {
+    @TwoPhaseBusinessAction(
+        name = "prepare",
+        commitMethod = "commit",
+        rollbackMethod = "rollback"
+    )
+    boolean prepare(BusinessActionContext context,
+                    @BusinessActionContextParameter(paramName = "amount") BigDecimal amount);
+    
+    boolean commit(BusinessActionContext context);
+    
+    boolean rollback(BusinessActionContext context);
+}
+
+// TCC 服务实现
+@Service
+public class TccServiceImpl implements TccService {
+    
+    @Override
+    @Transactional
+    public boolean prepare(BusinessActionContext context, BigDecimal amount) {
+        // Try 阶段：冻结资源
+        String accountNo = context.getString("accountNo");
+        accountMapper.freeze(accountNo, amount);
+        
+        // 记录事务日志
+        tccLogMapper.insert(new TccLog(
+            context.getXid(),
+            "prepare",
+            "freeze",
+            amount
+        ));
+        
+        return true;
+    }
+    
+    @Override
+    @Transactional
+    public boolean commit(BusinessActionContext context) {
+        // Confirm 阶段：扣除冻结资源
+        String accountNo = context.getString("accountNo");
+        BigDecimal amount = new BigDecimal(context.getActionContext("amount").toString());
+        
+        // 幂等检查
+        if (tccLogMapper.exists(context.getXid(), "commit")) {
+            return true;
+        }
+        
+        accountMapper.deductFrozen(accountNo, amount);
+        tccLogMapper.insert(new TccLog(context.getXid(), "commit", "deduct", amount));
+        
+        return true;
+    }
+    
+    @Override
+    @Transactional
+    public boolean rollback(BusinessActionContext context) {
+        // Cancel 阶段：解冻资源
+        String accountNo = context.getString("accountNo");
+        BigDecimal amount = new BigDecimal(context.getActionContext("amount").toString());
+        
+        // 幂等检查
+        if (tccLogMapper.exists(context.getXid(), "rollback")) {
+            return true;
+        }
+        
+        // 空回滚检测
+        if (!accountMapper.existsFrozen(accountNo, amount)) {
+            // 记录空回滚
+            tccLogMapper.insert(new TccLog(context.getXid(), "rollback", "empty", amount));
+            return true;
+        }
+        
+        accountMapper.unfreeze(accountNo, amount);
+        tccLogMapper.insert(new TccLog(context.getXid(), "rollback", "unfreeze", amount));
+        
+        return true;
+    }
+}
+```
+
+### TCC 异常处理
+
+| 异常类型 | 原因 | 处理方式 |
+|----------|------|----------|
+| 空回滚 | Try 未执行就执行 Cancel | 空回滚检测+记录 |
+| 悬挂 | Cancel 先于 Try 执行 | 悬挂检测+补偿 |
+| 幂等失败 | 重复提交 | 幂等表+去重 |
+| 资源预留失败 | 余额不足等 | 业务检查+回滚 |
+
+## 补充：Saga 模式详解
+
+### Saga 状态机
+
+```java
+// 状态机定义
+public enum OrderStatus {
+    CREATED,           // 创建成功
+    INVENTORY_RESERVED, // 库存预留
+    PAYMENT_PROCESSED, // 支付处理
+    COMPLETED,         // 订单完成
+    CANCELLED,         // 订单取消
+    COMPENSATING       // 补偿中
+}
+
+// Saga 状态机
+@Service
+public class OrderSaga {
+    
+    private final StateMachine<OrderStatus, OrderEvent> stateMachine;
+    
+    public OrderSaga() {
+        stateMachine = StateMachineBuilder.<OrderStatus, OrderEvent>builder()
+            .defaultState(OrderStatus.CREATED)
+            .state(OrderStatus.CREATED, OrderEvent.RESERVE_INVENTORY)
+            .state(OrderStatus.INVENTORY_RESERVED, OrderEvent.PROCESS_PAYMENT)
+            .state(OrderStatus.PAYMENT_PROCESSED, OrderEvent.COMPLETE_ORDER)
+            .state(OrderStatus.CANCELLED)
+            .state(OrderStatus.COMPENSATING)
+            
+            // 补偿转换
+            .from(OrderStatus.INVENTORY_RESERVED).to(OrderStatus.CANCELLED)
+            .via(OrderEvent.CANCEL)
+            .action(this::cancelInventory)
+            
+            .from(OrderStatus.PAYMENT_PROCESSED).to(OrderStatus.COMPENSATING)
+            .via(OrderEvent.COMPENSATE)
+            .action(this::compensatePayment)
+            
+            .build();
+    }
+    
+    public void processOrder(Order order) {
+        stateMachine.sendEvent(OrderEvent.CREATE);
+        
+        try {
+            // 预留库存
+            stateMachine.sendEvent(OrderEvent.RESERVE_INVENTORY);
+            inventoryService.reserve(order.getProductId(), order.getCount());
+            
+            // 处理支付
+            stateMachine.sendEvent(OrderEvent.PROCESS_PAYMENT);
+            paymentService.process(order.getPaymentInfo());
+            
+            // 完成订单
+            stateMachine.sendEvent(OrderEvent.COMPLETE_ORDER);
+            order.setStatus(OrderStatus.COMPLETED);
+            
+        } catch (Exception e) {
+            // 补偿流程
+            stateMachine.sendEvent(OrderEvent.CANCEL);
+            compensate(order);
+        }
+    }
+    
+    private void compensate(Order order) {
+        // 执行补偿操作
+        if (stateMachine.getState() == OrderStatus.INVENTORY_RESERVED) {
+            inventoryService.cancelReservation(order.getProductId(), order.getCount());
+        }
+        if (stateMachine.getState() == OrderStatus.PAYMENT_PROCESSED) {
+            paymentService.refund(order.getPaymentId());
+        }
+    }
+}
+```
+
+### Saga 补偿策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 向前恢复 | 重试直到成功 | 暂时性故障 |
+| 向后恢复 | 执行补偿操作 | 不可恢复故障 |
+| 混合恢复 | 重试+补偿 | 复杂场景 |
+
+## 补充：AT vs TCC 对比
+
+### 模式对比表
+
+| 维度 | AT 模式 | TCC 模式 |
+|------|---------|----------|
+| 侵入性 | 低（自动） | 高（手动） |
+| 实现复杂度 | 低 | 高 |
+| 性能 | 中 | 高 |
+| 一致性 | 强一致 | 最终一致 |
+| 适用场景 | 简单CRUD | 复杂业务 |
+| 锁机制 | 全局锁 | 业务锁 |
+| 补偿逻辑 | 自动生成 | 手动实现 |
+
+### 选型决策树
+
+```mermaid
+graph TD
+    A[开始] --> B{业务复杂度?}
+    B -->|简单| C{性能要求?}
+    B -->|复杂| D{事务时长?}
+    
+    C -->|高| E[AT模式]
+    C -->|低| F[AT模式]
+    
+    D -->|短| G{TCC模式}
+    D -->|长| H[Saga模式]
+    
+    E --> I[检查数据库支持]
+    F --> I
+    G --> J[实现补偿逻辑]
+    H --> K[设计状态机]
+    
+    I -->|支持| L[使用AT]
+    I -->|不支持| M[使用TCC]
+```
+
+## 补充：生产调优参数
+
+### 性能优化配置
+
+```yaml
+# Seata 配置优化
+seata:
+  client:
+    rm:
+      asyncCommitBufferLimit: 10000
+      reportRetryCount: 5
+      tableMetaCheckEnable: false
+      sqlParserType: JAVAX
+    tm:
+      commitRetryCount: 5
+      rollbackRetryCount: 5
+    undo:
+      logSerialization: jackson
+  transport:
+    type: TCP
+    server: NIO
+    heartbeat: true
+    thread-factory:
+      boss-thread-prefix: NettyBoss
+      worker-thread-prefix: NettyServerNIOWorker
+      server-executor-thread-prefix: NettyServerBizHandler
+      share-boss-worker: false
+      client-selector-thread-prefix: NettyClientSelector
+      client-worker-thread-prefix: NettyClientWorkerThread
+      boss-thread-size: 1
+      worker-thread-size: 8
+  server:
+    distributed-lock-expire-time: 10000
+    rollback-retry-commit-unlock-enable: false
+  service:
+    vgroup-mapping:
+      my_tx_group: default
+    grouplist:
+      default: 127.0.0.1:8091
+    enableDegrade: false
+    disableGlobalTransaction: false
+```
+
+### 数据库优化
+
+```sql
+-- AT 模式优化
+-- 1. 添加 undo_log 索引
+CREATE INDEX idx_undo_log_xid ON undo_log(xid);
+CREATE INDEX idx_undo_log_rollback_status ON undo_log(rollback_status);
+
+-- 2. 定期清理 undo_log
+DELETE FROM undo_log WHERE create_time < NOW() - INTERVAL 7 DAY;
+
+-- 3. 分区表优化
+ALTER TABLE undo_log PARTITION BY RANGE (UNIX_TIMESTAMP(create_time)) (
+    PARTITION p202401 VALUES LESS THAN (UNIX_TIMESTAMP('2024-02-01')),
+    PARTITION p202402 VALUES LESS THAN (UNIX_TIMESTAMP('2024-03-01')),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+### JVM 参数优化
+
+```bash
+# Seata Server JVM 参数
+-Xms512m -Xmx512m
+-XX:MetaspaceSize=128m
+-XX:MaxMetaspaceSize=256m
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/log/seata/seata_heapdump.hprof
+-Xloggc:/var/log/seata/seata_gc.log
+-XX:+PrintGCDetails
+-XX:+PrintGCDateStamps
+```
+
+## 补充：问题排查深入
+
+### 常见问题解决
+
+```java
+// 事务悬挂检测
+public boolean checkTransactionHanging(String xid) {
+    // 检查是否有 Try 未执行但 Cancel 已执行的情况
+    int tryCount = tccLogMapper.countByXidAndAction(xid, "prepare");
+    int cancelCount = tccLogMapper.countByXidAndAction(xid, "rollback");
+    
+    return tryCount == 0 && cancelCount > 0;
+}
+
+// 空回滚检测
+public boolean checkEmptyRollback(String xid) {
+    // 检查 Cancel 执行时 Try 是否已执行
+    TccLog tryLog = tccLogMapper.findByXidAndAction(xid, "prepare");
+    return tryLog == null;
+}
+
+// 幂等性保证
+public boolean isIdempotent(String xid, String action) {
+    TccLog existingLog = tccLogMapper.findByXidAndAction(xid, action);
+    return existingLog != null;
+}
+```
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `seata_transaction_total` | 事务总数 | - |
+| `seata_transaction_success` | 成功事务数 | - |
+| `seata_transaction_fail` | 失败事务数 | > 10/min |
+| `seata_transaction_timeout` | 超时事务数 | > 5/min |
+| `seata_rollback_total` | 回滚事务数 | - |
+| `seata_lock_wait_time` | 锁等待时间 | > 1s |
+
+### 故障排查流程
+
+```mermaid
+graph TB
+    A[发现问题] --> B{问题类型}
+    B -->|事务失败| C[检查事务日志]
+    B -->|性能问题| D[检查锁竞争]
+    B -->|一致性问题| E[检查数据状态]
+    
+    C --> F[分析失败原因]
+    D --> G[优化锁策略]
+    E --> H[修复数据]
+    
+    F --> I[解决方案]
+    G --> I
+    H --> I
+    
+    I --> J[验证修复]
+    J --> K[监控告警]
+```
+
+## 补充：Seata 与 Spring 集成
+
+### Spring Boot 配置
+
+```yaml
+# application.yml
+seata:
+  enabled: true
+  application-id: ${spring.application.name}
+  tx-service-group: my_tx_group
+  service:
+    vgroup-mapping:
+      my_tx_group: default
+  registry:
+    type: nacos
+    nacos:
+      server-addr: 127.0.0.1:8848
+      namespace: seata
+  config:
+    type: nacos
+    nacos:
+      server-addr: 127.0.0.1:8848
+      namespace: seata
+```
+
+### 注解使用
+
+```java
+// AT 模式
+@Service
+public class OrderService {
+    
+    @GlobalTransactional(timeoutMills = 60000, name = "create-order")
+    public void createOrder(Order order) {
+        // 业务逻辑
+        orderMapper.insert(order);
+        inventoryMapper.deduct(order.getProductId(), order.getCount());
+        paymentMapper.deduct(order.getUserId(), order.getAmount());
+    }
+}
+
+// TCC 模式
+@Service
+public class AccountService {
+    
+    @TwoPhaseBusinessAction(
+        name = "deduct",
+        commitMethod = "commit",
+        rollbackMethod = "rollback"
+    )
+    public boolean deduct(BusinessActionContext context,
+                         @BusinessActionContextParameter(paramName = "amount") BigDecimal amount) {
+        // Try 阶段
+        return accountMapper.freeze(context.getString("accountNo"), amount);
+    }
+    
+    public boolean commit(BusinessActionContext context) {
+        // Confirm 阶段
+        BigDecimal amount = new BigDecimal(context.getActionContext("amount").toString());
+        return accountMapper.deductFrozen(context.getString("accountNo"), amount);
+    }
+    
+    public boolean rollback(BusinessActionContext context) {
+        // Cancel 阶段
+        BigDecimal amount = new BigDecimal(context.getActionContext("amount").toString());
+        return accountMapper.unfreeze(context.getString("accountNo"), amount);
+    }
+}
+```
+
+## 补充：Seata 监控与运维
+
+### Prometheus 监控配置
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'seata-server'
+    static_configs:
+      - targets: ['seata-server:7091']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+```
+
+### Grafana 仪表板
+
+```json
+{
+  "dashboard": {
+    "title": "Seata 监控",
+    "panels": [
+      {
+        "title": "事务成功率",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "seata_transaction_success / seata_transaction_total * 100",
+            "legendFormat": "成功率"
+          }
+        ]
+      },
+      {
+        "title": "事务QPS",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(seata_transaction_total[1m])",
+            "legendFormat": "QPS"
+          }
+        ]
+      },
+      {
+        "title": "锁等待时间",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "seata_lock_wait_time",
+            "legendFormat": "等待时间"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

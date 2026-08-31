@@ -2037,8 +2037,697 @@ jenkins:
      → 恢复共享库
      → 验证功能
 
-  3. 测试恢复
+   3. 测试恢复
      → 定期测试恢复流程
      → 验证数据完整性
      → 文档化恢复步骤
+```
+
+## 三十六、高级流水线模式
+
+### 36.1 并行执行与阶段门
+
+```groovy
+// 高级并行流水线
+pipeline {
+    agent any
+    
+    stages {
+        stage('Build') {
+            steps {
+                script {
+                    // 并行构建多个组件
+                    parallel(
+                        'Frontend Build': {
+                            sh 'cd frontend && npm run build'
+                        },
+                        'Backend Build': {
+                            sh 'cd backend && mvn clean package'
+                        },
+                        'Database Migration': {
+                            sh 'cd database && flyway migrate'
+                        }
+                    )
+                }
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'mvn test'
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        sh 'mvn verify -P integration-test'
+                    }
+                }
+                stage('Security Scan') {
+                    steps {
+                        sh 'trivy fs --severity HIGH,CRITICAL .'
+                    }
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                script {
+                    // 质量门检查
+                    def qualityMetrics = readJSON file: 'quality-report.json'
+                    
+                    if (qualityMetrics.coverage < 80) {
+                        error("Code coverage is below 80%")
+                    }
+                    
+                    if (qualityMetrics.duplicated_lines > 5) {
+                        error("Duplicated lines ratio is above 5%")
+                    }
+                    
+                    if (qualityMetrics.code_smells > 100) {
+                        error("Too many code smells")
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            steps {
+                script {
+                    // 部署到 staging 环境
+                    sh 'kubectl apply -f k8s/staging/'
+                    
+                    // 等待部署完成
+                    sh 'kubectl rollout status deployment/my-app -n staging'
+                    
+                    // 执行冒烟测试
+                    sh 'npm run test:smoke'
+                }
+            }
+        }
+        
+        stage('Approval') {
+            steps {
+                script {
+                    // 等待人工审批
+                    input message: 'Deploy to production?', 
+                          ok: 'Deploy', 
+                          submitter: 'admin,release-managers'
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            steps {
+                script {
+                    // 蓝绿部署
+                    sh 'kubectl apply -f k8s/production/'
+                    
+                    // 切换流量
+                    sh 'kubectl patch service my-app -p \'{"spec":{"selector":{"version":"blue"}}}\''
+                    
+                    // 验证部署
+                    sh 'kubectl rollout status deployment/my-app -n production'
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // 清理工作空间
+            cleanWs()
+        }
+        success {
+            // 发送成功通知
+            slackSend channel: '#builds', 
+                      message: "Build succeeded: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        }
+        failure {
+            // 发送失败通知
+            slackSend channel: '#builds', 
+                      message: "Build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        }
+    }
+}
+```
+
+### 36.2 动态参数化构建
+
+```groovy
+// 动态参数化构建
+properties([
+    parameters([
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'production'],
+            description: 'Target environment'
+        ),
+        string(
+            name: 'VERSION',
+            defaultValue: 'latest',
+            description: 'Version to deploy'
+        ),
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip tests'
+        ),
+        password(
+            name: 'SECRET_KEY',
+            description: 'Secret key for deployment'
+        ),
+        // 动态参数
+        [
+            $class: 'CascadeChoiceParameter',
+            choiceType: 'PT_SINGLE_SELECT',
+            name: 'DYNAMIC_PARAM',
+            description: 'Dynamic parameter based on environment',
+            script: [
+                $class: 'GroovyScript',
+                script: [
+                    classpath: [],
+                    script: [
+                        sandbox: false,
+                        script: '''
+                            import groovy.json.JsonSlurper
+                            
+                            def environments = [
+                                'dev': ['replicas': 1, 'memory': '512Mi'],
+                                'staging': ['replicas': 2, 'memory': '1Gi'],
+                                'production': ['replicas': 5, 'memory': '2Gi']
+                            ]
+                            
+                            def env = params.ENVIRONMENT
+                            return environments[env]?.collect { k, v -> "${k}=${v}" } ?: []
+                        '''
+                    ],
+                    fallbackScript: [
+                        classpath: [],
+                        script: ['sandbox': false, 'script': 'return ["default"]']
+                    ]
+                ]
+            ]
+        ]
+    ])
+])
+
+pipeline {
+    agent any
+    
+    stages {
+        stage('Deploy') {
+            steps {
+                script {
+                    // 使用参数
+                    sh """
+                        kubectl set image deployment/my-app \
+                            my-app=my-app:${params.VERSION} \
+                            -n ${params.ENVIRONMENT}
+                    """
+                }
+            }
+        }
+    }
+}
+```
+
+## 三十七、安全与权限深度实战
+
+### 37.1 基于角色的访问控制
+
+```groovy
+// RBAC 配置
+// roles.yaml
+roles:
+  - name: admin
+    permissions:
+      - Overall/Administer
+      - Job/Read
+      - Job/Build
+      - Job/Cancel
+      - Job/Configure
+      - Job/Delete
+      - Job/Discover
+      - Job/Read
+      - Job/Workspace
+      - View/Read
+      - View/Create
+      - View/Configure
+      - View/Delete
+  
+  - name: developer
+    permissions:
+      - Job/Read
+      - Job/Build
+      - Job/Cancel
+      - Job/Read
+      - View/Read
+  
+  - name: viewer
+    permissions:
+      - Job/Read
+      - View/Read
+
+# users.yaml
+users:
+  - username: admin
+    roles:
+      - admin
+  
+  - username: developer1
+    roles:
+      - developer
+  
+  - username: viewer1
+    roles:
+      - viewer
+```
+
+```groovy
+// 流水线权限控制
+pipeline {
+    agent any
+    
+    // 权限检查
+    stages {
+        stage('Check Permissions') {
+            steps {
+                script {
+                    // 检查用户是否有权限
+                    if (!currentBuild.rawBuild.getACL().hasPermission(
+                            Jenkins.getAuthentication(), 
+                            Jenkins.MANAGE)) {
+                        error("You don't have permission to run this pipeline")
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                script {
+                    // 只有特定角色可以部署到生产
+                    if (params.ENVIRONMENT == 'production') {
+                        if (!currentBuild.rawBuild.getACL().hasPermission(
+                                Jenkins.getAuthentication(), 
+                                Jenkins.ADMINISTER)) {
+                            error("Only admins can deploy to production")
+                        }
+                    }
+                    
+                    sh 'kubectl apply -f k8s/'
+                }
+            }
+        }
+    }
+}
+```
+
+### 37.2 凭据管理
+
+```groovy
+// 凭据管理
+pipeline {
+    agent any
+    
+    stages {
+        stage('Use Credentials') {
+            steps {
+                script {
+                    // 使用用户名密码
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'github-credentials',
+                            usernameVariable: 'GITHUB_USERNAME',
+                            passwordVariable: 'GITHUB_TOKEN'
+                        )
+                    ]) {
+                        sh 'git push https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/repo.git'
+                    }
+                    
+                    // 使用秘密文本
+                    withCredentials([
+                        string(
+                            credentialsId: 'slack-webhook',
+                            variable: 'SLACK_WEBHOOK'
+                        )
+                    ]) {
+                        sh 'curl -X POST -H "Content-type: application/json" --data \'{"text":"Build completed"}\' ${SLACK_WEBHOOK}'
+                    }
+                    
+                    // 使用 SSH 密钥
+                    withCredentials([
+                        sshUserPrivateKey(
+                            credentialsId: 'ssh-key',
+                            keyFileVariable: 'SSH_KEY',
+                            usernameVariable: 'SSH_USER'
+                        )
+                    ]) {
+                        sh 'ssh -i ${SSH_KEY} ${SSH_USER}@server "deploy.sh"'
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## 三十八、性能优化深度实战
+
+### 38.1 构建缓存优化
+
+```groovy
+// 构建缓存优化
+pipeline {
+    agent any
+    
+    stages {
+        stage('Restore Cache') {
+            steps {
+                script {
+                    // 恢复缓存
+                    def cacheDir = "${WORKSPACE}/.cache"
+                    
+                    // 检查缓存是否存在
+                    if (fileExists("${cacheDir}/dependencies.tar.gz")) {
+                        sh "tar -xzf ${cacheDir}/dependencies.tar.gz -C ${WORKSPACE}"
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                script {
+                    // 构建项目
+                    sh 'mvn clean package -Dmaven.repo.local=${WORKSPACE}/.m2/repository'
+                }
+            }
+        }
+        
+        stage('Save Cache') {
+            steps {
+                script {
+                    // 保存缓存
+                    def cacheDir = "${WORKSPACE}/.cache"
+                    sh "mkdir -p ${cacheDir}"
+                    sh "tar -czf ${cacheDir}/dependencies.tar.gz -C ${WORKSPACE} .m2"
+                    
+                    // 清理旧缓存
+                    sh "find ${cacheDir} -name '*.tar.gz' -mtime +7 -delete"
+                }
+            }
+        }
+    }
+}
+```
+
+### 38.2 并行执行优化
+
+```groovy
+// 并行执行优化
+pipeline {
+    agent any
+    
+    stages {
+        stage('Parallel Build') {
+            parallel {
+                stage('Build Component A') {
+                    agent {
+                        docker {
+                            image 'node:16'
+                            args '-v $WORKSPACE:/workspace'
+                        }
+                    }
+                    steps {
+                        sh 'cd /workspace/component-a && npm run build'
+                    }
+                }
+                
+                stage('Build Component B') {
+                    agent {
+                        docker {
+                            image 'maven:3.8'
+                            args '-v $WORKSPACE:/workspace'
+                        }
+                    }
+                    steps {
+                        sh 'cd /workspace/component-b && mvn clean package'
+                    }
+                }
+                
+                stage('Build Component C') {
+                    agent {
+                        docker {
+                            image 'golang:1.18'
+                            args '-v $WORKSPACE:/workspace'
+                        }
+                    }
+                    steps {
+                        sh 'cd /workspace/component-c && go build'
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Test') {
+            steps {
+                script {
+                    // 等待所有并行任务完成
+                    // 执行集成测试
+                    sh 'mvn verify -P integration-test'
+                }
+            }
+        }
+    }
+}
+```
+
+## 三十九、生产监控与告警
+
+### 39.1 核心监控指标
+
+```groovy
+// 监控指标收集
+pipeline {
+    agent any
+    
+    stages {
+        stage('Build') {
+            steps {
+                script {
+                    def startTime = System.currentTimeMillis()
+                    
+                    // 执行构建
+                    sh 'mvn clean package'
+                    
+                    def duration = System.currentTimeMillis() - startTime
+                    
+                    // 发送指标到 Prometheus
+                    sh """
+                        curl -X POST http://prometheus:9090/metrics/job/jenkins \
+                            --data-binary @- <<EOF
+                        # HELP jenkins_build_duration_seconds Build duration in seconds
+                        # TYPE jenkins_build_duration_seconds gauge
+                        jenkins_build_duration_seconds{job="${env.JOB_NAME}",status="success"} ${duration / 1000}
+                    EOF
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                // 发送构建指标
+                def metrics = [
+                    job: env.JOB_NAME,
+                    build_number: env.BUILD_NUMBER,
+                    status: currentBuild.currentResult,
+                    duration: currentBuild.duration,
+                    timestamp: System.currentTimeMillis()
+                ]
+                
+                // 发送到监控系统
+                httpRequest httpMode: 'POST',
+                    url: 'http://metrics-collector:8080/metrics',
+                    contentType: 'APPLICATION_JSON',
+                    requestBody: writeJSON(metrics)
+            }
+        }
+    }
+}
+```
+
+### 39.2 告警规则配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: jenkins_alerts
+    rules:
+      - alert: JenkinsBuildFailed
+        expr: jenkins_build_status{status="FAILURE"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins 构建失败"
+          description: "Job {{ $labels.job }} 构建失败"
+      
+      - alert: JenkinsBuildDurationHigh
+        expr: jenkins_build_duration_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins 构建时间过长"
+          description: "Job {{ $labels.job }} 构建时间超过10分钟"
+      
+      - alert: JenkinsQueueLengthHigh
+        expr: jenkins_queue_length > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins 队列积压"
+          description: "Jenkins 队列长度超过10"
+```
+
+## 四十、集成模式深度实战
+
+### 40.1 与 Docker 集成
+
+```groovy
+// Docker 集成
+pipeline {
+    agent any
+    
+    stages {
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    // 构建 Docker 镜像
+                    sh """
+                        docker build -t my-app:${env.BUILD_NUMBER} .
+                        docker tag my-app:${env.BUILD_NUMBER} my-registry/my-app:${env.BUILD_NUMBER}
+                    """
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            steps {
+                script {
+                    // 推送到镜像仓库
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'docker-registry',
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )
+                    ]) {
+                        sh """
+                            echo \${DOCKER_PASS} | docker login my-registry -u \${DOCKER_USER} --password-stdin
+                            docker push my-registry/my-app:${env.BUILD_NUMBER}
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    // 部署到 Kubernetes
+                    sh """
+                        kubectl set image deployment/my-app \
+                            my-app=my-registry/my-app:${env.BUILD_NUMBER}
+                    """
+                }
+            }
+        }
+    }
+}
+```
+
+### 40.2 与 Ansible 集成
+
+```groovy
+// Ansible 集成
+pipeline {
+    agent any
+    
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn clean package'
+            }
+        }
+        
+        stage('Deploy with Ansible') {
+            steps {
+                script {
+                    // 使用 Ansible 部署
+                    sh """
+                        ansible-playbook -i inventory/hosts \
+                            -e "version=${env.BUILD_NUMBER}" \
+                            -e "environment=production" \
+                            deploy.yml
+                    """
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    // 验证部署
+                    sh """
+                        ansible-playbook -i inventory/hosts \
+                            -e "environment=production" \
+                            verify.yml
+                    """
+                }
+            }
+        }
+    }
+}
+```
+
+```yaml
+# Ansible playbook 示例
+# deploy.yml
+---
+- hosts: web servers
+  become: yes
+  vars:
+    version: "{{ lookup('env', 'VERSION') }}"
+    environment: "{{ lookup('env', 'ENVIRONMENT') }}"
+  
+  tasks:
+    - name: Pull Docker image
+      docker_image:
+        name: "my-registry/my-app:{{ version }}"
+        source: pull
+    
+    - name: Stop existing container
+      docker_container:
+        name: my-app
+        state: absent
+    
+    - name: Start new container
+      docker_container:
+        name: my-app
+        image: "my-registry/my-app:{{ version }}"
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "8080:8080"
+        env:
+          ENVIRONMENT: "{{ environment }}"
 ```

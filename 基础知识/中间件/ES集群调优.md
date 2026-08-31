@@ -1010,6 +1010,469 @@ PUT _ilm/policy/search_lifecycle
     日志聚合 → ClickHouse（成本优势）
 ```
 
+## 索引设计
+
+### 主分片数公式
+
+```text
+主分片数计算公式：
+  分片数 = 数据总量 / 单分片大小
+  单分片大小建议：10~50GB（最佳 20~30GB）
+
+  示例：
+    100GB 数据 → 100 / 30 ≈ 4 个主分片
+    500GB 数据 → 500 / 30 ≈ 17 个主分片
+    1TB 数据 → 1000 / 30 ≈ 33 个主分片
+
+  预估增长：
+    数据增长 3 倍 → 分片数 × 3
+    建议预留 20% 余量
+```
+
+### 副本数
+
+| 副本数 | 适用场景 | 说明 |
+|--------|---------|------|
+| 0 | 写入密集/导入期 | 导入完成后恢复 |
+| 1 | 一般场景 | 生产推荐 |
+| 2 | 高可用要求 | 跨可用区部署 |
+| 3 | 金融级 | 极高可用 |
+
+### 分片大小控制
+
+```text
+分片大小建议：
+  最小：10GB（太小浪费并发）
+  最大：50GB（太大影响查询）
+  最佳：20~30GB
+
+爆炸因子控制：
+  爆炸因子 = 单分片文档数 × 字段数
+  建议：< 10亿（避免 mapping 爆炸）
+
+  控制方法：
+    1. 合理设计 mapping（避免 dynamic: true）
+    2. 控制字段数量（< 500）
+    3. 使用 runtime fields 替代动态字段
+```
+
+### 索引设计示例
+
+```json
+// 日志索引设计
+PUT /logs-2026.01.15
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "refresh_interval": "30s",
+    "codec": "best_compression"
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "level": { "type": "keyword" },
+      "message": { "type": "text", "analyzer": "standard" },
+      "service": { "type": "keyword" },
+      "trace_id": { "type": "keyword" },
+      "duration_ms": { "type": "integer" }
+    }
+  }
+}
+```
+
+## 查询优化
+
+### filter context vs query context
+
+```json
+// query context：计算相关性评分（慢）
+GET /logs/_search
+{
+  "query": {
+    "match": {
+      "message": "error"
+    }
+  }
+}
+
+// filter context：不计算评分，可缓存（快）
+GET /logs/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "level": "ERROR" } },
+        { "range": { "@timestamp": { "gte": "now-1h" } } }
+      ]
+    }
+  }
+}
+```
+
+### scoring 优化
+
+```text
+评分优化策略：
+  1. 使用 filter 替代 query（不计分）
+  2. 禁用不需要的评分（_score: false）
+  3. 使用 constant_score 查询（固定评分）
+  4. 调整 TF-IDF/BM25 参数
+
+  常量评分查询：
+    GET /logs/_search
+    {
+      "query": {
+        "constant_score": {
+          "filter": { "term": { "level": "ERROR" } },
+          "boost": 1.0
+        }
+      }
+    }
+```
+
+### aggs 前置
+
+```json
+// 优化前：先查询再聚合
+GET /logs/_search
+{
+  "query": { "match_all": {} },
+  "aggs": {
+    "by_service": {
+      "terms": { "field": "service" }
+    }
+  }
+}
+
+// 优化后：size=0 只返回聚合
+GET /logs/_search
+{
+  "size": 0,
+  "query": { "match_all": {} },
+  "aggs": {
+    "by_service": {
+      "terms": { "field": "service", "size": 100 }
+    }
+  }
+}
+```
+
+## 节点角色
+
+### Master/Data/Coordinating/Ingest/ML 角色分离
+
+```yaml
+# Master 节点配置
+node.roles: [master]
+node.master: true
+node.data: false
+node.ingest: false
+
+# Data Hot 节点配置
+node.roles: [data_hot, ingest]
+node.data: true
+node.master: false
+
+# Data Warm 节点配置
+node.roles: [data_warm]
+node.data: true
+node.master: false
+
+# Coordinating 节点配置
+node.roles: []
+node.data: false
+node.master: false
+
+# ML 节点配置
+node.roles: [ml]
+node.data: false
+node.master: false
+```
+
+### 角色分离配置建议
+
+| 角色 | 数量 | 内存 | 磁盘 | 说明 |
+|------|------|------|------|------|
+| Master | 3-5 | 8GB | SSD | 集群管理 |
+| Data Hot | 3+ | 31GB | NVMe SSD | 热数据 |
+| Data Warm | 2+ | 16GB | SSD | 温数据 |
+| Coordinating | 2+ | 16GB | - | 查询协调 |
+| Ingest | 1-2 | 8GB | - | 数据预处理 |
+
+## ES 分片分配
+
+### Shard Allocation
+
+```yaml
+# 索引级别分片分配
+"index.routing.allocation.require.zone": "zone_a"
+"index.routing.allocation.require.node_type": "hot"
+
+# 集群级别分片分配
+"cluster.routing.allocation.awareness.attributes": "zone"
+
+# 分片过滤
+"index.routing.allocation.include.zone": "zone_a,zone_b"
+"index.routing.allocation.exclude.zone": "zone_c"
+```
+
+### 磁盘水位线
+
+```yaml
+# 磁盘水位线配置
+cluster.routing.allocation.disk.watermark.low: 85%
+cluster.routing.allocation.disk.watermark.high: 90%
+cluster.routing.allocation.disk.watermark.flood_stage: 95%
+
+# 水位线说明：
+# low：停止分配新分片到该节点
+# high：尝试迁移分片到其他节点
+# flood_stage：索引变为只读
+```
+
+### 节点过滤
+
+```json
+// 节点过滤配置
+PUT /_cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.awareness.attributes": "zone",
+    "cluster.routing.allocation.awareness.force.zone.values": "zone_a,zone_b"
+  }
+}
+
+// 热节点配置
+PUT /_cluster/settings
+{
+  "persistent": {
+    "cluster.routing.allocation.disk.watermark.low": "85%",
+    "cluster.routing.allocation.disk.watermark.high": "90%",
+    "cluster.routing.allocation.disk.watermark.flood_stage": "95%"
+  }
+}
+```
+
+## ES 内存管理
+
+### Filesystem Cache/Off-Heap/Doc Values/HeapSize 配置
+
+```text
+ES 内存管理：
+  1. Heap 内存（JVM）
+     ├── 建议：物理内存的 50%，最大 31GB
+     ├── 避免超过 31GB（指针压缩失效）
+     └── Xms = Xmx（避免动态调整）
+
+  2. Filesystem Cache（OS 缓存）
+     ├── Lucene 使用 OS 缓存加速查询
+     ├── 建议：留一半内存给 OS
+     └── 热数据自动缓存
+
+  3. Off-Heap 内存
+     ├── Doc Values 使用堆外内存
+     ├── Netty 堆外缓冲区
+     └── 减少 GC 压力
+
+  4. Doc Values
+     ├── 列式存储（堆外内存）
+     ├── 排序/聚合/脚本访问
+     └── 默认开启（keyword/数值/日期）
+```
+
+### HeapSize 配置
+
+```bash
+# ES 堆内存配置
+ES_JAVA_OPTS="-Xms31g -Xmx31g"
+
+# 建议：
+# 64GB 内存机器 → 堆 31GB，OS 33GB
+# 128GB 内存机器 → 堆 31GB，OS 97GB
+# 256GB 内存机器 → 堆 31GB，OS 225GB
+```
+
+## ES 集群监控
+
+### Prometheus Exporter/集群健康/分片分配/慢查询日志
+
+```yaml
+# Prometheus Exporter 配置
+# elasticsearch.yml
+xpack.monitoring.collection.enabled: true
+xpack.monitoring.exporters.prometheus.type: http
+xpack.monitoring.exporters.prometheus.host: ["http://prometheus:9090"]
+
+# 慢查询日志配置
+index.search.slowlog.threshold.query.warn: 5s
+index.search.slowlog.threshold.query.info: 2s
+index.search.slowlog.threshold.fetch.warn: 1s
+index.indexing.slowlog.threshold.index.warn: 5s
+```
+
+### 告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: es-alerts
+    rules:
+      - alert: ESHighIndexingLatency
+        expr: elasticsearch_indexing_latency_seconds > 0.2
+        for: 5m
+        labels:
+          severity: warning
+
+      - alert: ESRejectedThreads
+        expr: increase(elasticsearch_thread_pool_rejected_count[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+
+      - alert: ESDiskHigh
+        expr: elasticsearch_disk_usage_percent > 80
+        for: 10m
+        labels:
+          severity: critical
+```
+
+## ES 安全
+
+### X-Pack SSL/RBAC/Audit Log/Field Level Security
+
+```yaml
+# SSL 配置
+xpack.security.enabled: true
+xpack.security.transport.ssl.enabled: true
+xpack.security.transport.ssl.verification_mode: certificate
+xpack.security.transport.ssl.keystore.path: certs/transport.p12
+xpack.security.transport.ssl.truststore.path: certs/transport.p12
+
+# RBAC 配置
+POST /_security/role/log_reader
+{
+  "cluster": ["monitor"],
+  "indices": [
+    {
+      "names": ["logs-*"],
+      "privileges": ["read", "view_index_metadata"]
+    }
+  ]
+}
+
+# Field Level Security
+POST /_security/role/sensitive_data_reader
+{
+  "indices": [
+    {
+      "names": ["users-*"],
+      "privileges": ["read"],
+      "field_security": {
+        "grant": ["*"],
+        "deny": ["user.email", "user.phone"]
+      }
+    }
+  ]
+}
+
+# Audit Log
+xpack.security.audit.enabled: true
+xpack.security.audit.logfile.events.include: ["access_denied", "access_granted"]
+```
+
+## ES 备份恢复
+
+### Snapshot/Restore/增量备份/跨集群恢复
+
+```bash
+# 创建快照仓库
+PUT _snapshot/my_s3_repository
+{
+  "type": "s3",
+  "settings": {
+    "bucket": "my-backup-bucket",
+    "region": "us-east-1"
+  }
+}
+
+# 创建快照
+PUT _snapshot/my_s3_repository/snapshot_1?wait_for_completion=true
+{
+  "indices": "logs-*",
+  "ignore_unavailable": true,
+  "include_global_state": false
+}
+
+# 恢复快照
+POST _snapshot/my_s3_repository/snapshot_1/_restore
+{
+  "indices": "logs-*",
+  "ignore_unavailable": true,
+  "include_global_state": false
+}
+
+# 增量备份
+# ES 快照自动支持增量备份
+# 只备份变化的数据块
+```
+
+## ES 版本升级
+
+### 滚动升级/全量升级/兼容性检查/回滚
+
+```text
+滚动升级步骤：
+  1. 禁用分片分配
+     PUT _cluster/settings
+     {"persistent": {"cluster.routing.allocation.enable": "primaries"}}
+
+  2. 停止非索引操作
+     PUT _cluster/settings
+     {"persistent": {"cluster.max_shards_per_node": 0}}
+
+  3. 关闭索引（可选）
+     POST /my-index/_close
+
+  4. 升级节点
+     停止节点 → 替换二进制 → 启动节点
+
+  5. 恢复分片分配
+     PUT _cluster/settings
+     {"persistent": {"cluster.routing.allocation.enable": "all"}}
+
+  6. 等待集群健康变绿
+     GET _cluster/health
+
+回滚策略：
+  升级失败 → 停止新版本节点 → 启动旧版本节点
+  数据兼容：ES 版本向前兼容
+```
+
+## ES 集群架构
+
+### 单集群/多集群/跨集群复制 CCR
+
+```text
+集群架构选择：
+  单集群：中小规模，简单部署
+  多集群：大规模，物理隔离
+  跨集群复制（CCR）：灾备+就近读
+
+CCR 配置：
+  1. 主集群：创建 Leader 索引
+  2. 从集群：创建 Follower 索引
+  3. 异步复制：最终一致性
+  4. 故障转移：从集群提升为主
+
+  适用场景：
+    灾备：主集群故障，从集群接管
+    跨地域读：就近读取，降低延迟
+    报表查询：从集群专门处理查询
+    数据合规：特定地域数据保留
+```
+
 ## 十三、与其他板块的关系
 
 - ES 基础见「[ES 体系](../ES体系.md)」；

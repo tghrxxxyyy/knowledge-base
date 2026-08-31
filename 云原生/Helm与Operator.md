@@ -188,4 +188,282 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 ---
 
+---
+
+## 七、Helm 模板高级
+
+Helm 模板本质是 **Go text/template + Sprig 函数库**，难点在「控制流 + 命名模板复用 + 渲染上下文」。
+
+### 7.1 流程控制
+
+```yaml
+# 条件：values 里 enabled=false 就不渲染该块
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-ingress
+spec:
+  rules:
+  {{- range .Values.ingress.hosts }}
+  - host: {{ .host }}
+    http:
+      paths:
+      {{- range .paths }}
+      - path: {{ . }}
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ $.Release.Name }}
+            port: {number: 80}
+      {{- end }}
+  {{- end }}
+{{- end }}
+```
+
+要点：
+- `{{- ... -}}` 的 `-` 用于**裁剪首尾空白**（防止渲染出空行破坏 YAML）。这是 Helm 模板最常见的「幽灵空行」来源。
+- `range` 内用 `$` 引用外层上下文（如 `$.Release.Name`），`range` 内部 `.` 被重载为当前迭代项。
+- `with` 可缩小 `.` 的作用域：`{{- with .Values.resources }}` 之后 `.` 指向 resources 子树。
+
+### 7.2 命名模板与 `_helpers.tpl`
+
+```yaml
+# _helpers.tpl —— 公共函数，供所有模板 include
+{{- define "mychart.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end -}}
+
+# 在 deployment.yaml 使用
+metadata:
+  labels:
+    {{- include "mychart.labels" . | nindent 4 }}
+```
+
+- `include` vs `template`：`include` 可以管道处理（如 `| nindent 4` 缩进），`template` 不行；**生产一律用 `include`**。
+- 命名约定：模板名加 chart 前缀（`mychart.xxx`），避免多个子 Chart 重名冲突。
+
+### 7.3 进阶：lookup / required / 管道
+
+```yaml
+# required：缺值直接渲染失败（Fail Fast，比运行时报错友好）
+image: "{{ required "image.repository is required" .Values.image.repository }}:{{ .Values.image.tag }}"
+
+# lookup：在渲染期查集群已有资源（谨慎用，破坏幂等、且需要对应 RBAC）
+{{- $cm := lookup "v1" "ConfigMap" .Release.Namespace "shared-config" }}
+{{- if $cm }}
+data:
+  inherited: {{ $cm.data.key }}
+{{- end }}
+```
+
+> ⚠️ `lookup` 在 `--dry-run` / `helm template` 本地渲染时拿不到集群数据（返回空），会造成「本地渲染正常、集群里不一致」——尽量不用，或仅作可选增强。
+
+---
+
+## 八、库 Chart、子 Chart 依赖与生命周期
+
+### 8.1 子 Chart 与全局值
+
+- `charts/` 目录下放被依赖的子 Chart，或用 `dependencies` 从 OCI/仓库拉取。
+- 子 Chart **默认读不到父 Chart 的 `values.yaml`**，只能读到自己的 `values` 与父 Chart 通过 `xxx-chart.key` 显式传入的值。
+- 全局值用 `global:` 键：父 Chart 设 `.Values.global.region`，所有子 Chart 都能读到。
+
+```yaml
+# 父 Chart values.yaml
+global:
+  imageRegistry: registry.example.com
+subchart-a:
+  replicaCount: 2
+```
+
+### 8.2 库 Chart（type: library）
+
+```yaml
+# Chart.yaml
+type: library
+```
+库 Chart 不生成任何资源，只提供可被 `include` 的命名模板——适合把公司统一的 label/annotation/sidecar 注入逻辑沉淀成共享库，所有业务 Chart 依赖它。
+
+### 8.3 生命周期钩子（Hooks）
+
+| Hook | 触发时机 |
+|------|----------|
+| pre-install / post-install | 安装前后 |
+| pre-upgrade / post-upgrade | 升级前后 |
+| pre-delete / post-delete | 删除前后 |
+| pre-rollback / post-rollback | 回滚前后 |
+| test | `helm test` 时 |
+
+```yaml
+# 用 Hook 在升级前做数据库迁移
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "{{ .Release.Name }}-migrate"
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"        # 负数先执行
+    "helm.sh/hook-delete-policy": hook-succeeded
+```
+
+---
+
+## 九、Helm 测试与 CI 集成
+
+| 工具 | 用途 |
+|------|------|
+| `helm lint` | 静态检查（Chart.yaml 结构、模板块） |
+| `helm template --debug` | 渲染并检查输出 YAML 合法性 |
+| `helm unittest` | 对模板写单测（断言渲染结果含某字段） |
+| `chart-testing (ct)` | 校验改动 Chart 的 lint + 安装到 kind 集群验证 |
+| `helm diff` | 升级前对比「将产生什么变更」，避免误删/误改 |
+
+```bash
+# CI 中典型流水线
+helm dependency build ./mychart        # 拉子 Chart
+helm lint ./mychart
+helm template ./mychart | kubeconform -strict -o std   # 校验 K8s schema
+helm unittest ./mychart                  # 模板单测
+```
+
+> 经验：把 `helm template | kubeconform` 放进 PR 检查，能在合并前挡掉 80% 的 YAML/字段错误。
+
+---
+
+## 十、Operator 深入：Kubebuilder 工程化
+
+### 10.1 项目结构与关键文件
+
+```
+my-operator/
+├── api/v1/
+│   ├── rediscluster_types.go     # CRD Go 类型（Spec/Status）+ kubebuilder 注解生成 CRD
+│   └── groupversion_info.go      # GroupVersion 注册
+├── controllers/
+│   └── rediscluster_controller.go# Reconcile 实现
+├── config/
+│   ├── crd/                      # 生成的 CRD YAML
+│   ├── manager/                  # 部署 controller 的 Deployment
+│   ├── rbac/                     # 自动生成的 Role/RoleBinding
+│   └── webhook/                  # 校验/默认值 webhook
+├── main.go                       # manager 启动入口
+└── Makefile                     # make install / run / deploy
+```
+
+### 10.2 Reconcile 关键细节
+
+```go
+func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cr := &redisv1.RedisCluster{}
+    if err := r.Get(ctx, req.NamespacedName, cr); err != nil {
+        if apierrors.IsNotFound(err) {
+            return ctrl.Result{}, nil // 已删除，结束
+        }
+        return ctrl.Result{}, err
+    }
+
+    // 删除中：处理 Finalizer（清理外部资源，如云盘/备份）
+    if !cr.DeletionTimestamp.IsZero() {
+        if controllerutil.ContainsFinalizer(cr, redisFinalizer) {
+            if err := r.cleanupExternal(ctx, cr); err != nil {
+                return ctrl.Result{}, err
+            }
+            controllerutil.RemoveFinalizer(cr, redisFinalizer)
+            r.Update(ctx, cr)
+        }
+        return ctrl.Result{}, nil
+    }
+
+    // 确保 Finalizer 已挂上（保护关键资源不被误删）
+    if !controllerutil.ContainsFinalizer(cr, redisFinalizer) {
+        controllerutil.AddFinalizer(cr, redisFinalizer)
+        r.Update(ctx, cr)
+        return ctrl.Result{Requeue: true}, nil
+    }
+
+    // 调谐子资源：StatefulSet / Service / PVC / 备份 Job
+    if err := r.reconcileStatefulSet(ctx, cr); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 回写 Status 子资源（需 CRD 声明 status subresource）
+    cr.Status.ReadyReplicas = ready
+    cr.Status.Phase = "Running"
+    r.Status().Update(ctx, cr)
+
+    // 周期重对账（兜底漏掉的事件）
+    return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+```
+
+要点：
+- **Finalizer**：保护「有外部副作用」的 CR（如创建了云盘/数据库实例）。删除时先跑清理逻辑再真正删——避免孤儿资源。
+- **OwnerReference**：让 StatefulSet/PVC 自动归属 CR，CR 删除时级联删除；也能让垃圾回收正确工作。
+- **Status 子资源**：`status` 与 `spec` 分开，避免状态变更触发无限 Reconcile（watch spec 变化即可）。
+- **幂等**：Reconcile 可任意次重跑，结果一致——所有操作前先 Get 再 Create-or-Update。
+
+### 10.3 多版本 CRD 与转换
+
+- 用 `apiextensions.k8s.io/v1` 的 `versions` 声明多个版本（如 v1alpha1 → v1），配 `conversion: strategy: Webhook` 做版本间字段转换。
+- 升级 Operator 时先「双版本并存」一段，验证老版本 CR 能正常被新控制器接管，再下线老版本。
+
+---
+
+## 十一、Operator 测试与质量
+
+| 层级 | 工具 | 说明 |
+|------|------|------|
+| 单元测试 | `envtest` | 起一个仅 etcd+API Server 的迷你控制面，跑 Reconcile，无需真实 K8s |
+| 集成测试 | kind / Kubebuilder 的 `test` | 在真实-ish 集群验证端到端 |
+| 模糊测试 | go-fuzz | 校验 CR 字段边界 |
+
+```go
+// envtest 示例（关键：用 controller-runtime 的 envtest 包）
+cfg, _ := testEnv.Start()            // 拉起临时 API Server
+k8sClient, _ := client.New(cfg, ...)
+mgr := ctrl.NewManager(cfg, ...)
+go mgr.Start(ctx)
+
+// 创建 CR → 断言 StatefulSet 被创建 → 断言 status 更新
+```
+
+> ⚠️ 常见坑：① 忘记给 CRD `status` 子资源导致 Status 写不进去；② RBAC 漏配（controller 起不来，日志里 `forbidden`）；③ Reconcile 里打日志过多拖慢性能；④ 没有 `RequeueAfter` 兜底，靠事件触发漏掉状态变化。
+
+---
+
+## 十二、Helm + Operator 组合生产范式
+
+典型 Middleware 交付链路：
+```
+Helm Chart（分发 Operator 本体 + 默认 CR）
+   └── 安装 operator Deployment + CRD
+       └── 用户 apply 一个 CR（如 RedisCluster）
+           └── Operator 持续调谐出 StatefulSet/Service/PVC/备份
+               └── GitOps（ArgoCD）把 Helm Release 与 CR 一起纳入 Git 管理
+```
+即：**Helm 负责「装好 Operator + 给初始 CR」，Operator 负责「长期把应用运维好」，GitOps 负责「整套声明都在 Git 里可追溯」**——三层各司其职。
+
+---
+
+## 十三、常见坑与排障速查
+
+| 现象 | 根因 | 处理 |
+|------|------|------|
+| 模板渲染报 `nil pointer` | `.Values.x.y` 未定义就取值 | 用 `default` / `required` / 先 `if` 判断 |
+| 升级后旧资源没删 | `helm upgrade` 默认不删字段导致的孤儿 | 用 `helm diff` 预演 + `--history-max` 控制 |
+| CRD 升级冲突 | 老 CRD 与新版本字段不兼容 | 先双版本并存，再迁移 |
+| Operator 不调谐 | RBAC 缺、controller 没 watch CR | 看 controller 日志 `unable to watch` |
+| 状态永远不 Ready | readinessProbe 指向错端口 | 对齐 CR 暴露端口与探针 |
+| 删除 CR 卡 Terminating | Finalizer 没清掉或清理逻辑报错 | 看 controller 日志，手动清 finalizer 仅作最后手段 |
+
+---
+
+## 十四、速记口诀
+
+> 口诀：**「Helm 是包、values 是参、Release 是实例；include 复用、required 兜底、hook 做迁移。Operator 是 CR+控制器，Reconcile 比对 Spec 与 Status；Finalizer 防误删、OwnerRef 管级联、envtest 测调谐。」**
+
 [← 返回云原生索引](README.md)

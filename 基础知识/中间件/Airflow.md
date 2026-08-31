@@ -2222,6 +2222,523 @@ default_args:
   kill_on_timeout: True
 ```
 
+## 补充：Sensor vs Deferrable 深度对比
+
+### 技术原理
+
+| 维度 | Sensor | Deferrable |
+|------|--------|------------|
+| 实现方式 | 轮询（while循环） | 异步回调（Trigger） |
+| 资源占用 | 持续占用Worker槽位 | 释放Worker槽位 |
+| 延迟 | 轮询间隔决定 | 事件驱动 |
+| 成本 | 高（持续运行） | 低（仅触发时运行） |
+| 复杂度 | 低 | 中 |
+| 可靠性 | 一般 | 高（可重试） |
+
+### Deferrable Operator 实现
+
+```python
+from airflow.triggers.base import BaseTrigger, TriggerEvent
+
+class FileTrigger(BaseTrigger):
+    def __init__(self, filepath, modified_after=None):
+        self.filepath = filepath
+        self.modified_after = modified_after
+    
+    def run(self):
+        """异步监听文件变化"""
+        import asyncio
+        while True:
+            if os.path.exists(self.filepath):
+                mtime = os.path.getmtime(self.filepath)
+                if self.modified_after is None or mtime > self.modified_after:
+                    yield TriggerEvent({"filepath": self.filepath, "mtime": mtime})
+            yield asyncio.sleep(10)  # 非阻塞等待
+
+# 使用 Deferrable Operator
+class MyDeferrableOperator(BaseOperator):
+    def execute(self, context):
+        """同步阶段：启动异步触发器"""
+        self.defer(
+            trigger=FileTrigger(filepath="/data/input.csv"),
+            method_name="execute_complete",
+        )
+    
+    def execute_complete(self, context, event):
+        """异步回调阶段"""
+        self.log.info(f"文件就绪: {event['filepath']}")
+        # 处理文件
+        process_file(event['filepath'])
+```
+
+### 迁移指南
+
+```python
+# 旧方式：Sensor（轮询）
+from airflow.sensors.external_task import ExternalTaskSensor
+
+sensor = ExternalTaskSensor(
+    task_id="wait_for_upstream",
+    external_dag_id="upstream_dag",
+    external_task_id="final_task",
+    poke_interval=60,  # 每60秒轮询一次
+    timeout=3600,
+)
+
+# 新方式：Deferrable（异步）
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.triggers.external_task import ExternalTaskTrigger
+
+operator = SparkSubmitOperator(
+    task_id="wait_for_upstream",
+    deferrable=True,
+    trigger=ExternalTaskTrigger(
+        dag_id="upstream_dag",
+        task_id="final_task",
+        execution_date=...,
+    ),
+)
+```
+
+## 补充：Variable 加密与安全
+
+### 加密存储
+
+```python
+from airflow.models import Variable
+from cryptography.fernet import Fernet
+
+# 设置加密密钥
+FERNET_KEY = Variable.get("fernet_key")
+fernet = Fernet(FERNET_KEY)
+
+# 加密存储
+secret_value = "my-secret-password"
+encrypted = fernet.encrypt(secret_value.encode())
+Variable.set("encrypted_secret", encrypted.decode())
+
+# 解密使用
+encrypted_value = Variable.get("encrypted_secret")
+decrypted = fernet.decrypt(encrypted_value.encode()).decode()
+```
+
+### 环境变量注入
+
+```python
+# 从环境变量读取敏感配置
+import os
+
+# 环境变量优先级最高
+db_password = Variable.get("db_password", default_var=os.environ.get("DB_PASSWORD"))
+
+# 多环境配置
+env = Variable.get("environment", default_var="dev")
+if env == "prod":
+    config = Variable.get("prod_config")
+else:
+    config = Variable.get("dev_config")
+```
+
+## 补充：Pool 与 Slot 管理
+
+### Pool 资源限制
+
+```python
+from airflow.models import Pool
+
+# 创建 Pool
+Pool(pool="database_pool", slots=5, description="数据库连接池")
+
+# 使用 Pool
+from airflow.operators.python import PythonOperator
+
+task = PythonOperator(
+    task_id="db_task",
+    python_callable=process_data,
+    pool="database_pool",  # 使用指定 Pool
+    pool_slots=2,  # 占用2个槽位
+    dag=dag,
+)
+
+# 动态调整 Pool
+from airflow.api.common.pool import create_pool, get_pool
+
+# 获取 Pool 信息
+pool = get_pool("database_pool")
+print(f"总槽位: {pool.slots}, 使用中: {pool.occupied_slots}")
+```
+
+### Pool 监控
+
+```sql
+-- 查询 Pool 使用情况
+SELECT 
+    pool_id,
+    slots,
+    occupied_slots,
+    (slots - occupied_slots) as available_slots
+FROM slot_pool;
+
+-- 查询任务占用的 Pool
+SELECT 
+    t.task_id,
+    t.pool,
+    t.pool_slots,
+    t.state
+FROM task_instance t
+WHERE t.pool IS NOT NULL
+AND t.state = 'running';
+```
+
+## 补充：Trigger Rule 高级用法
+
+### 触发规则详解
+
+```python
+from airflow.utils.trigger_rule import TriggerRule
+
+# 所有上游必须成功（默认）
+task1 = PythonOperator(
+    task_id="task1",
+    python_callable=func,
+    trigger_rule=TriggerRule.ALL_SUCCESS,
+)
+
+# 所有上游必须完成（无论成功失败）
+task2 = PythonOperator(
+    task_id="task2",
+    python_callable=func,
+    trigger_rule=TriggerRule.ALL_DONE,
+)
+
+# 任一上游成功即可
+task3 = PythonOperator(
+    task_id="task3",
+    python_callable=func,
+    trigger_rule=TriggerRule.ONE_SUCCESS,
+)
+
+# 任一上游失败即触发
+task4 = PythonOperator(
+    task_id="task4",
+    python_callable=func,
+    trigger_rule=TriggerRule.ONE_FAILED,
+)
+
+# 所有上游失败
+task5 = PythonOperator(
+    task_id="task5",
+    python_callable=func,
+    trigger_rule=TriggerRule.ALL_FAILED,
+)
+
+# 上游无完成（跳过时使用）
+task6 = PythonOperator(
+    task_id="task6",
+    python_callable=func,
+    trigger_rule=TriggerRule.NONE_FAILED,
+)
+```
+
+### 条件分支示例
+
+```python
+from airflow.operators.python import BranchPythonOperator
+
+def branch_func(**kwargs):
+    """条件分支函数"""
+    ti = kwargs['ti']
+    xcom_value = ti.xcom_pull(task_ids='check_task')
+    
+    if xcom_value > 100:
+        return 'process_large'
+    else:
+        return 'process_small'
+
+# 条件分支
+branch_task = BranchPythonOperator(
+    task_id='branch',
+    python_callable=branch_func,
+    dag=dag,
+)
+
+# 任务组
+process_large = PythonOperator(
+    task_id='process_large',
+    python_callable=process_large_func,
+    dag=dag,
+)
+
+process_small = PythonOperator(
+    task_id='process_small',
+    python_callable=process_small_func,
+    dag=dag,
+)
+
+# 设置依赖
+branch_task >> [process_large, process_small]
+
+# 使用 TriggerRule 处理分支
+final_task = PythonOperator(
+    task_id='final_task',
+    python_callable=final_func,
+    trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,  # 至少一个成功
+    dag=dag,
+)
+
+[process_large, process_small] >> final_task
+```
+
+## 补充：dbt 集成
+
+### dbt 与 Airflow 集成
+
+```python
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+
+# dbt Cloud Job
+dbt_task = DbtCloudRunJobOperator(
+    task_id="dbt_transform",
+    job_id=12345,  # dbt Cloud Job ID
+    trigger_rule="all_success",
+    dag=dag,
+)
+
+# dbt Core 命令
+from airflow.operators.bash import BashOperator
+
+dbt_deps = BashOperator(
+    task_id="dbt_deps",
+    bash_command="dbt deps --profiles-dir /opt/airflow/dbt",
+    dag=dag,
+)
+
+dbt_run = BashOperator(
+    task_id="dbt_run",
+    bash_command="dbt run --profiles-dir /opt/airflow/dbt --models +tag:daily",
+    dag=dag,
+)
+
+dbt_test = BashOperator(
+    task_id="dbt_test",
+    bash_command="dbt test --profiles-dir /opt/airflow/dbt",
+    dag=dag,
+)
+
+# 依赖关系
+dbt_deps >> dbt_run >> dbt_test
+```
+
+### dbt 配置
+
+```yaml
+# profiles.yml
+default:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DB_HOST') }}"
+      port: 5432
+      user: "{{ env_var('DB_USER') }}"
+      pass: "{{ env_var('DB_PASS') }}"
+      dbname: analytics
+      schema: dbt_dev
+      threads: 4
+    
+    prod:
+      type: postgres
+      host: "{{ env_var('DB_HOST_PROD') }}"
+      port: 5432
+      user: "{{ env_var('DB_USER_PROD') }}"
+      pass: "{{ env_var('DB_PASS_PROD') }}"
+      dbname: analytics
+      schema: dbt_prod
+      threads: 8
+```
+
+## 补充：KubernetesExecutor 部署
+
+### K8s Executor 配置
+
+```yaml
+# airflow.cfg
+[core]
+executor = KubernetesExecutor
+
+[kubernetes_executor]
+namespace = airflow
+image = apache/airflow:2.7.0
+worker_container_repository = apache/airflow
+worker_container_tag = 2.7.0
+delete_worker_pods = True
+delete_worker_pods_on_failure = True
+worker_pods_created_quota = 100
+worker_memory_limit = 4Gi
+worker_cpu_limit = 2
+worker_resources_requests_memory = 2Gi
+worker_resources_requests_cpu = 1
+worker_service_account_name = airflow-worker
+logs_volume_claim = airflow-logs
+dags_in_image = True
+```
+
+### K8s Worker Pod 配置
+
+```python
+from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+from airflow.kubernetes.secret import Secret
+
+# 自定义 Worker Pod
+worker_pod = KubernetesPodOperator(
+    task_id="custom_worker",
+    namespace="airflow",
+    image="apache/airflow:2.7.0",
+    cmds=["python", "-c"],
+    arguments=["print('Hello from K8s pod')"],
+    labels={"team": "data-engineering"},
+    secrets=[Secret("env", "db_password", "airflow-secrets", "db-password")],
+    resources={
+        "requests": {"memory": "2Gi", "cpu": "1"},
+        "limits": {"memory": "4Gi", "cpu": "2"},
+    },
+    tolerations=[
+        {"key": "data-engineering", "operator": "Equal", "value": "true", "effect": "NoSchedule"}
+    ],
+    node_selector={"node-type": "worker"},
+    volumes=[
+        {"name": "dags", "persistentVolumeClaim": {"claimName": "airflow-dags"}},
+    ],
+    volume_mounts=[
+        {"name": "dags", "mountPath": "/opt/airflow/dags"},
+    ],
+)
+```
+
+## 补充：Airflow vs 其他调度器对比
+
+### 功能对比
+
+| 功能 | Airflow | Prefect | Dagster | Mage |
+|------|---------|---------|---------|------|
+| DAG 定义 | Python | Python | Python | Python |
+| 调度器 | Cron | Interval | Cron | Cron |
+| 执行器 | Celery/K8s | Local/Dask | Local/Dask/K8s | Local/Docker |
+| UI | Web UI | Cloud UI | Web UI | Web UI |
+| 监控 | Prometheus | Cloud | Prometheus | 内置 |
+| 社区 | 大 | 中 | 中 | 小 |
+| 云集成 | 广泛 | 原生 | 原生 | 中等 |
+
+### 选型决策树
+
+```mermaid
+graph TD
+    A[开始] --> B{团队规模?}
+    B -->|小型| C{技术栈?}
+    B -->|中型| D{数据量?}
+    B -->|大型| E{架构要求?}
+    
+    C -->|Python| F[Prefect/Mage]
+    C -->|多语言| G[Airflow]
+    
+    D -->|TB级| H[Prefect/Dagster]
+    D -->|PB级| I[Airflow+K8s]
+    
+    E -->|微服务| J[Dagster]
+    E -->|单体| K[Airflow]
+```
+
+## 补充：Airflow 架构设计
+
+### 高可用架构
+
+```mermaid
+graph TB
+    subgraph Web Server
+        A1[Web Server 1] --> DB[(PostgreSQL)]
+        A2[Web Server 2] --> DB
+    end
+    
+    subgraph Scheduler
+        B1[Scheduler 1] --> DB
+        B2[Scheduler 2] --> DB
+        B1 --> Redis[(Redis)]
+        B2 --> Redis
+    end
+    
+    subgraph Workers
+        C1[Celery Worker 1] --> Redis
+        C2[Celery Worker 2] --> Redis
+        C3[Celery Worker N] --> Redis
+    end
+    
+    subgraph K8s Executor
+        D1[K8s Worker Pod 1]
+        D2[K8s Worker Pod 2]
+        D3[K8s Worker Pod N]
+    end
+```
+
+### 任务执行流程
+
+```text
+1. DAG 解析
+   └── Scheduler 解析 DAG 文件
+   └── 创建 DagModel 和 TaskModel
+
+2. 调度决策
+   └── 检查依赖关系
+   └── 检查资源限制
+   └── 检查执行时间
+
+3. 任务执行
+   └── 创建 TaskInstance
+   └── 分配到 Worker
+   └── 执行任务逻辑
+
+4. 状态更新
+   └── 更新任务状态
+   └── 记录日志
+   └── 触发下游任务
+
+5. 监控告警
+   └── 任务失败告警
+   └── 性能监控
+   └── 资源使用监控
+```
+
+### 性能优化配置
+
+```yaml
+# airflow.cfg 优化配置
+[core]
+# 并行度
+parallelism = 32
+dag_concurrency = 16
+max_active_runs_per_dag = 16
+
+[.scheduler]
+# 调度器配置
+min_file_process_interval = 30
+dag_dir_list_interval = 300
+print_stats_interval = 30
+pool_metrics_interval = 10
+
+[celery]
+# Worker 配置
+worker_concurrency = 16
+worker_prefetch_multiplier = 1
+worker_max_tasks_per_child = 100
+worker_max_recursion_depth = 100
+
+[logging]
+# 日志配置
+base_log_folder = /var/log/airflow
+remote_logging = True
+remote_log_conn_id = airflow_logs
+remote_base_log_folder = s3://airflow-logs/
+```
+
 ### 最佳实践
 
 | 实践 | 说明 | 优先级 |

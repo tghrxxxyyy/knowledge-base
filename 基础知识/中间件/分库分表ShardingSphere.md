@@ -2284,13 +2284,326 @@ shadowRule:
 | 事务 | XA/Seata | 高 |
 | 监控 | 慢SQL告警 | 高 |
 
-### 生产问题排查
+## 补充：分片算法详解
 
-| 问题 | 排查步骤 | 解决方案 |
-|------|----------|----------|
-| 跨片查询 | 检查分片键 | 优化查询 |
-| 分布式事务 | 检查事务配置 | 使用Seata |
-| 数据迁移 | 检查数据一致性 | 双写验证 |
+### 标准分片算法
+
+```java
+// 取模分片
+public class ModShardingAlgorithm implements StandardShardingAlgorithm<Integer> {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, Integer shardingValue) {
+        int mod = shardingValue % availableTargetNames.size();
+        return availableTargetNames.stream()
+            .skip(mod)
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("没有可用分片"));
+    }
+}
+
+// 范围分片
+public class RangeShardingAlgorithm implements StandardShardingAlgorithm<Integer> {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, Integer shardingValue) {
+        // 按ID范围分片：0-10000 -> ds_0, 10001-20000 -> ds_1
+        long index = (long) Math.floor((double) shardingValue / 10000);
+        return availableTargetNames.stream()
+            .skip(Math.min(index, availableTargetNames.size() - 1))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("没有可用分片"));
+    }
+}
+```
+
+### 复合分片算法
+
+```java
+// 复合分片（时间+取模）
+public class ComplexShardingAlgorithm implements ComplexKeysShardingAlgorithm {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, 
+                            ShardingValue<?> shardingValue) {
+        ComplexShardingValue<?> complexValue = (ComplexShardingValue<?>) shardingValue;
+        Comparable<?> orderId = complexValue.getColumnNameValuesMap().get("order_id");
+        Comparable<?> createTime = complexValue.getColumnNameValuesMap().get("create_time");
+        
+        // 先按时间分片，再按ID取模
+        int timeShard = ((LocalDate) createTime).getMonthValue() % 12;
+        int idShard = ((Integer) orderId) % 10;
+        String target = "ds_" + timeShard + "_t_" + idShard;
+        
+        return availableTargetNames.contains(target) ? target : availableTargetNames.iterator().next();
+    }
+}
+```
+
+### Hint分片算法
+
+```java
+// 强制路由（通过Hint指定分片）
+public class HintShardingAlgorithm implements HintShardingAlgorithm<Integer> {
+    @Override
+    public String doSharding(Collection<String> availableTargetNames, 
+                            ShardingValue<Integer> shardingValue) {
+        // Hint值直接指定分片
+        Integer hintValue = shardingValue.getValue();
+        return "ds_" + (hintValue % availableTargetNames.size());
+    }
+}
+
+// 使用示例
+HintManager hintManager = HintManager.getInstance();
+hintManager.addTableShardingValue("t_order", 1); // 强制路由到分片1
+List<Order> orders = orderMapper.selectByCondition(condition);
+hintManager.close();
+```
+
+### 分片算法选型决策树
+
+```mermaid
+graph TD
+    A[开始] --> B{分片键类型?}
+    B -->|数值型| C{数据分布?}
+    B -->|时间型| D{时间粒度?}
+    B -->|字符串| E{哈希分布?}
+    
+    C -->|均匀| F[取模分片]
+    C -->|范围| G[范围分片]
+    C -->|热点| H[一致性哈希]
+    
+    D -->|月度| I[按月分片]
+    D -->|季度| J[按季度分片]
+    D -->|年度| K[按年分片]
+    
+    E -->|随机| L[哈希取模]
+    E -->|有序| M[字典序分片]
+```
+
+## 补充：分布式事务深度对比
+
+### 事务模式对比
+
+| 模式 | 原理 | 性能 | 一致性 | 适用场景 |
+|------|------|------|--------|----------|
+| XA | 两阶段提交 | 低 | 强一致 | 金融、支付 |
+| Seata-AT | 自动生成回滚SQL | 中 | 最终一致 | 电商、订单 |
+| Seata-TCC | 手动实现Try/Confirm/Cancel | 高 | 最终一致 | 高性能场景 |
+| Seata-Saga | 状态机+补偿 | 高 | 最终一致 | 长事务 |
+| 消息最终一致 | 本地事务+消息 | 高 | 最终一致 | 异步场景 |
+
+### XA 模式配置
+
+```yaml
+# XA 模式配置
+rules:
+  - !XA
+    dataSources:
+      ds_0:
+        xaTxClassName: com.atomikos.icjta.jta.AtomikosTransactionManagerPlugin
+    props:
+      xaTxClassName: com.atomikos.icjta.jta.AtomikosTransactionManagerPlugin
+
+# 使用方式
+@Transactional
+public void createOrderWithXa(Order order) {
+    // XA 事务会自动管理分布式事务
+    orderMapper.insert(order);
+    inventoryMapper.deduct(order.getProductId(), order.getCount());
+}
+```
+
+### Seata TCC 实现
+
+```java
+// TCC 接口定义
+public interface TccService {
+    @TwoPhaseBusinessAction(name = "prepare", commitMethod = "commit", rollbackMethod = "rollback")
+    boolean prepare(BusinessActionContext context, @BusinessActionContextParameter(paramName = "amount") BigDecimal amount);
+    
+    boolean commit(BusinessActionContext context);
+    
+    boolean rollback(BusinessActionContext context);
+}
+
+// 实现类
+@Service
+public class TccServiceImpl implements TccService {
+    @Override
+    @Transactional
+    public boolean prepare(BusinessActionContext context, BigDecimal amount) {
+        // Try 阶段：冻结资源
+        accountMapper.freeze(context.getAccountNo(), amount);
+        return true;
+    }
+    
+    @Override
+    @Transactional
+    public boolean commit(BusinessActionContext context) {
+        // Confirm 阶段：扣除冻结资源
+        accountMapper.deductFrozen(context.getAccountNo(), new BigDecimal(context.getActionContext("amount")));
+        return true;
+    }
+    
+    @Override
+    @Transactional
+    public boolean rollback(BusinessActionContext context) {
+        // Cancel 阶段：解冻资源
+        accountMapper.unfreeze(context.getAccountNo(), new BigDecimal(context.getActionContext("amount")));
+        return true;
+    }
+}
+```
+
+## 补充：生产调优深度指南
+
+### 连接池配置
+
+```yaml
+# HikariCP 连接池
+spring:
+  datasource:
+    hikari:
+      minimum-idle: 10
+      maximum-pool-size: 50
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      leak-detection-threshold: 60000
+      connection-test-query: SELECT 1
+```
+
+### 线程池配置
+
+```yaml
+# ShardingSphere 线程池
+props:
+  executor:
+    size: 16
+    rejected-handlers: CALLER_RUNS_POLICY
+    thread-factory:
+      thread-name-prefix: sharding-
+```
+
+### JVM 参数优化
+
+```bash
+# 推荐 JVM 参数
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:G1HeapRegionSize=16m
+-XX:InitiatingHeapOccupancyPercent=45
+-Xms4g -Xmx4g
+-XX:MaxMetaspaceSize=512m
+-XX:+PrintGCDetails -XX:+PrintGCDateStamps
+-Xloggc:/var/log/gc.log
+```
+
+### 慢SQL监控配置
+
+```yaml
+# 慢SQL阈值配置
+props:
+  sql-simple:
+    show: true
+  sql-slow:
+    threshold: 1000  # 1秒
+    log-path: /var/log/shardingsphere/slow-sql.log
+```
+
+## 补充：数据迁移实战
+
+### 在线迁移流程
+
+```mermaid
+graph TB
+    subgraph 第一阶段：全量同步
+        A[源库] -->|mysqldump| B[数据导出]
+        B --> C[数据导入]
+        C --> D[目标库]
+    end
+    
+    subgraph 第二阶段：增量同步
+        E[Binlog] --> F[Canal]
+        F --> G[ShardingSphere]
+        G --> D
+    end
+    
+    subgraph 第三阶段：切换验证
+        H[双写验证] --> I[流量切换]
+        I --> J[数据校验]
+    end
+```
+
+### 数据校验脚本
+
+```python
+#!/usr/bin/env python3
+import pymysql
+import hashlib
+
+def verify_data(source_db, target_db, table, sharding_key):
+    # 查询源库数据
+    source_conn = pymysql.connect(**source_db)
+    source_cursor = source_conn.cursor()
+    source_cursor.execute(f"SELECT * FROM {table} ORDER BY id")
+    source_data = source_cursor.fetchall()
+    
+    # 查询目标库数据（需要遍历分片）
+    target_conn = pymysql.connect(**target_db)
+    target_cursor = target_conn.cursor()
+    target_cursor.execute(f"SELECT * FROM {table} ORDER BY id")
+    target_data = target_cursor.fetchall()
+    
+    # 数据比对
+    if len(source_data) != len(target_data):
+        print(f"数据量不匹配: 源库 {len(source_data)} 条, 目标库 {len(target_data)} 条")
+        return False
+    
+    for i, (source_row, target_row) in enumerate(zip(source_data, target_data)):
+        source_hash = hashlib.md5(str(source_row).encode()).hexdigest()
+        target_hash = hashlib.md5(str(target_row).encode()).hexdigest()
+        if source_hash != target_hash:
+            print(f"数据不匹配: 行 {i}, 源库 {source_hash}, 目标库 {target_hash}")
+            return False
+    
+    print("数据校验通过")
+    return True
+```
+
+## 补充：DistSQL 动态配置
+
+### DistSQL 语法示例
+
+```sql
+-- 创建分片规则
+CREATE SHARDING TABLE RULE t_order (
+    RESOURCES(ds_0, ds_1),
+    SHARDING_COLUMN=order_id,
+    TYPE(NAME=MOD, PROPERTIES("sharding-count"=4)),
+    KEY_GENERATE_STRATEGY(COLUMN=order_id, KEY_GENERATOR_NAME=snowflake)
+);
+
+-- 修改分片规则
+ALTER SHARDING TABLE RULE t_order (
+    RESOURCES(ds_0, ds_1, ds_2),
+    SHARDING_COLUMN=order_id,
+    TYPE(NAME=MOD, PROPERTIES("sharding-count"=6))
+);
+
+-- 创建读写分离规则
+CREATE READWRITE_SPLITTING RULE ds_0 (
+    WRITEDataSource=ds_0,
+    READDataSourceS(ds_0_slave0, ds_0_slave1),
+    TYPE(NAME="random")
+);
+
+-- 创建加密规则
+CREATE ENCRYPT RULE t_user (
+    COLUMNS(
+        (NAME=pwd, CIPHER(pwd_cipher), PLAIN(pwd_plain), TYPE(NAME=AES, PROPERTIES("aes.key.value"="12345678")))
+    )
+);
+```
 
 ## 十五、速查表（扩展）
 

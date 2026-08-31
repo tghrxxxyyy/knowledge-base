@@ -2256,6 +2256,514 @@ spec:
   5. 本地 Agent 减少网络延迟
 ```
 
----
+## 补充：采样策略详解
+
+### 采样类型对比
+
+| 采样类型 | 原理 | 优点 | 缺点 | 适用场景 |
+|----------|------|------|------|----------|
+| Constant | 固定比例 | 简单 | 可能丢失重要数据 | 开发环境 |
+| Probabilistic | 概率采样 | 灵活 | 高流量可能漏采 | 生产环境 |
+| Rate Limiting | 限速采样 | 控制流量 | 可能丢数据 | 高流量场景 |
+| Adaptive | 自适应 | 智能 | 复杂 | 大规模生产 |
+| ParentBased | 继承父级 | 一致 | 依赖上游 | 分布式系统 |
+| Tail-based | 尾部采样 | 精确 | 实现复杂 | 问题排查 |
+
+### 采样配置示例
+
+```yaml
+# Jaeger Agent 采样配置
+{
+  "service_name": "my-service",
+  "sampler": {
+    "type": "ratelimiting",
+    "param": 100  // 每秒最多100个采样
+  }
+}
+
+# 远程采样配置
+{
+  "service_name": "my-service",
+  "sampler": {
+    "type": "remote",
+    "param": 0.01,  // 初始采样率1%
+    "endpoint": "http://jaeger-collector:14269/api/sampling/my-service"
+  }
+}
+
+# 自适应采样
+{
+  "service_name": "my-service",
+  "sampler": {
+    "type": "adaptive",
+    "param": 0.01,
+    "maxTracesPerSecond": 100,
+    "minSamplesPerSecond": 10
+  }
+}
+```
+
+### 尾部采样实现
+
+```python
+# Tail-based 采样规则
+{
+  "rules": [
+    {
+      "name": "error-sampling",
+      "condition": {
+        "type": "span_count",
+        "min": 1,
+        "max": 100
+      },
+      "sampleRate": 1.0  // 100%采样错误链路
+    },
+    {
+      "name": "latency-sampling",
+      "condition": {
+        "type": "duration",
+        "min": 1000  // 大于1秒
+      },
+      "sampleRate": 0.5  // 50%采样
+    },
+    {
+      "name": "random-sampling",
+      "condition": {
+        "type": "always"
+      },
+      "sampleRate": 0.01  // 1%随机采样
+    }
+  ]
+}
+```
+
+## 补充：Span 数据模型
+
+### Span 结构
+
+```json
+{
+  "traceID": "abc123def456",
+  "spanID": "1234567890abcdef",
+  "parentSpanID": "0987654321fedcba",
+  "operationName": "HTTP GET /api/users",
+  "startTime": 1633046400000000,
+  "duration": 15000,
+  "tags": {
+    "http.method": "GET",
+    "http.url": "/api/users/123",
+    "http.status_code": 200,
+    "component": "net/http",
+    "span.kind": "client"
+  },
+  "logs": [
+    {
+      "timestamp": 1633046400001000,
+      "fields": {
+        "event": "retry",
+        "retry.count": 3,
+        "error": true
+      }
+    }
+  ],
+  "process": {
+    "serviceName": "user-service",
+    "tags": {
+      "host.name": "user-service-pod-123",
+      "ip": "10.0.0.123",
+      "version": "1.2.3"
+    }
+  }
+}
+```
+
+### Span 标准标签
+
+| 标签 | 说明 | 示例值 |
+|------|------|--------|
+| `span.kind` | Span类型 | client/server/internal/producer/consumer |
+| `http.method` | HTTP方法 | GET/POST/PUT |
+| `http.url` | 请求URL | /api/users |
+| `http.status_code` | 状态码 | 200/404/500 |
+| `http.request_content_length` | 请求大小 | 1234 |
+| `http.response_content_length` | 响应大小 | 5678 |
+| `db.type` | 数据库类型 | mysql/postgresql |
+| `db.statement` | SQL语句 | SELECT * FROM users |
+| `db.user` | 数据库用户 | root |
+| `message_bus.destination` | 消息目标 | orders/topic |
+
+## 补充：存储后端对比
+
+### 存储后端选型
+
+| 后端 | 性能 | 可靠性 | 成本 | 适用场景 |
+|------|------|--------|------|----------|
+| Cassandra | 高 | 高 | 中 | 大规模生产 |
+| Elasticsearch | 高 | 高 | 高 | 复杂查询 |
+| ClickHouse | 极高 | 高 | 低 | 分析场景 |
+| Kafka | 极高 | 高 | 中 | 缓冲层 |
+| Badger | 中 | 中 | 低 | 小规模/开发 |
+| Memory | 极高 | 低 | 高 | 测试环境 |
+
+### ClickHouse 存储配置
+
+```yaml
+# ClickHouse 存储配置
+span_storage:
+  type: clickhouse
+  options:
+    address: clickhouse:9000
+    database: jaeger
+    span_table: spans
+    index_table: span_index
+    dependencies_table: dependencies
+    max_span_size: 1048576  # 1MB
+    batch_size: 1000
+    flush_interval: 1s
+
+# ClickHouse 建表语句
+CREATE TABLE jaeger.spans ON CLUSTER '{cluster}'
+(
+    trace_id String,
+    span_id UInt64,
+    parent_span_id UInt64,
+    operation_name String,
+    start_time DateTime64(6),
+    duration UInt64,
+    service_name String,
+    tags Map(String, String),
+    logs String
+)
+ENGINE = ReplicatedMergeTree()
+PARTITION BY toYYYYMM(start_time)
+ORDER BY (service_name, operation_name, start_time)
+TTL start_time + INTERVAL 30 DAY;
+
+CREATE TABLE jaeger.span_index ON CLUSTER '{cluster}'
+(
+    trace_id String,
+    span_id UInt64,
+    service_name String,
+    operation_name String,
+    start_time DateTime64(6)
+)
+ENGINE = ReplicatedMergeTree()
+PARTITION BY toYYYYMM(start_time)
+ORDER BY (service_name, operation_name, start_time);
+```
+
+## 补充：OpenTelemetry 集成
+
+### OTel + Jaeger 架构
+
+```mermaid
+graph TB
+    subgraph 应用层
+        A[Application] --> B[OTel SDK]
+        B --> C[OTel Exporter]
+    end
+    
+    subgraph 收集层
+        C --> D[OTel Collector]
+        D --> E[OTLP Receiver]
+        E --> F[Processor]
+        F --> G[Jaeger Exporter]
+    end
+    
+    subgraph 存储层
+        G --> H[Jaeger Collector]
+        H --> I[Jaeger Storage]
+    end
+    
+    subgraph 查询层
+        I --> J[Jaeger Query]
+        J --> K[Jaeger UI]
+    end
+```
+
+### OTel 配置示例
+
+```yaml
+# OTel Collector 配置
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  
+  jaeger:
+    protocols:
+      thrift_compact:
+        endpoint: 0.0.0.0:6831
+      thrift_http:
+        endpoint: 0.0.0.0:14268
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+exporters:
+  jaeger:
+    endpoint: jaeger-collector:14250
+    tls:
+      insecure: true
+  
+  logging:
+    loglevel: debug
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp, jaeger]
+      processors: [memory_limiter, batch]
+      exporters: [jaeger, logging]
+```
+
+### 应用集成示例
+
+```python
+# Python 应用集成 OTel + Jaeger
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.sdk.resources import Resource
+
+# 配置资源
+resource = Resource.create({
+    "service.name": "my-service",
+    "service.version": "1.0.0",
+    "deployment.environment": "production"
+})
+
+# 配置 Tracer
+provider = TracerProvider(resource=resource)
+jaeger_exporter = JaegerExporter(
+    agent_host_name="jaeger-agent",
+    agent_port=6831,
+)
+processor = BatchSpanProcessor(jaeger_exporter)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+# 使用 Tracer
+tracer = trace.get_tracer(__name__)
+
+def handle_request():
+    with tracer.start_as_current_span("process-request") as span:
+        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.url", "/api/users")
+        
+        # 业务逻辑
+        result = query_database()
+        
+        span.set_attribute("http.status_code", 200)
+        return result
+```
+
+## 补充：依赖图生成
+
+### 服务依赖分析
+
+```sql
+-- 查询服务依赖关系
+SELECT 
+    parent_service,
+    child_service,
+    COUNT(*) as call_count,
+    AVG(duration) as avg_duration
+FROM jaeger.dependencies
+WHERE timestamp > NOW() - INTERVAL 1 DAY
+GROUP BY parent_service, child_service
+ORDER BY call_count DESC;
+```
+
+### 依赖图可视化
+
+```python
+# 生成依赖图数据
+def get_dependency_graph(service_name, time_range):
+    query = """
+    SELECT 
+        parent_service,
+        child_service,
+        COUNT(*) as call_count
+    FROM dependencies
+    WHERE parent_service = %s 
+    AND timestamp BETWEEN %s AND %s
+    GROUP BY parent_service, child_service
+    """
+    
+    results = execute_query(query, service_name, time_range.start, time_range.end)
+    
+    nodes = set()
+    edges = []
+    
+    for row in results:
+        nodes.add(row['parent_service'])
+        nodes.add(row['child_service'])
+        edges.append({
+            'source': row['parent_service'],
+            'target': row['child_service'],
+            'value': row['call_count']
+        })
+    
+    return {
+        'nodes': [{'id': n} for n in nodes],
+        'edges': edges
+    }
+```
+
+## 补充：生产部署架构
+
+### 高可用部署
+
+```mermaid
+graph TB
+    subgraph Agent 层
+        A1[Agent 1] --> B1[App 1]
+        A2[Agent 2] --> B2[App 2]
+        A3[Agent 3] --> B3[App 3]
+    end
+    
+    subgraph Collector 层
+        A1 --> C1[Collector 1]
+        A2 --> C2[Collector 2]
+        A3 --> C3[Collector 3]
+        C1 --> D[Kafka]
+        C2 --> D
+        C3 --> D
+    end
+    
+    subgraph Storage 层
+        D --> E1[Ingester 1]
+        D --> E2[Ingester 2]
+        E1 --> F[Cassandra/Elasticsearch]
+        E2 --> F
+    end
+    
+    subgraph Query 层
+        F --> G1[Query 1]
+        F --> G2[Query 2]
+        G1 --> H[Load Balancer]
+        G2 --> H
+        H --> I[Jaeger UI]
+    end
+```
+
+### 资源配置参考
+
+| 组件 | CPU | 内存 | 存储 | 副本数 |
+|------|-----|------|------|--------|
+| Agent | 0.5核 | 256MB | - | 每个节点 |
+| Collector | 2核 | 4GB | - | 3+ |
+| Ingester | 4核 | 8GB | - | 3+ |
+| Query | 2核 | 4GB | - | 2+ |
+| Cassandra | 4核 | 16GB | SSD | 3+ |
+| Elasticsearch | 4核 | 16GB | SSD | 3+ |
+
+## 补充：上下文传播
+
+### W3C Trace Context
+
+```python
+# 注入（生产者）
+from opentelemetry.propagate import inject
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+headers = {}
+inject(headers)  # 注入 traceparent 头
+requests.get("http://service-b.com", headers=headers)
+
+# 提取（消费者）
+from opentelemetry.propagate import extract
+
+extracted_context = extract(request.headers)
+with tracer.start_as_current_span("consumer", context=extracted_context):
+    # 处理请求
+    pass
+```
+
+### 传播头格式
+
+| 格式 | 头 | 示例 |
+|------|-----|------|
+| W3C | traceparent | 00-abc123-123456-01 |
+| W3C | tracestate | congo=t61rcWkgMzE |
+| B3 | X-B3-TraceId | abc123def456 |
+| B3 | X-B3-SpanId | 1234567890abcdef |
+| B3 | X-B3-ParentSpanId | 0987654321fedcba |
+| Jaeger | uber-trace-id | abc123:123456:0:1 |
+
+### 跨服务传播配置
+
+```yaml
+# Spring Boot 配置
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://jaeger-collector:14268/api/v1/traces
+
+# 配置传播头
+opentelemetry:
+  propagators: tracecontext,baggage
+  exporter:
+    jaeger:
+      endpoint: jaeger-collector:14250
+```
+
+## 补充：生产问题排查
+
+### 高级排查技巧
+
+```bash
+# 1. 查询特定服务的所有 Span
+curl -s 'http://localhost:16686/api/traces?service=user-service&limit=100' | jq '.data | length'
+
+# 2. 查询错误 Span
+curl -s 'http://localhost:16686/api/traces?service=user-service&tags={"error":"true"}' | jq '.data[].spans[] | select(.tags.error == "true")'
+
+# 3. 查询慢请求
+curl -s 'http://localhost:16686/api/traces?service=user-service&minDuration=1000000' | jq '.data[].spans[] | select(.duration > 1000000)'
+
+# 4. 分析服务依赖
+curl -s 'http://localhost:16686/api/dependencies?endTs=$(date +%s)000&lookback=3600000' | jq '.data'
+
+# 5. 检查 Collector 状态
+curl -s 'http://localhost:14269/metrics' | grep 'jaeger_collector'
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `--collector.num-workers` | 50 | 200 | Collector 工作线程 |
+| `--collector.queue-size` | 2000 | 10000 | Collector 队列大小 |
+| `--collector.grpc.max-message-size` | 4MB | 16MB | gRPC 最大消息 |
+| `--query.timeout` | 10s | 30s | 查询超时 |
+| `--query.max-traces-per-request` | 1000 | 5000 | 每请求最大 Trace |
+| `--agent.max-queue-size` | 1000 | 5000 | Agent 队列大小 |
+
+### 最佳实践总结
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 采样策略 | 生产环境使用自适应采样 | 高 |
+| 上下文传播 | 使用 W3C Trace Context | 高 |
+| 存储选择 | 大规模用 ClickHouse | 高 |
+| 性能优化 | 批量上报+异步 | 中 |
+| 监控告警 | Agent/Collector 监控 | 高 |
+| 安全配置 | TLS 加密 | 中 |
 
 > 一句话：**Jaeger = OpenTelemetry 原生后端 + W3C Trace Context 传播 + 灵活采样（Head/Tail-based）+ ES/Cassandra/ClickHouse 存储；选型先看「生态（云原生→Jaeger，Java→SkyWalking）」，再定「采样策略（高吞吐→概率采样，找问题→Tail-based）」**。

@@ -2348,6 +2348,457 @@ ALTER TABLE logs ADD INDEX timestamp_idx timestamp TYPE minmax GRANULARITY 4;
 EXPLAIN SELECT * FROM logs WHERE level = 'ERROR';
 ```
 
+## ReplicatedMergeTree 引擎
+
+### ZooKeeper 依赖与复制机制
+
+```sql
+-- ReplicatedMergeTree 表创建
+CREATE TABLE logs_replicated ON CLUSTER cluster_1
+(
+    event_date Date,
+    event_time DateTime,
+    service String,
+    message String
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{cluster}/{shard}/logs', '{replica}')
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, service);
+
+-- 复制机制说明：
+-- 1. ZooKeeper 存储复制元数据
+-- 2. 每个分片有多个副本
+-- 3. 写入时 Leader 接收，Follower 异步复制
+-- 4. 数据一致性：最终一致性
+-- 5. 故障恢复：自动从其他副本同步
+
+-- 查看复制状态
+SELECT * FROM system.replicas WHERE table = 'logs_replicated';
+
+-- 手动触发复制
+SYSTEM RESTART REPLICA logs_replicated;
+SYSTEM SYNC REPLICA logs_replicated;
+```
+
+### ReplicatedMergeTree vs MergeTree
+
+| 维度 | MergeTree | ReplicatedMergeTree |
+|------|-----------|---------------------|
+| 高可用 | 无 | 有（多副本） |
+| 依赖 | 无 | ZooKeeper |
+| 写性能 | 高 | 中（复制开销） |
+| 适用场景 | 单节点/测试 | 生产环境 |
+| 运维复杂度 | 低 | 中 |
+| 数据一致性 | 无保证 | 最终一致 |
+
+## MergeTree 引擎家族
+
+### 各引擎适用场景
+
+```sql
+-- ReplacingMergeTree：去重
+CREATE TABLE ordersReplacing ON CLUSTER cluster_1
+(
+    order_id UInt64,
+    user_id String,
+    amount Decimal(18,2),
+    status String,
+    update_time DateTime
+)
+ENGINE = ReplacingMergeTree(update_time)
+ORDER BY order_id;
+
+-- SummingMergeTree：预聚合
+CREATE TABLE metricsSumming ON CLUSTER cluster_1
+(
+    date Date,
+    service String,
+    request_count UInt64,
+    error_count UInt64,
+    latency_sum Float64
+)
+ENGINE = SummingMergeTree((request_count, error_count, latency_sum))
+ORDER BY (date, service);
+
+-- AggregatingMergeTree：复杂聚合
+CREATE TABLE metricsAggregating ON CLUSTER cluster_1
+(
+    date Date,
+    service String,
+    request_count AggregateFunction(count, UInt64),
+    latency_avg AggregateFunction(avg, Float64)
+)
+ENGINE = AggregatingMergeTree()
+ORDER BY (date, service);
+
+-- CollapsingMergeTree：状态折叠
+CREATE TABLE logsCollapsing ON CLUSTER cluster_1
+(
+    log_id UInt64,
+    timestamp DateTime,
+    message String,
+    sign Int8
+)
+ENGINE = CollapsingMergeTree(sign)
+ORDER BY (log_id, timestamp);
+```
+
+### 引擎选择决策树
+
+```mermaid
+flowchart TD
+    A{需要去重?} -->|是| B[ReplacingMergeTree]
+    A -->|否| C{需要预聚合?}
+    C -->|是| D{聚合类型?}
+    D -->|简单求和| E[SummingMergeTree]
+    D -->|复杂聚合| F[AggregatingMergeTree]
+    C -->|否| G{需要状态折叠?}
+    G -->|是| H[CollapsingMergeTree]
+    G -->|否| I[MergeTree]
+```
+
+## 物化视图
+
+### ClickHouse 物化视图
+
+```sql
+-- 创建物化视图
+CREATE MATERIALIZED VIEW logs_mv ON CLUSTER cluster_1
+(
+    date Date,
+    service String,
+    level String,
+    request_count UInt64,
+    error_count UInt64
+)
+ENGINE = SummingMergeTree()
+ORDER BY (date, service, level)
+AS SELECT
+    toDate(event_time) AS date,
+    service,
+    level,
+    count() AS request_count,
+    countIf(level = 'ERROR') AS error_count
+FROM logs
+GROUP BY date, service, level;
+
+-- 查询物化视图
+SELECT
+    date,
+    service,
+    sum(request_count) AS total_requests,
+    sum(error_count) AS total_errors
+FROM logs_mv
+WHERE date >= today() - 7
+GROUP BY date, service;
+
+-- 物化视图自动聚合：
+-- 1. 新数据插入到源表
+-- 2. 物化视图自动触发聚合
+-- 3. 查询直接命中聚合结果
+-- 4. 性能提升 10-100 倍
+```
+
+### 物化视图最佳实践
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| SummingMergeTree | 简单求和聚合 | 计数、求和 |
+| AggregatingMergeTree | 复杂聚合 | 平均值、分位数 |
+| ReplacingMergeTree | 去重 | 实时更新数据 |
+| 内存表 | 零拷贝 | 高吞吐写入 |
+
+## 分布式表
+
+### Distributed 表引擎
+
+```sql
+-- 创建分布式表
+CREATE TABLE logs_distributed ON CLUSTER cluster_1
+(
+    event_date Date,
+    event_time DateTime,
+    service String,
+    message String
+)
+ENGINE = Distributed(cluster_1, default, logs_replicated, sipHash64(service));
+
+-- Distributed 引擎说明：
+-- cluster_1：集群名称
+-- default：数据库名
+-- logs_replicated：本地表名
+-- sipHash64(service)：分片键（哈希函数）
+
+-- 分片策略
+-- 1. 哈希分片：sipHash64(key)
+-- 2. 范围分片：rand()
+-- 3. 自定义分片：自定义表达式
+
+-- 分布式查询
+SELECT
+    service,
+    count() AS cnt
+FROM logs_distributed
+WHERE event_date >= today() - 7
+GROUP BY service
+ORDER BY cnt DESC;
+
+-- 查询会自动分发到所有分片，合并结果
+```
+
+### 分布式表最佳实践
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| 均匀哈希 | 数据均匀分布 | 一般场景 |
+| 范围分片 | 按时间分区 | 时间序列 |
+| 复合分片 | 多键分片 | 复杂查询 |
+| 空分片 | 允许空分片 | 动态扩容 |
+
+## 内存管理
+
+### Query Memory 配置
+
+```sql
+-- 内存限制配置
+SET max_memory_usage = 10000000000;  -- 10GB
+SET max_bytes_before_external_group_by = 5000000000;  -- 5GB
+SET max_bytes_before_external_sort = 5000000000;  -- 5GB
+
+-- 内存溢出处理
+-- 1. 超过内存限制时写入临时文件
+-- 2. 临时文件存储在指定目录
+-- 3. 查询完成后清理
+
+-- 内存使用监控
+SELECT
+    query_id,
+    user,
+    query,
+    memory_usage,
+    peak_memory_usage
+FROM system.query_log
+WHERE memory_usage > 1000000000  -- > 1GB
+ORDER BY memory_usage DESC;
+```
+
+### 内存优化策略
+
+```text
+内存优化策略：
+  1. 启用压缩
+     SET compression = 'lz4';
+     SET min_bytes_for_wide_part = 10485760;  -- 10MB
+
+  2. 限制并发查询
+     SET max_concurrent_queries = 100;
+
+  3. 使用低基数类型
+     LowCardinality(String) 替代 String
+
+  4. 列式存储
+     默认启用列式存储
+
+  5. 物化视图预聚合
+     避免实时聚合大数据集
+```
+
+## 集群运维
+
+### 集群部署与监控
+
+```yaml
+# ClickHouse 集群配置
+# config.xml
+<clickhouse>
+    <remote_servers>
+        <cluster_1>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>node1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>node2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>node3</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>node4</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </cluster_1>
+    </remote_servers>
+
+    <zookeeper>
+        <node>
+            <host>zk1</host>
+            <port>2181</port>
+        </node>
+        <node>
+            <host>zk2</host>
+            <port>2181</port>
+        </node>
+        <node>
+            <host>zk3</host>
+            <port>2181</port>
+        </node>
+    </zookeeper>
+</clickhouse>
+```
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|---------|
+| query.count | 查询数 | 基线对比 |
+| query.duration.ms | 查询延迟 | > 10s |
+| memory_usage | 内存使用 | > 80% |
+| disk_usage | 磁盘使用 | > 85% |
+| replication.delay | 复制延迟 | > 60s |
+| merge.duration.ms | 合并延迟 | > 30s |
+
+## ClickHouse vs Doris vs StarRocks
+
+### OLAP 引擎对比
+
+| 维度 | ClickHouse | Doris | StarRocks |
+|------|------------|-------|-----------|
+| 架构 | Shared-nothing | Shared-nothing | Shared-nothing |
+| 存储 | 列式存储 | 列式存储 | 列式存储 |
+| MPP | 是 | 是 | 是 |
+| 物化视图 | ✅ | ✅ | ✅ |
+| 实时导入 | ✅ | ✅ | ✅ |
+| MySQL 兼容 | ✅ | ✅ | ✅ |
+| 向量化执行 | ✅ | ✅ | ✅ |
+| 运维复杂度 | 中 | 中 | 低 |
+| 社区活跃度 | 高 | 高 | 高 |
+| 适用场景 | 分析/日志 | 分析/报表 | 分析/报表 |
+
+## 最佳实践
+
+### 写入/查询/Schema 设计
+
+```text
+ClickHouse 最佳实践：
+  写入优化：
+    1. 批量写入（>1000 条/批）
+    2. 避免频繁小写入
+    3. 使用 Buffer 表缓冲写入
+    4. 控制写入频率（<1次/秒）
+
+  查询优化：
+    1. 避免 SELECT *
+    2. 使用 ORDER BY 键过滤
+    3. 利用物化视图预聚合
+    4. 控制查询并发数
+
+  Schema 设计：
+    1. 使用低基数类型
+    2. 启用压缩（LZ4）
+    3. 合理设置分区键
+    4. 避免过多列（< 1000）
+
+  运维建议：
+    1. 监控磁盘使用率
+    2. 定期清理过期数据
+    3. 备份重要数据
+    4. 升级前测试兼容性
+```
+
+## 监控
+
+### Prometheus + Grafana 监控
+
+```yaml
+# ClickHouse Prometheus 配置
+# config.xml
+<clickhouse>
+    <prometheus>
+        <port>9363</port>
+        <metrics>/metrics</metrics>
+        <events>/events</metrics>
+        <asynchronous_metrics>/asynchronous_metrics</metrics>
+    </prometheus>
+</clickhouse>
+
+# Grafana Dashboard 配置
+# 关键面板：
+# 1. 查询 QPS
+# 2. 查询延迟 P99
+# 3. 内存使用率
+# 4. 磁盘使用率
+# 5. 复制延迟
+# 6. 合并队列长度
+```
+
+### 告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: clickhouse-alerts
+    rules:
+      - alert: ClickHouseHighMemory
+        expr: clickhouse_system_metrics_memory_usage_bytes / clickhouse_system_metrics_total_memory_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+
+      - alert: ClickHouseSlowQueries
+        expr: rate(clickhouse_query_duration_seconds_sum[5m]) / rate(clickhouse_query_duration_seconds_count[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+
+      - alert: ClickHouseReplicationLag
+        expr: clickhouse_replicas_max_absolute_delay > 60
+        for: 5m
+        labels:
+          severity: critical
+```
+
+## 生产问题排查
+
+### 常见问题与解决方案
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 查询超时 | 数据量大/查询复杂 | 优化查询/物化视图 |
+| 内存溢出 | 并发高/查询复杂 | 限制并发/内存限制 |
+| 写入失败 | 表锁/磁盘满 | 检查磁盘/清理数据 |
+| 复制延迟 | 网络/负载高 | 检查网络/扩容 |
+| 合并延迟 | 数据量大/IO 瓶颈 | 调整合并策略 |
+
+### 排查命令
+
+```sql
+-- 查看当前查询
+SELECT * FROM system.processes ORDER BY duration DESC;
+
+-- 查看慢查询
+SELECT * FROM system.query_log
+WHERE type = 'QueryFinish' AND duration > 10000
+ORDER BY duration DESC LIMIT 10;
+
+-- 查看复制状态
+SELECT * FROM system.replicas;
+
+-- 查看磁盘使用
+SELECT * FROM system.disks;
+
+-- 取消查询
+KILL QUERY WHERE query_id = 'xxx';
+```
+
 ## 与其他板块的关系
 
 - 与 [大数据/HBase](../大数据/06-分布式NoSQL与HBase.md)：HBase 是 KV 宽列、适合点查/随机读写；ClickHouse 是列存 OLAP、适合扫描聚合。二者场景不同。

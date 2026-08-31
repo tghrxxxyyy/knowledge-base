@@ -192,3 +192,268 @@
 23. **CRI/CNI/CSI 区别？** 分别是容器运行时、网络、存储的接口标准。
 24. **K8s 为什么弃用 Docker 运行时？** 1.24 起走 CRI 标准，用 containerd/CRI-O；镜像与 Dockerfile 仍通用。
 25. **Operator 和 Controller 区别？** Operator = 业务级的 Controller，把领域运维知识编码进 CRD+调和循环（如 etcd-operator）。
+
+---
+
+## 十四、API 优先级与公平性（APF）
+
+当集群同时涌来大量请求（CI 批量 apply、控制器风暴、恶意扫描），API Server 若不做流控会雪崩。APF 用 **FlowSchema + PriorityLevelConfiguration** 给请求分级、配额隔离：
+
+- 每个请求按身份/资源/动词分到某个 `FlowSchema`（如 system:controller-manager 高优、anonymous 低优）。
+- 每个优先级有「并发配额 + 排队队列」，低优先级被限流时**不影响**高优先级（如 kubelet 上报、控制器调谐）。
+- 关键保护：`catch-all` 与 `exempt`：节点 kubelet、controller-manager 通常 exempt，避免自我封锁。
+
+> 排障：集群「卡死、apply 报 429 Too Many Requests」多因 APF 配额太低或某 Flow 把配额占满，可调 `kubectl get flowschema/prioritylevelconfigurations`。
+
+---
+
+## 十五、准入控制（Admission Control）
+
+请求经 API Server 认证/鉴权后、写 etcd 前，还要过**准入链**：
+
+```mermaid
+flowchart LR
+    Req[客户端请求] --> Auth[认证 Authentication]
+    Auth --> RBAC[鉴权 Authorization-RBAC]
+    RBAC --> Mutating[变更准入<br/>MutatingWebhook 改资源]
+    Mutating --> Validating[校验准入<br/>ValidatingWebhook 拒/放]
+    Validating --> Etcd[(etcd 落盘)]
+```
+
+- **内置控制器**：`NamespaceLifecycle`、`ResourceQuota`、`LimitRanger`、`PodSecurity`（替代 PSP）、`ServiceAccount`、`NodeRestriction`。
+- **动态 Webhook**：自定义校验/默认值。典型产品 **OPA/Gatekeeper**、**Kyverno**——把「必须带 resource limit」「只能从白名单仓库拉镜像」「禁止 privileged」写成策略即代码。
+- **校验时机**：渲染/apply 阶段若违反策略直接拒绝，CI 与 ArgoCD 同步都会失败，从根本上挡住不合规配置。
+
+```yaml
+# 用 Kyverno 强制容器必须有 resource limit（示例策略意图）
+validationFailureAction: enforce
+rules:
+- name: require-limits
+  match:
+    resources:
+      kinds: [Pod]
+  validate:
+    message: "容器必须设置 resources.limits"
+    pattern:
+      spec:
+        containers:
+        - resources:
+            limits:
+              memory: "?*"
+              cpu: "?*"
+```
+
+---
+
+## 十六、QoS、驱逐与 OOM 机制
+
+### 16.1 QoS 等级（决定「先杀谁」）
+
+| 等级 | 条件 | 被杀优先级 |
+|------|------|-----------|
+| **Guaranteed** | requests==limits 且每个容器都设 | 最后被杀 |
+| **Burstable** | 部分设了 request/limit | 中间 |
+| **BestEffort** | 全没设 | 最先被杀（节点压力时） |
+
+### 16.2 节点压力驱逐（kubelet 行为）
+
+- kubelet 监控 `MemoryPressure` / `DiskPressure` / `PIDPressure`。
+- 触发时按 **QoS 从低到高** 驱逐 Pod（先 BestEffort）；优雅终止（`terminationGracePeriodSeconds`）。
+- `evictionHard` 阈值默认如 `memory.available<100Mi`、`nodefs.available<10%`。
+
+### 16.3 OOM 两层
+
+- **容器 OOM**：容器的 memory limit 超限 → cgroup OOM Killer 杀该容器，Pod 状态 `OOMKilled`，重启（CrashLoop 若反复）。
+- **节点 OOM**：节点整体内存耗尽 → 内核 OOM Killer 按 oom_score 杀进程，常杀 BestEffort。
+- 经验：**生产务必设 limits**（防止单 Pod 吃垮节点），且关键服务设 `Guaranteed`。
+
+---
+
+## 十七、调度器深入（Scheduling Framework）
+
+原生调度不止 Filter→Score→Bind，1.19+ 引入**插件化框架**：
+
+| 扩展点 | 作用 |
+|--------|------|
+| QueueSort | 决定 Pod 出队顺序 |
+| PreFilter | 预处理/预检 |
+| Filter | 可行性（原谓词） |
+| PostFilter | 若 Filter 全失败，做抢占（Preemption） |
+| Score | 打分（原优先级） |
+| Reserve | 预留资源（防并发分配冲突） |
+| Permit | 可暂停/批准/拒绝（如等待 webhook） |
+| Bind | 真正绑定（可自定义绑定到扩展资源） |
+
+- **抢占（Preemption）**：高优先级 Pending Pod 可驱逐低优先级 Pod 上位。
+- **自定义调度器**：`spec.schedulerName: my-scheduler` 让特定 Pod 走自研调度器（如 GPU 拓扑亲和、批量调度 Volcano）。
+- **性能**：调度吞吐约百 pods/s；大规模靠「等价节点打散 + 调度缓存 + 减少无用 Filter」优化。
+
+---
+
+## 十八、etcd 深入
+
+- **Raft**：强一致共识，每次写需多数派（quorum）确认；leader 负责写，follower 复制。
+- **WAL + Snapshot**：写先追加日志（WAL）再 Apply；定期快照压缩历史。
+- ** compaction 与碎片**：etcd 保留历史版本，需定期 `compact` 否则 DB 膨胀；碎片用 `defrag` 回收（**defrag 会阻塞，生产在低峰做**）。
+- **备份**：`etcdctl snapshot save` 是救命稻草；恢复需停 API Server 再 `snapshot restore`。
+- **告警**：K8s 暴露 `etcd_db_total_size_in_bytes` 等，DB 超 8G 性能明显下滑。
+
+```bash
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /backup/etcd-$(date +%s).db
+```
+
+---
+
+## 十九、Service / EndpointSlice / Ingress 深入
+
+- **EndpointSlice**：大规模下取代 Endpoints（一个 Svc 后端上千 Pod 时，Endpoints 单对象过大），按每段 ≤100 端点切片，降低 kube-proxy/watch 压力。
+- **headless Service**（`clusterIP: None`）：返回 Pod IP 列表（用于 StatefulSet 稳定域名 `pod-0.svc`、或应用自己做客户端负载）。
+- **ExternalName**：Service 直接 CNAME 到外部域名，无需 selector。
+- **dual-stack**：K8s 支持 IPv4/IPv6 双栈，`Service` 可同时分配两类 VIP。
+- **Ingress vs Gateway API**：Ingress 仅 L7 路由且靠注解扩展；Gateway API（Gateway/HTTPRoute/GPRCRoute）标准化、角色分离（基础设施团队管 Gateway、应用团队管 Route）、支持 TCP/gRPC/权重切分。
+
+---
+
+## 二十、安全：RBAC / ServiceAccount / Pod Security
+
+- **RBAC**：`Role`（命名空间内）+ `ClusterRole`（集群级），通过 `RoleBinding`/`ClusterRoleBinding` 绑定到 `User/Group/ServiceAccount`。最小权限原则。
+- **ServiceAccount**：Pod 访问 API Server 的身份；`automountServiceAccountToken: false` 关闭不必要的 token 挂载。
+- **Pod Security Standards**：`Privileged` / `Baseline` / `Restricted` 三档，用 `Pod Security Admission` 在命名空间级强制（替代已废弃的 PSP）。生产建议至少 `Baseline`，关键负载 `Restricted`。
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod-apps
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+```
+
+---
+
+## 二十一、生产最佳实践 Checklist
+
+| 维度 | 建议 |
+|------|------|
+| 控制平面 | 多副本 API Server + etcd（奇数 3/5）+ 定期备份 |
+| 资源 | 所有容器设 requests/limits，关键服务 Guaranteed |
+| 调度 | 用 nodeSelector/亲和把负载分散；GPU 节点用 Taint 隔离 |
+| 自愈 | liveness 检测死锁、readiness 控制接流；HPA 抗波动 |
+| 发布 | 滚动更新 `maxUnavailable=0`；重要变更用 Argo Rollouts 金丝雀 |
+| 安全 | RBAC 最小权限、PSA Restricted、NetworkPolicy 默认拒绝 |
+| 存储 | 有状态用 StatefulSet + PVC；生产 Retain + 快照 |
+| 可观测 | Metrics/Logs/Traces 三件套；关键 SLO 告警 |
+| 网络 | CNI 用 Calico/Cilium + IPVS；DNS ndots 调优 |
+| 备份 | etcd 快照 + 应用数据（Velero 跨集群） |
+
+---
+
+## 二十二、速记口诀
+
+> 口诀：**「API 先认后鉴权，准入 webhook 再把关；调度 Filter→Score→Bind，框架插件随便扩。QoS 定生死序，压力先杀 BestEffort；etcd 靠 Raft 保一致，backup/defrag 是命根。RBAC 最小权限、PSA 兜底、NetworkPolicy 零信任。」**
+
+- 记住全景：**「声明式 Spec + 控制器调谐」是 K8s 的心脏**，一切能力（自愈/弹性/发布）都建在这套机制上。
+- 排障心法：**「先问状态、再查事件、后看日志」**——`get` 看现状，`describe` 看 events，`logs` 看原因。
+
+---
+
+## 二十三、控制器模式本质与 Level-Triggered
+
+K8s 所有自动化都建立在**「声明式 + 调谐循环」**上：
+
+- **Level-Triggered（状态对齐）**：控制器只关心「当前实际状态 vs 期望状态」，不依赖事件流。即使某次事件丢了、或控制器重启，下次循环仍会收敛——这是 K8s 容错的根基。
+- **边缘触发（Edge-Triggered）**：只在变化瞬间触发动作，事件丢了就永久偏离——K8s 不用它做核心逻辑。
+- **Informer + Workqueue**：控制器的标准实现。Informer 通过 `List+Watch` 把资源缓存到本地（减少 API Server 压力），变更入 Workqueue，worker 取出来跑 Reconcile。Watch 断线自动 `List` 全量重建缓存。
+
+```mermaid
+flowchart LR
+    API[kube-apiserver] -->|Watch 变更| Informer[Informer 本地缓存]
+    Informer -->|入队| Queue[Workqueue]
+    Queue -->|取任务| Reconcile[Reconcile Loop]
+    Reconcile -->|读期望 Spec| CR[CustomResource/内置资源]
+    Reconcile -->|创建/更新子资源| K8s[(集群实际状态)]
+    K8s -->|状态回报| CR
+    Reconcile -->|RequeueAfter 兜底| Queue
+```
+
+> 推论：写控制器时**不要依赖「收到事件就一定处理」**，永远假设 Reconcile 可能被重复调用——代码必须幂等。
+
+---
+
+## 二十四、一次 `kubectl apply` 发生了什么
+
+```
+1. kubectl 读取 YAML → 做 client-side 或 server-side 的 diff/merge
+2. 携带 kubeconfig 凭据访问 kube-apiserver
+3. API Server：认证（你是谁）→ 鉴权（RBAC 是否允许）→ 准入（Mutating 改、Validating 拦）
+4. 通过则写 etcd（持久化对象的 Spec）
+5. 对应控制器（如 ReplicaSet/Deployment controller）Watch 到变更
+6. 控制器调谐：创建 Pod 对象（仍只是 etcd 里的记录）
+7. Scheduler Watch 到「未调度 Pod」→ Filter/Score/Bind → 写入 Pod.spec.nodeName
+8. 目标节点 kubelet Watch 到自己节点的 Pod → 调 CRI 拉镜像、起容器
+9. kubelet 上报 Pod 状态（Running/Ready）回 API Server
+10. 若配 readinessProbe，通过后才进 Service Endpoints，开始接流量
+```
+理解这条链路，排障时就能定位「卡在哪一段」：是准入被拒（步骤3）、调度失败（步骤7）、还是 kubelet 起不来（步骤8）。
+
+---
+
+## 二十五、常见生产事故模式与预防
+
+| 事故模式 | 触发 | 预防 |
+|----------|------|------|
+| 节点雪崩 | 某 Pod 无 limits 吃满内存 → 节点 OOM → 上面所有 Pod 被杀 | 全量设 limits |
+| 滚动更新全断 | `maxUnavailable` 设大 + readinessProbe 误配 → 旧的全下线新的没就绪 | maxUnavailable=0 + 正确探针 |
+| 配置错改全集群 | 直接 `kubectl edit` 生产资源 | GitOps + 保护分支 + 禁止手工改 |
+| etcd 膨胀 | 频繁创建删除导致历史版本堆积 | 定期 compact + defrag + 监控 DB 大小 |
+| 镜像 latest 漂移 | 用 `latest` tag，回滚/扩缩时拉到不同版本 | 用 commit SHA 不可变 tag |
+| 调度不均 | 没配反亲和，副本挤在一两个节点 | PodAntiAffinity + TopologySpread |
+| 证书过期 | kubeadm 证书 1 年有效期忘续 | 监控证书剩余 + `kubeadm certs renew` |
+
+---
+
+## 二十六、速记口诀（补充）
+
+> 口诀：**「apply 走九步：认证鉴权准入过，etcd 落盘控制器调，调度绑定 kubelet 跑，就绪探针才接流。控制器靠 Informer 缓存 + Workqueue 重跑，Level-Triggered 不怕丢事件。」**
+
+---
+
+## 二十七、API 版本、弃用与升级纪律
+
+- **API Group/Version**：资源带版本（如 `apps/v1`、`networking.k8s.io/v1`）。大版本升级常伴随 API 废弃（如 `extensions/v1beta1 Ingress` → `networking.k8s.io/v1`），升级前必须用 `kubectl get --raw /apis` 核对集群支持的版本。
+- **废弃三阶段**：Alpha（默认关）→ Beta（默认开，可能改字段）→ GA（稳定，承诺兼容）。跨大版本升级时，**一次只升一个小版本**（如 1.26→1.27→1.28），不能跳，否则跳过的中间版本已删除的 API 会导致资源无法 apply。
+- **Deprecated API 检查**：升级前用 `kubectl get` 全量扫一遍是否在用即将删除的 API（社区提供 `kubent` 等工具）。
+- **升级顺序**：先升级控制平面（多副本滚动），再逐节点 `cordon/drain` 升级 kubelet/kube-proxy，最后确认所有系统组件（CNI、CSI、监控）兼容新版本——与「[K8s 运维实战](./K8s运维实战.md)」的升级 SOP 呼应。
+
+---
+
+## 二十八、一句话总览
+
+> K8s 不是「更聪明的脚本」，而是一套**用声明式 API + 调谐循环把集群持续拉向期望状态**的分布式系统。理解「Spec/Status/Reconcile」这一核心范式，再叠加调度、网络、存储、安全、弹性四大支柱，就能在绝大多数生产场景里既知道怎么做、也知道为什么。细节深抠见本板块各深挖文档。
+
+---
+
+## 二十九、对象依赖关系速查
+
+```mermaid
+flowchart TB
+    Deploy[Deployment] -->|管理副本| RS[ReplicaSet]
+    RS -->|创建| Pod[Pod]
+    Pod -->|挂载| PVC[PVC]
+    PVC -->|绑定| PV[PV]
+    PV -->|由| SC[StorageClass] -.动态供给.-> CSI[CSI 驱动]
+    Pod -->|受控于| SA[ServiceAccount]
+    SA -.绑定.-> RB[RoleBinding] --> Role[Role/ClusterRole]
+    Svc[Service] -->|selector 选| Pod
+    Svc -->|端点| EP[EndpointSlice]
+    VS[VirtualService] -.需.-> Svc
+    CR[CustomResource] -->|被| Ctrl[自定义 Controller] -->|调谐出| Pod
+```
+
+> 记住这条链：`Deployment→ReplicaSet→Pod→(PVC→PV / Service→EndpointSlice)`，再加「SA/RBAC 给身份、CRD/Operator 扩能力」，就是一份 K8s 对象关系全景。

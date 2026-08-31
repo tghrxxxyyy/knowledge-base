@@ -2192,6 +2192,696 @@ graph TB
      → 定期健康检查
 ```
 
+## 三十三、插件开发深度实战
+
+### 33.1 自定义插件架构
+
+```lua
+-- Kong 自定义插件示例
+local kong = kong
+local ngx = ngx
+local json = require("cjson")
+
+local MyPlugin = {}
+
+MyPlugin.PRIORITY = 1000
+MyPlugin.VERSION = "1.0.0"
+
+function MyPlugin:init(config)
+  self.config = config
+end
+
+function MyPlugin:access(conf)
+  -- 获取请求信息
+  local method = ngx.req.get_method()
+  local uri = ngx.var.uri
+  local headers = ngx.req.get_headers()
+  
+  -- 自定义认证逻辑
+  local token = headers["Authorization"]
+  if not token then
+    return kong.response.exit(401, {
+      message = "Missing authorization header"
+    })
+  end
+  
+  -- 验证 token
+  local user_data = self:validate_token(token)
+  if not user_data then
+    return kong.response.exit(401, {
+      message = "Invalid token"
+    })
+  end
+  
+  -- 注入用户信息到请求头
+  ngx.req.set_header("X-User-Id", user_data.id)
+  ngx.req.set_header("X-User-Role", user_data.role)
+  
+  -- 记录审计日志
+  self:audit_log(user_data, method, uri)
+end
+
+function MyPlugin:validate_token(token)
+  -- 实现 token 验证逻辑
+  -- 可以调用外部服务或本地验证
+  local jwt = require("resty.jwt")
+  local jwt_obj = jwt:verify(self.config.secret_key, token)
+  
+  if jwt_obj.verified then
+    return jwt_obj.payload
+  end
+  
+  return nil
+end
+
+function MyPlugin:audit_log(user_data, method, uri)
+  local log_data = {
+    timestamp = ngx.now(),
+    user_id = user_data.id,
+    method = method,
+    uri = uri,
+    ip = ngx.var.remote_addr
+  }
+  
+  -- 发送到日志服务
+  kong.log.info(json.encode(log_data))
+end
+
+return MyPlugin
+```
+
+### 33.2 APISIX 插件开发
+
+```lua
+-- APISIX 自定义插件
+local core = require("apisix.core")
+local plugin = require("apisix.plugin")
+local ngx = ngx
+
+local _M = {
+    version = 0.1,
+    type = 'auth',
+    name = "my-auth-plugin",
+    schema = {
+        type = "object",
+        properties = {
+            token_header = {type = "string", default = "Authorization"},
+            secret_key = {type = "string"},
+            whitelist_paths = {
+                type = "array",
+                items = {type = "string"}
+            }
+        },
+        required = {"secret_key"}
+    }
+}
+
+function _M.check_schema(conf)
+    return core.schema.check(_M.schema, conf)
+end
+
+function _M.rewrite(conf, ctx)
+    -- 检查是否在白名单中
+    if conf.whitelist_paths then
+        local uri = ctx.var.uri
+        for _, path in ipairs(conf.whitelist_paths) do
+            if uri:find(path) then
+                return
+            end
+        end
+    end
+    
+    -- 获取 token
+    local token = ngx.req.get_headers()[conf.token_header]
+    if not token then
+        return 401, {message = "Missing token"}
+    end
+    
+    -- 验证 token
+    local jwt = require("resty.jwt")
+    local jwt_obj = jwt:verify(conf.secret_key, token)
+    
+    if not jwt_obj.verified then
+        return 401, {message = "Invalid token"}
+    end
+    
+    -- 注入用户信息
+    core.request.set_header(ctx, "X-User-Id", jwt_obj.payload.sub)
+    core.request.set_header(ctx, "X-User-Role", jwt_obj.payload.role)
+end
+
+return _M
+```
+
+| 插件类型 | 开发难度 | 性能影响 | 适用场景 |
+|----------|----------|----------|----------|
+| 认证插件 | 中 | 低 | 所有 API |
+| 限流插件 | 低 | 低 | 公开 API |
+| 转换插件 | 高 | 中 | 数据转换 |
+| 日志插件 | 低 | 低 | 审计需求 |
+| 缓存插件 | 中 | 高 | 热点数据 |
+
+## 三十四、安全加固深度实战
+
+### 34.1 TLS/SSL 配置
+
+```nginx
+# Kong TLS 配置
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+    
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    
+    # HSTS 配置
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    
+    # OCSP Stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+}
+```
+
+```yaml
+# APISIX TLS 配置
+apisix:
+  ssl:
+    enable: true
+    listen_port: 9443
+    cert: /path/to/cert.pem
+    key: /path/to/key.pem
+    ssl_protocols: "TLSv1.2 TLSv1.3"
+    ssl_ciphers: "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
+    
+# 动态 SSL 证书
+ssl_trusted_certificate: /path/to/ca.pem
+ssl_verify_client: optional
+ssl_verify_depth: 2
+```
+
+### 34.2 速率限制与防护
+
+```lua
+-- 多维度限流插件
+local limit_req = require("resty.limit.req")
+local limit_count = require("resty.limit.count")
+local limit_traffic = require("resty.limit.traffic")
+
+local _M = {}
+
+function _M.new(conf)
+    local self = setmetatable({}, { __index = _M })
+    
+    -- 创建多个限流器
+    self.req_limiter = limit_req.new(conf.req_rate, conf.req_burst)
+    self.count_limiter = limit_count.new(conf.count_rate, conf.count_period)
+    self.traffic_limiter = limit_traffic.new(conf.traffic_rate, conf.traffic_period)
+    
+    return self
+end
+
+function _M:check(conf)
+    local key = self:get_key(conf)
+    
+    -- 请求频率限制
+    local req_delay, req_err = self.req_limiter:incoming(key, true)
+    if not req_delay then
+        if req_err == "rejected" then
+            return false, "Request rate limit exceeded"
+        end
+        return false, "Rate limit error: " .. req_err
+    end
+    
+    -- 计数限制
+    local count_remaining, count_err = self.count_limiter:incoming(key, true)
+    if not count_remaining then
+        if count_err == "rejected" then
+            return false, "Count limit exceeded"
+        end
+        return false, "Count limit error: " .. count_err
+    end
+    
+    -- 流量限制
+    local traffic_delay, traffic_err = self.traffic_limiter:incoming(key, true)
+    if not traffic_delay then
+        if traffic_err == "rejected" then
+            return false, "Traffic limit exceeded"
+        end
+        return false, "Traffic limit error: " .. traffic_err
+    end
+    
+    return true
+end
+
+function _M:get_key(conf)
+    local user_id = ngx.var.http_x_user_id or "anonymous"
+    local client_ip = ngx.var.remote_addr
+    local uri = ngx.var.uri
+    
+    -- 组合限流键
+    return user_id .. ":" .. client_ip .. ":" .. uri
+end
+
+return _M
+```
+
+```yaml
+# 限流配置示例
+plugins:
+  limit-req:
+    rate: 100  # 每秒请求数
+    burst: 50  # 突发容量
+    key_type: var
+    key: remote_addr
+    
+  limit-count:
+    count: 1000  # 时间窗口内请求数
+    time_window: 60  # 时间窗口（秒）
+    key_type: var
+    key: http_x_user_id
+    
+  limit-conn:
+    conn: 50  # 并发连接数
+    burst: 10  # 突发连接数
+    default_conn_delay: 0.1  # 默认延迟
+    key_type: var
+    key: remote_addr
+```
+
+## 三十五、性能优化深度实战
+
+### 35.1 连接池与复用
+
+```lua
+-- Kong 连接池配置
+upstream my_upstream {
+    # 连接池配置
+    keepalive 32;
+    keepalive_timeout 60s;
+    keepalive_requests 1000;
+    
+    # 负载均衡
+    algorithm round_robin;
+    
+    # 健康检查
+    healthchecks {
+        active {
+            http_path /health
+            healthy {
+                interval 5
+                successes 3
+            }
+            unhealthy {
+                interval 5
+                http_failures 3
+                tcp_failures 3
+                timeouts 3
+            }
+        }
+        passive {
+            healthy {
+                successes 5
+            }
+            unhealthy {
+                http_failures 3
+                tcp_failures 3
+                timeouts 3
+            }
+        }
+    }
+    
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+    server 10.0.0.3:8080;
+}
+```
+
+```yaml
+# APISIX Upstream 配置
+upstreams:
+  - id: 1
+    type: roundrobin
+    nodes:
+      "10.0.0.1:8080": 1
+      "10.0.0.2:8080": 1
+      "10.0.0.3:8080": 1
+    checks:
+      active:
+        type: http
+        http_path: /health
+        healthy:
+          interval: 5
+          successes: 3
+        unhealthy:
+          interval: 5
+          http_failures: 3
+      passive:
+        healthy:
+          successes: 5
+        unhealthy:
+          http_failures: 3
+    retries: 3
+    retry_timeout: 30
+    keepalive: 32
+    keepalive_pool_size: 30
+    keepalive_max_requests: 1000
+    keepalive_idle_timeout: 60
+```
+
+### 35.2 缓存策略优化
+
+```lua
+-- 多级缓存实现
+local _M = {}
+
+function _M:new(conf)
+    local self = setmetatable({}, { __index = _M })
+    
+    -- 本地缓存
+    local lrucache = require("resty.lrucache")
+    self.local_cache = lrucache.new(conf.local_cache_size or 1000)
+    
+    -- 分布式缓存（Redis）
+    if conf.redis_enabled then
+        local redis = require("resty.redis")
+        self.redis = redis:new()
+        self.redis:set_timeout(conf.redis_timeout or 1000)
+        
+        local ok, err = self.redis:connect(conf.redis_host, conf.redis_port)
+        if not ok then
+            ngx.log(ngx.ERR, "Failed to connect to Redis: ", err)
+        end
+    end
+    
+    return self
+end
+
+function _M:get(key)
+    -- 1. 检查本地缓存
+    local value = self.local_cache:get(key)
+    if value then
+        return value
+    end
+    
+    -- 2. 检查分布式缓存
+    if self.redis then
+        value, err = self.redis:get(key)
+        if value and value ~= ngx.null then
+            -- 回写本地缓存
+            self.local_cache:set(key, value, 300)
+            return value
+        end
+    end
+    
+    return nil
+end
+
+function _M:set(key, value, ttl)
+    -- 写入本地缓存
+    self.local_cache:set(key, value, ttl)
+    
+    -- 写入分布式缓存
+    if self.redis then
+        local ok, err = self.redis:setex(key, ttl, value)
+        if not ok then
+            ngx.log(ngx.ERR, "Failed to set Redis key: ", err)
+        end
+    end
+end
+
+return _M
+```
+
+## 三十六、生产监控与告警
+
+### 36.1 核心监控指标
+
+```sql
+-- Kong 监控指标查询
+SELECT 
+    timestamp,
+    request_count,
+    request_latency_avg,
+    request_latency_max,
+    upstream_latency_avg,
+    upstream_latency_max,
+    bandwidth_consumed,
+    cache_hit_count,
+    cache_miss_count
+FROM kong_metrics
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+
+-- APISIX 监控指标
+SELECT 
+    route_id,
+    service_id,
+    upstream_id,
+    request_count,
+    response_status_2xx,
+    response_status_4xx,
+    response_status_5xx,
+    request_latency,
+    upstream_latency
+FROM apisix_metrics
+WHERE timestamp > UNIX_TIMESTAMP() - 3600
+ORDER BY request_count DESC;
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: gateway_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: rate(gateway_requests_total{status=~"5.."}[5m]) / rate(gateway_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "网关错误率过高"
+          description: "过去5分钟错误率超过5%"
+      
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(gateway_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "网关延迟过高"
+          description: "P95延迟超过1秒"
+      
+      - alert: UpstreamDown
+        expr: gateway_upstream_healthy == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "上游服务不可用"
+          description: "上游服务健康检查失败"
+```
+
+### 36.2 分布式追踪集成
+
+```yaml
+# OpenTelemetry 配置
+plugins:
+  opentelemetry:
+    resource:
+      service.name: "api-gateway"
+      service.version: "1.0.0"
+    collector:
+      address: "otel-collector:4318"
+      request_timeout: 3
+    batch_span_processor:
+      max_queue_size: 2048
+      schedule_delay_millis: 5000
+      max_export_batch_size: 512
+```
+
+```java
+// 追踪上下文传播
+@Component
+public class TraceContextPropagator {
+    
+    @Autowired
+    private Tracer tracer;
+    
+    public void propagateTraceContext(HttpRequest request) {
+        Span currentSpan = tracer.currentSpan();
+        if (currentSpan != null) {
+            // 注入追踪上下文到请求头
+            request.getHeaders().add("X-Trace-Id", currentSpan.context().traceId());
+            request.getHeaders().add("X-Span-Id", currentSpan.context().spanId());
+            request.getHeaders().add("X-Parent-Span-Id", currentSpan.context().parentId());
+        }
+    }
+    
+    public SpanContext extractTraceContext(HttpRequest request) {
+        String traceId = request.getHeaders().getFirst("X-Trace-Id");
+        String spanId = request.getHeaders().getFirst("X-Span-Id");
+        String parentSpanId = request.getHeaders().getFirst("X-Parent-Span-Id");
+        
+        if (traceId != null && spanId != null) {
+            return SpanContext.createFromRemoteParent(
+                traceId,
+                spanId,
+                parentSpanId != null ? SpanId.fromLong(parentSpanId) : null
+            );
+        }
+        
+        return null;
+    }
+}
+```
+
+## 三十七、多区域部署与容灾
+
+### 37.1 多活架构设计
+
+```mermaid
+graph TB
+    subgraph "区域 A"
+        LB_A[负载均衡器]
+        GW_A[网关集群]
+        UP_A[上游服务A]
+    end
+    
+    subgraph "区域 B"
+        LB_B[负载均衡器]
+        GW_B[网关集群]
+        UP_B[上游服务B]
+    end
+    
+    subgraph "全局配置中心"
+        CONFIG[配置同步]
+        DISCOVERY[服务发现]
+    end
+    
+    LB_A --> GW_A
+    GW_A --> UP_A
+    LB_B --> GW_B
+    GW_B --> UP_B
+    
+    CONFIG --> GW_A
+    CONFIG --> GW_B
+    DISCOVERY --> GW_A
+    DISCOVERY --> GW_B
+    
+    GW_A <--> GW_B
+    
+    style CONFIG fill:#ff9800
+    style DISCOVERY fill:#4caf50
+```
+
+```yaml
+# 多区域配置同步
+cluster:
+  name: global-cluster
+  regions:
+    - name: region-a
+      endpoint: "https://region-a.example.com"
+      weight: 50
+    - name: region-b
+      endpoint: "https://region-b.example.com"
+      weight: 50
+  
+  sync:
+    enabled: true
+    interval: 30
+    retry_count: 3
+    retry_interval: 10
+  
+  failover:
+    enabled: true
+    threshold: 3
+    fallback_region: region-b
+```
+
+### 37.2 故障转移策略
+
+```lua
+-- 智能故障转移插件
+local _M = {}
+
+function _M:new(conf)
+    local self = setmetatable({}, { __index = _M })
+    self.primary_region = conf.primary_region
+    self.secondary_region = conf.secondary_region
+    self.health_check_interval = conf.health_check_interval or 10
+    self.failure_threshold = conf.failure_threshold or 3
+    self.recovery_threshold = conf.recovery_threshold or 5
+    
+    -- 健康状态跟踪
+    self.region_status = {
+        [self.primary_region] = { healthy = true, failure_count = 0 },
+        [self.secondary_region] = { healthy = true, failure_count = 0 }
+    }
+    
+    return self
+end
+
+function _M:check_and_failover()
+    local current_region = self:get_current_region()
+    local status = self.region_status[current_region]
+    
+    if not status.healthy then
+        -- 当前区域不健康，尝试故障转移
+        local target_region = self:get_target_region(current_region)
+        if self.region_status[target_region].healthy then
+            self:set_current_region(target_region)
+            return true, target_region
+        end
+    end
+    
+    return false, nil
+end
+
+function _M:record_failure(region)
+    local status = self.region_status[region]
+    status.failure_count = status.failure_count + 1
+    
+    if status.failure_count >= self.failure_threshold then
+        status.healthy = false
+        ngx.log(ngx.WARN, "Region ", region, " marked as unhealthy")
+    end
+end
+
+function _M:record_success(region)
+    local status = self.region_status[region]
+    status.failure_count = math.max(0, status.failure_count - 1)
+    
+    if not status.healthy and status.failure_count == 0 then
+        status.healthy = true
+        ngx.log(ngx.INFO, "Region ", region, " marked as healthy")
+    end
+end
+
+function _M:get_current_region()
+    -- 从配置或环境变量获取当前区域
+    return os.getenv("CURRENT_REGION") or self.primary_region
+end
+
+function _M:set_current_region(region)
+    -- 设置当前区域（实际实现可能需要更新路由配置）
+    ngx.log(ngx.INFO, "Switching to region: ", region)
+end
+
+function _M:get_target_region(current_region)
+    if current_region == self.primary_region then
+        return self.secondary_region
+    else
+        return self.primary_region
+    end
+end
+
+return _M
+```
+
 ## 与其他板块的关系
 
 - OpenResty 底层见「[OpenResty](./OpenResty.md)」；

@@ -2180,3 +2180,692 @@ public void consume(ConsumerRecord<String, String> record) {
 | 监控告警 | 积压监控 | 提前预警 |
 | 容量规划 | 定期评估 | 资源保障 |
 | 故障演练 | 模拟故障 | 提升能力 |
+
+## 三十三、高级消息模式
+
+### 33.1 死信队列与重试策略
+
+```java
+// 死信队列配置
+@Component
+public class DeadLetterQueueConfig {
+    
+    @Bean
+    public Queue deadLetterQueue() {
+        return QueueBuilder.durable("dead-letter-queue")
+            .withArgument("x-dead-letter-exchange", "")
+            .withArgument("x-dead-letter-routing-key", "dead-letter")
+            .withArgument("x-message-ttl", 86400000) // 24小时
+            .build();
+    }
+    
+    @Bean
+    public Binding deadLetterBinding() {
+        return BindingBuilder
+            .bind(deadLetterQueue())
+            .to("main-exchange")
+            .with("dead-letter");
+    }
+}
+
+// 重试策略实现
+@Component
+public class RetryableMessageListener {
+    
+    @RabbitListener(queues = "main-queue")
+    public void handleMessage(Message message, Channel channel) throws IOException {
+        try {
+            // 处理消息
+            processMessage(message);
+            
+            // 确认消息
+            channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+            
+        } catch (RetryableException e) {
+            // 可重试异常，重新入队
+            handleRetry(message, channel, e);
+            
+        } catch (Exception e) {
+            // 不可重试异常，发送到死信队列
+            handleDeadLetter(message, channel, e);
+        }
+    }
+    
+    private void handleRetry(Message message, Channel channel, Exception e) throws IOException {
+        MessageProperties properties = message.getMessageProperties();
+        int retryCount = properties.getHeaders().getRetryCount() != null ? 
+            properties.getHeaders().getRetryCount() : 0;
+        
+        if (retryCount < 3) {
+            // 重新入队，增加重试次数
+            properties.getHeaders().put("retryCount", retryCount + 1);
+            properties.getHeaders().put("retryDelay", calculateDelay(retryCount));
+            
+            channel.basicNack(
+                properties.getDeliveryTag(),
+                false,
+                true // 重新入队
+            );
+        } else {
+            // 超过最大重试次数，发送到死信队列
+            handleDeadLetter(message, channel, e);
+        }
+    }
+    
+    private long calculateDelay(int retryCount) {
+        // 指数退避算法
+        return (long) Math.pow(2, retryCount) * 1000;
+    }
+}
+```
+
+### 33.2 延迟消息与定时任务
+
+```java
+// 延迟消息配置
+@Configuration
+public class DelayedMessageConfig {
+    
+    @Bean
+    public Queue delayedMessageQueue() {
+        return QueueBuilder.durable("delayed-message-queue")
+            .withArgument("x-delayed-type", "direct")
+            .build();
+    }
+    
+    @Bean
+    public Binding delayedMessageBinding() {
+        return BindingBuilder
+            .bind(delayedMessageQueue())
+            .to("delayed-exchange")
+            .with("delayed");
+    }
+}
+
+// 延迟消息生产者
+@Component
+public class DelayedMessageProducer {
+    
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+    
+    public void sendDelayedMessage(Object message, long delayMs) {
+        rabbitTemplate.convertAndSend("delayed-exchange", "delayed", message, msg -> {
+            msg.getMessageProperties().setDelay((int) delayMs);
+            return msg;
+        });
+    }
+    
+    public void sendScheduledMessage(Object message, Date scheduledTime) {
+        long delay = scheduledTime.getTime() - System.currentTimeMillis();
+        if (delay > 0) {
+            sendDelayedMessage(message, delay);
+        }
+    }
+}
+
+// 延迟消息消费者
+@Component
+public class DelayedMessageConsumer {
+    
+    @RabbitListener(queues = "delayed-message-queue")
+    public void handleDelayedMessage(Message message) {
+        // 处理延迟消息
+        processDelayedMessage(message);
+    }
+}
+```
+
+```sql
+-- 延迟消息监控
+SELECT 
+    DATE(created_at) as date,
+    HOUR(created_at) as hour,
+    COUNT(*) as total_messages,
+    AVG(delay_ms) as avg_delay,
+    MAX(delay_ms) as max_delay,
+    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+FROM delayed_messages
+WHERE created_at > NOW() - INTERVAL '7 days'
+GROUP BY DATE(created_at), HOUR(created_at)
+ORDER BY date DESC, hour DESC;
+```
+
+## 三十四、安全与认证深度实战
+
+### 34.1 SSL/TLS 加密
+
+```yaml
+# RabbitMQ SSL 配置
+listeners:
+  ssl.default:
+    port: 5671
+    ssl_options:
+      certfile: /path/to/server-cert.pem
+      keyfile: /path/to/server-key.pem
+      cacertfile: /path/to/ca-cert.pem
+      verify: verify_peer
+      fail_if_no_peer_cert: true
+      versions:
+        - 'tlsv1.2'
+        - 'tlsv1.3'
+
+# Kafka SSL 配置
+listeners:
+  - name: SSL
+    port: 9093
+    ssl:
+      enabled: true
+      keyStoreLocation: /path/to/kafka.server.keystore.jks
+      keyStorePassword: changeit
+      trustStoreLocation: /path/to/kafka.server.truststore.jks
+      trustStorePassword: changeit
+      clientAuth: required
+```
+
+```java
+// SSL 连接配置
+@Configuration
+public class SSLConfig {
+    
+    @Bean
+    public ConnectionFactory rabbitConnectionFactory() {
+        CachingConnectionFactory factory = new ConnectionFactory();
+        factory.setHost("localhost");
+        factory.setPort(5671);
+        
+        // SSL 配置
+        factory.useSslProtocol();
+        factory.setSocketFactory(sslSocketFactory());
+        
+        return factory;
+    }
+    
+    private SSLSocketFactory sslSocketFactory() {
+        try {
+            SSLContext sslContext = SSLContext.getInstance("TLSv1.2");
+            
+            KeyStore keyStore = KeyStore.getInstance("JKS");
+            keyStore.load(new FileInputStream("server.keystore"), "changeit".toCharArray());
+            
+            KeyStore trustStore = KeyStore.getInstance("JKS");
+            trustStore.load(new FileInputStream("server.truststore"), "changeit".toCharArray());
+            
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance("SunX509");
+            kmf.init(keyStore, "changeit".toCharArray());
+            
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance("SunX509");
+            tmf.init(trustStore);
+            
+            sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), new SecureRandom());
+            
+            return sslContext.getSocketFactory();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create SSL socket factory", e);
+        }
+    }
+}
+```
+
+### 34.2 ACL 授权控制
+
+```yaml
+# RabbitMQ ACL 配置
+users:
+  - name: admin
+    password_hash: ""  # 使用 LDAP 或其他认证
+    tags: administrator
+    limits:
+      max-connections: 1000
+      max-channels: 100
+  
+  - name: producer
+    password_hash: ""  # 使用 LDAP 或其他认证
+    tags: []
+    limits:
+      max-connections: 100
+      max-channels: 10
+
+# ACL 规则
+vhosts:
+  - name: /
+    limits:
+      max-connections: 10000
+      max-queues: 1000
+
+permissions:
+  - user: producer
+    vhost: /
+    configure: ""  # 不允许配置
+    write: "orders\\..*"  # 只允许写入 orders 开头的队列
+    read: ""  # 不允许读取
+
+# Kafka ACL 配置
+authorizer.class.name: kafka.security.authorizer.AclAuthorizer
+allow.everyone.if.no.acl.found: false
+super.users: User:admin
+
+# ACL 规则
+acls:
+  # 生产者权限
+  - principal: User:producer
+    operation: Write
+    resource: Topic:orders
+    patternType: prefixed
+  
+  # 消费者权限
+  - principal: User:consumer
+    operation: Read
+    resource: Topic:orders
+    patternType: prefixed
+  
+  # 消费者组权限
+  - principal: User:consumer
+    operation: Read
+    resource: Group:order-consumer-group
+    patternType: literal
+```
+
+```java
+// ACL 检查实现
+@Component
+public class ACLChecker {
+    
+    @Autowired
+    private ACLRepository aclRepository;
+    
+    public boolean checkPermission(String username, String resource, String action) {
+        // 获取用户权限
+        List<ACLEntry> permissions = aclRepository.getPermissions(username);
+        
+        for (ACLEntry permission : permissions) {
+            if (matchesResource(resource, permission.getResourcePattern())) {
+                if (permission.getActions().contains(action)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    private boolean matchesResource(String resource, String pattern) {
+        // 使用通配符匹配资源
+        return resource.matches(pattern.replace("*", ".*"));
+    }
+}
+```
+
+## 三十五、性能优化深度实战
+
+### 35.1 批量处理优化
+
+```java
+// 批量生产者配置
+@Configuration
+public class BatchProducerConfig {
+    
+    @Bean
+    public RabbitTemplate rabbitTemplate() {
+        RabbitTemplate template = new RabbitTemplate(connectionFactory());
+        
+        // 批量配置
+        template.setBatchSize(100);
+        template.setBatchTimeout(1000);
+        
+        return template;
+    }
+}
+
+// 批量消费者配置
+@Component
+public class BatchConsumer {
+    
+    @RabbitListener(queues = "batch-queue", containerFactory = "batchListenerFactory")
+    public void handleBatch(List<Message> messages, Channel channel) throws IOException {
+        try {
+            // 批量处理消息
+            List<ProcessedMessage> results = processBatch(messages);
+            
+            // 批量确认
+            long lastTag = messages.get(messages.size() - 1)
+                .getMessageProperties().getDeliveryTag();
+            channel.basicAck(lastTag, true);
+            
+        } catch (Exception e) {
+            // 批量拒绝
+            long lastTag = messages.get(messages.size() - 1)
+                .getMessageProperties().getDeliveryTag();
+            channel.basicNack(lastTag, true, true);
+        }
+    }
+    
+    private List<ProcessedMessage> processBatch(List<Message> messages) {
+        // 批量处理逻辑
+        return messages.stream()
+            .map(this::processMessage)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+```yaml
+# 批量处理配置
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        batch-size: 100
+        batch-timeout: 1000
+        prefetch: 100
+        concurrency: 10
+        max-concurrency: 20
+      
+      direct:
+        batch-size: 50
+        batch-timeout: 500
+        prefetch: 50
+        concurrency: 5
+        max-concurrency: 10
+```
+
+### 35.2 连接池优化
+
+```java
+// 连接池配置
+@Configuration
+public class ConnectionPoolConfig {
+    
+    @Bean
+    public ConnectionFactory connectionFactory() {
+        CachingConnectionFactory factory = new CachingConnectionFactory();
+        factory.setHost("localhost");
+        factory.setPort(5672);
+        
+        // 连接池配置
+        factory.setChannelCacheSize(25);
+        factory.setCacheMode(CachingConnectionFactory.CacheMode.CHANNEL);
+        factory.setConnectionCacheSize(5);
+        factory.setConnectionLimit(100);
+        
+        // 超时配置
+        factory.setChannelCheckoutTimeout(5000);
+        factory.setRequestedHeartBeat(30);
+        
+        return factory;
+    }
+}
+
+// Kafka 连接池配置
+@Bean
+public ProducerFactory<String, String> producerFactory() {
+    Map<String, Object> configProps = new HashMap<>();
+    configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+    configProps.put(ProducerConfig.ACKS_CONFIG, "all");
+    configProps.put(ProducerConfig.RETRIES_CONFIG, 3);
+    configProps.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
+    configProps.put(ProducerConfig.LINGER_MS_CONFIG, 5);
+    configProps.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
+    configProps.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+    
+    return new DefaultKafkaProducerFactory<>(configProps);
+}
+
+@Bean
+public KafkaTemplate<String, String> kafkaTemplate() {
+    return new KafkaTemplate<>(producerFactory());
+}
+```
+
+## 三十六、生产监控与告警
+
+### 36.1 核心监控指标
+
+```sql
+-- RabbitMQ 监控指标
+SELECT 
+    timestamp,
+    connections,
+    channels,
+    queues,
+    consumers,
+    messages_ready,
+    messages_unacknowledged,
+    messages_delivered,
+    messages_acked,
+    messages_returned
+FROM rabbitmq_metrics
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+
+-- Kafka 监控指标
+SELECT 
+    timestamp,
+    topic,
+    partition,
+    offset_lag,
+    messages_in,
+    bytes_in,
+    bytes_out,
+    consumer_groups,
+    rebalance_count
+FROM kafka_metrics
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: mq_alerts
+    rules:
+      - alert: RabbitMQHighMessageLag
+        expr: rabbitmq_queue_messages_ready - rabbitmq_queue_messages_unacknowledged > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 消息积压过高"
+          description: "队列 {{ $labels.queue }} 消息积压超过10000"
+      
+      - alert: RabbitMQHighConnectionCount
+        expr: rabbitmq_connections > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RabbitMQ 连接数过高"
+          description: "连接数超过1000"
+      
+      - alert: KafkaHighConsumerLag
+        expr: kafka_consumer_group_lag > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka 消费者延迟过高"
+          description: "消费者组 {{ $labels.group }} 延迟超过100000"
+```
+
+### 36.2 告警规则配置
+
+```yaml
+# 告警规则配置
+alert_rules:
+  # 消息积压告警
+  - name: message_lag
+    condition: messages_ready > 10000
+    duration: 5m
+    severity: warning
+    message: "消息积压过高: {{ .Value }}"
+  
+  # 连接数告警
+  - name: high_connections
+    condition: connections > 1000
+    duration: 5m
+    severity: warning
+    message: "连接数过高: {{ .Value }}"
+  
+  # 内存使用告警
+  - name: high_memory_usage
+    condition: memory_used_percent > 80
+    duration: 5m
+    severity: warning
+    message: "内存使用率过高: {{ .Value }}%"
+  
+  # 磁盘使用告警
+  - name: high_disk_usage
+    condition: disk_used_percent > 90
+    duration: 5m
+    severity: critical
+    message: "磁盘使用率过高: {{ .Value }}%"
+```
+
+## 三十七、集成模式深度实战
+
+### 37.1 事件溯源模式
+
+```java
+// 事件存储
+@Component
+public class EventStore {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    public void storeEvent(Event event) {
+        String sql = "INSERT INTO events (aggregate_id, event_type, event_data, version, timestamp) " +
+                     "VALUES (?, ?, ?, ?, ?)";
+        
+        jdbcTemplate.update(sql,
+            event.getAggregateId(),
+            event.getEventType(),
+            event.getEventData(),
+            event.getVersion(),
+            event.getTimestamp()
+        );
+        
+        // 发布事件到消息队列
+        eventPublisher.publish(event);
+    }
+    
+    public List<Event> getEvents(String aggregateId, int fromVersion) {
+        String sql = "SELECT * FROM events WHERE aggregate_id = ? AND version >= ? " +
+                     "ORDER BY version ASC";
+        
+        return jdbcTemplate.query(sql, new Object[]{aggregateId, fromVersion},
+            (rs, rowNum) -> mapRowToEvent(rs));
+    }
+}
+
+// 事件重放
+@Component
+public class EventReplayer {
+    
+    @Autowired
+    private EventStore eventStore;
+    
+    public Aggregate rebuildAggregate(String aggregateId) {
+        List<Event> events = eventStore.getEvents(aggregateId, 0);
+        
+        Aggregate aggregate = new Aggregate(aggregateId);
+        for (Event event : events) {
+            aggregate.apply(event);
+        }
+        
+        return aggregate;
+    }
+}
+```
+
+### 37.2 CQRS 模式
+
+```java
+// 命令处理器
+@Component
+public class CommandHandler {
+    
+    @Autowired
+    private EventStore eventStore;
+    
+    public void handle(CreateOrderCommand command) {
+        // 1. 创建领域事件
+        OrderCreatedEvent event = new OrderCreatedEvent(
+            command.getOrderId(),
+            command.getCustomerId(),
+            command.getItems(),
+            Instant.now()
+        );
+        
+        // 2. 存储事件
+        eventStore.storeEvent(event);
+        
+        // 3. 发布事件
+        eventPublisher.publish(event);
+    }
+}
+
+// 查询处理器
+@Component
+public class QueryHandler {
+    
+    @Autowired
+    private ReadModelRepository readModelRepository;
+    
+    public OrderDTO getOrder(String orderId) {
+        return readModelRepository.findById(orderId);
+    }
+    
+    public List<OrderDTO> getOrdersByCustomer(String customerId) {
+        return readModelRepository.findByCustomerId(customerId);
+    }
+}
+
+// 读模型更新器
+@Component
+public class ReadModelUpdater {
+    
+    @EventListener
+    public void onOrderCreated(OrderCreatedEvent event) {
+        // 更新读模型
+        OrderDTO orderDTO = new OrderDTO();
+        orderDTO.setId(event.getOrderId());
+        orderDTO.setCustomerId(event.getCustomerId());
+        orderDTO.setItems(event.getItems());
+        orderDTO.setStatus("CREATED");
+        orderDTO.setCreatedAt(event.getTimestamp());
+        
+        readModelRepository.save(orderDTO);
+    }
+}
+```
+
+```sql
+-- CQRS 查询优化
+-- 写模型（事件存储）
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY,
+    aggregate_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(255) NOT NULL,
+    event_data JSONB NOT NULL,
+    version INTEGER NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    UNIQUE(aggregate_id, version)
+);
+
+-- 读模型（查询优化）
+CREATE TABLE orders_read (
+    id VARCHAR(255) PRIMARY KEY,
+    customer_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    total_amount DECIMAL(10,2),
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+
+-- 索引优化
+CREATE INDEX idx_orders_customer_id ON orders_read(customer_id);
+CREATE INDEX idx_orders_status ON orders_read(status);
+CREATE INDEX idx_orders_created_at ON orders_read(created_at);
+```

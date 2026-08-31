@@ -2241,6 +2241,311 @@ consumer.registerMessageListener(new MessageListenerOrderly() {
 
 ## 参考资料
 
+## 事务消息深入
+
+### Half Message 与本地事务
+
+```text
+事务消息流程：
+  1. 生产者发送 Half Message（半消息）
+     ├── 消息对消费者不可见
+     ├── Broker 存储半消息
+     └── 等待生产者确认
+
+  2. 生产者执行本地事务
+     ├── 执行业务逻辑
+     ├── 成功 → Commit 消息
+     └── 失败 → Rollback 消息
+
+  3. Broker 处理确认
+     ├── Commit → 消息对消费者可见
+     ├── Rollback → 删除消息
+     └── 超时 → 回查本地事务状态
+
+  4. 回查机制
+     ├── 生产者超时未确认
+     ├── Broker 主动回查
+     ├── 生产者检查本地事务状态
+     └── 返回 Commit/Rollback
+```
+
+### 事务消息代码示例
+
+```java
+// 事务消息生产者
+TransactionMQProducer producer = new TransactionMQProducer("tx-group");
+producer.setTransactionListener(new TransactionListener() {
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        try {
+            // 执行本地事务
+            orderService.createOrder(msg);
+            return LocalTransactionState.COMMIT_MESSAGE;
+        } catch (Exception e) {
+            return LocalTransactionState.ROLLBACK_MESSAGE;
+        }
+    }
+
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        // 回查本地事务状态
+        Order order = orderService.getOrder(msg.getKeys());
+        if (order != null) {
+            return LocalTransactionState.COMMIT_MESSAGE;
+        }
+        return LocalTransactionState.UNKNOW;
+    }
+});
+```
+
+## 延迟消息深入
+
+### 延迟级别与定时消息
+
+```text
+延迟消息实现：
+  延迟级别：
+    1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h
+    对应级别：1-18
+
+  定时消息：
+    精确到秒级
+    支持任意时间点
+    适合超时关闭、定时触发
+
+  实现原理：
+    Broker 收到延迟消息
+    → 存储到延迟队列
+    → 到达投递时间
+    → 投递到目标 Topic
+    → 消费者消费
+```
+
+### 延迟消息使用场景
+
+| 场景 | 延迟时间 | 说明 |
+|------|---------|------|
+| 订单超时关闭 | 30 分钟 | 未支付自动关闭 |
+| 延迟通知 | 5 秒 | 避免通知风暴 |
+| 定时任务 | 任意时间 | 定时触发业务 |
+| 重试机制 | 指数退避 | 失败后延迟重试 |
+
+## 顺序消息深入
+
+### 全局顺序与分区顺序
+
+```text
+顺序消息：
+  全局顺序：
+    一个 Topic 只有一个队列
+    所有消息严格有序
+    适用：金融交易、订单状态变更
+    缺点：吞吐量低
+
+  分区顺序：
+    同一 Key 的消息在同一队列
+    不同 Key 可并行
+    适用：同一订单的消息有序
+    优点：吞吐量高
+
+  实现：
+    MessageQueueSelector 选择队列
+    按 Key（如订单 ID）哈希选择
+    同一 Key 进入同一队列
+```
+
+### 顺序消息代码示例
+
+```java
+// 顺序消息发送
+for (Order order : orders) {
+    Message msg = new Message("order-topic", "order-status",
+        order.getId().getBytes(), order.toString().getBytes());
+    
+    SendResult result = producer.send(msg, new MessageQueueSelector() {
+        @Override
+        public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+            String orderId = (String) arg;
+            int index = Math.abs(orderId.hashCode()) % mqs.size();
+            return mqs.get(index);
+        }
+    }, order.getId());
+}
+
+// 顺序消息消费
+consumer.registerMessageListener(new MessageListenerOrderly() {
+    @Override
+    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext context) {
+        for (MessageExt msg : msgs) {
+            // 顺序处理
+            processOrder(new String(msg.getBody()));
+        }
+        return ConsumeOrderlyStatus.SUCCESS;
+    }
+});
+```
+
+## 消息过滤深入
+
+### Tag/SQL/消息属性过滤
+
+```text
+消息过滤：
+  Tag 过滤：
+    生产者设置 Tag：msg.setTag("order-created")
+    消费者订阅 Tag：consumer.subscribe("topic", "order-created || order-paid")
+    Broker 端过滤：只投递匹配的消息
+
+  SQL 过滤：
+    消费者设置 SQL：consumer.subscribe("topic", SelectorParser.parse("amount > 100 AND city = '北京'"))
+    Broker 端过滤：基于消息属性过滤
+    支持运算符：=, !=, >, <, >=, <=, IN, BETWEEN, LIKE, IS NULL
+
+  消息属性过滤：
+    生产者设置属性：msg.putUserProperty("amount", "150")
+    消费者基于属性过滤
+    支持自定义属性
+```
+
+## 集群部署深入
+
+### 主从同步与 DLedger 模式
+
+```text
+集群模式：
+  主从模式（Master-Slave）：
+    Master：读写
+    Slave：只读（同步/异步复制）
+    适用：一般生产环境
+
+  DLedger 模式：
+    基于 Raft 协议
+    自动 Leader 选举
+    数据强一致
+    适用：金融级场景
+
+  部署建议：
+    3 节点 DLedger（推荐）
+    5 节点 DLedger（高可用）
+    主从模式：1 Master + 2 Slave
+```
+
+## Dashboard 监控
+
+### RocketMQ Dashboard 功能
+
+```text
+Dashboard 功能：
+  Topic 管理：
+    创建/删除 Topic
+    查看 Topic 状态
+    消息轨迹查询
+
+  Consumer 管理：
+    查看消费组
+    消费进度（Offset）
+    消费延迟监控
+
+  Producer 管理：
+    发送消息测试
+    消息轨迹查询
+
+  运维：
+    Broker 状态
+    集群配置
+    日志查看
+```
+
+## 对比 Kafka 深入
+
+### 功能与性能对比
+
+| 维度 | RocketMQ | Kafka |
+|------|----------|-------|
+| 开发语言 | Java | Scala/Java |
+| 吞吐量 | 十万级 | 百万级 |
+| 延迟 | 微秒级 | 毫秒级 |
+| 消息可靠性 | 高 | 高 |
+| 事务消息 | 原生支持 | 支持（0.11+） |
+| 延迟消息 | 原生支持 | 需要自己实现 |
+| 顺序消息 | 支持 | 支持 |
+| 消息过滤 | Tag/SQL | 无 |
+| 回溯消费 | 支持 | 支持 |
+| 消息堆积 | 亿级 | 亿级 |
+| 适用场景 | 电商/金融/事务 | 日志/大数据/流处理 |
+
+## 最佳实践深入
+
+### 消息设计/消费幂等/死信队列
+
+```text
+消息设计最佳实践：
+  1. 消息体精简
+     避免携带大数据
+     只传 ID，详情查库
+
+  2. 消息幂等
+     消费者实现幂等
+     使用消息 ID 去重
+
+  3. 死信队列
+     失败消息进入死信队列
+     定期人工处理
+
+  4. 消息追踪
+     设置 Key 便于追踪
+     记录消息轨迹
+
+  5. 监控告警
+     消费延迟告警
+     消息堆积告警
+     死信队列告警
+```
+
+## 生产问题排查深入
+
+### 消费延迟/消息丢失/重复消费
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 消费延迟 | 消费能力不足 | 增加消费者/线程数 |
+| 消息丢失 | 生产者未确认 | 同步发送+重试 |
+| 消息丢失 | Broker 未同步 | 同步刷盘+主从同步 |
+| 重复消费 | 网络超时重试 | 消费者幂等 |
+| 消息堆积 | 消费速度慢 | 优化消费逻辑 |
+
+## 对比 Pulsar 深入
+
+### 架构与功能对比
+
+| 维度 | RocketMQ | Pulsar |
+|------|----------|--------|
+| 架构 | Broker 有状态 | Broker 无状态 |
+| 存储 | 本地磁盘 | BookKeeper |
+| 计算存储耦合 | 是 | 否 |
+| 多租户 | 弱 | 强 |
+| 跨地域复制 | 支持 | 支持 |
+| 函数计算 | 无 | Pulsar Functions |
+| 适用场景 | 电商/金融 | 云原生/大数据 |
+
+## 监控深入
+
+### Prometheus + Grafana 监控
+
+```yaml
+# RocketMQ Exporter 配置
+rocketmq:
+  exporter:
+    port: 5557
+    namesrvAddr: "namesrv1:9876;namesrv2:9876"
+
+# 监控指标
+# rocketmq_consumer_lag: 消费延迟
+# rocketmq_produce_tps: 生产 TPS
+# rocketmq_consume_tps: 消费 TPS
+# rocketmq_message_count: 消息总数
+```
+
 - [Apache RocketMQ 官方文档](https://rocketmq.apache.org/docs/)
 - [RocketMQ GitHub](https://github.com/apache/rocketmq)
 - [RocketMQ 事务消息设计](https://rocketmq.apache.org/docs/featureBehavior/04transactionmessage)

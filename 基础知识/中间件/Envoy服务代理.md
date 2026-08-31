@@ -1078,6 +1078,402 @@ resources:
 
 > 一句话：**Envoy = xDS 动态配置 + 过滤器链 + 内置可观测性 + HTTP/2/gRPC 原生；选型先看「场景（服务网格→Envoy，传统代理→Nginx）」，再定「扩展需求（Wasm/Lua 自定义过滤器）」**。
 
+## xDS 协议深入
+
+### LDS/RDS/CDS/EDS 协议详解
+
+```text
+xDS 协议族：
+  LDS（Listener Discovery Service）：
+    用途：监听器配置
+    内容：IP、端口、过滤器链
+    更新：动态添加/删除监听器
+
+  RDS（Route Discovery Service）：
+    用途：路由配置
+    内容：路由规则、集群映射
+    更新：动态更新路由
+
+  CDS（Cluster Discovery Service）：
+    用途：集群配置
+    内容：端点、负载均衡、熔断
+    更新：动态添加/删除集群
+
+  EDS（Endpoint Discovery Service）：
+    用途：端点配置
+    内容：服务实例 IP、端口、健康状态
+    更新：动态更新端点
+
+  SDS（Secret Discovery Service）：
+    用途：证书配置
+    内容：TLS 证书、私钥
+    更新：动态轮换证书
+
+  ECDS（Extension Config Discovery Service）：
+    用途：扩展配置
+    内容：Wasm/Lua 过滤器配置
+    更新：动态更新扩展
+```
+
+### xDS 交互流程
+
+```mermaid
+sequenceDiagram
+    participant C as 控制面
+    participant E as Envoy
+    C->>E: LDS（监听器配置）
+    E->>C: ACK
+    C->>E: RDS（路由配置）
+    E->>C: ACK
+    C->>E: CDS（集群配置）
+    E->>C: ACK
+    C->>E: EDS（端点配置）
+    E->>C: ACK
+    Note over C,E: 配置变更时推送
+    C->>E: RDS（新路由）
+    E->>C: ACK
+```
+
+## 过滤器链深入
+
+### Network/HTTP 过滤器详解
+
+```yaml
+# 过滤器链配置
+filter_chains:
+- filters:
+  - name: envoy.filters.network.http_connection_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+      stat_prefix: ingress_http
+      http_filters:
+      - name: envoy.filters.http.jwt_authn
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+          providers:
+            auth0:
+              issuer: https://auth0.example.com/
+              audiences:
+              - "https://api.example.com"
+              remote_jwks:
+                http_uri:
+                  uri: https://auth0.example.com/.well-known/jwks.json
+                  cluster: auth0_cluster
+                  timeout: 1s
+      - name: envoy.filters.http.cors
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+      - name: envoy.filters.http.router
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+```
+
+### 常用过滤器
+
+| 过滤器 | 类型 | 功能 | 适用场景 |
+|--------|------|------|---------|
+| jwt_authn | HTTP | JWT 认证 | API 认证 |
+| cors | HTTP | 跨域 | Web API |
+| rate_limit | HTTP | 限流 | API 保护 |
+| fault | HTTP | 故障注入 | 测试 |
+| lua | HTTP | Lua 脚本 | 自定义逻辑 |
+| tcp_proxy | Network | TCP 代理 | 数据库代理 |
+| mongo_proxy | Network | MongoDB 代理 | 数据库代理 |
+
+## 熔断深入
+
+### 异常检测与连接池限制
+
+```yaml
+# 熔断配置
+clusters:
+- name: backend
+  type: STRICT_DNS
+  lb_policy: ROUND_ROBIN
+  circuit_breakers:
+    thresholds:
+    - priority: DEFAULT
+      max_connections: 1024
+      max_pending_requests: 1024
+      max_requests: 1024
+      max_retries: 3
+  outlier_detection:
+    consecutive_5xx: 5
+    interval: 10s
+    base_ejection_time: 30s
+    max_ejection_percent: 50
+```
+
+### 异常检测详解
+
+```text
+异常检测（Outlier Detection）：
+  原理：自动驱逐异常端点
+  检测指标：
+    5xx 错误率：连续 5 个 5xx → 驱逐
+    连接失败：连续连接失败 → 驱逐
+    响应时间：超过阈值 → 驱逐
+
+  驱逐策略：
+    驱逐时间：30 秒（默认）
+    最大驱逐比例：50%
+    恢复策略：驱逐后定期探测
+
+  配置参数：
+    consecutive_5xx：连续 5xx 次数
+    interval：检测间隔
+    base_ejection_time：基础驱逐时间
+    max_ejection_percent：最大驱逐比例
+```
+
+## 访问日志深入
+
+### Access Log 格式与自定义
+
+```yaml
+# 访问日志配置
+access_log:
+- name: envoy.access_loggers.file
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+    path: /var/log/envoy/access.log
+    log_format:
+      text_format_source:
+        inline_string: |
+          [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
+          %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT%
+          %DURATION% "%REQ(X-FORWARDED-FOR)%" "%REQ(USER-AGENT)%"
+          "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%" "%UPSTREAM_HOST%"
+          %UPSTREAM_CLUSTER% %UPSTREAM_LOCAL_ADDRESS%
+          %DOWNSTREAM_LOCAL_ADDRESS% %DOWNSTREAM_REMOTE_ADDRESS%
+          %REQUESTED_SERVER_NAME% %ROUTING_CLUSTER%
+```
+
+### 日志字段说明
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| %START_TIME% | 请求开始时间 | 2026-01-15T10:30:00.000Z |
+| %REQ(:METHOD)% | HTTP 方法 | GET/POST |
+| %RESPONSE_CODE% | 响应码 | 200/404/500 |
+| %RESPONSE_FLAGS% | 响应标志 | NR/UF/UC |
+| %DURATION% | 请求耗时(ms) | 123 |
+| %BYTES_RECEIVED% | 接收字节数 | 1024 |
+| %BYTES_SENT% | 发送字节数 | 2048 |
+| %UPSTREAM_HOST% | 上游地址 | 10.0.0.1:8080 |
+
+## OpenTelemetry 集成
+
+### 指标/日志/追踪统一采集
+
+```yaml
+# OpenTelemetry 配置
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          tracing:
+            provider:
+              name: envoy.tracers.opentelemetry
+              typed_config:
+                "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                grpc_service:
+                  envoy_grpc:
+                    cluster_name: otel_collector
+                    authority: otel-collector.observability:4317
+                service_name: envoy-proxy
+          http_filters:
+          - name: envoy.filters.http.router
+```
+
+## Envoy 对比 Nginx
+
+### 性能与功能对比
+
+| 维度 | Envoy | Nginx |
+|------|-------|-------|
+| 架构 | 现代 C++ | 传统 C |
+| 配置 | 动态（xDS） | 静态（reload） |
+| 协议 | HTTP/2/gRPC 原生 | HTTP/1.1 为主 |
+| 扩展 | Wasm/Lua | Lua/C 模块 |
+| 可观测 | 内置丰富 | 需要模块 |
+| 服务网格 | 原生支持 | 不支持 |
+| 性能 | 高 | 高 |
+| 生态 | 云原生 | 传统 Web |
+| 适用 | 微服务/网格 | Web 服务器/反向代理 |
+
+## 在 Istio 中的角色
+
+### Sidecar 注入与流量拦截
+
+```text
+Istio 数据面：
+  Envoy Sidecar：
+    注入方式：自动注入（label）/手动注入
+    流量拦截：iptables REDIRECT
+    配置下发：Istiod → xDS
+
+  流量路径：
+    入站：客户端 → iptables → Envoy → 应用
+    出站：应用 → iptables → Envoy → 服务端
+
+  功能：
+    mTLS：自动证书轮换
+    流量治理：金丝雀/故障注入/重试
+    可观测：Metrics/Traces/Access Log
+    安全：RBAC/授权策略
+```
+
+## 性能调优
+
+### 连接池/缓冲区/线程模型
+
+```yaml
+# 连接池配置
+clusters:
+- name: backend
+  type: STRICT_DNS
+  lb_policy: ROUND_ROBIN
+  circuit_breakers:
+    thresholds:
+    - priority: DEFAULT
+      max_connections: 1024
+      max_pending_requests: 1024
+      max_requests: 1024
+  upstream_connection_options:
+    tcp_keepalive:
+      keepalive_time: 300
+      keepalive_interval: 30
+      keepalive_probes: 6
+
+# 缓冲区配置
+per_connection_buffer_limit_bytes: 32768
+```
+
+### 线程模型
+
+```text
+Envoy 线程模型：
+  主线程：配置管理、xDS 通信
+  Worker 线程：请求处理（默认 = CPU 核数）
+  网络线程：TCP/UDP 处理
+
+  性能优化：
+    1. Worker 线程数 = CPU 核数
+    2. 启用 HTTP/2 多路复用
+    3. 调整连接池大小
+    4. 启用压缩（gzip/brotli）
+    5. 使用 Linux epoll
+```
+
+## 安全深入
+
+### mTLS/RBAC/JWT/OWASP
+
+```yaml
+# mTLS 配置
+transport_socket:
+  name: envoy.transport_sockets.tls
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+    require_client_certificate: true
+    common_tls_context:
+      tls_certificates:
+      - certificate_chain:
+          filename: /etc/envoy/certs/server.crt
+        private_key:
+          filename: /etc/envoy/certs/server.key
+      validation_context:
+        trusted_ca:
+          filename: /etc/envoy/certs/ca.crt
+
+# RBAC 配置
+http_filters:
+- name: envoy.filters.http.rbac
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+    rules:
+      action: ALLOW
+      policies:
+        viewer:
+          permissions:
+          - url_path:
+              path: {prefix: "/api/"}
+          principals:
+          - header:
+              name: ":authorization"
+              exact_match: "Bearer token123"
+```
+
+## 最佳实践
+
+### 生产环境配置建议
+
+```text
+最佳实践：
+  1. 高可用
+     多副本部署
+     健康检查
+     自动故障转移
+
+  2. 性能
+     启用 HTTP/2
+     连接池调优
+     缓冲区配置
+
+  3. 安全
+     启用 mTLS
+     RBAC 授权
+     限流保护
+
+  4. 可观测
+     访问日志
+     指标采集
+     链路追踪
+
+  5. 运维
+     灰度升级
+     配置回滚
+     监控告警
+```
+
+## 生产问题排查
+
+### 常见问题与解决方案
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 503 错误 | 上游不可用 | 检查服务健康状态 |
+| 连接超时 | 上游响应慢 | 调整超时配置 |
+| 内存泄漏 | 配置错误 | 检查配置+重启 |
+| 证书错误 | 证书过期/不匹配 | 更新证书 |
+| 路由错误 | 路由配置错误 | 检查 RDS 配置 |
+
+### 排查命令
+
+```bash
+# 查看 Envoy 配置
+curl http://localhost:15000/config_dump
+
+# 查看统计信息
+curl http://localhost:15000/stats
+
+# 查看集群信息
+curl http://localhost:15000/clusters
+
+# 查看日志
+tail -f /var/log/envoy/access.log
+```
+
 ---
 
 ## 九、Envoy Wasm 扩展（云原生可编程代理）

@@ -1273,6 +1273,771 @@ Schema 演进策略：
   4. 下线旧版本
 ```
 
+## Protobuf 序列化深入
+
+### Protobuf Schema 定义与编译
+
+```protobuf
+// order.proto - 完整 Protobuf Schema 示例
+syntax = "proto3";
+
+package com.example;
+
+import "google/protobuf/timestamp.proto";
+
+message Order {
+  int64 order_id = 1;
+  string user_id = 2;
+  double amount = 3;
+  OrderStatus status = 4;
+  repeated OrderItem items = 5;
+  google.protobuf.Timestamp created_at = 6;
+  map<string, string> properties = 7;
+}
+
+enum OrderStatus {
+  CREATED = 0;
+  PAID = 1;
+  SHIPPED = 2;
+  COMPLETED = 3;
+}
+
+message OrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+  double price = 3;
+}
+
+// 向后兼容：新增字段使用新编号
+message OrderV2 {
+  int64 order_id = 1;
+  string user_id = 2;
+  double amount = 3;
+  OrderStatus status = 4;
+  repeated OrderItem items = 5;
+  google.protobuf.Timestamp created_at = 6;
+  map<string, string> properties = 7;
+  string coupon_code = 8;  // 新增字段，向后兼容
+  reserved 9;              // 保留已删除字段编号
+  reserved "deprecated_field"; // 保留已删除字段名
+}
+```
+
+### Protobuf 与 Avro 性能对比详解
+
+| 维度 | Protobuf | Avro | 说明 |
+|------|----------|------|------|
+| 序列化体积 | 0.5x JSON | 0.6x JSON | Protobuf 略优 |
+| 编码速度 | 3x JSON | 2.5x JSON | Protobuf 更快 |
+| 解码速度 | 3.5x JSON | 3x JSON | 接近 |
+| Schema 位置 | 编译时（.proto） | 运行时（注册中心） | 各有优势 |
+| 字段标识 | 字段编号（按号匹配） | 字段名称（按名匹配） | Protobuf 更稳定 |
+| 向后兼容 | 需手动管理 reserved | Registry 自动校验 | Avro 更安全 |
+| 跨语言 | 最强（生态最广） | 强（Kafka 生态默认） | Protobuf 胜 |
+| 数据湖导出 | 需转换 | Avro 文件原生 | Avro 胜 |
+| 动态 Schema | 不支持 | 支持（GenericRecord） | Avro 胜 |
+| 适用场景 | 微服务 RPC/REST API | Kafka 消息/数据湖 | 各有所长 |
+
+```text
+Protobuf 编码原理：
+  varint 编码：小整数只占 1 字节
+  TLV 格式：Tag-Length-Value
+  字段编号：固定 1 字节 Tag（3 bits 类型 + 4 bits 编号）
+
+  示例：amount=99.0
+    Tag: 0x21（type=5=float, field=4）
+    Value: 8 字节 double
+    总体积：约 9 字节（vs JSON ~15 字节）
+
+  优势：
+    - 无字段名开销（编号代替）
+    - 无分隔符开销
+    - varint 压缩小整数
+```
+
+### Protobuf 配置最佳实践
+
+```protobuf
+// proto 配置规范
+syntax = "proto3";
+package com.example.v1;
+
+// 版本化包名：v1/v2 隔离
+option java_package = "com.example.proto.v1";
+option java_outer_classname = "OrderProto";
+
+// 向后兼容规则：
+// 1. 新字段只加不改（加字段用新编号）
+// 2. 删除字段用 reserved（保留编号+名称）
+// 3. 不改变已有字段的类型或编号
+// 4. map 字段不能 required
+// 5. repeated 字段用 packed 编码（默认）
+```
+
+## Schema 演进最佳实践
+
+### 字段添加
+
+```json
+// v1 Schema
+{
+  "type": "record",
+  "name": "Order",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "amount", "type": "double"}
+  ]
+}
+
+// v2 Schema（添加字段，带默认值）
+{
+  "type": "record",
+  "name": "Order",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "amount", "type": "double"},
+    {"name": "status", "type": "string", "default": "CREATED"}
+  ]
+}
+
+// v3 Schema（继续添加字段）
+{
+  "type": "record",
+  "name": "Order",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "amount", "type": "double"},
+    {"name": "status", "type": "string", "default": "CREATED"},
+    {"name": "coupon_code", "type": ["null", "string"], "default": null}
+  ]
+}
+```
+
+### 类型变更
+
+```text
+类型变更规则：
+  1. int32 → int64：✅ 宽化兼容（Backward）
+  2. double → float：❌ 窄化不兼容
+  3. string → bytes：❌ 不兼容
+  4. 枚举：只能添加新值，不能删除旧值
+
+正确做法：
+  方案一：新增字段 + 迁移数据
+    v2: {"name": "amount_v2", "type": "string", "default": ""}
+    → 消费者同时支持 amount 和 amount_v2
+    → 数据迁移完成后删除 amount
+
+  方案二：使用别名
+    {"name": "amount", "type": "double", "aliases": ["amount_old"]}
+
+  方案三：大版本升级
+    新 Topic + 新 Schema（隔离验证）
+    双写过渡期（新旧并行）
+    消费者切新 Topic
+    老 Topic 保留期后清理
+```
+
+### 删除字段
+
+```text
+删除字段流程：
+  1. 标记字段为可选（optional/默认值）
+  2. 消费者停止使用该字段
+  3. 生产者停止填充该字段
+  4. 下个版本删除字段
+
+注意事项：
+  - Backward 兼容允许删除字段（有默认值）
+  - 删除后不可恢复，必须谨慎
+  - 建议保留 2-3 个版本后再删除
+  - Protobuf 必须用 reserved 保留编号
+
+删除字段 SQL 示例：
+  -- Avro 删除字段
+  v1: {name, email, phone}
+  v2: {name, email}  -- phone 有默认值可删
+
+  -- Protobuf 删除字段
+  message User {
+    string name = 1;
+    string email = 2;
+    reserved 3;  // phone 字段已删除，编号保留
+    reserved "phone";
+  }
+```
+
+### 兼容性规则汇总
+
+| 操作 | BACKWARD | FORWARD | FULL | 说明 |
+|------|----------|---------|------|------|
+| 加字段（有默认值） | ✅ | ✅ | ✅ | 最安全操作 |
+| 加字段（无默认值） | ❌ | ✅ | ❌ | 破坏 BACKWARD |
+| 删字段（有默认值） | ✅ | ❌ | ❌ | 破坏 FORWARD |
+| 删字段（无默认值） | ✅ | ❌ | ❌ | 破坏 FORWARD |
+| 改类型 | ❌ | ❌ | ❌ | 永远不兼容 |
+| 重命名字段 | ❌ | ❌ | ❌ | 永远不兼容 |
+| 改默认值 | ✅ | ✅ | ✅ | 安全操作 |
+| 改字段编号(Protobuf) | ❌ | ❌ | ❌ | 数据串位 |
+
+### 示例：安全演进全流程
+
+```text
+安全演进流程（v1 → v2 → v3）：
+
+v1: {id, amount}
+  → 注册到 Registry
+
+v2: {id, amount, status(default:"CREATED")}
+  → BACKWARD 兼容：v2 能读 v1 数据
+  → 消费者升级到 v2
+
+v3: {id, amount, status, coupon_code(default:null)}
+  → BACKWARD 兼容：v3 能读 v2 数据
+  → 消费者升级到 v3
+
+v4: {id, amount, status}  // 删除 coupon_code
+  → BACKWARD 兼容：v4 能读 v3 数据（coupon_code 有默认值）
+  → 但需确认所有消费者已停止使用 coupon_code
+
+关键：每次只做一个小改动，全程无停服
+```
+
+## 格式兼容性详解
+
+### BACKWARD 兼容（消费者先升级）
+
+```text
+BACKWARD = 新 Schema 能读老数据
+
+允许操作：
+  ✅ 加字段（带默认值）
+  ✅ 删字段（有默认值）
+  ✅ 改默认值
+  ❌ 加字段（无默认值）
+  ❌ 改类型
+  ❌ 重命名字段
+
+适用场景：
+  消费者先升级到新版本
+  生产者继续发老格式
+  消费者能处理两种格式
+
+配置：
+  curl -X PUT http://registry:8081/config/topic-value \
+    -H "Content-Type: application/json" \
+    -d '{"compatibility": "BACKWARD"}'
+```
+
+### FORWARD 兼容（生产者先升级）
+
+```text
+FORWARD = 老 Schema 能读新数据
+
+允许操作：
+  ✅ 加字段
+  ✅ 删字段（有默认值）
+  ❌ 加字段（无默认值）
+  ❌ 删字段（无默认值）
+  ❌ 改类型
+
+适用场景：
+  生产者先升级到新版本
+  消费者继续用老版本
+  老消费者能处理新格式
+
+配置：
+  curl -X PUT http://registry:8081/config/topic-value \
+    -H "Content-Type: application/json" \
+    -d '{"compatibility": "FORWARD"}'
+```
+
+### FULL 兼容（严格契约）
+
+```text
+FULL = 双向兼容（最严格）
+
+允许操作：
+  ✅ 加字段（带默认值）
+  ✅ 删字段（有默认值）
+  ✅ 改默认值
+  ❌ 加字段（无默认值）
+  ❌ 删字段（无默认值）
+  ❌ 改类型
+  ❌ 重命名字段
+
+适用场景：
+  生产者和消费者无法确定升级顺序
+  需要严格保证兼容性
+  金融/支付等关键场景
+
+配置：
+  curl -X PUT http://registry:8081/config/topic-value \
+    -H "Content-Type: application/json" \
+    -d '{"compatibility": "FULL"}'
+```
+
+### NONE（不校验）
+
+```text
+NONE = 不检查兼容性
+
+⚠️ 禁止生产使用！
+
+适用场景：
+  开发调试
+  原型验证
+  测试环境
+
+配置：
+  curl -X PUT http://registry:8081/config/topic-value \
+    -H "Content-Type: application/json" \
+    -d '{"compatibility": "NONE"}'
+```
+
+### 兼容性选择决策树
+
+```mermaid
+flowchart TD
+    A{升级顺序?} -->|消费者先升级| B[BACKWARD]
+    A -->|生产者先升级| C[FORWARD]
+    A -->|不确定/严格要求| D[FULL]
+    A -->|开发调试| E[NONE]
+    B --> F{字段变更?}
+    C --> F
+    D --> F
+    F -->|加字段| G[必须带默认值]
+    F -->|删字段| H[必须有默认值]
+    F -->|改类型| I[禁止!]
+```
+
+## Schema Registry API 操作
+
+### Subjects CRUD
+
+```bash
+# 注册 Schema
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"}]}"}' \
+  http://schema-registry:8081/subjects/orders-value/versions
+
+# 获取 Subject
+curl http://schema-registry:8081/subjects/orders-value
+
+# 获取所有 Subject
+curl http://schema-registry:8081/subjects
+
+# 删除 Subject（软删除）
+curl -X DELETE http://schema-registry:8081/subjects/orders-value
+
+# 硬删除
+curl -X DELETE http://schema-registry:8081/subjects/orders-value?permanent=true
+
+# 获取 Subject 的所有版本
+curl http://schema-registry:8081/subjects/orders-value/versions
+
+# 获取指定版本
+curl http://schema-registry:8081/subjects/orders-value/versions/1
+
+# 获取最新版本
+curl http://schema-registry:8081/subjects/orders-value/versions/latest
+```
+
+### Version 管理
+
+```bash
+# 按 ID 获取 Schema
+curl http://schema-registry:8081/schemas/ids/1
+
+# 按 ID 获取 Schema（指定格式）
+curl http://schema-registry:8081/schemas/ids/1?format=avro
+
+# 获取 Schema 的版本列表
+curl http://schema-registry:8081/schemas/ids/1/versions
+
+# 删除版本
+curl -X DELETE http://schema-registry:8081/subjects/orders-value/versions/2
+```
+
+### Compatibility 配置
+
+```bash
+# 设置全局兼容性
+curl -X PUT -H "Content-Type: application/json" \
+  -d '{"compatibility": "BACKWARD"}' \
+  http://schema-registry:8081/config
+
+# 设置 Subject 兼容性
+curl -X PUT -H "Content-Type: application/json" \
+  -d '{"compatibility": "FULL"}' \
+  http://schema-registry:8081/config/orders-value
+
+# 获取兼容性配置
+curl http://schema-registry:8081/config
+
+# 获取 Subject 兼容性配置
+curl http://schema-registry:8081/config/orders-value
+
+# 测试兼容性
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"schema": "...新 Schema..."}' \
+  http://schema-registry:8081/compatibility/subjects/orders-value/versions/latest
+
+# 测试与特定版本的兼容性
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"schema": "...新 Schema..."}' \
+  http://schema-registry:8081/compatibility/subjects/orders-value/versions/1
+```
+
+## Schema Registry 多集群架构
+
+### 主从同步
+
+```text
+多集群同步模式：
+  ├── 主从模式（Master-Follower）
+  │   ├── 主集群处理写请求
+  │   ├── 从集群同步主集群数据
+  │   ├── 从集群只读
+  │   └── 故障时主从切换
+
+  ├── 多活模式（Active-Active）
+  │   ├── 两个集群都可写
+  │   ├── 双向同步（冲突检测）
+  │   ├── 适用于跨地域部署
+  │   └── 需要冲突解决策略
+
+  └── 一致性保证
+      ├── 同步复制：强一致但延迟高
+      ├── 异步复制：最终一致但性能好
+      └── 半同步：至少一个从确认
+```
+
+### 多活部署配置
+
+```yaml
+# 多活集群配置
+# 集群 A 配置
+schema.registry.url=http://cluster-a:8081
+schema.registry.sync.peer=http://cluster-b:8081
+schema.registry.sync.interval=5s
+
+# 集群 B 配置
+schema.registry.url=http://cluster-b:8081
+schema.registry.sync.peer=http://cluster-a:8081
+schema.registry.sync.interval=5s
+```
+
+### 数据一致性保障
+
+| 一致性级别 | 说明 | 适用场景 | 配置 |
+|------------|------|----------|------|
+| 强一致 | 所有副本确认后返回 | 金融/交易 | sync.replication=true |
+| 最终一致 | 异步同步，有延迟 | 大多数场景 | sync.replication=false |
+| 读己之写 | 写后读自己写的数据 | 用户体验 | read.your.writes=true |
+| 单调读 | 不会读到更旧的数据 | 分析查询 | monotonic.reads=true |
+
+## Schema Registry 与 Kafka Connect 集成
+
+### Converter 配置
+
+```json
+// Kafka Connect Schema Registry 集成
+{
+  "name": "mysql-source-connector",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSourceConnector",
+    "connection.url": "jdbc:mysql://localhost:3306/mydb",
+    "topic.prefix": "my-",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://registry:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://registry:8081",
+    "value.converter.subject.name.strategy": "io.confluent.connect.storage.class.TopicSubjectNameStrategy"
+  }
+}
+```
+
+### Sink Source 配置
+
+```json
+// Sink Connector 配置
+{
+  "name": "elasticsearch-sink",
+  "config": {
+    "connector.class": "io.confluent.connect.elasticsearch.ElasticsearchSinkConnector",
+    "topics": "my-orders",
+    "connection.url": "http://elasticsearch:9200",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://registry:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://registry:8081",
+    "type.name": "_doc"
+  }
+}
+```
+
+### 性能优化
+
+| 配置 | 说明 | 建议值 |
+|------|------|--------|
+| schema.registry.cache.ttl | Schema 缓存时间 | 300s |
+| schema.registry.cache.size | 缓存大小 | 1000 |
+| schema.registry.max.schemas.per.subject | 每 Subject 最大版本数 | 1000 |
+| schema.registry.request.timeout.ms | 请求超时 | 10000 |
+| schema.registry.max.retries | 最大重试次数 | 3 |
+
+## Schema Registry 安全
+
+### Kerberos/mTLS 配置
+
+```properties
+# Kerberos 认证
+schema.registry.kerberos.service.name=kafka
+schema.registry.kerberos.kinit.command=/usr/bin/kinit
+schema.registry.kerberos.principal=HTTP/schema-registry@EXAMPLE.COM
+schema.registry.kerberos.keytab.path=/etc/security/keytabs/HTTP.keytab
+
+# mTLS 配置
+schema.registry.ssl.keystore.location=/path/to/keystore.jks
+schema.registry.ssl.keystore.password=changeit
+schema.registry.ssl.truststore.location=/path/to/truststore.jks
+schema.registry.ssl.truststore.password=changeit
+schema.registry.ssl.client.auth=requested
+schema.registry.ssl.protocol=TLSv1.2
+schema.registry.ssl.enabled.protocols=TLSv1.2,TLSv1.3
+```
+
+### RBAC 配置
+
+```json
+// RBAC 角色定义
+{
+  "roles": [
+    {
+      "name": "schema-reader",
+      "permissions": ["SCHEMA_READ"]
+    },
+    {
+      "name": "schema-writer",
+      "permissions": ["SCHEMA_READ", "SCHEMA_WRITE"]
+    },
+    {
+      "name": "schema-admin",
+      "permissions": ["SCHEMA_READ", "SCHEMA_WRITE", "SCHEMA_DELETE", "CONFIG_WRITE"]
+    }
+  ]
+}
+```
+
+| 权限 | 说明 | API | 最小角色 |
+|------|------|-----|----------|
+| SCHEMA_READ | 读取 Schema | GET /schemas/ids/* | reader |
+| SCHEMA_WRITE | 注册 Schema | POST /subjects/*/versions | writer |
+| SCHEMA_DELETE | 删除 Schema | DELETE /subjects/* | admin |
+| CONFIG_WRITE | 修改配置 | PUT /config/* | admin |
+
+### 最佳实践
+
+```text
+安全最佳实践：
+  1. 生产环境必须启用认证（Kerberos/mTLS）
+  2. 按团队/应用分配最小权限
+  3. 审计所有注册/删除操作
+  4. 禁用 auto.register.schemas（生产）
+  5. 定期轮换 TLS 证书
+  6. 监控未授权访问尝试
+```
+
+## Schema Registry 性能优化
+
+### Caching 与 Batch 请求
+
+```text
+性能优化策略：
+  1. Schema 缓存
+     ├── 客户端本地缓存（减少 Registry 查询）
+     ├── 缓存 TTL：300s（5 分钟）
+     ├── 缓存命中率监控
+     └── 失效策略：版本号比对
+
+  2. 批量请求
+     ├── 批量获取 Schema（减少 HTTP 调用）
+     ├── 批量注册（批量 Topic Schema）
+     └── 并发请求（多线程）
+
+  3. 超时配置
+     ├── 注册超时：10s
+     ├── 获取超时：5s
+     ├── 重试策略：指数退避
+     └── 重试次数：3 次
+```
+
+### 超时配置示例
+
+```properties
+# 客户端超时配置
+schema.registry.request.timeout.ms=10000
+schema.registry.max.schemas.per.subject=1000
+schema.registry.cache.capacity=1000
+schema.registry.cache.ttl.seconds=300
+
+# 重试配置
+schema.registry.request.retries=3
+schema.registry.retry.backoff.ms=100
+schema.registry.retry.backoff.max.ms=1000
+
+# 连接池配置
+schema.registry.max.connections=100
+schema.registry.connection.timeout.ms=5000
+schema.registry.socket.timeout.ms=10000
+```
+
+## Schema Registry 监控
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| schema_registry_registration_success_total | 注册成功数 | 基线对比 |
+| schema_registry_registration_failure_total | 注册失败数 | > 1%/5min |
+| schema_registry_compatibility_check_total | 兼容性检查数 | 基线对比 |
+| schema_registry_compatibility_check_failed_total | 兼容性检查失败数 | > 5%/5min |
+| schema_registry_fetch_latency_seconds | Schema 获取延迟 | > 1s |
+| schema_registry_jvm_memory_used_bytes | JVM 内存使用 | > 80% |
+| schema_registry_subject_count | Subject 数量 | 基线对比 |
+| schema_registry_version_count | 版本总数 | 基线对比 |
+
+### Prometheus 告警配置
+
+```yaml
+groups:
+  - name: schema-registry
+    rules:
+      - alert: SchemaRegistrationFailed
+        expr: rate(schema_registry_registration_failure_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schema 注册失败率过高"
+          description: "失败率 {{ $value | humanizePercentage }}"
+
+      - alert: SchemaCompatibilityFailed
+        expr: rate(schema_registry_compatibility_check_failed_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schema 兼容性检查失败率过高"
+
+      - alert: SchemaFetchLatencyHigh
+        expr: histogram_quantile(0.99, rate(schema_registry_fetch_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schema 获取延迟过高"
+```
+
+## Schema Registry 生产部署
+
+### HA 架构
+
+```text
+生产集群架构：
+  节点数量：3 个或 5 个（奇数个支持仲裁）
+  共享存储：Kafka _schemas Topic
+  负载均衡：前置 Nginx/HAProxy
+  高可用：Leader-Follower 模式
+  数据一致性：基于 Kafka 的强一致
+
+  部署拓扑：
+    Client → Load Balancer → Schema Registry Node 1
+                             → Schema Registry Node 2
+                             → Schema Registry Node 3
+                             → Kafka Cluster（_schemas）
+
+  故障恢复：
+    单节点故障→其他节点接管
+    无需人工干预
+    恢复后自动同步
+```
+
+### 备份恢复
+
+```bash
+# 备份 _schemas topic
+kafka-console-consumer --bootstrap-server kafka:9092 \
+  --topic _schemas --from-beginning \
+  --consumer.config /path/to/consumer.properties > schemas_backup.json
+
+# 恢复
+kafka-console-producer --bootstrap-server kafka:9092 \
+  --topic _schemas --property parse.key=true \
+  --property key.separator=: < schemas_backup.json
+
+# 定期备份脚本
+#!/bin/bash
+DATE=$(date +%Y%m%d)
+kafka-console-consumer --bootstrap-server kafka:9092 \
+  --topic _schemas --from-beginning \
+  --consumer.config /etc/schema-registry/consumer.properties \
+  > /backup/schemas_${DATE}.json
+
+# 保留 30 天备份
+find /backup -name "schemas_*.json" -mtime +30 -delete
+```
+
+### 升级策略
+
+```text
+滚动升级步骤：
+  1. 升级从节点（Follower）
+     ├── 停止从节点
+     ├── 替换二进制
+     ├── 启动从节点
+     └── 验证同步状态
+
+  2. 切换 Leader
+     ├── 停止当前 Leader
+     ├── 等待新 Leader 选出
+     └── 验证新 Leader 状态
+
+  3. 升级原 Leader（现为 Follower）
+     ├── 停止节点
+     ├── 替换二进制
+     └── 启动节点
+
+  4. 验证
+     ├── 注册测试 Schema
+     ├── 检查兼容性
+     └── 监控指标
+
+回滚策略：
+  升级失败 → 切回旧版本二进制 → 启动
+  数据兼容：新版本 Schema 兼容旧版本
+```
+
+### 监控大屏
+
+```text
+Schema Registry 监控大屏：
+  ┌────────────────────────────────────────────────┐
+  │  注册 TPS  │  兼容性检查 TPS  │  错误率  │
+  ├────────────────────────────────────────────────┤
+  │  Subject 数  │  版本总数  │  缓存命中率  │
+  ├────────────────────────────────────────────────┤
+  │  JVM 内存  │  GC 频率  │  线程数  │
+  └────────────────────────────────────────────────┘
+
+关键告警：
+  注册失败率 > 1% → 检查 Schema 格式
+  兼容性失败率 > 5% → 检查演进策略
+  获取延迟 > 1s → 检查网络/缓存
+  JVM 内存 > 80% → 扩容/调优
+```
+
 - Kafka 基础见「[Kafka](./Kafka.md)」；
 - Kafka Streams/ksqlDB（Serde 集成）见「[Kafka Streams 与 ksqlDB](./KafkaStreams与ksqlDB.md)」；
 - gRPC（Protobuf 契约）见「[gRPC](./gRPC.md)」；

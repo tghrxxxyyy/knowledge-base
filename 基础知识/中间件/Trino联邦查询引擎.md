@@ -2121,6 +2121,878 @@ Catalog 组织：
 | 连接失败 | Catalog 配置错误 | 1.检查连接配置<br>2.测试网络 | 修复配置 |
 | 性能下降 | 数据倾斜 | 1.检查数据分布<br>2.分析执行计划 | 优化分区 |
 
+## 二十六、Trino 安全深度实战
+
+### 26.1 认证体系详解
+
+```
+Trino 认证架构：
+  内置认证：
+    → Password 文件认证
+    → LDAP 认证
+    → Certificate 证书认证
+
+  外部认证：
+    → OAuth 2.0 集成
+    → SAML 2.0 单点登录
+    → Kerberos 集成
+
+  认证流程：
+    → 客户端提交凭据
+    → Coordinator 验证
+    → 生成认证令牌
+    → 后续请求携带令牌
+```
+
+```properties
+# LDAP 认证配置
+http-server.https.enabled=true
+http-server.https.port=8443
+http-server.https.keystore.path=/path/to/keystore.jks
+http-server.https.keystore.password=keystore_password
+
+# LDAP 配置
+ldap.url=ldap://ldap.example.com:389
+ldap.base-dn=dc=example,dc=com
+ldap.user-bind-pattern=uid=${USER},ou=people,dc=example,dc=com
+ldap.group-auth-pattern=member=${USER}
+ldap.user-search-base=ou=people
+ldap.user-search-filter=(&(objectClass=person)(uid=${USER}))
+```
+
+| 认证方式 | 配置复杂度 | 安全性 | 适用场景 |
+|----------|------------|--------|----------|
+| Password 文件 | 低 | 中 | 开发测试 |
+| LDAP | 中 | 高 | 企业环境 |
+| OAuth 2.0 | 高 | 很高 | 云环境 |
+| Kerberos | 很高 | 很高 | Hadoop 生态 |
+
+### 26.2 授权与访问控制
+
+```sql
+-- 创建角色层次
+CREATE ROLE data_admin;
+CREATE ROLE data_analyst;
+CREATE ROLE data_viewer;
+
+-- 授予权限
+GRANT ALL ON SCHEMA production TO data_admin;
+GRANT SELECT ON SCHEMA analytics TO data_analyst;
+GRANT SELECT ON SCHEMA public TO data_viewer;
+
+-- 角色继承
+GRANT data_analyst TO data_admin;
+GRANT data_viewer TO data_analyst;
+
+-- 行级安全策略
+CREATE ROW LEVEL SECURITY POLICY region_filter ON sales
+    FOR SELECT
+    USING (region = current_user_region());
+
+-- 列级权限
+GRANT SELECT (order_id, product_name, quantity) ON orders TO data_analyst;
+REGRANT SELECT (customer_email, customer_phone) ON orders FROM data_analyst;
+```
+
+```java
+// 自定义授权器
+public class CustomAccessControl implements AccessControl {
+    
+    @Override
+    public void checkCanCreateTable(TrinoIdentity identity, SchemaTableName table) {
+        // 检查用户是否有创建表权限
+        if (!hasPermission(identity, "CREATE_TABLE", table.getSchemaName())) {
+            throw new AccessDeniedException("User " + identity.getUser() 
+                + " cannot create table in schema " + table.getSchemaName());
+        }
+    }
+    
+    @Override
+    public void checkCanSelectFromTable(TrinoIdentity identity, SchemaTableName table) {
+        // 检查行级安全策略
+        if (isRowLevelSecurityEnabled(table)) {
+            applyRowLevelSecurityFilter(identity, table);
+        }
+    }
+}
+```
+
+### 26.3 数据加密与传输安全
+
+```properties
+# TLS/SSL 配置
+http-server.https.enabled=true
+http-server.https.port=8443
+
+# 服务端证书
+http-server.https.keystore.path=/path/to/trino.jks
+http-server.https.keystore.password=changeit
+
+# 客户端证书认证（双向 TLS）
+http-server.https.client.required=true
+http-server.https.client.keystore.path=/path/to/client.jks
+http-server.https.client.keystore.password=changeit
+
+# 内部通信加密
+internal-communication.shared-secret=your-shared-secret
+internal-communication.token.enabled=true
+```
+
+```yaml
+# Kubernetes TLS 配置
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-tls
+  namespace: trino
+type: kubernetes.io/tls
+data:
+  tls.crt: <base64-encoded-cert>
+  tls.key: <base64-encoded-key>
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: trino-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  tls:
+  - hosts:
+    - trino.example.com
+    secretName: trino-tls
+  rules:
+  - host: trino.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: trino-coordinator
+            port:
+              number: 8443
+```
+
+## 二十七、Trino 高级性能调优
+
+### 27.1 查询优化器深度配置
+
+```properties
+# 优化器配置
+query.max-execution-time=30m
+query.max-memory=20GB
+query.max-memory-per-node=4GB
+
+# 并行度优化
+query.default-filter-factor-limit=100
+query.optimization-inner-join-reordering=true
+query.optimization-hash-aggregation-strategy=auto
+
+# 谓词下推优化
+connector.predicate-pushdown.enabled=true
+predicate.pushdown.join-pushdown=true
+predicate.pushdown.aggregation-pushdown=true
+```
+
+```sql
+-- 使用 EXPLAIN 分析查询计划
+EXPLAIN (TYPE DISTRIBUTED, FORMAT JSON)
+SELECT 
+    region,
+    product_category,
+    SUM(amount) as total_sales,
+    COUNT(DISTINCT customer_id) as unique_customers
+FROM sales
+WHERE sale_date BETWEEN '2024-01-01' AND '2024-12-31'
+GROUP BY region, product_category
+HAVING SUM(amount) > 1000000;
+
+-- 查看查询统计
+SELECT * FROM system.runtime.queries
+WHERE query_id = '2024_0115_123456_001'
+ORDER BY created DESC;
+```
+
+| 优化项 | 配置参数 | 默认值 | 推荐值 | 说明 |
+|--------|----------|--------|--------|------|
+| 内存分配 | query.max-memory | 20GB | 30-50GB | 根据集群调整 |
+| 并行度 | query.max-concurrent | 100 | 200-500 | 根据 Worker 数 |
+| 超时时间 | query.max-execution-time | 30m | 60m | 复杂查询 |
+| Spill 阈值 | spill.enabled | false | true | 大查询必备 |
+
+### 27.2 资源队列与调度
+
+```sql
+-- 创建资源队列
+CREATE RESOURCE QUEUE analytics_queue 
+    WITH (
+        max_memory = '50GB',
+        max_concurrent = 50,
+        scheduling_policy = 'fair'
+    );
+
+CREATE RESOURCE QUEUE etl_queue
+    WITH (
+        max_memory = '100GB',
+        max_concurrent = 20,
+        scheduling_policy = 'fifo'
+    );
+
+-- 分配队列给用户
+ALTER USER analyst_user SET RESOURCE QUEUE analytics_queue;
+ALTER USER etl_user SET RESOURCE QUEUE etl_queue;
+
+-- 创建资源池
+CREATE RESOURCE POOL io_pool
+    WITH (
+        max_memory = '200GB',
+        max_concurrent = 100
+    );
+```
+
+```mermaid
+graph TB
+    A[用户查询] --> B{资源队列选择}
+    B --> C[analytics_queue]
+    B --> D[etl_queue]
+    C --> E[公平调度]
+    D --> F[FIFO调度]
+    E --> G[Worker 1-10]
+    F --> H[Worker 11-20]
+    G --> I[执行查询]
+    H --> I
+    I --> J{资源竞争}
+    J --> K[内存不足]
+    J --> L[Spill to Disk]
+    K --> M[等待释放]
+    L --> N[继续执行]
+```
+
+### 27.3 数据倾斜处理策略
+
+```java
+// 自定义分区器处理数据倾斜
+public class SkewAwarePartitioner implements ConnectorPartitionProvider {
+    
+    @Override
+    public PartitionResult getPartitions(ConnectorTransactionHandle transaction,
+                                        ConnectorSession session,
+                                        ConnectorTableHandle table) {
+        // 检测数据倾斜
+        Map<Object, Long> partitionSizes = analyzePartitionSizes(table);
+        
+        // 对大分区进行二次分割
+        List<Partition> partitions = new ArrayList<>();
+        for (Map.Entry<Object, Long> entry : partitionSizes.entrySet()) {
+            if (entry.getValue() > SKEW_THRESHOLD) {
+                // 大分区拆分为多个子分区
+                partitions.addAll(splitLargePartition(entry.getKey(), entry.getValue()));
+            } else {
+                partitions.add(new Partition(entry.getKey(), entry.getValue()));
+            }
+        }
+        
+        return new PartitionResult(partitions);
+    }
+    
+    private List<Partition> splitLargePartition(Object key, Long size) {
+        List<Partition> subPartitions = new ArrayList<>();
+        int subPartitionsCount = (int) Math.ceil(size.doubleValue() / IDEAL_PARTITION_SIZE);
+        
+        for (int i = 0; i < subPartitionsCount; i++) {
+            subPartitions.add(new Partition(
+                new CompositeKey(key, i), 
+                size / subPartitionsCount
+            ));
+        }
+        return subPartitions;
+    }
+}
+```
+
+```sql
+-- 使用 TABLESAMPLE 处理倾斜
+SELECT 
+    region,
+    AVG(amount) as avg_amount
+FROM sales TABLESAMPLE BERNOULLI (10)
+GROUP BY region;
+
+-- 使用 DISTRIBUTE BY 强制重新分布
+SELECT 
+    customer_id,
+    SUM(amount) as total
+FROM orders
+DISTRIBUTE BY customer_id
+SORT BY customer_id;
+
+-- 使用 HINT 指定分区策略
+SELECT /*+ JOIN_PARTITIONING(cartesian, hash) */
+    o.order_id,
+    c.customer_name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id;
+```
+
+## 二十八、生产监控与告警体系
+
+### 28.1 核心监控指标
+
+```sql
+-- 查询性能监控
+SELECT 
+    query_id,
+    user,
+    source,
+    state,
+    query,
+    created,
+    started,
+    end_time,
+    duration_ms,
+    queued_time_ms,
+    analysis_time_ms,
+    distributed_planning_time_ms,
+    execution_time_ms,
+    memory_pool,
+    peak_memory_bytes,
+    cumulative_memory,
+    cpu_time_ms,
+    wall_time_ms,
+    processed_rows,
+    processed_bytes
+FROM system.runtime.queries
+WHERE state = 'FAILED'
+  AND created > current_timestamp - interval '1' hour
+ORDER BY duration_ms DESC;
+
+-- 资源使用监控
+SELECT 
+    node_id,
+    heap_used,
+    heap_max,
+    heap_used_percent,
+    non_heap_used,
+    cpu_usage,
+    memory_pools,
+    threads_running,
+    threads_blocked
+FROM system.runtime.nodes
+ORDER BY heap_used DESC;
+
+-- 连接器性能监控
+SELECT 
+    catalog_name,
+    connector_id,
+    total_queries,
+    successful_queries,
+    failed_queries,
+    avg_query_duration,
+    total_processed_rows,
+    total_processed_bytes
+FROM system.runtime.connector_stats
+ORDER BY total_queries DESC;
+```
+
+```yaml
+# Prometheus 配置
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "trino_alerts.yml"
+
+scrape_configs:
+  - job_name: 'trino'
+    static_configs:
+      - targets: ['trino-coordinator:9090']
+    metrics_path: '/metrics'
+    
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+```
+
+```yaml
+# 告警规则
+groups:
+  - name: trino_alerts
+    rules:
+      - alert: TrinoHighQueryDuration
+        expr: trino_query_duration_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trino 查询执行时间过长"
+          description: "查询 {{ $labels.query_id }} 执行时间超过 5 分钟"
+      
+      - alert: TrinoHighMemoryUsage
+        expr: trino_memory_used_bytes / trino_memory_max_bytes > 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trino 内存使用率过高"
+          description: "节点 {{ $labels.node_id }} 内存使用率超过 90%"
+      
+      - alert: TrinoQueryFailureRate
+        expr: rate(trino_query_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trino 查询失败率过高"
+          description: "过去 5 分钟查询失败率超过 10%"
+```
+
+### 28.2 监控大盘配置
+
+```json
+{
+  "dashboard": {
+    "title": "Trino 监控大盘",
+    "panels": [
+      {
+        "title": "查询吞吐量",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(trino_queries_total[5m])",
+            "legendFormat": "{{state}}"
+          }
+        ]
+      },
+      {
+        "title": "查询延迟分布",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(trino_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95"
+          }
+        ]
+      },
+      {
+        "title": "内存使用情况",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "trino_memory_used_bytes / trino_memory_max_bytes * 100",
+            "legendFormat": "{{node_id}}"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 二十九、高级连接器模式
+
+### 29.1 连接器开发最佳实践
+
+```java
+// 高性能连接器示例
+public class HighPerformanceConnector implements Connector {
+    
+    private final ConnectionPool connectionPool;
+    private final CacheManager cacheManager;
+    private final MetricsCollector metrics;
+    
+    @Override
+    public ConnectorMetadata getMetadata() {
+        return new CachingMetadata(
+            new MyConnectorMetadata(config),
+            cacheManager,
+            Duration.ofMinutes(5)
+        );
+    }
+    
+    @Override
+    public ConnectorSplitManager getSplitManager() {
+        return new ParallelSplitManager(
+            new MyConnectorSplitManager(config),
+            Runtime.getRuntime().availableProcessors() * 2
+        );
+    }
+    
+    @Override
+    public ConnectorRecordCursorProvider getRecordCursorProvider() {
+        return new BatchRecordCursorProvider(
+            connectionPool,
+            config.getBatchSize(),
+            config.getFetchSize()
+        );
+    }
+}
+```
+
+```yaml
+# 连接器配置最佳实践
+connector:
+  name: mysql-production
+  
+  # 连接池配置
+  connection:
+    pool:
+      min-size: 5
+      max-size: 20
+      idle-timeout: 30m
+      max-lifetime: 1h
+    
+    # 超时配置
+    timeout:
+      connection: 30s
+      query: 5m
+      socket: 60s
+  
+  # 批量读取配置
+  fetch:
+    size: 10000
+    timeout: 30s
+  
+  # 缓存配置
+  cache:
+    enabled: true
+    size: 10000
+    ttl: 5m
+```
+
+### 29.2 连接器性能对比
+
+```mermaid
+graph LR
+    A[连接器类型] --> B{性能特征}
+    B --> C[批量读取]
+    B --> D[流式读取]
+    B --> E[索引查询]
+    
+    C --> F[高吞吐]
+    D --> G[低延迟]
+    E --> H[精准查询]
+    
+    F --> I[适用场景: 数据分析]
+    G --> J[适用场景: 实时查询]
+    H --> K[适用场景: 点查]
+    
+    style A fill:#e1f5fe
+    style B fill:#f3e5f5
+    style C fill:#e8f5e8
+    style D fill:#fff3e0
+    style E fill:#fce4ec
+```
+
+| 连接器 | 吞吐量 | 延迟 | 资源消耗 | 适用场景 |
+|--------|--------|------|----------|----------|
+| MySQL | 中 | 低 | 低 | OLTP 查询 |
+| Hive | 高 | 高 | 中 | 批量分析 |
+| Kafka | 很高 | 很低 | 高 | 流式处理 |
+| Iceberg | 很高 | 中 | 中 | 数据湖查询 |
+| Elasticsearch | 中 | 很低 | 中 | 全文搜索 |
+
+## 三十、数据治理与合规
+
+### 30.1 数据血缘追踪
+
+```java
+// 数据血缘收集器
+public class LineageCollector implements ConnectorMetadata {
+    
+    private final LineageStore lineageStore;
+    
+    @Override
+    public void beginQuery(ConnectorSession session, String queryId) {
+        // 开始查询时收集血缘
+        lineageStore.beginQuery(queryId, session.getIdentity());
+    }
+    
+    @Override
+    public void endQuery(ConnectorSession session, String queryId) {
+        // 结束查询时保存血缘
+        lineageStore.endQuery(queryId);
+    }
+    
+    @Override
+    public void addLineage(ConnectorSession session, 
+                          SchemaTableName table,
+                          LineageOperation operation) {
+        // 记录数据血缘
+        lineageStore.recordLineage(
+            session.getQueryId(),
+            table,
+            operation,
+            session.getIdentity()
+        );
+    }
+}
+```
+
+```sql
+-- 查询数据血缘
+SELECT 
+    query_id,
+    query_text,
+    user,
+    source_table,
+    target_table,
+    operation,
+    created_time
+FROM system.metadata.lineage
+WHERE source_table = 'mysql.production.orders'
+  AND created_time > current_timestamp - interval '7' day
+ORDER BY created_time DESC;
+
+-- 生成血缘报告
+SELECT 
+    table_name,
+    COUNT(DISTINCT query_id) as query_count,
+    COUNT(DISTINCT user) as user_count,
+    MIN(created_time) as first_access,
+    MAX(created_time) as last_access
+FROM system.metadata.lineage
+WHERE created_time > current_timestamp - interval '30' day
+GROUP BY table_name
+ORDER BY query_count DESC;
+```
+
+### 30.2 数据质量检查
+
+```sql
+-- 创建数据质量规则
+CREATE DATA QUALITY RULE order_completeness
+ON mysql.production.orders
+AS
+SELECT 
+    COUNT(*) as total_rows,
+    COUNT(CASE WHEN order_id IS NULL THEN 1 END) as null_order_ids,
+    COUNT(CASE WHEN amount <= 0 THEN 1 END) as invalid_amounts,
+    COUNT(CASE WHEN order_date > CURRENT_DATE THEN 1 END) as future_dates
+FROM orders
+WHERE created_time > current_timestamp - interval '1' day;
+
+-- 执行数据质量检查
+EXECUTE DATA QUALITY RULE order_completeness;
+
+-- 查看检查结果
+SELECT 
+    rule_name,
+    check_time,
+    total_rows,
+    null_order_ids,
+    invalid_amounts,
+    future_dates,
+    CASE 
+        WHEN null_order_ids = 0 AND invalid_amounts = 0 AND future_dates = 0 
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END as status
+FROM system.data_quality.results
+WHERE rule_name = 'order_completeness'
+ORDER BY check_time DESC;
+```
+
+```yaml
+# 数据质量告警配置
+data_quality:
+  rules:
+    - name: order_completeness
+      table: mysql.production.orders
+      schedule: "0 2 * * *"  # 每天凌晨2点
+      thresholds:
+        null_percentage: 0.01  # 空值比例不超过1%
+        invalid_percentage: 0.005  # 无效数据比例不超过0.5%
+      alerting:
+        channels:
+          - type: email
+            recipients:
+              - data-team@example.com
+          - type: slack
+            channel: "#data-quality"
+```
+
+## 三十一、灾难恢复与高可用
+
+### 31.1 集群高可用架构
+
+```mermaid
+graph TB
+    subgraph "可用区 A"
+        CA[Coordinator 1]
+        WA1[Worker 1]
+        WA2[Worker 2]
+    end
+    
+    subgraph "可用区 B"
+        CB[Coordinator 2]
+        WB1[Worker 3]
+        WB2[Worker 4]
+    end
+    
+    subgraph "可用区 C"
+        CC[Coordinator 3]
+        WC1[Worker 5]
+        WC2[Worker 6]
+    end
+    
+    LB[负载均衡器] --> CA
+    LB --> CB
+    LB --> CC
+    
+    CA --> WA1
+    CA --> WA2
+    CB --> WB1
+    CB --> WB2
+    CC --> WC1
+    CC --> WC2
+    
+    CA <--> CB
+    CB <--> CC
+    CC <--> CA
+    
+    style LB fill:#ff9800
+    style CA fill:#4caf50
+    style CB fill:#4caf50
+    style CC fill:#4caf50
+```
+
+```yaml
+# Kubernetes 高可用配置
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trino-coordinator
+  namespace: trino
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: trino-coordinator
+  template:
+    metadata:
+      labels:
+        app: trino-coordinator
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - trino-coordinator
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: coordinator
+        image: trinodb/trino:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8443
+          name: https
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        livenessProbe:
+          httpGet:
+            path: /v1/status
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /v1/status
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+```
+
+### 31.2 故障转移与恢复
+
+```java
+// 故障检测与转移
+public class FailureDetector {
+    
+    private final ScheduledExecutorService scheduler;
+    private final Map<NodeId, NodeStatus> nodeStatuses;
+    private final FailureHandler failureHandler;
+    
+    @Scheduled(fixedDelay = 5000)
+    public void checkNodeHealth() {
+        for (NodeId nodeId : nodeStatuses.keySet()) {
+            try {
+                NodeStatus status = checkNodeStatus(nodeId);
+                nodeStatuses.put(nodeId, status);
+                
+                if (status.isUnhealthy()) {
+                    handleNodeFailure(nodeId);
+                }
+            } catch (Exception e) {
+                handleNodeFailure(nodeId);
+            }
+        }
+    }
+    
+    private void handleNodeFailure(NodeId nodeId) {
+        // 1. 标记节点为失败
+        nodeStatuses.get(nodeId).markFailed();
+        
+        // 2. 重新分配该节点上的查询
+        List<RunningQuery> queries = getQueriesOnNode(nodeId);
+        for (RunningQuery query : queries) {
+            rerouteQuery(query);
+        }
+        
+        // 3. 通知故障处理器
+        failureHandler.handleNodeFailure(nodeId, queries);
+        
+        // 4. 触发告警
+        alertManager.sendAlert(new NodeFailureAlert(nodeId));
+    }
+}
+```
+
+```sql
+-- 故障恢复检查
+SELECT 
+    node_id,
+    status,
+    last_heartbeat,
+    CURRENT_TIMESTAMP - last_heartbeat as heartbeat_age,
+    CASE 
+        WHEN CURRENT_TIMESTAMP - last_heartbeat > interval '30' second 
+        THEN 'UNHEALTHY'
+        ELSE 'HEALTHY'
+    END as health_status
+FROM system.runtime.nodes
+ORDER BY heartbeat_age DESC;
+
+-- 恢复失败查询
+SELECT 
+    query_id,
+    user,
+    source,
+    state,
+    error_message,
+    created,
+    started
+FROM system.runtime.queries
+WHERE state = 'FAILED'
+  AND error_message LIKE '%node failure%'
+  AND created > current_timestamp - interval '1' hour
+ORDER BY created DESC;
+```
+
 ## 二十六、与其他板块的关系
 
 - 数据湖格式见「[列式存储与数据湖格式](../大数据/05-列式存储与数据湖格式.md)」；

@@ -2329,7 +2329,455 @@ graph TD
 | 混合云 | GitHub Actions | Argo CD + ApplicationSet | Kustomize + Helm |
 | 多地域 | Tekton | Argo CD + Multi-cluster | Helm + Values |
 
+## 补充：FluxCD 深入配置
+
+### FluxCD 核心组件
+
+```mermaid
+graph TB
+    subgraph FluxCD 核心组件
+        A[Source Controller] --> B[GitRepository]
+        A --> C[HelmRepository]
+        A --> D[Bucket]
+        
+        E[Kustomize Controller] --> F[Kustomization]
+        E --> G[健康检查]
+        
+        H[Helm Controller] --> I[HelmRelease]
+        I --> J[升级/回滚]
+        
+        K[Notification Controller] --> L[告警]
+        K --> M[事件处理]
+    end
+```
+
+### FluxCD 多集群配置
+
+```yaml
+# 跨集群部署配置
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: cluster-app
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./clusters/production
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: nginx
+      namespace: default
+  timeout: 5m
 ---
+# 多集群应用集
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-config
+data:
+  clusters.yaml: |
+    apiVersion: cluster.toolkit.fluxcd.io/v1beta1
+    kind: Cluster
+    metadata:
+      name: production
+    spec:
+      interval: 10m
+      url: https://production-cluster.example.com
+      secretRef:
+        name: production-cluster-secret
+```
+
+### FluxCD 渐进式交付
+
+```yaml
+# Canary 发布
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: my-app
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  service:
+    port: 80
+  analysis:
+    interval: 1m
+    threshold: 5
+    maxWeight: 50
+    stepWeight: 10
+    metrics:
+      - name: request-success-rate
+        thresholdRange:
+          min: 99
+      - name: request-duration
+        thresholdRange:
+          max: 500
+    webhooks: []
+```
+
+## 补充：Tekton 流水线
+
+### Tekton Pipeline 定义
+
+```yaml
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-and-deploy
+spec:
+  params:
+    - name: repo-url
+      type: string
+    - name: image-name
+      type: string
+  
+  workspaces:
+    - name: shared-workspace
+    - name: docker-credentials
+  
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: url
+          value: $(params.repo-url)
+    
+    - name: build-image
+      taskRef:
+        name: kaniko-build
+      runAfter:
+        - fetch-source
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: dockerconfig
+          workspace: docker-credentials
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+    
+    - name: deploy
+      taskRef:
+        name: kubernetes-deploy
+      runAfter:
+        - build-image
+      params:
+        - name: manifests
+          value: $(workspaces.source.path)/k8s/
+
+  finally:
+    - name: notify
+      taskRef:
+        name: slack-notify
+```
+
+### Tekton Triggers
+
+```yaml
+# EventListener 配置
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: github-listener
+spec:
+  serviceAccountName: tekton-triggers-sa
+  triggers:
+    - name: github-push
+      interceptors:
+        - ref:
+            name: github
+          params:
+            - name: secretRef
+              value:
+                secretName: github-secret
+                secretKey: secret-token
+            - name: eventTypes
+              value: ["push"]
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: >-
+                body.ref == 'refs/heads/main'
+      bindings:
+        - ref: github-push-binding
+      template:
+        ref: build-and-deploy-template
+```
+
+## 补充：Argo CD 多集群管理
+
+### ApplicationSet 模板
+
+```yaml
+# Git Generator
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-apps
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/example/gitops-config
+        revision: main
+        directories:
+          - path: clusters/*
+  template:
+    metadata:
+      name: '{{path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/app-manifests
+        targetRevision: HEAD
+        path: 'apps/{{path.basename}}'
+      destination:
+        server: 'https://{{path.basename}}'
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+
+# List Generator
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: environment-apps
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            url: https://dev-cluster.example.com
+          - env: staging
+            url: https://staging-cluster.example.com
+          - env: production
+            url: https://production-cluster.example.com
+  template:
+    metadata:
+      name: '{{env}}-app'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/app-manifests
+        targetRevision: HEAD
+        path: 'environments/{{env}}'
+      destination:
+        server: '{{url}}'
+        namespace: default
+```
+
+### Argo CD 漂移检测与自愈
+
+```yaml
+# 自动同步配置
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+spec:
+  sourceRepos:
+    - '*'
+  destinations:
+    - namespace: '*'
+      server: '*'
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  orphanedResources:
+    warn: true
+
+# 自愈策略
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/app
+    targetRevision: HEAD
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m0s
+```
+
+## 补充：云原生安全实践
+
+### 镜像安全扫描
+
+```yaml
+# Trivy 扫描配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-config
+data:
+  trivy.yaml: |
+    scan:
+      scanners:
+        - vuln
+        - secret
+        - misconfig
+    vulnerability:
+      severity: HIGH,CRITICAL
+      ignoreUnfixed: true
+    report:
+      format: json
+      output: /tmp/scan-results.json
+
+# 扫描任务
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: image-scan
+spec:
+  template:
+    spec:
+      containers:
+        - name: trivy
+          image: aquasec/trivy:latest
+          args:
+            - image
+            - --severity
+            - HIGH,CRITICAL
+            - --exit-code
+            - "1"
+            - my-app:latest
+      restartPolicy: Never
+```
+
+### Secret 管理
+
+```yaml
+# Sealed Secrets
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: my-secret
+spec:
+  encryptedData:
+    db-password: AgBy3i4OJSWK+PiTySYZZA9rO43cGDEq...
+  template:
+    metadata:
+      name: my-secret
+      namespace: default
+
+# External Secrets
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: my-secret
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: SecretStore
+  target:
+    name: my-secret
+  data:
+    - secretKey: db-password
+      remoteRef:
+        key: secret/data/my-app
+        property: db-password
+```
+
+### OPA 策略
+
+```rego
+# 拒绝没有资源限制的 Pod
+package kubernetes.admission
+
+deny[msg] {
+  input.request.kind.kind == "Pod"
+  not input.request.object.spec.containers[_].resources.limits
+  msg := "容器必须设置资源限制"
+}
+
+deny[msg] {
+  input.request.kind.kind == "Pod"
+  input.request.object.spec.containers[_].securityContext.privileged == true
+  msg := "不允许运行特权容器"
+}
+```
+
+## 补充：CI/CD 工具演进对比
+
+### 工具演进时间线
+
+| 时期 | 工具 | 特点 | 适用场景 |
+|------|------|------|----------|
+| 2011-2015 | Jenkins | 插件丰富、灵活 | 传统应用 |
+| 2016-2018 | GitLab CI/CD | 集成度高 | 中小团队 |
+| 2019-2021 | GitHub Actions | 云原生、易用 | 开源项目 |
+| 2020-2022 | Tekton | K8s 原生 | 云原生应用 |
+| 2022-至今 | AI 增强 | 智能化、自愈 | 所有场景 |
+
+### 未来趋势
+
+```mermaid
+graph TB
+    subgraph AI 增强
+        A[智能代码审查] --> B[自动修复]
+        C[智能测试] --> D[预测性维护]
+        E[智能调度] --> F[资源优化]
+    end
+    
+    subgraph 平台工程
+        G[内部开发者平台] --> H[自助服务]
+        I[标准化流程] --> J[治理合规]
+    end
+    
+    subgraph 安全左移
+        K[供应链安全] --> L[软件物料清单]
+        M[运行时保护] --> N[零信任架构]
+    end
+```
+
+### 最佳实践总结
+
+| 实践 | 说明 | 优先级 |
+|------|------|--------|
+| 声明式配置 | Git 作为唯一来源 | 高 |
+| 自动化同步 | 自动部署 | 高 |
+| 漂移检测 | 监控配置变化 | 高 |
+| 自动回滚 | 失败自动恢复 | 高 |
+| 多集群管理 | 统一管理 | 中 |
+| 安全扫描 | 镜像/配置扫描 | 高 |
+| 监控告警 | 部署状态监控 | 高 |
+| 文档化 | 流程文档 | 中 |
 
 ## 参考资料
 

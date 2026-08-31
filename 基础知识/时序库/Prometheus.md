@@ -2258,6 +2258,469 @@ journalctl -u prometheus -f
 
 ---
 
+## 补充：Recording Rules 高级用法
+
+### 多维度聚合规则
+
+```yaml
+groups:
+  - name: multi_dimension_rules
+    interval: 30s
+    rules:
+      # 按 namespace 和 pod 聚合 CPU 使用率
+      - record: namespace_pod_cpu_usage:ratio
+        expr: |
+          sum(rate(container_cpu_usage_seconds_total{container!="POD"}[5m])) by (namespace, pod)
+          /
+          sum(container_spec_cpu_quota{container!="POD"} / container_spec_cpu_period{container!="POD"}) by (namespace, pod)
+
+      # 跨集群聚合
+      - record: cluster:memory_usage:ratio
+        expr: |
+          sum(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) by (cluster)
+          /
+          sum(node_memory_MemTotal_bytes) by (cluster)
+
+      # 时间窗口比较（同比）
+      - record: api_error_rate:week_over_week
+        expr: |
+          sum(rate(http_requests_total{code=~"5.."}[5m])) by (service)
+          /
+          sum(rate(http_requests_total[5m])) by (service)
+          /
+          (
+            sum(rate(http_requests_total{code=~"5.."}[5m] offset 7d)) by (service)
+            /
+            sum(rate(http_requests_total[5m] offset 7d)) by (service)
+          )
+```
+
+### Recording Rules 性能优化
+
+| 优化策略 | 说明 | 适用场景 |
+|----------|------|----------|
+| 合理设置 interval | 避免过于频繁计算 | 高基数指标 |
+| 预计算高频查询 | 减少即时计算 | Grafana Dashboard |
+| 分层聚合 | 原始→中间→最终 | 复杂多层聚合 |
+| 限制规则数量 | 单组不超过数百条 | 大规模集群 |
+| 使用 and/without | 减少标签维度 | 多维度交叉 |
+
+### Rule 文件组织结构
+
+```text
+rules/
+├── base/
+│   ├── node_recording.yml        # 节点基础指标
+│   ├── container_recording.yml   # 容器基础指标
+│   └── k8s_recording.yml         # K8s 基础指标
+├── intermediate/
+│   ├── service_slo.yml           # 服务 SLO 中间指标
+│   └── cluster_health.yml        # 集群健康中间指标
+├── alerting/
+│   ├── node_alerts.yml           # 节点告警规则
+│   ├── service_alerts.yml        # 服务告警规则
+│   └── infra_alerts.yml          # 基础设施告警规则
+└── custom/
+    └── business_metrics.yml      # 业务自定义指标
+```
+
+## 补充：Alerting Rules 高级模式
+
+### 多窗口多条件告警
+
+```yaml
+groups:
+  - name: multi_window_alerts
+    rules:
+      # 快速恢复 + 慢速触发（避免误报）
+      - alert: HighErrorRateMultiWindow
+        expr: |
+          sum(rate(http_requests_total{code=~"5.."}[5m])) by (service)
+          / sum(rate(http_requests_total[5m])) by (service)
+          > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "服务 {{ $labels.service }} 错误率超过 5%（5分钟窗口）"
+
+      - alert: HighErrorRatePersistent
+        expr: |
+          sum(rate(http_requests_total{code=~"5.."}[30m])) by (service)
+          / sum(rate(http_requests_total[30m])) by (service)
+          > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "服务 {{ $labels.service }} 错误率持续超过 10%（30分钟窗口）"
+
+      # 恢复条件：错误率低于阈值持续一段时间
+      - alert: HighErrorRateRecovery
+        expr: |
+          sum(rate(http_requests_total{code=~"5.."}[5m])) by (service)
+          / sum(rate(http_requests_total[5m])) by (service)
+          < 0.01
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "服务 {{ $labels.service }} 错误率已恢复至 1% 以下"
+```
+
+### 预测性告警
+
+```yaml
+# 基于趋势预测
+- alert: DiskSpacePredictedFull
+  expr: |
+    predict_linear(
+      node_filesystem_avail_bytes{mountpoint="/"}[7d],
+      7 * 24 * 3600
+    ) < 0
+  for: 1h
+  labels:
+    severity: warning
+  annotations:
+    summary: "磁盘预计 7 天后耗尽"
+    description: "当前可用 {{ $value | humanize1024 }}B，预测线性趋势"
+
+# 基于季节性预测
+- alert: TrafficAnomalyPredicted
+  expr: |
+    (
+      sum(rate(http_requests_total[1h])) by (service)
+      - avg_over_time(sum(rate(http_requests_total[1h])) by (service) [7d:1h] offset 168h)
+    )
+    /
+    avg_over_time(sum(rate(http_requests_total[1h])) by (service) [7d:1h] offset 168h)
+    > 2
+  for: 30m
+  labels:
+    severity: warning
+  annotations:
+    summary: "服务 {{ $labels.service }} 流量异常偏高（相比上周同期）"
+```
+
+### 告警规则模板
+
+| 告警类型 | PromQL 模板 | 持续时间 | 严重级别 |
+|----------|-------------|----------|----------|
+| 服务不可用 | `up == 0` | 1m | critical |
+| 高错误率 | `rate(errors[5m]) / rate(total[5m]) > 0.05` | 5m | warning |
+| 高延迟 | `histogram_quantile(0.99, rate(duration_bucket[5m])) > 1` | 10m | warning |
+| 预测磁盘满 | `predict_linear(disk_avail[7d], 7d*24*3600) < 0` | 1h | warning |
+| 流量异常 | `rate(current[1h]) / avg_over_time(rate(current[1h])[7d:1h]) > 2` | 30m | info |
+
+## 补充：Thanos 集成架构
+
+### Thanos 核心组件
+
+```mermaid
+graph TB
+    subgraph Edge Cluster
+        A[Prometheus Server] --> B[Thanos Sidecar]
+        B --> C[Object Storage]
+    end
+    
+    subgraph Central Cluster
+        D[Thanos Query] --> E[Thanos Store Gateway]
+        D --> F[Thanos Compact]
+        F --> C
+        G[Thanos Ruler] --> D
+    end
+    
+    C --> H[S3/GCS/Azure Blob]
+    D --> I[Grafana]
+    B --> J[Thanos Receive]
+```
+
+### Thanos 配置示例
+
+```yaml
+# prometheus 配置（启用 remote_write）
+global:
+  external_labels:
+    cluster: production
+    replica: prometheus-0
+  remote_write:
+    - url: http://thanos-receive:19291/api/v1/receive
+
+# Thanos Sidecar 启动参数
+thanos sidecar \
+  --tsdb.path=/prometheus \
+  --prometheus.url=http://localhost:9090 \
+  --objstore.config-file=/etc/thanos/bucket.yml \
+  --shipper.upload-compacted \
+  --http-address=0.0.0.0:10902
+
+# Thanos Query 启动参数
+thanos query \
+  --http-address=0.0.0.0:10902 \
+  --query.replica-label=replica \
+  --store=dnssrv+_grpc._tcp.thanos-sidecar.thanos.svc.cluster.local \
+  --store=dnssrv+_grpc._tcp.thanos-store.thanos.svc.cluster.local
+```
+
+### Thanos vs 原生 Prometheus 对比
+
+| 维度 | 原生 Prometheus | Thanos |
+|------|-----------------|--------|
+| 存储时长 | 本地磁盘（15天） | 对象存储（永久） |
+| 高可用 | Federation（复杂） | Sidecar（简单） |
+| 全局查询 | 不支持 | Thanos Query |
+| 数据压缩 | 手动 | 自动（Compact） |
+| 降采样 | 不支持 | 自动 5m/1h 降采样 |
+| 成本 | 高（SSD） | 低（对象存储） |
+
+## 补充：容量规划
+
+### 存储容量计算
+
+```text
+存储容量 = 指标数量 × 采样点大小 × 保留期 × 副本数
+
+计算公式：
+  1. 指标数量 = series_count × samples_per_scrape
+  2. 采样点大小 ≈ 1-2 字节（压缩后）
+  3. 保留期 = 15 天（默认）
+  4. 副本数 = HA 部署数量
+
+示例计算：
+  series_count = 100,000
+  samples_per_scrape = 1（每 15 秒一个样本）
+  采样频率 = 1/15s = 5760 samples/day/series
+  15 天 = 5760 × 15 = 86,400 samples/series
+  压缩后 ≈ 86,400 × 1.5 bytes = 129,600 bytes/series ≈ 127 KB/series
+  总存储 = 100,000 × 127 KB ≈ 12.7 GB
+  加上索引和 WAL ≈ 20 GB
+```
+
+### 资源配置参考
+
+| 指标数量 | CPU | 内存 | 存储 | 网络 |
+|----------|-----|------|------|------|
+| < 10万 | 2核 | 4GB | 50GB | 100Mbps |
+| 10-50万 | 4核 | 8GB | 200GB | 1Gbps |
+| 50-100万 | 8核 | 16GB | 500GB | 1Gbps |
+| > 100万 | 16核+ | 32GB+ | 1TB+ | 10Gbps |
+
+### 水平扩展方案
+
+```mermaid
+graph TB
+    subgraph 方案一：Federation
+        A[Prometheus-0] --> E[Federation]
+        B[Prometheus-1] --> E
+        C[Prometheus-2] --> E
+        E --> F[Grafana]
+    end
+    
+    subgraph 方案二：Thanos
+        G[Prometheus-0 + Sidecar] --> H[Thanos Query]
+        I[Prometheus-1 + Sidecar] --> H
+        J[Prometheus-2 + Sidecar] --> H
+        H --> K[Grafana]
+    end
+```
+
+## 补充：Federation 聚合
+
+### Federation 配置
+
+```yaml
+# prometheus.yml 聚合层配置
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job=~".+"}'
+        - '{__name__=~"job:.*"}'
+    static_configs:
+      - targets:
+          - 'prometheus-0:9090'
+          - 'prometheus-1:9090'
+          - 'prometheus-2:9090'
+```
+
+### Federation 架构模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| 单层联邦 | 直接聚合 | 小规模（< 5个实例） |
+| 双层联邦 | 边缘+中心 | 中大规模 |
+| 层级联邦 | 多级聚合 | 跨地域部署 |
+
+### Federation 查询优化
+
+```yaml
+# 聚合规则（减少数据量）
+groups:
+  - name: federation_rules
+    rules:
+      # 只聚合核心指标
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job, code)
+
+      # 使用 and/without 减少标签
+      - record: node:cpu:utilization
+        expr: 1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)
+
+      # 预计算 SLO 指标
+      - record: service:slo:availability
+        expr: |
+          sum(rate(http_requests_total{code!~"5.."}[30d])) by (service)
+          /
+          sum(rate(http_requests_total[30d])) by (service)
+```
+
+## 补充：Prometheus 自监控
+
+### 自身健康指标
+
+```yaml
+# Prometheus 自监控告警
+groups:
+  - name: prometheus_self_monitoring
+    rules:
+      # Prometheus 实例宕机
+      - alert: PrometheusDown
+        expr: up{job="prometheus"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus 实例 {{ $labels.instance }} 宕机"
+
+      # 采集延迟过高
+      - alert: PrometheusScrapeDurationHigh
+        expr: prometheus_target_sync_length_seconds{quantile="0.99"} > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus 采集延迟过高（P99 > 30s）"
+
+      # WAL 写入延迟
+      - alert: PrometheusWALWriteLatencyHigh
+        expr: rate(prometheus_tsdb_wal_fsync_duration_seconds_sum[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus WAL 写入延迟过高"
+
+      # 存储空间不足
+      - alert: PrometheusStorageSpaceLow
+        expr: prometheus_tsdb_storage_blocks_bytes / (1024*1024*1024) > 50
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus 存储空间使用超过 50GB"
+```
+
+### 自监控仪表板指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `prometheus_config_last_reload_successful` | 配置重载状态 | == 0 |
+| `prometheus_tsdb_head_series` | 活跃时间序列数 | > 500k |
+| `prometheus_tsdb_head_chunks` | 内存中 chunks 数 | > 100万 |
+| `prometheus_rule_evaluation_duration_seconds` | 规则评估耗时 | P99 > 10s |
+| `prometheus_notification_queue_length` | 告警通知队列长度 | > 100 |
+
+## 补充：多集群监控方案
+
+### 方案对比
+
+| 方案 | 架构 | 优点 | 缺点 |
+|------|------|------|------|
+| Federation | 边缘→中心聚合 | 简单 | 数据不完整 |
+| Thanos | Sidecar+Query | 全局视图 | 架构复杂 |
+| Cortex | 远程写入 | 水平扩展 | 运维复杂 |
+| VictoriaMetrics | 远程写入 | 高性能 | 生态较小 |
+
+### 多集群 Thanos 架构
+
+```mermaid
+graph TB
+    subgraph Cluster-A
+        A1[Prometheus] --> A2[Thanos Sidecar]
+        A2 --> A3[Object Storage]
+    end
+    
+    subgraph Cluster-B
+        B1[Prometheus] --> B2[Thanos Sidecar]
+        B2 --> B3[Object Storage]
+    end
+    
+    subgraph Central
+        C1[Thanos Query] --> C2[Thanos Store Gateway]
+        C1 --> C3[Thanos Compact]
+        C2 --> A3
+        C2 --> B3
+        C3 --> A3
+        C3 --> B3
+    end
+    
+    A3 --> D[S3 Bucket]
+    B3 --> D
+    C1 --> E[Grafana]
+```
+
+### 跨集群查询配置
+
+```yaml
+# Thanos Query 跨集群查询
+thanos query \
+  --http-address=0.0.0.0:10902 \
+  --query.replica-label=replica \
+  --store=dnssrv+_grpc._tcp.thanos-sidecar-cluster-a.thanos.svc.cluster.local \
+  --store=dnssrv+_grpc._tcp.thanos-sidecar-cluster-b.thanos.svc.cluster.local \
+  --store=dnssrv+_grpc._tcp.thanos-store.thanos.svc.cluster.local
+
+# 使用 ExternalLabels 区分集群
+global:
+  external_labels:
+    cluster: production-us-east
+    replica: prometheus-0
+```
+
+## 补充：生产问题排查
+
+### 高级排查技巧
+
+```bash
+# 1. 检查时间序列基数
+curl -s 'http://localhost:9090/api/v1/label/__name__/values' | jq '.data | length'
+
+# 2. 检查指标内存占用
+curl -s 'http://localhost:9090/api/v1/status/tsdb' | jq '.data.seriesCountByMetricName[:10]'
+
+# 3. 检查规则评估性能
+curl -s 'http://localhost:9090/api/v1/rules' | jq '.data.groups[] | {name: .name, interval: .interval, rules: [.rules[] | {name: .name, duration: .duration}]}' | head -100
+
+# 4. 检查采集目标状态
+curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.health != "up") | {instance: .labels.instance, health: .health, lastError: .lastError}'
+
+# 5. 检查告警队列
+curl -s 'http://localhost:9090/api/v1/alerts' | jq '.data.alerts | length'
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `--storage.tsdb.retention.time` | 15d | 30-90d | 数据保留时长 |
+| `--storage.tsdb.retention.size` | 0 | 按需设置 | 按大小保留 |
+| `--storage.tsdb.wal-compression` | false | true | WAL 压缩 |
+| `--query.timeout` | 2m | 5m | 查询超时 |
+| `--query.max-samples` | 5000000 | 10000000 | 最大样本数 |
+| `--rule.evaluation-interval` | 1m | 30s | 规则评估间隔 |
+
 ## 二十三、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](../中间件/云上可观测性体系.md)」；

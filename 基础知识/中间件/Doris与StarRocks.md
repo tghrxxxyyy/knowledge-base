@@ -2297,3 +2297,179 @@ GROUP BY user_id;
      ├── 索引优化
      └── 参数调优
 ```
+
+## 函数下推深入
+
+### 函数下推策略详解
+
+| 函数类型 | 下推条件 | 示例 | 性能影响 |
+|----------|---------|------|---------|
+| 聚合函数 | 支持下推 | SUM/COUNT/AVG | 减少数据传输 |
+| 条件函数 | 支持下推 | CASE/IF | 减少扫描行数 |
+| 字符串函数 | 部分下推 | CONCAT/SUBSTRING | 视复杂度 |
+| 日期函数 | 支持下推 | DATE_FORMAT | 减少扫描 |
+| 数学函数 | 支持下推 | ABS/ROUND | 减少扫描 |
+| 窗口函数 | 不下推 | ROW_NUMBER/RANK | 本地计算 |
+
+### 物化视图深入
+
+```sql
+-- 同步物化视图
+CREATE MATERIALIZED VIEW mv_orders_sync
+AS SELECT
+  date_trunc('day', order_time) AS dt,
+  user_id,
+  SUM(amount) AS total_amount,
+  COUNT(*) AS order_count
+FROM orders
+GROUP BY date_trunc('day', order_time), user_id;
+
+-- 异步物化视图
+CREATE MATERIALIZED VIEW mv_orders_async
+BUILD DEFERRED REFRESH AUTO ON COMMIT
+AS SELECT
+  date_trunc('day', order_time) AS dt,
+  category_id,
+  SUM(amount) AS total_amount,
+  COUNT(*) AS order_count
+FROM orders
+JOIN products ON orders.product_id = products.product_id
+GROUP BY date_trunc('day', order_time), category_id;
+
+-- 物化视图选择策略
+-- 1. 同步物化视图：写入时自动更新，适合简单聚合
+-- 2. 异步物化视图：手动或定时刷新，适合复杂查询
+-- 3. 查询自动路由：FE 自动选择最优物化视图
+```
+
+## 存储格式深入
+
+### 列式存储与数据压缩
+
+```text
+Doris 存储格式：
+  明细模型（Duplicate）：
+    存储原始数据，无聚合
+    适用：日志、事件流
+    优点：灵活查询
+    缺点：存储量大
+
+  聚合模型（Aggregate）：
+    按 Key 聚合 Value
+    适用：指标、统计
+    优点：存储高效
+    缺点：不支持 UPDATE
+
+  唯一模型（Unique）：
+    按 Key 去重，保留最新
+    适用：用户表、配置表
+    优点：支持 UPDATE/DELETE
+    缺点：写入开销大
+
+  主键模型（Primary Key）：
+    实时更新，LSM-Tree
+    适用：实时更新场景
+    优点：实时性好
+    缺点：读放大
+
+压缩算法：
+  LZ4：默认，速度快
+  ZSTD：压缩率高，速度中等
+  ZLIB：压缩率最高，速度慢
+```
+
+## 导入调优深入
+
+### Stream Load/Broker Load/Routine Load
+
+| 导入方式 | 数据源 | 并发 | 适用 |
+|----------|--------|------|------|
+| Stream Load | 本地文件/HTTP | 单并发 | 小批量导入 |
+| Broker Load | HDFS/S3 | 多并发 | 大批量导入 |
+| Routine Load | Kafka | 持续 | 实时导入 |
+| Spark Load | Spark | 多并发 | 超大批量 |
+| Insert Into | Doris 表 | 单并发 | 数据迁移 |
+
+### 导入性能优化
+
+```sql
+-- Stream Load 优化
+curl --location-trusted -u root: -T data.csv \
+  -H "format:csv" \
+  -H "column_separator:," \
+  -H "max_filter_ratio:0.1" \
+  -H "mem_limit:1073741824" \
+  http://be_host:8040/api/db/table/_stream_load
+
+-- 性能优化点：
+-- 1. 合理设置 batch size（建议 10000-50000）
+-- 2. 调整并行度（max_parallel_threads）
+-- 3. 增加写缓冲（write_buffer_size）
+-- 4. 控制导入速率（rate_limit）
+-- 5. 避免同时大量导入（错峰）
+```
+
+## 集群架构深入
+
+### FE/BE 角色与扩展
+
+```text
+FE（Frontend）角色：
+  元数据管理：表结构、分区信息
+  查询解析：SQL 解析、查询规划
+  调度器：任务调度、负载均衡
+  HA：Leader-Follower 模式
+
+  扩展建议：
+    1. 3 个 FE 节点（HA）
+    2. Master 负责写，Follower 负责读
+    3. 元数据同步依赖 BDB JE
+
+BE（Backend）角色：
+  数据存储：列式存储引擎
+  查询执行：MPP 并行执行
+  数据导入：写入数据
+  复制：数据副本同步
+
+  扩展建议：
+    1. 按需增加 BE 节点
+    2. 数据自动均衡
+    3. 副本数可动态调整
+```
+
+## 对比 StarRocks 深入
+
+### 功能差异详解
+
+| 功能 | Doris | StarRocks | 说明 |
+|------|-------|-----------|------|
+| CBO | 支持 | 更成熟 | StarRocks 优化器更智能 |
+| 物化视图 | 同步/异步 | 同步/异步 | 功能接近 |
+| 多源导入 | 更多 | 较少 | Doris 生态更广 |
+| 存储引擎 | 明细/聚合/唯一 | 明细/聚合/唯一 | 接近 |
+| 向量化 | 支持 | 更彻底 | StarRocks 性能更好 |
+| 社区 | Apache 社区 | 商业+开源 | Doris 更开放 |
+| 运维 | 较复杂 | 更简单 | StarRocks 更易用 |
+| 选型建议 | 开源优先/国内 | 性能优先/商业 | 看团队能力 |
+
+### 选型决策
+
+```text
+选型建议：
+  选择 Doris：
+    1. 开源优先（Apache 顶级项目）
+    2. 国内生态好（中文社区活跃）
+    3. 导入源丰富（Stream/Broker/Routine/Spark）
+    4. 成本敏感（无商业许可）
+
+  选择 StarRocks：
+    1. 性能优先（向量化更彻底）
+    2. 商业支持（有专业团队）
+    3. 运维简单（更易上手）
+    4. 复杂查询（CBO 更智能）
+
+  混合方案：
+    Doris 做实时分析
+    StarRocks 做复杂查询
+    通过数据同步工具打通
+```

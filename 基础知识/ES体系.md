@@ -2406,3 +2406,372 @@ GET /_cluster/settings?include_defaults=false
 # 查看磁盘使用
 GET /_cat/allocation?v
 ```
+
+## ILM 策略深入
+
+### Hot-Warm-Cold-Frozen 生命周期详解
+
+```text
+ILM 四阶段详解：
+  Hot（热数据）：
+    特点：最新数据，频繁读写
+    存储：NVMe SSD
+    副本：1-2
+    动作：Rollover、Force Merge
+    适用：实时日志、交易数据
+
+  Warm（温数据）：
+    特点：历史数据，偶尔查询
+    存储：SAS SSD / HDD
+    副本：1
+    动作：Shrink、Force Merge、Read-Only
+    适用：历史分析、报表
+
+  Cold（冷数据）：
+    特点：归档数据，极少查询
+    存储：高密度 HDD / 对象存储
+    副本：0
+    动作：Freeze、Shrink
+    适用：合规存档、审计
+
+  Frozen（冻结数据）：
+    特点：不可搜索，需 Unfreeze
+    存储：对象存储
+    副本：0
+    动作：Unfreeze 后可查询
+    适用：长期归档
+```
+
+### ILM 配置示例
+
+```json
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_primary_shard_size": "50gb"
+          },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 },
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": { "priority": 0 },
+          "freeze": {}
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### ILM 阶段说明
+
+| 阶段 | 数据特征 | 动作 | 适用场景 |
+|------|---------|------|---------|
+| Hot | 最新数据，频繁读写 | Rollover、Force Merge | 实时日志、交易 |
+| Warm | 历史数据，偶尔查询 | Shrink、Force Merge | 历史分析 |
+| Cold | 冻结数据，极少查询 | Freeze | 合规存档 |
+| Delete | 过期数据 | Delete | 日志清理 |
+
+## 索引别名深入
+
+### Index Alias 与零停机切换
+
+```json
+// 创建别名
+POST _aliases
+{
+  "actions": [
+    { "add": { "index": "logs-2026.01.15", "alias": "logs-current" } }
+  ]
+}
+
+// 原子切换
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "logs-2026.01.14", "alias": "logs-current" } },
+    { "add": { "index": "logs-2026.01.15", "alias": "logs-current" } }
+  ]
+}
+
+// 别名过滤（隔离读写）
+PUT _aliases
+{
+  "actions": [
+    {
+      "add": {
+        "index": "logs-2026.01.15",
+        "alias": "logs-user-a",
+        "filter": { "term": { "user_id": "user_a" } }
+      }
+    }
+  ]
+}
+```
+
+## 副本分片策略
+
+### 副本数选择与分片迁移
+
+```text
+副本数策略：
+  0 副本：批量导入期（写性能最优）
+  1 副本：一般生产环境（推荐）
+  2 副本：高可用要求（跨可用区）
+  3 副本：金融级（容灾级别）
+
+分片再平衡触发条件：
+  1. 新增/删除节点
+  2. 磁盘水位线变化
+  3. 节点故障恢复后
+  4. 分片分配过滤器变更
+
+分片分配设置：
+  PUT _cluster/settings
+  {
+    "persistent": {
+      "cluster.routing.allocation.enable": "all",
+      "cluster.routing.allocation.balance.shard": 0.45,
+      "cluster.routing.allocation.balance.index": 0.55
+    }
+  }
+```
+
+## Painless 脚本
+
+### 脚本更新与聚合
+
+```json
+// Painless 脚本更新
+POST /users/_update/1
+{
+  "script": {
+    "source": "ctx._source.age += params.increment",
+    "params": { "increment": 5 }
+  }
+}
+
+// 脚本字段
+GET /_search
+{
+  "script_fields": {
+    "age_in_days": {
+      "script": {
+        "source": "doc['age'].value * 365"
+      }
+    }
+  }
+}
+
+// 脚本聚合
+GET /_search
+{
+  "size": 0,
+  "aggs": {
+    "avg_age": {
+      "avg": {
+        "script": { "source": "doc['age'].value" }
+      }
+    }
+  }
+}
+```
+
+### Script Cache
+
+```text
+脚本缓存配置：
+  script.cache.max_size: 3000  # 最大缓存脚本数
+  script.cache.expire: 60m     # 缓存过期时间
+
+禁用动态脚本（安全考虑）：
+  script.allowed_types: inline
+  script.allowed_contexts: search, update
+```
+
+## CCR 跨集群复制
+
+### Follower-Index 与 Leader-Index
+
+```json
+// 主集群：创建 Leader
+PUT /logs-leader
+{
+  "settings": {
+    "index.xpack.security.transport.ssl.enabled": true
+  }
+}
+
+// 从集群：创建 Follower
+POST /_ccr/follow
+{
+  "remote_cluster": "cluster-a",
+  "leader_index": "logs-leader",
+  "follow_index": "logs-follower"
+}
+
+// 暂停/恢复
+POST /_ccr/follow/logs-follower/pause
+POST /_ccr/follow/logs-follower/resume
+```
+
+### CCR 限制
+
+```text
+CCR 限制：
+  1. 集群版本需一致（主从版本相同）
+  2. Follower 索引不可写入
+  3. 异步复制，有延迟（秒级）
+  4. 需要配置远程集群发现
+  5. 主集群索引需开启 soft deletes
+```
+
+## 索引模板深入
+
+### Index Template 管理
+
+```json
+// 创建索引模板
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" },
+        "level": { "type": "keyword" }
+      }
+    }
+  },
+  "priority": 100
+}
+
+// 组件模板
+PUT _component_template/logs-mapping
+{
+  "template": {
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" }
+      }
+    }
+  }
+}
+```
+
+## 文档大小影响
+
+### Bulk Size 与性能关系
+
+```text
+文档大小建议：
+  最佳文档大小：1KB~10KB
+  过小文档：合并索引浪费资源
+  过大文档：内存压力+查询慢
+
+Bulk 批量大小：
+  建议：5~15MB/批
+  文档数：1000~5000 条/批
+  线程数：CPU 核心数 × 1.5
+
+  Bulk API：
+    POST _bulk
+    {"index": {"_index": "logs", "_id": "1"}}
+    {"message": "test"}
+    {"index": {"_index": "logs", "_id": "2"}}
+    {"message": "test2"}
+```
+
+### 文档最佳实践
+
+| 文档大小 | 索引速度 | 查询性能 | 建议 |
+|---------|---------|---------|------|
+| < 1KB | 中 | 差 | 合并小文档 |
+| 1~10KB | 高 | 好 | 最佳范围 |
+| 10KB~100KB | 中 | 中 | 可接受 |
+| > 100KB | 差 | 差 | 避免 |
+
+## 查询 DSL 详解
+
+### Bool/Must/Should/Filter
+
+```json
+// 复杂 Bool 查询
+GET /logs/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "message": "error" } },
+        { "range": { "@timestamp": { "gte": "now-1h" } } }
+      ],
+      "should": [
+        { "term": { "level": "ERROR" } },
+        { "term": { "level": "WARN" } }
+      ],
+      "filter": [
+        { "term": { "service": "payment" } }
+      ],
+      "must_not": [
+        { "term": { "user_id": "test_user" } }
+      ],
+      "minimum_should_match": 1
+    }
+  }
+}
+```
+
+### 聚合查询
+
+```json
+// 嵌套聚合
+GET /logs/_search
+{
+  "size": 0,
+  "aggs": {
+    "by_service": {
+      "terms": { "field": "service", "size": 10 },
+      "aggs": {
+        "by_level": {
+          "terms": { "field": "level" },
+          "aggs": {
+            "avg_duration": {
+              "avg": { "field": "duration_ms" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```

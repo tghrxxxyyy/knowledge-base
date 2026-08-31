@@ -2175,4 +2175,597 @@ steps:
 | 超时 | 步骤执行时间长 | 增加 timeout |
 | 磁盘空间不足 | 缓存过大 | 清理缓存 |
 
+## 三十一、高级工作流模式
+
+### 31.1 矩阵构建策略
+
+```yaml
+# 多平台矩阵构建
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [16, 18, 20]
+        include:
+          - os: ubuntu-latest
+            node-version: 20
+            experimental: true
+        exclude:
+          - os: windows-latest
+            node-version: 16
+      fail-fast: false
+      max-parallel: 3
+    
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests
+        run: npm test
+      
+      - name: Build
+        run: npm run build
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.node-version }}
+          path: dist/
+```
+
+### 31.2 可重用工作流
+
+```yaml
+# 可重用工作流定义
+name: Reusable Build Workflow
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        required: true
+        type: string
+      publish:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      npm-token:
+        required: true
+    outputs:
+      build-version:
+        description: "Build version"
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      
+      - name: Get version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      
+      - name: Build
+        run: npm run build
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ steps.version.outputs.version }}
+          path: dist/
+  
+  publish:
+    if: ${{ inputs.publish }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ needs.build.outputs.version }}
+      
+      - name: Publish to npm
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.npm-token }}" > .npmrc
+          npm publish
+```
+
+### 31.3 工作流编排
+
+```yaml
+# 复杂工作流编排
+name: CI/CD Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # 阶段1: 代码检查
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run linting
+        run: npm run lint
+  
+  # 阶段2: 测试
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: npm test
+  
+  # 阶段3: 构建
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: npm run build
+  
+  # 阶段4: 部署到staging
+  deploy-staging:
+    if: github.ref == 'refs/heads/develop'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging..."
+  
+  # 阶段5: 部署到production
+  deploy-production:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production..."
+  
+  # 通知
+  notify:
+    if: always()
+    needs: [lint, test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send notification
+        run: |
+          echo "Pipeline completed with status: ${{ needs.build.result }}"
+```
+
+## 三十二、安全最佳实践
+
+### 32.1 密钥管理
+
+```yaml
+# 密钥使用最佳实践
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Use secrets
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          # 使用环境变量，不要硬编码
+          aws s3 sync ./dist s3://my-bucket
+      
+      # 使用 OIDC 进行云服务认证
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions
+          aws-region: us-east-1
+      
+      # 使用临时凭据
+      - name: Get temporary credentials
+        run: |
+          CREDS=$(aws sts assume-role \
+            --role-arn arn:aws:iam::123456789012:role/deploy-role \
+            --role-session-name github-actions)
+          export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.Credentials.SessionToken')
+```
+
+### 32.2 权限最小化
+
+```yaml
+# 权限配置
+permissions:
+  contents: read
+  packages: write
+  issues: write
+  pull-requests: write
+  actions: read
+  id-token: write  # OIDC
+
+# 工作流级别权限
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push
+        run: |
+          docker build -t ghcr.io/my-org/my-app:${{ github.sha }} .
+          docker push ghcr.io/my-org/my-app:${{ github.sha }}
+  
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: npm test
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: 'Tests passed! ✅'
+            })
+```
+
+### 32.3 安全扫描
+
+```yaml
+# 安全扫描工作流
+name: Security Scan
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * 1'  # 每周一凌晨2点
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+      
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          languages: javascript
+          category: '/language:javascript'
+```
+
+## 三十三、性能优化深度实战
+
+### 33.1 缓存策略优化
+
+```yaml
+# 高级缓存策略
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+      
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+      
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      
+      - name: Build with cache
+        run: |
+          npm ci
+          npm run build
+```
+
+### 33.2 并行执行优化
+
+```yaml
+# 并行执行策略
+jobs:
+  # 并行运行多个测试套件
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit tests
+        run: npm run test:unit
+  
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run integration tests
+        run: npm run test:integration
+  
+  test-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run e2e tests
+        run: npm run test:e2e
+  
+  # 并行构建多个平台
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for Linux
+        run: npm run build:linux
+  
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for Windows
+        run: npm run build:windows
+  
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for macOS
+        run: npm run build:macos
+  
+  # 汇总结果
+  test-summary:
+    needs: [test-unit, test-integration, test-e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test summary
+        run: |
+          echo "All tests passed!"
+  
+  build-summary:
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build summary
+        run: |
+          echo "All builds completed!"
+```
+
+## 三十四、企业级治理
+
+### 34.1 合规性检查
+
+```yaml
+# 合规性检查工作流
+name: Compliance Check
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check license compliance
+        uses: licensing-ly/oss-license-checker@v1
+        with:
+          allowed-licenses: MIT,Apache-2.0,BSD-2-Clause,BSD-3-Clause
+      
+      - name: Check secret scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+      
+      - name: Check dependency vulnerabilities
+        uses: advanced-security/dependency-review-action@v3
+        with:
+          fail-on-severity: high
+      
+      - name: Check code coverage
+        run: |
+          npm run test:coverage
+          if [ $(cat coverage/coverage-summary.json | jq '.total.lines.pct') -lt 80 ]; then
+            echo "Code coverage is below 80%"
+            exit 1
+          fi
+```
+
+### 34.2 审计与日志
+
+```yaml
+# 审计工作流
+name: Audit Trail
+on:
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types: [completed]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send audit event
+        run: |
+          EVENT_DATA='{
+            "workflow": "${{ github.event.workflow_run.name }}",
+            "status": "${{ github.event.workflow_run.conclusion }}",
+            "repository": "${{ github.repository }}",
+            "actor": "${{ github.event.workflow_run.actor.login }}",
+            "timestamp": "${{ github.event.workflow_run.updated_at }}"
+          }'
+          
+          # 发送到审计日志服务
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -d "$EVENT_DATA" \
+            https://audit.example.com/events
+```
+
+```sql
+-- 审计日志查询
+SELECT 
+    workflow_name,
+    repository,
+    actor,
+    status,
+    created_at,
+    completed_at,
+    duration_seconds
+FROM github_audit_logs
+WHERE created_at > NOW() - INTERVAL '30 days'
+  AND status = 'failure'
+ORDER BY created_at DESC;
+
+-- 合规性报告
+SELECT 
+    DATE(created_at) as date,
+    COUNT(*) as total_workflows,
+    SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successful,
+    SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END) as failed,
+    ROUND(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as success_rate
+FROM github_audit_logs
+WHERE created_at > NOW() - INTERVAL '7 days'
+GROUP BY DATE(created_at)
+ORDER BY date DESC;
+```
+
+## 三十五、集成与扩展
+
+### 35.1 与 Slack 集成
+
+```yaml
+# Slack 通知
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "GitHub Actions Notification",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚀 Workflow Completed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ job.status }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### 35.2 与 Jira 集成
+
+```yaml
+# Jira 集成
+jobs:
+  update-jira:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Jira ticket
+        uses: atlassian/gajira-comment@v3
+        with:
+          issue: ${{ github.event.pull_request.title }}
+          comment: |
+            Build ${{ github.run_number }} completed with status ${{ job.status }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+      
+      - name: Transition Jira ticket
+        uses: atlassian/gajira-transition@v3
+        with:
+          issue: ${{ github.event.pull_request.title }}
+          transition: "Done"
+```
+
 ## 本篇补充 Checklist

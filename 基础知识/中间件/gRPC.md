@@ -1997,6 +1997,769 @@ spec:
       simple: ROUND_ROBIN
 ```
 
+## 十三、Protobuf 高级特性
+
+### 13.1 消息版本兼容
+
+```protobuf
+syntax = "proto3";
+
+package example;
+
+// 消息版本兼容示例
+message User {
+  // 版本 1 的字段
+  int32 id = 1;
+  string name = 2;
+  string email = 3;
+  
+  // 版本 2 新增字段
+  string phone = 4;
+  int32 age = 5;
+  
+  // 版本 3 新增字段
+  Address address = 6;
+  
+  // 保留字段号（避免重用）
+  reserved 7, 8;
+  reserved "old_field1", "old_field2";
+  
+  // 保留字段范围
+  reserved 100 to 200;
+}
+
+message Address {
+  string street = 1;
+  string city = 2;
+  string country = 3;
+  string zip_code = 4;
+}
+
+// 枚举版本兼容
+enum Status {
+  UNKNOWN = 0;
+  ACTIVE = 1;
+  INACTIVE = 2;
+  // 版本 2 新增
+  PENDING = 3;
+  SUSPENDED = 4;
+  // 保留值
+  reserved 100 to 200;
+  reserved "DELETED";
+}
+```
+
+```java
+// 版本兼容处理
+@Component
+public class MessageVersionHandler {
+    
+    public User processUser(User user) {
+        // 检查消息版本
+        if (user.hasPhone()) {
+            // 处理版本 2+ 的消息
+            processPhone(user.getPhone());
+        }
+        
+        if (user.hasAddress()) {
+            // 处理版本 3+ 的消息
+            processAddress(user.getAddress());
+        }
+        
+        return user;
+    }
+    
+    private void processPhone(String phone) {
+        // 验证电话号码格式
+        if (!phone.matches("^\\+?[1-9]\\d{1,14}$")) {
+            throw new IllegalArgumentException("Invalid phone number");
+        }
+    }
+    
+    private void processAddress(Address address) {
+        // 验证地址信息
+        if (address.getStreet().isEmpty() || address.getCity().isEmpty()) {
+            throw new IllegalArgumentException("Invalid address");
+        }
+    }
+}
+```
+
+### 13.2 自定义序列化
+
+```java
+// 自定义序列化器
+public class CustomMarshaller implements MethodDescriptor.Marshaller<MyMessage> {
+    
+    @Override
+    public InputStream stream(MyMessage value) {
+        // 自定义序列化逻辑
+        byte[] bytes = value.toByteArray();
+        return new ByteArrayInputStream(bytes);
+    }
+    
+    @Override
+    public MyMessage parse(InputStream stream) {
+        // 自定义反序列化逻辑
+        try {
+            return MyMessage.parseFrom(stream);
+        } catch (InvalidProtocolBufferException e) {
+            throw new RuntimeException("Failed to parse message", e);
+        }
+    }
+}
+
+// 使用自定义序列化器
+MethodDescriptor<MyRequest, MyResponse> methodDescriptor = MethodDescriptor.create(
+    MethodDescriptor.MethodType.UNARY,
+    "/example.MyService/MyMethod",
+    new CustomMarshaller<>(),  // 请求序列化器
+    new CustomMarshaller<>()   // 响应序列化器
+);
+```
+
+## 十四、拦截器与中间件
+
+### 14.1 客户端拦截器
+
+```java
+// 客户端拦截器
+public class ClientLoggingInterceptor implements ClientInterceptor {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ClientLoggingInterceptor.class);
+    
+    @Override
+    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+            MethodDescriptor<ReqT, RespT> methodDescriptor,
+            CallOptions callOptions,
+            Channel channel) {
+        
+        return new ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(
+                channel.newCall(methodDescriptor, callOptions)) {
+            
+            @Override
+            public void start(Listener<RespT> responseListener, Metadata headers) {
+                // 记录请求开始
+                long startTime = System.currentTimeMillis();
+                String methodName = methodDescriptor.getFullMethodName();
+                
+                logger.info("gRPC call started: {}", methodName);
+                
+                // 添加自定义头
+                headers.put(Metadata.Key.of("x-request-id", Metadata.ASCII_STRING_MARSHALLER),
+                        UUID.randomUUID().toString());
+                
+                super.start(new ForwardingClientCallListener.SimpleForwardingClientCallListener<RespT>(
+                        responseListener) {
+                    
+                    @Override
+                    public void onHeaders(Metadata headers) {
+                        // 记录响应头
+                        logger.info("gRPC call headers received: {}", headers);
+                        super.onHeaders(headers);
+                    }
+                    
+                    @Override
+                    public void onClose(Status status, Metadata trailers) {
+                        // 记录调用结束
+                        long duration = System.currentTimeMillis() - startTime;
+                        logger.info("gRPC call completed: {} status={} duration={}ms",
+                                methodName, status.getCode(), duration);
+                        
+                        super.onClose(status, trailers);
+                    }
+                }, headers);
+            }
+            
+            @Override
+            public void sendMessage(ReqT message) {
+                // 记录发送的消息
+                logger.debug("gRPC message sent: {}", message);
+                super.sendMessage(message);
+            }
+        };
+    }
+}
+```
+
+### 14.2 服务端拦截器
+
+```java
+// 服务端拦截器
+public class ServerAuthInterceptor implements ServerInterceptor {
+    
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+        
+        // 提取认证信息
+        String authorization = headers.get(
+                Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER));
+        
+        if (authorization == null || !authorization.startsWith("Bearer ")) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Missing authorization"),
+                    new Metadata());
+            return new ServerCall.Listener<ReqT>() {};
+        }
+        
+        // 验证 token
+        String token = authorization.substring(7);
+        try {
+            Claims claims = validateToken(token);
+            
+            // 将用户信息传递给后续处理
+            Context context = Context.current()
+                    .withValue(Context.Key.of("userId"), claims.getSubject())
+                    .withValue(Context.Key.of("userRole"), claims.get("role"));
+            
+            return Contexts.interceptCall(context, call, headers, next);
+            
+        } catch (Exception e) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Invalid token"),
+                    new Metadata());
+            return new ServerCall.Listener<ReqT>() {};
+        }
+    }
+    
+    private Claims validateToken(String token) {
+        // 验证 JWT token
+        return Jwts.parser()
+                .setSigningKey("secret")
+                .parseClaimsJws(token)
+                .getBody();
+    }
+}
+```
+
+## 十五、负载均衡与服务发现
+
+### 15.1 客户端负载均衡
+
+```java
+// 客户端负载均衡配置
+@Configuration
+public class LoadBalancingConfig {
+    
+    @Bean
+    public ManagedChannel managedChannel() {
+        return ManagedChannelBuilder.forAddress("localhost", 8080)
+                .loadBalancerFactory(RoundRobinLoadBalancerFactory.getInstance())
+                .usePlaintext()
+                .build();
+    }
+    
+    @Bean
+    public MyServiceGrpc.MyServiceBlockingStub blockingStub(ManagedChannel channel) {
+        return MyServiceGrpc.newBlockingStub(channel);
+    }
+    
+    @Bean
+    public MyServiceGrpc.MyServiceStub asyncStub(ManagedChannel channel) {
+        return MyServiceGrpc.newStub(channel);
+    }
+}
+
+// 自定义负载均衡策略
+public class WeightedRoundRobinBalancer implements LoadBalancer {
+    
+    private final Map<String, Integer> serverWeights = new HashMap<>();
+    private int currentIndex = 0;
+    
+    @Override
+    public Subchannel pickSubchannel(PickArgs args) {
+        List<Subchannel> subchannels = getSubchannels();
+        
+        // 根据权重选择服务器
+        int totalWeight = serverWeights.values().stream().mapToInt(Integer::intValue).sum();
+        int randomWeight = ThreadLocalRandom.current().nextInt(totalWeight);
+        
+        int currentWeight = 0;
+        for (Subchannel subchannel : subchannels) {
+            currentWeight += serverWeights.get(subchannel.getAddresses().toString());
+            if (randomWeight < currentWeight) {
+                return subchannel;
+            }
+        }
+        
+        return subchannels.get(0);
+    }
+}
+```
+
+### 15.2 服务发现集成
+
+```java
+// Consul 服务发现
+@Component
+public class ConsulServiceDiscovery {
+    
+    @Autowired
+    private ConsulClient consulClient;
+    
+    public List<ServiceInstance> discoverService(String serviceName) {
+        HealthServicesResponse response = consulClient.getHealthServices(serviceName, true, 
+                QueryParams.Builder.builder().build());
+        
+        return response.getHealthServices().stream()
+                .filter(service -> service.getChecks().stream()
+                        .allMatch(check -> check.getStatus() == HealthCheck.Response.PASSING))
+                .map(service -> new ServiceInstance(
+                        service.getService().getId(),
+                        service.getService().getAddress(),
+                        service.getService().getPort(),
+                        service.getService().getMeta()
+                ))
+                .collect(Collectors.toList());
+    }
+    
+    public void registerService(String serviceName, String serviceId, int port) {
+        NewService service = new NewService();
+        service.setId(serviceId);
+        service.setName(serviceName);
+        service.setPort(port);
+        service.setCheck(new NewService.Check()
+                .tcp("localhost:" + port)
+                .interval("10s")
+                .timeout("5s"));
+        
+        consulClient.agentServiceRegister(service);
+    }
+}
+
+// 服务发现负载均衡
+@Component
+public class DiscoveryLoadBalancer implements LoadBalancer {
+    
+    @Autowired
+    private ConsulServiceDiscovery serviceDiscovery;
+    
+    @Override
+    public Subchannel pickSubchannel(PickArgs args) {
+        String serviceName = extractServiceName(args);
+        
+        // 发现实例
+        List<ServiceInstance> instances = serviceDiscovery.discoverService(serviceName);
+        
+        if (instances.isEmpty()) {
+            throw new RuntimeException("No available instances for service: " + serviceName);
+        }
+        
+        // 选择实例（这里使用随机选择）
+        ServiceInstance instance = instances.get(
+                ThreadLocalRandom.current().nextInt(instances.size()));
+        
+        // 创建 Subchannel
+        return createSubchannel(instance);
+    }
+}
+```
+
+## 十六、安全与认证深度实战
+
+### 16.1 mTLS 双向认证
+
+```java
+// mTLS 配置
+@Configuration
+public class MTLSConfig {
+    
+    @Bean
+    public SslContextBuilder sslContextBuilder() {
+        try {
+            // 加载证书和私钥
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            
+            // 服务端证书
+            Certificate serverCert = cf.generateCertificate(
+                    new FileInputStream("server.crt"));
+            KeyStore serverKeyStore = KeyStore.getInstance("JKS");
+            serverKeyStore.load(null, null);
+            serverKeyStore.setCertificateEntry("server", serverCert);
+            
+            // 客户端证书
+            Certificate clientCert = cf.generateCertificate(
+                    new FileInputStream("client.crt"));
+            KeyStore clientKeyStore = KeyStore.getInstance("JKS");
+            clientKeyStore.load(null, null);
+            clientKeyStore.setCertificateEntry("client", clientCert);
+            
+            // 信任库
+            KeyStore trustStore = KeyStore.getInstance("JKS");
+            trustStore.load(new FileInputStream("truststore.jks"), 
+                    "changeit".toCharArray());
+            
+            // SSL 上下文
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance(
+                    KeyManagerFactory.getDefaultAlgorithm());
+            kmf.init(serverKeyStore, "changeit".toCharArray());
+            
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+                    TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init(trustStore);
+            
+            sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+            
+            return SslContextBuilder.forServer(sslContext)
+                    .clientAuth(io.grpc.netty.shaded.io.grpc.netty.ClientAuth.REQUIRE);
+            
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to configure mTLS", e);
+        }
+    }
+}
+
+// 服务器配置
+public class GrpcServer {
+    
+    public Server createServer() {
+        SslContextBuilder sslContextBuilder = sslContextBuilder();
+        
+        return ServerBuilder.forPort(8443)
+                .sslContext(sslContextBuilder.build())
+                .addService(new MyServiceImpl())
+                .build();
+    }
+}
+```
+
+### 16.2 Token 认证
+
+```java
+// Token 认证器
+public class TokenAuthenticator implements ServerInterceptor {
+    
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+        
+        // 提取 token
+        String token = headers.get(
+                Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER));
+        
+        if (token == null || !token.startsWith("Bearer ")) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Missing token"),
+                    new Metadata());
+            return new ServerCall.Listener<ReqT>() {};
+        }
+        
+        // 验证 token
+        String actualToken = token.substring(7);
+        try {
+            Claims claims = validateToken(actualToken);
+            
+            // 创建认证上下文
+            Context currentContext = Context.current();
+            Context authenticatedContext = Context.newBuilder()
+                    .withValue(Context.Key.of("userId"), claims.getSubject())
+                    .withValue(Context.Key.of("roles"), claims.get("roles"))
+                    .withValue(Context.Key.of("expiry"), claims.getExpiration())
+                    .build();
+            
+            return Contexts.interceptCall(authenticatedContext, call, headers, next);
+            
+        } catch (Exception e) {
+            call.close(Status.UNAUTHENTICATED.withDescription("Invalid token"),
+                    new Metadata());
+            return new ServerCall.Listener<ReqT>() {};
+        }
+    }
+    
+    private Claims validateToken(String token) {
+        return Jwts.parser()
+                .setSigningKey("secret")
+                .parseClaimsJws(token)
+                .getBody();
+    }
+}
+```
+
+## 十七、性能优化深度实战
+
+### 17.1 连接池优化
+
+```java
+// 连接池配置
+@Configuration
+public class ConnectionPoolConfig {
+    
+    @Bean
+    public ManagedChannel managedChannel() {
+        NettyChannelBuilder builder = NettyChannelBuilder.forAddress("localhost", 8080)
+                .usePlaintext();
+        
+        // 连接池配置
+        builder.flowControlWindow(1024 * 1024)  // 1MB 流控窗口
+               .maxInboundMessageSize(1024 * 1024 * 10)  // 10MB 最大消息
+               .keepAliveTime(30, TimeUnit.SECONDS)
+               .keepAliveTimeout(10, TimeUnit.SECONDS);
+        
+        // 负载均衡配置
+        builder.loadBalancerFactory(RoundRobinLoadBalancerFactory.getInstance());
+        
+        return builder.build();
+    }
+}
+
+// 连接池管理
+@Component
+public class ConnectionPoolManager {
+    
+    private final Map<String, ManagedChannel> channelPool = new ConcurrentHashMap<>();
+    
+    public ManagedChannel getChannel(String target) {
+        return channelPool.computeIfAbsent(target, this::createChannel);
+    }
+    
+    private ManagedChannel createChannel(String target) {
+        String[] parts = target.split(":");
+        String host = parts[0];
+        int port = Integer.parseInt(parts[1]);
+        
+        return ManagedChannelBuilder.forAddress(host, port)
+                .usePlaintext()
+                .keepAliveTime(30, TimeUnit.SECONDS)
+                .keepAliveTimeout(10, TimeUnit.SECONDS)
+                .maxInboundMessageSize(1024 * 1024 * 10)
+                .build();
+    }
+    
+    public void shutdownAll() {
+        channelPool.values().forEach(ManagedChannel::shutdown);
+    }
+}
+```
+
+### 17.2 消息压缩
+
+```java
+// 消息压缩配置
+public class CompressedStub {
+    
+    public static MyServiceGrpc.MyServiceStub createCompressedStub(Channel channel) {
+        return MyServiceGrpc.newStub(channel)
+                .withInterceptors(new ClientInterceptor() {
+                    @Override
+                    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+                            MethodDescriptor<ReqT, RespT> methodDescriptor,
+                            CallOptions callOptions,
+                            Channel channel) {
+                        
+                        // 启用 gzip 压缩
+                        return channel.newCall(methodDescriptor,
+                                callOptions.withCompression("gzip"));
+                    }
+                });
+    }
+}
+
+// 服务端压缩配置
+public class CompressedServer {
+    
+    public Server createServer() {
+        return ServerBuilder.forPort(8080)
+                .addService(new CompressedServiceImpl())
+                .compressorRegistry(CompressorRegistry.getDefaultInstance())
+                .build();
+    }
+}
+
+// 自定义压缩器
+public class LZ4Compressor implements Compressor {
+    
+    @Override
+    public String getMessageEncoding() {
+        return "lz4";
+    }
+    
+    @Override
+    public InputStream decompress(InputStream stream) throws IOException {
+        LZ4Factory factory = LZ4Factory.fastestInstance();
+        LZ4FastDecompressor decompressor = factory.fastDecompressor();
+        
+        byte[] compressed = stream.readAllBytes();
+        byte[] decompressed = new byte[decompressor.maxDecompressedLength(compressed)];
+        decompressor.decompress(compressed, decompressed);
+        
+        return new ByteArrayInputStream(decompressed);
+    }
+    
+    @Override
+    public OutputStream compress(OutputStream stream) throws IOException {
+        LZ4Factory factory = LZ4Factory.fastestInstance();
+        LZ4Compressor compressor = factory.fastCompressor();
+        
+        return new LZ4OutputStream(stream, compressor);
+    }
+}
+```
+
+## 十八、监控与追踪
+
+### 18.1 分布式追踪集成
+
+```java
+// OpenTelemetry 追踪配置
+@Configuration
+public class TracingConfig {
+    
+    @Bean
+    public Tracer tracer() {
+        OpenTelemetry openTelemetry = OpenTelemetrySdk.builder()
+                .setResource(Resource.getDefault().merge(
+                        Resource.builder()
+                                .put(ResourceAttributes.SERVICE_NAME, "grpc-service")
+                                .put(ResourceAttributes.SERVICE_VERSION, "1.0.0")
+                                .build()))
+                .setSpanProcessor(BatchSpanProcessor.builder(
+                        OtlpGrpcSpanExporter.builder()
+                                .setEndpoint("otel-collector:4317")
+                                .build())
+                        .setScheduleDelay(5, TimeUnit.SECONDS)
+                        .setMaxQueueSize(2048)
+                        .setMaxExportBatchSize(512)
+                        .build())
+                .build();
+        
+        return openTelemetry.getTracer("grpc-service");
+    }
+}
+
+// 追踪拦截器
+public class TracingInterceptor implements ServerInterceptor {
+    
+    private final Tracer tracer;
+    
+    public TracingInterceptor(Tracer tracer) {
+        this.tracer = tracer;
+    }
+    
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+        
+        // 提取追踪上下文
+        Context extractedContext = OpenTelemetry.getPropagators().getTextMapPropagator()
+                .extract(Context.current(), headers, MetadataGetter.INSTANCE);
+        
+        // 创建 span
+        Span span = tracer.spanBuilder(call.getMethodDescriptor().getFullMethodName())
+                .setSpanKind(SpanKind.SERVER)
+                .setParent(extractedContext)
+                .setAttribute("rpc.system", "grpc")
+                .setAttribute("rpc.service", call.getMethodDescriptor().getServiceName())
+                .setAttribute("rpc.method", call.getMethodDescriptor().getSimpleName())
+                .startSpan();
+        
+        try (Scope scope = span.makeCurrent()) {
+            return next.startCall(call, headers);
+        } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+            span.recordException(e);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}
+```
+
+### 18.2 指标收集
+
+```java
+// 指标收集器
+@Component
+public class MetricsCollector {
+    
+    private final Meter meter;
+    private final LongCounter requestCounter;
+    private final LongHistogram latencyHistogram;
+    private final LongCounter errorCounter;
+    
+    public MetricsCollector() {
+        this.meter = GlobalOpenTelemetry.getMeter("grpc-service");
+        
+        this.requestCounter = meter.counterBuilder("grpc_requests_total")
+                .setDescription("Total gRPC requests")
+                .build();
+        
+        this.latencyHistogram = meter.histogramBuilder("grpc_request_duration_ms")
+                .setDescription("gRPC request duration in milliseconds")
+                .ofLongs()
+                .build();
+        
+        this.errorCounter = meter.counterBuilder("grpc_errors_total")
+                .setDescription("Total gRPC errors")
+                .build();
+    }
+    
+    public void recordRequest(String method, String status, long durationMs) {
+        requestCounter.add(1, Attributes.builder()
+                .put("method", method)
+                .put("status", status)
+                .build());
+        
+        latencyHistogram.record(durationMs, Attributes.builder()
+                .put("method", method)
+                .build());
+    }
+    
+    public void recordError(String method, String errorType) {
+        errorCounter.add(1, Attributes.builder()
+                .put("method", method)
+                .put("error_type", errorType)
+                .build());
+    }
+}
+
+// 指标拦截器
+public class MetricsInterceptor implements ServerInterceptor {
+    
+    private final MetricsCollector metricsCollector;
+    
+    public MetricsInterceptor(MetricsCollector metricsCollector) {
+        this.metricsCollector = metricsCollector;
+    }
+    
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call,
+            Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+        
+        long startTime = System.currentTimeMillis();
+        String method = call.getMethodDescriptor().getFullMethodName();
+        
+        return new ForwardingServerCallListener.SimpleForwardingServerCallListener<ReqT>(
+                next.startCall(call, headers)) {
+            
+            @Override
+            public void onHalfClose() {
+                try {
+                    super.onHalfClose();
+                } catch (Exception e) {
+                    metricsCollector.recordError(method, e.getClass().getSimpleName());
+                    throw e;
+                }
+            }
+            
+            @Override
+            public void onComplete() {
+                long duration = System.currentTimeMillis() - startTime;
+                metricsCollector.recordRequest(method, "OK", duration);
+                super.onComplete();
+            }
+        };
+    }
+}
+```
+
 ## 十二、与其他板块的关系（扩展）
 
 - Dubbo 对比见「[Apache Dubbo RPC 框架](./ApacheDubboRPC框架.md)」；

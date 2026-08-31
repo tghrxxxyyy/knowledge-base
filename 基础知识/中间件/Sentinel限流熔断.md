@@ -2221,4 +2221,495 @@ public class SentinelConfig {
      → 减少锁竞争
 ```
 
+## 补充：滑动窗口实现
+
+### 滑动窗口算法
+
+```java
+// 滑动窗口计数器
+public class SlidingWindowCounter {
+    private final int windowSize; // 窗口大小（毫秒）
+    private final int subWindowCount; // 子窗口数量
+    private final AtomicLongArray subWindows;
+    private final AtomicLong windowStart;
+    
+    public SlidingWindowCounter(int windowSize, int subWindowCount) {
+        this.windowSize = windowSize;
+        this.subWindowCount = subWindowCount;
+        this.subWindows = new AtomicLongArray(subWindowCount);
+        this.windowStart = new AtomicLong(System.currentTimeMillis());
+    }
+    
+    public long increment() {
+        long currentTime = System.currentTimeMillis();
+        long startTime = windowStart.get();
+        
+        // 计算当前子窗口索引
+        int index = (int) ((currentTime - startTime) / (windowSize / subWindowCount)) % subWindowCount;
+        
+        // 检查是否需要滑动窗口
+        if (currentTime - startTime > windowSize) {
+            // 滑动窗口
+            long newStartTime = currentTime - (windowSize / subWindowCount);
+            windowStart.set(newStartTime);
+            
+            // 重置过期的子窗口
+            for (int i = 0; i < subWindowCount; i++) {
+                subWindows.set(i, 0);
+            }
+        }
+        
+        return subWindows.incrementAndGet(index);
+    }
+    
+    public long get() {
+        long total = 0;
+        for (int i = 0; i < subWindowCount; i++) {
+            total += subWindows.get(i);
+        }
+        return total;
+    }
+}
+```
+
+### 滑动窗口配置
+
+```yaml
+# Sentinel 滑动窗口配置
+sentinel:
+  stat:
+    # 统计窗口长度（毫秒）
+    window-interval-ms: 1000
+    # 子窗口数量
+    window-sub-interval-count: 5
+    # 指标数据保留时间
+    metric-file-retain-seconds: 1800
+  # 流控配置
+  flow:
+    # 默认限流模式：QPS
+    default-flow-control-behavior: 0
+    # 默认阈值
+    default-count: 1000
+```
+
+## 补充：热点参数限流
+
+### 热点参数识别
+
+```java
+// 热点参数限流
+@SentinelResource(
+    value = "getProduct",
+    blockHandler = "getProductBlockHandler",
+    fallback = "getProductFallback"
+)
+public Product getProduct(Long productId, String category) {
+    // 业务逻辑
+    return productMapper.selectById(productId);
+}
+
+// 热点参数配置
+public Map<String, FlowRule> getHotParamRules() {
+    Map<String, FlowRule> rules = new HashMap<>();
+    
+    // 为不同参数值设置不同阈值
+    FlowRule rule1 = new FlowRule();
+    rule1.setResource("getProduct");
+    rule1.setParamIdx(0); // 第一个参数
+    rule1.setGrade(RuleConstant.FLOW_GRADE_QPS);
+    rule1.setCount(100);
+    // 为热点参数值设置特殊阈值
+    Map<Object, Integer> hotParamMap = new HashMap<>();
+    hotParamMap.put(1001L, 50); // 商品1001限流50 QPS
+    hotParamMap.put(1002L, 200); // 商品1002限流200 QPS
+    rule1.setClusterMode(false);
+    
+    rules.put("getProduct", rule1);
+    return rules;
+}
+```
+
+### 热点参数监控
+
+```java
+// 热点参数统计
+@Component
+public class HotParamStatistics {
+    
+    private final Map<String, Map<Object, Long>> paramStatistics = new ConcurrentHashMap<>();
+    
+    public void record(String resource, Object paramValue, long count) {
+        paramStatistics.computeIfAbsent(resource, k -> new ConcurrentHashMap<>())
+            .merge(paramValue, count, Long::sum);
+    }
+    
+    public Map<Object, Long> getStatistics(String resource) {
+        return paramStatistics.getOrDefault(resource, Collections.emptyMap());
+    }
+    
+    public List<Map.Entry<Object, Long>> getTopParams(String resource, int topN) {
+        return getStatistics(resource).entrySet().stream()
+            .sorted(Map.Entry.<Object, Long>comparingByValue().reversed())
+            .limit(topN)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 补充：系统自适应限流
+
+### 系统指标监控
+
+```java
+// 系统自适应限流配置
+@Component
+public class SystemAdaptiveConfig {
+    
+    @PostConstruct
+    public void init() {
+        // 系统自适应限流规则
+        SystemRule systemRule = new SystemRule();
+        
+        // CPU 使用率阈值
+        systemRule.setHighestCpuUsage(0.7); // 70%
+        
+        // 平均 RT 阈值
+        systemRule.setHighestAvgRt(200); // 200ms
+        
+        // 入口 QPS 阈值
+        systemRule.setHighestQps(1000);
+        
+        // 最大线程数
+        systemRule.setMaxThread(100);
+        
+        SystemRuleManager.loadRules(Collections.singletonList(systemRule));
+    }
+    
+    // 监听系统指标
+    @Scheduled(fixedRate = 1000)
+    public void monitorSystemMetrics() {
+        // 获取 CPU 使用率
+        double cpuUsage = ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage();
+        
+        // 获取线程数
+        int threadCount = Thread.activeCount();
+        
+        // 记录指标
+        Metrics.gauge("system.cpu.usage", cpuUsage);
+        Metrics.gauge("system.thread.count", threadCount);
+    }
+}
+```
+
+### 系统保护策略
+
+| 策略 | 指标 | 阈值 | 说明 |
+|------|------|------|------|
+| CPU 保护 | CPU 使用率 | 70% | 防止过载 |
+| RT 保护 | 平均响应时间 | 200ms | 防止延迟 |
+| QPS 保护 | 入口 QPS | 1000 | 防止洪峰 |
+| 线程保护 | 并发线程数 | 100 | 防止阻塞 |
+
+## 补充：集群流控
+
+### 集群流控架构
+
+```mermaid
+graph TB
+    subgraph 客户端
+        A1[App 1] --> B1[Sentinel Client]
+        A2[App 2] --> B2[Sentinel Client]
+        A3[App 3] --> B3[Sentinel Client]
+    end
+    
+    subgraph 服务端
+        B1 --> C[Sentinel Server]
+        B2 --> C
+        B3 --> C
+    end
+    
+    subgraph 存储
+        C --> D[Redis]
+        D --> E[限流计数]
+    end
+    
+    subgraph 监控
+        C --> F[Prometheus]
+        F --> G[Grafana]
+    end
+```
+
+### 集群流控配置
+
+```yaml
+# 集群流控配置
+sentinel:
+  cluster:
+    client:
+      # 集群服务端地址
+      server-addr: 127.0.0.1:8888
+      # 请求超时时间
+      request-timeout: 20000
+    server:
+      # 是否开启集群服务端
+      standalone: true
+      # 服务端端口
+      port: 8888
+      # 心跳间隔
+      heartbeat-interval: 5000
+    # 集群流控规则
+    flow:
+      # 限流模式：集群均摊
+      cluster-mode: true
+      # 阈值类型：QPS
+      threshold-type: 1
+      # 集群总阈值
+      cluster-count: 1000
+```
+
+### 集群限流模式
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| 单机均摊 | 每个节点独立限流 | 均匀负载 |
+| 集群总体 | 所有节点共享阈值 | 全局限制 |
+| 动态调整 | 根据负载动态调整 | 弹性伸缩 |
+
+## 补充：规则持久化
+
+### 持久化方案对比
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| 文件 | 规则写入文件 | 简单 | 不支持动态 |
+| Nacos | 推送规则 | 实时 | 依赖Nacos |
+| ZooKeeper | 推送规则 | 实时 | 依赖ZK |
+| Apollo | 配置中心 | 实时 | 依赖Apollo |
+| Redis | 存储规则 | 灵活 | 性能一般 |
+
+### Nacos 持久化配置
+
+```java
+// Nacos 规则推送
+@Component
+public class NacosConfig {
+    
+    @PostConstruct
+    public void init() {
+        try {
+            // 从 Nacos 加载规则
+            String rules = NacosConfigService.getConfig("sentinel-rules", "DEFAULT_GROUP", 5000);
+            if (rules != null) {
+                List<FlowRule> flowRules = JSON.parseArray(rules, FlowRule.class);
+                FlowRuleManager.loadRules(flowRules);
+            }
+            
+            // 监听规则变化
+            NacosConfigService.addListener("sentinel-rules", "DEFAULT_GROUP", new Listener() {
+                @Override
+                public Executor getExecutor() {
+                    return null;
+                }
+                
+                @Override
+                public void receiveConfigInfo(String configInfo) {
+                    List<FlowRule> flowRules = JSON.parseArray(configInfo, FlowRule.class);
+                    FlowRuleManager.loadRules(flowRules);
+                }
+            });
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+### 配置推送格式
+
+```json
+{
+  "resource": "user-api",
+  "limitApp": "default",
+  "grade": 1,
+  "count": 100,
+  "clusterMode": false,
+  "controlBehavior": 0,
+  "warmUpPeriodSec": 10,
+  "maxQueueingTimeMs": 500
+}
+```
+
+## 补充：限流降级策略
+
+### 限流策略对比
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| 快速失败 | 直接拒绝 | 一般业务 |
+| Warm Up | 预热启动 | 高并发场景 |
+| 排队等待 | 匀速通过 | 削峰填谷 |
+| 自适应限流 | 根据系统负载 | 系统保护 |
+
+### 降级策略配置
+
+```java
+// 熔断降级规则
+DegradeRule degradeRule = new DegradeRule();
+degradeRule.setResource("user-api");
+// 慢调用比例
+degradeRule.setGrade(RuleConstant.DEGRADE_GRADE_RT);
+degradeRule.setCount(1000); // RT 阈值 1000ms
+degradeRule.setSlowRatioThreshold(0.5); // 慢调用比例阈值
+degradeRule.setMinRequestAmount(10); // 最小请求数
+degradeRule.setStatIntervalMs(10000); // 统计时间窗口
+degradeRule.setTimeWindow(10); // 熔断时长 10秒
+
+// 异常比例
+DegradeRule degradeRule2 = new DegradeRule();
+degradeRule2.setResource("payment-api");
+degradeRule2.setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO);
+degradeRule2.setCount(0.5); // 异常比例阈值 50%
+degradeRule2.setMinRequestAmount(10);
+degradeRule2.setStatIntervalMs(10000);
+
+// 异常数
+DegradeRule degradeRule3 = new DegradeRule();
+degradeRule3.setResource("order-api");
+degradeRule3.setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_COUNT);
+degradeRule3.setCount(10); // 异常数阈值 10个
+degradeRule3.setMinRequestAmount(10);
+degradeRule3.setStatIntervalMs(10000);
+```
+
+### 降级状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: 触发降级条件
+    Open --> HalfOpen: 熔断时长结束
+    HalfOpen --> Closed: 试探成功
+    HalfOpen --> Open: 试探失败
+    
+    note right of Closed: 正常状态，允许请求
+    note right of Open: 熔断状态，拒绝所有请求
+    note right of HalfOpen: 半开状态，允许少量请求试探
+```
+
+## 补充：Spring Cloud Alibaba 集成
+
+### 依赖配置
+
+```xml
+<!-- Spring Cloud Alibaba Sentinel -->
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
+</dependency>
+
+<!-- Sentinel 数据源 -->
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-alibaba-sentinel-datasource</artifactId>
+</dependency>
+
+<!-- Nacos 数据源 -->
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
+</dependency>
+```
+
+### 配置文件
+
+```yaml
+# application.yml
+spring:
+  cloud:
+    sentinel:
+      transport:
+        port: 8719
+        dashboard: 127.0.0.1:8080
+      eager: true
+      datasource:
+        # Nacos 数据源
+        nacos:
+          server-addr: 127.0.0.1:8848
+          data-id: sentinel-rules
+          group-id: DEFAULT_GROUP
+          rule-type: flow
+          data-type: json
+```
+
+### 注解使用
+
+```java
+@Service
+public class UserService {
+    
+    @SentinelResource(
+        value = "getUser",
+        fallback = "getUserFallback",
+        blockHandler = "getUserBlockHandler",
+        exceptionsToIgnore = {IllegalArgumentException.class}
+    )
+    public User getUser(Long userId) {
+        if (userId == null) {
+            throw new IllegalArgumentException("userId不能为空");
+        }
+        return userMapper.selectById(userId);
+    }
+    
+    // Fallback 方法
+    public User getUserFallback(Long userId, Throwable e) {
+        // 服务降级逻辑
+        return new User(userId, "默认用户");
+    }
+    
+    // BlockHandler 方法
+    public User getUserBlockHandler(Long userId, BlockException e) {
+        // 限流降级逻辑
+        throw new RuntimeException("请求被限流");
+    }
+}
+```
+
+## 补充：Sentinel vs Hystrix 对比
+
+### 功能对比
+
+| 功能 | Sentinel | Hystrix |
+|------|----------|---------|
+| 隔离策略 | 信号量/线程 | 线程/信号量 |
+| 熔断策略 | 慢调用/异常比例/异常数 | 异常比例/异常数 |
+| 限流策略 | QPS/并发线程 | QPS |
+| 限流算法 | 滑动窗口/令牌桶 | 滑动窗口 |
+| 动态规则 | 支持（多种数据源） | 不支持 |
+| 流控效果 | 快速失败/Warm Up/排队等待 | 快速失败 |
+| 仪表板 | 有（功能丰富） | 有（功能简单） |
+| 生态 | Spring Cloud Alibaba | Netflix |
+
+### 迁移指南
+
+```java
+// Hystrix 方式
+@HystrixCommand(fallbackMethod = "fallback")
+public User getUser(Long userId) {
+    return userMapper.selectById(userId);
+}
+
+// Sentinel 方式
+@SentinelResource(value = "getUser", fallback = "getUserFallback")
+public User getUser(Long userId) {
+    return userMapper.selectById(userId);
+}
+
+// 迁移步骤
+// 1. 添加 Sentinel 依赖
+// 2. 配置 Sentinel Dashboard
+// 3. 修改注解
+// 4. 配置限流规则
+// 5. 测试验证
+```
+
 ## 与其他板块的关系

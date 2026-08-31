@@ -2020,3 +2020,666 @@ cache:
       use-key-prefix: true
       key-prefix: "cache:"
 ```
+
+## 二十、高级缓存策略
+
+### 20.1 多级缓存架构
+
+```java
+// 多级缓存实现
+@Component
+public class MultiLevelCache<K, V> {
+    
+    private final Cache<K, V> localCache;      // L1: 本地缓存
+    private final Cache<K, V> remoteCache;     // L2: 远程缓存
+    private final DataLoader<K, V> dataLoader; // 数据加载器
+    
+    public MultiLevelCache(Cache<K, V> localCache, Cache<K, V> remoteCache, 
+                          DataLoader<K, V> dataLoader) {
+        this.localCache = localCache;
+        this.remoteCache = remoteCache;
+        this.dataLoader = dataLoader;
+    }
+    
+    public V get(K key) {
+        // L1: 检查本地缓存
+        V value = localCache.getIfPresent(key);
+        if (value != null) {
+            return value;
+        }
+        
+        // L2: 检查远程缓存
+        value = remoteCache.getIfPresent(key);
+        if (value != null) {
+            // 回写本地缓存
+            localCache.put(key, value);
+            return value;
+        }
+        
+        // L3: 从数据源加载
+        value = dataLoader.load(key);
+        if (value != null) {
+            // 写入所有缓存层
+            remoteCache.put(key, value);
+            localCache.put(key, value);
+        }
+        
+        return value;
+    }
+    
+    public void put(K key, V value) {
+        // 写入所有缓存层
+        remoteCache.put(key, value);
+        localCache.put(key, value);
+    }
+    
+    public void invalidate(K key) {
+        // 失效所有缓存层
+        remoteCache.invalidate(key);
+        localCache.invalidate(key);
+    }
+}
+```
+
+```yaml
+# 多级缓存配置
+multi-level-cache:
+  l1:
+    type: caffeine
+    maximum-size: 10000
+    expire-after-write: 5m
+    record-stats: true
+  
+  l2:
+    type: redis
+    host: localhost
+    port: 6379
+    database: 0
+    time-to-live: 600000
+    key-prefix: "cache:"
+  
+  loader:
+    type: database
+    batch-size: 100
+    concurrency: 10
+```
+
+### 20.2 缓存预热策略
+
+```java
+// 缓存预热实现
+@Component
+public class CacheWarmer {
+    
+    @Autowired
+    private CacheManager cacheManager;
+    
+    @Autowired
+    private DataLoader dataLoader;
+    
+    @EventListener(ApplicationReadyEvent.class)
+    public void warmCache() {
+        // 预热热门数据
+        List<String> hotKeys = dataLoader.getHotKeys();
+        
+        for (String key : hotKeys) {
+            try {
+                Object value = dataLoader.load(key);
+                if (value != null) {
+                    cacheManager.getCache("hot-data").put(key, value);
+                    log.info("Warmed cache for key: {}", key);
+                }
+            } catch (Exception e) {
+                log.error("Failed to warm cache for key: {}", key, e);
+            }
+        }
+    }
+    
+    // 定时预热
+    @Scheduled(fixedRate = 300000)  // 每5分钟
+    public void scheduledWarm() {
+        warmCache();
+    }
+}
+
+// 缓存预热配置
+@Configuration
+public class CacheWarmConfig {
+    
+    @Bean
+    public CacheWarmer cacheWarmer() {
+        return new CacheWarmer();
+    }
+    
+    @Bean
+    public TaskScheduler taskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(5);
+        scheduler.setThreadNamePrefix("cache-warmer-");
+        return scheduler;
+    }
+}
+```
+
+```yaml
+# 缓存预热配置
+cache-warming:
+  enabled: true
+  hot-keys:
+    source: database
+    query: "SELECT key FROM hot_data ORDER BY access_count DESC LIMIT 1000"
+  
+  schedule:
+    initial-delay: 1000
+    fixed-rate: 300000
+  
+  batch:
+    size: 100
+    concurrency: 10
+  
+  metrics:
+    enabled: true
+    prefix: cache.warming
+```
+
+## 二十一、缓存失效模式
+
+### 21.1 缓存失效策略
+
+```java
+// 缓存失效策略
+@Component
+public class CacheInvalidationStrategy {
+    
+    @Autowired
+    private CacheManager cacheManager;
+    
+    // 基于时间的失效
+    public void invalidateByTime(String cacheName, long maxAgeMs) {
+        Cache cache = cacheManager.getCache(cacheName);
+        if (cache instanceof CaffeineCache) {
+            CaffeineCache caffeineCache = (CaffeineCache) cache;
+            caffeineCache.getNativeCache().invalidateAll();
+        }
+    }
+    
+    // 基于版本的失效
+    public void invalidateByVersion(String cacheName, String versionKey) {
+        Cache cache = cacheManager.getCache(cacheName);
+        String currentVersion = getVersionFromConfig(versionKey);
+        
+        // 检查版本是否变化
+        String cachedVersion = (String) cache.get("version");
+        if (!currentVersion.equals(cachedVersion)) {
+            cache.invalidateAll();
+            cache.put("version", currentVersion);
+        }
+    }
+    
+    // 基于事件的失效
+    @EventListener(DataChangeEvent.class)
+    public void handleDataChange(DataChangeEvent event) {
+        String cacheName = event.getCacheName();
+        String key = event.getKey();
+        
+        Cache cache = cacheManager.getCache(cacheName);
+        if (key != null) {
+            cache.invalidate(key);
+        } else {
+            cache.invalidateAll();
+        }
+    }
+}
+```
+
+### 21.2 缓存穿透防护
+
+```java
+// 缓存穿透防护
+@Component
+public class CachePenetrationGuard {
+    
+    private final Cache<String, Object> nullObjectCache;
+    private final LoadingCache<String, Optional<Object>> loadingCache;
+    
+    public CachePenetrationGuard() {
+        // 空对象缓存（短过期时间）
+        this.nullObjectCache = Caffeine.newBuilder()
+                .maximumSize(10000)
+                .expireAfterWrite(1, TimeUnit.MINUTES)
+                .build();
+        
+        // 加载缓存（带自动加载）
+        this.loadingCache = Caffeine.newBuilder()
+                .maximumSize(10000)
+                .expireAfterWrite(5, TimeUnit.MINUTES)
+                .build(key -> loadFromDataSource(key));
+    }
+    
+    public Object get(String key) {
+        // 检查空对象缓存
+        if (nullObjectCache.getIfPresent(key) != null) {
+            return null;
+        }
+        
+        // 从加载缓存获取
+        Optional<Object> value = loadingCache.get(key);
+        return value.orElse(null);
+    }
+    
+    private Optional<Object> loadFromDataSource(String key) {
+        // 从数据源加载
+        Object value = dataSource.get(key);
+        
+        if (value == null) {
+            // 缓存空对象
+            nullObjectCache.put(key, Boolean.TRUE);
+            return Optional.empty();
+        }
+        
+        return Optional.of(value);
+    }
+}
+
+// 布隆过滤器防护
+@Component
+public class BloomFilterGuard {
+    
+    private final BloomFilter<String> bloomFilter;
+    
+    public BloomFilterGuard() {
+        this.bloomFilter = BloomFilter.create(
+                Funnels.stringFunnel(Charset.defaultCharset()),
+                1000000,  // 预期元素数量
+                0.01      // 误判率
+        );
+        
+        // 初始化布隆过滤器
+        initializeBloomFilter();
+    }
+    
+    public boolean mightContain(String key) {
+        return bloomFilter.mightContain(key);
+    }
+    
+    private void initializeBloomFilter() {
+        // 从数据源加载所有键到布隆过滤器
+        List<String> allKeys = dataSource.getAllKeys();
+        for (String key : allKeys) {
+            bloomFilter.put(key);
+        }
+    }
+}
+```
+
+## 二十二、性能优化深度实战
+
+### 22.1 连接池优化
+
+```java
+// Memcached 连接池优化
+@Configuration
+public class MemcachedPoolConfig {
+    
+    @Bean
+    public MemcachedClient memcachedClient() {
+        // 连接池配置
+        ConnectionPoolBuilder poolBuilder = ConnectionPoolBuilder.builder()
+                .maxTotal(100)           // 最大连接数
+                .maxIdle(50)             // 最大空闲连接
+                .minIdle(10)             // 最小空闲连接
+                .maxWaitMillis(5000)     // 获取连接最大等待时间
+                .testOnBorrow(true)      // 借用时测试
+                .testOnReturn(true)      // 归还时测试
+                .testWhileIdle(true)     // 空闲时测试
+                .timeBetweenEvictionRunsMillis(30000)  // 驱逐检查间隔
+                .minEvictableIdleTimeMillis(60000)     // 最小空闲时间
+                .numTestsPerEvictionRun(3);            // 每次驱逐检查数量
+        
+        // 创建 Memcached 客户端
+        MemcachedClientBuilder builder = new MemcachedClientBuilder(
+                AddressUtil.getAddresses("localhost:11211"));
+        builder.setConnectionPoolSize(100);
+        builder.setProtocol(ConnectionFactoryBuilder.Protocol.BINARY);
+        builder.setFailureMode(FailureMode.Redistribute);
+        
+        return builder.build();
+    }
+}
+
+// Redis 连接池优化
+@Configuration
+public class RedisPoolConfig {
+    
+    @Bean
+    public LettuceConnectionFactory lettuceConnectionFactory() {
+        RedisStandaloneConfiguration configuration = new RedisStandaloneConfiguration();
+        configuration.setHostName("localhost");
+        configuration.setPort(6379);
+        
+        GenericObjectPoolConfig<?> poolConfig = new GenericObjectPoolConfig<>();
+        poolConfig.setMaxTotal(100);
+        poolConfig.setMaxIdle(50);
+        poolConfig.setMinIdle(10);
+        poolConfig.setMaxWait(Duration.ofMillis(5000));
+        poolConfig.setTestOnBorrow(true);
+        poolConfig.setTestOnReturn(true);
+        poolConfig.setTestWhileIdle(true);
+        poolConfig.setTimeBetweenEvictionRuns(Duration.ofSeconds(30));
+        poolConfig.setMinEvictableIdleTime(Duration.ofSeconds(60));
+        
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .commandTimeout(Duration.ofSeconds(5))
+                .poolConfig(poolConfig)
+                .build();
+        
+        return new LettuceConnectionFactory(configuration, clientConfig);
+    }
+}
+```
+
+### 22.2 序列化优化
+
+```java
+// 序列化优化
+@Component
+public class SerializationOptimizer {
+    
+    private final Map<String, Serializer> serializers = new HashMap<>();
+    
+    public SerializationOptimizer() {
+        // 注册序列化器
+        serializers.put("json", new JsonSerializer());
+        serializers.put("protobuf", new ProtobufSerializer());
+        serializers.put("msgpack", new MsgPackSerializer());
+        serializers.put("kryo", new KryoSerializer());
+    }
+    
+    public byte[] serialize(Object object, String format) {
+        Serializer serializer = serializers.get(format);
+        if (serializer == null) {
+            throw new IllegalArgumentException("Unsupported serialization format: " + format);
+        }
+        
+        return serializer.serialize(object);
+    }
+    
+    public <T> T deserialize(byte[] data, Class<T> type, String format) {
+        Serializer serializer = serializers.get(format);
+        if (serializer == null) {
+            throw new IllegalArgumentException("Unsupported serialization format: " + format);
+        }
+        
+        return serializer.deserialize(data, type);
+    }
+}
+
+// Kryo 序列化器（高性能）
+public class KryoSerializer implements Serializer {
+    
+    private final ThreadLocal<Kryo> kryoThreadLocal = ThreadLocal.withInitial(() -> {
+        Kryo kryo = new Kryo();
+        kryo.register(ArrayList.class);
+        kryo.register(HashMap.class);
+        kryo.register(LinkedList.class);
+        kryo.register(LinkedHashMap.class);
+        kryo.setRegistrationRequired(false);
+        return kryo;
+    });
+    
+    @Override
+    public byte[] serialize(Object object) {
+        Kryo kryo = kryoThreadLocal.get();
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        Output output = new Output(outputStream);
+        
+        kryo.writeObject(output, object);
+        output.close();
+        
+        return outputStream.toByteArray();
+    }
+    
+    @Override
+    public <T> T deserialize(byte[] data, Class<T> type) {
+        Kryo kryo = kryoThreadLocal.get();
+        ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
+        Input input = new Input(inputStream);
+        
+        T object = kryo.readObject(input, type);
+        input.close();
+        
+        return object;
+    }
+}
+```
+
+## 二十三、生产监控与告警
+
+### 23.1 核心监控指标
+
+```sql
+-- 缓存监控指标
+SELECT 
+    timestamp,
+    cache_name,
+    hit_count,
+    miss_count,
+    hit_rate,
+    eviction_count,
+    size,
+    memory_usage
+FROM cache_metrics
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+
+-- 性能监控
+SELECT 
+    timestamp,
+    cache_name,
+    avg_get_time,
+    max_get_time,
+    avg_put_time,
+    max_put_time,
+    avg_remove_time,
+    max_remove_time
+FROM cache_performance
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: cache_alerts
+    rules:
+      - alert: CacheHitRateLow
+        expr: cache_hit_rate < 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存命中率过低"
+          description: "缓存 {{ $labels.cache_name }} 命中率低于80%"
+      
+      - alert: CacheEvictionRateHigh
+        expr: rate(cache_evictions_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存驱逐率过高"
+          description: "缓存 {{ $labels.cache_name }} 驱逐速率超过100/s"
+      
+      - alert: CacheMemoryUsageHigh
+        expr: cache_memory_usage_bytes / cache_memory_max_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存内存使用率过高"
+          description: "缓存 {{ $labels.cache_name }} 内存使用率超过90%"
+```
+
+### 23.2 告警规则配置
+
+```yaml
+# 告警规则配置
+alert_rules:
+  # 命中率告警
+  - name: cache_hit_rate
+    condition: cache_hit_rate < 0.8
+    duration: 5m
+    severity: warning
+    message: "缓存命中率过低: {{ .Value }}"
+  
+  # 驱逐率告警
+  - name: cache_eviction_rate
+    condition: cache_eviction_rate > 100
+    duration: 5m
+    severity: warning
+    message: "缓存驱逐率过高: {{ .Value }}/s"
+  
+  # 内存使用告警
+  - name: cache_memory_usage
+    condition: cache_memory_usage > 0.9
+    duration: 5m
+    severity: warning
+    message: "缓存内存使用率过高: {{ .Value }}%"
+  
+  # 连接池告警
+  - name: cache_connection_pool
+    condition: cache_connection_pool_active > cache_connection_pool_max * 0.8
+    duration: 5m
+    severity: warning
+    message: "缓存连接池使用率过高: {{ .Value }}%"
+```
+
+## 二十四、集成模式深度实战
+
+### 24.1 Spring Cache 集成
+
+```java
+// Spring Cache 配置
+@Configuration
+@EnableCaching
+public class CacheConfig {
+    
+    @Bean
+    public CacheManager cacheManager() {
+        // 创建 Caffeine 缓存管理器
+        CaffeineCacheManager cacheManager = new CaffeineCacheManager();
+        cacheManager.setCaffeine(Caffeine.newBuilder()
+                .maximumSize(10000)
+                .expireAfterWrite(5, TimeUnit.MINUTES)
+                .recordStats());
+        
+        // 设置默认过期时间
+        cacheManager.setCacheSpecification("maximumSize=10000,expireAfterWrite=5m");
+        
+        return cacheManager;
+    }
+}
+
+// 使用 Spring Cache
+@Service
+public class UserService {
+    
+    @Cacheable(value = "users", key = "#userId")
+    public User getUserById(String userId) {
+        // 从数据库加载用户
+        return userRepository.findById(userId).orElse(null);
+    }
+    
+    @CachePut(value = "users", key = "#user.id")
+    public User updateUser(User user) {
+        // 更新用户
+        return userRepository.save(user);
+    }
+    
+    @CacheEvict(value = "users", key = "#userId")
+    public void deleteUser(String userId) {
+        // 删除用户
+        userRepository.deleteById(userId);
+    }
+    
+    @CacheEvict(value = "users", allEntries = true)
+    public void clearCache() {
+        // 清空缓存
+    }
+}
+```
+
+### 24.2 缓存抽象层
+
+```java
+// 缓存抽象层
+@Component
+public class CacheAbstraction {
+    
+    private final CacheManager cacheManager;
+    private final Map<String, Cache> cacheMap = new ConcurrentHashMap<>();
+    
+    public CacheAbstraction(CacheManager cacheManager) {
+        this.cacheManager = cacheManager;
+    }
+    
+    public <T> T get(String cacheName, String key, Supplier<T> dataLoader) {
+        Cache cache = getCache(cacheName);
+        
+        // 尝试从缓存获取
+        Cache.ValueWrapper wrapper = cache.get(key);
+        if (wrapper != null) {
+            return (T) wrapper.get();
+        }
+        
+        // 从数据源加载
+        T value = dataLoader.get();
+        if (value != null) {
+            cache.put(key, value);
+        }
+        
+        return value;
+    }
+    
+    public void put(String cacheName, String key, Object value) {
+        Cache cache = getCache(cacheName);
+        cache.put(key, value);
+    }
+    
+    public void invalidate(String cacheName, String key) {
+        Cache cache = getCache(cacheName);
+        cache.evict(key);
+    }
+    
+    public void clear(String cacheName) {
+        Cache cache = getCache(cacheName);
+        cache.clear();
+    }
+    
+    private Cache getCache(String cacheName) {
+        return cacheMap.computeIfAbsent(cacheName, 
+                name -> cacheManager.getCache(name));
+    }
+}
+```
+
+```yaml
+# 缓存抽象层配置
+cache-abstraction:
+  defaults:
+    ttl: 300
+    max-size: 10000
+  
+  caches:
+    users:
+      ttl: 600
+      max-size: 5000
+    
+    products:
+      ttl: 120
+      max-size: 10000
+    
+    orders:
+      ttl: 60
+      max-size: 20000
+```

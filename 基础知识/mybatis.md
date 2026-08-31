@@ -1990,7 +1990,627 @@ mybatis:
     cache-enabled: true
 ```
 
-### 缓存机制
+## 补充：MyBatis 拦截器深度剖析
+
+### 拦截器执行链
+
+```mermaid
+graph TD
+    A[Executor] --> B[StatementHandler]
+    B --> C[ParameterHandler]
+    C --> D[PreparedStatement]
+    D --> E[ResultSetHandler]
+    E --> F[ResultHandler]
+    
+    G[Plugin] -->|wrap| A
+    G -->|wrap| B
+    G -->|wrap| C
+    G -->|wrap| E
+```
+
+### 自定义拦截器实现
+
+```java
+// 慢SQL拦截器
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "query", 
+        args = {Statement.class, ResultHandler.class})
+})
+public class SlowSqlInterceptor implements Interceptor {
+    private static final Logger log = LoggerFactory.getLogger(SlowSqlInterceptor.class);
+    private long threshold = 1000; // 1秒
+    
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        long start = System.currentTimeMillis();
+        Object result = invocation.proceed();
+        long duration = System.currentTimeMillis() - start;
+        
+        if (duration > threshold) {
+            StatementHandler handler = (StatementHandler) invocation.getTarget();
+            BoundSql boundSql = handler.getBoundSql();
+            log.warn("慢SQL检测: 耗时{}ms, SQL: {}", duration, boundSql.getSql());
+        }
+        return result;
+    }
+    
+    @Override
+    public Object plugin(Object target) {
+        return Plugin.wrap(target, this);
+    }
+    
+    @Override
+    public void setProperties(Properties properties) {
+        this.threshold = Long.parseLong(properties.getProperty("threshold", "1000"));
+    }
+}
+```
+
+### 拦截器执行顺序
+
+| 拦截器 | 执行时机 | 典型用途 |
+|--------|----------|----------|
+| Executor | 执行器级别 | 事务管理、二级缓存 |
+| StatementHandler | SQL执行前 | SQL改写、分页 |
+| ParameterHandler | 参数设置前 | 参数加密、脱敏 |
+| ResultSetHandler | 结果集处理后 | 结果缓存、数据转换 |
+
+## 补充：PageHelper 高级用法
+
+### 分页参数详解
+
+```java
+// 基础分页
+PageHelper.startPage(1, 10); // 第1页，每页10条
+
+// 高级分页参数
+PageHelper.startPage(1, 10, true); // count查询
+PageHelper.startPage(1, 10, true, true, true); // count+排序+方言
+
+// 使用PageMethod
+PageHelper.offsetPage(0, 10); // 偏移量分页
+
+// 不进行count查询
+PageHelper.startPage(1, 10, false);
+
+// 排序
+PageHelper.startPage(1, 10, "id desc");
+PageHelper.startPage(1, 10, "id desc, create_time asc");
+```
+
+### PageHelper 原理图解
+
+```mermaid
+sequenceDiagram
+    participant App as 应用代码
+    participant PH as PageHelper
+    participant TH as ThreadLocal
+    participant Exec as Executor
+    participant SQL as SQL解析
+    
+    App->>PH: startPage(1, 10)
+    PH->>TH: 存储分页参数
+    App->>Exec: mapper.selectList()
+    Exec->>TH: 获取分页参数
+    TH->>Exec: 返回分页参数
+    Exec->>SQL: 生成Count SQL
+    SQL-->>Exec: SELECT COUNT(*)
+    Exec->>SQL: 生成分页SQL
+    SQL-->>Exec: SELECT ... LIMIT 10
+    Exec-->>App: 返回分页结果
+    PH->>TH: 清除ThreadLocal
+```
+
+### PageHelper 与 MyBatis-Plus 集成
+
+```java
+// 配置
+@Configuration
+public class MybatisConfig {
+    @Bean
+    public PageHelper pageHelper() {
+        PageHelper pageHelper = new PageHelper();
+        Properties properties = new Properties();
+        properties.setProperty("helperDialect", "mysql");
+        properties.setProperty("reasonable", "true");
+        properties.setProperty("supportMethodsArguments", "true");
+        pageHelper.setProperties(properties);
+        return pageHelper;
+    }
+}
+
+// 使用
+Page<User> page = PageHelper.startPage(1, 10)
+    .doSelectPage(() -> userMapper.selectList(wrapper));
+
+// 获取总数
+long total = page.getTotal();
+List<User> list = page.getResult();
+```
+
+## 补充：MyBatis-Plus 条件构造器
+
+### 条件构造器类型
+
+| 类型 | 说明 | 适用场景 |
+|------|------|----------|
+| QueryWrapper | 字符串条件 | 简单查询 |
+| UpdateWrapper | 字符串更新 | 简单更新 |
+| LambdaQueryWrapper | Lambda条件 | 推荐使用 |
+| LambdaUpdateWrapper | Lambda更新 | 推荐使用 |
+| AbstractWrapper | 基类 | 自定义扩展 |
+
+### 条件构造器高级用法
+
+```java
+// 复杂条件组合
+LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+wrapper
+    // 基础条件
+    .eq(User::getStatus, 1)
+    .ne(User::getDeleted, 1)
+    
+    // 模糊查询
+    .like(User::getName, "张")
+    .likeRight(User::getEmail, "test@")
+    
+    // 范围查询
+    .between(User::getAge, 18, 30)
+    .ge(User::getCreateTime, LocalDateTime.now().minusDays(7))
+    
+    // IN查询
+    .in(User::getId, Arrays.asList(1, 2, 3))
+    .notIn(User::getId, Arrays.asList(4, 5))
+    
+    // 排序
+    .orderByDesc(User::getId)
+    .orderByAsc(User::getName)
+    
+    // 分组
+    .groupBy(User::getStatus)
+    
+    // 去重
+    .select(User::getId, User::getName, User::getStatus);
+
+// 条件动态构建
+LambdaQueryWrapper<User> dynamicWrapper = new LambdaQueryWrapper<>();
+if (StringUtils.isNotBlank(name)) {
+    dynamicWrapper.like(User::getName, name);
+}
+if (age != null) {
+    dynamicWrapper.eq(User::getAge, age);
+}
+if (start_time != null && end_time != null) {
+    dynamicWrapper.between(User::getCreateTime, start_time, end_time);
+}
+```
+
+### MyBatis-Plus 批量操作
+
+```java
+// 批量插入（默认）
+@Autowired
+private UserMapper userMapper;
+
+List<User> users = prepareUsers();
+users.forEach(userMapper::insert); // 逐条插入
+
+// 批量插入（优化）
+userMapper.insertBatchSomeColumn(users); // 批量插入
+
+// 批量更新
+users.forEach(user -> {
+    userMapper.updateById(user);
+});
+
+// 条件批量更新
+UpdateWrapper<User> updateWrapper = new UpdateWrapper<>();
+updateWrapper
+    .set(User::getStatus, 1)
+    .in(User::getId, userIds);
+userMapper.update(null, updateWrapper);
+```
+
+## 补充：TransactionManager 详解
+
+### 事务传播行为
+
+| 传播行为 | 说明 | 适用场景 |
+|----------|------|----------|
+| REQUIRED | 有则加入，无则新建 | 默认行为 |
+| REQUIRES_NEW | 总是新建事务 | 独立操作 |
+| SUPPORTS | 有则加入，无则非事务 | 只读查询 |
+| NOT_SUPPORTED | 非事务执行 | 大数据操作 |
+| MANDATORY | 必须有事务 | 强制事务 |
+| NEVER | 不能有事务 | 非事务方法 |
+| NESTED | 嵌套事务 | 子事务控制 |
+
+### 事务隔离级别
+
+```java
+@Transactional(isolation = Isolation.DEFAULT)
+public void defaultIsolation() {
+    // 使用数据库默认隔离级别
+}
+
+@Transactional(isolation = Isolation.READ_UNCOMMITTED)
+public void readUncommitted() {
+    // 读未提交（脏读）
+}
+
+@Transactional(isolation = Isolation.READ_COMMITTED)
+public void readCommitted() {
+    // 读已提交（不可重复读）
+}
+
+@Transactional(isolation = Isolation.REPEATABLE_READ)
+public void repeatableRead() {
+    // 可重复读（幻读）
+}
+
+@Transactional(isolation = Isolation.SERIALIZABLE)
+public void serializable() {
+    // 串行化
+}
+```
+
+### 编程式事务详解
+
+```java
+// TransactionTemplate 方式
+@Autowired
+private TransactionTemplate transactionTemplate;
+
+public void executeWithTemplate() {
+    transactionTemplate.execute(status -> {
+        try {
+            // 业务逻辑1
+            userMapper.insert(user1);
+            
+            // 业务逻辑2
+            orderMapper.insert(order1);
+            
+            return null;
+        } catch (Exception e) {
+            status.setRollbackOnly();
+            throw e;
+        }
+    });
+}
+
+// PlatformTransactionManager 方式
+@Autowired
+private PlatformTransactionManager transactionManager;
+
+public void executeWithManager() {
+    DefaultTransactionDefinition def = new DefaultTransactionDefinition();
+    def.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+    def.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+    def.setTimeout(30);
+    
+    TransactionStatus status = transactionManager.getTransaction(def);
+    try {
+        // 业务逻辑
+        userMapper.insert(user);
+        orderMapper.insert(order);
+        
+        transactionManager.commit(status);
+    } catch (Exception e) {
+        transactionManager.rollback(status);
+        throw e;
+    }
+}
+```
+
+## 补充：延迟加载深入
+
+### 延迟加载策略
+
+```xml
+<!-- 全局配置 -->
+<settings>
+    <!-- 开启延迟加载 -->
+    <setting name="lazyLoadingEnabled" value="true"/>
+    <!-- 关闭立即加载 -->
+    <setting name="aggressiveLazyLoading" value="false"/>
+    <!-- 延迟加载触发方法 -->
+    <setting name="lazyLoadTriggerMethods" value="toString,equals,hashCode"/>
+    <!-- 按需加载所有延迟属性 -->
+    <setting name="defaultLazyLoaderFactory" value="true"/>
+</settings>
+
+<!-- 按需加载配置 -->
+<resultMap id="userWithOrders" type="User">
+    <id property="id" column="user_id"/>
+    <result property="name" column="user_name"/>
+    <collection property="orders" ofType="Order" 
+        select="selectOrdersByUserId" 
+        fetchType="lazy"/>
+</resultMap>
+
+<!-- 立即加载配置 -->
+<resultMap id="userWithOrdersEager" type="User">
+    <id property="id" column="user_id"/>
+    <result property="name" column="user_name"/>
+    <collection property="orders" ofType="Order" 
+        select="selectOrdersByUserId" 
+        fetchType="eager"/>
+</resultMap>
+```
+
+### N+1 问题详解
+
+```java
+// N+1 问题示例
+List<User> users = userMapper.selectAll(); // 1次查询
+for (User user : users) {
+    List<Order> orders = orderMapper.selectByUserId(user.getId()); // N次查询
+}
+
+// 解决方案1：JOIN查询
+<select id="selectUserWithOrders" resultMap="userWithOrders">
+    SELECT u.*, o.*
+    FROM user u
+    LEFT JOIN orders o ON u.id = o.user_id
+</select>
+
+// 解决方案2：子查询（按需加载）
+<select id="selectOrdersByUserId" resultType="Order">
+    SELECT * FROM orders WHERE user_id = #{userId}
+</select>
+
+// 解决方案3：批量查询
+<select id="selectOrdersByUserIds" resultType="Order">
+    SELECT * FROM orders WHERE user_id IN
+    <foreach collection="userIds" item="userId" open="(" separator="," close=")">
+        #{userId}
+    </foreach>
+</select>
+```
+
+### 延迟加载性能对比
+
+| 策略 | 查询次数 | 适用场景 | 优缺点 |
+|------|----------|----------|--------|
+| 立即加载 | 1次（JOIN） | 数据量小 | 性能好，数据全 |
+| 延迟加载 | N+1次 | 数据量大 | 性能差，按需加载 |
+| 批量查询 | 2次（IN查询） | 数据量中等 | 平衡方案 |
+| 子查询 | N+1次 | 复杂关联 | 灵活，性能一般 |
+
+## 补充：多数据源路由策略
+
+### 动态数据源实现
+
+```java
+// 数据源枚举
+public enum DataSourceType {
+    MASTER,
+    SLAVE,
+    REPORT
+}
+
+// 数据源上下文
+public class DataSourceContextHolder {
+    private static final ThreadLocal<DataSourceType> CONTEXT = new ThreadLocal<>();
+    
+    public static void setDataSourceType(DataSourceType type) {
+        CONTEXT.set(type);
+    }
+    
+    public static DataSourceType getDataSourceType() {
+        return CONTEXT.get();
+    }
+    
+    public static void clear() {
+        CONTEXT.remove();
+    }
+}
+
+// 动态数据源路由
+public class DynamicDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return DataSourceContextHolder.getDataSourceType();
+    }
+}
+
+// AOP切面
+@Aspect
+@Component
+public class DataSourceAspect {
+    @Before("@annotation(master)")
+    public void switchToMaster(JoinPoint joinPoint) {
+        DataSourceContextHolder.setDataSourceType(DataSourceType.MASTER);
+    }
+    
+    @Before("@annotation(slave)")
+    public void switchToSlave(JoinPoint joinPoint) {
+        DataSourceContextHolder.setDataSourceType(DataSourceType.SLAVE);
+    }
+    
+    @After("@annotation(master) || @annotation(slave)")
+    public void restore(JoinPoint joinPoint) {
+        DataSourceContextHolder.clear();
+    }
+}
+
+// 使用注解
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Master {}
+
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Slave {}
+```
+
+### 多数据源配置
+
+```yaml
+spring:
+  datasource:
+    dynamic:
+      primary: master
+      strict: false
+      datasource:
+        master:
+          url: jdbc:mysql://master:3306/db
+          username: root
+          password: root
+          driver-class-name: com.mysql.cj.jdbc.Driver
+        slave:
+          url: jdbc:mysql://slave:3306/db
+          username: root
+          password: root
+          driver-class-name: com.mysql.cj.jdbc.Driver
+        report:
+          url: jdbc:mysql://report:3306/db
+          username: root
+          password: root
+          driver-class-name: com.mysql.cj.jdbc.Driver
+```
+
+## 补充：动态 SQL 深入
+
+### 动态 SQL 标签
+
+```xml
+<!-- if 标签 -->
+<if test="name != null and name != ''">
+    AND name = #{name}
+</if>
+
+<!-- choose/when/otherwise -->
+<choose>
+    <when test="status == 1">AND status = 'ACTIVE'</when>
+    <when test="status == 2">AND status = 'INACTIVE'</when>
+    <otherwise>AND status != 'DELETED'</otherwise>
+</choose>
+
+<!-- where 标签（自动去除AND/OR） -->
+<where>
+    <if test="name != null">AND name = #{name}</if>
+    <if test="age != null">AND age = #{age}</if>
+</where>
+
+<!-- set 标签（自动去除逗号） -->
+<update>
+    UPDATE user
+    <set>
+        <if test="name != null">name = #{name},</if>
+        <if test="age != null">age = #{age},</if>
+    </set>
+    WHERE id = #{id}
+</update>
+
+<!-- foreach -->
+<foreach collection="ids" item="id" open="(" separator="," close=")">
+    #{id}
+</foreach>
+
+<!-- trim 标签 -->
+<trim prefix="(" suffix=")" prefixOverrides="AND |OR ">
+    <if test="name != null">AND name = #{name}</if>
+    <if test="age != null">AND age = #{age}</if>
+</trim>
+
+<!-- sql 片段 -->
+<sql id="userCondition">
+    <if test="name != null">AND name = #{name}</if>
+    <if test="age != null">AND age = #{age}</if>
+</sql>
+
+<select id="selectUser" resultType="User">
+    SELECT * FROM user
+    <where>
+        <include refid="userCondition"/>
+    </where>
+</select>
+```
+
+## 补充：Spring Boot 自动配置
+
+### 自动配置原理
+
+```mermaid
+graph TD
+    A[Spring Boot] --> B[MybatisAutoConfiguration]
+    B --> C[SqlSessionFactory]
+    B --> D[SqlSessionTemplate]
+    C --> E[DataSource]
+    C --> F[MybatisConfiguration]
+    D --> G[SqlSession]
+    G --> H[MapperProxy]
+    H --> I[Mapper接口]
+```
+
+### 自动配置属性
+
+```yaml
+# application.yml
+mybatis:
+  # Mapper XML 文件位置
+  mapper-locations: classpath:mapper/**/*.xml
+  # 实体类包路径
+  type-aliases-package: com.example.entity
+  # MyBatis 配置
+  configuration:
+    # 驼峰命名转换
+    map-underscore-to-camel-case: true
+    # 开启二级缓存
+    cache-enabled: true
+    # 开启延迟加载
+    lazy-loading-enabled: true
+    # 按需加载
+    aggressive-lazy-loading: false
+    # 日志实现
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    # 全局滚动行为
+    default-fetch-size: 100
+    # 超时时间
+    default-statement-timeout: 30
+  # 数据源配置
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/db
+    username: root
+    password: root
+```
+
+### 自动配置类
+
+```java
+@Configuration
+@ConditionalOnClass({SqlSessionFactory.class, SqlSessionFactoryBean.class})
+@ConditionalOnBean(DataSource.class)
+@EnableConfigurationProperties(MybatisProperties.class)
+public class MybatisAutoConfiguration {
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public SqlSessionFactory sqlSessionFactory(DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean factory = new SqlSessionFactoryBean();
+        factory.setDataSource(dataSource);
+        factory.setMapperLocations(this.properties.resolveMapperLocations());
+        factory.setTypeAliasesPackage(this.properties.getTypeAliasesPackage());
+        
+        org.apache.ibatis.session.Configuration configuration = new org.apache.ibatis.session.Configuration();
+        configuration.setMapUnderscoreToCamelCase(this.properties.isMapUnderscoreToCamelCase());
+        configuration.setCacheEnabled(this.properties.isCacheEnabled());
+        factory.setConfiguration(configuration);
+        
+        return factory.getObject();
+    }
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public SqlSessionTemplate sqlSessionTemplate(SqlSessionFactory sqlSessionFactory) {
+        return new SqlSessionTemplate(sqlSessionFactory);
+    }
+}
+```
+
+## 缓存机制
 
 | 缓存类型 | 作用域 | 说明 |
 |----------|--------|------|

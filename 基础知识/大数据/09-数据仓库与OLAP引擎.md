@@ -2330,4 +2330,426 @@ groups:
 
 ---
 
+## ClickHouse vs StarRocks 物化视图对比
+
+### 物化视图实现差异
+
+| 维度 | ClickHouse | StarRocks |
+|------|------------|-----------|
+| 类型 | 异步（写入触发） | 同步/异步 |
+| 刷新策略 | 写入时自动 | 定时/手动 |
+| 查询路由 | 不自动 | 自动选择最优 |
+| 维护方式 | 合并时更新 | 实时更新 |
+| 适用场景 | 日志聚合 | 实时报表 |
+
+```sql
+-- ClickHouse 物化视图
+CREATE MATERIALIZED VIEW mv_orders_ch
+ENGINE = SummingMergeTree()
+ORDER BY (date, user_id)
+AS SELECT
+    toDate(order_time) AS date,
+    user_id,
+    SUM(amount) AS total_amount,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY date, user_id;
+
+-- StarRocks 物化视图
+CREATE MATERIALIZED VIEW mv_orders_sr
+BUILD DEFERRED REFRESH AUTO ON COMMIT
+AS SELECT
+    date_trunc('day', order_time) AS dt,
+    user_id,
+    SUM(amount) AS total_amount,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY date_trunc('day', order_time), user_id;
+```
+
+## Doris Lakehouse 架构
+
+### 湖仓一体实现
+
+```text
+Doris Lakehouse：
+  存储层：
+    支持 HDFS/S3/OSS 对象存储
+    外表直读：Hive/Iceberg/Delta Lake/Hudi
+    统一 SQL：对外表进行 SQL 查询
+
+  计算层：
+    向量化执行引擎
+    MPP 并行计算
+    物化视图加速
+
+  优势：
+    1. 无需数据搬迁
+    2. 统一 SQL 接口
+    3. 实时+离线统一
+    4. 降低存储成本
+```
+
+### Iceberg 外表配置
+
+```sql
+-- Iceberg 外表
+CREATE EXTERNAL TABLE iceberg_orders
+(
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(18,2),
+    order_time DATETIME
+)
+ENGINE = iceberg
+PROPERTIES
+(
+    "iceberg.catalog.type" = "hive",
+    "iceberg.hadoop.metastore.uris" = "thrift://metastore:9083",
+    "iceberg.database" = "iceberg_db",
+    "iceberg.table" = "orders"
+);
+
+-- 查询 Iceberg 外表
+SELECT user_id, SUM(amount)
+FROM iceberg_orders
+WHERE order_time >= '2026-01-01'
+GROUP BY user_id;
+```
+
+## OLAP 选型决策树
+
+### 技术选型指南
+
+```mermaid
+flowchart TD
+    A[OLAP 选型] --> B{数据规模?}
+    B -->|< 100GB| C[DuckDB/SQLite]
+    B -->|100GB~1TB| D[ClickHouse/Doris]
+    B -->|> 1TB| E[StarRocks/自建]
+
+    D --> F{查询模式?}
+    F -->|单表聚合| G[ClickHouse]
+    F -->|复杂 JOIN| H[Doris/StarRocks]
+
+    E --> I{并发要求?}
+    I -->|高并发| J[StarRocks]
+    I -->|低并发| K[ClickHouse]
+
+    G --> L{运维能力?}
+    L -->|强| M[ClickHouse 自建]
+    L -->|弱| N[Doris 托管]
+```
+
+### 选型评分卡
+
+| 维度 | ClickHouse | Doris | StarRocks |
+|------|------------|-------|-----------|
+| 性能 | 9 | 8 | 9 |
+| 易用性 | 7 | 8 | 9 |
+| 生态 | 8 | 8 | 7 |
+| 运维 | 7 | 7 | 8 |
+| 成本 | 8 | 9 | 7 |
+| **总分** | **8.2** | **8.0** | **8.0** |
+
+## 导入性能对比
+
+### 各引擎导入能力
+
+| 引擎 | 导入方式 | 吞吐量 | 延迟 | 适用 |
+|------|---------|--------|------|------|
+| ClickHouse | Batch Insert | 高 | 中 | 批量 |
+| Doris | Stream Load | 高 | 低 | 实时 |
+| StarRocks | Stream Load | 高 | 低 | 实时 |
+| ClickHouse | Kafka Engine | 高 | 低 | 流式 |
+| Doris | Routine Load | 中 | 低 | 流式 |
+
+### 导入性能优化
+
+```text
+导入优化策略：
+  1. 批量写入
+     大批量 > 小批量
+     建议：10000-50000 条/批
+
+  2. 并行导入
+     多线程/多节点并行
+     避免单点瓶颈
+
+  3. 数据格式
+     列式格式（Parquet/ORC）> 行式（CSV/JSON）
+     压缩：LZ4/ZSTD
+
+  4. 索引跳过
+     分区裁剪
+     布隆过滤器
+
+  5. 资源隔离
+     导入资源组
+     避免影响查询
+```
+
+## 集群运维深入
+
+### 监控与告警
+
+```yaml
+# OLAP 集群监控指标
+metrics:
+  - name: query_count
+    type: counter
+    labels: [database, user]
+
+  - name: query_duration
+    type: histogram
+    buckets: [0.1, 0.5, 1, 5, 10, 30]
+    labels: [database, user]
+
+  - name: memory_usage
+    type: gauge
+    labels: [node]
+
+  - name: disk_usage
+    type: gauge
+    labels: [node]
+
+  - name: merge_count
+    type: counter
+    labels: [table]
+
+告警规则：
+  - alert: HighQueryLatency
+    expr: histogram_quantile(0.99, query_duration) > 10
+    for: 5m
+    labels:
+      severity: warning
+
+  - alert: HighMemoryUsage
+    expr: memory_usage / max_memory_usage > 0.8
+    for: 5m
+    labels:
+      severity: warning
+
+  - alert: DiskAlmostFull
+    expr: disk_usage / max_disk_usage > 0.85
+    for: 5m
+    labels:
+      severity: critical
+```
+
+### 运维最佳实践
+
+```text
+运维最佳实践：
+  1. 日常巡检
+     检查集群状态
+     检查磁盘使用
+     检查慢查询
+
+  2. 性能优化
+     定期 ANALYZE
+     物化视图维护
+     索引优化
+
+  3. 数据管理
+     过期数据清理
+     压缩策略调整
+     分区管理
+
+  4. 备份恢复
+     定期备份
+     恢复测试
+     灾备演练
+
+  5. 版本升级
+     测试兼容性
+     灰度升级
+     回滚方案
+```
+
+## OLAP 实时报表
+
+### 实时报表架构
+
+```mermaid
+flowchart LR
+    A[数据源] --> B[Kafka]
+    B --> C[Flink]
+    C --> D[Doris/StarRocks]
+    D --> E[BI 工具]
+    E --> F[实时大屏]
+
+    A --> G[CDC]
+    G --> D
+```
+
+### 实时报表优化
+
+```text
+实时报表优化：
+  1. 预聚合
+     物化视图自动维护
+     查询直接命中
+
+  2. 增量更新
+     CDC 增量同步
+     避免全量刷新
+
+  3. 缓存策略
+     热点数据缓存
+     多级缓存
+
+  4. 查询优化
+     分区裁剪
+     列裁剪
+     聚合下推
+
+  5. 资源隔离
+     报表查询独立资源组
+     避免影响分析
+```
+
+## 数仓分层深入
+
+### ODS/DWD/DWS/ADS 设计
+
+```text
+数仓分层：
+  ODS（Operational Data Store）：
+    原始数据层
+    保持数据原貌
+    数据清洗：去重、格式化
+
+  DWD（Data Warehouse Detail）：
+    明细数据层
+    数据清洗、规范化
+    维度退化
+
+  DWS（Data Warehouse Summary）：
+    汇总数据层
+    轻度聚合
+    宽表设计
+
+  ADS（Application Data Store）：
+    应用数据层
+    面向应用
+    高度聚合
+
+  DIM（Dimension）：
+    维度层
+    维度表管理
+    SCD 处理
+```
+
+## 维度建模深入
+
+### 星型/雪花/星座模型
+
+```text
+维度建模：
+  星型模型：
+    事实表 + 维度表（直接关联）
+    查询简单，性能好
+    适用：OLAP 分析
+
+  雪花模型：
+    事实表 + 维度表（规范化）
+    存储高效，查询复杂
+    适用：数据仓库
+
+  星座模型：
+    多个事实表共享维度表
+    适合复杂业务
+    适用：企业级数仓
+
+  设计原则：
+    1. 事实表：度量、外键
+    2. 维度表：描述、属性
+    3. 一致性：维度一致性
+    4. 可扩展：支持新业务
+```
+
+## 对比传统数仓
+
+### MPP vs 列式 OLAP
+
+| 维度 | 传统数仓(MPP) | 列式 OLAP |
+|------|--------------|-----------|
+| 架存 | MPP | 列式存储 |
+| 扩展性 | 垂直扩展 | 水平扩展 |
+| 性能 | 高 | 高 |
+| 成本 | 高 | 低 |
+| 易用性 | 中 | 高 |
+| 适用 | 企业级 | 互联网 |
+
+## 最佳实践深入
+
+### 数仓建设最佳实践
+
+```text
+数仓建设最佳实践：
+  1. 需求驱动
+     业务需求优先
+     快速迭代
+
+  2. 数据治理
+     数据标准化
+     质量监控
+     元数据管理
+
+  3. 性能优化
+     分区策略
+     索引优化
+     物化视图
+
+  4. 成本控制
+     冷热数据分离
+     压缩策略
+     资源隔离
+
+  5. 安全合规
+     数据分级
+     权限控制
+     审计日志
+```
+
+## 生产问题排查
+
+### 常见问题与解决方案
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 查询慢 | 数据量大/查询复杂 | 优化查询/物化视图 |
+| 导入慢 | 并发低/数据量大 | 增加并发/批量导入 |
+| 内存溢出 | 查询复杂/并发高 | 限制并发/内存限制 |
+| 磁盘满 | 数据量增长 | 清理数据/扩容 |
+| 数据不一致 | ETL 错误 | 质量监控/修复 |
+
+### 排查流程
+
+```text
+问题排查流程：
+  1. 确认问题
+     错误日志
+     监控指标
+     用户反馈
+
+  2. 定位原因
+     慢查询分析
+     资源使用分析
+     数据质量检查
+
+  3. 解决方案
+     紧急处理：止血
+     根因分析：定位
+     长期优化：预防
+
+  4. 验证效果
+     监控指标
+     用户反馈
+     持续观察
+```
+
+---
+
 ## 一句话：**数仓 = 分层（ODS/DWD/DWS/ADS）+ 建模（星型 + SCD）+ 口径统一（OneData）；OLAP = 列式 + 向量化 + MPP 三支柱——选型："单表极致 ClickHouse、复杂高并发 StarRocks、轻量省心 Doris"；建物化视图加速热点查询**。

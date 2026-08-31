@@ -2144,4 +2144,535 @@ graph TB
 | 监控 | 完善监控 | 问题快速定位 |
 | 降级 | 熔断降级 | 保障系统稳定 |
 
+## 补充：Gateway Metrics 监控
+
+### Micrometer 指标配置
+
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.75,0.95,0.99
+      slt:
+        http.server.requests: 5ms,10ms,50ms,100ms,200ms,500ms,1s
+```
+
+### 自定义指标
+
+```java
+@Component
+public class GatewayMetricsFilter implements GlobalFilter, Ordered {
+    
+    private final MeterRegistry meterRegistry;
+    
+    public GatewayMetricsFilter(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String routeId = exchange.getAttribute(GATEWAY_ROUTE_ATTR);
+        String targetUri = exchange.getAttribute(GATEWAY_REQUEST_URL_ATTR);
+        
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+            // 记录请求指标
+            sample.stop(Timer.builder("gateway.request")
+                .tag("route.id", routeId != null ? routeId : "unknown")
+                .tag("target.uri", targetUri != null ? targetUri.toString() : "unknown")
+                .tag("status", exchange.getResponse().getStatusCode().value() + "")
+                .register(meterRegistry));
+            
+            // 记录响应时间
+            long duration = exchange.getAttribute("gateway.request.duration");
+            if (duration != null) {
+                meterRegistry.timer("gateway.response.time",
+                    "route.id", routeId,
+                    "status", exchange.getResponse().getStatusCode().value() + "")
+                    .record(duration, TimeUnit.MILLISECONDS);
+            }
+        }));
+    }
+    
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE;
+    }
+}
+```
+
+### 监控仪表板指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `gateway_requests_total` | 请求总数 | - |
+| `gateway_requests_seconds` | 请求延迟 | P99 > 1s |
+| `gateway_route_success_total` | 路由成功数 | - |
+| `gateway_route_failure_total` | 路由失败数 | > 10/min |
+| `gateway_upstream_latency` | 上游延迟 | P99 > 2s |
+
+## 补充：会话共享
+
+### Redis 会话共享配置
+
+```yaml
+# application.yml
+spring:
+  session:
+    store-type: redis
+    timeout: 1800
+    redis:
+      namespace: gateway
+      flush-mode: on_save
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: ${REDIS_PASSWORD}
+    database: 0
+    lettuce:
+      pool:
+        max-active: 16
+        max-idle: 8
+        min-idle: 4
+        max-wait: 1000ms
+```
+
+### 会话共享实现
+
+```java
+// 自定义会话存储
+@Component
+public class GatewaySessionFilter implements GlobalFilter, Ordered {
+    
+    private final ReactiveRedisTemplate<String, Object> redisTemplate;
+    
+    public GatewaySessionFilter(ReactiveRedisTemplate<String, Object> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // 获取或创建会话
+        return exchange.getSession()
+            .flatMap(session -> {
+                // 存储会话信息
+                String sessionId = session.getId();
+                Map<String, Object> sessionData = new HashMap<>();
+                sessionData.put("startTime", Instant.now());
+                sessionData.put("routeId", exchange.getAttribute(GATEWAY_ROUTE_ATTR));
+                
+                return redisTemplate.opsForHash()
+                    .putAll("session:" + sessionId, sessionData)
+                    .then(chain.filter(exchange));
+            });
+    }
+    
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE + 1;
+    }
+}
+```
+
+### 会话配置
+
+```yaml
+# Redis Session 配置
+spring:
+  session:
+    redis:
+      # 会话过期时间
+      flush-mode: on_save
+      # 会话清理策略
+      cleanup-policy: delete
+      # 会话存储格式
+      save-mode: on_save
+      # 会话序列化
+      serializer: jackson
+```
+
+## 补充：Service Mesh 集成
+
+### Istio 集成配置
+
+```yaml
+# Gateway 与 Istio 集成
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: spring-cloud-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: gateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "*.example.com"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: spring-cloud-gateway
+spec:
+  hosts:
+    - "*.example.com"
+  gateways:
+    - spring-cloud-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: spring-cloud-gateway
+            port:
+              number: 8080
+          weight: 100
+```
+
+### 负载均衡配置
+
+```java
+// 与 Istio 负载均衡集成
+@Configuration
+public class IstioLoadBalancingConfig {
+    
+    @Bean
+    public ReactorLoadBalancer<ServiceInstance> reactLoadBalancer(
+            Environment environment,
+            LoadBalancerClientFactory loadBalancerClientFactory) {
+        
+        String name = environment.getProperty("loadbalancer.client.name");
+        return new RoundRobinLoadBalancer(
+            loadBalancerClientFactory.getLazyProvider(name,
+                ServiceInstanceListSupplier.class),
+            name);
+    }
+}
+```
+
+## 补充：限流降级深入
+
+### 令牌桶限流实现
+
+```java
+// 令牌桶算法
+public class TokenBucket {
+    
+    private final long capacity; // 桶容量
+    private final long refillRate; // 每秒填充速率
+    private long tokens; // 当前令牌数
+    private long lastRefillTime; // 上次填充时间
+    
+    public TokenBucket(long capacity, long refillRate) {
+        this.capacity = capacity;
+        this.refillRate = refillRate;
+        this.tokens = capacity;
+        this.lastRefillTime = System.currentTimeMillis();
+    }
+    
+    public synchronized boolean tryConsume() {
+        refill();
+        if (tokens > 0) {
+            tokens--;
+            return true;
+        }
+        return false;
+    }
+    
+    private void refill() {
+        long now = System.currentTimeMillis();
+        long timePassed = now - lastRefillTime;
+        long newTokens = timePassed * refillRate / 1000;
+        
+        tokens = Math.min(capacity, tokens + newTokens);
+        lastRefillTime = now;
+    }
+}
+
+// Sentinel 令牌桶配置
+FlowRule rule = new FlowRule();
+rule.setResource("user-api");
+rule.setGrade(RuleConstant.FLOW_GRADE_QPS);
+rule.setCount(100);
+// 控制行为：1=快速失败，2=Warm Up，3=排队等待
+rule.setControlBehavior(RuleConstant.CONTROL_BEHAVIOR_WARM_UP);
+// 预热时长
+rule.setWarmUpPeriodSec(10);
+// 排队超时
+rule.setMaxQueueingTimeMs(500);
+```
+
+### 滑动窗口限流
+
+```java
+// 滑动窗口限流器
+public class SlidingWindowRateLimiter {
+    
+    private final int windowSize; // 窗口大小（毫秒）
+    private final int maxRequests; // 窗口内最大请求数
+    private final Map<Long, AtomicInteger> windowCounts = new ConcurrentHashMap<>();
+    
+    public SlidingWindowRateLimiter(int windowSize, int maxRequests) {
+        this.windowSize = windowSize;
+        this.maxRequests = maxRequests;
+    }
+    
+    public boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long windowKey = now / windowSize;
+        
+        // 获取或创建当前窗口计数器
+        AtomicInteger counter = windowCounts.computeIfAbsent(
+            windowKey, 
+            k -> new AtomicInteger(0)
+        );
+        
+        // 检查是否超过阈值
+        if (counter.get() >= maxRequests) {
+            return false;
+        }
+        
+        // 增加计数
+        counter.incrementAndGet();
+        
+        // 清理过期窗口
+        windowCounts.entrySet().removeIf(entry -> 
+            entry.getKey() < (now - windowSize) / windowSize
+        );
+        
+        return true;
+    }
+}
+```
+
+### 熔断降级配置
+
+```java
+// Resilience4j 熔断配置
+@Configuration
+public class CircuitBreakerConfig {
+    
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        // 熔断配置
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50) // 失败率阈值 50%
+            .waitDurationInOpenState(Duration.ofSeconds(10)) // 熔断时长 10秒
+            .slidingWindowSize(100) // 滑动窗口大小
+            .minimumNumberOfCalls(10) // 最小请求数
+            .permittedNumberOfCallsInHalfOpenState(10) // 半开状态允许请求数
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            .build();
+        
+        return CircuitBreakerRegistry.of(config);
+    }
+    
+    @Bean
+    public WebClient webClient(CircuitBreakerRegistry circuitBreakerRegistry) {
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker("userService");
+        
+        WebClient.builder()
+            .filter(ExchangeFilterFunctions
+                .circuitBreaker(circuitBreaker, 
+                    request -> Mono.error(new RuntimeException("Circuit breaker is open"))))
+            .build();
+    }
+}
+```
+
+## 补充：生产问题排查
+
+### 高级排查技巧
+
+```bash
+# 1. 检查路由配置
+curl -s 'http://localhost:8080/actuator/gateway/routes' | jq
+
+# 2. 检查路由谓词
+curl -s 'http://localhost:8080/actuator/gateway/routes/{id}' | jq
+
+# 3. 检查过滤器链
+curl -s 'http://localhost:8080/actuator/gateway/globalfilters' | jq
+
+# 4. 检查服务发现
+curl -s 'http://localhost:8080/actuator/gateway/routes' | jq '.[].metadata'
+
+# 5. 检查动态路由
+curl -s 'http://localhost:8080/actuator/gateway/refresh' -X POST
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `spring.cloud.gateway.httpclient.connect-timeout` | 5000 | 3000 | 连接超时 |
+| `spring.cloud.gateway.httpclient.response-timeout` | 10s | 5s | 响应超时 |
+| `spring.cloud.gateway.httpclient.pool.max-connections` | 500 | 1000 | 最大连接数 |
+| `spring.cloud.gateway.httpclient.pool.acquire-timeout` | 5000 | 3000 | 获取连接超时 |
+| `spring.cloud.gateway.httpclient.pool.max-idle-time` | 20s | 60s | 空闲连接超时 |
+
+### 内存优化
+
+```yaml
+# JVM 参数优化
+server:
+  tomcat:
+    max-threads: 200
+    min-spare-threads: 20
+    max-connections: 10000
+    accept-count: 100
+    connection-timeout: 5000
+
+spring:
+  cloud:
+    gateway:
+      httpclient:
+        pool:
+          type: elastic
+          max-connections: 1000
+          acquire-timeout: 3000
+          max-idle-time: 60s
+          max-life-time: 300s
+```
+
+## 补充：Gateway vs Nginx 对比
+
+### 功能对比
+
+| 功能 | Spring Cloud Gateway | Nginx |
+|------|---------------------|-------|
+| 路由 | 动态路由 | 静态配置 |
+| 语言 | Java | C |
+| 扩展性 | Java 插件 | Lua 模块 |
+| 性能 | 高 | 极高 |
+| 内存 | 较高 | 较低 |
+| 学习曲线 | 中 | 低 |
+| 社区 | 大 | 大 |
+| 云原生 | 原生支持 | 需要适配 |
+
+### 选型决策
+
+```mermaid
+graph TD
+    A[开始] --> B{技术栈?}
+    B -->|Java/Spring| C[Spring Cloud Gateway]
+    B -->|多语言| D[Nginx]
+    
+    C --> E{需求?}
+    E -->|动态路由| F[Spring Cloud Gateway]
+    E -->|静态配置| G[Nginx]
+    
+    D --> H{性能要求?}
+    H -->|极高| I[Nginx]
+    H -->|高| J[Spring Cloud Gateway]
+    
+    F --> K[集成服务发现]
+    G --> L[配置文件管理]
+```
+
+## 补充：高可用部署
+
+### 高可用架构
+
+```mermaid
+graph TB
+    subgraph 负载均衡
+        A[LB] --> B[Gateway 1]
+        A --> C[Gateway 2]
+        A --> D[Gateway 3]
+    end
+    
+    subgraph 注册中心
+        B --> E[Service Registry]
+        C --> E
+        D --> E
+    end
+    
+    subgraph 服务集群
+        B --> F[Service A]
+        C --> G[Service B]
+        D --> H[Service C]
+    end
+    
+    subgraph 监控
+        B --> I[Prometheus]
+        C --> I
+        D --> I
+        I --> J[Grafana]
+    end
+```
+
+### 部署配置
+
+```yaml
+# Kubernetes 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-cloud-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: spring-cloud-gateway:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-service
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: LoadBalancer
+```
+
 ## 二十二、与其他板块的关系

@@ -2004,6 +2004,608 @@ metrics:
      → 定期健康检查
 ```
 
+## 三十二、MQTT 协议高级特性
+
+### 32.1 QoS 级别深入解析
+
+```python
+# QoS 0: 最多一次
+# 发送后不等待确认，可能丢失
+client.publish("topic/qos0", "message", qos=0)
+
+# QoS 1: 至少一次
+# 发送后等待 PUBACK，可能重复
+client.publish("topic/qos1", "message", qos=1)
+
+# QoS 2: 恰好一次
+# 四次握手，保证一次且仅一次
+client.publish("topic/qos2", "message", qos=2)
+
+# QoS 2 四次握手流程
+# 1. 发送 PUBLISH (msg_id=1)
+# 2. 接收 PUBREC (msg_id=1)
+# 3. 发送 PUBREL (msg_id=1)
+# 4. 接收 PUBCOMP (msg_id=1)
+```
+
+```java
+// QoS 处理示例
+public class QoSHandler {
+    
+    public void handlePublish(MqttMessage message) {
+        switch (message.getQos()) {
+            case 0:
+                // QoS 0: 直接处理，不确认
+                processMessage(message);
+                break;
+                
+            case 1:
+                // QoS 1: 处理后发送 PUBACK
+                processMessage(message);
+                sendPubAck(message.getId());
+                break;
+                
+            case 2:
+                // QoS 2: 四次握手
+                if (!isDuplicate(message.getId())) {
+                    processMessage(message);
+                    sendPubRec(message.getId());
+                }
+                break;
+        }
+    }
+    
+    private boolean isDuplicate(int messageId) {
+        // 检查消息是否已处理（使用消息ID去重）
+        return processedMessages.contains(messageId);
+    }
+}
+```
+
+| QoS 级别 | 传输次数 | 延迟 | 可靠性 | 适用场景 |
+|----------|----------|------|--------|----------|
+| QoS 0 | 最多1次 | 低 | 低 | 遥测数据、日志 |
+| QoS 1 | 至少1次 | 中 | 中 | 告警、通知 |
+| QoS 2 | 恰好1次 | 高 | 高 | 控制指令、交易 |
+
+### 32.2 遗嘱消息与保留消息
+
+```python
+# 遗嘱消息配置
+# 当客户端异常断开时，Broker 自动发布遗嘱消息
+client = mqtt.Client(
+    client_id="device-001",
+    will_qos=1,
+    will_retain=True,
+    will_payload=b"offline",
+    will_topic="status/device-001"
+)
+
+# 保留消息配置
+# Broker 保存主题的最后一条消息
+client.publish("status/device-001", "online", qos=1, retain=True)
+
+# 订阅保留消息
+client.subscribe("status/+", qos=1)
+# 新订阅者会立即收到最后一条保留消息
+```
+
+```java
+// 遗嘱消息处理
+public class WillMessageHandler {
+    
+    public void onClientDisconnect(String clientId, String willTopic, String willMessage) {
+        // 客户端异常断开时触发
+        log.warn("Client {} disconnected, publishing will message to {}", clientId, willTopic);
+        
+        // 发布遗嘱消息
+        MqttMessage willMsg = new MqttMessage(willMessage.getBytes());
+        willMsg.setQos(1);
+        willMsg.setRetained(true);
+        mqttClient.publish(willTopic, willMsg);
+        
+        // 更新设备状态
+        deviceStatusService.updateStatus(clientId, "offline");
+    }
+}
+```
+
+## 三十三、安全与认证深度实战
+
+### 33.1 多种认证方式
+
+```yaml
+# EMQX 认证配置
+authentication:
+  # 1. 密码认证
+  - mechanism: password_based
+    backend: built_in_database
+    password_hash_algorithm:
+      name: sha256
+      salt_position: suffix
+  
+  # 2. LDAP 认证
+  - mechanism: password_based
+    backend: ldap
+    ldap:
+      servers: ["ldap.example.com"]
+      base_dn: "ou=users,dc=example,dc=com"
+      filter: "(uid=${username})"
+      bind_dn: "cn=admin,dc=example,dc=com"
+      bind_password: "admin_password"
+  
+  # 3. HTTP 认证
+  - mechanism: password_based
+    backend: http
+    http:
+      url: "http://auth-service:8080/auth"
+      method: post
+      body:
+        clientid: "${clientid}"
+        username: "${username}"
+        password: "${password}"
+      headers:
+        Content-Type: "application/json"
+  
+  # 4. JWT 认证
+  - mechanism: jwt
+    from: password
+    use_jwks: true
+    jwks:
+      url: "http://auth-service:8080/.well-known/jwks.json"
+      refresh_interval: 600
+    claim_mapping:
+      sub: username
+      exp: expiration
+```
+
+### 33.2 ACL 授权控制
+
+```yaml
+# ACL 配置
+authorization:
+  no_match: deny
+  deny_action: disconnect
+  
+  # 内置 ACL 规则
+  sources:
+    - type: built_in_database
+      enable: true
+      acl_nomatch: deny
+      
+  # HTTP ACL
+  - type: http
+    enable: true
+    url: "http://auth-service:8080/acl"
+    method: post
+    body:
+      clientid: "${clientid}"
+      username: "${username}"
+      topic: "${topic}"
+      action: "${action}"
+    
+  # 文件 ACL
+  - type: file
+    enable: true
+    path: "/etc/emqx/acl.conf"
+
+# ACL 规则示例
+# 允许设备发布自己的状态
+allow {
+    topic = "status/${username}"
+    action = publish
+}
+
+# 允许设备订阅自己的命令
+allow {
+    topic = "commands/${username}/#"
+    action = subscribe
+}
+
+# 拒绝其他所有操作
+deny {
+    topic = "#"
+    action = all
+}
+```
+
+```python
+# ACL 检查逻辑
+class ACLChecker:
+    
+    def check_acl(self, client_id, username, topic, action):
+        """
+        检查客户端是否有权限执行指定操作
+        """
+        # 1. 检查设备只能发布自己的状态
+        if topic.startswith("status/") and action == "publish":
+            device_id = topic.split("/")[1]
+            if device_id == username:
+                return True
+        
+        # 2. 检查设备只能订阅自己的命令
+        if topic.startswith("commands/") and action == "subscribe":
+            device_id = topic.split("/")[1]
+            if device_id == username:
+                return True
+        
+        # 3. 拒绝其他所有操作
+        return False
+```
+
+## 三十四、性能优化深度实战
+
+### 34.1 连接优化
+
+```yaml
+# 连接池配置
+listeners:
+  tcp:
+    default:
+      bind: "0.0.0.0:1883"
+      max_connections: 1000000
+      
+      # 连接优化
+      tcp_options:
+        nodelay: true
+        sndbuf: 1MB
+        recbuf: 1MB
+        
+      # 协议配置
+      max_packet_size: 1MB
+      max_clientid_len: 256
+      
+  ws:
+    default:
+      bind: "0.0.0.0:8083"
+      max_connections: 100000
+      
+      # WebSocket 优化
+      websocket_options:
+        idle_timeout: 60
+        max_frame_size: 1MB
+```
+
+```python
+# 客户端连接优化
+import paho.mqtt.client as mqtt
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Connected successfully")
+        
+        # 批量订阅
+        topics = [
+            ("sensor/temperature", 1),
+            ("sensor/humidity", 1),
+            ("sensor/pressure", 1),
+        ]
+        client.subscribe(topics)
+        
+        # 设置 keepalive
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+
+client = mqtt.Client(client_id="device-001")
+
+# 连接优化配置
+client.connect_async(
+    host="broker.example.com",
+    port=1883,
+    keepalive=60,
+    bind_address="0.0.0.0"
+)
+
+# 自动重连
+client.reconnect_delay_set(min_delay=1, max_delay=120)
+```
+
+### 34.2 消息优化
+
+```yaml
+# 消息配置优化
+mqtt {
+  # 消息队列配置
+  max_queue_size = 10000
+  
+  # 消息过期时间
+  message_expiry_interval = 3600
+  
+  # 最大消息大小
+  max_packet_size = 1MB
+  
+  # 消息合并
+  enable_message_coalescing = true
+  
+  # 批量发送
+  batch_size = 100
+  batch_timeout = 10
+}
+```
+
+```java
+// 消息批量处理
+public class MessageBatchProcessor {
+    
+    private final List<MqttMessage> messageBuffer = new ArrayList<>();
+    private final int batchSize;
+    private final long batchTimeout;
+    private final Timer batchTimer;
+    
+    public MessageBatchProcessor(int batchSize, long batchTimeout) {
+        this.batchSize = batchSize;
+        this.batchTimeout = batchTimeout;
+        this.batchTimer = new Timer("BatchProcessor", true);
+        
+        // 定时刷新批次
+        batchTimer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                flushBatch();
+            }
+        }, batchTimeout, batchTimeout);
+    }
+    
+    public synchronized void addMessage(MqttMessage message) {
+        messageBuffer.add(message);
+        
+        if (messageBuffer.size() >= batchSize) {
+            flushBatch();
+        }
+    }
+    
+    private synchronized void flushBatch() {
+        if (messageBuffer.isEmpty()) {
+            return;
+        }
+        
+        // 批量处理消息
+        List<MqttMessage> batch = new ArrayList<>(messageBuffer);
+        messageBuffer.clear();
+        
+        // 发送批量消息
+        processBatch(batch);
+    }
+}
+```
+
+## 三十五、生产监控与告警
+
+### 35.1 核心监控指标
+
+```sql
+-- EMQX 监控指标查询
+SELECT 
+    node,
+    connections,
+    connections_max,
+    live_connections,
+    messages_received,
+    messages_sent,
+    messages_dropped,
+    bytes_received,
+    bytes_sent,
+    topics_count,
+    subscriptions_count
+FROM emqx_metrics
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+
+-- 连接状态监控
+SELECT 
+    client_id,
+    username,
+    ip_address,
+    connected_at,
+    disconnected_at,
+    keepalive,
+    protocol_version
+FROM emqx_connections
+WHERE connected_at > NOW() - INTERVAL '24 hours'
+ORDER BY connected_at DESC;
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: emqx_alerts
+    rules:
+      - alert: EMQXHighConnectionRate
+        expr: rate(emqx_connections_count[5m]) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EMQX 连接速率过高"
+          description: "过去5分钟连接速率超过1000/s"
+      
+      - alert: EMQXHighMessageRate
+        expr: rate(emqx_messages_received[5m]) > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EMQX 消息速率过高"
+          description: "过去5分钟消息接收速率超过10000/s"
+      
+      - alert: EMQXMessageDropped
+        expr: rate(emqx_messages_dropped[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EMQX 消息丢弃率过高"
+          description: "过去5分钟消息丢弃速率超过100/s"
+```
+
+### 35.2 告警规则配置
+
+```yaml
+# 告警规则配置
+alarm_rules:
+  # 连接数告警
+  - name: high_connections
+    condition: connections > 100000
+    duration: 5m
+    severity: warning
+    message: "连接数过高: {{ .Value }}"
+  
+  # 消息速率告警
+  - name: high_message_rate
+    condition: messages_received_rate > 10000
+    duration: 5m
+    severity: warning
+    message: "消息速率过高: {{ .Value }}/s"
+  
+  # 内存使用告警
+  - name: high_memory_usage
+    condition: memory_used_percent > 80
+    duration: 5m
+    severity: warning
+    message: "内存使用率过高: {{ .Value }}%"
+  
+  # 磁盘使用告警
+  - name: high_disk_usage
+    condition: disk_used_percent > 90
+    duration: 5m
+    severity: critical
+    message: "磁盘使用率过高: {{ .Value }}%"
+```
+
+## 三十六、集成模式深度实战
+
+### 36.1 规则引擎高级配置
+
+```sql
+-- 复杂规则引擎配置
+SELECT 
+    clientid,
+    payload.temperature as temperature,
+    payload.humidity as humidity,
+    timestamp,
+    topic
+FROM "sensor/#"
+WHERE payload.temperature > 30 OR payload.humidity > 80
+
+-- 数据转换
+SELECT 
+    clientid,
+    payload.* as data,
+    timestamp as time,
+    'sensor_data' as type
+FROM "sensor/#"
+
+-- 数据聚合
+SELECT 
+    clientid,
+    avg(payload.temperature) as avg_temp,
+    max(payload.temperature) as max_temp,
+    min(payload.temperature) as min_temp,
+    count(*) as sample_count
+FROM "sensor/#"
+WHERE payload.temperature IS NOT NULL
+GROUP BY clientid, TUMBLING_WINDOW(timestamp, 5m)
+```
+
+### 36.2 数据桥接配置
+
+```yaml
+# Kafka 桥接配置
+bridges:
+  kafka:
+    my_kafka:
+      bootstrap_servers: "kafka1:9092,kafka2:9092"
+      topic: "emqx-data"
+      acks: all
+      batch_size: 16384
+      linger_ms: 5
+      compression_type: "lz4"
+      
+      # 主题映射
+      topic_mapping:
+        - source_topic: "sensor/temperature"
+          target_topic: "sensor-temperature"
+        - source_topic: "sensor/humidity"
+          target_topic: "sensor-humidity"
+
+# InfluxDB 桥接配置
+bridges:
+  influxdb:
+    my_influxdb:
+      host: "influxdb.example.com"
+      port: 8086
+      database: "iot_data"
+      precision: "ms"
+      
+      # 数据映射
+      measurement: "sensor_data"
+      tags:
+        - clientid
+        - topic
+      fields:
+        - temperature
+        - humidity
+      timestamp: "timestamp"
+
+# Redis 桥接配置
+bridges:
+  redis:
+    my_redis:
+      host: "redis.example.com"
+      port: 6379
+      database: 0
+      
+      # 命令模板
+      command_template: "SET ${clientid}:status ${payload} EX 3600"
+```
+
+```python
+# 自定义数据处理桥接
+class CustomBridge:
+    
+    def process_message(self, topic, payload):
+        """
+        自定义数据处理逻辑
+        """
+        # 1. 数据验证
+        if not self.validate_payload(payload):
+            return None
+        
+        # 2. 数据转换
+        transformed = self.transform_data(topic, payload)
+        
+        # 3. 数据增强
+        enriched = self.enrich_data(transformed)
+        
+        # 4. 数据过滤
+        if not self.filter_data(enriched):
+            return None
+        
+        return enriched
+    
+    def validate_payload(self, payload):
+        required_fields = ['temperature', 'humidity', 'timestamp']
+        return all(field in payload for field in required_fields)
+    
+    def transform_data(self, topic, payload):
+        return {
+            'device_id': topic.split('/')[1],
+            'temperature': float(payload['temperature']),
+            'humidity': float(payload['humidity']),
+            'timestamp': int(payload['timestamp']),
+            'received_at': int(time.time() * 1000)
+        }
+    
+    def enrich_data(self, data):
+        # 添加地理位置信息
+        device_location = self.get_device_location(data['device_id'])
+        data['location'] = device_location
+        return data
+    
+    def filter_data(self, data):
+        # 过滤异常数据
+        return 0 <= data['temperature'] <= 50 and 0 <= data['humidity'] <= 100
+```
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

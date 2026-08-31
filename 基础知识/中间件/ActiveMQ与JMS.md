@@ -2196,6 +2196,620 @@ graph TB
      → 调整预取数量
 ```
 
+## 补充：Artemis vs Classic 深度对比
+
+### 架构对比
+
+| 维度 | ActiveMQ Classic | ActiveMQ Artemis |
+|------|------------------|------------------|
+| 内核 | 传统阻塞I/O | Netty 异步I/O |
+| 协议 | JMS 1.1 | JMS 2.0 + AMQP |
+| 持久化 | KahaDB/A JDBC | Journal/AIO |
+| 性能 | 中 | 高（10x提升） |
+| 集群 | 网络连接器 | 自动发现 |
+| 管理 | Web Console | 内置监控 |
+| 扩展 | 有限 | 高扩展性 |
+
+### Artemis 性能优化
+
+```xml
+<!-- broker.xml 配置 -->
+<configuration xmlns="urn:activemq"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/activemq-core.xsd">
+    
+    <!-- 持久化配置 -->
+    <persistence>
+        <aio-properties>
+            <property key="journalMaxIO" value="50000"/>
+            <property key="checkpointInterval" value="5000"/>
+            <property key="compactionThreshold" value="10485760"/>
+        </aio-properties>
+    </persistence>
+    
+    <!-- 队列配置 -->
+    <addresses>
+        <address name="orders">
+            <multicast/>
+        </address>
+        <address name="payments">
+            <anycast>
+                <queue name="payments-queue"/>
+            </anycast>
+        </address>
+    </addresses>
+    
+    <!-- 预取配置 -->
+    <address-setting match="#">
+        <max-size-bytes>104857600</max-size-bytes>
+        <max-delivery-attempts>3</max-delivery-attempts>
+        <redelivery-delay>1000</redelivery-delay>
+        <max-size-messages>1000</max-size-messages>
+    </address-setting>
+</configuration>
+```
+
+## 补充：网络连接器详解
+
+### 网络连接器模式
+
+```xml
+<!-- 静态连接 -->
+<networkConnectors>
+    <networkConnector name="static-network" 
+                       uri="static:(tcp://broker1:61616,tcp://broker2:61616)"/>
+</networkConnectors>
+
+<!-- 发现连接 -->
+<networkConnectors>
+    <networkConnector name="discovery-network"
+                       uri="discovery:(discovery-group)"/>
+</networkConnectors>
+
+<!-- 多跳连接 -->
+<networkConnectors>
+    <networkConnector name="multi-hop"
+                       uri="static:(tcp://broker1:61616)">
+        <staticWelcome>
+            <property name="otherInfo" value="hop-1"/>
+        </staticWelcome>
+    </networkConnector>
+</networkConnectors>
+```
+
+### 消息路由流程
+
+```mermaid
+graph LR
+    A[Producer] --> B[Broker A]
+    B --> C{消息路由}
+    C -->|本地队列| D[Consumer 1]
+    C -->|网络连接| E[Broker B]
+    E --> F[Consumer 2]
+    C -->|Topic广播| G[Topic Subscribers]
+```
+
+### 网络监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `activemq.network.connector.broker.*.connected` | 连接状态 | < 期望值 |
+| `activemq.network.connector.broker.*.producers` | 生产者数量 | > 1000 |
+| `activemq.network.connector.broker.*.consumers` | 消费者数量 | > 1000 |
+| `activemq.network.connector.broker.*.queueSize` | 队列深度 | > 100000 |
+
+## 补充：消息投递确认机制
+
+### 确认模式对比
+
+| 模式 | 说明 | 性能 | 可靠性 | 适用场景 |
+|------|------|------|--------|----------|
+| AUTO_ACKNOWLEDGE | 自动确认 | 高 | 低 | 非关键业务 |
+| CLIENT_ACKNOWLEDGE | 客户端确认 | 中 | 高 | 关键业务 |
+| DUPS_OK_ACKNOWLEDGE | 可重复确认 | 高 | 中 | 允许重复 |
+| SESSION_TRANSACTED | 会话事务 | 低 | 极高 | 金融业务 |
+
+### 确认模式实现
+
+```java
+// 客户端确认模式
+Session session = connection.createSession(false, Session.CLIENT_ACKNOWLEDGE);
+Queue queue = session.createQueue("orders");
+MessageConsumer consumer = session.createConsumer(queue);
+
+Message message = consumer.receive();
+try {
+    // 处理消息
+    processMessage(message);
+    
+    // 确认消息
+    message.acknowledge();
+} catch (Exception e) {
+    // 不确认，消息将重新投递
+    throw e;
+}
+
+// 会话事务模式
+Session session = connection.createSession(true, Session.SESSION_TRANSACTED);
+MessageConsumer consumer = session.createConsumer(queue);
+
+Message message = consumer.receive();
+try {
+    processMessage(message);
+    session.commit();  // 提交事务
+} catch (Exception e) {
+    session.rollback();  // 回滚事务
+}
+```
+
+### 死信队列（DLQ）配置
+
+```xml
+<!-- broker.xml 配置 -->
+<address-setting match="#">
+    <dead-letter-address>
+        <address name="DLQ"/>
+    </dead-letter-address>
+    <max-delivery-attempts>5</max-delivery-attempts>
+    <redelivery-delay>5000</redelivery-delay>
+    <max-size-messages>1000</max-size-messages>
+    <message-counter-history-day-limit>10</message-counter-history-day-limit>
+</address-setting>
+
+<!-- DLQ 处理策略 -->
+<policy>
+    <policy entry="DLQ.">
+        <dead-letter>
+            <expiry-address>ExpiryQueue</expiry-address>
+            <max-re-deliveries>3</max-re-deliveries>
+            <redelivery-delay>10000</redelivery-delay>
+            <strategy>DELETE</strategy>  <!-- DELETE/PURGE/SEND -->
+        </dead-letter>
+    </policy>
+</policy>
+```
+
+## 补充：JMS 2.0 新特性
+
+### 简化 API
+
+```java
+// JMS 1.1 方式（传统）
+Connection connection = factory.createConnection();
+connection.start();
+Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+Queue queue = session.createQueue("orders");
+MessageProducer producer = session.createProducer(queue);
+TextMessage message = session.createTextMessage("Hello");
+producer.send(message);
+
+// JMS 2.0 方式（简化）
+JMSContext context = factory.createContext();
+Queue queue = context.createProducer().send(context.createQueue("orders"), "Hello");
+context.createConsumer(queue).setMessageListener(msg -> {
+    TextMessage textMsg = (TextMessage) msg;
+    System.out.println(textMsg.getText());
+});
+```
+
+### 共享订阅
+
+```java
+// JMS 1.1 - 独占订阅
+Topic topic = session.createTopic("events");
+MessageConsumer consumer = session.createDurableConsumer(topic, "subscriber-1");
+
+// JMS 2.0 - 共享订阅
+context.createSharedDurableConsumer(topic, "shared-subscriber-1");
+
+// JMS 2.0 - 非持久共享订阅
+context.createSharedConsumer(topic, "non-durable-subscriber-1");
+```
+
+### 异步发送
+
+```java
+// JMS 2.0 异步发送
+context.createProducer().send(queue, message, completionListener, asyncCallback);
+
+// 异步回调
+CompletionListener completionListener = new CompletionListener() {
+    @Override
+    public void onCompletion(Message message) {
+        System.out.println("消息发送成功");
+    }
+    
+    @Override
+    public void onException(Message message, Exception exception) {
+        System.out.println("消息发送失败: " + exception.getMessage());
+        // 重试或记录
+    }
+};
+```
+
+### 消息延迟和过期
+
+```java
+// JMS 2.0 消息属性
+context.createProducer()
+    .setTimeToLive(3600000)  // 1小时后过期
+    .setDeliveryMode(DeliveryMode.PERSISTENT)
+    .send(queue, message);
+
+// 设置消息延迟
+message.setLongProperty("AMQ_SCHEDULED_DELAY", 5000);  // 延迟5秒
+message.setLongProperty("AMQ_SCHEDULED_PERIOD", 1000);  // 每1秒重复
+message.setIntegerProperty("AMQ_SCHEDULED_REPEAT", 3);  // 重复3次
+
+// JMS 2.0 方式
+context.createProducer()
+    .setDeliveryDelay(5000)  // 5秒延迟
+    .send(queue, message);
+```
+
+## 补充：Spring JMS 集成
+
+### Spring Boot 配置
+
+```yaml
+# application.yml
+spring:
+  activemq:
+    broker-url: tcp://localhost:61616
+    user: admin
+    password: admin
+    pool:
+      enabled: true
+      max-connections: 10
+      idle-timeout: 30000
+      max-active: 20
+
+  jms:
+    pub-sub-domain: false  # false=Queue, true=Topic
+    template:
+      default-destination: orders
+      delivery-mode: persistent
+      priority: 4
+      time-to-live: 3600000
+```
+
+### JmsTemplate 使用
+
+```java
+@Service
+public class OrderService {
+    
+    @Autowired
+    private JmsTemplate jmsTemplate;
+    
+    // 发送消息
+    public void sendOrder(Order order) {
+        jmsTemplate.convertAndSend("orders", order, message -> {
+            message.setStringProperty("orderType", order.getType());
+            message.setIntProperty("priority", order.getPriority());
+            return message;
+        });
+    }
+    
+    // 接收消息
+    public Order receiveOrder() {
+        return (Order) jmsTemplate.receiveAndConvert("orders");
+    }
+    
+    // 带超时接收
+    public Order receiveOrderWithTimeout(long timeout) {
+        Message message = jmsTemplate.receiveSelected("orders", "orderType = 'VIP'");
+        if (message != null) {
+            return (Order) jmsTemplate.getMessageConverter().fromMessage(message);
+        }
+        return null;
+    }
+}
+
+// 监听器
+@Component
+public class OrderListener {
+    
+    @JmsListener(destination = "orders", selector = "orderType = 'VIP'")
+    public void handleOrder(Order order) {
+        System.out.println("处理VIP订单: " + order.getId());
+    }
+    
+    @JmsListener(destination = "orders", concurrency = "3-10")
+    public void handleOrderConcurrent(Order order) {
+        // 并发处理
+    }
+}
+```
+
+### 监控配置
+
+```yaml
+# Actuator 监控
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,jms
+  endpoint:
+    jms:
+      enabled: true
+
+# 自定义监控指标
+@Component
+public class JmsMetrics implements MeterBinder {
+    
+    @Override
+    public void bindTo(MeterRegistry registry) {
+        Gauge.builder("jms.queue.messages.sent", this, JmsMetrics::getMessagesSent)
+            .description("JMS messages sent")
+            .register(registry);
+        
+        Gauge.builder("jms.queue.messages.received", this, JmsMetrics::getMessagesReceived)
+            .description("JMS messages received")
+            .register(registry);
+    }
+}
+```
+
+## 补充：消息持久化策略
+
+### 持久化方式对比
+
+| 方式 | 性能 | 可靠性 | 说明 |
+|------|------|--------|------|
+| KahaDB | 中 | 高 | 默认持久化 |
+| JDBC | 低 | 极高 | 数据库存储 |
+| Memory | 极高 | 低 | 内存存储 |
+| PageStore | 高 | 高 | 分页存储 |
+
+### KahaDB 配置
+
+```xml
+<!-- persistence 配置 -->
+<persistence>
+    <kahaDB directory="${data.dir}/kahadb"
+            journalMaxFileLength="32mb"
+            syncOnCommit="true"
+            enableJournalDiskSyncs="true"
+            concurrentStoreAndDispatchQueues="true"
+            cleanupInterval="30000"
+            checkpointInterval="5000"
+            indexCacheSize="10000"
+            enableIndexWriteAsync="true"/>
+</persistence>
+```
+
+### 数据库持久化
+
+```xml
+<!-- JDBC 持久化 -->
+<persistence>
+    <jdbcPersistence datasource="jdbc/Derby"
+                     dataDirectory="activemq-data"
+                     storeDirectory="activemq-data"
+                     lockKeepAlivePeriod="5000"/>
+</persistence>
+
+<!-- 数据源配置 -->
+<bean id="jdbc/Derby" class="org.apache.commons.dbcp2.BasicDataSource" destroy-method="close">
+    <property name="driverClassName" value="org.apache.derby.jdbc.EmbeddedDriver"/>
+    <property name="url" value="jdbc:derby:${data.dir}/derbyDB;create=true"/>
+</bean>
+```
+
+## 补充：慢消费者处理
+
+### 慢消费者检测
+
+```java
+// 自定义慢消费者检测
+public class SlowConsumerDetector implements MessageListener {
+    private final long slowThreshold = 1000; // 1秒
+    private final AtomicInteger messageCount = new AtomicInteger(0);
+    private final AtomicLong lastCheckTime = new AtomicLong(System.currentTimeMillis());
+    
+    @Override
+    public void onMessage(Message message) {
+        long currentTime = System.currentTimeMillis();
+        long lastTime = lastCheckTime.get();
+        int count = messageCount.incrementAndGet();
+        
+        if (currentTime - lastTime > 1000) { // 每秒检查一次
+            int messagesPerSecond = count;
+            messageCount.set(0);
+            lastCheckTime.set(currentTime);
+            
+            if (messagesPerSecond < 10) { // 低于阈值
+                log.warn("检测到慢消费者，消息处理速率: {} 条/秒", messagesPerSecond);
+                // 触发告警或扩容
+            }
+        }
+        
+        // 处理消息
+        processMessage(message);
+    }
+}
+```
+
+### 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `prefetchSize` | 1000 | 10-50 | 预取数量 |
+| `windowSize` | - | 100 | 滑动窗口 |
+| `maximumRedeliveries` | 6 | 3 | 最大重试次数 |
+| `redeliveryDelay` | 1000 | 5000 | 重试延迟 |
+| `useSlowConsumerStrategy` | false | true | 慢消费者策略 |
+
+### 调优配置
+
+```xml
+<!-- 队列配置 -->
+<destinationPolicy>
+    <policyEntry queue="orders"
+                  producerFlowControl="true"
+                  memoryLimit="1mb"
+                  optimizedDispatch="true"
+                  lazyDispatch="true"
+                  preferDurableSubscribers="true">
+        <deadLetterStrategy>
+            <individualDeadLetterStrategy queuePrefix="DLQ."
+                                          processNonPersistent="true"
+                                          processExpired="true"/>
+        </deadLetterStrategy>
+        <pendingMessageLimitStrategy>
+            <constantPendingMessageLimitStrategy limit="1000"/>
+        </pendingMessageLimitStrategy>
+    </policyEntry>
+</destinationPolicy>
+```
+
+## 补充：集群部署方案
+
+### 主从集群
+
+```xml
+<!-- 主节点配置 -->
+<broker brokerName="master" ...>
+    <networkConnectors>
+        <networkConnector name="slave" uri="static:(tcp://slave:61616)"/>
+    </networkConnectors>
+</broker>
+
+<!-- 从节点配置 -->
+<broker brokerName="slave" ...>
+    <networkConnectors>
+        <networkConnector name="master" uri="static:(tcp://master:61616)"/>
+    </networkConnectors>
+    <persistence>
+        <kahaDB directory="${data.dir}/kahadb"
+                allowOpenWrite="false"/>
+    </persistence>
+</broker>
+```
+
+### 网络集群
+
+```xml
+<!-- 节点1配置 -->
+<broker brokerName="node1" ...>
+    <networkConnectors>
+        <networkConnector name="node1-to-node2" 
+                           uri="static:(tcp://node2:61616)"/>
+        <networkConnector name="node1-to-node3" 
+                           uri="static:(tcp://node3:61616)"/>
+    </networkConnectors>
+</broker>
+
+<!-- 节点2配置 -->
+<broker brokerName="node2" ...>
+    <networkConnectors>
+        <networkConnector name="node2-to-node1" 
+                           uri="static:(tcp://node1:61616)"/>
+        <networkConnector name="node2-to-node3" 
+                           uri="static:(tcp://node3:61616)"/>
+    </networkConnectors>
+</broker>
+
+<!-- 节点3配置 -->
+<broker brokerName="node3" ...>
+    <networkConnectors>
+        <networkConnector name="node3-to-node1" 
+                           uri="static:(tcp://node1:61616)"/>
+        <networkConnector name="node3-to-node2" 
+                           uri="static:(tcp://node2:61616)"/>
+    </networkConnectors>
+</broker>
+```
+
+### 集群监控
+
+```bash
+# 检查集群状态
+curl -s 'http://localhost:8161/api/jolokia/read/org.apache.activemq:type=Broker,brokerName=localhost'
+
+# 检查网络连接器
+curl -s 'http://localhost:8161/api/jolokia/read/org.apache.activemq:type=Broker,brokerName=localhost,connector=networkConnectors'
+
+# 检查队列深度
+curl -s 'http://localhost:8161/api/jolokia/read/org.apache.activemq:type=Broker,brokerName=localhost,destinationType=Queue,destinationName=orders'
+
+# 监控告警脚本
+#!/bin/bash
+ALERT_THRESHOLD=1000
+QUEUE_DEPTH=$(curl -s 'http://localhost:8161/api/jolokia/read/org.apache.activemq:type=Broker,brokerName=localhost,destinationType=Queue,destinationName=orders' | jq -r '.value.QueueSize')
+
+if [ "$QUEUE_DEPTH" -gt "$ALERT_THRESHOLD" ]; then
+    echo "队列深度超过阈值: $QUEUE_DEPTH"
+    # 发送告警
+fi
+```
+
+## 补充：性能基准测试
+
+### 测试场景
+
+| 场景 | 并发数 | 消息大小 | 持久化 | 预期TPS |
+|------|--------|----------|--------|---------|
+| 简单队列 | 10 | 1KB | 是 | 5000 |
+| 复杂消息 | 10 | 10KB | 是 | 2000 |
+| Topic广播 | 100 | 1KB | 是 | 10000 |
+| 事务消息 | 10 | 1KB | 是 | 1000 |
+| 消息压缩 | 10 | 100KB | 是 | 1500 |
+
+### 测试代码
+
+```java
+public class PerformanceTest {
+    
+    @Test
+    public void testQueuePerformance() throws Exception {
+        ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory("tcp://localhost:61616");
+        Connection connection = factory.createConnection();
+        connection.start();
+        
+        Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+        Queue queue = session.createQueue("test-queue");
+        MessageProducer producer = session.createProducer(queue);
+        producer.setDeliveryMode(DeliveryMode.PERSISTENT);
+        
+        // 预热
+        for (int i = 0; i < 1000; i++) {
+            TextMessage message = session.createTextMessage("warmup-" + i);
+            producer.send(message);
+        }
+        
+        // 性能测试
+        long startTime = System.currentTimeMillis();
+        int messageCount = 10000;
+        
+        for (int i = 0; i < messageCount; i++) {
+            TextMessage message = session.createTextMessage("test-" + i);
+            producer.send(message);
+        }
+        
+        long duration = System.currentTimeMillis() - startTime;
+        double tps = (double) messageCount / duration * 1000;
+        
+        System.out.printf("消息数: %d, 耗时: %d ms, TPS: %.2f%n", 
+                         messageCount, duration, tps);
+        
+        connection.close();
+    }
+}
+```
+
+### 性能优化清单
+
+| 优化项 | 说明 | 预期提升 |
+|--------|------|----------|
+| 启用批量发送 | `producer.setProducerWindowSize(1024*1024)` | 2-3x |
+| 使用异步发送 | `producer.setAlwaysSyncSend(false)` | 1.5x |
+| 调整预取数量 | `queue.setPrefetchSize(10)` | 1.2x |
+| 启用消息压缩 | `connectionFactory.setUseCompression(true)` | 1.3x |
+| 优化网络配置 | `tcp://localhost:61616?wireFormat.maxFrameSize=10485760` | 1.1x |
+
 ## 与其他板块的关系
 
 - 消息选型总览见「[Kafka](./Kafka.md)」「[RabbitMQ](./RabbitMQ.md)」「[RocketMQ](./RocketMQ.md)」；

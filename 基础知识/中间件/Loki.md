@@ -2187,6 +2187,496 @@ graph TB
      → 容量规划
 ```
 
+## 三十三、LogQL 高级查询实战
+
+### 33.1 复杂查询模式
+
+```logql
+# 多维度日志分析
+{job="api-gateway", env=~"prod|staging"} 
+| json 
+| line_format "{{.timestamp}} [{{.level}}] {{.message}}"
+| label_format 
+    duration="{{divide .response_time 1000}}ms",
+    status_class="{{if eq .status_code "200"}}success{{else if ge .status_code "400"}}client_error{{else}}server_error{{end}}"
+| regexp `(?P<ip>\d+\.\d+\.\d+\.\d+).*"(?P<method>\w+) (?P<path>[^\s]+).*" (?P<status>\d+) (?P<duration>\d+)`
+| bucket duration 5m
+| sum by (method, path, status) (count_over_time({job="api-gateway"} |= "error" [5m]))
+| sort by count desc
+| limit 10
+```
+
+```logql
+# 日志聚合并生成指标
+{job="application"} 
+| json 
+| unwrapped duration_ns 
+| quantile_over_time(0.99, {job="application"} | json | unwrap duration_ns [1h])
+| rate({job="application"} |= "ERROR" [5m])
+| count_over_time({job="application"} | pattern "<_> ERROR <msg>" [1h])
+| topk(10, sum by (level) (count_over_time({job="application"} | json [1h])))
+```
+
+```logql
+# 日志关联分析
+{job="api-gateway"} 
+| json 
+| line_format "{{.trace_id}}" 
+| label_format trace_id="{{.trace_id}}"
+| join 
+    {job="payment-service"} | json | label_format trace_id="{{.trace_id}}"
+    {job="order-service"} | json | label_format trace_id="{{.trace_id}}"
+| group by trace_id
+| count by trace_id
+| where count > 1
+| sort by count desc
+```
+
+### 33.2 LogQL 性能优化
+
+```logql
+# 高效查询模式
+# 1. 使用标签过滤代替内容过滤
+# 低效
+{job="api-gateway"} |= "ERROR" |= "timeout"
+# 高效
+{job="api-gateway", level="ERROR", error_type="timeout"}
+
+# 2. 使用管道阶段减少数据量
+{job="api-gateway"} 
+| json 
+| line_format "{{.message}}" 
+| pattern "<_> <level> <message>"
+| where level == "ERROR"
+
+# 3. 使用聚合减少返回数据
+{job="api-gateway"} 
+| json 
+| sum by (level) (count_over_time({job="api-gateway"} [5m]))
+
+# 4. 使用 LIMIT 限制结果数量
+{job="api-gateway"} 
+| json 
+| topk(10, sum by (path) (count_over_time({job="api-gateway"} [5m])))
+```
+
+| 优化策略 | 说明 | 效果 |
+|----------|------|------|
+| 标签前置 | 先过滤标签再过滤内容 | 减少扫描量 |
+| 模式匹配 | 使用 pattern 提取字段 | 提升解析速度 |
+| 聚合优先 | 使用 sum/count/topk | 减少返回数据 |
+| 时间范围 | 限制查询时间窗口 | 降低存储压力 |
+| 缓存利用 | 使用查询缓存 | 重复查询加速 |
+
+## 三十四、多租户与安全
+
+### 34.1 多租户隔离
+
+```yaml
+# 多租户配置
+auth_enabled: true
+
+# 租户限流
+limits_config:
+  max_entries_limit_per_query: 10000
+  max_query_parallelism: 32
+  max_query_series: 50000
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+
+# 租户配额
+tenant_limits:
+  tenant-1:
+    max_streams: 100000
+    max_rate: 10MB
+    max_burst: 20MB
+  tenant-2:
+    max_streams: 50000
+    max_rate: 5MB
+    max_burst: 10MB
+```
+
+```go
+// 租户上下文传播
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+    return context.WithValue(ctx, tenantIDKey, tenantID)
+}
+
+func GetTenantID(ctx context.Context) string {
+    if tenantID, ok := ctx.Value(tenantIDKey).(string); ok {
+        return tenantID
+    }
+    return ""
+}
+
+// 租户隔离中间件
+func TenantMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        tenantID := extractTenantID(r)
+        if tenantID == "" {
+            http.Error(w, "Missing tenant ID", http.StatusUnauthorized)
+            return
+        }
+        
+        ctx := WithTenantID(r.Context(), tenantID)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+### 34.2 访问控制
+
+```yaml
+# RBAC 配置
+rbac:
+  enabled: true
+  roles:
+    - name: admin
+      permissions:
+        - action: read
+          resources: ["*"]
+        - action: write
+          resources: ["*"]
+    - name: viewer
+      permissions:
+        - action: read
+          resources: ["logs", "metrics"]
+    - name: editor
+      permissions:
+        - action: read
+          resources: ["*"]
+        - action: write
+          resources: ["logs"]
+
+# 认证配置
+auth:
+  type: oauth2
+  oauth2:
+    issuer: "https://auth.example.com"
+    client_id: "loki-client"
+    client_secret: "${OAUTH2_CLIENT_SECRET}"
+    scopes: ["openid", "profile", "email"]
+```
+
+```sql
+-- 审计日志查询
+SELECT 
+    timestamp,
+    tenant_id,
+    user_id,
+    action,
+    resource,
+    result,
+    ip_address
+FROM loki.audit_logs
+WHERE timestamp > NOW() - INTERVAL '24 hours'
+  AND tenant_id = 'tenant-1'
+ORDER BY timestamp DESC;
+
+-- 权限检查
+SELECT 
+    u.username,
+    r.name as role_name,
+    p.action,
+    p.resource
+FROM users u
+JOIN user_roles ur ON u.id = ur.user_id
+JOIN roles r ON ur.role_id = r.id
+JOIN role_permissions rp ON r.id = rp.role_id
+JOIN permissions p ON rp.permission_id = p.id
+WHERE u.username = 'user1';
+```
+
+## 三十五、性能优化深度实战
+
+### 35.1 存储优化
+
+```yaml
+# 存储分层配置
+storage_config:
+  # 本地缓存
+  filesystem:
+    dir: /loki/chunks
+    chunks_directory: /loki/chunks
+    rules_directory: /loki/rules
+  
+  # 对象存储
+  aws:
+    s3: s3://loki-bucket
+    s3forcepathstyle: true
+    insecure: false
+  
+  # 缓存配置
+  cache: memcached
+  memcached:
+    memcached_client:
+      host: memcached
+      port: 11211
+      max-item-size: 1m
+      timeout: 500ms
+
+# 压缩配置
+chunk_store_config:
+  chunk_cache_config:
+    enabled: true
+    max_size_bytes: 1GB
+  
+  # 压缩算法
+  chunk_encoding: snappy
+  
+  # 保留策略
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+# 索引配置
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: boltdb-shipper
+      object_store: aws
+      schema: v11
+      index:
+        prefix: loki_index_
+        period: 24h
+```
+
+### 35.2 查询性能优化
+
+```yaml
+# 查询优化配置
+query_range:
+  results_cache:
+    cache: memcached
+    memcached:
+      host: memcached
+      port: 11211
+  
+  split_queries_by_interval: 15m
+  parallelise_shardable_queries: true
+
+# 引擎配置
+query_engine_config:
+  max_look_back_period: 30s
+  timeout: 30s
+  
+# 限制配置
+limits_config:
+  max_query_length: 721h
+  max_query_parallelism: 32
+  max_entries_limit_per_query: 10000
+  max_cache_freshness_per_query: 10m
+  per_stream_rate_limit: 5MB
+  per_stream_rate_limit_burst: 15MB
+```
+
+```logql
+# 高效查询示例
+# 1. 使用标签过滤
+{job="api-gateway", level="ERROR"} 
+| json 
+| line_format "{{.timestamp}} {{.message}}"
+
+# 2. 使用模式匹配
+{job="api-gateway"} 
+| pattern `<ip> - - [<timestamp>] "<method> <path> <_>" <status> <size> "<_>" "<_>"` 
+| line_format "{{.method}} {{.path}} {{.status}}"
+
+# 3. 使用聚合
+{job="api-gateway"} 
+| json 
+| sum by (status) (count_over_time({job="api-gateway"} [5m]))
+| sort by sum desc
+| limit 10
+
+# 4. 使用正则表达式
+{job="api-gateway"} 
+| regexp `(?P<ip>\d+\.\d+\.\d+\.\d+).*"(?P<method>\w+) (?P<path>[^\s]+).*"`
+| label_format method="{{toUpper .method}}"
+| topk(10, sum by (method) (count_over_time({job="api-gateway"} [5m])))
+```
+
+## 三十六、生产监控与告警
+
+### 36.1 核心监控指标
+
+```sql
+-- Loki 性能监控
+SELECT 
+    timestamp,
+    ingester_chunks_created,
+    ingester_chunks_flushed,
+    ingester_chunks_stored,
+    ingester_entries_created,
+    querier_query_duration,
+    querier_chunks_per_query,
+    querier_entries_per_query
+FROM loki.metrics
+WHERE timestamp > NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+
+-- 存储使用监控
+SELECT 
+    tenant_id,
+    SUM(stream_count) as total_streams,
+    SUM(chunk_count) as total_chunks,
+    SUM(chunk_size_bytes) as total_size_bytes,
+    AVG(chunk_age_seconds) as avg_chunk_age
+FROM loki.storage_stats
+GROUP BY tenant_id
+ORDER BY total_size_bytes DESC;
+```
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: loki_alerts
+    rules:
+      - alert: LokiHighIngestionRate
+        expr: rate(loki_ingester_chunks_created_total[5m]) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki 写入速率过高"
+          description: "过去5分钟创建chunk速率超过1000/s"
+      
+      - alert: LokiHighQueryDuration
+        expr: histogram_quantile(0.95, rate(lori_query_duration_seconds_bucket[5m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki 查询延迟过高"
+          description: "P95查询延迟超过30秒"
+      
+      - alert: LokiStorageFull
+        expr: loki_storage_disk_usage_bytes / loki_storage_disk_capacity_bytes > 0.9
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Loki 存储空间不足"
+          description: "磁盘使用率超过90%"
+```
+
+### 36.2 告警规则管理
+
+```yaml
+# 告警规则配置
+groups:
+  - name: application_errors
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate({job="api-gateway"} |= "ERROR" [5m])) by (path)
+          / sum(rate({job="api-gateway"} [5m])) by (path) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "API 错误率过高"
+          description: "路径 {{ $labels.path }} 错误率超过5%"
+      
+      - alert: LatencySpike
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate({job="api-gateway"} | json | unwrap duration_ns [5m])) by (le, path)
+          ) > 1000000000
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "API 延迟尖峰"
+          description: "路径 {{ $labels.path }} P99延迟超过1秒"
+      
+      - alert: LogVolumeSpike
+        expr: |
+          sum(rate({job="api-gateway"} [5m])) by (level)
+          > 3 * sum(avg_over_time({job="api-gateway"} [1h])) by (level)
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+        annotations:
+          summary: "日志量激增"
+          description: "{{ $labels.level }} 级别日志量激增3倍"
+```
+
+## 三十七、集成与扩展
+
+### 37.1 与 Prometheus 集成
+
+```yaml
+# Prometheus 配置
+scrape_configs:
+  - job_name: 'loki'
+    static_configs:
+      - targets: ['loki:3100']
+    metrics_path: '/metrics'
+    
+  - job_name: 'loki-rules'
+    static_configs:
+      - targets: ['loki-ruler:3100']
+    metrics_path: '/metrics'
+
+# Grafana 数据源配置
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+    jsonData:
+      maxLines: 1000
+      timeout: 60
+```
+
+### 37.2 与 Tempo 集成
+
+```yaml
+# Tempo 配置
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+
+# Loki Tempo 关联
+loki:
+  tempo:
+    datasource_uid: tempo
+    service_name: tempo
+```
+
+```logql
+# 使用 trace_id 关联日志和追踪
+{job="api-gateway"} 
+| json 
+| line_format "{{.trace_id}}"
+| label_format trace_id="{{.trace_id}}"
+| join 
+    {job="tempo"} | json | label_format trace_id="{{.trace_id}}"
+| group by trace_id
+| count by trace_id
+| where count > 1
+```
+
 ## 与其他板块的关系
 
 - 日志体系整体见「[ELK 日志体系](./ELK日志体系.md)」；

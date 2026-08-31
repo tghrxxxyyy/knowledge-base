@@ -2044,6 +2044,440 @@ esac
 | 告警分级 | 设置告警级别 | 快速响应 |
 | 定期审查 | 定期优化配置 | 持续改进 |
 
+## 补充：Zabbix Proxy 部署
+
+### Proxy 架构
+
+```mermaid
+graph TB
+    subgraph 中心节点
+        A[Zabbix Server] --> B[数据库]
+        A --> C[Web UI]
+    end
+    
+    subgraph 远程站点1
+        D[Zabbix Proxy 1] --> E[Agent 1]
+        D --> F[Agent 2]
+    end
+    
+    subgraph 远程站点2
+        G[Zabbix Proxy 2] --> H[Agent 3]
+        G --> I[Agent 4]
+    end
+    
+    D --> A
+    G --> A
+```
+
+### Proxy 配置
+
+```yaml
+# Proxy 配置
+ProxyMode=0  # 0=主动模式，1=被动模式
+Server=zabbix-server.example.com
+Hostname=Zabbix Proxy Beijing
+DBName=/var/lib/zabbix/proxy.sqlite
+DBUser=zabbix
+DBPassword=zabbix
+ConfigFrequency=60  # 配置同步频率
+DataSenderFrequency=5  # 数据发送频率
+StartPollers=10  # 轮询进程数
+StartPingers=5  # Ping 进程数
+CacheSize=256M  # 缓存大小
+```
+
+### Proxy 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `zabbix.proxy[proxy.data.rediserved,queued]` | 队列深度 | > 1000 |
+| `zabbix.proxy[proxy.data.rediserved,processing]` | 处理中数量 | > 100 |
+| `zabbix.proxy[proxy.data.rediserved,frequency]` | 数据发送频率 | 偏差>10% |
+| `zabbix.proxy[proxy.data.rediserved,processing_time]` | 处理时间 | > 5s |
+
+## 补充：LLD（低级别发现）
+
+### LLD 规则配置
+
+```json
+{
+  "data": [
+    {
+      "{#FSNAME}": "/",
+      "{#FSTYPE}": "ext4"
+    },
+    {
+      "{#FSNAME}": "/data",
+      "{#FSTYPE}": "xfs"
+    }
+  ]
+}
+```
+
+### LLD 规则使用
+
+```bash
+# 获取发现数据
+zabbix_get -s 192.168.1.100 -k vfs.fs.size[/,pfree]
+
+# LLD 规则表达式
+last(/Linux filesystems/vfs.fs.size[{#FSNAME},pfree])<10
+
+# 触发器表达式
+{Linux filesystems:vfs.fs.size[{#FSNAME},pfree].last()}<10
+```
+
+### LLD 自动发现配置
+
+```yaml
+# 发现规则
+DiscoveryRule:
+  name: "发现文件系统"
+  key: vfs.fs.discovery
+  delay: 3600  # 每小时执行一次
+  lifetime: 7d  # 保留7天
+
+# 原型
+ItemPrototype:
+  name: "磁盘空间 {#FSNAME}"
+  key: vfs.fs.size[{#FSNAME},pfree]
+  type: 0  # Zabbix Agent
+  value_type: 3  # 浮点数
+
+TriggerPrototype:
+  name: "磁盘空间不足 {#FSNAME}"
+  expression: last(/Linux filesystems/vfs.fs.size[{#FSNAME},pfree])<10
+  priority: 3  # 高
+```
+
+## 补充：自定义监控项
+
+### 自定义 UserParameter
+
+```bash
+# /etc/zabbix/zabbix_agentd.d/custom.conf
+UserParameter=custom.cpu.usage,mpstat 1 1 | awk '/Average/ {print $NF}'
+
+UserParameter=custom.memory.usage,free | awk '/Mem:/ {printf "%.2f", $3/$2*100}'
+
+UserParameter=custom.disk.io[*],iostat -dx $1 1 1 | awk '/$1/ {print $NF}'
+```
+
+### 自定义监控脚本
+
+```python
+#!/usr/bin/env python3
+import psutil
+import json
+
+def get_system_metrics():
+    """获取系统指标"""
+    metrics = {
+        "cpu_percent": psutil.cpu_percent(interval=1),
+        "memory_percent": psutil.virtual_memory().percent,
+        "disk_io": psutil.disk_io_counters()._asdict(),
+        "network_io": psutil.net_io_counters()._asdict()
+    }
+    return json.dumps(metrics)
+
+if __name__ == "__main__":
+    print(get_system_metrics())
+```
+
+### 监控项配置
+
+```xml
+<!-- Zabbix 监控项配置 -->
+<item>
+    <name>自定义CPU使用率</name>
+    <key>custom.cpu.usage</key>
+    <type>0</type>  <!-- Zabbix Agent -->
+    <value_type>3</value_type>  <!-- 浮点数 -->
+    <units>%</units>
+    <delay>30</delay>
+    <history>7d</history>
+    <trends>30d</trends>
+    <description>通过psutil获取的CPU使用率</description>
+</item>
+```
+
+## 补充：仪表板设计
+
+### 仪表板布局
+
+```yaml
+# 仪表板配置
+Dashboard:
+  name: "生产环境监控"
+  pages:
+    - name: "概览"
+      widgets:
+        - type: graph
+          name: "CPU使用率"
+          host: "*"
+          item: "system.cpu.util"
+          period: 3600
+        
+        - type: pie
+          name: "内存分布"
+          host: "*"
+          item: "vm.memory.size[available],vm.memory.size[used]"
+        
+        - type: clock
+          name: "系统时间"
+        
+        - type: top_hosts
+          name: "Top 10 CPU"
+          host_group: "Linux servers"
+          item: "system.cpu.util"
+          limit: 10
+    
+    - name: "网络"
+      widgets:
+        - type: graph
+          name: "网络流量"
+          host: "*"
+          item: "net.if.in,net.if.out"
+        
+        - type: map
+          name: "网络拓扑"
+```
+
+### 仪表板最佳实践
+
+| 实践 | 说明 | 收益 |
+|------|------|------|
+| 分层展示 | 概览→详细 | 快速定位 |
+| 关键指标突出 | 高优先级在上 | 快速响应 |
+| 自动刷新 | 30秒-5分钟 | 实时性 |
+| 时间范围 | 支持多范围 | 灵活分析 |
+| 交互功能 | 链接跳转 | 问题追踪 |
+
+## 补充：容量规划与预测
+
+### 容量预测算法
+
+```python
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+def predict_capacity(historical_data, days_ahead=30):
+    """预测容量需求"""
+    # 准备数据
+    X = np.array(range(len(historical_data))).reshape(-1, 1)
+    y = np.array(historical_data)
+    
+    # 线性回归
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # 预测
+    future_X = np.array(range(len(historical_data), len(historical_data) + days_ahead)).reshape(-1, 1)
+    predictions = model.predict(future_X)
+    
+    return predictions
+
+# 示例
+cpu_history = [20, 22, 25, 28, 30, 32, 35, 38, 40, 42]
+predictions = predict_capacity(cpu_history, days_ahead=30)
+print(f"30天后CPU预测: {predictions[-1]:.2f}%")
+```
+
+### 容量规划流程
+
+```mermaid
+graph TB
+    A[数据收集] --> B[历史趋势分析]
+    B --> C[容量预测]
+    C --> D{容量充足?}
+    D -->|是| E[继续监控]
+    D -->|否| F[扩容计划]
+    F --> G[资源申请]
+    G --> H[部署实施]
+    H --> I[验证测试]
+    I --> J[文档更新]
+    E --> A
+    J --> A
+```
+
+## 补充：Zabbix 升级指南
+
+### 升级路径
+
+| 版本 | 发布时间 | 主要特性 | 升级建议 |
+|------|----------|----------|----------|
+| 5.0 LTS | 2020 | 长期支持 | 保持 |
+| 6.0 LTS | 2022 | 新UI/性能 | 推荐升级 |
+| 6.4 | 2023 | 功能增强 | 可选升级 |
+| 7.0 LTS | 2024 | 云原生 | 计划升级 |
+
+### 升级步骤
+
+```bash
+# 1. 备份
+mysqldump -u root -p zabbix > zabbix_backup_$(date +%Y%m%d).sql
+
+# 2. 停止服务
+systemctl stop zabbix-server
+systemctl stop zabbix-agent
+
+# 3. 升级包
+yum update zabbix-server zabbix-web-mysql
+
+# 4. 数据库升级
+zabbix-server-sql-scripts upgrade
+
+# 5. 启动服务
+systemctl start zabbix-server
+systemctl start zabbix-agent
+
+# 6. 验证
+zabbix_get -s localhost -k agent.ping
+```
+
+### 回滚方案
+
+```bash
+# 回滚步骤
+# 1. 停止服务
+systemctl stop zabbix-server
+
+# 2. 恢复数据库
+mysql -u root -p zabbix < zabbix_backup_20240101.sql
+
+# 3. 降级包
+yum downgrade zabbix-server-5.0 zabbix-web-mysql-5.0
+
+# 4. 启动服务
+systemctl start zabbix-server
+
+# 5. 验证
+zabbix_get -s localhost -k agent.ping
+```
+
+## 补充：Zabbix vs Prometheus 对比
+
+### 功能对比
+
+| 功能 | Zabbix | Prometheus |
+|------|--------|------------|
+| 数据模型 | 主机→监控项 | 指标+标签 |
+| 查询语言 | 简单表达式 | PromQL |
+| 存储 | SQL/文件 | 时序数据库 |
+| 可视化 | 内置 | Grafana |
+| 告警 | 内置 | Alertmanager |
+| 云原生 | 一般 | 优秀 |
+| 扩展性 | Proxy | 联邦 |
+| 学习曲线 | 中 | 高 |
+
+### 选型决策
+
+```mermaid
+graph TD
+    A[开始] --> B{监控类型?}
+    B -->|基础设施| C{技术栈?}
+    B -->|应用监控| D{团队技能?}
+    
+    C -->|传统| E[Zabbix]
+    C -->|云原生| F[Prometheus]
+    
+    D -->|Java/Python| G[Prometheus]
+    D -->|运维团队| H[Zabbix]
+    
+    E --> I[资产监控]
+    F --> J[指标监控]
+    G --> K[应用性能]
+    H --> L[服务器监控]
+```
+
+## 补充：Zabbix API 自动化
+
+### API 使用示例
+
+```python
+import requests
+import json
+
+class ZabbixAPI:
+    def __init__(self, url, user, password):
+        self.url = url
+        self.user = user
+        self.password = password
+        self.auth = None
+    
+    def login(self):
+        """登录获取认证token"""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "user.login",
+            "params": {
+                "user": self.user,
+                "password": self.password
+            },
+            "id": 1
+        }
+        response = requests.post(self.url, json=payload)
+        self.auth = response.json()["result"]
+        return self.auth
+    
+    def get_hosts(self):
+        """获取主机列表"""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "host.get",
+            "params": {
+                "output": ["hostid", "host", "name"],
+                "filter": {
+                    "status": 0
+                }
+            },
+            "auth": self.auth,
+            "id": 2
+        }
+        response = requests.post(self.url, json=payload)
+        return response.json()["result"]
+    
+    def create_host(self, hostname, ip, group_id, template_id):
+        """创建主机"""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "host.create",
+            "params": {
+                "host": hostname,
+                "interfaces": [
+                    {
+                        "type": 1,
+                        "main": 1,
+                        "useip": 1,
+                        "ip": ip,
+                        "dns": "",
+                        "port": "10050"
+                    }
+                ],
+                "groups": [
+                    {
+                        "groupid": group_id
+                    }
+                ],
+                "templates": [
+                    {
+                        "templateid": template_id
+                    }
+                ]
+            },
+            "auth": self.auth,
+            "id": 3
+        }
+        response = requests.post(self.url, json=payload)
+        return response.json()["result"]
+
+# 使用示例
+zabbix = ZabbixAPI("http://zabbix.example.com/api_jsonrpc.php", "admin", "zabbix")
+zabbix.login()
+hosts = zabbix.get_hosts()
+print(f"主机数量: {len(hosts)}")
+```
+
 ## 与其他板块的关系
 
 ## Zabbix API 自动化运维
