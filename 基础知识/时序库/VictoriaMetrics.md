@@ -2073,4 +2073,165 @@ groups:
 | -storage.maxRowsPerInsertBlock | 10000 | 50000 | 每插入块最大行数 |
 | -storage.retentionPeriod | 1 | 6 | 数据保留月数 |
 
+## VictoriaMetrics集群运维实战
+
+### 集群部署架构
+
+```mermaid
+flowchart TB
+    subgraph 数据写入
+        A[vminsert] --> B[vmstorage-1]
+        A --> C[vmstorage-2]
+        A --> D[vmstorage-3]
+    end
+    subgraph 数据查询
+        E[vmselect] --> B
+        E --> C
+        E --> D
+    end
+    subgraph 数据存储
+        B --> F[本地磁盘/S3]
+        C --> F
+        D --> F
+    end
+    subgraph 监控告警
+        G[vmagent] --> A
+        G --> E
+        H[vmalert] --> I[告警规则]
+    end
+```
+
+### 集群运维命令
+
+```bash
+# 查看集群状态
+curl http://vmstorage:8428/api/v1/status/tsdb
+
+# 查看当前活动时间序列
+curl http://vmstorage:8428/api/v1/status/active_queries
+
+# 强制合并提升查询性能
+curl http://vmstorage:8428/api/v1/admin/tsdb/merge
+
+# 查看磁盘空间使用
+du -sh /path/to/vmstorage-data/
+
+# 滚动重启vmstorage
+kubectl delete pod vmstorage-0 -n monitoring
+kubectl rollout status statefulset/vmstorage -n monitoring
+```
+
+### 集群资源监控
+
+| 监控指标 | 采集方式 | 告警阈值 | 处理建议 |
+|----------|----------|----------|----------|
+| vm_rows_inserted_total | 写入速率 | <预期值50% | 检查vminsert |
+| vm_slow_queries_total | 查询慢 | >100/5m | 优化查询/扩容vmselect |
+| vm_disk_space_available_bytes | 磁盘剩余 | <10GB | 扩容/缩短保留期 |
+| vm_memory_usage_bytes | 内存使用 | >80% | 增加内存/减少并发 |
+| vm_down | 组件宕机 | >0 | 检查Pod/重启 |
+
+### 去重与降采样配置
+
+```yaml
+# vmstorage去重配置
+-storageDataPath=/data
+-storageNode=vmstorage-1:8400,vmstorage-2:8400,vmstorage-3:8400
+
+# 降采样配置（通过vmselect）
+-promscrape.config=/config/scrape.yml
+-remoteWrite.tmpDataPath=/tmpData
+
+# vmstorage数据保留与降采样
+-retentionPeriod=90d
+-downsampling.period=30d:5m,90d:1h
+```
+
+### 多租户隔离方案
+
+| 隔离维度 | 实现方式 | 资源限制 | 监控粒度 |
+|----------|----------|----------|----------|
+| 写入隔离 | 多租户key | 写入QPS限制 | 按租户统计 |
+| 查询隔离 | vmselect实例 | 查询超时限制 | 按租户统计 |
+| 存储隔离 | 独立vmstorage | 存储配额 | 按租户统计 |
+| 网络隔离 | K8s NetworkPolicy | 带宽限制 | 按租户统计 |
+
+### 与Prometheus共存方案
+
+```mermaid
+flowchart LR
+    A[Prometheus] -->|remote_write| B[vmagent]
+    C[vmagent] -->|采集| D[目标集群]
+    B -->|写入| E[vmstorage]
+    D -->|暴露指标| B
+    E -->|查询| F[vmselect]
+    F -->|PromQL| G[Grafana]
+```
+
+### vmagent配置最佳实践
+
+```yaml
+# vmagent配置示例
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vmagent-config
+data:
+  scrape.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    scrape_configs:
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: (.+)
+        replacement: ${1}
+```
+
+### 容量规划与扩展策略
+
+```text
+容量扩展决策树：
+  1. 写入瓶颈
+     → 增加vminsert节点
+     → 优化remote_write配置
+     → 检查vmstorage写入性能
+
+  2. 查询瓶颈
+     → 增加vmselect节点
+     → 优化查询语句
+     → 配置降采样
+
+  3. 存储瓶颈
+     → 扩展vmstorage磁盘
+     → 配置S3后端存储
+     → 缩短数据保留期
+
+  4. 网络瓶颈
+     → 检查网络带宽
+     → 优化数据压缩
+     → 调整批量发送参数
+```
+
+## VictoriaMetrics vs Thanos深度对比
+
+| 对比维度 | VictoriaMetrics | Thanos | 选型建议 |
+|----------|-----------------|--------|----------|
+| 架构复杂度 | 简单（3组件） | 复杂（5+组件） | 团队小选VM |
+| 存储成本 | 低（列式压缩7-10x） | 中（2-3x） | 存储敏感选VM |
+| 查询性能 | 快（预聚合） | 中（实时计算） | 查询密集选VM |
+| 全局视图 | 原生支持 | 需要Store Gateway | 多集群选Thanos |
+| 数据兼容 | 100% PromQL | 100% PromQL | 无差异 |
+| 运维复杂度 | 低 | 高 | 运维能力弱选VM |
+| 社区生态 | 快速增长 | 成熟稳定 | 企业级选Thanos |
+
 ## 二十四、与其他板块的关系

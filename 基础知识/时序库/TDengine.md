@@ -2022,6 +2022,164 @@ SELECT AVG(battery) FROM devices GROUP BY location;
 | 写入优化 | 批量写入 | 提升吞吐 |
 | 保留策略 | 按设备设置 | 节省空间 |
 
+## TDengine集群运维与监控
+
+### 集群状态监控
+
+```bash
+# 查看集群节点状态
+taos -s "SHOW DNODES;"
+#  id      | endpoint          | vnodes | status  | alive  | role
+#  1       | dn1:6030          | 6      | ready   | yes    | leader
+#  2       | dn2:6030          | 6      | ready   | yes    | follower
+#  3       | dn3:6030          | 6      | ready   | yes    | follower
+
+# 查看VGroup分布
+taos -s "SHOW VGROUPS;"
+#  id      | nodes      | status
+#  1       | 1,2,3      | ready
+#  2       | 1,2,3      | ready
+#  3       | 1,2,3      | ready
+
+# 查看数据库信息
+taos -s "SHOW DATABASES;"
+taos -s "DESCRIBE sensor_data;"
+
+# 查看表信息
+taos -s "SHOW TABLES;"
+taos -s "SELECT COUNT(*) FROM sensors;"
+```
+
+### 集群性能监控
+
+| 监控指标 | 采集方式 | 告警阈值 | 说明 |
+|----------|----------|----------|------|
+| 写入吞吐 | SHOW DNODES | <预期值50% | 检查网络/磁盘 |
+| 查询延迟 | slow query log | >1s | 优化查询/索引 |
+| 磁盘使用 | SHOW DATABASES | >80% | 扩容/缩短保留期 |
+| 内存使用 | DNODE STATUS | >80% | 增加内存 |
+| VNode数量 | SHOW VGROUPS | >1000/节点 | 重新分片 |
+| 连接数 | SHOW CONNECTIONS | >1000 | 连接池优化 |
+
+### 集群故障处理
+
+```mermaid
+flowchart TB
+    A[故障发现] --> B{故障类型?}
+    B -->|节点故障| C[检查VNode状态]
+    B -->|网络故障| D[检查网络连通]
+    B -->|磁盘故障| E[检查磁盘空间]
+    C --> F{VNode受影响?}
+    F -->|是| G[数据迁移]
+    F -->|否| H[继续监控]
+    G --> I[验证数据完整性]
+    D --> J[重启节点/切换网络]
+    E --> K[扩容/清理磁盘]
+```
+
+### 数据备份与恢复
+
+```bash
+# 全量备份
+taosdump -o /backup/full -D sensor_data
+
+# 增量备份（基于WAL）
+taosdump -o /backup/incremental -A sensor_data
+
+# 备份验证
+taosdump -i /backup/full --dry-run
+
+# 恢复数据
+taosdump -i /backup/full
+
+# 跨集群迁移
+taosdump -h source_host -o /backup/migration -D sensor_data
+taosdump -h target_host -i /backup/migration
+```
+
+### 多租户资源隔离
+
+| 隔离维度 | 实现方式 | 配置参数 | 限制效果 |
+|----------|----------|----------|----------|
+| 存储配额 | 数据库级别 | MAXROWS | 限制存储空间 |
+| 连接数 | 用户级别 | MAXCONNS | 限制并发连接 |
+| 查询资源 | 会话级别 | QUERY_LIMIT | 限制查询资源 |
+| 写入速率 | 数据库级别 | BUFFER | 限制写入速度 |
+| CPU配额 | 系统级别 | CPU_QUOTA | 限制CPU使用 |
+
+### 流计算配置
+
+```sql
+-- 创建流计算
+CREATE STREAM sensor_avg_stream
+TRIGGER WINDOW_CLOSE
+INTO sensor_avg_result
+AS
+SELECT ts, device_id, AVG(temperature) AS avg_temp, MAX(humidity) AS max_humidity
+FROM sensors
+PARTITION BY device_id
+WINDOW(SLIDING(5m));
+
+-- 创建连续查询
+CREATE CONTINUOUS QUERY sensor_1h
+BEGIN
+  SELECT AVG(temperature), MAX(humidity), COUNT(*)
+  FROM sensors
+  WHERE ts > NOW - 1h
+  INTO sensor_1h_result;
+END;
+
+-- 查看流状态
+SHOW STREAMS;
+SHOW QUERIES;
+```
+
+### TDengine安全配置
+
+```yaml
+# taosd安全配置
+firstEp: dn1:6030
+secondEp: dn2:6030
+
+# 认证配置
+authOnGrant: true
+authOnSuccess: true
+
+# 用户管理
+CREATE USER 'app_user' PASS 'secure_password';
+GRANT READ ON sensor_data TO 'app_user';
+REVOKE WRITE ON sensor_data FROM 'app_user';
+
+# 审计日志
+audit: true
+auditLog: /var/log/taos/audit.log
+```
+
+### TDengine vs 时序库对比详解
+
+| 对比维度 | TDengine | InfluxDB | TimescaleDB | 选型建议 |
+|----------|----------|----------|-------------|----------|
+| 数据模型 | STable+子表 | measurement | 表 | 关系型选TDengine |
+| 查询语言 | SQL | InfluxQL/Flux | SQL | SQL生态选TDengine |
+| 性能 | 极高 | 高 | 中 | 性能优先选TDengine |
+| 压缩比 | 10:1 | 5:1 | 3:1 | 存储敏感选TDengine |
+| 集群支持 | 原生 | 企业版 | 原生 | 开源集群选TDengine |
+| 生态兼容 | TDengine生态 | Prometheus兼容 | PostgreSQL兼容 | 根据现有生态选择 |
+| 学习曲线 | 中 | 低 | 低 | 简单场景选InfluxDB |
+| 社区生态 | 中文社区强 | 国际社区强 | PG生态 | 国内选TDengine |
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| maxRowsPerBlock | 4096 | 16384 | 块大小优化 |
+| compression | 2 | 2 | 压缩级别 |
+| keep | 365 | 按需 | 数据保留天数 |
+| replica | 1 | 3 | 副本数 |
+| vgroups | 6 | CPU核数×2 | VNode数量 |
+| buffer | 128 | 256 | 写入缓冲大小 |
+| cache | 16 | 32 | 查询缓存大小 |
+
 ## 九、与其他板块的关系
 
 - 时序数据库对比见「[时序库对比](./时序库对比.md)」；

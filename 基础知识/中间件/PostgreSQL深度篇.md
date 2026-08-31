@@ -2012,6 +2012,130 @@ ORDER BY idx_scan DESC;
 | incrementally | 增量备份 | 备份优化 |
 | pg_stat_io | I/O统计 | 性能监控 |
 
+## PostgreSQL生产问题深度排查
+
+### 常见生产问题场景
+
+| 问题类型 | 典型症状 | 根因分析 | 解决方案 |
+|----------|----------|----------|----------|
+| 连接风暴 | 连接数飙升/服务超时 | 连接池配置不当/慢查询 | PgBouncer+慢查询优化 |
+| WAL堆积 | 磁盘空间不足/复制延迟 | 归档失败/大事务 | 清理归档/优化事务 |
+| 表膨胀 | 查询变慢/磁盘增长 | VACUUM不及时/长事务 | 调整autovacuum参数 |
+| 锁等待 | 事务阻塞/超时 | 长事务/DDL操作 | 优化事务/在线DDL |
+| 查询退化 | 执行计划突变 | 统计信息过期 | ANALYZE/固定执行计划 |
+
+### 慢查询深度分析实战
+
+```sql
+-- 1. 定位慢查询（使用pg_stat_statements）
+SELECT query, calls, total_exec_time, mean_exec_time, rows
+FROM pg_stat_statements
+WHERE mean_exec_time > 1000  -- 超过1秒
+ORDER BY total_exec_time DESC
+LIMIT 20;
+
+-- 2. 分析执行计划
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT * FROM orders WHERE status = 'pending' AND created_at > '2024-01-01';
+
+-- 3. 查看索引使用效率
+SELECT schemaname, tablename, indexname, idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0  -- 未使用索引
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- 4. 检查锁等待链
+WITH RECURSIVE lock_chain AS (
+  SELECT pid, relation, mode, granted, pg_blocking_pids(pid) AS blockers
+  FROM pg_locks
+  WHERE NOT granted
+  UNION ALL
+  SELECT l.pid, l.relation, l.mode, l.granted, pg_blocking_pids(l.pid)
+  FROM pg_locks l
+  JOIN lock_chain lc ON l.pid = ANY(lc.blockers)
+)
+SELECT * FROM lock_chain;
+```
+
+### VACUUM调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| autovacuum_max_workers | 3 | 5-8 | 并发VACUUM工作进程 |
+| autovacuum_naptime | 1min | 30s | 检查间隔 |
+| autovacuum_vacuum_threshold | 50 | 100 | 最小行变化数 |
+| autovacuum_vacuum_scale_factor | 0.2 | 0.05 | 变化比例阈值 |
+| autovacuum_analyze_threshold | 50 | 100 | ANALYZE最小行变化 |
+| autovacuum_analyze_scale_factor | 0.1 | 0.02 | ANALYZE变化比例 |
+| autovacuum_vacuum_cost_delay | 2ms | 1ms | VACUUM节流延迟 |
+
+### 连接池生产配置
+
+```yaml
+# HikariCP生产配置
+spring:
+  datasource:
+    hikari:
+      pool-name: production-pool
+      minimum-idle: 10
+      maximum-pool-size: 50
+      connection-timeout: 5000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      leak-detection-threshold: 60000
+      connection-test-query: SELECT 1
+      validation-timeout: 3000
+
+# PgBouncer配置
+[databases]
+production = host=localhost port=5432 dbname=production
+
+[pgbouncer]
+listen_port = 6432
+listen_addr = 0.0.0.0
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+default_pool_size = 20
+max_client_conn = 1000
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+server_idle_timeout = 600
+client_idle_timeout = 0
+```
+
+### 复制监控与故障处理
+
+```sql
+-- 监控复制延迟
+SELECT client_addr, state, sync_state,
+  pg_size_bytes(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS lag_bytes,
+  pg_size_bytes(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) / 1024 / 1024 AS lag_mb,
+  replay_lag
+FROM pg_stat_replication;
+
+-- 检查WAL归档状态
+SELECT * FROM pg_stat_archiver;
+
+-- 复制槽健康检查
+SELECT slot_name, active, restart_lsn,
+  pg_size_bytes(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_bytes
+FROM pg_replication_slots;
+```
+
+### PostgreSQL性能基线建立
+
+| 指标类别 | 关键指标 | 基线值 | 告警阈值 |
+|----------|----------|--------|----------|
+| 连接数 | active_connections | <max_connections*80% | >90% |
+| 缓存命中率 | cache_hit_ratio | >99% | <95% |
+| 事务吞吐 | commits_per_sec | 基线值±20% | 波动>50% |
+| 查询延迟 | mean_exec_time | <100ms | >500ms |
+| 复制延迟 | replay_lag | <1s | >10s |
+| 磁盘使用 | data_disk_usage | <70% | >85% |
+| WAL生成 | wal_bytes_per_sec | 基线值±30% | 波动>100% |
+
 ## 十五、速查表（扩展）
 
 | 项 | 结论 |

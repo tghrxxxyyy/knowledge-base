@@ -1882,6 +1882,206 @@ node.attr.data: cold
 
 ---
 
+## ELK生产问题排查实战
+
+### 常见问题场景
+
+| 问题类型 | 典型症状 | 根因分析 | 解决方案 |
+|----------|----------|----------|----------|
+| 索引写入拒绝 | 429 Too Many Requests | 分片达到写入上限 | 扩容/增加分片 |
+| 查询超时 | 504 Gateway Timeout | 查询范围过大/聚合复杂 | 缩小范围/优化查询 |
+| 磁盘空间不足 | 红色集群状态 | 索引过多/保留期过长 | 清理/ILM策略 |
+| 数据不一致 | 副本分片未分配 | 节点故障/磁盘不足 | 检查节点/扩容 |
+| 日志丢失 | 日志条数不匹配 | Logstash背压/网络 | 检查Logstash/网络 |
+
+### ES集群健康检查
+
+```bash
+# 集群状态检查
+curl -XGET 'localhost:9200/_cluster/health?pretty'
+# {
+#   "status": "green",
+#   "number_of_nodes": 5,
+#   "number_of_data_nodes": 3,
+#   "active_primary_shards": 15,
+#   "active_shards": 30,
+#   "relocating_shards": 0,
+#   "initializing_shards": 0,
+#   "unassigned_shards": 0
+# }
+
+# 节点状态检查
+curl -XGET 'localhost:9200/_cat/nodes?v&h=name,heap.percent,ram.percent,cpu,load_1m'
+# name     heap.percent ram.percent cpu load_1m
+# node-1           45          68   12     2.5
+# node-2           52          72   15     3.1
+# node-3           38          65    8     1.8
+
+# 索引状态检查
+curl -XGET 'localhost:9200/_cat/indices?v&s=store.size:desc&h=index,health,status,pri,rep,docs.count,store.size'
+# index                    health status pri rep docs.count store.size
+# logs-2024.01.15          green  open   5   1    1000000     2.5gb
+# logs-2024.01.14          green  open   5   1     950000     2.3gb
+# logs-2024.01.13          yellow open   5   1     900000     2.1gb
+```
+
+### Logstash性能调优
+
+```ruby
+# logstash.conf性能优化配置
+input {
+  beats {
+    port => 5044
+    worker => 4
+    connector_cores => 2
+  }
+}
+
+filter {
+  # 使用grok解析日志
+  grok {
+    match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:log}" }
+    tag_on_failure => ["_grokparsefailure"]
+  }
+  
+  # 日期解析
+  date {
+    match => [ "timestamp", "yyyy-MM-dd HH:mm:ss.SSS" ]
+    target => "@timestamp"
+  }
+  
+  # 字段修改
+  mutate {
+    rename => { "host" => "hostname" }
+    remove_field => [ "timestamp", "agent", "ecs" ]
+  }
+  
+  # 内存优化
+  ruby {
+    code => "
+      event.set('memory_usage', GC.stat[:heap_used_slots])
+    "
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["http://es1:9200", "http://es2:9200"]
+    index => "logs-%{+YYYY.MM.dd}"
+    user => "elastic"
+    password => "${ES_PASSWORD}"
+    
+    # 批量写入优化
+    flush_size => 5000
+    idle_flush_time => 1
+    workers => 4
+    
+    # 重试配置
+    retry_max_interval => 30
+    retry_max_bulk_requests => 30
+  }
+}
+```
+
+### Kibana Dashboard设计最佳实践
+
+| Dashboard类型 | 设计要点 | 常用可视化 | 适用场景 |
+|---------------|----------|------------|----------|
+| 实时监控 | 大指标+趋势 | Metric/Line | 系统监控 |
+| 错误分析 | 分类+趋势 | Pie/Line | 错误排查 |
+| 性能分析 | 分布+百分位 | Histogram/Heatmap | 性能优化 |
+| 业务分析 | 漏斗+转化 | Bar/Pie | 业务分析 |
+
+### 日志采集链路监控
+
+```yaml
+# Filebeat配置监控
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /var/log/app/*.log
+  fields:
+    app: myapp
+    env: production
+  fields_under_root: true
+
+# 监控Filebeat自身
+monitoring.enabled: true
+monitoring.elasticsearch.hosts: ["http://es1:9200"]
+monitoring.elasticsearch.username: "elastic"
+monitoring.elasticsearch.password: "${ES_PASSWORD}"
+monitoring.kibana.hosts: ["http://kibana1:5601"]
+
+# 指标采集
+output.metrics.monitoring.enabled: true
+output.metrics.monitoring.stats.period: 10s
+```
+
+### ES索引生命周期管理
+
+```json
+// ILM策略配置
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_primary_shard_size": "50gb",
+            "max_age": "1d"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          },
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "set_priority": {
+            "priority": 50
+          }
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "set_priority": {
+            "priority": 0
+          }
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+### ELK性能调优参数
+
+| 组件 | 参数 | 默认值 | 推荐值 | 说明 |
+|------|------|--------|--------|------|
+| ES | index.refresh_interval | 1s | 30s | 降低刷新频率 |
+| ES | index.translog.durability | request | async | 异步事务日志 |
+| ES | thread_pool.write.queue_size | 1000 | 5000 | 写入队列大小 |
+| Logstash | pipeline.workers | 4 | CPU核数 | 工作线程数 |
+| Logstash | pipeline.batch.size | 125 | 500-1000 | 批量大小 |
+| Filebeat | bulk_max_size | 2048 | 5000 | 批量发送大小 |
+
 ## 六、与其他板块的关系
 
 - 和「**基础知识/ES体系**」「**基础知识/中间件/ClickHouse**」：ES 系检索细节见 ES 体系篇；日志分析报表可用 ClickHouse。

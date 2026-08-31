@@ -2069,6 +2069,203 @@ public void cronTask() {
 | 404错误 | 路由配置错误 | 检查@RequestMapping |
 | 连接超时 | 连接池配置不当 | 调整连接池参数 |
 
+## Spring Boot生产配置优化
+
+### 配置外置与管理
+
+| 配置来源 | 优先级 | 适用场景 | 安全级别 |
+|----------|--------|----------|----------|
+| 命令行参数 | 最高 | 临时覆盖 | 中 |
+| 环境变量 | 高 | 容器部署 | 高 |
+| 配置中心 | 高 | 动态配置 | 最高 |
+| application.yml | 低 | 默认配置 | 低 |
+
+### 优雅停机配置
+
+```yaml
+# Spring Boot优雅停机配置
+server:
+  shutdown: graceful
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+# K8s Pod配置
+spec:
+  terminationGracePeriodSeconds: 60
+  containers:
+  - name: app
+    lifecycle:
+      preStop:
+        exec:
+          command: ["/bin/sh", "-c", "sleep 5"]
+    readinessProbe:
+      httpGet:
+        path: /actuator/health/readiness
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    livenessProbe:
+      httpGet:
+        path: /actuator/health/liveness
+        port: 8080
+      initialDelaySeconds: 30
+      periodSeconds: 10
+```
+
+### 事务传播行为详解
+
+| 传播行为 | 说明 | 使用场景 |
+|----------|------|----------|
+| REQUIRED | 有事务就加入，没有就新建 | 默认行为 |
+| REQUIRES_NEW | 总是新建事务 | 独立操作 |
+| NESTED | 嵌套事务 | 部分回滚 |
+| SUPPORTS | 有事务就加入，没有就非事务 | 查询操作 |
+| NOT_SUPPORTED | 非事务执行 | 长时间操作 |
+| MANDATORY | 必须有事务 | 强制事务 |
+| NEVER | 必须没有事务 | 非事务操作 |
+
+### @Cacheable使用陷阱
+
+```java
+// ❌ 错误：自调用缓存失效
+@Service
+public class UserService {
+    public User getUser(Long id) {
+        return getUserInternal(id);  // 自调用不走代理
+    }
+    
+    @Cacheable("users")
+    public User getUserInternal(Long id) {
+        return userRepository.findById(id).orElse(null);
+    }
+}
+
+// ✅ 正确：通过代理调用
+@Service
+public class UserService {
+    @Autowired
+    private UserService self;  // 注入自身代理
+    
+    public User getUser(Long id) {
+        return self.getUserInternal(id);  // 通过代理调用
+    }
+    
+    @Cacheable("users")
+    public User getUserInternal(Long id) {
+        return userRepository.findById(id).orElse(null);
+    }
+}
+```
+
+### 异步线程池配置
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+    
+    @Bean("taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(100);
+        executor.setKeepAliveSeconds(60);
+        executor.setThreadNamePrefix("async-");
+        executor.setRejectedExecutionHandler(
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+        executor.initialize();
+        return executor;
+    }
+}
+
+// 使用自定义线程池
+@Async("taskExecutor")
+public void asyncMethod() {
+    // 异步执行逻辑
+}
+```
+
+### Actuator生产配置
+
+```yaml
+# Actuator安全配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: when-authorized
+      roles: ACTUATOR_ADMIN
+    shutdown:
+      enabled: false  # 生产环境禁用
+  health:
+    db:
+      enabled: true
+    redis:
+      enabled: true
+    diskspace:
+      enabled: true
+
+# 自定义健康检查
+@Component
+public class CustomHealthIndicator implements HealthIndicator {
+    @Override
+    public Health health() {
+        // 检查自定义组件健康状态
+        boolean healthy = checkCustomComponent();
+        if (healthy) {
+            return Health.up().withDetail("custom", "ok").build();
+        }
+        return Health.down().withDetail("custom", "error").build();
+    }
+}
+```
+
+### Spring Security生产配置
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())  // REST API禁用CSRF
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/**").hasRole("ACTUATOR_ADMIN")
+                .requestMatchers("/api/public/**").permitAll()
+                .requestMatchers("/api/**").authenticated()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(Customizer.withDefaults())
+            )
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+        return http.build();
+    }
+}
+```
+
+### 故障排查工具箱
+
+| 工具 | 用途 | 使用场景 |
+|------|------|----------|
+| Arthas | Java诊断 | 线程/类/方法分析 |
+| VisualVM | JVM监控 | 内存/CPU/线程 |
+| JProfiler | 性能分析 | 代码级性能 |
+| Spring Boot DevTools | 开发热重载 | 开发环境 |
+| Actuator | 应用监控 | 健康/指标/环境 |
+
 ## Spring 故障排查
 
 ### 常见故障处理

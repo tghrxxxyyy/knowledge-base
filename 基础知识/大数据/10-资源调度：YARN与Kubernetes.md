@@ -2074,3 +2074,164 @@ spec:
     jarURI: local:///opt/flink/examples/streaming/WindowWordCount.jar
     parallelism: 4
 ```
+
+## YARN与K8s调度性能对比实验
+
+### 实验设计
+
+| 实验维度 | 测试场景 | 测试指标 | 对比方案 |
+|----------|----------|----------|----------|
+| 调度延迟 | 1000 Pod部署 | 首Pod调度时间 | YARN vs K8s |
+| 吞吐量 | 10000 Pod批量 | Pod/秒 | YARN vs K8s |
+| 资源碎片 | 不同规格Pod | 资源利用率 | FIFO vs DRF |
+| 弹性扩缩 | 负载突增 | 扩缩速度 | 手动 vs 自动 |
+
+### 调度器配置对比
+
+```yaml
+# K8s调度器配置
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: default-scheduler
+  pluginConfig:
+  - name: NodeResourcesFit
+    args:
+      scoringStrategy:
+        type: LeastAllocated
+        resources:
+        - name: cpu
+          weight: 1
+        - name: memory
+          weight: 1
+  - name: PodTopologySpread
+    args:
+      defaultingType: System
+      defaultConstraints:
+      - maxSkew: 3
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+
+# YARN调度器配置
+yarn.scheduler.capacity.root.maximum-application-masters: 1000
+yarn.scheduler.capacity.root.maximum-application-containers: 10000
+yarn.scheduler.capacity.root.queue.maximum-am-resource-limit: 0.2
+yarn.scheduler.capacity.root.queue.user-limit-factor: 1.0
+```
+
+### 资源模型对比
+
+| 资源维度 | YARN | K8s | 说明 |
+|----------|------|-----|------|
+| CPU | vcore | millicore | 粒度不同 |
+| 内存 | MB | bytes | 单位不同 |
+| GPU | YARN-3937 | 扩展资源 | K8s更灵活 |
+| 自定义资源 | 不支持 | 支持 | K8s优势 |
+| 资源隔离 | cgroup v1 | cgroup v2 | K8s更新 |
+
+### 迁移风险评估矩阵
+
+| 风险类型 | 影响程度 | 发生概率 | 缓解措施 | 责任方 |
+|----------|----------|----------|----------|--------|
+| 作业兼容性 | 高 | 中 | 充分测试 | 开发 |
+| 数据迁移 | 高 | 低 | 增量同步 | 数据 |
+| 性能退化 | 中 | 中 | 性能测试 | 运维 |
+| 成本增加 | 中 | 低 | 成本分析 | 财务 |
+| 人才流失 | 低 | 中 | 知识转移 | HR |
+
+### Spark on K8s资源优化
+
+```yaml
+# Spark on K8s资源配置优化
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: optimized-spark-job
+spec:
+  type: Scala
+  mode: cluster
+  image: spark:3.3.1
+  sparkVersion: "3.3.1"
+  driver:
+    cores: 2
+    coreLimit: "4"
+    memory: "4g"
+    labels:
+      version: 3.3.1
+    serviceAccount: spark
+    env:
+    - name: SPARK_DRIVER_MEMORY
+      value: "4g"
+  executor:
+    cores: 4
+    coreLimit: "4"
+    memory: "8g"
+    instances: 5
+    labels:
+      version: 3.3.1
+    env:
+    - name: SPARK_EXECUTOR_MEMORY
+      value: "8g"
+    - name: SPARK_EXECUTOR_CORES
+      value: "4"
+  dynamicAllocation:
+    enabled: true
+    initialExecutors: 2
+    minExecutors: 1
+    maxExecutors: 20
+    schedulerBacklogTimeout: 1s
+    sustainedSchedulerBacklogTimeout: 1s
+```
+
+### Flink on K8s状态管理
+
+| 状态后端 | 存储位置 | 性能 | 容错 | 适用场景 |
+|----------|----------|------|------|----------|
+| HashMapStateBackend | TaskManager内存 | 极快 | 需Checkpoint | 测试/开发 |
+| EmbeddedRocksDBStateBackend | 本地RocksDB | 快 | 支持Checkpoint | 生产环境 |
+| FileSystemStateBackend | HDFS/S3 | 中 | 支持Checkpoint | 大状态作业 |
+
+### 调度器监控告警
+
+| 监控指标 | 采集方式 | 告警阈值 | 处理建议 |
+|----------|----------|----------|----------|
+| Pod调度延迟 | kube-scheduler指标 | >1s | 检查调度器负载 |
+| 待调度Pod数 | kube-scheduler指标 | >100 | 增加节点/优化调度 |
+| 资源碎片率 | 自定义计算 | >30% | 优化Pod规格 |
+| YARN队列使用率 | YARN Metrics | >90% | 扩容/调整配额 |
+| 节点资源利用率 | Prometheus | <40% | 缩容/整合节点 |
+
+### 混合云调度策略
+
+```text
+混合云调度策略：
+  1. 本地优先策略
+     → 优先调度到本地集群
+     → 本地资源不足时扩展到云
+     → 适用：稳定负载
+
+  2. 成本优先策略
+     → 根据实时价格选择调度目标
+     → Spot实例优先使用
+     → 适用：弹性负载
+
+  3. 延迟优先策略
+     → 选择网络延迟最低的节点
+     → 就近调度用户请求
+     → 适用：低延迟服务
+
+  4. 合规优先策略
+     → 根据数据合规要求调度
+     → 敏感数据不出境
+     → 适用：金融/政务
+```
+
+### 调度器性能调优参数
+
+| 参数 | YARN | K8s | 调优建议 |
+|------|------|-----|----------|
+| 调度间隔 | 5ms | 100ms | 降低可减少延迟 |
+| 队列大小 | 10000 | 1000 | 增加可提升吞吐 |
+| 并发度 | 1 | 10 | 增加可提升并发 |
+| 缓存大小 | 1000 | 1000 | 增加可减少查询 |
+| 超时时间 | 60s | 30s | 降低可快速失败 |

@@ -2061,6 +2061,190 @@ spec:
 | PVC绑定失败 | StorageClass/权限 | 检查存储配置 |
 | OOMKilled | 内存不足 | 增加内存限制 |
 
+## K8s生产环境调试与排障
+
+### Pod故障排查流程
+
+```mermaid
+flowchart TB
+    A[Pod异常] --> B{Pod状态?}
+    B -->|Pending| C[资源不足/调度问题]
+    B -->|CrashLoopBackOff| D[启动失败/健康检查]
+    B -->|ImagePullBackOff| E[镜像拉取失败]
+    B -->|OOMKilled| F[内存不足]
+    C --> G[检查资源配额/节点状态]
+    D --> H[查看容器日志/事件]
+    E --> I[检查镜像名/仓库凭证]
+    F --> J[增加内存限制]
+```
+
+### K8s调试命令速查
+
+```bash
+# Pod状态排查
+kubectl get pods -n <ns> --field-selector=status.phase!=Running
+kubectl describe pod <pod> -n <ns>
+kubectl logs <pod> -n <ns> --previous  # 上一次崩溃日志
+kubectl logs <pod> -n <ns> -c <container>  # 多容器Pod
+
+# 网络排查
+kubectl exec -it <pod> -n <ns> -- nslookup <service>
+kubectl exec -it <pod> -n <ns> -- curl <service>:<port>
+kubectl get endpoints <service> -n <ns>
+
+# 资源排查
+kubectl top pods -n <ns> --sort-by=memory
+kubectl top nodes
+kubectl describe nodes <node> | grep -A 5 "Allocated resources"
+
+# 事件排查
+kubectl get events -n <ns> --sort-by='.lastTimestamp'
+kubectl get events -n <ns> --field-selector=type=Warning
+```
+
+### HPA自动扩缩配置详解
+
+```yaml
+# 基于CPU/内存的自动扩缩
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+### PDB与滚动更新策略
+
+| 策略 | 配置示例 | 说明 | 适用场景 |
+|------|----------|------|----------|
+| minAvailable | minAvailable: 3 | 至少保持3个Pod | 关键服务 |
+| maxUnavailable | maxUnavailable: 1 | 最多1个不可用 | 一般服务 |
+| maxSurge | maxSurge: 25% | 最多25%额外Pod | 快速扩容 |
+| 交织更新 | maxUnavailable: 0, maxSurge: 1 | 零停机滚动 | 核心服务 |
+
+### 安全策略与最佳实践
+
+```yaml
+# Pod Security Standards
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+# 非Root用户配置
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 2000
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - NET_BIND_SERVICE
+
+# 只读根文件系统
+containers:
+- name: app
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+  volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+```
+
+### 网络策略实战
+
+```yaml
+# 默认拒绝所有入站
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+# 允许前端访问后端
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - port: 8080
+      protocol: TCP
+
+# 限制Pod间通信
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-cross-namespace
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: production
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: production
+```
+
 ## 二十二、与其他板块的关系
 
 ```text

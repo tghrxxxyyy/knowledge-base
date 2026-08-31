@@ -2162,3 +2162,149 @@ spec:
 | PVC | 持久卷声明 |
 | StorageClass | 存储类 |
 | 本地存储 | hostPath/emptyDir |
+
+## K8s CI/CD生产问题排查
+
+### 常见部署问题
+
+| 问题类型 | 典型症状 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 镜像拉取失败 | ImagePullBackOff | 检查镜像名/仓库凭证 | 修复镜像配置 |
+| 启动失败 | CrashLoopBackOff | 查看容器日志 | 修复启动命令 |
+| 资源不足 | Pending | 检查资源配额 | 调整资源配置 |
+| 健康检查失败 | Restarting | 检查探针配置 | 调整探针参数 |
+| 权限不足 | CrashLoopBackOff | 检查RBAC/SA | 配置权限 |
+
+### Helm Chart调试技巧
+
+```bash
+# 调试渲染后的模板
+helm template my-release ./chart -f values.yaml
+
+# 查看差异
+helm diff upgrade my-release ./chart -f values.yaml
+
+# 回滚到上一版本
+helm rollback my-release 1
+
+# 查看历史
+helm history my-release
+
+# 调试安装
+helm install my-release ./chart --dry-run --debug
+
+# 查看资源状态
+kubectl get all -n <namespace>
+kubectl describe deployment <name> -n <namespace>
+kubectl logs <pod> -n <namespace> -c <container>
+```
+
+### K8s资源管理最佳实践
+
+| 资源类型 | 配置建议 | 说明 |
+|----------|----------|------|
+| Deployment | replicas=3, maxSurge=1 | 高可用部署 |
+| Service | ClusterIP + Ingress | 内外网分离 |
+| ConfigMap | 热更新配置 | 配置与代码分离 |
+| Secret | 加密存储 | 敏感信息管理 |
+| HPA | min=2, max=10 | 弹性扩缩 |
+| PDB | minAvailable=1 | 保障可用性 |
+
+### CI/CD安全加固
+
+```yaml
+# 安全扫描集成
+trivy-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    # 漏洞扫描
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    # SBOM生成
+    - trivy image --format spdx-json $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA > sbom.json
+    # 合规检查
+    - trivy image --exit-code 1 --compliance docker-cis $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  artifacts:
+    paths: [sbom.json]
+    when: always
+
+# 镜像签名
+cosign-sign:
+  stage: security
+  image: gcr.io/projectsigstore/cosign:latest
+  script:
+    - cosign sign --key cosign.key $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+```
+
+### K8s网络策略配置
+
+```yaml
+# 生产环境网络策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: production-network-policy
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app: api-gateway
+    ports:
+    - port: 8080
+      protocol: TCP
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: production
+    ports:
+    - port: 5432
+      protocol: TCP
+    - port: 6379
+      protocol: TCP
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+```
+
+### 容器镜像构建最佳实践
+
+```dockerfile
+# 多阶段构建最佳实践
+# 阶段1：构建
+FROM maven:3.9-eclipse-temurin-21 AS builder
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:go-offline
+COPY src ./src
+RUN mvn package -DskipTests
+
+# 阶段2：运行
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+COPY --from=builder /app/target/*.jar app.jar
+USER appuser
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD wget -qO- http://localhost:8080/actuator/health || exit 1
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```

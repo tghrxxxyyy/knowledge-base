@@ -2082,6 +2082,174 @@ build:
 | 日志清理 | 定期清理日志 | 中 |
 | Runner维护 | 定期更新Runner | 中 |
 
+## GitLab CI性能优化与高级配置
+
+### 流水线性能分析
+
+| 性能指标 | 监控方法 | 优化目标 | 关键配置 |
+|----------|----------|----------|----------|
+| 作业耗时 | CI/CD Analytics | <5分钟 | needs/cache |
+| 流水线总时长 | Pipeline Analytics | <15分钟 | DAG并行 |
+| 缓存命中率 | Runner日志 | >80% | key策略 |
+| 资源利用率 | Runner监控 | >60% | 并行数调整 |
+
+### DAG流水线优化
+
+```yaml
+# 使用needs实现DAG并行
+stages:
+  - build
+  - test
+  - deploy
+
+build_java:
+  stage: build
+  script: mvn package -DskipTests
+  artifacts:
+    paths: [target/*.jar]
+
+test_unit:
+  stage: test
+  needs: ["build_java"]
+  script: mvn test
+
+test_integration:
+  stage: test
+  needs: ["build_java"]
+  script: mvn verify -Pintegration
+
+deploy_staging:
+  stage: deploy
+  needs: ["test_unit", "test_integration"]
+  script: ./deploy.sh staging
+  environment:
+    name: staging
+```
+
+### Runner配置优化
+
+```toml
+# GitLab Runner全局配置
+[global]
+  concurrent = 10          # 最大并发作业数
+  check_interval = 3       # 检查间隔
+
+[[runners]]
+  name = "docker-runner"
+  url = "https://gitlab.com/"
+  token = "xxxxx"
+  executor = "docker"
+  
+  [runners.docker]
+    image = "alpine:latest"
+    privileged = false
+    disable_entrypoint_overwrite = false
+    oom_kill_disable = false
+    disable_cache = false
+    volumes = ["/cache"]
+    shm_size = 0
+    
+  [runners.cache]
+    Type = "s3"
+    Shared = true
+    [runners.cache.s3]
+      BucketName = "gitlab-ci-cache"
+      BucketLocation = "us-east-1"
+```
+
+### 变量管理最佳实践
+
+| 变量类型 | 作用域 | 配置方式 | 安全级别 |
+|----------|--------|----------|----------|
+| 全局变量 | 所有作业 | Settings > CI/CD | 中 |
+| 项目变量 | 项目级 | Settings > CI/CD | 高 |
+| 组变量 | 组级 | Group Settings | 高 |
+| 文件变量 | 作业级 | CI/CD Variables | 高 |
+| Protected | 受保护分支 | Settings > CI/CD | 最高 |
+
+### 流水线模板设计模式
+
+```yaml
+# 基础模板
+.base-build:
+  image: maven:3.9-eclipse-temurin-21
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths: [.m2/repository/]
+  before_script:
+    - echo "Building $CI_PROJECT_NAME..."
+
+# 可见模板
+.build-java:
+  extends: .base-build
+  script:
+    - mvn package -DskipTests
+  artifacts:
+    paths: [target/]
+
+# 使用模板
+build_api:
+  extends: .build-java
+  stage: build
+  variables:
+    MAVEN_OPTS: "-Xmx1024m"
+
+build_web:
+  extends: .build-java
+  stage: build
+  variables:
+    MAVEN_OPTS: "-Xmx512m"
+    BUILD_PROFILE: "web"
+```
+
+### 安全扫描集成
+
+```yaml
+# SAST静态扫描
+sast:
+  stage: security
+  include:
+    - template: Security/SAST.gitlab-ci.yml
+  variables:
+    SAST_EXCLUDED_PATHS: "vendor/,node_modules/"
+
+# 依赖扫描
+dependency_scanning:
+  stage: security
+  include:
+    - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+# Secret扫描
+secret_detection:
+  stage: security
+  include:
+    - template: Security/Secret-Detection.gitlab-ci.yml
+
+# 容器扫描
+container_scanning:
+  stage: security
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+```
+
+### GitLab CI vs GitHub Actions vs Jenkins
+
+| 维度 | GitLab CI | GitHub Actions | Jenkins |
+|------|-----------|----------------|---------|
+| 配置格式 | YAML | YAML | Groovy |
+| 存储 | Git仓库 | Git仓库 | 文件系统 |
+| 运行器 | Runner | Runner | Agent |
+| 插件生态 | 内置功能 | Marketplace | Plugin |
+| UI体验 | 现代 | 现代 | 传统 |
+| 维护成本 | 低 | 低 | 高 |
+| 自托管 | 支持 | 支持 | 支持 |
+| 安全扫描 | 内置 | 需要第三方 | 需要插件 |
+
 ## 本篇补充 Checklist
 
 - [ ] 大仓/多服务用 parent-child `trigger`+`include`+`changes` 拆分。
