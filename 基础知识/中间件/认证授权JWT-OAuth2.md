@@ -1721,6 +1721,435 @@ def validate_claims(payload, expected_audience, expected_issuer):
     return True
 ```
 
+## JWT结构深度解析
+
+### JWT标准结构
+
+```text
+JWT由三部分组成（Header.Payload.Signature）：
+
+Header（头部）：
+  {
+    "alg": "RS256",        // 签名算法
+    "typ": "JWT",          // 令牌类型
+    "kid": "key-id"        // 密钥ID（可选）
+  }
+
+Payload（载荷）：
+  {
+    "sub": "1234567890",   // 主题（用户ID）
+    "name": "张三",        // 用户名
+    "iss": "auth-server",  // 签发者
+    "aud": "api-server",   // 接收方
+    "exp": 1609459200,     // 过期时间
+    "iat": 1609455600,     // 签发时间
+    "jti": "unique-id",    // 令牌唯一ID
+    "scope": "read write"  // 作用域
+  }
+
+Signature（签名）：
+  RS256(base64(header) + "." + base64(payload), private_key)
+```
+
+### JWT安全风险
+
+| 风险类型 | 攻击方式 | 防御措施 |
+|----------|----------|----------|
+| none算法攻击 | 篆改alg为none | 服务端强制指定算法 |
+| 密钥泄露 | 私钥被窃取 | 定期轮转密钥 |
+| 中间人攻击 | 未使用HTTPS | 强制HTTPS |
+| 重放攻击 | 令牌被重用 | 短有效期+刷新机制 |
+| 过期绕过 | 忽略exp验证 | 服务端严格验证 |
+
+### none算法攻击防御
+
+```python
+# 防御none算法攻击
+import jwt
+
+def safe_decode(token, public_key):
+    # 强制指定算法，不信任header中的alg
+    try:
+        payload = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],  # 只接受RS256
+            options={
+                "verify_exp": True,
+                "verify_iss": True,
+                "verify_aud": True
+            }
+        )
+        return payload
+    except jwt.InvalidSignatureError:
+        raise ValueError("签名验证失败")
+    except jwt.ExpiredSignatureError:
+        raise ValueError("令牌已过期")
+```
+
+### JWT密钥管理
+
+```yaml
+# 密钥管理策略
+jwt_key_management:
+  # 密钥生成
+  key_generation:
+    algorithm: "RS256"
+    key_size: 2048
+    rotation_period: "90d"
+  
+  # 密钥存储
+  key_storage:
+    type: "vault"  # HashiCorp Vault
+    path: "secret/jwt"
+    auto_rotate: true
+  
+  # 密钥分发
+  key_distribution:
+    jwks_endpoint: "/.well-known/jwks.json"
+    cache_ttl: "1h"
+```
+
+---
+
+## OAuth2授权流程详解
+
+### OAuth2四种授权模式
+
+| 模式 | 流程 | 适用场景 | 安全性 |
+|------|------|----------|--------|
+| 授权码模式 | 授权码+令牌交换 | Web应用 | 高 |
+| 隐式模式 | 直接返回令牌 | 单页应用 | 中 |
+| 密码模式 | 用户名密码换令牌 | 自建应用 | 中 |
+| 客户端模式 | 客户端凭证换令牌 | 服务间调用 | 高 |
+
+### 授权码模式详解
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant C as 客户端
+    participant AS as 授权服务器
+    participant RS as 资源服务器
+    
+    U->>C: 1. 点击登录
+    C->>U: 2. 重定向到授权服务器
+    U->>AS: 3. 认证并授权
+    AS->>C: 4. 返回授权码
+    C->>AS: 5. 用授权码换令牌
+    AS->>C: 6. 返回access_token
+    C->>RS: 7. 携带令牌访问资源
+    RS->>C: 8. 返回资源
+```
+
+### PKCE增强安全
+
+```python
+# PKCE流程实现
+import hashlib
+import base64
+import secrets
+
+def generate_pkce():
+    # 生成code_verifier
+    code_verifier = secrets.token_urlsafe(32)
+    
+    # 生成code_challenge
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip('=')
+    
+    return code_verifier, code_challenge
+
+# 授权请求
+def get_auth_url(auth_endpoint, client_id, redirect_uri, code_challenge):
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "scope": "openid profile"
+    }
+    return f"{auth_endpoint}?{urlencode(params)}"
+```
+
+---
+
+## RBAC权限模型
+
+### RBAC架构
+
+```mermaid
+graph TB
+    subgraph 用户
+        U1[用户1]
+        U2[用户2]
+    end
+    subgraph 角色
+        R1[管理员]
+        R2[编辑者]
+        R3[查看者]
+    end
+    subgraph 权限
+        P1[创建]
+        P2[编辑]
+        P3[查看]
+        P4[删除]
+    end
+    U1 --> R1
+    U2 --> R2
+    R1 --> P1
+    R1 --> P2
+    R1 --> P3
+    R1 --> P4
+    R2 --> P2
+    R2 --> P3
+    R3 --> P3
+```
+
+### RBAC实现示例
+
+```python
+# RBAC权限检查
+from functools import wraps
+
+class RBAC:
+    def __init__(self):
+        self.roles = {
+            "admin": ["create", "read", "update", "delete"],
+            "editor": ["read", "update"],
+            "viewer": ["read"]
+        }
+    
+    def check_permission(self, user_role, permission):
+        return permission in self.roles.get(user_role, [])
+
+def require_permission(permission):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            user_role = get_current_user_role()
+            if not rbac.check_permission(user_role, permission):
+                raise PermissionError("权限不足")
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@require_permission("delete")
+def delete_user(user_id):
+    # 删除用户逻辑
+    pass
+```
+
+---
+
+## 令牌管理策略
+
+### 令牌生命周期
+
+```text
+令牌生命周期：
+  1. 颁发：用户认证成功后颁发
+  2. 使用：携带令牌访问资源
+  3. 刷新：access_token过期时用refresh_token刷新
+  4. 吊销：用户登出或安全事件时吊销
+  5. 过期：令牌超过有效期自动失效
+```
+
+### 令牌刷新策略
+
+```python
+# 令牌刷新逻辑
+class TokenRefreshService:
+    def __init__(self, auth_server):
+        self.auth_server = auth_server
+    
+    def refresh_token(self, refresh_token):
+        # 检查refresh_token是否有效
+        if self.is_token_expired(refresh_token):
+            raise TokenExpired("refresh_token已过期")
+        
+        # 请求新的access_token
+        response = self.auth_server.post("/token", {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        })
+        
+        # 返回新令牌
+        return {
+            "access_token": response["access_token"],
+            "refresh_token": response["refresh_token"],
+            "expires_in": response["expires_in"]
+        }
+```
+
+### 令牌吊销实现
+
+```python
+# Token吊销服务
+class TokenRevocationService:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    def revoke_token(self, token, reason="user_logout"):
+        # 计算令牌哈希
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        
+        # 存储吊销记录
+        self.redis.setex(
+            f"revoked_token:{token_hash}",
+            86400 * 7,  # 7天过期
+            json.dumps({
+                "revoked_at": datetime.utcnow().isoformat(),
+                "reason": reason
+            })
+        )
+    
+    def is_token_revoked(self, token):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        return self.redis.exists(f"revoked_token:{token_hash}")
+```
+
+---
+
+## OAuth2安全实践
+
+### CSRF防护
+
+```python
+# State参数防护CSRF
+import secrets
+
+def generate_state():
+    return secrets.token_urlsafe(32)
+
+def verify_state(request_state, session_state):
+    if request_state != session_state:
+        raise CSRFError("State验证失败，可能遭受CSRF攻击")
+    return True
+
+# 授权请求
+def get_auth_url_with_state(auth_endpoint, client_id, redirect_uri):
+    state = generate_state()
+    session["oauth_state"] = state
+    
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state
+    }
+    return f"{auth_endpoint}?{urlencode(params)}"
+```
+
+### Redirect URI安全
+
+```text
+Redirect URI安全检查：
+  1. 严格匹配：必须完全匹配注册的URI
+  2. 禁止通配符：生产环境不使用通配符
+  3. HTTPS强制：必须使用HTTPS
+  4. 路径限制：限制重定向路径
+```
+
+---
+
+## JWT vs Session对比
+
+### 认证方式对比
+
+| 维度 | JWT | Session |
+|------|-----|---------|
+| 存储位置 | 客户端 | 服务端 |
+| 无状态 | 是 | 否 |
+| 扩展性 | 高 | 低 |
+| 安全性 | 中 | 高 |
+| 跨域 | 支持 | 不支持 |
+| 性能 | 高 | 中 |
+
+### 选型建议
+
+```text
+选型建议：
+  微服务架构 → JWT
+  单体应用 → Session
+  跨域场景 → JWT
+  高安全要求 → Session
+  分布式系统 → JWT
+```
+
+---
+
+## 安全最佳实践
+
+### 安全检查清单
+
+| 检查项 | 说明 | 优先级 |
+|--------|------|--------|
+| HTTPS | 强制使用HTTPS | 高 |
+| 密钥安全 | 密钥加密存储 | 高 |
+| 令牌有效期 | 设置合理过期时间 | 高 |
+| 刷新令牌 | 实现安全的刷新机制 | 中 |
+| 审计日志 | 记录认证操作 | 中 |
+| 速率限制 | 限制认证尝试次数 | 中 |
+
+### 安全配置示例
+
+```yaml
+# 安全配置
+security:
+  jwt:
+    # 令牌配置
+    access-token-expiry: 900      # 15分钟
+    refresh-token-expiry: 604800  # 7天
+    issuer: "auth.example.com"
+    audience: "api.example.com"
+    
+    # 签名配置
+    algorithm: "RS256"
+    key-rotation-period: "90d"
+    
+    # 安全配置
+    require-https: true
+    validate-claims: true
+  
+  oauth2:
+    # PKCE配置
+    pkce-required: true
+    
+    # State配置
+    state-required: true
+    
+    # Redirect URI配置
+    allowed-redirect-uris:
+      - "https://app.example.com/callback"
+```
+
+---
+
+## 生产问题排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 令牌验证失败 | 密钥不匹配 | 检查密钥配置 |
+| 刷新失败 | refresh_token过期 | 重新登录 |
+| 跨域失败 | CORS配置错误 | 配置CORS |
+| 性能问题 | 令牌验证开销 | 使用短缓存 |
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 认证成功率 | 认证成功比例 | <99% |
+| 令牌刷新率 | 刷新令牌使用比例 | >50% |
+| 认证延迟 | 认证操作耗时 | >500ms |
+| 安全事件 | 异常认证尝试 | >10次/分钟 |
+
+---
+
 ## Token 吊销策略深入
 
 ### 吊销策略对比

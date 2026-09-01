@@ -1969,6 +1969,522 @@ management:
         enabled: true
 ```
 
+## 服务注册发现对比（Eureka/Nacos/Consul）
+
+### 注册中心选型对比
+
+| 维度 | Eureka | Nacos | Consul |
+|------|--------|-------|--------|
+| CAP | AP | AP/CP | CP |
+| 健康检查 | 客户端心跳 | TCP/HTTP/gRPC | TCP/HTTP/gRPC/脚本 |
+| 配置中心 | 不支持 | 内置支持 | 不支持 |
+| 管理界面 | 简单 | 丰富 | 丰富 |
+| 多数据中心 | 不支持 | 支持 | 支持 |
+| Spring Cloud集成 | 原生支持 | 官方支持 | 官方支持 |
+| 社区活跃度 | 维护模式 | 活跃 | 活跃 |
+
+```yaml
+# Nacos 注册中心配置
+spring:
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+        namespace: dev
+        group: DEFAULT_GROUP
+        cluster-name: DEFAULT
+        weight: 1
+        metadata:
+          version: 1.0
+          env: development
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml
+        group: DEFAULT_GROUP
+```
+
+### Consul 服务发现配置
+
+```yaml
+# Consul 配置
+spring:
+  cloud:
+    consul:
+      host: localhost
+      port: 8500
+      discovery:
+        service-name: ${spring.application.name}
+        health-check-interval: 10s
+        instance-id: ${spring.application.name}:${server.port}
+        prefer-ip-address: true
+        metadata:
+          version: 1.0
+```
+
+### 注册中心高可用部署
+
+```mermaid
+graph TB
+    subgraph Eureka集群
+        E1[Eureka Server 1]
+        E2[Eureka Server 2]
+        E3[Eureka Server 3]
+    end
+    subgraph Nacos集群
+        N1[Nacos Server 1]
+        N2[Nacos Server 2]
+        N3[Nacos Server 3]
+    end
+    subgraph Consul集群
+        C1[Consul Server 1]
+        C2[Consul Server 2]
+        C3[Consul Server 3]
+    end
+    E1 <--> E2
+    E2 <--> E3
+    E1 <--> E3
+    N1 <--> N2
+    N2 <--> N3
+    C1 --> C2
+    C2 --> C3
+```
+
+---
+
+## 服务调用深度解析（OpenFeign底层机制）
+
+### OpenFeign 调用链路
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant F as Feign Proxy
+    participant L as LoadBalancer
+    participant H as HttpClient
+    participant S as Service
+    
+    C->>F: 调用接口方法
+    F->>F: InvocationHandler.invoke()
+    F->>F: SynchronousMethodHandler.invoke()
+    F->>L: 选择服务实例
+    L->>H: 发送HTTP请求
+    H->>S: 网络调用
+    S-->>H: 响应
+    H-->>F: 解码响应
+    F-->>C: 返回结果
+```
+
+### 负载均衡策略对比
+
+| 策略 | 实现类 | 说明 | 适用场景 |
+|------|--------|------|----------|
+| 轮询 | RoundRobinRule | 依次轮询 | 默认策略 |
+| 随机 | RandomRule | 随机选择 | 简单场景 |
+| 最低并发 | BestAvailableRule | 选择并发最低的实例 | 高并发场景 |
+| 重试 | RetryRule | 超时重试 | 网络不稳定 |
+| 区域感知 | ZoneAvoidanceRule | 综合区域和可用性 | 多区域部署 |
+
+```java
+// 自定义负载均衡策略
+@Configuration
+public class LoadBalancerConfig {
+    @Bean
+    public ReactorLoadBalancer<ServiceInstance> randomLoadBalancer(
+            Environment environment,
+            LoadBalancerClientFactory loadBalancerClientFactory) {
+        String name = environment.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
+        return new RandomLoadBalancer(
+            loadBalancerClientFactory.getLazyProvider(name, ServiceInstanceListSupplier.class),
+            name);
+    }
+}
+
+// 使用自定义负载均衡
+@LoadBalancerClient(name = "user-service", configuration = LoadBalancerConfig.class)
+public interface UserClient {
+    @GetMapping("/users/{id}")
+    User getUser(@PathVariable Long id);
+}
+```
+
+### 熔断降级配置
+
+```yaml
+# Resilience4j 熔断配置
+resilience4j:
+  circuitbreaker:
+    instances:
+      userService:
+        slidingWindowSize: 100
+        minimumNumberOfCalls: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 5000
+        permittedNumberOfCallsInHalfOpenState: 10
+  retry:
+    instances:
+      userService:
+        maxAttempts: 3
+        waitDuration: 1000
+  timelimiter:
+    instances:
+      userService:
+        timeoutDuration: 3000
+```
+
+---
+
+## 配置中心对比（Config Server/Nacos/Apollo）
+
+### 配置中心选型对比
+
+| 维度 | Spring Cloud Config | Nacos Config | Apollo |
+|------|---------------------|--------------|--------|
+| 配置格式 | Properties/YAML | Properties/YAML | Properties/YAML/XML |
+| 配置变更推送 | Bus/Webhook | 长轮询/推送 | 长轮询/推送 |
+| 灰度发布 | 不支持 | 支持 | 支持 |
+| 配置版本管理 | Git | 内置 | 内置 |
+| 权限管理 | Git权限 | 命名空间权限 | 项目/环境/集群权限 |
+| 审计日志 | Git历史 | 操作日志 | 完整审计 |
+
+```yaml
+# Apollo 配置
+apollo:
+  bootstrap:
+    enabled: true
+    eagerLoad:
+      enabled: true
+  meta:
+    server: http://apollo-config:8701
+  configService:
+    url: http://apollo-config:8080
+  cacheDir: /data/apollo-cache
+```
+
+### Nacos 动态配置监听
+
+```java
+@Configuration
+@RefreshScope
+public class NacosConfig {
+    @Value("${custom.config:default}")
+    private String customConfig;
+    
+    @NacosConfigListener(dataId = "application.yaml", groupId = "DEFAULT_GROUP")
+    public void onConfigChanged(String newConfig) {
+        // 配置变更处理
+        log.info("Config changed: {}", newConfig);
+    }
+}
+```
+
+---
+
+## 网关深度解析（Gateway路由/谓词/过滤器/限流）
+
+### Gateway 核心架构
+
+```mermaid
+graph LR
+    Client[客户端] --> Router[路由断言]
+    Router --> Filter[过滤器链]
+    Filter --> Service[下游服务]
+    
+    subgraph 过滤器链
+        Pre[Pre Filter]
+        Proxy[Proxy Filter]
+        Post[Post Filter]
+    end
+```
+
+### 路由谓词详解
+
+| 谓词 | 示例 | 说明 |
+|------|------|------|
+| Path | Path=/api/user/** | 路径匹配 |
+| Method | Method=GET,POST | HTTP方法 |
+| Header | Header=X-Token,\d+ | 请求头匹配 |
+| Query | Query=name,admin | 查询参数匹配 |
+| After | After=2024-01-01T00:00:00+08:00 | 时间之后 |
+| Before | Before=2024-12-31T23:59:59+08:00 | 时间之前 |
+
+```yaml
+# Gateway 路由配置
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+            - Method=GET,POST
+            - Header=X-Token, \S+
+          filters:
+            - StripPrefix=1
+            - name: CircuitBreaker
+              args:
+                name: userService
+                fallbackUri: forward:/fallback/user
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/order/**
+```
+
+### 限流配置
+
+```java
+// 自定义限流过滤器
+@Configuration
+public class RateLimitConfig {
+    @Bean
+    public KeyResolver userKeyResolver() {
+        return exchange -> Mono.just(
+            exchange.getRequest().getHeaders().getFirst("X-User-Id")
+        );
+    }
+}
+
+// 配置限流
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: limited-route
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@userKeyResolver}"
+```
+
+---
+
+## 链路追踪（Sleuth/Zipkin/SkyWalking）
+
+### 链路追踪架构
+
+```mermaid
+graph TB
+    subgraph 应用
+        A[Service A]
+        B[Service B]
+        C[Service C]
+    end
+    subgraph 采集
+        S[SkyWalking Agent]
+    end
+    subgraph 存储
+        ES[Elasticsearch]
+    end
+    subgraph 展示
+        UI[SkyWalking UI]
+    end
+    A --> S
+    B --> S
+    C --> S
+    S --> ES
+    ES --> UI
+```
+
+### SkyWalking 配置
+
+```yaml
+# application.yml
+agent:
+  application_code: my-service
+  collector:
+    backend_service: skywalking-oap:11800
+    gRPC:
+      max_msg_size: 52428800
+      channels: 5
+
+service:
+  mesh:
+    offset: 2
+    max_cache_time: 600
+
+logging:
+  level: INFO
+```
+
+---
+
+## 消息驱动（Stream/Binder/MQ对比）
+
+### Spring Cloud Stream 架构
+
+```mermaid
+graph LR
+    Producer[生产者] --> Binder[Binder]
+    Binder --> MQ[消息中间件]
+    MQ --> Binder2[Binder]
+    Binder2 --> Consumer[消费者]
+    
+    subgraph Binder实现
+        Rabbit[RabbitMQ Binder]
+        Kafka[Kafka Binder]
+        Rocket[RocketMQ Binder]
+    end
+```
+
+### 消息中间件对比
+
+| 特性 | RabbitMQ | Kafka | RocketMQ |
+|------|----------|-------|----------|
+| 消息模型 | 队列/主题 | 发布订阅 | 队列/主题 |
+| 消息可靠性 | 高 | 高 | 高 |
+| 吞吐量 | 中 | 极高 | 高 |
+| 延迟 | 微秒级 | 毫秒级 | 毫秒级 |
+| 消息回溯 | 不支持 | 支持 | 支持 |
+| 事务消息 | 不支持 | 支持 | 支持 |
+| 延迟消息 | 插件支持 | 不支持 | 原生支持 |
+
+---
+
+## 微服务通信方式对比
+
+| 通信方式 | 协议 | 性能 | 开发成本 | 适用场景 |
+|----------|------|------|----------|----------|
+| HTTP/REST | HTTP/1.1 | 中 | 低 | 对外API |
+| gRPC | HTTP/2 | 高 | 中 | 内部服务间 |
+| 消息队列 | AMQP/Kafka | 高 | 高 | 异步解耦 |
+| WebSocket | WS | 中 | 中 | 实时推送 |
+
+### gRPC 通信示例
+
+```protobuf
+syntax = "proto3";
+
+service UserService {
+  rpc GetUser (GetUserRequest) returns (UserResponse);
+  rpc ListUsers (ListUsersRequest) returns (stream UserResponse);
+}
+
+message GetUserRequest {
+  int64 id = 1;
+}
+
+message UserResponse {
+  int64 id = 1;
+  string name = 2;
+  string email = 3;
+}
+```
+
+---
+
+## 服务网格（Istio/Envoy）
+
+### 服务网格架构
+
+```mermaid
+graph TB
+    subgraph 数据平面
+        E1[Envoy Proxy 1]
+        E2[Envoy Proxy 2]
+        E3[Envoy Proxy 3]
+    end
+    subgraph 控制平面
+        ISTIOD[Istiod]
+        PILOT[Pilot]
+        Citadel[Citadel]
+    end
+    E1 <--> ISTIOD
+    E2 <--> ISTIOD
+    E3 <--> ISTIOD
+    E1 <--> E2
+    E2 <--> E3
+```
+
+### Istio 流量管理
+
+```yaml
+# VirtualService 配置
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: user-service
+spec:
+  hosts:
+    - user-service
+  http:
+    - match:
+        - headers:
+            x-version:
+              exact: v2
+      route:
+        - destination:
+            host: user-service
+            subset: v2
+    - route:
+        - destination:
+            host: user-service
+            subset: v1
+          weight: 90
+        - destination:
+            host: user-service
+            subset: v2
+          weight: 10
+```
+
+---
+
+## 微服务拆分（DDD/限界上下文）
+
+### DDD 战略设计
+
+```text
+DDD 核心概念：
+  1. 领域（Domain）：业务核心
+  2. 限界上下文（Bounded Context）：微服务边界
+  3. 上下文映射（Context Map）：服务间关系
+  4. 聚合（Aggregate）：一致性边界
+  5. 实体（Entity）：唯一标识
+  6. 值对象（Value Object）：不可变
+```
+
+### 限界上下文划分示例
+
+| 上下文 | 聚合根 | 实体 | 值对象 | 微服务 |
+|--------|--------|------|--------|--------|
+| 用户上下文 | 用户 | 账户 | 邮箱/手机 | user-service |
+| 订单上下文 | 订单 | 订单项 | 金额/地址 | order-service |
+| 商品上下文 | 商品 | SKU | 价格/规格 | product-service |
+| 支付上下文 | 支付单 | 支付记录 | 交易号 | payment-service |
+
+---
+
+## 微服务监控体系实战
+
+### 监控告警配置
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: microservice_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_server_requests_seconds_count{status=~"5.."}[5m]) / rate(http_server_requests_seconds_count[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "高错误率告警"
+          
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_server_requests_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+```
+
+---
+
 ## 微服务安全（OAuth2/JWT/HTTPS）
 
 ### 安全架构

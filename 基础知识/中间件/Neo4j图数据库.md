@@ -1934,7 +1934,270 @@ ES：存储全文检索数据（搜索/日志）
 
 ---
 
-## 十、Cypher 高级特性与性能陷阱
+## Cypher查询优化（EXPLAIN/PROFILE）
+
+### 查询分析工具
+
+```cypher
+-- 使用EXPLAIN分析查询计划
+EXPLAIN MATCH (p:Person)-[:FRIEND]->(friend:Person)
+WHERE p.name = '张三'
+RETURN friend.name
+
+-- 使用PROFILE查看实际执行统计
+PROFILE MATCH (p:Person)-[:FRIEND]->(friend:Person)
+WHERE p.name = '张三'
+RETURN friend.name
+```
+
+### 执行计划解读
+
+| 操作符 | 说明 | 优化建议 |
+|--------|------|----------|
+| AllNodesScan | 全图扫描 | 添加标签/索引 |
+| NodeByLabelScan | 按标签扫描 | 确保标签选择性 |
+| NodeIndexSeek | 索引查找 | 建立合适索引 |
+| Expand(All) | 关系遍历 | 限制遍历深度 |
+| Filter | 过滤操作 | 尽早过滤减少数据量 |
+| Sort | 排序操作 | 添加索引避免排序 |
+
+### 索引优化策略
+
+```cypher
+-- 创建索引
+CREATE INDEX FOR (p:Person) ON (p.name)
+CREATE INDEX FOR (p:Person) ON (p.age)
+
+-- 创建复合索引
+CREATE INDEX FOR (p:Person) ON (p.name, p.age)
+
+-- 创建全文索引
+CREATE FULLTEXT INDEX person_fulltext FOR (p:Person) ON EACH [p.name, p.description]
+
+-- 查看索引信息
+SHOW INDEXES
+
+-- 删除索引
+DROP INDEX person_name_index
+```
+
+### 查询优化技巧
+
+```text
+优化原则：
+  1. 指定标签：避免全图扫描
+  2. 使用索引：为常用查询字段建索引
+  3. 限制范围：使用LIMIT限制结果数
+  4. 尽早过滤：WHERE条件前置
+  5. 避免 OPTIONAL MATCH 在大数据集上使用
+  6. 使用 EXPLAIN 分析查询计划
+```
+
+---
+
+## Neo4j集群部署
+
+### 集群架构
+
+```mermaid
+graph TB
+    subgraph Core集群
+        C1[Core Server 1]
+        C2[Core Server 2]
+        C3[Core Server 3]
+    end
+    subgraph Read Replicas
+        R1[Read Replica 1]
+        R2[Read Replica 2]
+    end
+    Client[客户端] --> Router[路由层]
+    Router --> C1
+    Router --> C2
+    Router --> C3
+    Router --> R1
+    Router --> R2
+    C1 <--> C2
+    C2 <--> C3
+    C1 <--> C3
+```
+
+### 集群配置
+
+```properties
+# neo4j.conf 集群配置
+causal_clustering.initial_discovery_members=server1:5000,server2:5000,server3:5000
+causal_clustering.server_id=1
+causal_clustering.leader_election_timeout=7s
+causal_clustering.catch_up_batch_size=1024
+causal_clustering.state_transfer_batch_size=1024
+
+# 只读副本配置
+causal_clustering.role=READ_REPLICA
+```
+
+### 集群运维命令
+
+```bash
+# 查看集群状态
+cypher-shell -u neo4j -p password "CALL dbms.cluster.overview()"
+
+# 查看核心服务器状态
+cypher-shell -u neo4j -p password "CALL dbms.cluster.coreServers()"
+
+# 查看只读副本状态
+cypher-shell -u neo4j -p password "CALL dbms.cluster.readReplicaServers()"
+
+# 触发日志清理
+cypher-shell -u neo4j -p password "CALL dbms.cluster.cleanup()"
+```
+
+---
+
+## 内存配置优化
+
+### 内存分配策略
+
+```text
+内存分配建议：
+  pagecache.size = 总内存 * 0.5（推荐）
+  dbms.memory.heap.initial_size = 总内存 * 0.25
+  dbms.memory.heap.max_size = 总内存 * 0.25
+  dbms.memory.transaction.total.max = 总内存 * 0.25
+
+示例（32GB内存服务器）：
+  pagecache.size = 16GB
+  heap.initial_size = 8GB
+  heap.max_size = 8GB
+  transaction.total.max = 8GB
+```
+
+### 内存监控
+
+```cypher
+-- 查看内存使用情况
+CALL dbms.memory.ping()
+
+-- 查看JVM内存
+CALL dbmsJvmMemorys()
+
+-- 查看页面缓存命中率
+CALL dbms.listActiveLocks()
+```
+
+---
+
+## 数据导入方案
+
+### 批量导入工具对比
+
+| 工具 | 速度 | 适用场景 | 限制 |
+|------|------|----------|------|
+| neo4j-admin import | 极快 | 初始导入 | 需停机 |
+| LOAD CSV | 快 | 小数据集 | 文件大小限制 |
+| APOCPeriodicIterate | 快 | 大数据集 | 需要APOC |
+| Python驱动 | 中等 | 灵活导入 | 速度较慢 |
+
+```cypher
+-- LOAD CSV 导入
+LOAD CSV WITH HEADERS FROM 'file:///data.csv' AS row
+CREATE (p:Person {
+  name: row.name,
+  age: toInteger(row.age),
+  email: row.email
+})
+
+-- APOC 批量导入
+CALL apoc.periodic.iterate(
+  "LOAD CSV WITH HEADERS FROM 'file:///large.csv' AS row RETURN row",
+  "CREATE (p:Person {name: row.name, age: toInteger(row.age)})",
+  {batchSize: 10000, parallel: true}
+)
+```
+
+---
+
+## Neo4j与Elasticsearch联合查询
+
+### 联合查询架构
+
+```mermaid
+graph LR
+    App[应用程序] --> Neo4j[Neo4j图查询]
+    App --> ES[Elasticsearch全文搜索]
+    App --> Merge[结果合并]
+    
+    subgraph 查询场景
+        S1[图查询：关系分析]
+        S2[全文搜索：关键词匹配]
+        S3[混合：关系+全文]
+    end
+```
+
+### 联合查询示例
+
+```python
+# Python联合查询示例
+from neo4j import GraphDatabase
+from elasticsearch import Elasticsearch
+
+class HybridSearch:
+    def __init__(self, neo4j_uri, neo4j_auth, es_hosts):
+        self.neo4j_driver = GraphDatabase.driver(neo4j_uri, auth=neo4j_auth)
+        self.es_client = Elasticsearch(es_hosts)
+    
+    def search(self, keyword, min_relationship=2):
+        # 1. Elasticsearch全文搜索
+        es_results = self.es_client.search(
+            index="persons",
+            body={"query": {"match": {"name": keyword}}}
+        )
+        person_ids = [hit['_id'] for hit in es_results['hits']['hits']]
+        
+        # 2. Neo4j关系查询
+        with self.neo4j_driver.session() as session:
+            cypher = """
+            MATCH (p:Person)-[r*1..3]-(related:Person)
+            WHERE p.id IN $ids
+            RETURN related, length(r) as distance
+            ORDER BY distance
+            LIMIT 100
+            """
+            neo4j_results = session.run(cypher, ids=person_ids)
+        
+        return self._merge_results(es_results, neo4j_results)
+```
+
+---
+
+## Neo4j生产问题排查
+
+### 常见问题与解决方案
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 查询慢 | 缺少索引/全图扫描 | 添加索引/优化查询 |
+| 内存不足 | 堆内存/页面缓存不足 | 调整内存配置 |
+| 写入慢 | 批量写入未优化 | 使用PERIODIC ITERATE |
+| 连接池耗尽 | 连接数不足 | 增加连接池大小 |
+| 事务超时 | 长事务 | 拆分事务/增加超时时间 |
+
+### 性能调优清单
+
+```text
+调优清单：
+  ✓ 为常用查询字段建立索引
+  ✓ 使用EXPLAIN分析查询计划
+  ✓ 避免全图扫描（MATCH (n) RETURN n）
+  ✓ 限制可变长度路径的深度
+  ✓ 批量写入使用PERIODIC ITERATE
+  ✓ 监控JVM内存和页面缓存
+  ✓ 定期清理数据库垃圾
+  ✓ 使用Profile分析慢查询
+```
+
+---
+
+## Cypher高级特性与性能陷阱
 
 ### 10.1 可变长度路径（Variable-Length Paths）
 

@@ -2078,6 +2078,392 @@ from(bucket: "mydb")
 | 复制延迟 | 网络问题 | 检查网络 |
 | 连接数耗尽 | 连接泄漏 | 检查连接池 |
 
+## TSM引擎深度解析
+
+### TSM存储结构
+
+```text
+TSM（Time-Structured Merge Tree）引擎结构：
+  1. WAL（Write-Ahead Log）：预写日志，保证写入持久性
+  2. Cache：内存缓存，写入先到Cache
+  3. TSM File：磁盘存储，数据持久化
+  4. Compaction：后台合并，优化读取性能
+
+数据写入流程：
+  写入请求 → WAL → Cache → 达到阈值 → Flush到TSM File
+  后台Compaction → 合并多个TSM File → 优化存储
+```
+
+### TSM配置优化
+
+```toml
+# influxdb.conf TSM配置
+[data]
+  # 写入缓存大小
+  cache-max-memory-size = "1g"
+  # 写入缓存刷盘阈值
+  cache-snapshot-memory-size = "25m"
+  # 完整性检查间隔
+  compact-throughput = "48m"
+  # 最大TSM文件大小
+  max-concurrent-compactions = 0
+  # WAL同步策略
+  wal-fsync-delay = "0s"
+```
+
+### Compaction策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| Full Compaction | 合并所有Level | 定期执行 |
+| Level Compaction | 按Level合并 | 默认策略 |
+| Size-based | 按大小触发 | 大数据量 |
+| Time-based | 按时间触发 | 时间序列 |
+
+---
+
+## 连续查询vs Flux Task
+
+### CQ与Task对比
+
+| 特性 | 连续查询(CQ) | Flux Task |
+|------|--------------|-----------|
+| 版本 | InfluxDB 1.x | InfluxDB 2.x |
+| 语言 | InfluxQL | Flux |
+| 灵活性 | 低 | 高 |
+| 复杂转换 | 不支持 | 支持 |
+| 错误处理 | 无 | 支持 |
+| 调度 | 自动 | 可配置 |
+
+### Flux Task高级用法
+
+```flux
+// 告警检测任务
+option task = {name: "alert_check", every: 5m}
+
+from(bucket: "monitoring")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> filter(fn: (r) => r._field == "usage_user")
+  |> aggregateWindow(every: 5m, fn: mean)
+  |> yield(name: "mean")
+  |> alert.check(
+      crit: (r) => r._value > 90.0,
+      warn: (r) => r._value > 70.0,
+      data: {_level: "crit", _measurement: "cpu"},
+      messageFn: (r) => "CPU使用率过高: ${string(v: r._value)}%"
+  )
+```
+
+---
+
+## 多实例高可用部署
+
+### InfluxDB集群架构
+
+```text
+InfluxDB Enterprise集群部署：
+  数据节点（3+）：
+    ├── 接收写入和查询
+    ├── 数据分片（Shard）
+    └── 副本复制
+  
+  元数据节点（3）：
+    ├── 集群管理
+    ├── 元数据存储
+    └── 负载均衡
+  
+  客户端：
+    ├── 直连数据节点
+    └── 负载均衡器
+```
+
+### 高可用配置
+
+```toml
+# influxdb.conf 集群配置
+[data]
+  # 副本因子
+  replication-factor = 3
+  
+  # 分片组持续时间
+  shard-group-duration = "7d"
+
+[cluster]
+  # 集群通信超时
+  raft-timeout = "10s"
+  
+  # 集群心跳间隔
+  raft-heartbeat-interval = "1s"
+```
+
+---
+
+## Telegraf数据采集
+
+### Telegraf插件生态
+
+| 插件类型 | 代表插件 | 用途 |
+|----------|----------|------|
+| Input | cpu/mem/disk | 系统指标采集 |
+| Input | http/json | HTTP数据采集 |
+| Input | mqtt/kafka | 消息队列采集 |
+| Output | influxdb | 写入InfluxDB |
+| Output | kafka | 输出到Kafka |
+| Processor | starlaw | 数据转换 |
+| Aggregator | 汇总统计 | 数据聚合 |
+
+### Telegraf配置示例
+
+```toml
+# telegraf.conf
+[agent]
+  interval = "10s"
+  flush_interval = "10s"
+
+[[inputs.cpu]]
+  percpu = true
+  totalcpu = true
+
+[[inputs.mem]]
+
+[[inputs.disk]]
+  mount_points = ["/"]
+
+[[outputs.influxdb]]
+  urls = ["http://influxdb:8086"]
+  database = "telegraf"
+```
+
+---
+
+## Grafana仪表板配置
+
+### InfluxDB数据源配置
+
+```json
+{
+  "name": "InfluxDB",
+  "type": "influxdb",
+  "url": "http://influxdb:8086",
+  "database": "monitoring",
+  "access": "proxy",
+  "jsonData": {
+    "httpMode": "GET"
+  }
+}
+```
+
+### 常用仪表板面板
+
+| 面板类型 | 数据查询 | 用途 |
+|----------|----------|------|
+| Time Series | 时间序列数据 | 趋势展示 |
+| Stat | 单一数值 | KPI展示 |
+| Gauge | 仪表盘 | 阈值展示 |
+| Table | 表格数据 | 明细展示 |
+
+---
+
+## IoT场景应用
+
+### IoT数据采集架构
+
+```mermaid
+graph LR
+    subgraph 设备层
+        Sensor[传感器]
+        Gateway[网关]
+    end
+    subgraph 传输层
+        MQTT[MQTT Broker]
+        Kafka[Kafka]
+    end
+    subgraph 存储层
+        InfluxDB[InfluxDB]
+        TDengine[TDengine]
+    end
+    subgraph 应用层
+        Grafana[Grafana]
+        Alert[告警系统]
+    end
+    Sensor --> Gateway
+    Gateway --> MQTT
+    MQTT --> Kafka
+    Kafka --> InfluxDB
+    Kafka --> TDengine
+    InfluxDB --> Grafana
+    TDengine --> Alert
+```
+
+### IoT数据模型设计
+
+```text
+IoT数据模型：
+  1. 设备维度：device_id, location, type
+  2. 时间维度：timestamp
+  3. 测点维度：measurement, field, value
+  4. 标签维度：tag1, tag2, tag3
+
+示例数据点：
+  cpu_usage,device=server01,region=us-east value=85.2 1609459200000000000
+```
+
+---
+
+## InfluxDB vs Prometheus vs TDengine
+
+### 时序库对比
+
+| 维度 | InfluxDB | Prometheus | TDengine |
+|------|----------|------------|----------|
+| 数据模型 | measurement/field/tag | metric/label | 超级表/子表 |
+| 查询语言 | InfluxQL/Flux | PromQL | SQL |
+| 存储引擎 | TSM | 时序数据库 | 时序数据库 |
+| 集群 | Enterprise版 | 联邦/远程存储 | 原生集群 |
+| 压缩比 | 中等 | 较低 | 高 |
+| 物联网 | 强 | 中 | 强 |
+| 监控 | 强 | 强 | 中 |
+
+### 选型建议
+
+```text
+选型建议：
+  监控场景 → Prometheus
+  IoT场景 → InfluxDB/TDengine
+  大规模物联网 → TDengine
+  云原生监控 → Prometheus
+  混合场景 → InfluxDB
+```
+
+---
+
+## 容量规划
+
+### 容量计算公式
+
+```text
+存储容量 = 数据点数 × 每点大小 × 保留天数 × 压缩比
+
+示例：
+  每秒10万点
+  每点100字节
+  保留30天
+  压缩比10:1
+
+  存储 = 100000 × 100 × 86400 × 30 / 10 = 2.6TB
+```
+
+### 资源规划建议
+
+| 数据量 | CPU | 内存 | 磁盘 |
+|--------|-----|------|------|
+| <1万点/秒 | 2核 | 4GB | 100GB |
+| 1-10万点/秒 | 4核 | 16GB | 500GB |
+| 10-100万点/秒 | 8核 | 32GB | 2TB |
+| >100万点/秒 | 集群部署 | 64GB+ | 10TB+ |
+
+---
+
+## 集群部署方案
+
+### 部署架构选择
+
+```text
+部署架构：
+  单节点：开发测试环境
+  副本因子3：生产环境（推荐）
+  多数据中心：跨地域灾备
+  Kubernetes：云原生部署
+```
+
+### Kubernetes部署
+
+```yaml
+# influxdb-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: influxdb
+spec:
+  serviceName: influxdb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: influxdb
+  template:
+    metadata:
+      labels:
+        app: influxdb
+    spec:
+      containers:
+        - name: influxdb
+          image: influxdb:2.7
+          ports:
+            - containerPort: 8086
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/influxdb2
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+---
+
+## 性能调优
+
+### 写入性能优化
+
+| 优化点 | 配置 | 说明 |
+|--------|------|------|
+| 批量写入 | batch_size=5000 | 减少网络请求 |
+| 并行写入 | concurrency=10 | 提高吞吐 |
+| 压缩算法 | compression=gzip | 减少网络传输 |
+| WAL优化 | wal_fsync_delay=0 | 降低延迟 |
+
+### 查询性能优化
+
+```text
+查询优化：
+  1. 索引：为常用标签字段建索引
+  2. 聚合：使用GROUP BY进行聚合
+  3. 时间范围：限制查询时间范围
+  4. 降采样：预计算聚合数据
+  5. 缓存：使用缓存减少重复查询
+```
+
+---
+
+## 生产问题排查
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 写入慢 | 磁盘IO瓶颈 | 升级SSD/优化批量 |
+| 查询慢 | 缺少索引/全表扫描 | 添加索引/限制时间范围 |
+| 内存不足 | 缓存过大 | 调整cache配置 |
+| 数据丢失 | WAL未同步 | 调整fsync策略 |
+| 集群异常 | 节点故障 | 检查网络/重启节点 |
+
+### 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 写入延迟 | 写入操作耗时 | >100ms |
+| 查询延迟 | 查询操作耗时 | >1s |
+| 缓存命中率 | 缓存命中比例 | <90% |
+| 磁盘使用率 | 磁盘空间使用 | >80% |
+| 集群状态 | 节点健康状态 | 非healthy |
+
+---
+
 ## 二十四、InfluxDB监控与告警
 
 ### 24.1 监控指标
