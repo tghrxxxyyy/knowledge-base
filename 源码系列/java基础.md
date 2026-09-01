@@ -176,6 +176,7 @@ public interface Delayed extends Comparable<Delayed> {
 
 ---
 
+```
 ## 集合框架核心源码要点
 
 ### HashMap（JDK 8+）
@@ -424,4 +425,6 @@ if (tab == null || (n = tab.length) < MIN_TREEIFY_CAPACITY)
 else if ((b = tabAt(...)) != null)
     treeify(table);    // 真正成树
 ```
+```
+
 ```

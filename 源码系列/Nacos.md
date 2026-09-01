@@ -399,6 +399,7 @@ public void run() {
 
 ---
 
+```
 ## 注册中心的心跳与健康检查
 
 ### 客户端心跳（BeatReactor）
@@ -609,4 +610,6 @@ Nacos 控制台支持 **Beta 发布**：配置可先指定「灰度 IP / Tag」�
 - 服务端用 `ConfigCacheService` 区分 `beta` 配置与正式配置；`ConfigLongPollingService.DataChangeTask` 在推送时会校验 `betaIps` / `tag`，仅匹配客户端收到 Beta 值（前文 `DataChangeTask` 代码已体现 `isBeta` 判断）。
 - **监听隔离**：不同 `namespace` 的配置物理隔离，互不可见；同一 `namespace` 下 `group` 用于按应用聚合，`dataId` 精确标识。客户端只监听自己 `tenant+group` 下的 `dataId`，天然避免跨应用误配。
 - 运维建议：核心配置走 Beta + 灰度分批；非核心可直发。配合「配置变更审计（who/when）」与「一键回滚（历史版本）」形成闭环。
+```
+
 ```
