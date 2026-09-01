@@ -2350,6 +2350,181 @@ stateDescriptor.enableTimeToLive(ttlConfig);
 | 本地恢复 | 本地快照 | 加快恢复 |
 | 状态后端调优 | RocksDB 参数 | 提升性能 |
 
+
+## Flink 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| Checkpoint 失败 | 容错频繁触发 | 状态过大或超时 | 增大超时，优化状态 |
+| 反压严重 | 上游数据堆积 | 下游处理慢 | 增加并行度，优化算子 |
+| 数据倾斜 | 部分 Task 过载 | Key 分布不均 | 加盐打散，两阶段聚合 |
+| Exactly-Once 丢失 | 数据重复消费 | Sink 未实现两阶段提交 | 使用支持事务的 Sink |
+| 状态爆炸 | 内存溢出 | 状态未清理 | 设置 TTL，增量 Checkpoint |
+| 延迟升高 | 处理时间变长 | GC 或资源不足 | 调整 JVM，增加资源 |
+
+### Watermark 深度调优
+
+```java
+// 自定义 Watermark 策略
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+    .withIdleness(Duration.ofMinutes(1));
+
+// 多流 Watermark 对齐
+env.getConfig().setAutoWatermarkInterval(200);
+
+// Watermark 传递
+env.fromSource(kafkaSource, watermarkStrategy, "Kafka Source")
+    .assignTimestampsAndWatermarks(watermarkStrategy)
+    .keyBy(Event::getKey)
+    .window(TumblingEventTimeWindows.of(Time.seconds(60)))
+    .reduce((a, b) -> a.merge(b));
+```
+
+### RocksDB 状态后端调优
+
+```yaml
+# RocksDB 配置优化
+state.backend: rocksdb
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.fixed-per-slot: 256mb
+state.backend.rocksdb.block.cache-size: 256mb
+state.backend.rocksdb.writebuffer.size: 128mb
+state.backend.rocksdb.writebuffer.count: 4
+state.backend.rocksdb.compaction.style: level
+state.backend.rocksdb.block.restart-interval: 16
+
+# 增量 Checkpoint
+state.backend.incremental: true
+
+# 本地恢复
+state.backend.local-recovery: true
+```
+
+### Flink CDC 最佳实践
+
+```java
+// MySQL CDC Source 配置
+MySqlSource<String> mysqlSource = MySqlSource.<String>builder()
+    .hostname("localhost")
+    .port(3306)
+    .databaseList("mydb")
+    .tableList("mydb.orders")
+    .username("root")
+    .password("password")
+    .serverId("1-4")
+    .serverTimezone("UTC")
+    .startupOptions(StartupOptions.initial())
+    .deserializer(new DebeziumDeserializationSchema<>())
+    .build();
+
+// 避免锁表
+// snapshot.mode = "no_data"
+// snapshot.locking.mode = "none"
+```
+
+### Flink SQL 性能调优
+
+```sql
+-- 开启优化
+SET table.exec.mini-batch.enabled = true;
+SET table.exec.mini-batch.allow-latency = '5s';
+SET table.exec.mini-batch.size = '1000';
+
+-- 开启两阶段聚合
+SET table.optimizer.agg-phase-strategy = TWO_PHASE;
+
+-- 开启反压检测
+SET table.exec.source.idle-timeout = '30s';
+
+-- 开启状态 TTL
+SET table.exec.state.ttl = '24h';
+
+-- 使用 Bloom Filter 优化 JOIN
+SET table.optimizer.join.reorder.enabled = true;
+SET table.optimizer.bloom-filter.join.memory-fraction = 0.4;
+```
+
+### 监控告警配置
+
+```yaml
+# Flink Prometheus 告警规则
+groups:
+  - name: flink-alerts
+    rules:
+      - alert: Flink_CheckpointFailed
+        expr: flink_jobmanager_job_numberOfFailedCheckpoints > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flink Checkpoint 失败"
+      
+      - alert: Flink_BackPressure
+        expr: flink_taskmanager_job_task_buffers_inPoolUsage > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flink 背压严重"
+      
+      - alert: Flink_HighLatency
+        expr: flink_taskmanager_job_task_operator_latency > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flink 延迟高"
+      
+      - alert: Flink_Restarting
+        expr: flink_jobmanager_job_restartingTimeSeconds > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flink 任务重启时间过长"
+```
+
+### Savepoint vs Checkpoint 最佳实践
+
+| 场景 | 使用 Checkpoint | 使用 Savepoint |
+|------|----------------|----------------|
+| 容错恢复 | 自动触发 | 手动触发 |
+| 代码升级 | 不支持 | 支持 |
+| 并行度调整 | 不支持 | 支持 |
+| 状态迁移 | 不支持 | 支持 |
+| 定期备份 | 可选 | 推荐 |
+| 演练恢复 | 不适用 | 适用 |
+
+### 性能调优参数速查
+
+```text
+性能调优参数：
+  1. 内存配置
+     - taskmanager.memory.process.size: 4096m
+     - taskmanager.memory.task.heap: 2048m
+     - taskmanager.memory.managed: 1536m
+
+  2. 并行度配置
+     - parallelism.default: 8
+     - slotsharing.max-parallelism: 128
+
+  3. Checkpoint 配置
+     - execution.checkpointing.interval: 60000
+     - execution.checkpointing.timeout: 600000
+     - execution.checkpointing.min-pause: 30000
+     - execution.checkpointing.max-concurrent: 1
+
+  4. 网络配置
+     - taskmanager.network.memory.fraction: 0.1
+     - taskmanager.network.memory.min: 64mb
+     - taskmanager.network.memory.max: 1gb
+```
+
+
 ## 与消息队列的关系
 
 - 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；

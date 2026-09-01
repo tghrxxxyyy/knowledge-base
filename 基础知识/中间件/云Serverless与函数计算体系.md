@@ -2321,6 +2321,246 @@ Resources:
      - 缓存频繁访问数据
 ```
 
+
+## Serverless 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| 冷启动慢 | 首次调用延迟高 | 容器初始化 | 预置并发，优化包大小 |
+| 超时错误 | 函数执行超时 | 执行时间过长 | 拆分任务，异步处理 |
+| 并发限制 | 请求被拒绝 | 并发数超限 | 申请配额，优化架构 |
+| 内存溢出 | 函数 OOM | 内存配置不足 | 增加内存，优化代码 |
+| 权限错误 | 无法访问资源 | IAM 配置错误 | 检查角色权限 |
+| 成本超预期 | 费用飙升 | 调用次数过多 | 优化触发频率 |
+
+### Lambda 事件源配置
+
+```mermaid
+flowchart TD
+    A[事件源] --> B[Lambda 函数]
+    B --> C[处理结果]
+    
+    subgraph 事件源类型
+        D[API Gateway]
+        E[S3 事件]
+        F[SQS/SNS]
+        G[DynamoDB Stream]
+        H[EventBridge]
+        I[定时器]
+    end
+    
+    D --> B
+    E --> B
+    F --> B
+    G --> B
+    H --> B
+    I --> B
+```
+
+### Step Functions 编排
+
+```json
+{
+  "Comment": "数据处理工作流",
+  "StartAt": "Extract",
+  "States": {
+    "Extract": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:extract",
+      "Next": "Transform"
+    },
+    "Transform": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:transform",
+      "Next": "Load"
+    },
+    "Load": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:load",
+      "End": true
+    }
+  }
+}
+```
+
+### 冷启动优化
+
+| 优化项 | 优化前 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| 包大小 | 50MB | 10MB | 启动快 50% |
+| 内存配置 | 128MB | 512MB | 启动快 30% |
+| 预置并发 | 无 | 100 | 零冷启动 |
+| 连接池 | 无 | 复用 | 减少初始化 |
+
+### Knative 部署配置
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: data-processor
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "100"
+        autoscaling.knative.dev/target: "50"
+    spec:
+      containers:
+        - image: gcr.io/my-project/processor
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: host
+```
+
+### 定时任务最佳实践
+
+```text
+定时任务策略：
+  1. CloudWatch Events
+     - cron 表达式
+     - 固定速率
+     - 跨区域
+
+  2. EventBridge Scheduler
+     - 高级调度
+     - 时区支持
+     - 一次性任务
+
+  3. 容错机制
+     - 重试策略
+     - 死信队列
+     - 告警通知
+
+  4. 监控指标
+     - 执行成功率
+     - 执行延迟
+     - 资源使用
+```
+
+### 成本模型分析
+
+| 成本项 | 计费方式 | 优化策略 |
+|--------|----------|----------|
+| 请求费用 | 按请求数 | 减少调用 |
+| 执行费用 | 按时长 | 优化代码 |
+| 内存费用 | 按配置 | 合理配置 |
+| 存储费用 | 按容量 | 清理数据 |
+| 数据传输 | 按流量 | 使用 VPC 端点 |
+
+### 对比容器与 VM
+
+| 特性 | Serverless | 容器 | VM |
+|------|-----------|------|-----|
+| 启动时间 | 毫秒 | 秒 | 分钟 |
+| 扩缩容 | 自动 | 手动/自动 | 手动 |
+| 成本模型 | 按用付费 | 预留资源 | 预留资源 |
+| 运维成本 | 零 | 中 | 高 |
+| 适用场景 | 事件驱动 | 长期运行 | 传统应用 |
+| 状态管理 | 无状态 | 有状态 | 有状态 |
+
+### 监控告警配置
+
+```yaml
+# Serverless 告警规则
+groups:
+  - name: serverless-alerts
+    rules:
+      - alert: Lambda_ErrorRate
+        expr: rate(lambda_errors_total[5m]) / rate(lambda_invocations_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lambda 错误率过高"
+      
+      - alert: Lambda_ColdStart
+        expr: lambda_cold_start_duration_seconds > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lambda 冷启动时间过长"
+      
+      - alert: Lambda_Throttling
+        expr: rate(lambda_throttles_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lambda 被限流"
+```
+
+### 安全配置
+
+```yaml
+# Serverless 安全配置
+security:
+  iam:
+    role: lambda-execution-role
+    policies:
+      - arn:aws:iam::policy/AmazonS3ReadOnlyAccess
+      - arn:aws:iam::policy/AmazonDynamoDBReadOnlyAccess
+  
+  vpc:
+    enabled: true
+    subnet_ids:
+      - subnet-xxx
+      - subnet-yyy
+    security_group_ids:
+      - sg-xxx
+  
+  encryption:
+    kms_key_arn: arn:aws:kms:xxx
+    env_variables: true
+  
+  layers:
+    - arn:aws:lambda:xxx:layer:security-layer:1
+```
+
+### 运维最佳实践
+
+```text
+运维检查清单：
+  1. 日常巡检
+     - 函数状态
+     - 错误日志
+     - 延迟指标
+     - 成本分析
+
+  2. 定期维护
+     - 依赖更新
+     - 运行时升级
+     - 权限审查
+     - 配置优化
+
+  3. 容量规划
+     - 并发预估
+     - 内存需求
+     - 存储规划
+     - 成本预算
+
+  4. 应急预案
+     - 降级方案
+     - 回滚流程
+     - 通知机制
+     - 数据恢复
+```
+
+
 ## 三十九、与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；

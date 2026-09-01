@@ -1044,6 +1044,215 @@ flowchart TD
 | CDC 同步 | Debezium + Kafka + Flink | 实时同步 |
 | 指标计算 | Kafka Metrics + Flink | 实时监控 |
 
+
+## Kafka 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| 消费延迟 | Consumer Lag 增大 | 消费能力不足 | 增加消费者，优化处理 |
+| 分区不均 | 部分 Broker 负载高 | 分区分配不均 | 重平衡分区 |
+| 消息丢失 | 消费者未收到消息 |acks配置不当 | 设置 acks=all |
+| 消息重复 | 消费者重复消费 | 自动提交 offset | 手动提交 offset |
+| Leader 选举慢 | 切换时间长 | ISR 过小 | 调整 ISR 参数 |
+| 磁盘写满 | Broker 拒绝写入 | 日志保留过长 | 调整保留策略 |
+
+### KRaft 模式配置
+
+```properties
+# KRaft 配置
+process.roles=broker,controller
+controller.quorum.voters=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+node.id=1
+controller.listener.names=CONTROLLER
+inter.broker.listener.name=PLAINTEXT
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+
+# 性能调优
+num.io.threads=8
+num.network.threads=3
+num.partitions=6
+default.replication.factor=3
+min.insync.replicas=2
+log.retention.hours=168
+log.segment.bytes=1073741824
+```
+
+### 性能调优参数
+
+```properties
+# Producer 调优
+batch.size=65536
+linger.ms=5
+compression.type=lz4
+acks=all
+retries=2147483647
+max.in.flight.requests.per.connection=5
+buffer.memory=67108864
+
+# Consumer 调优
+fetch.min.bytes=1
+fetch.max.wait.ms=500
+max.partition.fetch.bytes=1048576
+auto.offset.reset=latest
+enable.auto.commit=false
+max.poll.records=500
+max.poll.interval.ms=300000
+session.timeout.ms=10000
+heartbeat.interval.ms=3000
+```
+
+### 监控告警配置
+
+```yaml
+# Kafka Prometheus 告警规则
+groups:
+  - name: kafka-alerts
+    rules:
+      - alert: Kafka_ConsumerLagHigh
+        expr: kafka_consumer_group_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka 消费者延迟过高"
+      
+      - alert: Kafka_BrokerDown
+        expr: kafka_broker_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka Broker 宕机"
+      
+      - alert: Kafka_DiskUsageHigh
+        expr: kafka_log_disk_usage_bytes / kafka_log_disk_total_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka 磁盘使用率高"
+      
+      - alert: Kafka_UnderReplicatedPartitions
+        expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka 副本不足分区"
+```
+
+### 多租户隔离
+
+```text
+多租户隔离策略：
+  1. 配额管理
+     - 限流（byte-rate）
+     - 限连接数
+     - 限请求率
+
+  2. 资源隔离
+     - 独立 Broker
+     - 独立 Topic
+     - 独立 Consumer Group
+
+  3. 安全隔离
+     - ACL 权限
+     - SASL 认证
+     - SSL 加密
+
+  4. 监控隔离
+     - 独立监控指标
+     - 独立告警规则
+     - 独立 Dashboard
+```
+
+### 压缩与存储优化
+
+| 压缩算法 | 压缩率 | CPU 开销 | 适用场景 |
+|----------|--------|----------|----------|
+| none | 1x | 无 | CPU 密集型 |
+| gzip | 3-5x | 高 | 带宽受限 |
+| snappy | 2-3x | 低 | 延迟敏感 |
+| lz4 | 2-3x | 低 | 通用 |
+| zstd | 3-5x | 中 | 平衡 |
+
+### Flink 集成最佳实践
+
+```java
+// Flink Kafka Sink 配置
+KafkaSink<String> sink = KafkaSink.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(
+        KafkaRecordSerializationSchema.builder()
+            .setTopic("output-topic")
+            .setValueSerializationSchema(new SimpleStringSchema())
+            .build()
+    )
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-kafka-")
+    .setProperty("transaction.timeout.ms", "900000")
+    .build();
+
+// Flink Kafka Source 配置
+KafkaSource<String> source = KafkaSource.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("input-topic")
+    .setGroupId("flink-consumer")
+    .setStartingOffsets(OffsetsInitializer.latest())
+    .setValueOnlyDeserializer(new SimpleStringSchema())
+    .build();
+```
+
+### 安全配置
+
+```properties
+# SSL 加密
+listeners=SASL_SSL://:9093
+ssl.keystore.location=/path/to/kafka.server.keystore.jks
+ssl.keystore.password=changeit
+ssl.key.password=changeit
+ssl.truststore.location=/path/to/kafka.server.truststore.jks
+ssl.truststore.password=changeit
+
+# SASL 认证
+sasl.enabled.mechanisms=PLAIN
+sasl.mechanism.inter.broker.protocol=PLAIN
+security.inter.broker.protocol=SASL_SSL
+
+# ACL 权限
+authorizer.class.name=kafka.security.authorizer.AclAuthorizer
+allow.everyone.if.no.acl.found=false
+super.users=User:admin
+```
+
+### 备份与恢复
+
+```text
+Kafka 备份策略：
+  1. Topic 配置备份
+     - 备份 topic 配置
+     - 备份 ACL 权限
+     - 版本控制
+
+  2. 数据备份
+     - MirrorMaker 2 跨集群复制
+     - 定期备份到 S3
+     - 保留策略管理
+
+  3. 恢复流程
+     - 从备份恢复 topic
+     - 从指定 offset 恢复
+     - 数据一致性验证
+
+  4. 灾难恢复
+     - 跨区域复制
+     - 故障切换
+     - 数据校验
+```
+
+
 ## 六、与其他板块的关系
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。

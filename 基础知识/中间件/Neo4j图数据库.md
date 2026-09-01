@@ -2342,6 +2342,290 @@ with driver.session() as session:
     print(f"张三的朋友: {friends}")
 ```
 
+
+## Neo4j 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| 查询超时 | Cypher 查询慢 | 缺少索引或查询低效 | 添加索引，优化查询 |
+| 内存溢出 | 服务 OOM | 全图加载或大查询 | 限制查询范围 |
+| 写入瓶颈 | 批量导入慢 | 事务冲突或索引更新 | 批量提交，异步索引 |
+| 集群同步延迟 | 副本不一致 | 网络或负载问题 | 调整同步策略 |
+| 磁盘空间不足 | 存储告警 | 事务日志堆积 | 清理旧日志 |
+| 连接数耗尽 | 无法新建连接 | 并发过高 | 连接池优化 |
+
+### Cypher 查询优化
+
+```cypher
+-- 使用 PROFILE 分析查询计划
+PROFILE MATCH (p:Person)-[:KNOWS*1..3]->(f:Person)
+WHERE p.name = 'Alice'
+RETURN f.name
+
+-- 创建索引
+CREATE INDEX FOR (p:Person) ON (p.name)
+CREATE INDEX FOR (p:Person) ON (p.age)
+
+-- 使用 EXPLAIN 验证查询计划
+EXPLAIN MATCH (p:Person)-[:WORKS_AT]->(c:Company)
+WHERE c.name = 'Neo4j'
+RETURN p.name
+
+-- 使用 OPTIONAL MATCH 避免空结果
+OPTIONAL MATCH (p:Person)-[:WORKS_AT]->(c:Company)
+RETURN p.name, c.name
+
+-- 使用 UNWIND 批量处理
+UNWIND $batch AS item
+MERGE (n:Node {id: item.id})
+SET n.name = item.name
+```
+
+### 内存配置优化
+
+```yaml
+# Neo4j 内存配置
+server.memory.heap.initial_size=2G
+server.memory.heap.max_size=4G
+server.memory.pagecache.size=8G
+
+# 数据库内存
+server.memory.off_buffer.size=512M
+
+# 查询内存限制
+server.query.memory.limit=2G
+
+# 事务内存限制
+server.memory.transaction.total.max=1G
+```
+
+### 集群高可用架构
+
+```mermaid
+flowchart TD
+    A[应用] --> B[Neo4j 集群]
+    B --> C[Leader]
+    B --> D[Follower 1]
+    B --> E[Follower 2]
+    C --> F[Core Server]
+    D --> F
+    E --> F
+
+    subgraph 故障转移
+        G[健康检查] --> H[自动切换]
+        H --> I[数据恢复]
+    end
+
+    subgraph 读写分离
+        J[写请求] --> C
+        K[读请求] --> D
+        K --> E
+    end
+```
+
+### 监控告警配置
+
+```yaml
+# Neo4j 监控规则
+groups:
+  - name: neo4j-alerts
+    rules:
+      - alert: Neo4j_QueryTimeout
+        expr: neo4j_query_duration_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j 查询超时"
+      
+      - alert: Neo4j_MemoryHigh
+        expr: neo4j_memory_usage_bytes / neo4j_memory_limit_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j 内存使用率高"
+      
+      - alert: Neo4j_ClusterSyncDelay
+        expr: neo4j_cluster_sync_delay_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j 集群同步延迟"
+```
+
+### Spring Data Neo4j 集成
+
+```java
+// 实体定义
+@Node
+public class Person {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private int age;
+    
+    @Relationship(type = "KNOWS", direction = Direction.OUTGOING)
+    private Set<Person> friends;
+}
+
+// Repository 接口
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    List<Person> findByName(String name);
+    
+    @Query("MATCH (p:Person)-[:KNOWS*1..3]->(f:Person) WHERE p.name = $name RETURN f")
+    List<Person> findFriendsOfDepth(@Param("name") String name);
+}
+
+// 自定义查询
+@Service
+public class PersonService {
+    @Autowired
+    private PersonRepository personRepository;
+    
+    public List<Person> findFriends(String name) {
+        return personRepository.findFriendsOfDepth(name);
+    }
+}
+```
+
+### 知识图谱构建
+
+```text
+知识图谱构建流程：
+  1. 数据采集
+     - 结构化数据
+     - 非结构化数据
+     - 半结构化数据
+
+  2. 实体识别
+     - 命名实体识别
+     - 实体消歧
+     - 实体对齐
+
+  3. 关系抽取
+     - 关系发现
+     - 关系分类
+     - 关系验证
+
+  4. 知识融合
+     - 知识对齐
+     - 知识推理
+     - 知识验证
+
+  5. 图存储
+     - 图数据库
+     - 图索引
+     - 图查询
+
+  6. 图分析
+     - 社区检测
+     - 影响力分析
+     - 路径分析
+```
+
+### 对比 MySQL/ES
+
+| 特性 | Neo4j | MySQL | Elasticsearch |
+|------|-------|-------|---------------|
+| 数据模型 | 图 | 关系 | 文档 |
+| 查询语言 | Cypher | SQL | DSL |
+| 关系查询 | 优秀 | 一般 | 一般 |
+| 全文搜索 | 一般 | 一般 | 优秀 |
+| 聚合分析 | 一般 | 一般 | 优秀 |
+| 事务支持 | 优秀 | 优秀 | 无 |
+| 扩展性 | 集群 | 集群 | 集群 |
+
+### 性能调优参数
+
+```text
+性能调优参数：
+  1. 索引优化
+     - 创建合适的索引
+     - 使用复合索引
+     - 定期重建索引
+
+  2. 查询优化
+     - 使用索引扫描
+     - 避免全图遍历
+     - 限制查询深度
+
+  3. 内存优化
+     - 合理配置堆内存
+     - 使用页缓存
+     - 限制查询内存
+
+  4. 集群优化
+     - 负载均衡
+     - 读写分离
+     - 数据分片
+```
+
+### 安全配置
+
+```yaml
+# Neo4j 安全配置
+security:
+  authentication:
+    enabled: true
+    provider: native
+    password_policy:
+      min_length: 8
+      require_uppercase: true
+      require_number: true
+  
+  authorization:
+    enabled: true
+    roles:
+      - admin
+      - reader
+      - writer
+  
+  encryption:
+    tls:
+      enabled: true
+      cert: /path/to/server.crt
+      key: /path/to/server.key
+  
+  audit:
+    enabled: true
+    log_queries: true
+    log_auth: true
+```
+
+### 运维最佳实践
+
+```text
+运维检查清单：
+  1. 日常巡检
+     - 集群状态
+     - 内存使用
+     - 查询性能
+     - 错误日志
+
+  2. 定期维护
+     - 索引重建
+     - 事务日志清理
+     - 配置审查
+     - 安全审计
+
+  3. 容量规划
+     - 存储增长
+     - 内存需求
+     - 查询负载
+     - 集群扩展
+
+  4. 应急预案
+     - 故障转移
+     - 数据恢复
+     - 回滚方案
+     - 通知机制
+```
+
+
 ## 与其他板块的关系
 
 - 图数据库选型见「[图数据库对比](./图数据库对比.md)」；

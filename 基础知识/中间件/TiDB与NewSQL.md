@@ -1971,7 +1971,185 @@ flowchart TD
     end
 ```
 
-## 十一、与其他板块的关系
+## TiDB 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| 写入热点 | 部分 TiKV 负载高 | 自增主键集中写入 | 使用 UUID 或打散主键 |
+| 读延迟高 | 查询慢 | 热点 Region 或大查询 | 调整 Region 调度，限流 |
+| DDL 卡住 | DDL 执行超时 | 大表 DDL 锁冲突 | 使用 online DDL，分批执行 |
+| 存储空间不足 | 磁盘告警 | 数据膨胀或 Compaction 不及时 | 手动 Compact，清理历史数据 |
+| TiFlash 同步延迟 | 副本数据不一致 | 网络抖动或负载高 | 调整同步参数，增加资源 |
+| GC 卡住 | 历史版本堆积 | GC 流程异常 | 手动触发 GC，检查配置 |
+
+### 性能调优参数
+
+```sql
+-- TiDB Server 调优
+SET GLOBAL tidb_distsql_scan_concurrency = 30;
+SET GLOBAL tidb_index_lookup_concurrency = 4;
+SET GLOBAL tidb_index_lookup_size = 20000;
+SET GLOBAL tidb_chunk_disk_size = '256MB';
+
+-- TiKV 调优
+-- raftdb.max-total-wal-size = "4GB"
+-- rocksdb.max-background-jobs = 8
+-- rocksdb.max-write-buffer-number = 5
+
+-- 会话级调优
+SET tidb_enable_parallel_apply = ON;
+SET tidb_allow_batch_cop = 1;
+SET tidb_opt_agg_push_down = ON;
+```
+
+### 写入热点处理
+
+```mermaid
+flowchart TD
+    A[检测热点] --> B{热点类型}
+    B -->|Region 热点| C[Region 分裂]
+    B -->|Table 热点| D[表打散]
+    B -->|Column 热点| E[列分散]
+    C --> F[调度热点 Region]
+    D --> G[预分裂 Region]
+    E --> H[应用层打散]
+    F --> I[负载均衡]
+    G --> I
+    H --> I
+```
+
+### 监控告警配置
+
+```yaml
+# TiDB Prometheus 告警规则
+groups:
+  - name: tidb-alerts
+    rules:
+      - alert: TiDB_PDUnavailable
+        expr: pd_cluster_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PD 不可用"
+      
+      - alert: TiDB_TiKVLowDiskSpace
+        expr: tikv_store_size / tikv_engine_size > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TiKV 磁盘空间不足"
+      
+      - alert: TiDB_SlowQuery
+        expr: rate(tidb_session_statement_duration_seconds_sum{type="General"}[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "慢查询过多"
+```
+
+### 备份与恢复
+
+| 备份方式 | 工具 | 优势 | 劣势 | 适用场景 |
+|----------|------|------|------|----------|
+| 全量备份 | BR | 速度快 | 恢复慢 | 定期备份 |
+| 增量备份 | BR | 恢复快 | 管理复杂 | RTO 要求高 |
+| 日志备份 | BR | 实时 | 存储成本高 | 实时恢复 |
+| 快照备份 | TiDB Snapshot | 简单 | 数据量大 | 小规模 |
+
+### 迁移最佳实践
+
+```text
+MySQL → TiDB 迁移步骤：
+  1. 准备阶段
+     - 兼容性检查
+     - 性能测试
+     - 容量规划
+
+  2. 全量迁移
+     - 使用 DM 全量导入
+     - 并行导入
+     - 数据校验
+
+  3. 增量同步
+     - DM 增量同步
+     - 延迟监控
+     - 错误处理
+
+  4. 切换阶段
+     - 业务低峰期
+     - 短暂停写
+     - 数据校验
+     - 流量切换
+
+  5. 验证阶段
+     - 数据一致性
+     - 业务验证
+     - 性能监控
+```
+
+### SQL 优化技巧
+
+| 场景 | 优化前 | 优化后 | 效果 |
+|------|--------|--------|------|
+| 全表扫描 | SELECT * | 索引覆盖 | 100x |
+| 大事务 | 单事务百万行 | 分批提交 | 避免 OOM |
+| 聚合查询 | 子查询 | JOIN 优化 | 10x |
+| 分页查询 | LIMIT 1000000 | 游标分页 | 50x |
+| 热点读 | 读写混合 | 读 TiFlash 副本 | 降低延迟 |
+
+### 安全配置
+
+```yaml
+# TiDB 安全配置
+security:
+  # TLS 配置
+  tls:
+    cluster:
+      cert: /path/to/server.crt
+      key: /path/to/server.key
+      ca: /path/to/ca.crt
+  
+  # 权限管理
+  auth:
+    root_password: ${secrets:tidb-root-password}
+    audit:
+      enabled: true
+      log_queries: true
+    
+  # 数据加密
+  encryption:
+    key_rotation: true
+    algorithm: AES256
+```
+
+### 高可用架构
+
+```mermaid
+flowchart TD
+    A[应用] --> B[TiDB Server]
+    B --> C[PD 集群]
+    B --> D[TiKV 集群]
+    B --> E[TiFlash 集群]
+    C --> F[Leader]
+    C --> G[Follower 1]
+    C --> H[Follower 2]
+    D --> I[Region Group 1]
+    D --> J[Region Group 2]
+    D --> K[Region Group 3]
+    E --> L[列存副本]
+
+    subgraph 故障转移
+        M[健康检查] --> N[自动切换]
+        N --> O[数据恢复]
+    end
+```
+
+## 十一-2、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - 存储引擎见「[RocksDB 与嵌入式 KV 存储](./RocksDB与嵌入式KV存储.md)」；

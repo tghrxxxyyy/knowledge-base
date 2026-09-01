@@ -2226,6 +2226,182 @@ groups:
           summary: "Debezium 错误率高"
 ```
 
+## Debezium 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| Connector 频繁重启 | 任务不断重启 | 配置错误或资源不足 | 检查配置，增加资源 |
+| 数据延迟 | 变更事件延迟大 | binlog 读取慢 | 增加并行度，优化 SQL |
+| 数据丢失 | 部分变更未同步 | offset 提交失败 | 启用 exactly-once，检查 Kafka |
+| Schema 冲突 | 消费者解析失败 | 源表结构变更 | 配置 Schema 演进策略 |
+| 连接数耗尽 | 无法新建连接 | 并发 Connector 过多 | 限制并发，使用连接池 |
+| 内存溢出 | Connector OOM | 大事务处理 | 调整内存，分批处理 |
+
+### Kafka Connect 调优参数
+
+```properties
+# Worker 配置
+offset.flush.interval.ms=10000
+offset.flush.timeout.ms=60000
+task.shutdown.graceful.timeout.ms=5000
+plugin.path=/usr/share/java,/usr/share/kafka/connect
+
+# Connector 配置
+tasks.max=4
+heartbeat.interval.ms=30000
+max.batch.size=16384
+poll.interval.ms=500
+
+# MySQL Connector 专用
+snapshot.mode=initial
+snapshot.locking.mode=none
+heartbeat.topics=__debezium_heartbeat
+```
+
+### Schema 演进策略
+
+```mermaid
+flowchart TD
+    A[源表结构变更] --> B{是否兼容?}
+    B -->|是| C[自动演进]
+    B -->|否| D{策略配置}
+    D -->|none| E[忽略变更]
+    D -->|warn| F[记录警告]
+    D -->|manage| G[手动处理]
+    C --> H[更新 Schema Registry]
+    F --> I[跳过该记录]
+    G --> J[人工介入]
+    H --> K[消费者适配]
+```
+
+### 对比 Canal/Maxwell/Flink CDC
+
+| 特性 | Debezium | Canal | Maxwell | Flink CDC |
+|------|----------|-------|---------|-----------|
+| 支持数据库 | MySQL/PG/Oracle/SQL Server/MongoDB | MySQL | MySQL | MySQL/PG |
+| 架构 | Kafka Connect | 独立进程 | 独立进程 | Flink SQL |
+| 全量+增量 | 支持 | 不支持 | 不支持 | 支持 |
+| Exactly-Once | 支持 | 不支持 | 不支持 | 支持 |
+| Schema 演进 | 支持 | 不支持 | 不支持 | 支持 |
+| 生态集成 | Kafka 原生 | 独立 | 独立 | Flink 原生 |
+| 维护成本 | 中 | 低 | 低 | 中 |
+| 适用场景 | 企业级数据集成 | MySQL 同步 | MySQL 同步 | 实时计算 |
+
+### 监控告警配置
+
+```yaml
+# Debezium Prometheus 告警规则
+groups:
+  - name: debezium-alerts
+    rules:
+      - alert: Debezium_ConnectorDown
+        expr: debezium_connector_status == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Debezium Connector 停止"
+      
+      - alert: Debezium_HighLag
+        expr: debezium_source_connector_replication_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Debezium 复制延迟过高"
+      
+      - alert: Debezium_ErrorRate
+        expr: rate(debezium_connector_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Debezium 错误率高"
+```
+
+### 性能优化策略
+
+| 优化项 | 优化前 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| 并行度 | tasks.max=1 | tasks.max=4 | 吞吐量 4x |
+| 批量大小 | 1024 | 16384 | 吞吐量 3x |
+| 快照模式 | initial | no_data | 启动快 |
+| 心跳间隔 | 10s | 30s | 资源节省 |
+| 压缩 | 无 | lz4 | 网络节省 60% |
+
+### 安全配置
+
+```properties
+# SSL 加密
+database.sslmode=require
+database.sslcert=/path/to/client.crt
+database.sslkey=/path/to/client.key
+database.sslrootcert=/path/to/ca.crt
+
+# 认证
+database.user=debezium
+database.password=${secrets:debezium-db-password}
+
+# 权限（最小权限）
+# GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'debezium'@'%';
+```
+
+### 备份与恢复
+
+```text
+Debezium 备份策略：
+  1. 配置备份
+     - 备份 connector 配置
+     - 备份 schema registry
+     - 版本控制
+
+  2. Offset 备份
+     - Kafka __consumer_offsets
+     - 定期备份
+     - 用于恢复后定位
+
+  3. 数据恢复
+     - 全量快照恢复
+     - 从指定 offset 恢复
+     - 数据校验
+
+  4. 灾难恢复
+     - 跨集群复制
+     - 手动切换
+     - 数据一致性验证
+```
+
+### 运维最佳实践
+
+```text
+运维检查清单：
+  1. 日常巡检
+     - Connector 状态
+     - 复制延迟
+     - 错误日志
+     - 磁盘使用
+
+  2. 定期维护
+     - Offset 清理
+     - 日志轮转
+     - 证书更新
+     - 配置审查
+
+  3. 容量规划
+     - Kafka topic 分区数
+     - Connector 并行度
+     - 网络带宽
+     - 存储空间
+
+  4. 应急预案
+     - Connector 重启流程
+     - 数据修复流程
+     - 回滚方案
+     - 通知机制
+```
+
 ## Debezium 架构设计最佳实践
 
 ### 高可用架构

@@ -1398,6 +1398,219 @@ groups:
           summary: "Prometheus 查询慢"
 ```
 
+
+## Prometheus/Grafana 生产问题排查与最佳实践
+
+### 常见生产问题
+
+| 问题类型 | 症状 | 根因 | 解决方案 |
+|----------|------|------|----------|
+| 指标丢失 | 监控数据不完整 | 采集配置错误 | 检查 scrape 配置 |
+| 查询慢 | Grafana 加载慢 | 查询范围过大 | 缩小查询范围 |
+| 存储爆炸 | 存储成本飙升 | 指标过多 | 优化指标 |
+| 告警风暴 | 大量告警 | 阈值设置不当 | 优化告警规则 |
+| 内存溢出 | Prometheus OOM | 指标基数过高 | 降低基数 |
+| 数据不一致 | 副本数据不同 | 复制延迟 | 调整复制策略 |
+
+### Prometheus 部署架构
+
+```mermaid
+flowchart TD
+    A[应用] --> B[Prometheus Server]
+    B --> C[本地存储]
+    B --> D[Remote Write]
+    D --> E[Thanos/Cortex]
+    E --> F[对象存储]
+    B --> G[Grafana]
+    G --> H[Dashboard]
+
+    subgraph 采集层
+        B -->|Pull| I[ServiceMonitor]
+        B -->|Pull| J[PodMonitor]
+        B -->|Pull| K[Node Exporter]
+    end
+```
+
+### Grafana 仪表板最佳实践
+
+| 仪表板类型 | 用途 | 刷新频率 | 数据源 |
+|------------|------|----------|--------|
+| 概览 | 全局状态 | 1min | Prometheus |
+| 服务 | 服务健康 | 30s | Prometheus |
+| 基础设施 | 资源状态 | 5min | Prometheus |
+| 业务 | 业务指标 | 5min | Prometheus |
+| 告警 | 告警状态 | 10s | Alertmanager |
+
+### 告警规则最佳实践
+
+```yaml
+# 告警规则分层
+groups:
+  - name: critical
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "服务宕机"
+      
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "错误率过高"
+  
+  - name: warning
+    rules:
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "延迟过高"
+      
+      - alert: HighMemory
+        expr: process_resident_memory_bytes / 1024 / 1024 > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用过高"
+```
+
+### 数据模型与 PromQL
+
+```promql
+# 常用 PromQL 查询
+
+# QPS
+rate(http_requests_total[5m])
+
+# 错误率
+rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])
+
+# P99 延迟
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# 内存使用率
+process_resident_memory_bytes / process_virtual_memory_max_bytes
+
+# CPU 使用率
+rate(process_cpu_seconds_total[5m]) * 100
+
+# 磁盘使用率
+node_filesystem_avail_bytes / node_filesystem_size_bytes
+```
+
+### 长期存储方案
+
+| 方案 | 优势 | 劣势 | 适用场景 |
+|------|------|------|----------|
+| Thanos | 全局视图，去重 | 复杂度高 | 大规模 |
+| Cortex | 多租户 | 运维成本高 | SaaS |
+| VictoriaMetrics | 高性能 | 生态较小 | 性能敏感 |
+| Mimir | 云原生 | 较新 | 云环境 |
+
+### 对比 Zabbix
+
+| 特性 | Prometheus | Zabbix |
+|------|-----------|--------|
+| 架构 | Pull | Push/Pull |
+| 数据模型 | 时间序列 | 指标+事件 |
+| 查询语言 | PromQL | 无 |
+| 可视化 | Grafana | 内置 |
+| 告警 | Alertmanager | 内置 |
+| 扩展性 | 高 | 中 |
+| 云原生 | 是 | 否 |
+
+### 安全配置
+
+```yaml
+# Prometheus 安全配置
+security:
+  authentication:
+    basic_auth:
+      enabled: true
+      username: admin
+      password: ${secrets:prometheus-password}
+  
+  tls:
+    enabled: true
+    cert: /path/to/server.crt
+    key: /path/to/server.key
+    ca: /path/to/ca.crt
+  
+  authorization:
+    enabled: true
+    roles:
+      - admin
+      - viewer
+  
+  audit:
+    enabled: true
+    log_queries: true
+```
+
+### 性能优化
+
+```text
+性能优化策略：
+  1. 采集优化
+     - 降低采集频率
+     - 过滤不需要的指标
+     - 使用 Relabeling
+
+  2. 存储优化
+     - 降低保留期
+     - 使用压缩
+     - 远程存储
+
+  3. 查询优化
+     - 缩小查询范围
+     - 使用 Recording Rules
+     - 缓存查询结果
+
+  4. 架构优化
+     - 分片采集
+     - 负载均衡
+     - 高可用部署
+```
+
+### 运维最佳实践
+
+```text
+运维检查清单：
+  1. 日常巡检
+     - 采集状态
+     - 存储使用
+     - 告警状态
+     - 查询性能
+
+  2. 定期维护
+     - 规则优化
+     - 配置审查
+     - 证书更新
+     - 容量规划
+
+  3. 性能优化
+     - 指标清理
+     - 查询优化
+     - 存储优化
+     - 缓存优化
+
+  4. 应急预案
+     - 故障转移
+     - 数据恢复
+     - 回滚方案
+     - 通知机制
+```
+
+
 ## 十七、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；
