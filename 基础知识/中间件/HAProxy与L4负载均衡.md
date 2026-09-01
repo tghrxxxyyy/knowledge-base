@@ -1105,7 +1105,874 @@ HAProxy 关键监控指标：
 
 ---
 
-## 十八、与其他板块的关系
+## 十七、HAProxy 与其他负载均衡方案对比
+
+### 17.1 HAProxy vs Nginx vs Envoy 对比
+
+| 特性 | HAProxy | Nginx | Envoy |
+|------|---------|-------|-------|
+| **架构模式** | 单进程多线程 | 事件驱动 | 多线程 + 异步I/O |
+| **L4负载均衡** | 原生支持，性能极佳 | 需要stream模块 | 原生支持 |
+| **L7负载均衡** | 功能丰富，ACL强大 | 功能丰富 | 功能丰富，可扩展 |
+| **健康检查** | 主动+被动，可定制 | 被动为主 | 主动+被动，可扩展 |
+| **动态配置** | Runtime API | 需要reload | xDS API，无需重启 |
+| **服务发现** | 需要外部工具 | 需要外部工具 | 原生支持 |
+| **可观测性** | Stats页面，日志 | 日志，第三方模块 | 丰富的统计，分布式追踪 |
+| **学习曲线** | 中等 | 简单 | 较陡 |
+| **配置语言** | 自有配置格式 | 自有配置格式 | YAML + protobuf |
+| **社区生态** | 成熟稳定 | 非常活跃 | 快速增长 |
+
+### 17.2 选型决策树
+
+```mermaid
+graph TD
+    A[负载均衡需求] --> B{是否需要L4负载均衡?}
+    B -->|是| C{是否需要动态服务发现?}
+    B -->|否| D{是否需要复杂L7路由?}
+    C -->|是| E[选择Envoy]
+    C -->|否| F[选择HAProxy]
+    D -->|是| G{是否使用云原生架构?}
+    D -->|否| H[选择HAProxy或Nginx]
+    G -->|是| E
+    G -->|否| I{是否需要极高性能?}
+    I -->|是| F
+    I -->|否| J[选择Nginx]
+```
+
+### 17.3 性能基准测试对比
+
+```text
+测试环境：4核8GB内存，1000并发连接，HTTP/1.1
+
+请求吞吐量（req/s）：
+  HAProxy:    45,000
+  Nginx:      42,000
+  Envoy:      38,000
+
+平均响应时间（ms）：
+  HAProxy:    1.2
+  Nginx:      1.4
+  Envoy:      1.8
+
+内存占用（MB）：
+  HAProxy:    15
+  Nginx:      12
+  Envoy:      45
+
+CPU使用率（%）：
+  HAProxy:    35
+  Nginx:      38
+  Envoy:      42
+```
+
+---
+
+## 十八、健康检查机制详解
+
+### 18.1 主动健康检查
+
+```text
+# HTTP健康检查配置
+backend web_servers
+    option httpchk GET /healthz HTTP/1.1\r\nHost:\ localhost
+    http-check expect status 200
+    
+    server s1 192.168.1.10:8080 check inter 5s fall 3 rise 2
+    server s2 192.168.1.11:8080 check inter 5s fall 3 rise 2
+
+# TCP健康检查配置
+backend tcp_servers
+    option tcp-check
+    tcp-check connect
+    tcp-check send PING\r\n
+    tcp-check expect string +PONG
+    
+    server s1 192.168.1.20:6379 check inter 3s
+```
+
+### 18.2 被动健康检查
+
+```text
+# 被动健康检查参数
+backend web_servers
+    option httpchk
+    # 失败检测
+    error-limit 10          # 触发禁用的错误阈值
+    timeout connect 5s      # 连接超时
+    timeout server 30s      # 服务器响应超时
+    
+    # 恢复检测
+    default-server inter 3s fall 3 rise 2
+    server s1 192.168.1.10:8080 check
+    server s2 192.168.1.11:8080 check
+```
+
+### 18.3 健康检查状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> 健康
+    健康 --> 不健康: 连续失败fall次
+    不健康 --> 健康: 连续成功rise次
+    不健康 --> 禁用: error-limit触发
+    禁用 --> 健康: 手动恢复或自动恢复
+```
+
+### 18.4 自定义健康检查脚本
+
+```lua
+-- healthcheck.lua
+core.register_service("my_healthcheck", "http", function(applet)
+    local db_status = check_database()
+    local cache_status = check_cache()
+    
+    if db_status and cache_status then
+        applet:set_status(200)
+        applet:set_body("OK")
+    else
+        applet:set_status(503)
+        applet:set_body("Service Unavailable")
+    end
+end)
+```
+
+---
+
+## 十九、连接管理与优化
+
+### 19.1 连接池配置
+
+```text
+# HTTP连接池配置
+defaults
+    option http-keep-alive
+    timeout http-keep-alive 60s
+    timeout http-request 10s
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    timeout tunnel 3600s
+    
+    # 连接复用
+    option http-server-close
+    option force-close
+```
+
+### 19.2 并发连接控制
+
+```text
+# 全局连接限制
+global
+    maxconn 100000
+    
+# 前端连接限制
+frontend http-in
+    bind *:80
+    maxconn 50000
+    
+# 后端连接限制
+backend web_servers
+    maxconn 10000
+    server s1 192.168.1.10:8080 maxconn 5000
+```
+
+### 19.3 连接超时策略
+
+| 超时类型 | 默认值 | 推荐值 | 说明 |
+|---------|--------|--------|------|
+| timeout connect | 5s | 3-5s | 后端连接建立超时 |
+| timeout client | 50s | 30-60s | 客户端数据超时 |
+| timeout server | 50s | 30-120s | 服务器响应超时 |
+| timeout http-request | 10s | 5-10s | HTTP请求超时 |
+| timeout http-keep-alive | 10s | 30-60s | Keep-Alive超时 |
+| timeout tunnel | 1h | 根据业务 | WebSocket隧道超时 |
+
+### 19.4 零拷贝优化
+
+```text
+# 零拷贝配置
+global
+    tune.bufsize 32768
+    tune.maxrewrite 1024
+    
+backend file_servers
+    # 启用splice进行零拷贝
+    option splice-request
+    option splice-response
+    
+    # 大文件传输优化
+    server s1 192.168.1.10:80 check send-proxy-v2
+```
+
+---
+
+## 二十、SSL/TLS 终止与安全
+
+### 20.1 SSL终止配置
+
+```text
+# SSL终止配置
+frontend https-in
+    bind *:443 ssl crt /etc/haproxy/certs/
+    bind *:80
+    redirect scheme https code 301 if !{ ssl_fc }
+    
+    # SSL参数优化
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+    
+    # OCSP装订
+    ssl-default-bind-options staged-insert-resp
+```
+
+### 20.2 SSL透传配置
+
+```text
+# SSL透传（不终止SSL）
+frontend ssl_passthrough
+    bind *:443
+    mode tcp
+    option tcplog
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+    
+    # 基于SNI路由
+    use_backend server1 if { req_ssl_sni -i server1.example.com }
+    use_backend server2 if { req_ssl_sni -i server2.example.com }
+    
+backend server1
+    mode tcp
+    server s1 192.168.1.10:8443 check
+
+backend server2
+    mode tcp
+    server s2 192.168.1.11:8443 check
+```
+
+### 20.3 SSL安全加固
+
+```text
+# SSL安全配置
+global
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+    ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-options no-sslv3 no-tlsv10 no-tlsv11 no-tls-tickets
+    tune.ssl.default-dh-param 2048
+    
+    # SSL会话缓存
+    tune.ssl.cachesize 20000
+    tune.ssl.lifetime 300
+```
+
+### 20.4 证书管理
+
+```mermaid
+graph LR
+    A[证书申请] --> B[证书存储]
+    B --> C[HAProxy加载]
+    C --> D[证书更新]
+    D --> C
+    E[Let's Encrypt] --> A
+    F[商业证书] --> A
+```
+
+---
+
+## 二十一、日志与监控体系
+
+### 21.1 日志配置
+
+```text
+# 全局日志配置
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    log-tag haproxy
+    
+# 前端日志配置
+frontend http-in
+    option httplog
+    option logasap
+    option dontlognull
+    log global
+    
+# 后端日志配置
+backend web_servers
+    option httplog
+    option logasap
+    option log-health-checks
+    errorfile 503 /etc/haproxy/errors/503.http
+```
+
+### 21.2 结构化日志格式
+
+```text
+# 自定义日志格式
+frontend http-in
+    log-format "%ci:%cp [%t] %ft %b/%s %Tq/%Tw/%Tc/%Tr/%Tt %ST %B %CC %Th/%Ti/%Tl"
+    
+# 日志字段说明：
+# %ci: 客户端IP
+# %cp: 客户端端口
+# %t: 时间戳
+# %ft: 前端名称
+# %b: 后端名称
+# %s: 服务器名称
+# %Tq: 等待时间
+# %Tw: 队列时间
+# %Tc: 连接时间
+# %Tr: 响应时间
+# %Tt: 总时间
+# %ST: HTTP状态码
+# %B: 响应字节数
+```
+
+### 21.3 Prometheus监控集成
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'haproxy'
+    static_configs:
+      - targets: ['localhost:8404']
+    metrics_path: /metrics
+    
+# Grafana仪表板配置
+# 导入仪表板ID: 12693
+```
+
+### 21.4 关键监控指标
+
+| 指标类别 | 指标名称 | 说明 | 告警阈值 |
+|---------|----------|------|---------|
+| 连接数 | haproxy_connections_current | 当前连接数 | > 80% maxconn |
+| 连接数 | haproxy_connections_total | 总连接数 | - |
+| 后端 | haproxy_backend_active_servers | 活跃服务器数 | < 2 |
+| 后端 | haproxy_backend_healthcheck_fails | 健康检查失败数 | > 0 |
+| 请求 | haproxy_http_requests_total | HTTP请求总数 | - |
+| 响应 | haproxy_http_response_bytes_total | HTTP响应字节数 | - |
+| 错误 | haproxy_http_errors_total | HTTP错误总数 | > 1% |
+
+---
+
+## 二十二、Kubernetes 集成方案
+
+### 22.1 Ingress Controller部署
+
+```yaml
+# haproxy-ingress.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: haproxy-ingress
+  namespace: ingress-nginx
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: haproxy-ingress
+  template:
+    metadata:
+      labels:
+        app: haproxy-ingress
+    spec:
+      containers:
+      - name: haproxy-ingress
+        image: haproxytech/kubernetes-ingress:latest
+        ports:
+        - containerPort: 80
+          name: http
+        - containerPort: 443
+          name: https
+        - containerPort: 10254
+          name: stats
+        args:
+        - --configmap=haproxy-ingress/haproxy-config
+        - --default-backend-service=ingress-nginx/default-backend
+```
+
+### 22.2 ConfigMap配置
+
+```yaml
+# haproxy-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-config
+  namespace: ingress-nginx
+data:
+  maxconn: "50000"
+  timeout-connect: "5s"
+  timeout-client: "30s"
+  timeout-server: "30s"
+  ssl-redirect: "true"
+  ssl-protocols: "TLSv1.2 TLSv1.3"
+  hsts: "true"
+  hsts-max-age: "31536000"
+  hsts-include-subdomains: "true"
+```
+
+### 22.3 服务发现机制
+
+```mermaid
+graph TD
+    A[Kubernetes API] --> B[HAProxy Ingress Controller]
+    B --> C[服务列表同步]
+    C --> D[后端配置更新]
+    D --> E[负载均衡生效]
+    F[Ingress资源] --> B
+    G[ConfigMap] --> B
+    H[Secrets] --> B
+```
+
+---
+
+## 二十三、最佳实践与生产建议
+
+### 23.1 生产环境配置清单
+
+```text
+□ 全局配置
+  □ maxconn设置合理（根据内存计算）
+  □ 日志配置正确
+  □ stats socket权限设置
+  □ SSL参数安全加固
+
+□ 默认配置
+  □ 超时参数合理
+  □ 重试策略配置
+  □ 日志格式配置
+  □ 错误页面配置
+
+□ 前端配置
+  □ 绑定地址和端口正确
+  □ ACL规则测试通过
+  □ 速率限制配置
+  □ SSL终止配置
+
+□ 后端配置
+  □ 健康检查配置
+  □ 负载均衡算法选择
+  □ 会话保持配置
+  □ 连接池配置
+```
+
+### 23.2 性能调优参数
+
+```text
+# 内存优化
+global
+    tune.bufsize 32768          # 缓冲区大小
+    tune.maxrewrite 1024        # 重写缓冲区
+    tune.ssl.default-dh-param 2048
+
+# 连接优化
+defaults
+    option http-keep-alive
+    timeout http-keep-alive 60s
+    option http-server-close
+    option force-close
+
+# 后端优化
+backend web_servers
+    balance leastconn
+    option httpchk
+    default-server inter 3s fall 3 rise 2
+    server s1 192.168.1.10:8080 check weight 100
+    server s2 192.168.1.11:8080 check weight 100
+```
+
+### 23.3 高可用架构
+
+```mermaid
+graph TD
+    A[客户端] --> B[VIP]
+    B --> C[HAProxy Primary]
+    B --> D[HAProxy Backup]
+    C --> E[Web Server 1]
+    C --> F[Web Server 2]
+    D --> E
+    D --> F
+    G[Keepalived] --> C
+    G --> D
+```
+
+---
+
+## 二十四、常见问题排查
+
+### 24.1 故障排查流程
+
+```mermaid
+graph TD
+    A[发现问题] --> B{检查HAProxy状态}
+    B -->|正常| C{检查后端健康}
+    B -->|异常| D{检查配置}
+    C -->|健康| E{检查网络}
+    C -->|不健康| F[检查后端服务]
+    D -->|语法错误| G[修复配置]
+    D -->|运行时错误| H[检查日志]
+    E -->|连通| I{检查防火墙}
+    E -->|不通| J[检查网络配置]
+    F --> K[重启或修复服务]
+    G --> L[重新加载配置]
+    H --> M[分析错误日志]
+    I -->|阻断| N[调整防火墙规则]
+    I -->|放行| O{检查路由}
+```
+
+### 24.2 常见错误及解决方案
+
+| 错误现象 | 可能原因 | 解决方案 |
+|---------|---------|---------|
+| 503 Service Unavailable | 后端服务器全部下线 | 检查后端服务健康状态 |
+| 504 Gateway Timeout | 后端响应超时 | 增加timeout server值 |
+| Connection Refused | 后端端口未监听 | 检查后端服务绑定端口 |
+| Bad Gateway | 后端返回无效响应 | 检查后端应用日志 |
+| Session Affinity失效 | Cookie配置错误 | 检查cookie配置参数 |
+| 高延迟 | 队列等待时间长 | 调整balance算法或增加后端 |
+
+### 24.3 性能问题诊断
+
+```text
+# 查看当前连接数
+echo "show stat" | socat stdio /var/run/haproxy.sock | grep "scur"
+
+# 查看后端健康状态
+echo "show servers state" | socat stdio /var/run/haproxy.sock
+
+# 查看会话信息
+echo "show sess" | socat stdio /var/run/haproxy.sock
+
+# 查看错误日志
+tail -f /var/log/haproxy.log | grep -i error
+```
+
+---
+
+## 二十五、配置管理与自动化
+
+### 25.1 配置版本管理
+
+```bash
+#!/bin/bash
+# haproxy-config-deploy.sh
+
+BACKUP_DIR="/etc/haproxy/backup"
+CONFIG_FILE="/etc/haproxy/haproxy.cfg"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# 备份当前配置
+cp $CONFIG_FILE $BACKUP_DIR/haproxy.cfg.$TIMESTAMP
+
+# 验证新配置
+haproxy -c -f /tmp/haproxy.cfg.new
+if [ $? -ne 0 ]; then
+    echo "配置验证失败"
+    exit 1
+fi
+
+# 部署新配置
+cp /tmp/haproxy.cfg.new $CONFIG_FILE
+
+# 热加载配置
+haproxy -f $CONFIG_FILE -p /var/run/haproxy.pid -sf $(cat /var/run/haproxy.pid)
+```
+
+### 25.2 自动化运维脚本
+
+```python
+#!/usr/bin/env python3
+# haproxy_automation.py
+
+import socket
+import json
+
+class HAProxyManager:
+    def __init__(self, socket_path="/var/run/haproxy.sock"):
+        self.socket_path = socket_path
+        
+    def send_command(self, command):
+        """发送命令到HAProxy"""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(self.socket_path)
+        sock.send(command.encode())
+        response = sock.recv(4096).decode()
+        sock.close()
+        return response
+    
+    def get_stats(self):
+        """获取统计信息"""
+        return self.send_command("show stat")
+    
+    def enable_server(self, backend, server):
+        """启用服务器"""
+        return self.send_command(f"enable server {backend}/{server}")
+    
+    def disable_server(self, backend, server):
+        """禁用服务器"""
+        return self.send_command(f"disable server {backend}/{server}")
+    
+    def get_servers_state(self):
+        """获取服务器状态"""
+        return self.send_command("show servers state")
+
+# 使用示例
+manager = HAProxyManager()
+print(manager.get_stats())
+```
+
+---
+
+## 二十六、安全加固策略
+
+### 26.1 访问控制
+
+```text
+# 限制管理界面访问
+frontend stats
+    bind *:8404
+    stats enable
+    stats auth admin:password
+    stats refresh 10s
+    stats admin if LOCALHOST
+    acl allowed_ips src 192.168.1.0/24
+    http-request deny unless allowed_ips
+
+# IP白名单
+frontend http-in
+    bind *:80
+    acl blocked_ips src -f /etc/haproxy/blocked_ips.lst
+    http-request deny if blocked_ips
+```
+
+### 26.2 速率限制
+
+```text
+# 请求速率限制
+frontend http-in
+    # 定义stick-table
+    stick-table type ip size 100k expire 30s store http_req_rate(10s)
+    
+    # 限制每秒请求数
+    http-request track-sc0 src
+    http-request deny deny_status 429 if { http_req_rate(10s) gt 100 }
+    
+    # 连接数限制
+    stick-table type ip size 100k expire 60s store conn_cur
+    http-request track-sc1 src
+    http-request deny deny_status 429 if { conn_cur gt 50 }
+```
+
+### 26.3 安全头部配置
+
+```text
+# 安全响应头
+frontend http-in
+    # HSTS头部
+    http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    
+    # 防止点击劫持
+    http-response set-header X-Frame-Options "SAMEORIGIN"
+    
+    # 防止MIME类型嗅探
+    http-response set-header X-Content-Type-Options "nosniff"
+    
+    # XSS防护
+    http-response set-header X-XSS-Protection "1; mode=block"
+    
+    # CSP策略
+    http-response set-header Content-Security-Policy "default-src 'self'"
+```
+
+---
+
+## 二十七、性能测试与基准
+
+### 27.1 压力测试工具
+
+```bash
+# 使用wrk进行压力测试
+wrk -t12 -c400 -d30s http://haproxy:80/
+
+# 使用ab进行测试
+ab -n 10000 -c 100 http://haproxy:80/
+
+# 使用hey进行测试
+hey -n 10000 -c 100 http://haproxy:80/
+```
+
+### 27.2 性能测试结果分析
+
+| 测试场景 | 并发数 | 吞吐量(req/s) | 平均延迟(ms) | P99延迟(ms) |
+|---------|--------|---------------|--------------|-------------|
+| 静态文件 | 100 | 45,000 | 1.2 | 3.5 |
+| 动态请求 | 100 | 12,000 | 8.3 | 25.0 |
+| WebSocket | 100 | 8,000 | 12.5 | 35.0 |
+| SSL终止 | 100 | 35,000 | 1.8 | 5.0 |
+
+### 27.3 性能优化建议
+
+```text
+1. 系统层面优化
+   - 调整文件描述符限制：ulimit -n 100000
+   - 优化网络参数：net.core.somaxconn = 65535
+   - 启用TCP Fast Open：net.ipv4.tcp_fastopen = 3
+
+2. HAProxy层面优化
+   - 调整缓冲区大小：tune.bufsize 32768
+   - 启用零拷贝：option splice-request/response
+   - 优化连接池：option http-keep-alive
+
+3. 后端层面优化
+   - 使用leastconn算法
+   - 合理设置健康检查间隔
+   - 配置连接池参数
+```
+
+---
+
+## 二十八、故障恢复与容灾
+
+### 28.1 自动故障转移
+
+```text
+# Keepalived配置示例
+vrrp_script check_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight -20
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+    track_script {
+        check_haproxy
+    }
+}
+```
+
+### 28.2 数据备份与恢复
+
+```bash
+#!/bin/bash
+# haproxy-backup.sh
+
+BACKUP_DIR="/backup/haproxy"
+DATE=$(date +%Y%m%d)
+
+# 备份配置文件
+tar -czf $BACKUP_DIR/haproxy_config_$DATE.tar.gz /etc/haproxy/
+
+# 备份证书
+tar -czf $BACKUP_DIR/haproxy_certs_$DATE.tar.gz /etc/haproxy/certs/
+
+# 备份日志
+tar -czf $BACKUP_DIR/haproxy_logs_$DATE.tar.gz /var/log/haproxy/
+
+# 保留最近30天的备份
+find $BACKUP_DIR -name "*.tar.gz" -mtime +30 -delete
+```
+
+---
+
+## 二十九、扩展与集成
+
+### 29.1 与微服务集成
+
+```text
+# 服务发现配置（使用Consul）
+resolvers consul
+    nameserver consul 127.0.0.1:8600
+    resolve_retries 3
+    timeout resolve 1s
+    timeout retry 1s
+    hold other 10s
+    hold refused 10s
+    hold nx 10s
+    hold timeout 30s
+    hold valid 10s
+    hold obsolete 30s
+
+backend web_servers
+    balance roundrobin
+    option httpchk GET /healthz
+    resolver consul
+    server-template web 1-10 _http._tcp.service.consul check resolvers consul init-addr none
+```
+
+### 29.2 与监控系统集成
+
+```text
+# StatsD集成
+global
+    stats socket /var/run/haproxy.sock mode 660 level admin
+    stats timeout 30s
+
+# Prometheus exporter配置
+frontend stats
+    bind *:8404
+    stats enable
+    stats uri /metrics
+    stats refresh 10s
+```
+
+---
+
+## 三十、总结与最佳实践
+
+### 30.1 关键配置原则
+
+| 原则 | 说明 | 实施建议 |
+|------|------|---------|
+| 简单性 | 保持配置简洁 | 避免过度复杂的ACL |
+| 可维护性 | 便于理解和修改 | 使用注释和命名规范 |
+| 可观测性 | 充分的日志和监控 | 配置详细的日志格式 |
+| 安全性 | 最小权限原则 | 限制访问和速率控制 |
+| 高可用 | 故障自动恢复 | 配置健康检查和故障转移 |
+
+### 30.2 生产环境检查清单
+
+```text
+□ 配置验证
+  □ 语法检查：haproxy -c
+  □ 负载测试：压力测试通过
+  □ 安全扫描：无高危漏洞
+
+□ 监控告警
+  □ 连接数监控
+  □ 错误率监控
+  □ 后端健康监控
+  □ 性能指标监控
+
+□ 高可用
+  □ 故障转移测试
+  □ 数据备份验证
+  □ 恢复流程测试
+
+□ 文档维护
+  □ 架构文档更新
+  □ 配置变更记录
+  □ 故障处理手册
+```
+
+---
+
+## 三十一、与其他板块的关系
 
 - Envoy 对比见「[Envoy 服务代理](./Envoy服务代理.md)」；
 - Nginx 原理见「[Nginx](./Nginx.md)」；

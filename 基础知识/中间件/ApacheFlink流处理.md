@@ -1054,7 +1054,574 @@ SET table.exec维表.cache.max-rows = 10000;
 SET table.exec维表.cache.ttl = '10min';
 ```
 
-## 十六、与其他板块的关系
+---
+
+## 十六、Flink 与消息队列集成
+
+### 16.1 Kafka 集成模式
+
+```mermaid
+graph TB
+    subgraph "Source模式"
+        A[Kafka Topic] --> B[Flink Source]
+        B --> C[数据处理]
+        C --> D[Flink Sink]
+        D --> E[Kafka Topic]
+    end
+    
+    subgraph "Consumer Group"
+        F[消费者组1] --> A
+        G[消费者组2] --> A
+    end
+```
+
+### 16.2 Kafka Source 配置
+
+```java
+// Kafka Source 配置示例
+Properties properties = new Properties();
+properties.setProperty("bootstrap.servers", "localhost:9092");
+properties.setProperty("group.id", "flink-consumer");
+
+KafkaSource<String> kafkaSource = KafkaSource.<String>builder()
+    .setBootstrapServers("localhost:9092")
+    .setTopics("input-topic")
+    .setGroupId("flink-consumer")
+    .setStartingOffsets(OffsetsInitializer.latest())
+    .setValueOnlyDeserializer(new SimpleStringSchema())
+    .build();
+
+DataStream<String> stream = env.fromSource(
+    kafkaSource,
+    WatermarkStrategy.noWatermarks(),
+    "Kafka Source"
+);
+```
+
+### 16.3 Kafka Sink 配置
+
+```java
+// Kafka Sink 配置示例
+KafkaSink<String> kafkaSink = KafkaSink.<String>builder()
+    .setBootstrapServers("localhost:9092")
+    .setRecordSerializer(
+        KafkaRecordSerializationSchema.builder()
+            .setTopic("output-topic")
+            .setValueSerializationSchema(new SimpleStringSchema())
+            .build()
+    )
+    .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+    .build();
+
+stream.sinkTo(kafkaSink);
+```
+
+### 16.4 消息队列对比
+
+| 特性 | Kafka | RabbitMQ | Pulsar |
+|------|-------|----------|--------|
+| **吞吐量** | 极高 | 中等 | 高 |
+| **延迟** | 毫秒级 | 微秒级 | 毫秒级 |
+| **持久化** | 支持 | 支持 | 支持 |
+| **顺序性** | 分区有序 | 队列有序 | 分区有序 |
+| **事务** | 支持 | 不支持 | 支持 |
+| **多租户** | 不支持 | 支持 | 支持 |
+| **Flink集成** | 原生支持 | 需要适配 | 原生支持 |
+
+---
+
+## 十七、Flink 与存储系统集成
+
+### 17.1 状态后端配置
+
+```java
+// RocksDB状态后端配置
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true));
+env.getCheckpointConfig().setCheckpointStorage("hdfs:///checkpoints");
+
+// 配置RocksDB参数
+Configuration config = new Configuration();
+config.setInteger("state.backend.rocksdb.memory.managed", 1);
+config.setInteger("state.backend.rocksdb.memory.fixed-per-slot", 256);
+```
+
+### 17.2 外部系统集成模式
+
+```mermaid
+graph TB
+    subgraph "同步查询"
+        A[Flink作业] --> B[外部系统]
+        B --> C[查询结果]
+        C --> A
+    end
+    
+    subgraph "异步查询"
+        D[Flink作业] --> E[异步查询]
+        E --> F[外部系统]
+        F --> G[查询结果]
+        G --> D
+    end
+```
+
+### 17.3 数据湖集成
+
+```java
+// Iceberg Sink配置
+DataStream<Record> stream = ...;
+
+stream.sinkTo(
+    IcebergSink.forRecords(
+        table,
+        SimpleRecord::new
+    )
+    .distributionMode(DistributionMode.HASH)
+    .equalityFieldColumns(Arrays.asList("id"))
+    .build()
+);
+```
+
+---
+
+## 十八、Flink 容错与恢复
+
+### 18.1 Checkpoint机制
+
+```mermaid
+graph TB
+    subgraph "Checkpoint流程"
+        A[触发Checkpoint] --> B[屏障对齐]
+        B --> C[状态快照]
+        C --> D[持久化存储]
+        D --> E[确认完成]
+    end
+    
+    subgraph "恢复流程"
+        F[故障检测] --> G[停止作业]
+        G --> H[加载最近Checkpoint]
+        H --> I[重启作业]
+        I --> J[恢复处理]
+    end
+```
+
+### 18.2 Checkpoint配置
+
+```java
+// Checkpoint配置
+env.enableCheckpointing(60000); // 60秒
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30000);
+env.getCheckpointConfig().setCheckpointTimeout(120000);
+env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+env.getCheckpointConfig().setTolerableCheckpointFailureNumber(3);
+
+// 启用外部化Checkpoint
+env.getCheckpointConfig().setExternalizedCheckpointCleanup(
+    ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+);
+```
+
+### 18.3 状态恢复策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| **EXACTLY_ONCE** | 精确一次，保证数据一致性 | 金融、交易场景 |
+| **AT_LEAST_ONCE** | 至少一次，可能重复 | 日志、监控场景 |
+| **NO_RECOVERY** | 无恢复，从头开始 | 测试、开发环境 |
+
+---
+
+## 十九、Flink 性能调优
+
+### 19.1 资源配置
+
+```java
+// 并行度配置
+env.setParallelism(4);
+env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, 10000));
+
+// 算子链配置
+dataStream
+    .keyBy(...)
+    .window(...)
+    .reduce(...)
+    .startNewChain(); // 开始新链
+
+// 禁用算子链
+dataStream
+    .disableChaining();
+```
+
+### 19.2 网络优化
+
+```text
+# 网络缓冲区配置
+taskmanager.network.memory.fraction: 0.1
+taskmanager.network.memory.min: 64mb
+taskmanager.network.memory.max: 1gb
+
+# 网络缓冲区数量
+taskmanager.network.numberOfBuffers: 2048
+
+# 数据传输优化
+taskmanager.network.segment-size: 1mb
+```
+
+### 19.3 内存管理
+
+```text
+# 内存配置
+taskmanager.memory.process.size: 4096m
+taskmanager.memory.managed.fraction: 0.4
+
+# 堆内存配置
+taskmanager.heap.size: 2048m
+
+# 堆外内存配置
+taskmanager.memory.off-heap.size: 1024m
+```
+
+### 19.4 性能优化建议
+
+| 优化项 | 配置 | 效果 |
+|--------|------|------|
+| **并行度** | 根据数据量调整 | 提高处理能力 |
+| **算子链** | 合并相邻算子 | 减少网络传输 |
+| **状态后端** | 使用RocksDB | 支持大状态 |
+| **序列化** | 使用高效序列化 | 减少内存占用 |
+| **网络缓冲** | 调整缓冲区大小 | 提高网络吞吐 |
+
+---
+
+## 二十、Flink 监控与运维
+
+### 20.1 监控指标
+
+```java
+// 自定义指标
+public class MyMetric extends Counter {
+    private long count = 0;
+    
+    @Override
+    public void inc() {
+        count++;
+        // 发送到监控系统
+        MetricGroup group = getMetricGroup();
+        group.gauge("my.counter", () -> count);
+    }
+    
+    @Override
+    public void inc(long n) {
+        count += n;
+    }
+}
+```
+
+### 20.2 Prometheus集成
+
+```yaml
+# prometheus.yml配置
+scrape_configs:
+  - job_name: 'flink'
+    static_configs:
+      - targets: ['localhost:9249']
+    metrics_path: /metrics
+```
+
+### 20.3 Grafana仪表板
+
+```text
+# 关键监控指标
+1. 作业状态：运行、失败、取消
+2. 处理延迟：端到端延迟、处理延迟
+3. 吞吐量：每秒处理记录数
+4. 资源使用：CPU、内存、网络
+5. 状态大小：状态后端大小
+6. Checkpoint：成功次数、失败次数、耗时
+```
+
+### 20.4 告警配置
+
+```yaml
+# 告警规则示例
+groups:
+  - name: flink-alerts
+    rules:
+      - alert: FlinkJobDown
+        expr: flink_jobmanager_job_uptime == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flink作业已停止"
+          
+      - alert: HighProcessingLatency
+        expr: flink_taskmanager_job_latency_avg > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "处理延迟过高"
+```
+
+---
+
+## 二十一、Flink SQL 最佳实践
+
+### 21.1 SQL优化技巧
+
+```sql
+-- 1. 使用提示优化查询
+SELECT /*+ USE_INDEX(table1, idx1) */
+    user_id, COUNT(*) as order_count
+FROM orders
+WHERE order_date >= '2024-01-01'
+GROUP BY user_id;
+
+-- 2. 使用窗口函数优化
+SELECT 
+    user_id,
+    SUM(amount) OVER (
+        PARTITION BY user_id 
+        ORDER BY order_time 
+        ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
+    ) as weekly_total
+FROM orders;
+
+-- 3. 使用物化视图
+CREATE MATERIALIZED VIEW mv_user_stats AS
+SELECT 
+    user_id,
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount
+FROM orders
+GROUP BY user_id;
+```
+
+### 21.2 表设计最佳实践
+
+```sql
+-- 1. 使用合适的分区键
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    order_time TIMESTAMP(3),
+    amount DECIMAL(10,2),
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'properties.bootstrap.servers' = 'localhost:9092',
+    'scan.startup.mode' = 'latest-offset',
+    'format' = 'json',
+    'partitioned-by' = '(user_id)'
+);
+
+-- 2. 使用合适的索引
+CREATE INDEX idx_user_time ON orders (user_id, order_time);
+```
+
+---
+
+## 二十二、Flink 流处理模式
+
+### 22.1 处理模式对比
+
+| 模式 | 说明 | 适用场景 | 实现方式 |
+|------|------|---------|---------|
+| **逐条处理** | 每条记录单独处理 | 简单转换 | map、flatMap |
+| **窗口处理** | 按时间或数量分组处理 | 聚合统计 | window |
+| **状态处理** | 使用状态存储中间结果 | 复杂业务逻辑 | operator state |
+| **CEP处理** | 复杂事件模式匹配 | 异常检测 | CEP库 |
+
+### 22.2 窗口类型
+
+```java
+// 滚动窗口
+dataStream.keyBy(...)
+    .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+    .sum(1);
+
+// 滑动窗口
+dataStream.keyBy(...)
+    .window(SlidingEventTimeWindows.of(Time.minutes(1), Time.seconds(30)))
+    .sum(1);
+
+// 会话窗口
+dataStream.keyBy(...)
+    .window(EventTimeSessionWindows.withGap(Time.minutes(5)))
+    .sum(1);
+
+// 全局窗口
+dataStream.keyBy(...)
+    .window(GlobalWindows.create())
+    .process(new ProcessWindowFunction<>());
+```
+
+### 22.3 水位线机制
+
+```java
+// 自定义水位线生成器
+WatermarkStrategy<Event> watermarkStrategy = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+    .withIdleness(Duration.ofMinutes(1));
+
+dataStream.assignTimestampsAndWatermarks(watermarkStrategy);
+```
+
+---
+
+## 二十三、Flink 与微服务架构
+
+### 23.1 微服务集成模式
+
+```mermaid
+graph TB
+    subgraph "微服务架构"
+        A[API网关] --> B[用户服务]
+        A --> C[订单服务]
+        A --> D[支付服务]
+    end
+    
+    subgraph "流处理层"
+        B --> E[Flink作业]
+        C --> E
+        D --> E
+        E --> F[实时分析]
+        E --> G[实时报警]
+    end
+```
+
+### 23.2 事件驱动架构
+
+```java
+// 事件驱动处理
+DataStream<Event> events = ...;
+
+events
+    .keyBy(Event::getUserId)
+    .process(new KeyedProcessFunction<String, Event, Alert>() {
+        @Override
+        public void processElement(Event event, Context ctx, Collector<Alert> out) {
+            // 处理事件
+            if (event.isSuspicious()) {
+                out.collect(new Alert("可疑活动", event));
+            }
+        }
+    });
+```
+
+---
+
+## 二十四、Flink 生产部署
+
+### 24.1 部署架构
+
+```mermaid
+graph TB
+    subgraph "YARN集群"
+        A[JobManager] --> B[TaskManager 1]
+        A --> C[TaskManager 2]
+        A --> D[TaskManager 3]
+    end
+    
+    subgraph "外部系统"
+        E[Kafka] --> A
+        F[HDFS] --> A
+        G[监控系统] --> A
+    end
+```
+
+### 24.2 部署配置
+
+```yaml
+# flink-conf.yaml配置
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+taskmanager.numberOfTaskSlots: 4
+taskmanager.memory.process.size: 4096m
+state.backend: rocksdb
+state.checkpoints.dir: hdfs:///flink/checkpoints
+state.savepoints.dir: hdfs:///flink/savepoints
+```
+
+### 24.3 运维脚本
+
+```bash
+#!/bin/bash
+# Flink运维脚本
+
+# 提交作业
+./bin/flink run \
+    -d \
+    -p 4 \
+    -c com.example.MyJob \
+    my-job.jar \
+    --input-topic orders \
+    --output-topic alerts
+
+# 查看作业状态
+./bin/flink list
+
+# 取消作业
+./bin/flink cancel <job_id>
+
+# 触发savepoint
+./bin/flink savepoint <job_id> hdfs:///flink/savepoints
+```
+
+---
+
+## 二十五、Flink 常见问题排查
+
+### 25.1 故障排查流程
+
+```mermaid
+graph TD
+    A[发现问题] --> B{检查作业状态}
+    B -->|运行中| C{检查性能}
+    B -->|失败| D{检查日志}
+    C -->|延迟高| E[检查资源]
+    C -->|吞吐低| F[检查并行度]
+    D -->|异常日志| G[分析异常]
+    D -->|超时| H[检查网络]
+    E --> I[调整资源配置]
+    F --> J[调整并行度]
+    G --> K[修复代码]
+    H --> L[调整超时配置]
+```
+
+### 25.2 常见问题及解决方案
+
+| 问题 | 可能原因 | 解决方案 |
+|------|---------|---------|
+| **Checkpoint失败** | 状态过大、超时 | 增加超时时间、优化状态 |
+| **背压** | 下游处理慢 | 增加并行度、优化代码 |
+| **数据倾斜** | Key分布不均 | 使用加盐、两阶段聚合 |
+| **连接超时** | 网络问题 | 检查网络配置 |
+| **内存溢出** | 状态过大 | 使用RocksDB、增加内存 |
+
+### 25.3 性能诊断
+
+```bash
+# 查看作业指标
+./bin/flink list -r
+
+# 查看任务管理器日志
+tail -f log/flink-*-taskmanager-*.log
+
+# 查看GC日志
+tail -f log/flink-*-taskmanager-*.gc
+
+# 监控系统资源
+top -p $(pgrep -f flink)
+```
+
+---
+
+## 二十六、与其他板块的关系
 
 - Kafka（Flink 的 Source/Sink 核心）见「[Kafka](./Kafka.md)」；
 - 实时数仓/湖仓一体见「[云上数仓与大数据生态](./云上数仓与大数据生态.md)」；

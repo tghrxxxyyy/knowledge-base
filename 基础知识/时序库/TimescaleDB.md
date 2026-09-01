@@ -2039,7 +2039,428 @@ groups:
 | 监控告警 | TimescaleDB监控 | 高 |
 | 备份策略 | 定期备份 | 高 |
 
-## 二十五、TimescaleDB监控与告警
+---
+
+## 二十五、TimescaleDB 数据建模
+
+### 25.1 Hypertable设计原则
+
+```sql
+-- 创建hypertable
+CREATE TABLE sensor_data (
+    time TIMESTAMPTZ NOT NULL,
+    device_id INTEGER,
+    temperature DOUBLE PRECISION,
+    humidity DOUBLE PRECISION,
+    battery INTEGER
+);
+
+SELECT create_hypertable('sensor_data', 'time');
+
+-- 添加分区
+SELECT add_dimension('sensor_data', 'device_id', 4);
+```
+
+### 25.2 数据模型设计
+
+```mermaid
+graph TB
+    subgraph "Hypertable设计"
+        A[时间列] --> B[设备ID列]
+        B --> C[数据列]
+        C --> D[元数据列]
+    end
+    
+    subgraph "分区策略"
+        E[时间分区] --> A
+        F[设备分区] --> B
+        G[空间分区] --> C
+    end
+```
+
+### 25.3 建模最佳实践
+
+| 设计原则 | 说明 | 优势 | 劣势 | 适用场景 |
+|---------|------|------|------|---------|
+| **时间优先** | 按时间分区 | 时间查询快 | 设备查询慢 | 时序分析 |
+| **设备优先** | 按设备分区 | 设备查询快 | 时间查询慢 | 设备监控 |
+| **混合分区** | 时间+设备 | 平衡 | 复杂 | 生产环境 |
+
+---
+
+## 二十六、TimescaleDB 查询优化
+
+### 26.1 查询性能对比
+
+| 查询类型 | TimescaleDB | PostgreSQL | InfluxDB | 说明 |
+|---------|-------------|------------|----------|------|
+| **单点查询** | 0.1ms | 0.5ms | 0.5ms | 按时间点查询 |
+| **范围查询** | 1ms | 5ms | 5ms | 按时间范围查询 |
+| **聚合查询** | 2ms | 10ms | 10ms | 聚合统计 |
+| **降采样查询** | 1ms | 20ms | 3ms | 数据降采样 |
+| **设备查询** | 5ms | 10ms | 5ms | 按设备查询 |
+
+### 26.2 查询优化技巧
+
+```sql
+-- 1. 使用时间过滤
+SELECT * FROM sensor_data 
+WHERE time > NOW() - INTERVAL '1 day';
+
+-- 2. 使用设备过滤
+SELECT * FROM sensor_data 
+WHERE device_id = 1 AND time > NOW() - INTERVAL '1 day';
+
+-- 3. 使用聚合函数
+SELECT device_id, AVG(temperature), MAX(temperature), MIN(temperature)
+FROM sensor_data
+WHERE time > NOW() - INTERVAL '1 day'
+GROUP BY device_id;
+
+-- 4. 使用降采样
+SELECT time_bucket('1 hour', time) AS bucket,
+       device_id,
+       AVG(temperature) AS avg_temp
+FROM sensor_data
+WHERE time > NOW() - INTERVAL '1 day'
+GROUP BY bucket, device_id
+ORDER BY bucket;
+```
+
+### 26.3 索引策略
+
+```sql
+-- 创建索引
+CREATE INDEX idx_device_id ON sensor_data (device_id);
+CREATE INDEX idx_time ON sensor_data (time);
+
+-- 创建复合索引
+CREATE INDEX idx_device_time ON sensor_data (device_id, time);
+
+-- 创建覆盖索引
+CREATE INDEX idx_covering ON sensor_data (device_id, time) 
+INCLUDE (temperature, humidity);
+```
+
+---
+
+## 二十七、TimescaleDB 数据导入
+
+### 27.1 数据导入方式
+
+| 方式 | 速度 | 灵活性 | 适用场景 |
+|------|------|--------|---------|
+| **SQL INSERT** | 慢 | 高 | 少量数据 |
+| **批量导入** | 中 | 中 | 中等数据量 |
+| **COPY命令** | 快 | 低 | 大量数据 |
+| **流式导入** | 快 | 高 | 实时数据 |
+
+### 27.2 批量导入示例
+
+```sql
+-- 批量插入数据
+INSERT INTO sensor_data VALUES 
+    (NOW(), 1, 25.5, 60, 85),
+    (NOW() + INTERVAL '1 second', 1, 25.6, 61, 84),
+    (NOW() + INTERVAL '2 seconds', 1, 25.7, 62, 83);
+
+-- 使用COPY命令导入
+COPY sensor_data FROM '/data/sensors.csv' WITH CSV HEADER;
+```
+
+### 27.3 流式数据导入
+
+```sql
+-- 创建流式计算
+CREATE VIEW sensor_avg_view AS
+SELECT time_bucket('1 hour', time) AS bucket,
+       device_id,
+       AVG(temperature) AS avg_temp
+FROM sensor_data
+GROUP BY bucket, device_id;
+
+-- 写入流式数据
+INSERT INTO sensor_data (time, device_id, temperature, humidity, battery)
+VALUES (NOW(), 1, 25.5, 60, 85);
+```
+
+---
+
+## 二十八、TimescaleDB 数据导出
+
+### 28.1 导出方式
+
+```sql
+-- 导出为CSV文件
+COPY sensor_data TO '/data/sensors.csv' WITH CSV HEADER;
+
+-- 导出为JSON格式
+SELECT row_to_json(sensor_data) 
+FROM sensor_data 
+WHERE time > NOW() - INTERVAL '1 day' 
+INTO OUTFILE '/data/sensors.json';
+
+-- 导出为Parquet格式
+-- 使用pg_parquet扩展
+COPY sensor_data TO '/data/sensors.parquet' WITH PARQUET;
+```
+
+### 28.2 导出策略
+
+| 策略 | 说明 | 优势 | 劣势 | 适用场景 |
+|------|------|------|------|---------|
+| **全量导出** | 导出所有数据 | 简单 | 数据量大 | 备份 |
+| **增量导出** | 只导出新增数据 | 高效 | 复杂 | 同步 |
+| **定时导出** | 定时自动导出 | 自动化 | 资源消耗 | 定期备份 |
+
+---
+
+## 二十九、TimescaleDB 高可用
+
+### 29.1 集群架构
+
+```mermaid
+graph TB
+    subgraph "TimescaleDB集群"
+        A[主节点] --> B[从节点1]
+        A --> C[从节点2]
+        B --> C
+    end
+    
+    subgraph "数据分布"
+        D[分片1] --> A
+        E[分片2] --> B
+        F[分片3] --> C
+    end
+    
+    subgraph "客户端"
+        G[应用1] --> A
+        H[应用2] --> B
+        I[应用3] --> C
+    end
+```
+
+### 29.2 数据副本
+
+```sql
+-- 创建带副本的表
+CREATE TABLE sensor_data (
+    time TIMESTAMPTZ NOT NULL,
+    device_id INTEGER,
+    temperature DOUBLE PRECISION,
+    PRIMARY KEY (time, device_id)
+) WITH (
+    REPLICATION = 3,
+    TIMESCALEDB_REPLICATION_FACTOR = 3
+);
+```
+
+### 29.3 故障转移
+
+```text
+故障检测：
+  - 心跳检测
+  - 超时检测
+  - 异常检测
+
+故障转移：
+  - 自动故障转移
+  - 手动故障转移
+  - 数据恢复
+
+故障恢复：
+  - 节点恢复
+  - 数据同步
+  - 集群均衡
+```
+
+---
+
+## 三十、TimescaleDB 安全管理
+
+### 30.1 用户权限管理
+
+```sql
+-- 创建用户
+CREATE USER reader WITH PASSWORD 'password123';
+
+-- 授权
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader;
+GRANT INSERT ON sensor_data TO writer;
+
+-- 撤销权限
+REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM reader;
+
+-- 查看权限
+SELECT grantee, privilege_type 
+FROM information_schema.role_table_grants 
+WHERE table_name = 'sensor_data';
+```
+
+### 30.2 数据加密
+
+```sql
+-- 创建加密表
+CREATE TABLE sensor_data (
+    time TIMESTAMPTZ NOT NULL,
+    device_id INTEGER,
+    temperature DOUBLE PRECISION,
+    PRIMARY KEY (time, device_id)
+) WITH (
+    ENCRYPTION = 'AES256',
+    ENCRYPTION_KEY = 'my_secret_key'
+);
+
+-- 数据传输加密
+-- 使用SSL/TLS连接
+psql -h server -p 5432 -U user -d db --sslmode=require
+```
+
+---
+
+## 三十一、TimescaleDB 监控运维
+
+### 31.1 监控指标
+
+| 指标类别 | 指标名称 | 说明 | 告警阈值 |
+|---------|----------|------|---------|
+| **连接数** | client_connections | 客户端连接数 | >1000 |
+| **查询数** | query_count | 查询数量 | >10000 |
+| **写入数** | insert_count | 写入数量 | >100000 |
+| **存储** | data_nodes | 数据节点数 | <3 |
+| **内存** | memory_usage | 内存使用率 | >80% |
+
+### 31.2 性能监控
+
+```sql
+-- 查看hypertable信息
+SELECT * FROM timescaledb_information.hypertables;
+
+-- 查看chunk信息
+SELECT * FROM timescaledb_information.chunks;
+
+-- 查看压缩状态
+SELECT * FROM timescaledb_information.compression_stats;
+
+-- 查看连续聚合
+SELECT * FROM timescaledb_information.continuous_aggregates;
+```
+
+### 31.3 日常运维
+
+```bash
+# 启动TimescaleDB
+systemctl start timescaledb
+
+# 停止TimescaleDB
+systemctl stop timescaledb
+
+# 查看日志
+tail -f /var/log/postgresql/timescaledb.log
+
+# 备份数据库
+pg_dump -h server -U user -d db > backup.sql
+
+# 恢复数据库
+psql -h server -U user -d db < backup.sql
+```
+
+---
+
+## 三十二、TimescaleDB 与 IoT 平台
+
+### 32.1 IoT数据架构
+
+```mermaid
+graph LR
+    A[设备] --> B[网关]
+    B --> C[MQTT Broker]
+    C --> D[数据处理]
+    D --> E[TimescaleDB]
+    E --> F[监控平台]
+    E --> G[分析平台]
+```
+
+### 32.2 实时数据处理
+
+```sql
+-- 创建实时计算视图
+CREATE VIEW real_time_view AS
+SELECT time_bucket('1 minute', time) AS bucket,
+       device_id,
+       AVG(temperature) AS avg_temp,
+       MAX(temperature) AS max_temp,
+       MIN(temperature) AS min_temp
+FROM sensor_data
+WHERE time > NOW() - INTERVAL '1 hour'
+GROUP BY bucket, device_id;
+
+-- 创建告警视图
+CREATE VIEW alert_view AS
+SELECT *
+FROM sensor_data
+WHERE temperature > 50 AND time > NOW() - INTERVAL '1 hour';
+```
+
+---
+
+## 三十三、TimescaleDB 最佳实践
+
+### 33.1 生产环境配置清单
+
+```text
+□ 硬件配置
+  □ CPU：8核以上
+  □ 内存：32GB以上
+  □ 磁盘：SSD 1TB以上
+  □ 网络：千兆网卡
+
+□ 软件配置
+  □ 操作系统：CentOS 7+ / Ubuntu 18+
+  □ PostgreSQL版本：12+
+  □ TimescaleDB版本：2.0+
+  □ 文件系统：ext4/xfs
+
+□ TimescaleDB配置
+  □ Hypertable配置
+  □ 分区配置
+  □ 压缩配置
+  □ 连续聚合配置
+
+□ 监控配置
+  □ 系统监控
+  □ 应用监控
+  □ 告警配置
+  □ 日志配置
+```
+
+### 33.2 性能优化建议
+
+```text
+数据模型优化：
+  - 合理设计hypertable
+  - 选择合适的时间粒度
+  - 创建合适的索引
+
+查询优化：
+  - 使用时间过滤
+  - 避免全表扫描
+  - 使用连续聚合
+
+写入优化：
+  - 批量写入
+  - 合理设置缓冲
+  - 避免频繁写入
+
+存储优化：
+  - 启用压缩
+  - 设置保留策略
+  - 定期清理数据
+```
+
+---
+
+## 三十四、TimescaleDB 监控与告警
 
 ### 25.1 监控指标
 

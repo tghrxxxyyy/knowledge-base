@@ -1291,7 +1291,441 @@ Lindorm 搜索引擎（Lindorm Search）：
 | 数据保留 | 自动过期清理旧数据 | 按需 |
 | 资源弹性 | 闲时缩容，忙时扩容 | 30-50% |
 
-## 与其他板块的关系
+---
+
+## 九、Lindorm 数据建模
+
+### 9.1 数据模型设计
+
+```sql
+-- 宽表模型
+CREATE TABLE sensor_data (
+    device_id VARCHAR(32),
+    ts BIGINT,
+    temperature FLOAT,
+    humidity FLOAT,
+    battery INT,
+    location VARCHAR(64),
+    PRIMARY KEY (device_id, ts)
+);
+
+-- 窄表模型
+CREATE TABLE sensor_temperature (
+    device_id VARCHAR(32),
+    ts BIGINT,
+    value FLOAT,
+    PRIMARY KEY (device_id, ts)
+);
+
+CREATE TABLE sensor_humidity (
+    device_id VARCHAR(32),
+    ts BIGINT,
+    value FLOAT,
+    PRIMARY KEY (device_id, ts)
+);
+```
+
+### 9.2 数据模型对比
+
+| 模型 | 说明 | 优势 | 劣势 | 适用场景 |
+|------|------|------|------|---------|
+| **宽表模型** | 所有字段一张表 | 查询简单 | 写入复杂 | 读多写少 |
+| **窄表模型** | 每个指标一张表 | 写入简单 | 查询复杂 | 写多读少 |
+| **混合模型** | 宽表+窄表 | 平衡 | 中等 | 生产环境 |
+
+### 9.3 建模最佳实践
+
+```sql
+-- 1. 合理设计主键
+PRIMARY KEY (device_id, ts)
+
+-- 2. 使用合适的数据类型
+device_id VARCHAR(32)  -- 固定长度
+ts BIGINT              -- 时间戳
+temperature FLOAT      -- 浮点数
+battery INT            -- 整数
+
+-- 3. 创建索引
+CREATE INDEX idx_device_id ON sensor_data (device_id);
+CREATE INDEX idx_ts ON sensor_data (ts);
+```
+
+---
+
+## 十、Lindorm 查询优化
+
+### 10.1 查询性能对比
+
+| 查询类型 | Lindorm | HBase | Cassandra | 说明 |
+|---------|---------|-------|-----------|------|
+| **单点查询** | 1ms | 2ms | 2ms | 按主键查询 |
+| **范围查询** | 5ms | 10ms | 10ms | 按时间范围 |
+| **聚合查询** | 10ms | 50ms | 50ms | 聚合统计 |
+| **全文搜索** | 10ms | N/A | N/A | 文本搜索 |
+| **时序查询** | 5ms | 20ms | 20ms | 时序数据 |
+
+### 10.2 查询优化技巧
+
+```sql
+-- 1. 使用主键查询
+SELECT * FROM sensor_data 
+WHERE device_id = 'device_001' AND ts > 1704067200000;
+
+-- 2. 使用索引查询
+SELECT * FROM sensor_data 
+WHERE device_id = 'device_001' AND ts > 1704067200000;
+
+-- 3. 使用聚合函数
+SELECT device_id, AVG(temperature), MAX(temperature), MIN(temperature)
+FROM sensor_data
+WHERE ts > 1704067200000
+GROUP BY device_id;
+
+-- 4. 使用降采样
+SELECT device_id, AVG(temperature)
+FROM sensor_data
+WHERE ts > 1704067200000
+GROUP BY device_id, ts/3600000;
+```
+
+### 10.3 索引策略
+
+```sql
+-- 创建二级索引
+CREATE INDEX idx_location ON sensor_data (location);
+
+-- 创建复合索引
+CREATE INDEX idx_device_time ON sensor_data (device_id, ts);
+
+-- 创建全文索引
+CREATE FULLTEXT INDEX idx_message ON sensor_data (message);
+```
+
+---
+
+## 十一、Lindorm 数据导入
+
+### 11.1 数据导入方式
+
+| 方式 | 速度 | 灵活性 | 适用场景 |
+|------|------|--------|---------|
+| **SQL INSERT** | 慢 | 高 | 少量数据 |
+| **批量导入** | 中 | 中 | 中等数据量 |
+| **文件导入** | 快 | 低 | 大量数据 |
+| **流式导入** | 快 | 高 | 实时数据 |
+
+### 11.2 批量导入示例
+
+```sql
+-- 批量插入数据
+INSERT INTO sensor_data VALUES 
+    ('device_001', 1704067200000, 25.5, 60, 85, '北京'),
+    ('device_001', 1704067201000, 25.6, 61, 84, '北京'),
+    ('device_001', 1704067202000, 25.7, 62, 83, '北京');
+
+-- 从文件导入
+LOAD DATA INFILE '/data/sensors.csv' 
+INTO TABLE sensor_data 
+FIELDS TERMINATED BY ',' 
+LINES TERMINATED BY '\n';
+```
+
+### 11.3 流式数据导入
+
+```sql
+-- 创建流式计算
+CREATE STREAM sensor_avg_stream AS
+SELECT device_id, AVG(temperature) as avg_temp
+FROM sensor_data
+GROUP BY device_id, ts/3600000;
+
+-- 写入流式数据
+INSERT INTO sensor_data (device_id, ts, temperature, humidity, battery, location)
+VALUES ('device_001', 1704067200000, 25.5, 60, 85, '北京');
+```
+
+---
+
+## 十二、Lindorm 数据导出
+
+### 12.1 导出方式
+
+```sql
+-- 导出为CSV文件
+SELECT * FROM sensor_data 
+WHERE ts > 1704067200000 AND ts < 1704153600000 
+INTO OUTFILE '/data/sensors.csv' 
+FIELDS TERMINATED BY ',' 
+LINES TERMINATED BY '\n';
+
+-- 导出为JSON格式
+SELECT TO_JSON(sensor_data) 
+FROM sensor_data 
+WHERE ts > 1704067200000 
+INTO OUTFILE '/data/sensors.json';
+
+-- 导出为Parquet格式
+SELECT * FROM sensor_data 
+WHERE ts > 1704067200000 
+INTO OUTFILE '/data/sensors.parquet' 
+FORMAT PARQUET;
+```
+
+### 12.2 导出策略
+
+| 策略 | 说明 | 优势 | 劣势 | 适用场景 |
+|------|------|------|------|---------|
+| **全量导出** | 导出所有数据 | 简单 | 数据量大 | 备份 |
+| **增量导出** | 只导出新增数据 | 高效 | 复杂 | 同步 |
+| **定时导出** | 定时自动导出 | 自动化 | 资源消耗 | 定期备份 |
+
+---
+
+## 十三、Lindorm 高可用
+
+### 13.1 集群架构
+
+```mermaid
+graph TB
+    subgraph "Lindorm集群"
+        A[主节点] --> B[从节点1]
+        A --> C[从节点2]
+        B --> C
+    end
+    
+    subgraph "数据分布"
+        D[分片1] --> A
+        E[分片2] --> B
+        F[分片3] --> C
+    end
+    
+    subgraph "客户端"
+        G[应用1] --> A
+        H[应用2] --> B
+        I[应用3] --> C
+    end
+```
+
+### 13.2 数据副本
+
+```sql
+-- 创建带副本的表
+CREATE TABLE sensor_data (
+    device_id VARCHAR(32),
+    ts BIGINT,
+    temperature FLOAT,
+    PRIMARY KEY (device_id, ts)
+) WITH (
+    REPLICATION = 3,
+    CONSISTENCY = 'strong'
+);
+```
+
+### 13.3 故障转移
+
+```text
+故障检测：
+  - 心跳检测
+  - 超时检测
+  - 异常检测
+
+故障转移：
+  - 自动故障转移
+  - 手动故障转移
+  - 数据恢复
+
+故障恢复：
+  - 节点恢复
+  - 数据同步
+  - 集群均衡
+```
+
+---
+
+## 十四、Lindorm 安全管理
+
+### 14.1 用户权限管理
+
+```sql
+-- 创建用户
+CREATE USER 'reader' IDENTIFIED BY 'password123';
+
+-- 授权
+GRANT SELECT ON db1.sensor_data TO 'reader';
+GRANT INSERT ON db1.sensor_data TO 'writer';
+
+-- 撤销权限
+REVOKE SELECT ON db1.sensor_data FROM 'reader';
+
+-- 查看权限
+SHOW GRANTS FOR 'reader';
+```
+
+### 14.2 数据加密
+
+```sql
+-- 创建加密表
+CREATE TABLE sensor_data (
+    device_id VARCHAR(32),
+    ts BIGINT,
+    temperature FLOAT,
+    PRIMARY KEY (device_id, ts)
+) WITH (
+    ENCRYPTION = 'AES256',
+    ENCRYPTION_KEY = 'my_secret_key'
+);
+
+-- 数据传输加密
+-- 使用SSL/TLS连接
+mysql -h server -P 3306 --ssl-ca=ca.pem --ssl-cert=client-cert.pem --ssl-key=client-key.pem
+```
+
+---
+
+## 十五、Lindorm 监控运维
+
+### 15.1 监控指标
+
+| 指标类别 | 指标名称 | 说明 | 告警阈值 |
+|---------|----------|------|---------|
+| **连接数** | client_connections | 客户端连接数 | >1000 |
+| **查询数** | query_count | 查询数量 | >10000 |
+| **写入数** | insert_count | 写入数量 | >100000 |
+| **存储** | data_nodes | 数据节点数 | <3 |
+| **内存** | memory_usage | 内存使用率 | >80% |
+
+### 15.2 性能监控
+
+```sql
+-- 查看集群状态
+SHOW NODES;
+SHOW DATABASES;
+SHOW TABLES;
+
+-- 查看查询状态
+SHOW QUERIES;
+SHOW PROCESSLIST;
+
+-- 查看系统信息
+SHOW VARIABLES;
+SHOW STATUS;
+```
+
+### 15.3 日常运维
+
+```bash
+# 启动Lindorm
+systemctl start lindorm
+
+# 停止Lindorm
+systemctl stop lindorm
+
+# 查看日志
+tail -f /var/log/lindorm/lindorm.log
+
+# 备份数据库
+lindorm-backup --database db1 --output /backup/
+
+# 恢复数据库
+lindorm-restore --database db1 --input /backup/
+```
+
+---
+
+## 十六、Lindorm 与 IoT 平台
+
+### 16.1 IoT数据架构
+
+```mermaid
+graph LR
+    A[设备] --> B[网关]
+    B --> C[MQTT Broker]
+    C --> D[数据处理]
+    D --> E[Lindorm]
+    E --> F[监控平台]
+    E --> G[分析平台]
+```
+
+### 16.2 实时数据处理
+
+```sql
+-- 创建实时计算视图
+CREATE VIEW real_time_view AS
+SELECT 
+    device_id,
+    AVG(temperature) as avg_temp,
+    MAX(temperature) as max_temp,
+    MIN(temperature) as min_temp
+FROM sensor_data
+WHERE ts > 1704067200000
+GROUP BY device_id;
+
+-- 创建告警视图
+CREATE VIEW alert_view AS
+SELECT *
+FROM sensor_data
+WHERE temperature > 50 AND ts > 1704067200000;
+```
+
+---
+
+## 十七、Lindorm 最佳实践
+
+### 17.1 生产环境配置清单
+
+```text
+□ 硬件配置
+  □ CPU：8核以上
+  □ 内存：32GB以上
+  □ 磁盘：SSD 1TB以上
+  □ 网络：千兆网卡
+
+□ 软件配置
+  □ 操作系统：CentOS 7+ / Ubuntu 18+
+  □ 内核版本：3.10+
+  □ 文件系统：ext4/xfs
+  □ 网络配置：TCP优化
+
+□ Lindorm配置
+  □ 数据库配置
+  □ 表配置
+  □ 索引配置
+  □ 复制配置
+
+□ 监控配置
+  □ 系统监控
+  □ 应用监控
+  □ 告警配置
+  □ 日志配置
+```
+
+### 17.2 性能优化建议
+
+```text
+数据模型优化：
+  - 合理设计主键
+  - 选择合适的数据类型
+  - 创建合适的索引
+
+查询优化：
+  - 使用主键查询
+  - 避免全表扫描
+  - 使用聚合函数
+
+写入优化：
+  - 批量写入
+  - 合理设置缓冲
+  - 避免频繁写入
+
+存储优化：
+  - 合理设置保留策略
+  - 使用压缩
+  - 定期清理数据
+```
+
+---
+
+## 十八、与其他板块的关系
 
 - Lindorm 与云数据库对比见「[云上数据库与缓存生态](../中间件/云上数据库与缓存生态.md)」；
 - Lindorm 与 HBase 对比见「[中间件/HBase列式存储](../中间件/HBase列式存储.md)」；

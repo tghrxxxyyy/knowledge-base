@@ -2721,7 +2721,521 @@ curl -s 'http://localhost:9090/api/v1/alerts' | jq '.data.alerts | length'
 | `--query.max-samples` | 5000000 | 10000000 | 最大样本数 |
 | `--rule.evaluation-interval` | 1m | 30s | 规则评估间隔 |
 
-## 二十三、与其他板块的关系
+---
+
+## 二十三、Prometheus 高级特性
+
+### 23.1 服务发现配置
+
+```yaml
+# 服务发现配置
+scrape_configs:
+  # Kubernetes服务发现
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      
+  # 文件服务发现
+  - job_name: 'file-sd'
+    file_sd_configs:
+      - files:
+        - '/etc/prometheus/targets/*.json'
+        refresh_interval: 5m
+      
+  # DNS服务发现
+  - job_name: 'dns-sd'
+    dns_sd_configs:
+      - names: ['_prometheus._tcp.example.com']
+        type: SRV
+        refresh_interval: 30s
+```
+
+### 23.2 服务发现模式对比
+
+| 模式 | 说明 | 优势 | 劣势 | 适用场景 |
+|------|------|------|------|---------|
+| **静态配置** | 手动配置目标 | 简单 | 不灵活 | 简单环境 |
+| **文件发现** | 从文件读取目标 | 灵活 | 需要工具 | 动态环境 |
+| **Kubernetes发现** | 从K8s API读取 | 自动化 | 复杂 | K8s环境 |
+| **DNS发现** | 从DNS记录读取 | 简单 | 依赖DNS | 传统环境 |
+| **Consul发现** | 从Consul读取 | 灵活 | 依赖Consul | 微服务 |
+
+### 23.3 服务发现流程
+
+```mermaid
+graph TB
+    subgraph "服务发现流程"
+        A[服务注册] --> B[发现源]
+        B --> C[目标列表]
+        C --> D[抓取配置]
+        D --> E[指标采集]
+    end
+    
+    subgraph "发现源"
+        F[Kubernetes API] --> B
+        G[文件系统] --> B
+        H[DNS服务器] --> B
+        I[Consul] --> B
+    end
+```
+
+---
+
+## 二十四、Prometheus 告警规则
+
+### 24.1 告警规则语法
+
+```yaml
+# 告警规则配置
+groups:
+  - name: application-alerts
+    rules:
+      # 基础告警
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "高错误率告警"
+          description: "HTTP请求错误率超过10%"
+          
+      # 预测性告警
+      - alert: DiskSpacePrediction
+        expr: predict_linear(node_filesystem_free_bytes[1h], 3600*24) < 0
+        for: 30m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "磁盘空间预测告警"
+          description: "预计24小时内磁盘空间将耗尽"
+          
+      # 异常检测告警
+      - alert: AnomalyDetected
+        expr: abs(avg_over_time(http_request_duration_seconds[1h]) - avg_over_time(http_request_duration_seconds[1d])) > 2*stddev_over_time(http_request_duration_seconds[1d])
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "异常检测告警"
+          description: "HTTP请求延迟出现异常"
+```
+
+### 24.2 告警规则最佳实践
+
+```text
+# 告警规则设计原则
+1. 明确性：告警描述清晰明确
+2. 可操作性：告警包含处理建议
+3. 分级：根据严重程度分级
+4. 抑制：避免告警风暴
+5. 升级：设置告警升级机制
+
+# 告警规则示例
+- 基础设施告警：CPU、内存、磁盘、网络
+- 应用告警：错误率、延迟、吞吐量
+- 业务告警：订单量、支付成功率
+- 安全告警：登录失败、权限异常
+```
+
+### 24.3 告警处理流程
+
+```mermaid
+graph TD
+    A[告警触发] --> B{告警级别}
+    B -->|紧急| C[立即处理]
+    B -->|重要| D[快速处理]
+    B -->|一般| E[计划处理]
+    B -->|低| F[记录处理]
+    C --> G[通知相关人员]
+    D --> G
+    E --> H[创建工单]
+    F --> I[记录日志]
+    G --> J[处理告警]
+    H --> J
+    I --> J
+    J --> K[验证结果]
+    K --> L[更新状态]
+```
+
+---
+
+## 二十五、Prometheus 数据保留
+
+### 25.1 数据保留策略
+
+```yaml
+# 数据保留配置
+storage:
+  tsdb:
+    # 按时间保留
+    retention.time: 30d
+    
+    # 按大小保留
+    retention.size: 50GB
+    
+    # WAL压缩
+    wal-compression: true
+
+# 数据清理配置
+cleanup:
+  # 自动清理过期数据
+  auto: true
+  
+  # 清理间隔
+  interval: 1h
+```
+
+### 25.2 数据保留策略对比
+
+| 策略 | 说明 | 优势 | 劣势 | 适用场景 |
+|------|------|------|------|---------|
+| **按时间保留** | 保留固定时间数据 | 简单 | 可能浪费存储 | 时间敏感 |
+| **按大小保留** | 保留固定大小数据 | 精确 | 需要计算 | 存储敏感 |
+| **混合保留** | 时间+大小 | 平衡 | 复杂 | 生产环境 |
+| **无限保留** | 保留所有数据 | 完整 | 存储压力大 | 审计需求 |
+
+### 25.3 数据归档策略
+
+```mermaid
+graph LR
+    A[热数据] --> B[温数据]
+    B --> C[冷数据]
+    C --> D[归档数据]
+    
+    subgraph "存储介质"
+        E[SSD] --> A
+        F[HDD] --> B
+        G[对象存储] --> C
+        H[磁带] --> D
+    end
+```
+
+---
+
+## 二十六、Prometheus 性能优化
+
+### 26.1 性能优化配置
+
+```yaml
+# 性能优化配置
+global:
+  # 抓取间隔
+  scrape_interval: 15s
+  
+  # 评估间隔
+  evaluation_interval: 15s
+  
+  # 查询超时
+  query_timeout: 2m
+
+# 存储优化
+storage:
+  tsdb:
+    # WAL压缩
+    wal-compression: true
+    
+    # 内存限制
+    memory_limit: 4GB
+
+# 查询优化
+query:
+  # 最大并发查询
+  max_concurrent: 20
+  
+  # 最大样本数
+  max_samples: 5000000
+```
+
+### 26.2 性能监控指标
+
+| 指标 | 说明 | 目标值 |
+|------|------|--------|
+| **prometheus_tsdb_head_series** | 活跃时间序列数 | <100万 |
+| **prometheus_tsdb_head_chunks** | 活跃数据块数 | <1000万 |
+| **prometheus_query_duration_seconds** | 查询延迟 | <1s |
+| **prometheus_rule_evaluation_duration_seconds** | 规则评估延迟 | <1s |
+
+### 26.3 性能优化建议
+
+```text
+数据模型优化：
+  - 减少高基数标签
+  - 使用标签重写
+  - 避免过多标签值
+
+抓取优化：
+  - 合理设置抓取间隔
+  - 使用抓取限制
+  - 优化抓取配置
+
+查询优化：
+  - 使用记录规则
+  - 避免复杂查询
+  - 使用查询缓存
+
+存储优化：
+  - 启用WAL压缩
+  - 合理设置保留策略
+  - 定期清理数据
+```
+
+---
+
+## 二十七、Prometheus 安全管理
+
+### 27.1 认证与授权
+
+```yaml
+# 认证配置
+global:
+  # 基本认证
+  basic_auth:
+    username: admin
+    password: secret
+    
+  # TLS认证
+  tls_config:
+    cert_file: /path/to/cert.pem
+    key_file: /path/to/key.pem
+
+# 授权配置
+authorization:
+  # RBAC配置
+  type: RBAC
+  
+  # 角色配置
+  roles:
+    - name: admin
+      permissions: ["read", "write"]
+    - name: viewer
+      permissions: ["read"]
+```
+
+### 27.2 网络安全
+
+```yaml
+# 网络安全配置
+server:
+  # 监听地址
+  listen_address: "0.0.0.0:9090"
+  
+  # TLS配置
+  tls_config:
+    cert_file: /path/to/cert.pem
+    key_file: /path/to/key.pem
+    
+  # 访问控制
+  access_control:
+    allow:
+      - "192.168.1.0/24"
+      - "10.0.0.0/8"
+    deny:
+      - "0.0.0.0/0"
+```
+
+### 27.3 数据安全
+
+```text
+# 数据安全措施
+传输安全：
+  - 使用TLS加密传输
+  - 证书验证
+  - 密钥管理
+
+存储安全：
+  - 加密存储数据
+  - 访问控制
+  - 审计日志
+
+访问安全：
+  - 用户认证
+  - 权限控制
+  - 操作审计
+```
+
+---
+
+## 二十八、Prometheus 与 Grafana 集成
+
+### 28.1 数据源配置
+
+```yaml
+# Grafana数据源配置
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+```
+
+### 28.2 仪表板设计
+
+```mermaid
+graph TB
+    subgraph "仪表板层次"
+        A[概览仪表板] --> B[详细仪表板]
+        B --> C[诊断仪表板]
+    end
+    
+    subgraph "仪表板组件"
+        D[图表] --> E[表格]
+        E --> F[统计]
+        F --> G[告警]
+    end
+```
+
+### 28.3 仪表板最佳实践
+
+```text
+# 仪表板设计原则
+1. 简洁性：避免信息过载
+2. 层次性：从概览到详细
+3. 可操作性：包含告警和操作
+4. 一致性：统一风格和格式
+5. 可维护性：便于更新和维护
+
+# 仪表板组件选择
+- 图表：趋势分析、对比分析
+- 表格：详细数据、列表信息
+- 统计：关键指标、状态信息
+- 告警：异常检测、实时告警
+```
+
+---
+
+## 二十九、Prometheus 与 Kubernetes
+
+### 29.1 Kubernetes监控架构
+
+```mermaid
+graph TB
+    subgraph "Kubernetes集群"
+        A[API Server] --> B[etcd]
+        C[Controller Manager] --> A
+        D[Scheduler] --> A
+    end
+    
+    subgraph "Prometheus监控"
+        E[Prometheus Server] --> A
+        F[Node Exporter] --> E
+        G[cAdvisor] --> E
+        H[kube-state-metrics] --> E
+    end
+    
+    subgraph "监控目标"
+        I[Pod] --> F
+        J[Node] --> F
+        K[Service] --> E
+        L[Deployment] --> H
+    end
+```
+
+### 29.2 Kubernetes监控配置
+
+```yaml
+# Kubernetes监控配置
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: prometheus
+spec:
+  replicas: 2
+  serviceAccountName: prometheus
+  resources:
+    requests:
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  serviceMonitorSelector:
+    matchLabels:
+      team: frontend
+  ruleSelector:
+    matchLabels:
+      role: prometheus-rules
+```
+
+### 29.3 Kubernetes监控指标
+
+| 指标类型 | 指标名称 | 说明 |
+|---------|----------|------|
+| **Pod指标** | pod_cpu_usage | Pod CPU使用率 |
+| **Pod指标** | pod_memory_usage | Pod内存使用率 |
+| **Node指标** | node_cpu_usage | Node CPU使用率 |
+| **Node指标** | node_memory_usage | Node内存使用率 |
+| **Service指标** | service_requests_total | Service请求总数 |
+| **Deployment指标** | deployment_replicas | Deployment副本数 |
+
+---
+
+## 三十、Prometheus 最佳实践
+
+### 30.1 生产环境配置清单
+
+```text
+□ 高可用配置
+  □ Prometheus实例数：2+
+  □ 数据复制：启用
+  □ 负载均衡：配置
+
+□ 存储配置
+  □ 存储类型：本地存储/远程存储
+  □ 数据保留：按时间/按大小
+  □ 备份策略：定期备份
+
+□ 安全配置
+  □ 认证：基本认证/TLS认证
+  □ 授权：RBAC配置
+  □ 网络安全：防火墙/ACL
+
+□ 监控配置
+  □ 自监控：监控Prometheus自身
+  □ 告警配置：关键告警规则
+  □ 仪表板配置：Grafana仪表板
+```
+
+### 30.2 性能优化建议
+
+```text
+数据模型优化：
+  - 减少高基数标签
+  - 使用标签重写
+  - 避免过多标签值
+
+抓取优化：
+  - 合理设置抓取间隔
+  - 使用抓取限制
+  - 优化抓取配置
+
+查询优化：
+  - 使用记录规则
+  - 避免复杂查询
+  - 使用查询缓存
+
+存储优化：
+  - 启用WAL压缩
+  - 合理设置保留策略
+  - 定期清理数据
+```
+
+---
+
+## 三十一、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](../中间件/云上可观测性体系.md)」；
 - 日志采集见「[日志采集与传输](../中间件/日志采集与传输.md)」；

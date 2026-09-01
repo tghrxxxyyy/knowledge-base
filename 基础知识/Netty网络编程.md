@@ -2148,7 +2148,408 @@ b.group(bossGroup, workerGroup)
 
 ---
 
-## 二十、与其他板块的关系
+---
+
+## 二十、Netty 高级特性
+
+### 20.1 零拷贝机制
+
+```java
+// 零拷贝文件传输
+FileRegion region = new DefaultFileRegion(
+    fileChannel, 0, fileChannel.size()
+);
+channel.writeAndFlush(region);
+
+// 组合Buffer零拷贝
+CompositeByteBuf compositeBuf = Unpooled.compositeBuffer();
+compositeBuf.addComponent(true, buf1);
+compositeBuf.addComponent(true, buf2);
+
+// Slice零拷贝
+ByteBuf slice = buf.slice(0, 100);
+```
+
+### 20.2 内存池管理
+
+```java
+// PooledByteBufAllocator配置
+EventLoopGroup group = new NioEventLoopGroup();
+ServerBootstrap bootstrap = new ServerBootstrap();
+bootstrap.group(group)
+    .channel(NioServerSocketChannel.java)
+    .childOption(ChannelOption.ALLOCATOR, 
+        PooledByteBufAllocator.DEFAULT)
+    .childOption(ChannelOption.RCVBUF_ALLOCATOR, 
+        new AdaptiveRecvByteBufAllocator(128, 1024, 65536));
+
+// 内存池监控
+PooledByteBufAllocator allocator = (PooledByteBufAllocator) channel.alloc();
+PoolArenaMetric arenaMetric = allocator.metric();
+```
+
+### 20.3 零拷贝性能对比
+
+| 拷贝方式 | CPU拷贝次数 | 上下文切换 | 内存占用 | 适用场景 |
+|---------|------------|-----------|---------|---------|
+| 传统拷贝 | 4次 | 4次 | 高 | 小文件传输 |
+| mmap | 3次 | 4次 | 中 | 小文件随机读 |
+| sendfile | 2次 | 2次 | 低 | 大文件传输 |
+| Netty零拷贝 | 0次 | 2次 | 最低 | 大文件传输 |
+
+---
+
+## 二十一、Netty 线程模型
+
+### 21.1 Reactor模式详解
+
+```mermaid
+graph TB
+    subgraph "单Reactor单线程"
+        A[Reactor线程] --> B[处理事件]
+        B --> C[执行Handler]
+    end
+    
+    subgraph "单Reactor多线程"
+        D[Reactor线程] --> E[事件分发]
+        E --> F[Worker线程池]
+        F --> G[执行Handler]
+    end
+    
+    subgraph "主从Reactor多线程"
+        H[Main Reactor] --> I[Accept连接]
+        I --> J[Sub Reactor]
+        J --> K[Worker线程池]
+        K --> L[执行Handler]
+    end
+```
+
+### 21.2 线程模型配置
+
+```java
+// 主从Reactor模型
+EventLoopGroup bossGroup = new NioEventLoopGroup(1);
+EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+ServerBootstrap bootstrap = new ServerBootstrap();
+bootstrap.group(bossGroup, workerGroup)
+    .channel(NioServerSocketChannel.class)
+    .option(ChannelOption.SO_BACKLOG, 1024)
+    .childOption(ChannelOption.TCP_NODELAY, true)
+    .childOption(ChannelOption.SO_KEEPALIVE, true)
+    .childHandler(new ChannelInitializer<SocketChannel>() {
+        @Override
+        protected void initChannel(SocketChannel ch) {
+            ch.pipeline().addLast(new MyHandler());
+        }
+    });
+```
+
+### 21.3 线程模型对比
+
+| 模型 | 优势 | 劣势 | 适用场景 |
+|------|------|------|---------|
+| **单线程** | 简单、无锁 | 性能低、阻塞 | 简单应用 |
+| **多线程** | 并发高 | 复杂、锁竞争 | 一般应用 |
+| **主从多线程** | 高并发、高可用 | 复杂、资源多 | 生产环境 |
+
+---
+
+## 二十二、Netty 心跳机制
+
+### 22.1 心跳检测配置
+
+```java
+// 心跳检测处理器
+public class HeartbeatHandler extends ChannelInboundHandlerAdapter {
+    private static final int READ_IDLE_TIME = 60;
+    private static final int WRITE_IDLE_TIME = 30;
+    private static final int ALL_IDLE_TIME = 90;
+    
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+        if (evt instanceof IdleStateEvent) {
+            IdleStateEvent event = (IdleStateEvent) evt;
+            switch (event.state()) {
+                case READER_IDLE:
+                    // 读空闲，关闭连接
+                    ctx.close();
+                    break;
+                case WRITER_IDLE:
+                    // 写空闲，发送心跳
+                    ctx.writeAndFlush(new HeartbeatMessage());
+                    break;
+                case ALL_IDLE:
+                    // 全空闲，发送心跳
+                    ctx.writeAndFlush(new HeartbeatMessage());
+                    break;
+            }
+        }
+    }
+}
+
+// 配置心跳检测
+bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+    @Override
+    protected void initChannel(SocketChannel ch) {
+        ch.pipeline()
+            .addLast(new IdleStateHandler(60, 30, 90))
+            .addLast(new HeartbeatHandler());
+    }
+});
+```
+
+### 22.2 心跳策略
+
+| 策略 | 检测间隔 | 超时时间 | 适用场景 |
+|------|---------|---------|---------|
+| **固定间隔** | 30秒 | 90秒 | 一般应用 |
+| **自适应** | 动态调整 | 动态调整 | 移动应用 |
+| **指数退避** | 递增 | 递增 | 弱网环境 |
+
+---
+
+## 二十三、Netty 序列化
+
+### 23.1 序列化方案对比
+
+| 方案 | 优势 | 劣势 | 适用场景 |
+|------|------|------|---------|
+| **JDK序列化** | 简单 | 性能低、体积大 | 测试环境 |
+| **Protobuf** | 高效、跨语言 | 需要定义proto | 生产环境 |
+| **Kryo** | 高速、紧凑 | 不跨语言 | Java环境 |
+| **MessagePack** | 跨语言、紧凑 | 复杂结构支持弱 | 简单协议 |
+| **Avro** | 跨语言、Schema演化 | 需要定义Schema | 大数据 |
+
+### 23.2 Protobuf集成示例
+
+```java
+// 定义Proto文件
+// message.proto
+syntax = "proto3";
+package com.example;
+option java_package = "com.example.proto";
+option java_outer_classname = "MessageProto";
+
+message Request {
+    string id = 1;
+    string type = 2;
+    bytes data = 3;
+}
+
+message Response {
+    string id = 1;
+    int32 code = 2;
+    string message = 3;
+    bytes data = 4;
+}
+
+// Protobuf编码器
+public class ProtobufEncoder extends MessageToByteEncoder<MessageLite> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, MessageLite msg, ByteBuf out) throws Exception {
+        byte[] bytes = msg.toByteArray();
+        out.writeInt(bytes.length);
+        out.writeBytes(bytes);
+    }
+}
+
+// Protobuf解码器
+public class ProtobufDecoder extends ReplayingDecoder<Void> {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        int length = in.readInt();
+        byte[] bytes = new byte[length];
+        in.readBytes(bytes);
+        out.add(Request.parseFrom(bytes));
+    }
+}
+```
+
+---
+
+## 二十四、Netty 黏包与拆包
+
+### 24.1 黏包拆包原因
+
+```text
+1. TCP是流式协议，没有消息边界
+2. 发送端发送数据时，可能合并多个包
+3. 接收端读取数据时，可能读取多个包
+4. 网络缓冲区大小影响
+```
+
+### 24.2 解决方案对比
+
+| 方案 | 说明 | 优势 | 劣势 |
+|------|------|------|------|
+| **固定长度** | 每个消息固定长度 | 简单 | 浪费带宽 |
+| **分隔符** | 使用特殊字符分隔 | 灵活 | 需要转义 |
+| **长度字段** | 消息头包含长度 | 高效 | 需要协议设计 |
+| **固定协议** | 使用标准协议 | 可靠 | 复杂 |
+
+### 24.3 LengthFieldBasedFrameDecoder配置
+
+```java
+// 长度字段解码器
+bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+    @Override
+    protected void initChannel(SocketChannel ch) {
+        ch.pipeline()
+            .addLast(new LengthFieldBasedFrameDecoder(
+                1024,    // 最大帧长度
+                0,       // 长度字段偏移
+                4,       // 长度字段长度
+                0,       // 长度调整值
+                4        // 初始剥离长度
+            ))
+            .addLast(new MyDecoder())
+            .addLast(new MyEncoder())
+            .addLast(new MyHandler());
+    }
+});
+```
+
+---
+
+## 二十五、Netty 与微服务
+
+### 25.1 微服务通信模式
+
+```mermaid
+graph TB
+    subgraph "同步通信"
+        A[服务A] --> B[HTTP/REST]
+        B --> C[服务B]
+        A --> D[gRPC]
+        D --> E[服务C]
+    end
+    
+    subgraph "异步通信"
+        F[服务D] --> G[消息队列]
+        G --> H[服务E]
+        I[服务F] --> G
+    end
+```
+
+### 25.2 gRPC与Netty集成
+
+```java
+// gRPC服务器配置
+Server server = ServerBuilder.forPort(8080)
+    .addService(new MyServiceImpl())
+    .executor(Executors.newFixedThreadPool(10))
+    .build();
+
+// Netty传输层
+ServerBuilder.forPort(8080)
+    .channelType(new NioServerSocketChannelFactory())
+    .addService(new MyServiceImpl())
+    .build();
+```
+
+---
+
+## 二十六、Netty 最佳实践
+
+### 26.1 配置最佳实践
+
+```text
+# 服务器配置
+- 设置合理的backlog大小
+- 启用TCP_NODELAY
+- 启用SO_KEEPALIVE
+- 设置合理的缓冲区大小
+- 使用堆外内存
+
+# 客户端配置
+- 设置连接超时时间
+- 设置读写超时时间
+- 启用心跳检测
+- 配置重试策略
+- 使用连接池
+
+# Handler配置
+- 避免阻塞操作
+- 使用异步处理
+- 合理使用线程池
+- 及时释放资源
+```
+
+### 26.2 性能优化建议
+
+```java
+// 1. 使用CompositeByteBuf减少内存拷贝
+CompositeByteBuf compositeBuf = Unpooled.compositeBuffer();
+compositeBuf.addComponent(true, buf1);
+compositeBuf.addComponent(true, buf2);
+
+// 2. 使用PooledByteBufAllocator
+childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
+
+// 3. 使用DirectBuffer
+ByteBuf buf = Unpooled.directBuffer(1024);
+
+// 4. 零拷贝文件传输
+FileRegion region = new DefaultFileRegion(fileChannel, 0, fileChannel.size());
+channel.writeAndFlush(region);
+```
+
+---
+
+## 二十七、Netty 监控与运维
+
+### 27.1 监控指标
+
+```java
+// Netty指标收集
+public class NettyMetrics {
+    private final ChannelGroup channels = new DefaultChannelGroup(
+        GlobalEventExecutor.INSTANCE
+    );
+    
+    public void channelActive(ChannelHandlerContext ctx) {
+        channels.add(ctx.channel());
+    }
+    
+    public void channelInactive(ChannelHandlerContext ctx) {
+        // 移除关闭的channel
+    }
+    
+    public Map<String, Object> getMetrics() {
+        Map<String, Object> metrics = new HashMap<>();
+        metrics.put("active_channels", channels.size());
+        return metrics;
+    }
+}
+```
+
+### 27.2 性能监控
+
+```yaml
+# 监控配置
+monitoring:
+  metrics:
+    - name: netty_active_connections
+      type: gauge
+      help: "活跃连接数"
+    - name: netty_bytes_read
+      type: counter
+      help: "读取字节数"
+    - name: netty_bytes_written
+      type: counter
+      help: "写入字节数"
+    - name: netty_messages_read
+      type: counter
+      help: "读取消息数"
+    - name: netty_messages_written
+      type: counter
+      help: "写入消息数"
+```
+
+---
+
+## 二十八、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；
 - Reactor 模式见「[并发编程](../基础知识/并发编程.md)」；

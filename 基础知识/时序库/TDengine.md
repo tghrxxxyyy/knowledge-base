@@ -2180,7 +2180,420 @@ auditLog: /var/log/taos/audit.log
 | buffer | 128 | 256 | 写入缓冲大小 |
 | cache | 16 | 32 | 查询缓存大小 |
 
-## 九、与其他板块的关系
+---
+
+## 九、TDengine 数据建模
+
+### 9.1 超级表设计原则
+
+```sql
+-- 设备数据建模
+CREATE STABLE sensors (
+    ts TIMESTAMP,
+    temperature FLOAT,
+    humidity FLOAT,
+    battery INT
+) TAGS (
+    device_id NCHAR(32),
+    location NCHAR(64),
+    model NCHAR(32)
+);
+
+-- 创建子表
+CREATE TABLE sensor_001 USING sensors TAGS ('device_001', '北京', 'DHT22');
+CREATE TABLE sensor_002 USING sensors TAGS ('device_002', '上海', 'DHT22');
+```
+
+### 9.2 数据模型设计
+
+```mermaid
+graph TB
+    subgraph "设备数据模型"
+        A[设备表] --> B[温度数据]
+        A --> C[湿度数据]
+        A --> D[电池数据]
+    end
+    
+    subgraph "关系模型"
+        E[设备信息表] --> A
+        F[位置信息表] --> A
+        G[设备类型表] --> A
+    end
+```
+
+### 9.3 建模最佳实践
+
+| 建模方式 | 说明 | 优势 | 劣势 | 适用场景 |
+|---------|------|------|------|---------|
+| **单表模型** | 所有设备一张表 | 简单 | 查询复杂 | 简单场景 |
+| **多表模型** | 每种设备一张表 | 灵活 | 管理复杂 | 复杂场景 |
+| **混合模型** | 超级表+子表 | 平衡 | 中等 | 生产环境 |
+
+---
+
+## 十、TDengine 查询优化
+
+### 10.1 查询性能对比
+
+| 查询类型 | TDengine | InfluxDB | PostgreSQL | 说明 |
+|---------|----------|----------|------------|------|
+| **单点查询** | 0.1ms | 0.5ms | 1ms | 按时间点查询 |
+| **范围查询** | 1ms | 5ms | 20ms | 按时间范围查询 |
+| **聚合查询** | 2ms | 10ms | 50ms | 聚合统计 |
+| **降采样查询** | 1ms | 3ms | 30ms | 数据降采样 |
+| **多设备查询** | 5ms | 20ms | 100ms | 跨设备查询 |
+
+### 10.2 查询优化技巧
+
+```sql
+-- 1. 使用时间过滤
+SELECT * FROM sensors WHERE ts > '2024-01-01' AND ts < '2024-01-02';
+
+-- 2. 使用设备过滤
+SELECT * FROM sensors WHERE device_id = 'device_001';
+
+-- 3. 使用聚合函数
+SELECT device_id, AVG(temperature) 
+FROM sensors 
+WHERE ts > '2024-01-01' 
+GROUP BY device_id;
+
+-- 4. 使用降采样
+SELECT device_id, AVG(temperature) 
+FROM sensors 
+WHERE ts > '2024-01-01' 
+INTERVAL(1h) 
+GROUP BY device_id;
+```
+
+### 10.3 索引策略
+
+```sql
+-- 创建索引
+CREATE INDEX idx_device_id ON sensors (device_id);
+CREATE INDEX idx_location ON sensors (location);
+
+-- 复合索引
+CREATE INDEX idx_device_time ON sensors (device_id, ts);
+```
+
+---
+
+## 十一、TDengine 数据导入
+
+### 11.1 数据导入方式
+
+| 方式 | 速度 | 灵活性 | 适用场景 |
+|------|------|--------|---------|
+| **SQL INSERT** | 慢 | 高 | 少量数据 |
+| **批量插入** | 中 | 中 | 中等数据量 |
+| **文件导入** | 快 | 低 | 大量数据 |
+| **流式导入** | 快 | 高 | 实时数据 |
+
+### 11.2 批量插入示例
+
+```sql
+-- 批量插入数据
+INSERT INTO sensor_001 VALUES 
+    (NOW, 25.5, 60, 85),
+    (NOW + 1s, 25.6, 61, 84),
+    (NOW + 2s, 25.7, 62, 83);
+
+-- 从文件导入
+IMPORT INTO sensors FROM '/data/sensors.csv';
+```
+
+### 11.3 流式数据导入
+
+```sql
+-- 创建流式计算
+CREATE STREAM sensor_avg_stream AS
+SELECT device_id, AVG(temperature) as avg_temp
+FROM sensors
+INTERVAL(1h)
+GROUP BY device_id;
+
+-- 写入流式数据
+INSERT INTO sensors (ts, device_id, temperature, humidity)
+VALUES (NOW, 'device_001', 25.5, 60);
+```
+
+---
+
+## 十二、TDengine 数据导出
+
+### 12.1 导出方式
+
+```sql
+-- 导出为CSV文件
+SELECT * FROM sensors 
+WHERE ts > '2024-01-01' AND ts < '2024-01-02' 
+INTO OUTFILE '/data/sensors.csv';
+
+-- 导出为JSON格式
+SELECT TO_JSON(sensors) 
+FROM sensors 
+WHERE ts > '2024-01-01' 
+INTO OUTFILE '/data/sensors.json';
+
+-- 导出为InfluxDB Line Protocol
+SELECT TO_ILP(sensors) 
+FROM sensors 
+WHERE ts > '2024-01-01' 
+INTO OUTFILE '/data/sensors.ilp';
+```
+
+### 12.2 导出策略
+
+| 策略 | 说明 | 优势 | 劣势 | 适用场景 |
+|------|------|------|------|---------|
+| **全量导出** | 导出所有数据 | 简单 | 数据量大 | 备份 |
+| **增量导出** | 只导出新增数据 | 高效 | 复杂 | 同步 |
+| **定时导出** | 定时自动导出 | 自动化 | 资源消耗 | 定期备份 |
+
+---
+
+## 十三、TDengine 高可用
+
+### 13.1 集群架构
+
+```mermaid
+graph TB
+    subgraph "TDengine集群"
+        A[节点1] --> B[节点2]
+        B --> C[节点3]
+        A --> C
+    end
+    
+    subgraph "数据分布"
+        D[VNode1] --> A
+        E[VNode2] --> B
+        F[VNode3] --> C
+    end
+    
+    subgraph "客户端"
+        G[应用1] --> A
+        H[应用2] --> B
+        I[应用3] --> C
+    end
+```
+
+### 13.2 数据副本
+
+```sql
+-- 创建带副本的数据库
+CREATE DATABASE replica3 
+    KEEP 365 
+    DURATION 30 
+    BUFFER 256 
+    CACHEMODEL 'both'
+    REPLICA 3;
+
+-- 创建带副本的表
+CREATE TABLE sensor_001 USING sensors TAGS ('device_001', '北京', 'DHT22')
+    REPLICA 3;
+```
+
+### 13.3 故障转移
+
+```text
+故障检测：
+  - 心跳检测
+  - 超时检测
+  - 异常检测
+
+故障转移：
+  - 自动故障转移
+  - 手动故障转移
+  - 数据恢复
+
+故障恢复：
+  - 节点恢复
+  - 数据同步
+  - 集群均衡
+```
+
+---
+
+## 十四、TDengine 安全管理
+
+### 14.1 用户权限管理
+
+```sql
+-- 创建用户
+CREATE USER 'reader' PASSWORD 'password123';
+
+-- 授权
+GRANT READ ON db1 TO 'reader';
+GRANT WRITE ON db1 TO 'writer';
+
+-- 撤销权限
+REVOKE READ ON db1 FROM 'reader';
+
+-- 查看权限
+SHOW GRANTS FOR 'reader';
+```
+
+### 14.2 数据加密
+
+```sql
+-- 创建加密数据库
+CREATE DATABASE encrypted_db
+    ENCRYPT_KEY 'my_secret_key'
+    KEEP 365;
+
+-- 数据传输加密
+-- 使用SSL/TLS连接
+taos -h server -P 6030 -S ssl -u root -p password
+```
+
+---
+
+## 十五、TDengine 监控运维
+
+### 15.1 监控指标
+
+| 指标类别 | 指标名称 | 说明 | 告警阈值 |
+|---------|----------|------|---------|
+| **连接数** | client_connections | 客户端连接数 | >1000 |
+| **查询数** | query_count | 查询数量 | >10000 |
+| **写入数** | insert_count | 写入数量 | >100000 |
+| **存储** | data_nodes | 数据节点数 | <3 |
+| **内存** | memory_usage | 内存使用率 | >80% |
+
+### 15.2 性能监控
+
+```sql
+-- 查看集群状态
+SHOW DNODES;
+SHOW DATABASES;
+SHOW TABLES;
+
+-- 查看查询状态
+SHOW QUERIES;
+SHOW STREAMS;
+
+-- 查看系统信息
+SHOW SERVER STATUS;
+SHOW VARIABLES;
+```
+
+### 15.3 日常运维
+
+```bash
+# 启动TDengine
+taosd &
+
+# 停止TDengine
+taosd -s
+
+# 查看日志
+tail -f /var/log/taos/taosd.log
+
+# 备份数据库
+taosdump -D db1 -o /backup/
+
+# 恢复数据库
+taosdump -i /backup/ -d db1
+```
+
+---
+
+## 十六、TDengine 与 IoT 平台
+
+### 16.1 IoT数据架构
+
+```mermaid
+graph LR
+    A[设备] --> B[网关]
+    B --> C[MQTT Broker]
+    C --> D[数据处理]
+    D --> E[TDengine]
+    E --> F[监控平台]
+    E --> G[分析平台]
+```
+
+### 16.2 实时数据处理
+
+```sql
+-- 创建实时计算流
+CREATE STREAM real_time_stream AS
+SELECT 
+    device_id,
+    AVG(temperature) as avg_temp,
+    MAX(temperature) as max_temp,
+    MIN(temperature) as min_temp
+FROM sensors
+INTERVAL(1h)
+GROUP BY device_id;
+
+-- 创建告警流
+CREATE STREAM alert_stream AS
+SELECT *
+FROM sensors
+WHERE temperature > 50
+INTERVAL(1h);
+```
+
+---
+
+## 十七、TDengine 最佳实践
+
+### 17.1 生产环境配置清单
+
+```text
+□ 硬件配置
+  □ CPU：8核以上
+  □ 内存：32GB以上
+  □ 磁盘：SSD 1TB以上
+  □ 网络：千兆网卡
+
+□ 软件配置
+  □ 操作系统：CentOS 7+ / Ubuntu 18+
+  □ 内核版本：3.10+
+  □ 文件系统：ext4/xfs
+  □ 网络配置：TCP优化
+
+□ TDengine配置
+  □ 数据库配置
+  □ 表配置
+  □ 索引配置
+  □ 复制配置
+
+□ 监控配置
+  □ 系统监控
+  □ 应用监控
+  □ 告警配置
+  □ 日志配置
+```
+
+### 17.2 性能优化建议
+
+```text
+数据模型优化：
+  - 使用超级表
+  - 合理设计标签
+  - 避免过多子表
+
+查询优化：
+  - 使用时间过滤
+  - 使用设备过滤
+  - 避免全表扫描
+
+写入优化：
+  - 批量写入
+  - 合理设置缓冲
+  - 避免频繁写入
+
+存储优化：
+  - 合理设置保留策略
+  - 使用压缩
+  - 定期清理数据
+```
+
+---
+
+## 十八、与其他板块的关系
 
 - 时序数据库对比见「[时序库对比](./时序库对比.md)」；
 - IoT 数据采集见「[IoT平台](../../云原生/IoT平台.md)」；
