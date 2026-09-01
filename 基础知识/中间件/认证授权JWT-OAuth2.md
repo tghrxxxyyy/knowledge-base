@@ -1999,6 +1999,124 @@ function createClientAssertion(clientId, tokenEndpoint) {
 | 是否需要 TLS | 强烈建议 | 必须 |
 | 规范要求 | OAuth 2.1 强制公开客户端使用 | 机密客户端可选 |
 
+## 二十五、JWT安全深度
+
+### 25.1 JWT攻击向量
+
+| 攻击类型 | 原理 | 防御措施 |
+|----------|------|----------|
+| 密钥泄露 | 签名密钥被获取 | 密钥轮换、硬件存储 |
+| 算法降级 | 修改header中的alg | 强制指定算法 |
+| None算法 | 设置alg为none | 禁用none算法 |
+| 注入攻击 | Payload中注入字段 | 输入验证 |
+| 重放攻击 | 复用有效Token | 短过期时间+刷新Token |
+
+### 25.2 安全配置示例
+
+```java
+// JWT安全配置
+@Configuration
+public class JwtSecurityConfig {
+    
+    @Bean
+    public JwtDecoder jwtDecoder() {
+        NimbusJwtDecoder decoder = NimbusJwtDecoder
+            .withJwkSetUri("https://auth.example.com/.well-known/jwks.json")
+            .build();
+        
+        // 强制验证签名算法
+        decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(
+            "https://auth.example.com"
+        ));
+        
+        return decoder;
+    }
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt
+                    .decoder(jwtDecoder())
+                    .jwtAuthenticationConverter(jwtAuthConverter())
+                )
+            )
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+        return http.build();
+    }
+}
+```
+
+### 25.3 Token刷新策略
+
+| 策略 | 说明 | 安全性 | 用户体验 |
+|------|------|--------|----------|
+| 固定过期 | Token固定时间过期 | 中 | 差 |
+| 滑动过期 | 使用时延长过期 | 中 | 好 |
+| 刷新Token | 短Access+长Refresh | 高 | 好 |
+| 双Token | Access+Refresh分离 | 高 | 中 |
+
+---
+
+## 二十六、OAuth2高级模式
+
+### 26.1 PKCE（Proof Key for Code Exchange）
+
+```mermaid
+sequenceDiagram
+    participant 用户
+    participant 客户端
+    participant 授权服务
+    participant 资源服务
+    用户->>客户端: 登录请求
+    客户端->>客户端: 生成code_verifier + code_challenge
+    客户端->>授权服务: /authorize?code_challenge=xxx
+    授权服务->>用户: 登录页面
+    用户->>授权服务: 提交凭证
+    授权服务->>客户端: 授权码(code)
+    客户端->>授权服务: /token?code=xxx&code_verifier=yyy
+    授权服务->>授权服务: 验证code_verifier
+    授权服务->>客户端: access_token + refresh_token
+    客户端->>资源服务: 请求资源
+```
+
+### 26.2 授权服务器配置
+
+```yaml
+# Spring Authorization Server 配置
+spring:
+  security:
+    oauth2:
+      authorizationserver:
+        issuer: https://auth.example.com
+        authorization-endpoint: /oauth2/authorize
+        token-endpoint: /oauth2/token
+        jwk-set-uri: https://auth.example.com/.well-known/jwks.json
+        supported-scopes:
+          - openid
+          - profile
+          - email
+          - api.read
+          - api.write
+        registered-clients:
+          - client-id: web-app
+            client-secret: ${CLIENT_SECRET}
+            authorization-grant-types:
+              - authorization_code
+              - refresh_token
+            redirect-uris:
+              - https://app.example.com/callback
+            scopes:
+              - openid
+              - profile
+            client-settings:
+              require-authorization-consent: true
+```
+
+---
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

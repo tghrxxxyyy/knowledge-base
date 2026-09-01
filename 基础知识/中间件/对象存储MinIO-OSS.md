@@ -782,6 +782,293 @@ MinIO Gateway = S3 协议代理（不存储数据）
   --endpoint http://namenode:8020
 ```
 
+## 十六、MinIO 高级特性详解
+
+### 16.1 多租户架构
+
+| 特性 | 说明 | 配置方式 |
+|------|------|----------|
+| 租户隔离 | 独立集群/命名空间 | Tenant 隔离 |
+| 配额管理 | 存储/请求配额 | Bucket Quota |
+| IAM 策略 | 细粒度权限控制 | Policy JSON |
+| 审计日志 | 操作记录 | Audit Logs |
+
+```json
+// 多租户 IAM 策略
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::tenant-123/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:ExistingObjectTag/tenant": "tenant-123"
+        }
+      }
+    }
+  ]
+}
+```
+
+### 16.2 数据生命周期管理
+
+```text
+生命周期规则：
+  1. 过期删除
+     - 30天后删除临时文件
+     - 90天后删除日志文件
+     - 配置：Lifecycle Rules
+
+  2. 智能分层
+     - 热数据：Standard（SSD）
+     - 温数据：Standard（HDD）
+     - 冷数据：Glacier
+     - 配置：Storage Class
+
+  3. 版本控制
+     - 保留最近5个版本
+     - 保留30天历史版本
+     - 配置：Versioning
+```
+
+### 16.3 数据加密与安全
+
+```yaml
+# MinIO 加密配置
+encryption:
+  # SSE-S3：服务端加密
+  - type: SSE-S3
+    enabled: true
+    
+  # SSE-KMS：密钥管理加密
+  - type: SSE-KMS
+    enabled: true
+    kms: aws-kms
+    
+  # SSE-C：客户提供密钥
+  - type: SSE-C
+    enabled: false
+    
+# 传输加密
+tls:
+  enabled: true
+  cert: /path/to/cert.pem
+  key: /path/to/key.pem
+```
+
+## 十七、MinIO 性能调优实战
+
+### 17.1 读写性能优化
+
+| 场景 | 优化策略 | 配置参数 | 预期提升 |
+|------|----------|----------|----------|
+| 大文件上传 | 分片上传+并发 | part-size=64MB | 3~5x |
+| 小文件上传 | 合并上传 | batch-size=100 | 5~10x |
+| 大文件下载 | 分片下载+并发 | concurrent=10 | 3~5x |
+| 随机读取 | 缓存预热 | cache-size=1GB | 2~3x |
+| 批量删除 | 并发删除 | concurrent=20 | 5~10x |
+
+### 17.2 存储层优化
+
+```bash
+# 磁盘性能测试
+fio --name=test --ioengine=libaio --iodepth=1 \
+    --rw=randwrite --bs=4k --size=1G --numjobs=4
+
+# MinIO 存储配置
+MINIO_STORAGE_CLASS_STANDARD=EC:4
+MINIO_STORAGE_CLASS_REDUCED_REDUNDANCY=EC:2
+MINIO_VOLUMES="/data{1...4}"
+```
+
+### 17.3 网络优化
+
+```text
+网络优化策略：
+  1. 带宽优化
+     - 使用万兆网卡（10Gbps）
+     - 启用 Jumbo Frame（MTU 9000）
+     - 配置：ethtool -s eth0 mtu 9000
+
+  2. 连接优化
+     - 增大 TCP 缓冲区
+     - 配置：net.core.rmem_max=16777216
+     - 配置：net.core.wmem_max=16777216
+
+  3. 负载均衡
+     - 使用 DNS 轮询
+     - 或 HAProxy/LVS
+     - 配置：多 IP 绑定
+```
+
+## 十八、MinIO 生产问题排查指南
+
+### 18.1 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 上传失败 | 磁盘空间不足 | df -h 检查 | 清理/扩容 |
+| 读取超时 | 网络延迟 | ping/iperf 测试 | 优化网络 |
+| 数据损坏 | 磁盘故障 | minio admin heal | 修复数据 |
+| 权限错误 | IAM 配置 | 检查 Policy | 修正权限 |
+| 高延迟 | 对象过多 | ls 检查 | 优化存储结构 |
+
+### 18.2 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|上传失败| C[检查磁盘空间]
+    B -->|读取超时| D[检查网络]
+    B -->|数据损坏| E[检查磁盘健康]
+    C --> F[df -h 检查]
+    D --> G[ping/iperf 测试]
+    E --> H[minio admin heal]
+    F --> I[清理/扩容]
+    G --> J[优化网络配置]
+    H --> K[修复数据]
+    I --> L[验证恢复]
+    J --> L
+    K --> L
+```
+
+### 18.3 监控关键指标
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: minio-alerts
+    rules:
+      - alert: MinIO_DiskFull
+        expr: minio_cluster_disk_free_bytes < 107374182400  # 100GB
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinIO 磁盘空间不足"
+          
+      - alert: MinIO_HighLatency
+        expr: minio_s3_request_duration_seconds > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO 请求延迟高"
+          
+      - alert: MinIO_DataCorruption
+        expr: minio_cluster_disk_heal_errors_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinIO 数据损坏"
+```
+
+## 十九、MinIO 架构设计最佳实践
+
+### 19.1 存储架构设计
+
+| 设计原则 | 说明 | 实践建议 |
+|----------|------|----------|
+| 数据分布 | 均匀分布 | 使用 erasure coding |
+| 冗余策略 | 3副本/EC | 小文件3副本，大文件EC |
+| 分层存储 | 冷热分离 | Standard/Glacier |
+| 跨域复制 | 异地容灾 | 同步/异步复制 |
+
+### 19.2 应用架构集成
+
+```text
+应用架构模式：
+  1. 直连模式
+     - 应用直连 MinIO
+     - 简单高效
+     - 适合小规模
+
+  2. 代理模式
+     - 通过 Nginx/HAProxy
+     - 负载均衡/SSL
+     - 适合大规模
+
+  3. 网关模式
+     - MinIO Gateway
+     - 兼容 S3/OSS
+     - 适合混合云
+```
+
+### 19.3 容灾架构设计
+
+```mermaid
+flowchart TD
+    A[主集群] --> B[异步复制]
+    B --> C[备集群]
+    C --> D[故障切换]
+    D --> E[流量切换]
+    E --> F[数据恢复]
+    
+    subgraph 复制策略
+        B -->|同步复制| G[零数据丢失]
+        B -->|异步复制| H[低延迟]
+    end
+```
+
+## 二十、云 OSS 对比与选型指南
+
+### 20.1 功能对比矩阵
+
+| 功能 | MinIO | AWS S3 | 阿里 OSS | 腾讯 COS |
+|------|-------|--------|----------|----------|
+| S3 兼容 | 完全 | 原生 | 部分 | 部分 |
+| 私有部署 | 支持 | 不支持 | 不支持 | 不支持 |
+| 数据加密 | 支持 | 支持 | 支持 | 支持 |
+| 生命周期 | 支持 | 支持 | 支持 | 支持 |
+| 跨域复制 | 支持 | 支持 | 支持 | 支持 |
+| 免费额度 | 无限 | 5GB/月 | 5GB/月 | 10GB/月 |
+
+### 20.2 成本对比分析
+
+```text
+成本构成：
+  1. 存储成本
+     - MinIO：硬件成本（自建）
+     - S3/OSS：按量付费
+     - 对比：大规模自建更便宜
+
+  2. 请求成本
+     - MinIO：免费
+     - S3/OSS：按请求计费
+     - 对比：高请求量自建更便宜
+
+  3. 流量成本
+     - MinIO：带宽成本
+     - S3/OSS：出流量计费
+     - 对比：出流量大自建更便宜
+```
+
+### 20.3 选型决策树
+
+```mermaid
+flowchart TD
+    A[存储需求] --> B{部署方式}
+    B -->|公有云| C{云厂商}
+    B -->|私有云| D{规模}
+    C -->|AWS| E[S3]
+    C -->|阿里云| F[OSS]
+    C -->|腾讯云| G[COS]
+    D -->|小规模| H[MinIO 单机]
+    D -->|大规模| I[MinIO 集群]
+    
+    subgraph 选型因素
+        J[成本] --> K[自建 vs 云]
+        J[性能] --> L[本地 vs 远程]
+        J[合规] --> M[数据主权]
+    end
+```
+
 ## 十五、与其他板块的关系
 
 - 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。

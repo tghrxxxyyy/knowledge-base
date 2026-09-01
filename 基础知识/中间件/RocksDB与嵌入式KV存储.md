@@ -2006,6 +2006,102 @@ checkpoint->CreateCheckpoint("/backup/path");
 | Compaction堆积 | 检查线程数 | 增加线程 |
 | 读性能 | 检查缓存命中率 | 增加BlockCache |
 
+## 二十三、RocksDB 读写性能调优
+
+### 23.1 写入性能优化
+
+| 优化项 | 配置 | 效果 | 适用场景 |
+|--------|------|------|----------|
+| 批量写入 | WriteBatch | 减少WAL写入次数 | 高吞吐写入 |
+| 压缩策略 | Lz4/Zstd | 减少磁盘IO | 写密集 |
+| WAL优化 | disableWAL=true | 跳过WAL写入 | 可容忍数据丢失 |
+| Bloom Filter | filterPolicy=BloomFilter | 减少读放大 | 读密集 |
+| L0写入限流 | level0_slowdown_writes_trigger | 避免写停顿 | 突发写入 |
+
+```cpp
+// RocksDB 写入优化配置
+Options options;
+options.write_buffer_size = 64 << 20;  // 64MB MemTable
+options.max_write_buffer_number = 4;
+options.min_write_buffer_number_to_merge = 2;
+options.level0_file_num_compaction_trigger = 4;
+options.level0_slowdown_writes_trigger = 20;
+options.level0_stop_writes_trigger = 36;
+options.max_background_compactions = 4;
+options.max_background_flushes = 2;
+options.target_file_size_base = 64 << 20;  // 64MB
+options.max_bytes_for_level_base = 256 << 20;  // 256MB
+
+// 批量写入
+WriteBatch batch;
+batch.Put("key1", "value1");
+batch.Put("key2", "value2");
+batch.Delete("key3");
+db->Write(WriteOptions(), &batch);
+```
+
+### 23.2 读取性能优化
+
+| 优化项 | 配置 | 效果 | 适用场景 |
+|--------|------|------|----------|
+| 布隆过滤器 | bloom_filter_bits=10 | 减少无效IO | 点查询 |
+| 块缓存 | block_cache_size=1GB | 热数据缓存 | 频繁读取 |
+| 压缩 | 压缩级别=1 | 平衡CPU/IO | 读写混合 |
+| 预取 | prepopulate_block_cache=1 | 预热缓存 | 冷启动 |
+| 直接IO | use_direct_reads=true | 绕过OS缓存 | 大数据集 |
+
+### 23.3 RocksDB vs LevelDB vs BadgerDB
+
+| 特性 | RocksDB | LevelDB | BadgerDB |
+|------|---------|---------|----------|
+| 语言 | C++ | C++ | Go |
+| 并发 | 多线程 | 单线程 | 多goroutine |
+| 压缩 | 多种算法 | Snappy | Snappy |
+| 事务 | 支持 | 不支持 | 支持 |
+| 嵌入式 | 是 | 是 | 是 |
+| 性能 | 高 | 中 | 高 |
+| 适用场景 | 分布式存储 | 简单KV | Go应用 |
+
+---
+
+## 二十四、RocksDB 在分布式系统中的应用
+
+### 24.1 应用场景
+
+| 系统 | 用途 | 数据类型 | 性能要求 |
+|------|------|----------|----------|
+| TiKV | Raft日志存储 | KV+版本 | 高 |
+| Kafka Streams | 状态存储 | KV+窗口 | 高 |
+| MySQL InnoDB | Buffer Pool | 行数据 | 极高 |
+| CockroachDB | 存储引擎 | KV+MVCC | 高 |
+| YugabyteDB | DocDB存储 | KV+文档 | 高 |
+
+### 24.2 TiKV 中的 RocksDB
+
+```text
+TiKV存储架构：
+  应用层：TiKV API（gRPC）
+    ↓
+  事务层：MVCC + 2PC
+    ↓
+  Raft层：Raft协议复制
+    ↓
+  RocksDB层：
+    RaftDB：存储Raft日志
+    KVDB：存储实际数据
+      ├─ WriteBatch：原子写入
+      ├─ Snapshot：MVCC实现
+      └─ Compaction：数据压缩
+
+优化策略：
+  1. 使用RocksDB的WriteBatch保证原子性
+  2. 使用Snapshot实现MVCC
+  3. 自定义Compaction策略
+  4. 使用Merge Operator优化合并操作
+```
+
+---
+
 ## 与其他板块的关系
 
 | 关联板块 | 关系描述 |

@@ -1386,6 +1386,201 @@ monitoring:
 
 > 核心原则：**索引优化先行，内存合理配置，集群高可用，监控备份到位**。
 
+## Neo4j 内部机制深度剖析
+
+### Neo4j 存储引擎
+
+| 存储组件 | 功能 | 存储内容 | 优化策略 |
+|----------|------|----------|----------|
+| 本地存储 | 图数据存储 | 节点/关系 | 内存映射 |
+| Native Index | 原生索引 | 属性索引 | 合理建索引 |
+| Label Store | 标签存储 | 节点标签 | 标签优化 |
+| Relationship Store | 关系存储 | 关系数据 | 关系方向 |
+
+```text
+Neo4j 存储结构：
+  数据库目录/
+    ├── neostore.nodeStore.nodes | 节点存储
+    ├── neostore.relationshipStore | 关系存储
+    ├── neostore.propStore | 属性存储
+    ├── neostore.labelStore | 标签存储
+    └── schema/ | 索引和约束
+
+  存储特点：
+  - 无索引邻接（Index-Free Adjacency）
+  - 固定大小记录（9字节/关系）
+  - 原地更新（In-Place Update）
+```
+
+### Neo4j 事务机制
+
+```java
+// Neo4j 事务管理
+try (Transaction tx = db.beginTx()) {
+    // 读取节点
+    Node node = tx.getNodeById(1);
+    
+    // 修改节点
+    node.setProperty("name", "Alice");
+    
+    // 创建关系
+    Node other = tx.createNode(Label.label("Person"));
+    other.setProperty("name", "Bob");
+    node.createRelationshipTo(other, RelationshipKNOWS);
+    
+    // 提交事务
+    tx.commit();
+} catch (Exception e) {
+    // 回滚事务
+    tx.rollback();
+}
+```
+
+### Neo4j 并发控制
+
+| 并发机制 | 说明 | 适用场景 |
+|----------|------|----------|
+| MVCC | 多版本并发控制 | 读写并发 |
+| 锁机制 | 节点/关系锁 | 写写并发 |
+| 读写锁 | 读写分离 | 高并发读 |
+| 乐观锁 | 版本号控制 | 低冲突写 |
+
+## Neo4j Cypher 查询优化
+
+### Cypher 查询计划
+
+```cypher
+// 查看查询计划
+EXPLAIN MATCH (a:Person)-[:KNOWS]->(b:Person)
+WHERE a.name = 'Alice'
+RETURN b.name;
+
+// 详细执行计划
+PROFILE MATCH (a:Person)-[:KNOWS]->(b:Person)
+WHERE a.name = 'Alice'
+RETURN b.name;
+```
+
+### 索引优化策略
+
+| 索引类型 | 创建语句 | 适用场景 |
+|----------|----------|----------|
+| B-Tree | CREATE INDEX ON :Person(name) | 等值查询 |
+| 全文索引 | CREATE FULLTEXT INDEX ON :Person(name) | 文本搜索 |
+| 空间索引 | CREATE POINT INDEX ON :Location(location) | 空间查询 |
+| 复合索引 | CREATE INDEX ON :Person(age, name) | 多属性查询 |
+
+### 查询优化技巧
+
+| 技巧 | 说明 | 示例 |
+|------|------|------|
+| 使用索引 | 避免全表扫描 | WHERE n.name = 'Alice' |
+| 限制深度 | 避免无限遍历 | MATCH (a)-[*1..5]->(b) |
+| 使用PROFILE | 分析查询计划 | PROFILE MATCH ... |
+| 避免 OPTIONAL | 减少空值处理 | 使用 OPTIONAL MATCH |
+
+## Neo4j 集群架构设计
+
+### 集群部署模式
+
+| 部署模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| 单机 | 单实例部署 | 开发测试 |
+| 集群 | 多实例集群 | 生产环境 |
+|ausal Cluster | 因果集群 | 高可用 |
+| 核心边缘 | 核心+边缘 | 多区域 |
+
+### 集群配置
+
+```yaml
+# Neo4j 集群配置
+causal_clustering:
+  initial_discovery_members:
+    - neo4j-core1:5000
+    - neo4j-core2:5000
+    - neo4j-core3:5000
+    
+  server_role: CORE
+  
+  # Read Replica 配置
+  read_replica:
+    server_role: READ_REPLICA
+    initial_discovery_members:
+      - neo4j-core1:5000
+```
+
+### 集群监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 副本延迟 | 主从同步延迟 | > 100ms |
+| 连接数 | 活跃连接数 | > 1000 |
+| 内存使用 | JVM堆内存 | > 80% |
+| 事务数 | 每秒事务数 | 异常波动 |
+
+## Neo4j 生产问题排查指南
+
+### 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 查询慢 | 缺少索引 | EXPLAIN分析 | 创建索引 |
+| 内存溢出 | 数据量大 | 检查内存 | 扩容/优化 |
+| 写入慢 | 锁竞争 | 检查锁 | 优化事务 |
+| 连接数高 | 连接池配置 | 检查连接 | 调整配置 |
+| 数据不一致 | 主从延迟 | 检查集群 | 等待同步 |
+
+### 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|查询慢| C[分析查询计划]
+    B -->|写入慢| D[检查锁竞争]
+    B -->|内存溢出| E[检查数据量]
+    C --> F[EXPLAIN分析]
+    D --> G[检查锁等待]
+    E --> H[检查内存使用]
+    F --> I[优化查询/索引]
+    G --> J[优化事务]
+    H --> K[扩容/分片]
+    I --> L[验证恢复]
+    J --> L
+    K --> L
+```
+
+### 监控关键指标
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: neo4j-alerts
+    rules:
+      - alert: Neo4j_HighMemory
+        expr: neo4j_jvm_heap_used_bytes / neo4j_jvm_heap_max_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j 内存使用率高"
+          
+      - alert: Neo4j_SlowQuery
+        expr: neo4j_query_duration_seconds > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j 查询慢"
+          
+      - alert: Neo4j_ConnectionHigh
+        expr: neo4j_connections_active > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Neo4j 连接数高"
+```
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。
@@ -1996,7 +2191,158 @@ neo4j-admin database backup neo4j --backup-dir=/backup
 | 内存使用率 | 堆/页面缓存 | > 85% |
 | 磁盘使用率 | 存储空间 | > 80% |
 
-## 十三、与其他板块的关系
+## 十三、Neo4j 性能优化深度
+
+### 13.1 索引策略
+
+| 索引类型 | 语法 | 适用场景 | 性能影响 |
+|----------|------|----------|----------|
+| B-Tree | `CREATE INDEX FOR (n:Label) ON (n.prop)` | 等值查询 | O(log n) |
+| 全文索引 | `CREATE FULLTEXT INDEX FOR (n:Label) ON EACH [n.prop]` | 文本搜索 | 全文检索 |
+| 空间索引 | `CREATE POINT INDEX FOR (n:Location) ON (n.point)` | 地理查询 | 空间查询 |
+| 复合索引 | `CREATE INDEX FOR (n:Label) ON (n.prop1, n.prop2)` | 多属性查询 | 复合查询 |
+
+```cypher
+// 索引优化示例
+// ❌ 没有索引：全表扫描
+MATCH (p:Person) WHERE p.name = '张三' RETURN p
+
+// ✅ 创建索引后：索引查找
+CREATE INDEX FOR (p:Person) ON (p.name)
+MATCH (p:Person) WHERE p.name = '张三' RETURN p
+
+// 复合索引优化
+CREATE INDEX FOR (p:Person) ON (p.city, p.age)
+MATCH (p:Person) WHERE p.city = '北京' AND p.age > 25 RETURN p
+```
+
+### 13.2 查询优化技巧
+
+```cypher
+// 1. 使用 EXPLAIN 查看执行计划
+EXPLAIN MATCH (a:Person)-[:FRIEND]->(b:Person)-[:WORKS_AT]->(c:Company)
+WHERE c.name = '腾讯'
+RETURN a.name
+
+// 2. 使用 PROFILE 查看实际执行
+PROFILE MATCH (a:Person)-[:FRIEND]->(b:Person)
+WHERE a.city = '深圳'
+RETURN b.name
+
+// 3. 避免全图扫描
+// ❌ 不指定标签：扫描所有节点
+MATCH (n) WHERE n.name = '张三' RETURN n
+
+// ✅ 指定标签：只扫描Person节点
+MATCH (n:Person) WHERE n.name = '张三' RETURN n
+
+// 4. 限制结果数量
+MATCH (p:Person)-[:FRIEND]->(f:Person)
+RETURN p, f
+LIMIT 100
+```
+
+### 13.3 内存配置
+
+| 参数 | 默认值 | 建议值 | 说明 |
+|------|--------|--------|------|
+| dbms.memory.heap.initial_size | 1G | 物理内存50% | JVM初始堆 |
+| dbms.memory.heap.max_size | 1G | 物理内存50% | JVM最大堆 |
+| dbms.memory.pagecache.size | 物理内存50% | 物理内存40% | 页面缓存 |
+| dbms.memory.transaction.total.size | 无限 | 按需设置 | 事务内存限制 |
+
+---
+
+## 十四、Neo4j 运维与高可用
+
+### 14.1 因果集群架构
+
+```mermaid
+graph TB
+    subgraph Core-Server-1
+        C1[Core 1<br/>Raft Leader]
+    end
+    subgraph Core-Server-2
+        C2[Core 2<br/>Raft Follower]
+    end
+    subgraph Core-Server-3
+        C3[Core 3<br/>Raft Follower]
+    end
+    subgraph Read-Replica
+        R1[Read Replica 1]
+        R2[Read Replica 2]
+    end
+    C1 --> C2
+    C1 --> C3
+    C2 --> C3
+    C1 --> R1
+    C1 --> R2
+```
+
+| 节点角色 | 职责 | 数量 | 数据一致性 |
+|----------|------|------|------------|
+| Core Server | 读写、Raft协议 | 3或5 | 强一致 |
+| Read Replica | 只读、查询扩展 | 0或多个 | 最终一致 |
+
+### 14.2 备份与恢复
+
+```bash
+# 在线备份（不停机）
+neo4j-admin database backup neo4j \
+  --to-path=/backup/neo4j-$(date +%Y%m%d)
+
+# 定时备份脚本
+#!/bin/bash
+BACKUP_DIR="/backup/neo4j/$(date +%Y%m%d_%H%M%S)"
+mkdir -p $BACKUP_DIR
+neo4j-admin database backup neo4j --to-path=$BACKUP_DIR
+
+# 保留最近7天备份
+find /backup/neo4j -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \;
+
+# 恢复（需要停止数据库）
+neo4j-admin database restore \
+  --from-path=/backup/neo4j/20250101_020000 \
+  --database=neo4j
+```
+
+---
+
+## 十五、Neo4j 生态工具链
+
+| 工具 | 用途 | 特点 |
+|------|------|------|
+| Neo4j Browser | Web查询界面 | 内置、可视化 |
+| Neo4j Desktop | 桌面客户端 | 开发调试 |
+| Neo4j Bloom | 图可视化 | 无代码探索 |
+| neovis.js | JavaScript可视化 | 前端集成 |
+| APOC | 扩展函数库 | 500+函数 |
+| Graph Data Science | 图算法库 | 50+算法 |
+| Neo4j GraphQL | GraphQL绑定 | Schema-first |
+| Neo4j Java Driver | Java驱动 | 原生协议 |
+| Neo4j Python Driver | Python驱动 | Neo4j库 |
+
+```python
+# Python Driver 示例
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
+
+def find_friends(tx, name):
+    result = tx.run(
+        "MATCH (p:Person)-[:FRIEND]->(f:Person) "
+        "WHERE p.name = $name "
+        "RETURN f.name AS friend",
+        name=name
+    )
+    return [record["friend"] for record in result]
+
+with driver.session() as session:
+    friends = session.read_transaction(find_friends, "张三")
+    print(f"张三的朋友: {friends}")
+```
+
+## 与其他板块的关系
 
 - 图数据库选型见「[图数据库对比](./图数据库对比.md)」；
 - 知识图谱见「[知识图谱构建](../../知识图谱/构建.md)」；

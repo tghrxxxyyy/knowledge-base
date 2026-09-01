@@ -1111,6 +1111,293 @@ Error Budget：
 
 ---
 
+## Prometheus 内部机制深度剖析
+
+### Prometheus 数据模型
+
+| 数据类型 | 定义 | 存储方式 | 查询方式 |
+|----------|------|----------|----------|
+| Counter | 单调递增计数器 | 时间序列 | rate/increase |
+| Gauge | 可增可减指标 | 时间序列 | 直接查询 |
+| Histogram | 分位数统计 | 多时间序列 | histogram_quantile |
+| Summary | 客户端分位数 | 多时间序列 | 直接查询 |
+
+```text
+时间序列数据模型：
+  metric_name{label1="value1", label2="value2"} timestamp value
+
+  示例：
+  http_requests_total{method="GET", status="200"} 1234567890 42
+  
+  特点：
+  - 不可变标签键值对
+  - 按标签组合唯一标识
+  - 支持多维数据模型
+```
+
+### Prometheus 存储引擎
+
+```text
+本地存储结构：
+  数据目录/
+    ├── chunks/          # 数据块
+    │   ├── 000001       # 时间序列数据
+    │   ├── 000002
+    │   └── ...
+    ├── index            # 索引文件
+    ├── meta.json        # 元数据
+    └── tombstones       # 删除标记
+
+  压缩策略：
+    - 原始数据按2小时分块
+    - 自动压缩合并小块
+    - 保留策略自动清理
+```
+
+### Prometheus 查询引擎
+
+```promql
+# PromQL 查询示例
+
+# 1. Rate 计算（每秒增长率）
+rate(http_requests_total[5m])
+
+# 2. Histogram 分位数
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# 3. 聚合查询
+sum(rate(http_requests_total[5m])) by (method)
+
+# 4. 预测查询
+predict_linear(http_requests_total[24h], 3600)
+
+# 5. 标签匹配
+http_requests_total{method=~"GET|POST"}
+```
+
+## Grafana 仪表板设计最佳实践
+
+### 仪表板布局设计
+
+| 区域 | 内容 | 设计原则 |
+|------|------|----------|
+| 顶部 | 关键指标 | 一眼可见 |
+| 左侧 | 趋势图 | 时间序列 |
+| 右侧 | 状态面板 | 实时状态 |
+| 底部 | 详细表格 | 明细数据 |
+
+### 面板类型选择
+
+| 面板类型 | 适用场景 | 数据特点 |
+|----------|----------|----------|
+| Time Series | 趋势分析 | 时间序列 |
+| Stat | 单值指标 | 单一数值 |
+| Gauge | 进度/状态 | 百分比/状态 |
+| Table | 明细数据 | 多列数据 |
+| Heatmap | 分布分析 | 热力图 |
+
+### 仪表板模板变量
+
+```yaml
+# 模板变量配置
+templating:
+  list:
+    - name: instance
+      type: query
+      query: label_values(up, instance)
+      refresh: 2
+      multi: true
+      includeAll: true
+      
+    - name: job
+      type: query
+      query: label_values(up{instance="$instance"}, job)
+      refresh: 2
+```
+
+## 告警规则设计最佳实践
+
+### 告警规则模板
+
+```yaml
+# 告警规则模板
+groups:
+  - name: app-alerts
+    rules:
+      # 1. 错误率告警
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          /
+          sum(rate(http_requests_total[5m])) by (service)
+          > 0.05
+        for: 5m
+        labels:
+          severity: P1
+        annotations:
+          summary: "{{ $labels.service }} 错误率超过5%"
+          description: "当前错误率 {{ $value | humanizePercentage }}"
+          
+      # 2. 延迟告警
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)
+          ) > 1
+        for: 5m
+        labels:
+          severity: P2
+        annotations:
+          summary: "{{ $labels.service }} P99延迟超过1秒"
+          
+      # 3. 资源告警
+      - alert: HighCPU
+        expr: |
+          process_cpu_seconds_total / process_start_time_seconds > 0.8
+        for: 5m
+        labels:
+          severity: P2
+        annotations:
+          summary: "CPU使用率超过80%"
+```
+
+### 告警收敛策略
+
+| 策略 | 配置 | 说明 |
+|------|------|------|
+| 抑制 | inhibit_rules | 相同告警抑制 |
+| 分组 | group_by | 相关告警分组 |
+| 静默 | silence | 维护时间静默 |
+| 路由 | route | 按级别路由 |
+
+## Prometheus 高可用架构
+
+### 高可用部署方案
+
+```mermaid
+flowchart TD
+    A[服务发现] --> B[Prometheus 1]
+    A --> C[Prometheus 2]
+    B --> D[Thanos Sidecar]
+    C --> D
+    D --> E[Thanos Store]
+    E --> F[对象存储]
+    D --> G[Thanos Query]
+    G --> H[Grafana]
+    
+    subgraph 高可用
+        B -->|主| I[主实例]
+        C -->|备| J[备实例]
+    end
+```
+
+### 联邦集群架构
+
+```text
+联邦集群配置：
+  1. 全局 Prometheus
+     - 收集全局指标
+     - 跨区域聚合
+     - 长期存储
+
+  2. 区域 Prometheus
+     - 收集区域指标
+     - 本地存储
+     - 向上联邦
+
+  3. 边缘 Prometheus
+     - 收集边缘指标
+     - 本地存储
+     - 向上联邦
+```
+
+### Thanos 长期存储
+
+```yaml
+# Thanos 配置
+thanos:
+  sidecar:
+    object-storage-config:
+      type: S3
+      config:
+        bucket: thanos-metrics
+        endpoint: s3.amazonaws.com
+        
+  store:
+    object-storage-config:
+      type: S3
+      config:
+        bucket: thanos-metrics
+        
+  query:
+    stores:
+      - thanos-sidecar:10901
+      - thanos-store:10902
+```
+
+## Prometheus 生产问题排查指南
+
+### 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 采集失败 | 目标不可达 | 检查网络 | 修复网络 |
+| 数据丢失 | 采样率低 | 检查配置 | 调整采样 |
+| 查询超时 | 数据量大 | 检查数据量 | 优化查询 |
+| 内存溢出 | 指标过多 | 检查指标 | 优化配置 |
+| 告警漏发 | 规则错误 | 检查规则 | 修复规则 |
+
+### 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|采集失败| C[检查目标]
+    B -->|数据丢失| D[检查配置]
+    B -->|查询超时| E[检查数据量]
+    C --> F[查看targets页面]
+    D --> G[查看配置文件]
+    E --> H[查看存储状态]
+    F --> I[修复网络/配置]
+    G --> J[调整采样率]
+    H --> K[优化查询/存储]
+    I --> L[验证恢复]
+    J --> L
+    K --> L
+```
+
+### 监控关键指标
+
+```yaml
+# Prometheus 自身监控
+groups:
+  - name: prometheus-alerts
+    rules:
+      - alert: Prometheus_TargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: P0
+        annotations:
+          summary: "Prometheus 目标宕机"
+          
+      - alert: Prometheus_HighMemory
+        expr: process_resident_memory_bytes > 1073741824  # 1GB
+        for: 5m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Prometheus 内存使用率高"
+          
+      - alert: Prometheus_SlowQuery
+        expr: prometheus_engine_query_duration_seconds > 10
+        for: 5m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Prometheus 查询慢"
+```
+
 ## 十七、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；

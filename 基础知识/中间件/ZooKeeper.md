@@ -1947,6 +1947,51 @@ echo "stat" | nc zk1 2181
 | 替换 | 扩容+缩容 | 无需 | 低 | 推荐方式 |
 | 升级 | 滚动升级 | 无需 | 低 | 逐个升级 |
 
+## ZooKeeper 性能优化深度
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| tickTime | 2000ms | 2000ms | 心跳间隔 |
+| initLimit | 10 | 5 | 初始化超时倍数 |
+| syncLimit | 5 | 3 | 同步超时倍数 |
+| maxClientCnxns | 60 | 200 | 最大客户端连接数 |
+| maxSessionTimeout | 40000ms | 60000ms | 最大会话超时 |
+| autopurge.snapRetainCount | 3 | 5 | 保留快照数 |
+| autopurge.purgeInterval | 0 | 24 | 清理间隔(小时) |
+
+### 性能优化策略
+
+```bash
+# JVM调优
+export JVMFLAGS="-Xms4g -Xmx4g"
+export JVMFLAGS="$JVMFLAGS -XX:+UseG1GC"
+export JVMFLAGS="$JVMFLAGS -XX:MaxGCPauseMillis=20"
+export JVMFLAGS="$JVMFLAGS -XX:+ParallelRefProcEnabled"
+
+# 磁盘优化
+# 使用SSD存储数据目录
+# 使用单独的磁盘存储事务日志
+# 避免数据目录和日志目录在同一磁盘
+
+# 网络优化
+# 增大TCP缓冲区
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+```
+
+### 性能监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| avg_latency | 平均请求延迟 | >100ms |
+| outstanding_requests | 排队请求数 | >1000 |
+| num_alive_connections | 活跃连接数 | >1000 |
+| followers | Follower数量 | <n/2 |
+| pending_syncs | 待同步事务数 | >100 |
+| znode_count | ZNode数量 | >100万 |
+
 ---
 
 ## 二十二、ZK vs etcd vs Kafka Watcher对比

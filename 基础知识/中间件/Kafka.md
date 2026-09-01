@@ -820,6 +820,230 @@ Sink Connector Exactly-Once 实现：
 
 ---
 
+## Kafka 内部机制深度剖析
+
+### Kafka 数据存储机制
+
+```text
+日志存储结构：
+  Topic
+    └── Partition
+          └── Segment
+                ├── .log（数据文件）
+                ├── .index（偏移量索引）
+                ├── .timeindex（时间索引）
+                └── .txnindex（事务索引）
+
+  Segment 切割条件：
+    1. 大小超过 log.segment.bytes（默认1GB）
+    2. 时间超过 log.roll.ms（默认7天）
+    3. 索引满时自动切割
+```
+
+### Kafka 副本同步机制
+
+| 概念 | 定义 | 作用 |
+|------|------|------|
+| LEO | Log End Offset | 下一条写入位置 |
+| HW | High Watermark | 已同步位置 |
+| ISR | In-Sync Replicas | 同步副本集 |
+| AR | Assigned Replicas | 所有副本 |
+
+```text
+副本同步流程：
+  1. Producer 写入 Leader
+  2. Leader 更新 LEO
+  3. Follower 拉取数据
+  4. Follower 更新 LEO
+  5. Leader 更新 HW（取 ISR 最小 LEO）
+  6. Consumer 读取 HW 之前数据
+```
+
+### Kafka 事务机制
+
+```java
+// 事务配置示例
+Properties props = new Properties();
+props.put("transactional.id", "my-transactional-id");
+props.put("enable.idempotence", true);
+props.put("acks", "all");
+props.put("retries", 3);
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();
+
+try {
+    producer.beginTransaction();
+    // 发送消息
+    producer.send(new ProducerRecord<>("topic", "key", "value"));
+    // 提交事务
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+}
+```
+
+## Kafka 性能调优实战
+
+### 生产者调优
+
+| 参数 | 默认值 | 优化建议 | 影响 |
+|------|--------|----------|------|
+| `batch.size` | 16KB | 64~256KB | 吞吐量 |
+| `linger.ms` | 0 | 5~100ms | 延迟/吞吐 |
+| `compression.type` | none | lz4/zstd | CPU/带宽 |
+| `acks` | 1 | all | 可靠性 |
+| `buffer.memory` | 32MB | 64~128MB | 写入能力 |
+
+### 消费者调优
+
+| 参数 | 默认值 | 优化建议 | 影响 |
+|------|--------|----------|------|
+| `fetch.min.bytes` | 1 | 1MB | 批量拉取 |
+| `fetch.max.wait.ms` | 500 | 1000ms | 延迟 |
+| `max.poll.records` | 500 | 1000~2000 | 处理量 |
+| `session.timeout.ms` | 10s | 30s | 稳定性 |
+
+### Broker 调优
+
+```yaml
+# Broker 配置优化
+server:
+  # 日志段大小
+  log.segment.bytes: 1073741824  # 1GB
+  
+  # 日志保留策略
+  log.retention.hours: 168  # 7天
+  log.retention.bytes: -1  # 不限制
+  
+  # 副本配置
+  default.replication.factor: 3
+  min.insync.replicas: 2
+  
+  # 网络配置
+  num.network.threads: 8
+  num.io.threads: 16
+```
+
+## Kafka 生产问题排查指南
+
+### 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 消息丢失 | 副本不同步 | 检查 ISR | 增加副本数 |
+| 消息重复 | 消费者重平衡 | 检查 offset | 幂等消费 |
+| 消费延迟 | 消费能力不足 | 检查 lag | 增加消费者 |
+| 磁盘写满 | 保留策略 | 检查日志 | 调整保留 |
+| 连接数高 | 连接池配置 | 检查连接 | 调整配置 |
+
+### 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|消息丢失| C[检查副本同步]
+    B -->|消息重复| D[检查消费者]
+    B -->|消费延迟| E[检查消费能力]
+    C --> F[查看 ISR 状态]
+    D --> G[查看 offset]
+    E --> H[查看 lag]
+    F --> I[增加副本数]
+    G --> J[优化消费逻辑]
+    H --> K[增加消费者]
+    I --> L[验证恢复]
+    J --> L
+    K --> L
+```
+
+### 监控关键指标
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: kafka-alerts
+    rules:
+      - alert: Kafka_BrokerDown
+        expr: kafka_server_brokertopicmetrics_messagesin_total == 0
+        for: 1m
+        labels:
+          severity: P0
+        annotations:
+          summary: "Kafka Broker 宕机"
+          
+      - alert: Kafka_ConsumerLag
+        expr: kafka_consumergroup_lag_sum > 1000000
+        for: 5m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Kafka 消费延迟"
+          
+      - alert: Kafka_PartitionUnderReplicated
+        expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+        for: 5m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Kafka 副本不同步"
+```
+
+## Kafka 架构设计最佳实践
+
+### 集群架构设计
+
+| 设计原则 | 说明 | 实践建议 |
+|----------|------|----------|
+| 高可用 | 多副本 | 3副本 |
+| 水平扩展 | 增加 Broker | 动态扩容 |
+| 负载均衡 | 分区均匀 | 分区策略 |
+| 容灾 | 跨机架/跨机房 | 机架感知 |
+
+### 应用架构集成
+
+```text
+应用架构模式：
+  1. 直连模式
+     - 应用直连 Kafka
+     - 简单高效
+     - 适合小规模
+
+  2. 代理模式
+     - 通过 Kafka Connect
+     - 数据集成
+     - 适合数据管道
+
+  3. 流处理模式
+     - Kafka Streams
+     - 实时处理
+     - 适合事件驱动
+```
+
+### 容灾架构设计
+
+```mermaid
+flowchart TD
+    A[主集群] --> B[跨集群复制]
+    B --> C[备集群]
+    C --> D[故障切换]
+    D --> E[流量切换]
+    E --> F[数据恢复]
+    
+    subgraph 复制策略
+        B -->|MirrorMaker| G[异步复制]
+        B -->|Confluent Replicator| H[同步复制]
+    end
+```
+
+## 与 Flink 的深度集成
+
+| 集成场景 | 方案 | 说明 |
+|----------|------|------|
+| 实时数仓 | Flink SQL + Kafka | 流式 ETL |
+| 事件驱动 | Kafka Events + Flink | 事件处理 |
+| CDC 同步 | Debezium + Kafka + Flink | 实时同步 |
+| 指标计算 | Kafka Metrics + Flink | 实时监控 |
+
 ## 六、与其他板块的关系
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。

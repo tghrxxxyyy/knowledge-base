@@ -2072,4 +2072,285 @@ java -jar arthas-boot.jar
 | 监控告警 | 完善监控 | 及时发现 |
 | 容量规划 | 合理资源 | 稳定性 |
 | 版本管理 | 版本兼容 | 平滑升级 |
+
+## 三十四、Flink 内部机制深度剖析
+
+### 14.1 Flink 运行时架构
+
+```text
+Flink 运行时组件：
+  1. JobManager
+     - 作业管理器
+     - 协调 TaskManager
+     - 管理 Checkpoint
+     - 故障恢复
+
+  2. TaskManager
+     - 任务管理器
+     - 执行 Task
+     - 管理状态
+     - 数据交换
+
+  3. Task Slot
+     - 任务槽
+     - 资源隔离
+     - 内存分配
+     - CPU 共享
+
+  4. Network
+     - 数据交换网络
+     - Shuffle Service
+     - 数据传输
+     - 背压控制
+```
+
+### 14.2 Flink 状态后端机制
+
+| 状态后端 | 存储位置 | 性能特点 | 适用场景 |
+|----------|----------|----------|----------|
+| HashMapStateBackend | JVM 堆内存 | 读写最快 | 开发测试 |
+| EmbeddedRocksDBStateBackend | RocksDB磁盘 | 支持大状态 | 生产环境 |
+| FsStateBackend | 文件系统 | 分布式存储 | 容器环境 |
+
+```java
+// 状态后端配置
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+// HashMapStateBackend（内存）
+env.setStateBackend(new HashMapStateBackend());
+
+// EmbeddedRocksDBStateBackend（磁盘）
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true));
+env.getCheckpointConfig().setCheckpointStorage("hdfs:///checkpoints");
+```
+
+### 14.3 Flink 内存模型
+
+```text
+Flink 内存分配：
+  总内存 = 框架内存 + 任务内存 + 网络内存 + 托管内存
+
+  框架内存：
+    - 默认：128MB
+    - 用于 Flink 框架本身
+    - 一般不需要调整
+
+  任务内存：
+    - 默认：128MB
+    - 用于 Task 执行
+    - 根据作业调整
+
+  网络内存：
+    - 默认：10% 总内存
+    - 用于数据交换
+    - Shuffle 时使用
+
+  托管内存：
+    - 默认：40% 总内存
+    - 用于 RocksDB 状态
+    - 大状态作业需要
+```
+
+## 三十五、Flink 性能调优实战
+
+### 15.1 资源调优
+
+| 调优项 | 默认值 | 优化建议 | 影响范围 |
+|--------|--------|----------|----------|
+| TaskManager 内存 | 1.7GB | 4~8GB | 状态大小 |
+| Task Slot 数量 | 1 | CPU 核数 | 并行度 |
+| 并行度 | 1 | 数据源分片数 | 吞吐量 |
+| 网络缓冲区 | 1024 | 2048~4096 | 数据传输 |
+
+### 15.2 Checkpoint 调优
+
+```yaml
+# Checkpoint 配置
+checkpointing:
+  enabled: true
+  interval: 60000          # 60秒
+  timeout: 600000          # 10分钟
+  min-pause: 30000         # 30秒
+  max-concurrent: 1        # 并发数
+  externalized-checkpoint: RETAIN_ON_CANCELLATION
+  
+# RocksDB 调优
+rocksdb:
+  block-cache-size: 256MB
+  write-buffer-size: 64MB
+  max-write-buffer-number: 3
+  level0-slowdown-trigger: 20
+  level0-stop-trigger: 40
+```
+
+### 15.3 SQL 调优
+
+```sql
+-- Flink SQL 调优示例
+SET table.exec.mini-batch.enabled = true;
+SET table.exec.mini-batch.allow-latency = '5s';
+SET table.exec.mini-batch.size = '1000';
+SET table.exec.state.ttl = '1h';
+
+-- Hint 调优
+SELECT /*+ REPARTITION(user_id) */ 
+    user_id, COUNT(*) 
+FROM orders 
+GROUP BY user_id;
+```
+
+## 三十六、Flink 生产问题排查指南
+
+### 16.1 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| Checkpoint 失败 | 状态超时 | 检查状态大小 | 增大超时时间 |
+| 背压严重 | 下游处理慢 | 检查背压监控 | 增加并行度 |
+| 数据倾斜 | Key 分布不均 | 检查 Key 分布 | 加盐/两阶段聚合 |
+| OOM | 内存不足 | 检查内存使用 | 增大内存 |
+| 延迟高 | 数据等待 | 检查 Watermark | 优化 Watermark |
+
+### 16.2 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|Checkpoint失败| C[检查状态大小]
+    B -->|背压严重| D[检查下游处理]
+    B -->|数据倾斜| E[检查Key分布]
+    C --> F[调整超时时间]
+    D --> G[增加并行度]
+    E --> H[加盐/聚合]
+    F --> I[验证恢复]
+    G --> I
+    H --> I
+```
+
+### 16.3 监控关键指标
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: flink-alerts
+    rules:
+      - alert: Flink_CheckpointFailed
+        expr: flink_jobmanager_job_numberOfFailedCheckpoints > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flink Checkpoint 失败"
+          
+      - alert: Flink_BackPressure
+        expr: flink_taskmanager_job_task_buffers_inPoolUsage > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flink 背压严重"
+          
+      - alert: Flink_HighLatency
+        expr: flink_taskmanager_job_task_operator_latency > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flink 延迟高"
+```
+
+## 三十七、Flink 与 Kafka 深度集成
+
+### 17.1 Kafka Source 配置
+
+```java
+// Kafka Source 配置
+KafkaSource<String> source = KafkaSource.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("orders")
+    .setGroupId("flink-consumer")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setDeserializer(new SimpleStringSchema())
+    .build();
+
+// Kafka Source 配置（Exactly-Once）
+KafkaSource<String> source = KafkaSource.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("orders")
+    .setGroupId("flink-consumer")
+    .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
+    .setDeserializer(new SimpleStringSchema())
+    .setProperty("isolation.level", "read_committed")
+    .build();
+```
+
+### 17.2 Kafka Sink 配置
+
+```java
+// Kafka Sink 配置
+KafkaSink<String> sink = KafkaSink.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(new SimpleStringSchema())
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-")
+    .setKafkaProducerConfig(new Properties())
+    .build();
+
+// Kafka Sink 配置（At-Least-Once）
+KafkaSink<String> sink = KafkaSink.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(new SimpleStringSchema())
+    .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+    .build();
+```
+
+### 17.3 Kafka 与 Flink 集成最佳实践
+
+| 实践 | 说明 | 示例 |
+|------|------|------|
+| Exactly-Once | 事务性写入 | setTransactionalIdPrefix |
+| Offset 管理 | 提交 Offset | setAutoCommitOnCheckpoints |
+| 分区策略 | 自定义分区 | setPartitioner |
+| 背压处理 | 限流控制 | setRateLimit |
+
+## 三十八、Flink 状态管理最佳实践
+
+### 18.1 状态类型选择
+
+| 状态类型 | 适用场景 | 性能特点 |
+|----------|----------|----------|
+| ValueState | 单值状态 | 读写快 |
+| ListState | 列表状态 | 读写快 |
+| MapState | Map 状态 | 读写快 |
+| ReducingState | 聚合状态 | 自动聚合 |
+| AggregatingState | 聚合状态 | 自动聚合 |
+
+### 18.2 状态 TTL 配置
+
+```java
+// 状态 TTL 配置
+StateTtlConfig ttlConfig = StateTtlConfig
+    .newBuilder(Time.hours(1))
+    .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+
+ValueStateDescriptor<String> stateDescriptor = 
+    new ValueStateDescriptor<>("my-state", String.class);
+stateDescriptor.enableTimeToLive(ttlConfig);
+```
+
+### 18.3 状态优化技巧
+
+| 技巧 | 说明 | 效果 |
+|------|------|------|
+| 状态 TTL | 自动清理过期状态 | 减少状态大小 |
+| 增量 Checkpoint | 只保存增量 | 加快 Checkpoint |
+| 本地恢复 | 本地快照 | 加快恢复 |
+| 状态后端调优 | RocksDB 参数 | 提升性能 |
+
+## 与消息队列的关系
+
+- 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；
 | 定期演练 | 故障演练 | 容灾能力 |

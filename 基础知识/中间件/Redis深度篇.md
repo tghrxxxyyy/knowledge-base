@@ -1748,6 +1748,58 @@ flowchart TD
   延迟时间 > 主从同步延迟 + 业务处理时间
 ```
 
+## 二十五、Redis 分布式锁深度
+
+### 25.1 分布式锁实现对比
+
+| 实现方式 | 命令 | 优点 | 缺点 |
+|----------|------|------|------|
+| SETNX | SET key value NX EX | 简单 | 无法续期 |
+| Redlock | 多节点SETNX | 高可用 | 复杂 |
+| Redisson | RedissonLock | 自动续期 | 依赖客户端 |
+| Lua脚本 | 原子操作 | 灵活 | 需要脚本能力 |
+
+### 25.2 Redisson 分布式锁
+
+```java
+// Redisson 分布式锁
+RLock lock = redisson.getLock("order:lock");
+try {
+    // 尝试加锁，最多等待3秒，自动释放时间30秒
+    if (lock.tryLock(3, 30, TimeUnit.SECONDS)) {
+        // 执行业务逻辑
+        processOrder(orderId);
+    }
+} finally {
+    if (lock.isHeldByCurrentThread()) {
+        lock.unlock();
+    }
+}
+
+// 看门狗机制（自动续期）
+// 默认锁超时30秒，每10秒续期一次
+// 只要在持有锁，就会自动续期
+```
+
+### 25.3 Redis 集群分布式锁
+
+```text
+Redlock算法：
+  1. 获取当前时间T1
+  2. 依次向N个Redis实例请求锁
+     SET lock_key random_value NX EX 10
+  3. 计算获取锁耗时 = 当前时间 - T1
+  4. 如果：
+     - 多数节点加锁成功
+     - 且获取锁耗时 < 锁超时时间
+     则加锁成功
+     
+  5. 如果加锁失败，向所有节点释放锁
+     Lua脚本：if random_value == get(lock_key) then del(lock_key)
+```
+
+---
+
 ## 与其他板块的关系
 
 - Redis 基础知识见「[基础知识/redis知识](../redis知识.md)」；

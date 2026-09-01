@@ -2109,6 +2109,45 @@ b.option(ChannelOption.SO_BACKLOG, 1024)
 
 ---
 
+## 二十、Netty 性能优化最佳实践
+
+### 20.1 内存优化
+
+| 优化项 | 配置 | 效果 | 适用场景 |
+|--------|------|------|----------|
+| 堆外内存 | -Dio.netty.allocator.type=unpooled | 减少GC压力 | 高吞吐 |
+| 内存池 | PooledByteBufAllocator | 对象复用 | 通用 |
+| 直接内存 | -XX:MaxDirectMemorySize | 避免内存拷贝 | 大数据传输 |
+| 零拷贝 | FileRegion.transferTo | 减少拷贝 | 文件传输 |
+
+### 20.2 线程模型优化
+
+```java
+// 优化线程配置
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup)
+ .channel(NioServerSocketChannel.class)
+ .option(ChannelOption.SO_BACKLOG, 1024)
+ .option(ChannelOption.SO_REUSEADDR, true)
+ .childOption(ChannelOption.TCP_NODELAY, true)
+ .childOption(ChannelOption.SO_KEEPALIVE, true)
+ .childOption(ChannelOption.ALLOCATOR, 
+     PooledByteBufAllocator.DEFAULT)
+ .childOption(ChannelOption.RCVBUF_ALLOCATOR, 
+     new AdaptiveRecvByteBufAllocator(128, 1024, 65536));
+```
+
+### 20.3 常见性能问题
+
+| 问题 | 现象 | 排查工具 | 解决方案 |
+|------|------|----------|----------|
+| 内存泄漏 | OOM/内存持续增长 | 内存分析工具 | 检查ByteBuf释放 |
+| 线程阻塞 | 吞吐下降 | jstack/Arthas | 避免阻塞操作 |
+| GC停顿 | 延迟飙升 | GC日志/JFR | 使用堆外内存 |
+| 连接泄漏 | 连接数持续增长 | 监控指标 | 检查连接关闭 |
+
+---
+
 ## 二十、与其他板块的关系
 
 - 网络基础见「[网络](../基础知识/网络.md)」；

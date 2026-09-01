@@ -1728,6 +1728,249 @@ RocksDB 关键参数：
   5. 写入高峰避免 ANALYZE（调整时间窗口）
 ```
 
+## 十二、TiDB 内部机制深度剖析
+
+### 12.1 TiKV 数据分布与调度
+
+```text
+Region 调度机制：
+  1. Leader Transfer
+     - 手动切换 Leader（PD 控制）
+     - 用于维护/升级场景
+     - 影响：短暂写入中断
+
+  2. Region Split
+     - Region 大小超过 96MB 自动分裂
+     - 分裂后两个 Region 各有独立副本
+     - 可调整阈值：region-split-size
+
+  3. Region Merge
+     - 相邻小 Region 自动合并
+     - 减少 Region 数量
+     - 适合冷数据场景
+
+  4. Region Relocation
+     - 基于负载均衡自动迁移
+     - PD 根据 store 负载决定
+     - 避免热点集中在少数 store
+```
+
+### 12.2 Percolator 事务模型详解
+
+| 阶段 | 操作 | 锁类型 | 失败处理 |
+|------|------|--------|----------|
+| Prewrite | 检查锁冲突 | Primary Lock | 回滚所有锁 |
+| Prewrite | 写入数据 | Secondary Lock | 回滚所有锁 |
+| Commit | 解锁 Primary | Unlock | 清理残留锁 |
+| Commit | 写入 Commit | N/A | GC 清理 |
+| GC | 清理旧版本 | N/A | 按 GC life time |
+
+```go
+// TiKV 事务处理伪代码
+func prewrite(mutation Mutation) error {
+    // 1. 检查冲突
+    if lock := checkLock(mutation.Key); lock != nil {
+        if lock.IsPrimary(mutation.Key) {
+            return ErrLockFound
+        }
+        // 等待或清理
+        waitOrClean(lock)
+    }
+    
+    // 2. 写入锁
+    putLock(mutation.Key, &Lock{
+        Primary: getPrimaryKey(mutation.Key),
+        TSO:     oracle.GetTimestamp(),
+        TTL:     calculateTTL(),
+    })
+    
+    // 3. 写入数据
+    putValue(mutation.Key, mutation.Value, mutation.TSO)
+    return nil
+}
+```
+
+### 12.3 TiFlash 列存同步机制
+
+```text
+TiFlash 同步模式：
+  1. 异步模式（默认）
+     - TiKV 写入后异步同步到 TiFlash
+     - 延迟：100ms~1s
+     - 适用：OLAP 场景
+
+  2. 同步模式（可选）
+     - TiKV 写入时同步到 TiFlash
+     - 延迟：增加 10~50ms
+     - 适用：实时性要求高
+
+  3. 同步方式：
+     - Raft Learner（非投票成员）
+     - 不影响写入性能
+     - 自动重试失败同步
+```
+
+## 十三、TiDB 性能调优实战
+
+### 13.1 SQL 层调优
+
+```sql
+-- 慢查询分析
+SELECT * FROM information_schema.slow_query
+WHERE query_time > 1
+ORDER BY query_time DESC;
+
+-- 执行计划分析
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123;
+
+-- 索引优化建议
+SELECT * FROM information_schema.tidb_index_usage
+WHERE index_name = 'idx_user_id';
+```
+
+### 13.2 TiKV 调优参数
+
+| 参数 | 默认值 | 优化建议 | 影响范围 |
+|------|--------|----------|----------|
+| `rocksdb.max-background-jobs` | 8 | CPU 核数 * 2 | 写入性能 |
+| `rocksdb.max-write-buffer-number` | 4 | 6~8 | 写入吞吐 |
+| `rocksdb.max-total-wal-size` | 4GB | 8GB | 恢复速度 |
+| `rocksdb.target-file-size-base` | 64MB | 128MB | Compaction |
+| `rocksdb.max-bytes-for-level-base` | 256MB | 512MB | 读取性能 |
+| `rocksdb.level0-stop-writes-trigger` | 20 | 30 | 写入延迟 |
+
+### 13.3 内存配置优化
+
+```text
+TiKV 内存分配：
+  Block Cache: 
+    - 默认：总内存的 45%
+    - 优化：大型 OLAP 场景可增至 60%
+    - 配置：block-cache-size = "10GB"
+
+  Region Cache:
+    - 默认：总内存的 8%
+    - 优化：Region 数量多时增大
+    - 配置：region-cache-size = "2GB"
+
+  联合内存池:
+    - 默认：总内存的 25%
+    - 优化：复杂查询多时增大
+    - 配置：memory-pool-size = "4GB"
+```
+
+## 十四、TiDB 生产问题排查指南
+
+### 14.1 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 写入变慢 | Region 热点 | 查看 PD 热点监控 | 打散热点 Region |
+| 查询超时 | 执行计划错误 | EXPLAIN ANALYZE 分析 | 强制使用索引 |
+| OOM | 大事务/大查询 | 查看内存监控 | 拆分事务/限制内存 |
+| 延迟抖动 | GC 风暴 | 查看 GC 监控 | 调整 GC 参数 |
+| 连接数过高 | 连接池配置 | 查看连接数监控 | 调整连接池大小 |
+
+### 14.2 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|写入慢| C[检查 Region 热点]
+    B -->|查询慢| D[分析执行计划]
+    B -->|OOM| E[检查内存使用]
+    C --> F[查看 PD 调度日志]
+    D --> G[EXPLAIN ANALYZE]
+    E --> H[查看 TiKV 内存]
+    F --> I[调整调度参数]
+    G --> J[优化 SQL/索引]
+    H --> K[调整内存配置]
+    I --> L[验证恢复]
+    J --> L
+    K --> L
+```
+
+### 14.3 监控关键指标
+
+```yaml
+# Prometheus 告警规则示例
+groups:
+  - name: tidb-alerts
+    rules:
+      - alert: TiDB_WriteSlow
+        expr: rate(tidb_session_transaction_duration_seconds_sum[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TiDB 写入变慢"
+          
+      - alert: TiKV_RegionHot
+        expr: tikv_store_size_bytes > 10737418240  # 10GB
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TiKV Region 热点"
+          
+      - alert: TiFlash_SyncDelay
+        expr: tiflash_proxy_raft_apply_duration_seconds > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TiFlash 同步延迟"
+```
+
+## 十五、TiDB 架构设计最佳实践
+
+### 15.1 数据库架构设计
+
+| 设计原则 | 说明 | 实践建议 |
+|----------|------|----------|
+| 水平扩展 | 按 Region 自动分片 | 无需手动分片 |
+| 高可用 | 3 副本 Raft | 至少 3 节点 |
+| 读写分离 | TiFlash 列存 | OLAP 走 TiFlash |
+| 冷热分离 | 数据生命周期 | 热数据在 SSD |
+
+### 15.2 应用架构集成
+
+```text
+应用架构模式：
+  1. 直连模式
+     - 应用直连 TiDB
+     - 简单高效
+     - 适合小规模
+
+  2. 代理模式
+     - 通过 ProxySQL/HAProxy
+     - 连接池/读写分离
+     - 适合大规模
+
+  3. 微服务模式
+     - 每个服务独立连接
+     - 数据库连接池
+     - 适合微服务架构
+```
+
+### 15.3 迁移架构设计
+
+```mermaid
+flowchart TD
+    A[源 MySQL] --> B[全量迁移]
+    B --> C[增量同步]
+    C --> D[TiDB]
+    D --> E[双写验证]
+    E --> F[切换流量]
+    F --> G[下线 MySQL]
+    
+    subgraph 迁移工具
+        B -->|DM 全量| H[Data Migration]
+        C -->|DM 增量| H
+        E -->|同步比对| I[数据校验]
+    end
+```
+
 ## 十一、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

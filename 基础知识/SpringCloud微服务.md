@@ -1989,7 +1989,380 @@ flowchart LR
 | mTLS | 双向认证 | 服务间安全 |
 | RBAC | 角色权限 | 细粒度控制 |
 
-## 二十八、与其他板块的关系
+## 二十八、微服务监控体系全景
+
+### 28.1 三大支柱对比
+
+| 监控支柱 | 工具 | 数据类型 | 存储 | 查询语言 |
+|----------|------|----------|------|----------|
+| Metrics（指标） | Prometheus | 数值时间序列 | TSDB | PromQL |
+| Logging（日志） | ELK/Loki | 文本日志 | ES/S3 | LogQL/KQL |
+| Tracing（链路） | Jaeger/Zipkin | 分布式链路 | ES/内存 | TraceQL |
+
+```mermaid
+graph TB
+    subgraph 应用层
+        APP1[服务A]
+        APP2[服务B]
+        APP3[服务C]
+    end
+    subgraph 采集层
+        PROM[Prometheus<br/>指标采集]
+        FLUENT[Fluent Bit<br/>日志采集]
+        OTEL[OTel Agent<br/>链路采集]
+    end
+    subgraph 存储层
+        MIMO[Mimir<br/>指标存储]
+        LOKI[Loki<br/>日志存储]
+        TEMPO[Tempo<br/>链路存储]
+    end
+    subgraph 展示层
+        GRAFANA[Grafana<br/>统一可视化]
+    end
+    APP1 --> PROM
+    APP2 --> FLUENT
+    APP3 --> OTEL
+    PROM --> MIMO
+    FLUENT --> LOKI
+    OTEL --> TEMPO
+    MIMO --> GRAFANA
+    LOKI --> GRAFANA
+    TEMPO --> GRAFANA
+```
+
+### 28.2 Micrometer Tracing 集成
+
+```java
+// 1. 添加依赖
+// spring-cloud-starter-zipkin
+// spring-boot-starter-actuator
+
+// 2. 配置
+management:
+  tracing:
+    sampling:
+      probability: 1.0  // 采样率100%
+  zipkin:
+    tracing:
+      endpoint: http://zipkin:9411/api/v2/spans
+
+// 3. 自定义Span
+@Service
+public class OrderService {
+    @Autowired
+    private Tracer tracer;
+    
+    public Order createOrder(OrderRequest req) {
+        Span span = tracer.nextSpan().name("createOrder");
+        try (Tracer.SpanInScope ws = tracer.withSpan(span.start())) {
+            span.tag("userId", req.getUserId());
+            span.event("validation_passed");
+            // 业务逻辑
+            return orderRepository.save(order);
+        } finally {
+            span.end();
+        }
+    }
+}
+```
+
+### 28.3 Grafana Dashboard 关键面板
+
+| 面板 | 指标 | 告警阈值 |
+|------|------|----------|
+| 服务可用性 | 成功请求/总请求 | <99.9% |
+| P99延迟 | http_server_requests_seconds | >500ms |
+| 错误率 | 错误请求/总请求 | >1% |
+| GC暂停 | jvm_gc_pause_seconds | >200ms |
+| 线程池 | 线程活跃数/最大数 | >80% |
+| 连接池 | 活跃连接/最大连接 | >80% |
+
+---
+
+## 二十九、微服务安全体系深度
+
+### 29.1 安全架构全景
+
+```mermaid
+graph LR
+    subgraph 外部流量
+        CLIENT[客户端]
+    end
+    subgraph 安全边界
+        WAF[WAF<br/>Web防火墙]
+        GW[API网关<br/>认证鉴权]
+    end
+    subgraph 服务网格
+        SVC_A[服务A]
+        SVC_B[服务B]
+        SVC_C[服务C]
+    end
+    subgraph 安全组件
+        OAUTH[OAuth2 Server]
+        VAULT[Vault<br/>密钥管理]
+        RBAC[RBAC权限中心]
+    end
+    CLIENT --> WAF
+    WAF --> GW
+    GW -->|JWT验证| SVC_A
+    GW -->|JWT验证| SVC_B
+    SVC_A -->|mTLS| SVC_B
+    SVC_B -->|mTLS| SVC_C
+    SVC_A --> OAUTH
+    OAUTH --> VAULT
+    GW --> RBAC
+```
+
+### 29.2 mTLS 服务间认证
+
+```yaml
+# Istio mTLS 配置
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT  # 强制mTLS
+---
+# 服务间调用示例
+# 调用方自动携带证书，被调用方验证证书
+# 无需修改业务代码，Sidecar自动处理
+```
+
+### 29.3 权限模型对比
+
+| 模型 | 核心思想 | 适用场景 | 复杂度 |
+|------|----------|----------|--------|
+| RBAC | 角色→权限 | 企业内部系统 | 低 |
+| ABAC | 属性→策略 | 细粒度控制 | 高 |
+| ReBAC | 关系→权限 | 社交/协作系统 | 中 |
+| PBAC | 策略→权限 | 动态权限 | 高 |
+
+```java
+// RBAC 实现示例
+@Entity
+public class Role {
+    @Id
+    private String name;
+    @ManyToMany
+    private Set<Permission> permissions;
+}
+
+@Entity
+public class UserRole {
+    @ManyToOne
+    private User user;
+    @ManyToOne
+    private Role role;
+    private String scope; // 作用域：全局/部门/项目
+}
+
+// 权限检查
+@PreAuthorize("hasRole('ADMIN') or hasPermission(#resource, 'WRITE')")
+public void updateResource(Resource resource) {
+    // 业务逻辑
+}
+```
+
+---
+
+## 三十、微服务配置管理最佳实践
+
+### 30.1 配置分层模型
+
+```text
+配置优先级（从低到高）：
+  1. application.yml（默认配置）
+  2. application-{profile}.yml（环境配置）
+  3. Nacos远程配置（配置中心）
+  4. 环境变量（部署时注入）
+  5. 命令行参数（最高优先级）
+  
+命名规范：
+  服务名-profile.yml → order-service-dev.yml
+  分组：DEFAULT_GROUP / 按业务线分组
+  命名空间：dev / test / staging / prod
+```
+
+### 30.2 配置加密方案
+
+```yaml
+# Nacos配置加密（Jasypt集成）
+spring:
+  cloud:
+    nacos:
+      config:
+        server-addr: nacos:8848
+        # 配置内容使用ENC()加密
+        # 数据库密码：ENC(加密后的密文)
+
+# Jasypt密钥管理
+jasypt:
+  encryptor:
+    password: ${JASYPT_KEY}  # 密钥从环境变量获取
+    algorithm: PBEWithMD5AndDES
+```
+
+### 30.3 配置变更通知流程
+
+```mermaid
+sequenceDiagram
+    participant 开发者
+    participant Nacos
+    participant ConfigWatcher
+    participant 应用服务
+    开发者->>Nacos: 修改配置
+    Nacos->>ConfigWatcher: 长轮询推送变更
+    ConfigWatcher->>应用服务: 触发@RefreshScope
+    应用服务->>应用服务: 重新加载Bean
+    应用服务->>应用服务: 打印变更日志
+    Note over 应用服务: 无需重启，热生效
+```
+
+---
+
+## 三十一、微服务部署与运维
+
+### 31.1 部署策略对比
+
+| 策略 | 描述 | 风险 | 回滚速度 | 适用场景 |
+|------|------|------|----------|----------|
+| 滚动更新 | 逐个替换实例 | 中 | 快 | 常规发布 |
+| 蓝绿部署 | 两套环境切换 | 低 | 极快 | 关键服务 |
+| 金丝雀 | 小比例试运行 | 极低 | 快 | 高风险变更 |
+| A/B测试 | 按用户分流 | 低 | 快 | 功能验证 |
+| 影子模式 | 生产流量复制 | 极低 | 极快 | 性能测试 |
+
+### 31.2 Kubernetes 部署配置
+
+```yaml
+# Deployment配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    spec:
+      containers:
+      - name: order-service
+        image: order-service:1.0.0
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 15
+```
+
+### 31.3 服务降级策略
+
+| 降级级别 | 策略 | 触发条件 | 恢复条件 |
+|----------|------|----------|----------|
+| L1-警告 | 告警通知 | 错误率>5% | 错误率<2% |
+| L2-限流 | 令牌桶限流 | QPS>阈值 | QPS<阈值 |
+| L3-熔断 | 断路器打开 | 错误率>50% | 半开成功 |
+| L4-降级 | 返回兜底数据 | 超时>3s | 服务恢复 |
+| L5-隔离 | 线程池隔离 | 线程池满 | 线程池空闲 |
+
+---
+
+## 三十二、微服务测试策略
+
+### 32.1 测试金字塔
+
+```text
+         /\
+        /  \  E2E测试（少量）
+       /----\
+      /      \  集成测试（适量）
+     /--------\
+    /          \  单元测试（大量）
+   /------------\
+  
+  单元测试：Mock外部依赖，验证业务逻辑
+  集成测试：验证服务间协作、数据库交互
+  E2E测试：验证完整用户流程
+```
+
+### 32.2 测试工具矩阵
+
+| 测试类型 | 工具 | 特点 | 执行环境 |
+|----------|------|------|----------|
+| 单元测试 | JUnit 5 + Mockito | 快速、隔离 | 本地 |
+| 集成测试 | Testcontainers | 真实依赖容器 | 本地/CI |
+| API测试 | RestAssured | HTTP接口验证 | 本地/CI |
+| 契约测试 | Pact | 消费者驱动 | CI |
+| 性能测试 | Gatling/JMeter | 高并发模拟 | 独立环境 |
+
+---
+
+## 三十三、微服务性能优化
+
+### 33.1 性能瓶颈分析
+
+| 瓶颈 | 现象 | 排查工具 | 优化方案 |
+|------|------|----------|----------|
+| 线程池满 | 请求排队、超时 | jstack/Arthas | 调整线程池参数 |
+| 连接池耗尽 | 获取连接超时 | HikariCP监控 | 增加最大连接数 |
+| GC停顿 | 响应延迟飙升 | GC日志/JFR | 调整堆大小/GC算法 |
+| 网络延迟 | 跨机房调用慢 | 链路追踪 | 就近部署/缓存 |
+| 数据库慢查询 | SQL执行慢 | 慢查询日志 | 优化SQL/加索引 |
+
+### 33.2 连接池优化配置
+
+```yaml
+# HikariCP连接池优化
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      idle-timeout: 30000
+      max-lifetime: 1800000
+      connection-timeout: 30000
+      leak-detection-threshold: 60000
+      pool-name: HikariPool-OrderService
+      data-source-properties:
+        cachePrepStmts: true
+        prepStmtCacheSize: 250
+        prepStmtCacheSqlLimit: 2048
+        useServerPrepStmts: true
+```
+
+### 33.3 缓存策略
+
+| 缓存层级 | 工具 | 延迟 | 一致性 | 适用场景 |
+|----------|------|------|--------|----------|
+| 本地缓存 | Caffeine | 纳秒级 | 弱 | 热点数据 |
+| 分布式缓存 | Redis | 毫秒级 | 中 | 共享数据 |
+| 数据库缓存 | MySQL Query Cache | 毫秒级 | 强 | 查询结果 |
+| CDN缓存 | Nginx/CDN | 毫秒级 | 弱 | 静态资源 |
+
+---
+
+## 与其他板块的关系
 
 - Redis 知识见「[基础知识/redis知识](redis知识.md)」；
 - 大数据链路见「[大数据/08-流处理计算：Flink](大数据/08-流处理计算：Flink.md)」；

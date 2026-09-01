@@ -2021,7 +2021,70 @@ flowchart LR
 | Failed Tasks | 失败Task数 | > 5% |
 | Peak Execution Memory | 峰值内存 | > 80%堆 |
 
-## 三十、与其他板块的关系
+## 三十、Spark 与 Iceberg/Paimon 集成
+
+### 30.1 Spark + Iceberg 集成
+
+```sql
+-- Spark SQL 配置 Iceberg
+SET spark.sql.catalog.catalog1 = org.apache.iceberg.spark.SparkCatalog
+SET spark.sql.catalog.catalog1.type = hdfs
+SET spark.sql.catalog.catalog1.warehouse = hdfs://warehouse
+
+-- 创建Iceberg表
+CREATE TABLE catalog1.db.events (
+    event_id BIGINT,
+    user_id BIGINT,
+    event_type STRING,
+    event_time TIMESTAMP
+) USING iceberg
+PARTITIONED BY (days(event_time));
+
+-- 读写操作
+INSERT INTO catalog1.db.events VALUES (1, 100, 'click', current_timestamp());
+SELECT * FROM catalog1.db.events WHERE event_time > '2025-01-01';
+
+-- 时间旅行
+SELECT * FROM catalog1.db.events FOR SYSTEM_TIME AS OF '2025-01-15 10:00:00';
+```
+
+### 30.2 Spark + Paimon 集成
+
+```sql
+-- Paimon 表配置
+CREATE TABLE catalog1.db.user_actions (
+    user_id BIGINT,
+    action_type STRING,
+    action_time TIMESTAMP,
+    payload STRING
+) USING paimon
+TBLPROPERTIES (
+    'primary-key' = 'user_id, action_time',
+    'bucket' = '4',
+    'changelog-producer' = 'input'
+);
+
+-- 流批一体查询
+-- 批量模式
+SELECT user_id, count(*) FROM catalog1.db.user_actions GROUP BY user_id;
+
+-- 流模式
+SELECT * FROM catalog1.db.user_actions /*+ OPTIONS('scan.startup.mode' = 'latest-offset') */;
+```
+
+### 30.3 Spark 性能调优矩阵
+
+| 调优维度 | 配置项 | 默认值 | 推荐值 | 效果 |
+|----------|--------|--------|--------|------|
+| 分区数 | spark.sql.shuffle.partitions | 200 | CPU核数×2~3 | 并行度 |
+| 缓存 | spark.sql.inMemoryColumnarStorage.compressed | true | true | 内存效率 |
+| 广播 | spark.sql.autoBroadcastJoinThreshold | 10MB | 50MB | 避免Shuffle |
+| 序列化 | spark.serializer | JavaSerializer | KryoSerializer | 性能 |
+| 压缩 | spark.rdd.compress | false | true | 内存 |
+
+---
+
+## 与其他板块的关系
 
 - 流处理对比见「[08-流处理计算：Flink](08-流处理计算：Flink.md)」；
 - 文件格式/表格式见「[05-列式存储与数据湖格式](05-列式存储与数据湖格式.md)」；

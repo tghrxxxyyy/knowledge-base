@@ -2059,4 +2059,218 @@ flowchart TD
 - 分库分表（binlog 迁移）见「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；
 - 云上数据同步见「[云上数据库与缓存生态](./云上数据库与缓存生态.md)」。
 
+---
+
+## Debezium 内部机制深度剖析
+
+### CDC 数据流架构
+
+```mermaid
+flowchart TD
+    A[源数据库] --> B[Debezium Connector]
+    B --> C[Kafka Connect]
+    C --> D[Kafka Topic]
+    D --> E[Sink Connector]
+    E --> F[目标系统]
+    
+    subgraph Debezium
+        B --> G[Source Connector]
+        G --> H[增量快照]
+        G --> I[日志读取]
+    end
+```
+
+### 变更事件格式
+
+```json
+{
+  "before": {
+    "id": 1,
+    "name": "Alice",
+    "age": 30
+  },
+  "after": {
+    "id": 1,
+    "name": "Alice",
+    "age": 31
+  },
+  "source": {
+    "version": "2.4.0",
+    "connector": "mysql",
+    "name": "my-connector",
+    "ts_ms": 1704067200000,
+    "db": "mydb",
+    "table": "users"
+  },
+  "op": "u",
+  "ts_ms": 1704067200000
+}
+```
+
+### Debezium 连接器类型
+
+| 连接器 | 支持数据库 | 协议 | 特点 |
+|--------|------------|------|------|
+| MySQL | MySQL/MariaDB | binlog | 最成熟 |
+| PostgreSQL | PostgreSQL | WAL | 支持逻辑复制 |
+| MongoDB | MongoDB | Oplog | 文档变更 |
+| SQL Server | SQL Server | LSCN | 企业级 |
+| Oracle | Oracle | LogMiner | 企业级 |
+
+## Debezium 性能调优实战
+
+### 连接器配置优化
+
+| 配置项 | 默认值 | 优化建议 | 影响范围 |
+|--------|--------|----------|----------|
+| `snapshot.mode` | initial | incremental | 首次快照 |
+| `poll.interval.ms` | 500 | 1000~2000 | 延迟 |
+| `batch.size` | 2048 | 4096~8192 | 吞吐量 |
+| `max.batch.size` | 1024 | 2048~4096 | 批处理 |
+
+### Kafka 配置优化
+
+```properties
+# Kafka Producer 优化
+batch.size=65536
+linger.ms=10
+compression.type=lz4
+acks=all
+retries=3
+
+# Kafka Consumer 优化
+fetch.min.bytes=1
+fetch.max.wait.ms=500
+max.poll.records=500
+```
+
+### 数据格式优化
+
+```json
+// Debezium 消息格式优化
+{
+  "schema": {
+    "type": "struct",
+    "fields": [...]
+  },
+  "payload": {
+    "before": {...},
+    "after": {...},
+    "source": {...},
+    "op": "u",
+    "ts_ms": 1704067200000
+  }
+}
+```
+
+## Debezium 生产问题排查指南
+
+### 常见问题与解决方案
+
+| 问题现象 | 可能原因 | 排查步骤 | 解决方案 |
+|----------|----------|----------|----------|
+| 连接失败 | 数据库权限 | 检查用户权限 | 授权 |
+| 位点丢失 | binlog清理 | 检查binlog | 重新快照 |
+| 内存溢出 | 快照数据量大 | 检查配置 | 增量快照 |
+| 延迟高 | 消费能力不足 | 检查lag | 增加task |
+| 数据不一致 | DDL变更 | 检查日志 | 重启connector |
+
+### 故障排查流程
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|连接失败| C[检查权限]
+    B -->|位点丢失| D[检查binlog]
+    B -->|内存溢出| E[检查配置]
+    C --> F[查看数据库日志]
+    D --> G[查看binlog状态]
+    E --> H[查看JVM内存]
+    F --> I[修复权限]
+    G --> J[重新快照]
+    H --> K[调整配置]
+    I --> L[验证恢复]
+    J --> L
+    K --> L
+```
+
+### 监控关键指标
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: debezium-alerts
+    rules:
+      - alert: Debezium_ConnectorDown
+        expr: debezium_connector_status != 1
+        for: 1m
+        labels:
+          severity: P0
+        annotations:
+          summary: "Debezium 连接器宕机"
+          
+      - alert: Debezium_HighLag
+        expr: debezium_source_connector_lag > 1000000
+        for: 5m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Debezium 消费延迟"
+          
+      - alert: Debezium_ErrorRate
+        expr: rate(debezium_source_connector_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Debezium 错误率高"
+```
+
+## Debezium 架构设计最佳实践
+
+### 高可用架构
+
+| 架构模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| 单机模式 | 单实例部署 | 开发测试 |
+| 集群模式 | 多实例集群 | 生产环境 |
+| 主备模式 | 主备切换 | 高可用 |
+| 多区域 | 跨区域部署 | 容灾 |
+
+### 应用架构集成
+
+```text
+应用架构模式：
+  1. 直连模式
+     - 应用直连 Debezium
+     - 简单高效
+     - 适合小规模
+
+  2. 管道模式
+     - Debezium + Kafka
+     - 数据管道
+     - 适合数据集成
+
+  3. 流处理模式
+     - Debezium + Flink
+     - 实时处理
+     - 适合事件驱动
+```
+
+### 容灾架构设计
+
+```mermaid
+flowchart TD
+    A[主集群] --> B[跨集群复制]
+    B --> C[备集群]
+    C --> D[故障切换]
+    D --> E[流量切换]
+    E --> F[数据恢复]
+    
+    subgraph 复制策略
+        B -->|异步复制| G[低延迟]
+        B -->|同步复制| H[零丢失]
+    end
+```
+
 > 一句话：**Debezium = Kafka Connect + 多数据库（binlog/WAL）+ 快照增量一体 + 标准变更事件（before/after/op）；选型先看「数据库（多库→Debezium，纯 MySQL→Canal）」，再定「出口（Kafka→Connect，SQL 数仓→Flink CDC）」，最后配「ROW 格式 + 增量快照 + 幂等 Sink + lag 监控」**。

@@ -1279,6 +1279,59 @@ df.write
 | 并行度 | spark.cassandra.output.concurrent.writes |
 | 压缩 | spark.cassandra.output.compression.level |
 
+## 二十六、Cassandra 数据建模最佳实践
+
+### 26.1 数据模型设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| 查询优先 | 按查询模式设计表 | 先确定查询，再设计表 |
+| 最小化分区 | 控制分区大小<100MB | 避免大分区 |
+| 反范式化 | 允许数据冗余 | 空间换时间 |
+| 分区键设计 | 均匀分布数据 | 使用复合分区键 |
+
+### 26.2 常见数据模型
+
+```sql
+-- 时序数据模型
+CREATE TABLE sensor_data (
+    sensor_id UUID,
+    event_time TIMESTAMP,
+    temperature DOUBLE,
+    humidity DOUBLE,
+    PRIMARY KEY (sensor_id, event_time)
+) WITH CLUSTERING ORDER BY (event_time DESC);
+
+-- 用户行为模型
+CREATE TABLE user_events (
+    user_id UUID,
+    event_date DATE,
+    event_time TIMESTAMP,
+    event_type TEXT,
+    event_data MAP<TEXT, TEXT>,
+    PRIMARY KEY ((user_id, event_date), event_time)
+) WITH CLUSTERING ORDER BY (event_time DESC);
+
+-- 社交关系模型
+CREATE TABLE user_friends (
+    user_id UUID,
+    friend_id UUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY (user_id, friend_id)
+);
+```
+
+### 26.3 反模式识别
+
+| 反模式 | 问题 | 解决方案 |
+|--------|------|----------|
+| 高基数分区 | 分区过大 | 限制分区大小 |
+| 时间戳作为分区键 | 数据倾斜 | 使用复合分区键 |
+| 多表关联 | Cassandra不支持JOIN | 反范式化 |
+| 全表扫描 | 性能极差 | 使用索引/物化视图 |
+
+---
+
 ## 十四、与其他板块的关系
 
 - HBase 对比见「[HBase 列式存储](./HBase列式存储.md)」；

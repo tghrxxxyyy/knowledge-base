@@ -2073,6 +2073,254 @@ Resources:
 
 ---
 
+## Serverless 内部机制深度剖析
+
+### 冷启动机制详解
+
+| 冷启动类型 | 触发条件 | 耗时范围 | 优化策略 |
+|------------|----------|----------|----------|
+| 首次冷启动 | 新实例创建 | 1~10s | 预置并发 |
+| 闲置冷启动 | 实例回收后 | 1~5s | 保温策略 |
+| 版本冷启动 | 新版本发布 | 1~10s | 灰度发布 |
+| 区域冷启动 | 跨区域调用 | 1~10s | 就近部署 |
+
+```text
+冷启动优化策略：
+  1. 预置并发（Provisioned Concurrency）
+     - 预先初始化实例
+     - 消除冷启动延迟
+     - 成本：常驻费用
+
+  2. 保温策略（Keep Warm）
+     - 定时触发保活
+     - 避免实例回收
+     - 成本：定时触发费用
+
+  3. SnapStart（AWS Lambda）
+     - 快照恢复技术
+     - 冷启动降至200ms
+     - 支持：Java/Python
+
+  4. 代码优化
+     - 减少依赖
+     - 延迟初始化
+     - 二进制打包
+```
+
+### 事件源映射机制
+
+| 事件源 | 触发方式 | 并发控制 | 适用场景 |
+|--------|----------|----------|----------|
+| API Gateway | HTTP 请求 | 按需扩展 | Web API |
+| S3 | 对象创建/删除 | 事件驱动 | 文件处理 |
+| SQS | 消息到达 | 批处理 | 消息处理 |
+| DynamoDB | 数据变更 | 流式处理 | 数据同步 |
+| Kinesis | 数据流 | 批量拉取 | 流处理 |
+| EventBridge | 定时/事件 | 按需扩展 | 定时任务 |
+
+### Step Functions 工作流
+
+```json
+// Step Functions 状态机定义
+{
+  "Comment": "订单处理流程",
+  "StartAt": "ValidateOrder",
+  "States": {
+    "ValidateOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:validate-order",
+      "Next": "ProcessPayment"
+    },
+    "ProcessPayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:process-payment",
+      "Next": "FulfillOrder"
+    },
+    "FulfillOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:fulfill-order",
+      "End": true
+    }
+  }
+}
+```
+
+## Serverless 性能调优实战
+
+### 函数配置调优
+
+| 配置项 | 默认值 | 优化建议 | 影响范围 |
+|--------|--------|----------|----------|
+| 内存 | 128MB | 512MB~1GB | CPU/网络 |
+| 超时 | 3s | 30~300s | 长任务 |
+| 并发 | 1000 | 3000~10000 | 吞吐量 |
+| 批大小 | 1 | 10~100 | 批处理 |
+
+### 内存与 CPU 关系
+
+```text
+AWS Lambda 内存-CPU 对应关系：
+  128MB  → 0.08 vCPU
+  256MB  → 0.17 vCPU
+  512MB  → 0.33 vCPU
+  1024MB → 0.58 vCPU
+  2048MB → 1.17 vCPU
+  4096MB → 2.33 vCPU
+  8192MB → 4.67 vCPU
+  10240MB → 6 vCPU
+  
+  经验法则：
+  - 计算密集型：内存/CPU 比例低
+  - IO 密集型：内存/CPU 比例高
+  - 网络密集型：高内存 + 高网络
+```
+
+### 连接池优化
+
+```python
+# Python Lambda 连接池优化
+import boto3
+from botocore.config import Config
+
+# 全局连接池（复用执行上下文）
+config = Config(
+    max_pool_connections=25,
+    connect_timeout=5,
+    read_timeout=10
+)
+
+# 复用客户端
+lambda_client = boto3.client('lambda', config=config)
+dynamodb = boto3.resource('dynamodb', config=config)
+
+def handler(event, context):
+    # 复用全局连接
+    response = lambda_client.invoke(
+        FunctionName='my-function',
+        Payload=json.dumps(event)
+    )
+    return response
+```
+
+## Serverless 安全最佳实践
+
+### 安全配置矩阵
+
+| 安全领域 | 配置项 | 最佳实践 |
+|----------|--------|----------|
+| 身份认证 | IAM 角色 | 最小权限 |
+| 网络安全 | VPC 配置 | 私有子网 |
+| 数据加密 | 环境变量 | 加密存储 |
+| 密钥管理 | Secrets Manager | 动态轮换 |
+| 代码安全 | 依赖扫描 | 定期更新 |
+
+### IAM 角色设计
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/my-table"
+    }
+  ]
+}
+```
+
+## Serverless 监控与可观测性
+
+### 监控指标体系
+
+| 指标类型 | 指标名称 | 告警阈值 | 处理方式 |
+|----------|----------|----------|----------|
+| 性能 | Duration | > 5s | 优化代码 |
+| 性能 | Throttles | > 0 | 增加并发 |
+| 错误 | Errors | > 0 | 修复代码 |
+| 成本 | Invocations | 异常增长 | 检查触发 |
+| 资源 | Memory | > 80% | 增加内存 |
+
+### 告警规则设计
+
+```yaml
+# CloudWatch 告警规则
+Resources:
+  HighErrorRate:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "函数错误率过高"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: my-function
+          
+  HighLatency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "函数延迟过高"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+```
+
+## Serverless 成本优化策略
+
+### 成本模型分析
+
+| 成本项 | 计费方式 | 优化策略 |
+|--------|----------|----------|
+| 请求费用 | 按请求数 | 减少调用 |
+| 执行费用 | 按时长 | 优化代码 |
+| 内存费用 | 按配置 | 合理配置 |
+| 存储费用 | 按容量 | 清理数据 |
+
+### 成本优化技巧
+
+```text
+成本优化策略：
+  1. 内存优化
+     - 测试不同内存配置
+     - 找到性价比最优
+     - 避免过度配置
+
+  2. 并发优化
+     - 使用预留并发
+     - 避免冷启动
+     - 减少初始化
+
+  3. 架构优化
+     - 合并小函数
+     - 减少调用次数
+     - 使用批处理
+
+  4. 缓存优化
+     - 使用 ElastiCache
+     - 减少数据库调用
+     - 缓存频繁访问数据
+```
+
 ## 三十九、与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；

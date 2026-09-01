@@ -1521,6 +1521,37 @@ listen stats
     审计日志：记录所有操作
 ```
 
+## HAProxy 故障排查与性能调优
+
+### 故障排查工具
+
+```bash
+# 状态检查
+haproxy -c -f /etc/haproxy/haproxy.cfg  # 配置检查
+echo "show stat" | socat stdio /var/run/haproxy.sock  # 后端状态
+echo "show errors" | socat stdio /var/run/haproxy.sock  # 错误日志
+echo "show info" | socat stdio /var/run/haproxy.sock  # 运行信息
+
+# 连接调试
+echo "show sess" | socat stdio /var/run/haproxy.sock  # 会话列表
+echo "show servers state" | socat stdio /var/run/haproxy.sock  # 后端状态
+```
+
+### 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| maxconn | 4096 | 50000 | 最大连接数 |
+| nbthread | 1 | CPU核数 | 线程数 |
+| spread-checks | 0 | 2 | 检查间隔(10ms) |
+| timeout connect | 5s | 3s | 连接超时 |
+| timeout client | 50s | 30s | 客户端超时 |
+| timeout server | 50s | 30s | 后端超时 |
+| timeout http-keep-alive | 1m | 10s | Keep-Alive超时 |
+| timeout http-request | 10s | 5s | 请求超时 |
+
+---
+
 ## 十五、HAProxy+Keepalived高可用配置
 
 ### 15.1 Keepalived配置

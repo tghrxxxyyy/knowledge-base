@@ -1941,6 +1941,94 @@ http:
 }
 ```
 
+## 二十四、InfluxDB 数据建模最佳实践
+
+### 24.1 数据模型设计原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| Tag用高基维度 | Tag用于过滤和分组 | device_id, region |
+| Field用低基维度 | Field存储数值数据 | temperature, humidity |
+| 避免高基Tag | Tag基数过高影响性能 | ❌ user_id作为Tag |
+| 合理设计Measurement | 按业务域划分 | cpu_usage, network_io |
+
+```text
+数据模型设计示例：
+  Measurement: server_metrics
+    Tags:
+      - host (服务器名)
+      - datacenter (数据中心)
+      - environment (环境)
+    Fields:
+      - cpu_usage (CPU使用率)
+      - memory_usage (内存使用率)
+      - disk_io (磁盘IO)
+      - network_in (网络入流量)
+    Timestamp: nanosecond precision
+
+避免的设计：
+  ❌ Tag: request_id (高基维度，每请求唯一)
+  ❌ Tag: timestamp (时间戳不应作为Tag)
+  ❌ Field: device_id (ID应作为Tag)
+```
+
+### 24.2 降采样策略
+
+```sql
+-- 创建连续查询（自动降采样）
+CREATE CONTINUOUS QUERY "cq_1h" ON "mydb"
+BEGIN
+  SELECT mean("cpu_usage") AS "avg_cpu",
+         max("cpu_usage") AS "max_cpu",
+         min("cpu_usage") AS "min_cpu"
+  INTO "1h_metrics"
+  FROM "server_metrics"
+  GROUP BY time(1h), "host", "datacenter"
+END
+
+-- 数据保留策略
+CREATE RETENTION POLICY "30d" ON "mydb" DURATION 30d REPLICATION 1
+CREATE RETENTION POLICY "1y" ON "mydb" DURATION 365d REPLICATION 1
+
+-- 自动数据迁移
+ALTER RETENTION POLICY "default" ON "mydb" DURATION 7d
+ALTER CONTINUOUS QUERY "cq_1h" ON "mydb" 
+  RESAMPLE EVERY 1h FOR 4h
+```
+
+### 24.3 InfluxDB v2.x FLUX查询示例
+
+```flux
+// 1. 基础查询
+from(bucket: "mydb")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "server_metrics")
+  |> filter(fn: (r) => r._field == "cpu_usage")
+  |> mean()
+
+// 2. 多维度聚合
+from(bucket: "mydb")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "server_metrics")
+  |> group(columns: ["host", "datacenter"])
+  |> aggregateWindow(every: 1h, fn: mean)
+
+// 3. 异常检测（超出阈值）
+from(bucket: "mydb")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "server_metrics")
+  |> filter(fn: (r) => r._field == "cpu_usage")
+  |> filter(fn: (r) => r._value > 80.0)
+
+// 4. 降采样查询
+from(bucket: "mydb")
+  |> range(start: -7d)
+  |> filter(fn: (r) => r._measurement == "1h_metrics")
+  |> aggregateWindow(every: 1d, fn: mean)
+```
+
+---
+
 ### IoT场景优化
 
 | 优化项 | 说明 | 配置 |

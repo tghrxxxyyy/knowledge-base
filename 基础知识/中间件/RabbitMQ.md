@@ -2037,4 +2037,62 @@ rabbitmqctl set_policy ha-all "^" '{"ha-mode":"all","ha-sync-mode":"automatic"}'
 
 ---
 
+## 三十一、RabbitMQ 消息模型深度
+
+### 31.1 消息投递模式
+
+| 模式 | 说明 | 可靠性 | 适用场景 |
+|------|------|--------|----------|
+| Fire-and-Forget | 发送即忘 | 低 | 日志收集 |
+| Publisher Confirm | 发布确认 | 高 | 关键业务 |
+| Transaction | 事务消息 | 最高 | 金融交易 |
+| Return Callback | 退回回调 | 高 | 路由失败处理 |
+
+### 31.2 消费模式对比
+
+| 模式 | 自动ACK | 手动ACK | 说明 |
+|------|---------|---------|------|
+| 自动确认 | 是 | 否 | 消息即删除，可能丢失 |
+| 手动确认 | 否 | 是 | 处理完才删除，可靠 |
+| 拒绝确认 | 否 | 拒绝 | 重新入队或进入死信 |
+
+### 31.3 死信队列（DLX）配置
+
+```java
+// 死信队列配置
+@Bean
+public Queue orderQueue() {
+    Map<String, Object> args = new HashMap<>();
+    args.put("x-dead-letter-exchange", "dlx.exchange");
+    args.put("x-dead-letter-routing-key", "dlx.order");
+    return new Queue("order.queue", true, false, false, args);
+}
+
+@Bean
+public Binding orderBinding() {
+    return BindingBuilder.bind(orderQueue())
+        .to(orderExchange())
+        .with("order.#");
+}
+
+// 消费失败处理
+@RabbitListener(queues = "order.queue")
+public void handleMessage(Message message, Channel channel) {
+    try {
+        // 处理消息
+        processMessage(message);
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+    } catch (Exception e) {
+        // 拒绝消息，进入死信队列
+        channel.basicNack(
+            message.getMessageProperties().getDeliveryTag(),
+            false,
+            false  // 不重新入队
+        );
+    }
+}
+```
+
+---
+
 ## 三十一、与其他板块的关系
