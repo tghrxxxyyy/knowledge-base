@@ -2824,6 +2824,170 @@ spec:
 }
 ```
 
+## 三十八-1、Serverless 进阶与实战
+
+### 38-1.1 Lambda 事件源配置详解
+
+| 事件源 | 配置要点 | 适用场景 |
+|--------|----------|----------|
+| API Gateway | REST/HTTP API | Web/移动端 |
+| S3 | PUT/POST 事件 | 文件处理 |
+| DynamoDB Streams | 增量数据捕获 | 数据同步 |
+| SQS/SNS | 消息驱动 | 异步处理 |
+| EventBridge | 定时/事件 | 定时任务 |
+| IoT Core | MQTT 消息 | IoT 数据处理 |
+
+### 38-1.2 Step Functions 工作流编排
+
+```json
+{
+  "StartAt": "ProcessData",
+  "States": {
+    "ProcessData": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:ProcessData",
+      "Next": "CheckResult"
+    },
+    "CheckResult": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.status",
+          "StringEquals": "SUCCESS",
+          "Next": "NotifySuccess"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:NotifySuccess",
+      "End": true
+    }
+  }
+}
+```
+
+### 38-1.3 冷启动优化策略
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| Provisioned Concurrency | 预热实例 | 消除冷启动 |
+| SnapStart | 快照恢复 | 减少 90% 冷启动 |
+| 最小化依赖 | 精简包大小 | 减少初始化时间 |
+| 连接复用 | 外部连接池 | 减少初始化开销 |
+| Lambda Layers | 共享依赖 | 减少部署包大小 |
+
+### 38-1.4 Serverless 成本优化
+
+```text
+成本优化策略：
+  1. 内存调优
+     - 测试不同内存配置的性价比
+     - CPU 与内存成正比
+     - 找到最优内存配置
+
+  2. 执行时间优化
+     - 减少函数执行时间
+     - 优化代码逻辑
+     - 使用异步处理
+
+  3. 调用频率优化
+     - 合并小请求
+     - 使用批处理
+     - 缓存结果
+
+  4. 预留实例
+     - 稳定负载使用预留
+     - 波动负载使用按量
+     - 混合使用降低成本
+```
+
+### 38-1.5 Serverless 安全最佳实践
+
+| 安全措施 | 说明 | 配置 |
+|----------|------|------|
+| IAM 最小权限 | 函数仅访问必要资源 | IAM Policy 精细化 |
+| 环境变量加密 | 敏感信息加密 | KMS 加密 |
+| VPC 隔离 | 私有子网部署 | 配置 VPC |
+| 依赖扫描 | 第三方依赖漏洞 | Snyk/Trivy |
+| 代码签名 | 防止篡改 | AWS Signer |
+
+### 38-1.6 Serverless 监控与告警
+
+```yaml
+# CloudWatch 告警
+LambdaErrorAlarm:
+  Type: AWS::CloudWatch::Alarm
+  Properties:
+    AlarmDescription: "Lambda function error rate high"
+    MetricName: Errors
+    Namespace: AWS/Lambda
+    Statistic: Sum
+    Period: 60
+    EvaluationPeriods: 3
+    Threshold: 10
+    ComparisonOperator: GreaterThanThreshold
+    Dimensions:
+      - Name: FunctionName
+        Value: !Ref LambdaFunction
+```
+
+### 38-1.7 Knative 扩缩容配置
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+        autoscaling.knative.dev/target: "50"
+        autoscaling.knative.dev/window: "60s"
+    spec:
+      containers:
+        - image: my-image
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+```
+
+### 38-1.8 Serverless vs 容器 vs VM 对比
+
+| 维度 | Serverless | 容器 | VM |
+|------|-----------|------|-----|
+| 扩缩容 | 自动，毫秒级 | 自动，秒级 | 手动，分钟级 |
+| 计费 | 按调用计费 | 按实例计费 | 按实例计费 |
+| 冷启动 | 有 | 无 | 无 |
+| 运维 | 零运维 | 中等 | 高 |
+| 适用 | 事件驱动 | 长期运行 | 传统应用 |
+
+### 38-1.9 Serverless 2.0 趋势
+
+```text
+Serverless 2.0 特征：
+  1. 容器化运行时
+     - 支持任意容器镜像
+     - 不受限于特定运行时
+
+  2. 持久化执行
+     - 长时间运行任务
+     - 状态管理
+
+  3. 边缘计算
+     - Cloudflare Workers
+     - Vercel Edge Functions
+
+  4. AI/ML 集成
+     - GPU 函数
+     - 模型推理
+```
+
 ## 三十九、与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；

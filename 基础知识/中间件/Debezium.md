@@ -2749,4 +2749,133 @@ flowchart TD
     end
 ```
 
+## 四十、Debezium Server 部署与运维
+
+### 40.1 Debezium Server vs Kafka Connect 对比
+
+| 维度 | Debezium Server | Kafka Connect |
+|------|-----------------|---------------|
+| 依赖 | 独立运行 | 需 Kafka Connect 集群 |
+| 存储 | 本地文件/内存 | Kafka Topic |
+| 部署 | 单容器 | Connect 集群 |
+| 适用 | 中小规模 | 大规模生产 |
+| 灵活性 | 低 | 高（插件生态） |
+
+### 40.2 Debezium Server 环境变量配置
+
+```bash
+# 核心环境变量
+DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.mysql.MySqlConnector
+DEBEZIUM_SOURCE_DATABASE_HOSTNAME=mysql
+DEBEZIUM_SOURCE_DATABASE_PORT=3306
+DEBEZIUM_SOURCE_DATABASE_USER=debezium
+DEBEZIUM_SOURCE_DATABASE_PASSWORD=secret
+DEBEZIUM_SOURCE_DATABASE_SERVER_ID=184054
+DEBEZIUM_SOURCE_DATABASE_INCLUDE_LIST=inventory
+DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/debezium/data/offsets.dat
+DEBEZIUM_SINK_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+DEBEZIUM_SINK_KAFKA_TOPIC_PREFIX=cdc
+```
+
+### 40.3 Debezium 性能调优参数速查
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `poll.interval.ms` | 500 | 1000 | 轮询间隔 |
+| `max.batch.size` | 2048 | 4096 | 每批处理行数 |
+| `max.queue.size` | 8192 | 16384 | 内部队列大小 |
+| `heartbeat.interval.ms` | 0 | 10000 | 心跳间隔 |
+| `snapshot.mode` | initial | no_data | 快照模式 |
+
+### 40.4 Debezium 告警规则
+
+```yaml
+groups:
+  - name: debezium_alerts
+    rules:
+      - alert: DebeziumConnectorDown
+        expr: debezium_connector_status{status="UNASSIGNED"} == 1
+        for: 1m
+        labels:
+          severity: critical
+      - alert: DebeziumReplicationLag
+        expr: debezium_replication_lag_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+```
+
+### 40.5 Debezium 故障排查清单
+
+| 症状 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 连接器 UNASSIGNED | 任务失败 | 检查 `connect/status` Topic |
+| 无数据输出 | 表不在 include.list | 验证 `database.include.list` |
+| 大延迟 | 大事务/长事务 | 检查 binlog 位置 |
+| OOM | 内存不足 | 增大 `max.queue.size` |
+
+## 四十一、Debezium 与数据平台集成
+
+### 41.1 Debezium + Flink CDC 架构
+
+```mermaid
+flowchart LR
+    A[MySQL] --> B[Debezium]
+    B --> C[Kafka]
+    C --> D[Flink SQL]
+    D --> E[ClickHouse]
+    D --> F[Elasticsearch]
+    D --> G[Redis]
+```
+
+### 41.2 Debezium + Data Lake 架构
+
+```text
+CDC 数据入湖流程：
+  1. Debezium 捕获变更
+  2. Kafka 缓冲与分发
+  3. Flink/Spark 消费处理
+  4. 写入 Iceberg/Hudi 表
+  5. 提供 ACID 事务支持
+```
+
+### 41.3 Debezium 多租户隔离方案
+
+```yaml
+# 租户A配置
+{
+  "name": "tenant-a-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql-tenant-a",
+    "database.server.id": "10001",
+    "database.include.list": "tenant_a_db",
+    "topic.prefix": "tenant-a"
+  }
+}
+```
+
+### 41.4 Debezium 安全加固
+
+| 安全措施 | 说明 | 配置 |
+|----------|------|------|
+| SSL/TLS | 加密传输 | `database.sslMode=REQUIRED` |
+| 认证 | 用户名密码 | `database.user/password` |
+| ACL | Kafka Topic 权限 | 精细化读写控制 |
+| 网络隔离 | VPC/安全组 | 仅允许必要端口 |
+
+### 41.5 Debezium 最佳实践清单
+
+```text
+生产环境部署清单：
+  ✓ 使用增量快照（incremental snapshot）
+  ✓ 配置心跳（heartbeat）
+  ✓ 启用事务元数据（provide.transaction.metadata）
+  ✓ 配置幂等 Sink
+  ✓ 设置合理的 offset 刷新间隔
+  ✓ 监控 replication lag
+  ✓ 定期清理 schema-history
+  ✓ 配置告警规则
+```
+
 > 一句话：**Debezium = Kafka Connect + 多数据库（binlog/WAL）+ 快照增量一体 + 标准变更事件（before/after/op）；选型先看「数据库（多库→Debezium，纯 MySQL→Canal）」，再定「出口（Kafka→Connect，SQL 数仓→Flink CDC）」，最后配「ROW 格式 + 增量快照 + 幂等 Sink + lag 监控」**。

@@ -1796,6 +1796,84 @@ kafka-consumer-groups --bootstrap-server broker:9092 \
 
 > **口诀：MirrorMaker2 = "Kafka 的数据搬运工"——双向复制做多活，中心辐射做汇聚，关键是配好 topics 白名单和 offset 映射。**
 
+## 五-1、Kafka 进阶与实战
+
+### 5-1.1 KRaft 模式部署
+
+```properties
+# kraft-server.properties
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@localhost:9093
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+log.dirs=/var/kafka-logs
+```
+
+| 维度 | ZooKeeper | KRaft |
+|------|-----------|-------|
+| 依赖 | 独立 ZK 集群 | 内置 |
+| 扩展性 | 有限 | 优秀 |
+| 适用规模 | < 10 万分区 | > 10 万分区 |
+
+### 5-1.2 Kafka 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `num.io.threads` | 8 | 16 | IO 线程数 |
+| `num.network.threads` | 3 | 8 | 网络线程数 |
+| `log.segment.bytes` | 1GB | 2GB | 段文件大小 |
+| `num.replica.fetchers` | 1 | 4 | 副本拉取线程 |
+
+### 5-1.3 Kafka 监控与告警
+
+```yaml
+groups:
+  - name: kafka_alerts
+    rules:
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_group_lag > 100000
+        for: 10m
+        labels:
+          severity: warning
+      - alert: KafkaBrokerDown
+        expr: up{job="kafka"} == 0
+        for: 1m
+        labels:
+          severity: critical
+```
+
+### 5-1.4 Kafka 安全加固
+
+```bash
+# 启用 SSL
+kafka-configs.sh --alter --entity-type brokers --entity-default \
+  --add-config listener.name.internal.ssl.keystore.location=/path/to/kafka.keystore.jks
+
+# ACL 配置
+kafka-acls.sh --add --allow-principal User:alice \
+  --operation Read --topic my-topic --group my-group
+```
+
+### 5-1.5 Kafka 生产问题排查
+
+| 症状 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 消费延迟大 | 消费者处理慢/分区不均 | 检查 consumer lag |
+| 消息丢失 | ACK=0/幂等未开启 | 检查 acks=all |
+| 分区不均衡 | Leader 分布不均 | preferred replica election |
+| 磁盘满 | 保留策略不当 | 调整 `log.retention.hours` |
+
+### 5-1.6 Kafka 最佳实践清单
+
+```text
+生产环境配置清单：
+  ✓ acks=all + min.insync.replicas=2
+  ✓ enable.idempotence=true（幂等生产者）
+  ✓ replication.factor=3
+  ✓ 启用压缩（lz4/zstd）
+  ✓ 监控 consumer lag
+```
+
 ## 六、与其他板块的关系（扩展）
 
 | 项 | 结论 |

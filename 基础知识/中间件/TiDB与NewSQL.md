@@ -2383,6 +2383,167 @@ flowchart LR
   6. 回滚方案（保留 MySQL 只读副本）
 ```
 
+## 十一-1、TiDB 分布式事务深度解析
+
+### 11-1.1 Percolator 事务模型详解
+
+```text
+Percolator 两阶段提交流程：
+
+1. Prewrite 阶段
+   - 选择一个 Key 作为 Primary
+   - 向所有涉及的 Region 发送 Prewrite 请求
+   - 写入锁信息到内存
+   - 检查写写冲突
+
+2. Commit 阶段
+   - 向 Primary Region 发送 Commit 请求
+   - Primary 成功后异步清理锁
+   - Secondary Key 异步提交（rollback 兜底）
+
+优化机制：
+  - 基于 HLC（混合逻辑时钟）的时间戳
+  - 乐观锁 vs 悲观锁（TiDB 6.0+ 默认悲观）
+  - 大事务优化：避免锁持有时间过长
+  - async commit：异步提交降低延迟
+```
+
+| 事务模式 | 场景 | 锁超时 | 特点 |
+|----------|------|--------|------|
+| 乐观事务 | 写冲突少 | 10s | 预写锁，冲突回滚成本高 |
+| 悲观事务 | 写冲突多 | 10-120s | 先占锁，按需加锁 |
+| async commit | 延迟敏感 | - | 异步提交，降低延迟 |
+| 1PC | 单 Region | - | 跳过两阶段，性能最优 |
+
+### 11-1.2 TiKV 热点调度策略
+
+```bash
+# 查看热点 Region
+curl http://tidb:10080/api/v1/region/hot
+
+# 手动拆分热点 Region
+curl -X POST http://tikv1:20180/split-region \
+  -d '{"split_key": "6480000000000000FFA500000000000000F8"}'
+
+# 调整调度器参数
+tiup ctl pd schedule add split-region-scheduler
+```
+
+| 调度策略 | 说明 | 适用场景 |
+|----------|------|----------|
+| `balance-region` | Region 均衡分布 | 默认启用 |
+| `balance-leader` | Leader 均衡分布 | 读热点 |
+| `hot-region` | 热点 Region 均衡 | 写热点 |
+| `split-region` | 按 Key 范围拆分 | 大表/热点 |
+
+### 11-1.3 TiDB SQL 性能调优
+
+```sql
+-- 查看执行计划
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 12345;
+
+-- 强制使用索引
+SELECT /*+ USE_INDEX(orders, idx_user_status) */ * FROM orders;
+
+-- 批量写入优化
+SET tidb_dml_batch_size = 1000;
+
+-- 分析表统计信息
+ANALYZE TABLE orders;
+
+-- 查看统计信息
+SHOW STATS_META WHERE table_name = 'orders';
+```
+
+### 11-1.4 TiFlash MPP 模式调优
+
+```text
+TiFlash MPP 优化：
+  1. 向量化执行（Vectorized Execution）
+     - 列式存储 + 列式计算
+     - 一次处理一批数据（Batch）
+
+  2. 延迟物化（Late Materialization）
+     - 先过滤，后物化
+     - 减少数据传输量
+
+  3. MPP 模式（Massively Parallel Processing）
+     - 多节点并行计算
+     - Shuffle Join / Broadcast Join
+     - 适合大表 Join 场景
+
+  调优建议：
+    SET tidb_mpp_task_concurrency = 8;
+    SET tidb_enforce_mpp = 1;
+```
+
+### 11-1.5 TiDB 备份恢复最佳实践
+
+```bash
+# 全量备份
+tiup br backup full \
+  --pd "tidb_pd:2379" \
+  --storage "s3://my-backup/full" \
+  --send-credentials-to-skip
+
+# 增量备份
+tiup br backup delta \
+  --pd "tidb_pd:2379" \
+  --storage "s3://my-backup/delta" \
+  --send-credentials-to-skip
+
+# 恢复
+tiup br restore full \
+  --pd "tidb_pd:2379" \
+  --storage "s3://my-backup/full" \
+  --send-credentials-to-skip
+```
+
+### 11-1.6 TiDB 与 MySQL 兼容性矩阵
+
+| 特性 | TiDB 支持 | 兼容说明 |
+|------|-----------|----------|
+| InnoDB 引擎 | ✅ | 仅语法兼容 |
+| 外键 | ⚠️ | 6.0+ 有约束但不执行 |
+| 存储过程 | ❌ | 不支持 |
+| 触发器 | ❌ | 不支持 |
+| 自增 ID | ⚠️ | 非连续，有跳跃 |
+| `SELECT ... FOR UPDATE` | ✅ | 悲观锁模式 |
+| 分区表 | ✅ | RANGE/LIST/HASH |
+| JSON 类型 | ✅ | 完整支持 |
+
+### 11-1.7 TiDB 监控与告警
+
+```yaml
+groups:
+  - name: tidb_alerts
+    rules:
+      - alert: TiDBDown
+        expr: up{job="tidb"} == 0
+        for: 1m
+        labels:
+          severity: critical
+      - alert: TiKVStoreDown
+        expr: tikv_store_size_bytes{type="available"} < 1073741824
+        for: 5m
+        labels:
+          severity: warning
+      - alert: TiDBQueryDurationHigh
+        expr: histogram_quantile(0.99, rate(tidb_session_execute_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+```
+
+### 11-1.8 TiDB 运维故障排查
+
+| 症状 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 慢查询多 | 统计信息过期/索引缺失 | `SHOW SLOW QUERY` + `EXPLAIN` |
+| Region 不均衡 | 热点/调度参数不当 | 检查 PD 监控 |
+| 事务冲突 | 写热点/锁超时 | 检查 `tikv_lock_manager_wait_duration` |
+| TiFlash 延迟高 | MPP 任务堆积 | 检查 `tidb_mpp_task_concurrency` |
+
 ## 十一-2、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

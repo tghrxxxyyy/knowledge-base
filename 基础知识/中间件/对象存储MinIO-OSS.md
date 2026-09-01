@@ -1895,6 +1895,131 @@ mc mirror myminio/mybucket /backup/
 | 高性能 | MinIO | 本地部署 |
 | 混合云 | MinIO | 一致性体验 |
 
+## 八-1、对象存储进阶与实战
+
+### 8-1.1 MinIO 多站点复制配置
+
+```bash
+# 启用站点复制
+mc admin replicate add minio-source minio-target \
+  --remote-bucket "my-replication-bucket" \
+  --credentials "minio-target:admin:password123" \
+  --bandwidth "100MB" \
+  --health-check-seconds 60
+
+# 查看复制状态
+mc admin replicate status minio-source my-replication-bucket
+
+# 强制同步
+mc admin replicate resync minio-source my-replication-bucket
+```
+
+| 复制模式 | 说明 | 适用场景 |
+|----------|------|----------|
+| 同步复制 | 写入等待目标确认 | 数据强一致 |
+| 异步复制 | 写入立即返回 | 低延迟 |
+| 带宽限制 | 控制复制速率 | 节省带宽 |
+| 健康检查 | 检测目标可用性 | 高可用 |
+
+### 8-1.2 MinIO 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `MINIO_STORAGE_CLASS_STANDARD` | - | EC:4 | 纠删码配置 |
+| `MINIO_CACHE_DRIVES` | - | /dev/nvme0n1 | 缓存盘 |
+| `MINIO_CACHE_QUOTA` | 80 | 70 | 缓存配额 |
+| `MINIO_API_REQUESTS_MAX` | 0 | 5000 | 最大并发 |
+
+### 8-1.3 MinIO 安全加固
+
+```bash
+# 启用加密
+mc encrypt enable minio-target/my-bucket
+
+# 设置访问策略
+cat > policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": ["arn:aws:iam::123456789012:role/ReadOnly"]},
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::my-bucket/*"]
+    }
+  ]
+}
+EOF
+mc anonymous set-json policy.json minio-target/my-bucket
+
+# 启用版本控制
+mc version enable minio-target/my-bucket
+```
+
+### 8-1.4 MinIO 与 Kubernetes 集成
+
+```yaml
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: minio-tenant
+  namespace: minio
+spec:
+  image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+  servers: 4
+  volumesPerServer: 4
+  size: 1Ti
+  requestAutoCert: true
+  env:
+    - name: MINIO_STORAGE_CLASS_STANDARD
+      value: "EC:2"
+```
+
+### 8-1.5 对象存储成本优化
+
+| 策略 | 说明 | 节省比例 |
+|------|------|----------|
+| 存储类型分层 | 热/温/冷/归档 | 30-70% |
+| 生命周期删除 | 自动清理过期数据 | 20-50% |
+| 压缩 | 客户端压缩 | 30-60% |
+| 去重 | 数据去重存储 | 10-30% |
+
+### 8-1.6 MinIO 告警与监控
+
+```yaml
+groups:
+  - name: minio_alerts
+    rules:
+      - alert: MinIODiskSpaceLow
+        expr: minio_cluster_disk_free_bytes / minio_cluster_disk_total_bytes < 0.2
+        for: 5m
+        labels:
+          severity: warning
+      - alert: MinIOHighLatency
+        expr: histogram_quantile(0.99, rate(minio_http_requests_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+```
+
+### 8-1.7 对象存储迁移方案对比
+
+| 方案 | 工具 | 适用场景 | 停机时间 |
+|------|------|----------|----------|
+| 同步迁移 | rclone | 小规模数据 | 低 |
+| 离线迁移 | AWS Snowball | PB 级数据 | 中 |
+| 在线迁移 | DMS | 云上迁移 | 低 |
+| 双写迁移 | 应用层 | 零停机 | 无 |
+
+### 8-1.8 MinIO 故障排查手册
+
+| 症状 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 写入失败 | 磁盘满/权限 | `mc admin info` |
+| 读取慢 | 纠删码开销 | 检查 `MINIO_STORAGE_CLASS_STANDARD` |
+| 复制延迟 | 网络/带宽 | `mc admin replicate status` |
+| 认证失败 | 密钥过期 | 检查 `mc admin user info` |
+
 ## 九、与其他板块的关系（扩展）
 
 - 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。

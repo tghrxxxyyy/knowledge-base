@@ -2822,6 +2822,184 @@ groups:
 ```
 
 
+## 十六-1、Flink 进阶与实战
+
+### 16-1.1 Flink Watermark 高级策略
+
+```java
+// 自定义 Watermark 生成器
+public class BoundedOutOfOrdernessWatermark implements WatermarkStrategy<Event> {
+    @Override
+    public WatermarkGenerator<Event> createWatermarkGenerator(WatermarkGeneratorSupplier.Context context) {
+        return new WatermarkGenerator<Event>() {
+            private long maxTimestamp = Long.MIN_VALUE;
+            private static final long MAX_OUT_OF_ORDNESS = 3000L;
+
+            @Override
+            public void onEvent(Event event, long eventTimestamp, WatermarkOutput output) {
+                maxTimestamp = Math.max(maxTimestamp, event.getTimestamp());
+            }
+
+            @Override
+            public void onPeriodicEmit(WatermarkOutput output) {
+                output.emitWatermark(new Watermark(maxTimestamp - MAX_OUT_OF_ORDNESS - 1));
+            }
+        };
+    }
+}
+
+// 使用 Watermark 策略
+env.fromSource(kafkaSource, watermarkStrategy, "Kafka Source");
+```
+
+| Watermark 策略 | 适用场景 | 延迟 |
+|----------------|----------|------|
+| BoundedOutOfOrderness | 事件时间乱序 | 可配置 |
+| AscendingTimestamps | 事件时间严格递增 | 最小 |
+| PunctuatedWatermark | 基于事件触发 | 按事件 |
+
+### 16-1.2 Flink 状态后端 RocksDB 调优
+
+```yaml
+# flink-conf.yaml
+state.backend: rocksdb
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.fixed-per-slot: 256mb
+state.backend.rocksdb.memory.per-transfer: 64mb
+state.backend.incremental: true
+state.backend.rocksdb.block.cache-size: 256mb
+state.backend.rocksdb.writebuffer.size: 64mb
+state.backend.rocksdb.writebuffer.count: 4
+state.backend.rocksdb.compaction.style: leveled
+state.backend.rocksdb.compaction.level.max-size-base: 256mb
+state.backend.rocksdb.compaction.level.target-file-size-base: 64mb
+```
+
+### 16-1.3 Flink SQL 调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `table.exec.mini-batch.enabled` | false | true | 微批处理 |
+| `table.exec.mini-batch.allow-latency` | - | 5s | 微批延迟 |
+| `table.exec.mini-batch.size` | - | 1000 | 微批大小 |
+| `table.optimizer.join-reorder.enabled` | false | true | Join 重排序 |
+| `table.exec.shuffle-mode` | PIPELINED | BATCH | Shuffle 模式 |
+| `pipeline.max-parallelism` | - | 128 | 最大并行度 |
+
+### 16-1.4 Flink CDC 数据入湖
+
+```mermaid
+flowchart LR
+    A[MySQL] --> B[Flink CDC]
+    B --> C[Flink SQL]
+    C --> D[Iceberg 表]
+    C --> E[Hudi 表]
+    C --> F[Paimon 表]
+    D --> G[离线分析]
+    E --> H[增量查询]
+    F --> I[实时数仓]
+```
+
+### 16-1.5 Flink on Kubernetes 部署
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: flink-cluster
+spec:
+  image: flink:1.18-java11
+  flinkVersion: v1_18
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.checkpoints.dir: s3://flink/checkpoints
+    state.savepoints.dir: s3://flink/savepoints
+  serviceAccount: flink
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: local:///opt/flink/examples/WordCount.jar
+    parallelism: 4
+    upgradeMode: savepoint
+    savepointTriggerNonce: 0
+```
+
+### 16-1.6 Flink 监控与告警
+
+```yaml
+groups:
+  - name: flink_alerts
+    rules:
+      - alert: FlinkJobFailed
+        expr: flink_jobmanager_job_uptime == 0
+        for: 1m
+        labels:
+          severity: critical
+      - alert: FlinkCheckpointSlow
+        expr: rate(flink_jobmanager_job_numberOfCompletedCheckpoints[5m]) < 0.1
+        for: 10m
+        labels:
+          severity: warning
+      - alert: FlinkBackpressure
+        expr: flink_taskmanager_job_task_shuffling_buffers_inPoolUsage > 0.8
+        for: 5m
+        labels:
+          severity: warning
+```
+
+### 16-1.7 Flink vs Spark vs Kafka Streams 对比
+
+| 维度 | Flink | Spark Streaming | Kafka Streams |
+|------|-------|-----------------|---------------|
+| 模型 | 流批一体 | 微批 | 流处理 |
+| 延迟 | 毫秒 | 秒级 | 毫秒 |
+| 状态 | RocksDB | HDFS | 本地/RocksDB |
+| 窗口 | 丰富 | 有限 | 基础 |
+| Exactly-Once | ✅ | ✅ | ✅ |
+| 生态 | 最丰富 | 中等 | Kafka 专用 |
+
+### 16-1.8 Savepoint vs Checkpoint 最佳实践
+
+```text
+Savepoint 与 Checkpoint 区别：
+  - Checkpoint：自动触发，容错恢复
+  - Savepoint：手动触发，版本升级
+
+最佳实践：
+  ✓ 定期 Savepoint（每小时/每次变更前）
+  ✓ 升级前触发 Savepoint
+  ✓ 保留最近 3 个 Savepoint
+  ✓ 使用 s3/hdfs 存储 Savepoint
+  ✓ 验证 Savepoint 完整性
+```
+
+### 16-1.9 Flink 性能调优参数速查
+
+```text
+内存调优：
+  taskmanager.memory.process.size: 4096m
+  taskmanager.memory.managed.fraction: 0.4
+  taskmanager.memory.task.heap.size: 2048m
+  taskmanager.memory.network.fraction: 0.1
+
+网络调优：
+  taskmanager.network.memory.fraction: 0.1
+  taskmanager.network.memory.min: 64mb
+  taskmanager.network.memory.max: 1gb
+  taskmanager.network.buffers-per-channel: 2048
+
+并行度调优：
+  parallelism.default: 4
+  pipeline.max-parallelism: 128
+  table.exec.shuffle-mode: BATCH
+```
+
 ## 与消息队列的关系
 
 - 消息队列见「[03-数据采集与同步](03-数据采集与同步.md)」；

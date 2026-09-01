@@ -2908,6 +2908,198 @@ security:
 ```
 
 
+## 附录 G、Neo4j 进阶与实战
+
+### G.1 Cypher 高级查询优化
+
+```cypher
+// 使用 EXPLAIN 分析查询计划
+EXPLAIN MATCH (p:Person)-[:FRIEND]->(f:Person)
+WHERE p.age > 25
+RETURN f.name, count(f)
+
+// 使用 PROFILE 分析实际执行
+PROFILE MATCH (p:Person)-[:FRIEND]->(f:Person)
+WHERE p.age > 25
+RETURN f.name, count(f)
+
+// 强制使用索引
+MATCH (p:Person) USING INDEX p:Person(age)
+WHERE p.age > 25
+RETURN p
+```
+
+### G.2 Neo4j 集群配置
+
+```yaml
+# docker-compose-cluster.yml
+version: "3.8"
+services:
+  neo4j-core-1:
+    image: neo4j:5.15
+    environment:
+      NEOFFCLS_mode: CORE
+      NEO4J_clustering_initial_discovery_members: neo4j-core-1:5000,neo4j-core-2:5000,neo4j-core-3:5000
+      NEOFFCLS_core_tx__log__batch__size: 100
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+      - "5000:5000"
+
+  neo4j-core-2:
+    image: neo4j:5.15
+    environment:
+      NEOFFCLS_mode: CORE
+      NEO4J_clustering_initial_discovery_members: neo4j-core-1:5000,neo4j-core-2:5000,neo4j-core-3:5000
+
+  neo4j-core-3:
+    image: neo4j:5.15
+    environment:
+      NEOFFCLS_mode: CORE
+      NEO4J_clustering_initial_discovery_members: neo4j-core-1:5000,neo4j-core-2:5000,neo4j-core-3:5000
+
+  neo4j-read-replica:
+    image: neo4j:5.15
+    environment:
+      NEOFFCLS_mode: READ_REPLICA
+      NEO4J_clustering_initial_discovery_members: neo4j-core-1:5000,neo4j-core-2:5000,neo4j-core-3:5000
+```
+
+### G.3 Neo4j 内存调优
+
+```properties
+# neo4j.conf 内存配置
+server.memory.heap.initial_size=4g
+server.memory.heap.max_size=4g
+server.memory.pagecache.size=8g
+server.memory.off_heap.max_size=2g
+
+# 查询内存限制
+server.db.query.memory.limit=2g
+server.db.query.memory.analytics=1g
+```
+
+| 内存区域 | 说明 | 推荐比例 |
+|----------|------|----------|
+| Heap | JVM 堆内存 | 总内存 40% |
+| Page Cache | 页面缓存 | 总内存 50% |
+| Off-Heap | 原生内存 | 总内存 10% |
+
+### G.4 Neo4j 数据导入优化
+
+```cypher
+// 批量导入（neo4j-admin）
+// 准备 CSV 文件
+// node.csv:
+// id:ID,name,:LABEL
+// 1,Alice,Person
+// 2,Bob,Person
+
+// relationship.csv:
+// :START_ID,:END_ID,:TYPE
+// 1,2,FRIEND
+
+// 执行导入
+// neo4j-admin database import full \
+//   --nodes=node.csv \
+//   --relationships=relationship.csv \
+//   --overwrite-destination
+```
+
+### G.5 Spring Data Neo4j 集成
+
+```java
+@Node
+public class Person {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private int age;
+
+    @Relationship(type = "FRIEND", direction = Relationship.Direction.OUTGOING)
+    private Set<Person> friends;
+}
+
+@Repository
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    @Query("MATCH (p:Person)-[:FRIEND]->(f:Person) WHERE p.age > $age RETURN f")
+    List<Person> findFriendsOlderThan(@Param("age") int age);
+}
+```
+
+### G.6 Neo4j 知识图谱构建
+
+```cypher
+// 创建约束和索引
+CREATE CONSTRAINT person_id IF NOT EXISTS FOR (p:Person) REQUIRE p.id IS UNIQUE;
+CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name);
+
+// 批量创建节点
+UNWIND $data AS row
+CREATE (p:Person {id: row.id, name: row.name})
+
+// 批量创建关系
+UNWIND $relationships AS rel
+MATCH (a:Person {id: rel.from})
+MATCH (b:Person {id: rel.to})
+CREATE (a)-[:FRIEND]->(b)
+```
+
+### G.7 Neo4j 推荐系统实现
+
+```cypher
+// 协同过滤推荐
+MATCH (u:User {id: $userId})-[:PURCHASED]->(p:Product)
+      <-[:PURCHASED]-(other:User)
+      -[:PURCHASED]->(rec:Product)
+WHERE NOT (u)-[:PURCHASED]->(rec)
+RETURN rec.name, count(DISTINCT other) AS score
+ORDER BY score DESC
+LIMIT 10
+
+// 图嵌入推荐
+MATCH (u:User {id: $userId})
+CALL gds.nodeSimilarity.stream({
+  nodeProjection: ['User', 'Product'],
+  relationshipProjection: 'PURCHASED'
+})
+YIELD node1, node2, similarity
+WHERE gds.util.asNode(node1).id = $userId
+RETURN gds.util.asNode(node2).name, similarity
+ORDER BY similarity DESC
+LIMIT 10
+```
+
+### G.8 Neo4j vs MySQL vs Elasticsearch 对比
+
+| 维度 | Neo4j | MySQL | Elasticsearch |
+|------|-------|-------|---------------|
+| 数据模型 | 图 | 关系 | 文档 |
+| 查询语言 | Cypher | SQL | DSL |
+| 关系查询 | 极快 | JOIN 慢 | 关联弱 |
+| 全文搜索 | 一般 | 弱 | 极强 |
+| 扩展性 | 集群 | 主从 | 分布式 |
+| 适用 | 关系密集 | 结构化 | 搜索/分析 |
+
+### G.9 Neo4j 性能调优参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `pagecache.size` | - | 总内存 50% | 页面缓存 |
+| `heap.initial_size` | - | 总内存 40% | JVM 堆 |
+| `query.memory.limit` | 无限制 | 2g | 查询内存限制 |
+| `db.query.memory.analytics` | - | 1g | 分析查询内存 |
+| `bolt.thread_pool_size` | 400 | 800 | Bolt 连接池 |
+
+### G.10 Neo4j 运维故障排查
+
+| 症状 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 查询慢 | 缺少索引 | `EXPLAIN` 分析 |
+| OOM | 内存不足 | 检查 heap/pagecache |
+| 集群不同步 | 网络/磁盘 | 检查 `dbms.cluster.overview` |
+| 写入慢 | 事务过大 | 拆分事务 |
+
 ## 与其他板块的关系
 
 - 图数据库选型见「[图数据库对比](./图数据库对比.md)」；

@@ -1611,6 +1611,137 @@ security:
 ```
 
 
+## 十六-1、Prometheus 与 Grafana 进阶
+
+### 16-1.1 Prometheus 高可用部署
+
+```yaml
+# prometheus-ha.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# 联邦配置
+scrape_configs:
+  - job_name: 'prometheus-federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job=~".+"}'
+    static_configs:
+      - targets:
+          - 'prometheus-1:9090'
+          - 'prometheus-2:9090'
+
+# 远程写入
+remote_write:
+  - url: "http://thanos-receive:19291/api/v1/receive"
+    queue_config:
+      max_samples_per_send: 1000
+      batch_send_deadline: 5s
+      max_shards: 200
+```
+
+### 16-1.2 PromQL 高级查询
+
+```promql
+# 99分位延迟（5分钟窗口）
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# 错误率（按服务分组）
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+/
+sum(rate(http_requests_total[5m])) by (service)
+
+# 同比增长率
+predict_linear(http_requests_total[1h], 3600)
+
+# 移动平均
+avg_over_time(cpu_usage[1h])
+```
+
+### 16-1.3 Grafana 仪表板设计
+
+| 仪表板类型 | 关键指标 | 刷新频率 |
+|------------|----------|----------|
+| 业务概览 | QPS/成功率/延迟 | 1min |
+| 应用性能 | JVM/线程池/GC | 10s |
+| 基础设施 | CPU/内存/磁盘 | 30s |
+| 数据库 | 连接数/慢查询/QPS | 10s |
+
+### 16-1.4 告警规则设计
+
+```yaml
+groups:
+  - name: slo_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          / sum(rate(http_requests_total[5m])) by (service)
+          > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate for {{ $labels.service }}"
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) by (service)
+          > 1
+        for: 10m
+        labels:
+          severity: warning
+```
+
+### 16-1.5 Prometheus 长期存储方案
+
+| 方案 | 说明 | 适用场景 |
+|------|------|----------|
+| Thanos | 去中心化 | 大规模 |
+| Cortex | 多租户 | SaaS |
+| VictoriaMetrics | 高性能 | 替代方案 |
+| Mimir | Grafana 原生 | 云原生 |
+
+### 16-1.6 Prometheus vs Zabbix 对比
+
+| 维度 | Prometheus | Zabbix |
+|------|-----------|--------|
+| 数据模型 | 多维标签 | 主机/模板 |
+| 查询语言 | PromQL | 简单表达式 |
+| 服务发现 | K8s/Consul | 手动/自动发现 |
+| 存储 | 本地/远程 | 数据库 |
+| 适用 | 云原生 | 传统IT |
+
+### 16-1.7 Prometheus 安全加固
+
+| 安全措施 | 说明 | 配置 |
+|----------|------|------|
+| 认证 | Basic Auth/mTLS | `--web.config.file` |
+| 授权 | 读写分离 | RBAC 角色 |
+| 网络隔离 | 安全组 | 仅允许必要端口 |
+| 数据加密 | TLS 传输 | 证书配置 |
+
+### 16-1.8 Prometheus 性能优化
+
+| 优化策略 | 说明 | 效果 |
+|----------|------|------|
+| 降采样 | 长期数据聚合 | 减少存储 |
+| 保留策略 | 自动清理旧数据 | 节省空间 |
+| 联邦 | 分层采集 | 降低负载 |
+| 远程写入 | 分离存储 | 提升性能 |
+
+### 16-1.9 Prometheus 运维故障排查
+
+| 症状 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 采集失败 | Target 不可达 | 检查 `up` 指标 |
+| 内存溢出 | 时间序列过多 | 检查 `prometheus_tsdb_head_series` |
+| 查询慢 | 高基数 | 优化标签 |
+| 告警不触发 | 规则错误 | 检查 `prometheus_rule_group_last_evaluation_timestamp_seconds` |
+
 ## 十七、与其他板块的关系
 
 - 可观测性三支柱见「[云上可观测性体系](./云上可观测性体系.md)」；
