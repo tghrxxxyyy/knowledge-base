@@ -51,6 +51,28 @@
 - 或重建 schema + 种子数据，保证可重复。
 - 注意自增 ID、唯一约束导致的顺序依赖。
 
+```java
+// Spring 事务回滚测试示例
+@SpringBootTest
+@Transactional   // 测试结束自动回滚
+class OrderRepositoryTest {
+    @Autowired OrderRepository repo;
+    @Test void saveAndFind() {
+        Order o = repo.save(new Order("U1", 100));
+        assertThat(repo.findById(o.getId())).isPresent();
+    }
+}
+```
+
+### 3.3 Testcontainers 示例
+
+```java
+@Container
+static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.0")
+    .withDatabaseName("test").withUsername("u").withPassword("p");
+// 启动后把 JDBC URL 注入 DataSource 即可跑真实 DB 集成测试
+```
+
 ## 四、E2E 策略
 
 ### 4.1 只覆盖核心旅程
@@ -79,6 +101,17 @@
 - 提供者 CI 校验契约，保证不破坏调用方。
 - 工具：Pact。
 
+```java
+// 消费者侧定义契约（Pact 示意）
+@Pact(consumer = "order-service")
+public RequestResponsePact createPact(PactDslWithProvider b) {
+    return b.uponReceiving("get user")
+            .path("/users/1").method("GET")
+            .willRespondWith().status(200)
+            .body("{\"id\":1,\"name\":\"x\"}").toPact();
+}
+```
+
 ### 5.2 价值
 
 - 在**集成前**发现接口变更破坏，减少对脆弱 E2E 的依赖。
@@ -90,6 +123,11 @@
 - 数据隔离：每用例独立数据集，可并发、可重复。
 - 用随机/唯一后缀防冲突（并发跑时）。
 - 清理策略：事务回滚 / 用例后清理 / 容器销毁即清。
+
+```java
+// Builder 模式造测试数据
+Order order = OrderBuilder.anOrder().withUser("U1").withAmount(100).build();
+```
 
 ## 七、稳定性（Flaky）治理
 
@@ -104,6 +142,21 @@
 - 集成：PR 合并前跑（中速）。
 - E2E：每日/预发布跑（慢，不必每次 PR）。
 - 分阶段跑，平衡"反馈速度"与"覆盖成本"。
+
+### 8.1 CI 矩阵示例
+
+```yaml
+test:
+  strategy:
+    matrix: { suite: [unit, integration] }
+  steps:
+    - run: ./gradlew test --tests "*${{ matrix.suite }}*"
+e2e:
+  needs: test
+  if: github.ref == 'main'
+  steps:
+    - run: ./run-e2e.sh
+```
 
 ## 九、常见坑
 

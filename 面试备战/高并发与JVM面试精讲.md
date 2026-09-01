@@ -12,12 +12,27 @@ JVM 运行时数据区分线程私有与共享：
 
 > 栈溢出（StackOverflowError）来自无限递归或过深调用；堆溢出（OutOfMemoryError: Java heap space）来自对象无法回收或堆设太小。
 
+### 1.1 对象的内存布局
+
+一个 Java 对象在堆中由三部分组成：
+- **对象头（Header）**：Mark Word（哈希码、GC 分代年龄、锁标志位、偏向线程 ID）+ 类型指针（指向类元数据）+ 数组长度（仅数组）。
+- **实例数据（Instance Data）**：各字段值，受字段重排优化（相同宽度字段放一起）。
+- **对齐填充（Padding）**：对齐到 8 字节整数倍，提升访问效率。
+
 ## 二、堆的分代与 GC
 
 - **分代假设**：绝大多数对象朝生夕死，故分代收集。
 - **新生代**：Eden + 2 个 Survivor（S0/S1）。新对象在 Eden 分配，Minor GC 后存活对象进 Survivor，年龄到阈值（默认 15）晋升老年代。
 - **老年代**：存放长期存活对象，Major/Full GC 慢。
 - **元空间**：存类元数据，使用本地内存，默认无上限（需设 `-XX:MaxMetaspaceSize` 防耗尽）。
+
+### 2.1 垃圾回收算法
+
+| 算法 | 思想 | 缺点 |
+|------|------|------|
+| 标记-清除 | 标记存活，清除未标记 | 产生内存碎片 |
+| 标记-整理 | 标记后存活对象向一端移动 | 移动成本高 |
+| 复制 | 存活对象复制到空白半区 | 浪费一半空间（新生代适用） |
 
 ## 三、常见垃圾收集器
 
@@ -33,7 +48,16 @@ JVM 运行时数据区分线程私有与共享：
 - **G1**：把堆切成多个 Region，优先回收价值高（垃圾多）的 Region；可设 `-XX:MaxGCPauseMillis` 目标。
 - **ZGC**：染色指针 + 读屏障，几乎全并发，暂停不随堆增大而增长。
 
-## 四、GC  Roots 与可达性分析
+### 3.1 G1/ZGC 关键参数
+
+```bash
+# G1 常用
+-XX:+UseG1GC -Xmx8g -XX:MaxGCPauseMillis=200 -XX:InitiatingHeapOccupancyPercent=45
+# ZGC（JDK11+）
+-XX:+UseZGC -Xmx16g -XX:+UnlockExperimentalVMOptions
+```
+
+## 四、GC Roots 与可达性分析
 
 - 从 GC Roots（栈引用、静态变量、常量、JNI 引用）出发，可达的对象存活，不可达的回收。
 - **引用类型**：强（不回收）、软（内存不足才回收，适合缓存）、弱（下次 GC 必回收）、虚（仅跟踪回收）。
@@ -50,6 +74,10 @@ JVM 运行时数据区分线程私有与共享：
 - **可见性**：一个线程改了共享变量，其他线程能否立刻看到 → `volatile` 保证可见性与禁止指令重排。
 - **有序性**：编译器和 CPU 会重排指令（不影响单线程结果 as-if-serial），多线程下需 `volatile`/`synchronized`/锁保证。
 - **原子性**：`synchronized`、CAS（`Atomic` 类）保证。
+
+### 6.1 happens-before 规则
+
+JMM 通过 happens-before 约束重排：程序顺序、volatile 写读、锁释放获取、线程 start/join、传递性。理解它才能判断"某写是否对另一线程可见"。
 
 ## 七、volatile 与 synchronized
 
@@ -68,8 +96,17 @@ JVM 运行时数据区分线程私有与共享：
 ExecutorService pool = new ThreadPoolExecutor(
     8, 64, 60L, TimeUnit.SECONDS,
     new LinkedBlockingQueue<>(1000),
+    new ThreadFactory() {            // 命名线程，便于排查
+        private final AtomicInteger i = new AtomicInteger();
+        public Thread newThread(Runnable r){ return new Thread(r,"biz-"+i.incrementAndGet()); }
+    },
     new ThreadPoolExecutor.CallerRunsPolicy());
 ```
+
+### 8.1 线程池监控
+
+- 暴露 `ThreadPoolExecutor` 的 `getActiveCount()`、`getQueue().size()`、`getCompletedTaskCount()` 到监控。
+- 队列长期不空 → 消费慢，需扩容或优化任务；活跃线程长期打满 → 任务过重。
 
 ## 九、并发工具类
 
@@ -90,7 +127,17 @@ ExecutorService pool = new ThreadPoolExecutor(
 - **活锁**：线程互相谦让，都在跑但无进展。
 - **诊断**：`jstack` 看线程栈与死锁检测。
 
-## 十二、高频面试题
+## 十二、常见 OOM 类型与排查
+
+| OOM 类型 | 原因 | 排查 |
+|----------|------|------|
+| Java heap space | 堆对象过多/泄漏 | `jmap -dump` + MAT 看大对象 |
+| Metaspace | 类加载过多（动态代理/热部署） | 限制 MaxMetaspaceSize |
+| GC overhead limit | GC 占 98% 时间回收 <2% | 同上，查泄漏 |
+| Direct buffer | NIO/Netty 堆外内存 | `-XX:MaxDirectMemorySize` |
+| Unable to create native thread | 线程数超限（OS ulimit） | 降线程数/调 ulimit |
+
+## 十三、高频面试题
 
 1. 对象创建过程？类加载检查 → 分配内存（指针碰撞/空闲列表）→ 初始化零值 → 设对象头 → `<init>`。
 2. 对象头有什么？Mark Word（哈希/GC 年龄/锁状态）+ 类型指针 + 数组长度（数组）。
@@ -107,22 +154,33 @@ ExecutorService pool = new ThreadPoolExecutor(
 13. 强引用与软引用在缓存的应用？软引用做内存敏感缓存，不足时回收。
 14. 什么是伪共享（false sharing）？多变量同缓存行被不同核修改，互相失效；用 `@Contended` 填充。
 15. 单例的双重检查锁定为什么还要 volatile？防止指令重排导致拿到半初始化对象。
+16. 如何定位 CPU 100%？`top -Hp` 找线程 → `printf %x` → `jstack` 看对应栈。
+17. Full GC 频繁怎么查？看 GC 日志，堆转储找大对象/泄漏，调收集器与堆大小。
+18. 逃逸分析有什么用？栈上分配、锁消除、标量替换，减少堆压力。
 
-## 十三、调优实战
+## 十四、调优实战
 
 - 工具：`jps`（进程）、`jstat`（GC 统计）、`jmap`（堆转储）、`jstack`（线程）、`jinfo`、`arthas`（在线诊断）。
 - 思路：先定目标（吞吐 or 低延迟）→ 看 GC 日志（`-Xlog:gc*`）→ 调堆大小/收集器/代比例 → 压测验证。
 - 常见：Full GC 频繁 → 查内存泄漏（堆转储看大对象）、调大堆或换 G1/ZGC；Young GC 慢 → 调 Eden/Survivor 比例。
 
-## 十四、常见误区
+### 14.1 GC 日志示例
+
+```bash
+# JDK 9+ 统一日志
+-Xlog:gc*,gc+heap=debug,gc+age=trace:file=gc.log:time,uptime,level,tags
+```
+
+## 十五、常见误区
 
 - 误以为 `volatile` 能保原子 → 复合操作仍需锁/CAS。
 - 误用 `Executors` 快捷方法 → 无界队列 OOM。
 - 以为 GC 越频繁越好或越慢越好 → 看业务目标平衡。
 - 线程池不命名线程 → 出问题时难定位。
 - ThreadLocal 用完不 remove → 线程池复用泄漏/串数据。
+- 把所有对象都缓存 → 软/弱引用缓存需控制大小，否则反而 OOM。
 
-## 十五、延伸阅读
+## 十六、延伸阅读
 
 - [架构/CAP定理与一致性模型](../架构/CAP定理与一致性模型.md)
 - [场景设计/秒杀系统设计与高并发扣减](../场景设计/秒杀系统设计与高并发扣减.md)
