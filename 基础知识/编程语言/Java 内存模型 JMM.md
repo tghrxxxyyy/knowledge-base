@@ -1,6 +1,6 @@
 # Java 内存模型 JMM
 
-> Java 内存模型 JMM是编程语言方向的关键主题，围绕JMM、可见性、有序性等核心点展开，目标是在工程落地中取得正确性与可维护性的平衡。
+> Java 内存模型 JMM是编程语言方向的关键主题，围绕JMM、可见性、有序等核心点展开，目标是在工程落地中取得正确性与可维护性的平衡。
 
 ## 1. 背景与挑战
 
@@ -20,7 +20,7 @@
 flowchart LR
     A[JMM]
     B[可见性]
-    C[有序性]
+    C[有序]
     D[volatile]
     E[happens-before]
     A --> B --> C --> D --> E
@@ -32,7 +32,7 @@ flowchart LR
 | --- | --- |
 | JMM | 围绕JMM的实践要点、常见方案与权衡取舍，关注可落地与可观测。 |
 | 可见性 | 围绕可见性的实践要点、常见方案与权衡取舍，关注可落地与可观测。 |
-| 有序性 | 围绕有序性的实践要点、常见方案与权衡取舍，关注可落地与可观测。 |
+| 有序 | 围绕有序的实践要点、常见方案与权衡取舍，关注可落地与可观测。 |
 | volatile | 围绕volatile的实践要点、常见方案与权衡取舍，关注可落地与可观测。 |
 | happens-before | 围绕happens-before的实践要点、常见方案与权衡取舍，关注可落地与可观测。 |
 
@@ -45,8 +45,8 @@ def handle(ctx):
     plan = design('JMM', goal='可见性')
     # 2) 选择 可见性 的实施方案
     result = execute(plan)
-    # 3) 用 有序性 兜底与观测
-    assert observable(result), 'missing 有序性'
+    # 3) 用 有序 兜底与观测
+    assert observable(result), 'missing 有序'
     return result
 ```
 
@@ -79,7 +79,7 @@ def handle(ctx):
 
 - JMM如何落地？
 - 可见性如何落地？
-- 有序性如何落地？
+- 有序如何落地？
 - volatile如何落地？
 - happens-before如何落地？
 
