@@ -2149,6 +2149,240 @@ flowchart TD
     end
 ```
 
+## 十七-2、Percolator 事务深入
+
+### 17.2.1 Prewrite 与 Commit 流程
+
+```text
+Percolator 事务流程（Two-Phase Commit）：
+  1. Prewrite 阶段（准备）
+     - 选 Primary Key（第一个写入的 key）
+     - 对所有 key 加锁（lock record）
+     - 写入数据到多个 TiKV
+     - 检查是否有冲突（写写冲突）
+
+  2. Commit 阶段（提交）
+     - 先提交 Primary Key（原子操作）
+     - Primary 提交成功 → 整个事务成功
+     - Primary 提交失败 → 整个事务回滚
+     - Secondary Key 异步提交（rollback 兜底）
+
+冲突检测：
+  - 读取 lock record → 发现锁 → 检查 Primary 是否已提交
+  - Primary 已提交 → 清理 Secondary lock（推进提交）
+  - Primary 未提交 → 回滚整个事务
+```
+
+### 17.2.2 大事务处理
+
+| 问题 | 影响 | 解决方案 |
+|------|------|----------|
+| Prewrite 阶段长 | 大量 key 锁住 | 拆分为多个小事务 |
+| 二阶段提交开销 | 网络延迟放大 | 批量 Prewrite |
+| 锁冲突概率高 | 大事务持有锁时间长 | 调整 key 顺序 |
+| 历史版本堆积 | MVCC 垃圾回收压力 | 调整 GC life time |
+
+```sql
+-- 大事务优化：批量 DML + 减少锁持有时间
+BEGIN BATCH;
+  INSERT INTO orders (id, amount) VALUES (1, 100);
+  INSERT INTO orders (id, amount) VALUES (2, 200);
+  INSERT INTO orders (id, amount) VALUES (3, 300);
+COMMIT BATCH;
+
+-- 系统变量调整
+SET GLOBAL tidb_txn_commit_batch_size = 16384;
+SET GLOBAL tidb_gc_life_time = '10m';
+```
+
+---
+
+## 十七-3、Region 调度与热点治理
+
+### 17.3.1 Region 调度策略
+
+| 调度类型 | 触发条件 | 说明 |
+|----------|----------|------|
+| `balance-region` | Region 数不均 | 在 store 间迁移 Region |
+| `balance-leader` | Leader 数不均 | 在 store 间转移 Leader |
+| `split-region` | Region 过大（>96MB） | 自动分裂 |
+| `merge-region` | Region 过小（<4MB） | 自动合并 |
+| `hot-region` | 读写热点 | 热点 Region 打散 |
+
+### 17.3.2 热点检测与处理
+
+```text
+热点检测：
+  1. TiKV 上报 region read/write bytes/keys
+  2. PD 计算热点指标（QPS、流量、key 数）
+  3. 超阈值触发热点调度
+
+热点打散：
+  - 热点 Region 裂变（split → 更多小 Region）
+  - Leader 转移（balance-leader）
+  - Key 范围重新分配
+
+常见热点场景：
+  - 自增 ID → 按 ID 写入集中在单 Region
+  - 时间序列 → 最新时间戳集中在单 Region
+  - 哈希不均 → key 分布不均匀
+```
+
+```sql
+-- 预分裂 Region（避免热点）
+SPLIT TABLE orders BETWEEN (0) AND (1000000) REGIONS 16;
+
+-- 手动触发 Region 调度
+ALTER TABLE orders SPLIT REGION BETWEEN (0) AND (1000000);
+```
+
+---
+
+## 十七-4、TiFlash 列存深度调优
+
+### 17.4.1 TiFlash 同步模式
+
+| 模式 | 说明 | 延迟 | 数据安全 |
+|------|------|------|----------|
+| Async | 异步复制 | 高（秒级） | 可能丢数据 |
+| Sync | 同步复制 | 低（毫秒） | 强一致 |
+| Raft Learner | Learner 异步 | 中 | 可读备份 |
+
+### 17.4.2 TiFlash SQL 调优
+
+```sql
+-- 强制使用 TiFlash 副本
+SELECT /*+ read_from_storage(TIFLASH[orders]) */ * FROM orders;
+
+-- 检查表是否已添加 TiFlash 副本
+SHOW CREATE TABLE orders;
+-- 看 TiFLASH replica 数量
+
+-- 添加 TiFlash 副本
+ALTER TABLE orders SET TIFLASH REPLICA 1;
+
+-- 调整 TiFlash 同步延迟阈值
+SET GLOBAL tidb_auto_tune_affinity = 1;
+```
+
+---
+
+## 十七-5、TiDB SQL 优化实战
+
+### 17.5.1 执行计划分析
+
+```sql
+-- 查看执行计划
+EXPLAIN SELECT * FROM orders WHERE user_id = 1001 AND status = 'PAID';
+
+-- 详细执行计划
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 1001;
+
+-- 查看慢查询
+SELECT * FROM INFORMATION_SCHEMA.SLOW_QUERY ORDER BY query_time DESC LIMIT 10;
+```
+
+### 17.5.2 索引优化
+
+| 优化项 | 说明 | 示例 |
+|--------|------|------|
+| 聚簇索引 | 主键即聚簇索引 | `PRIMARY KEY (id)` |
+| 二级索引 | 辅助查询加速 | `INDEX idx_user (user_id)` |
+| 覆盖索引 | 避免回表 | `INDEX idx_cover (user_id, status, amount)` |
+| 前缀索引 | 长字段部分索引 | `INDEX idx_prefix (name(10))` |
+
+```sql
+-- 添加覆盖索引
+CREATE INDEX idx_user_status ON orders (user_id, status, amount);
+
+-- 查看索引使用情况
+SELECT * FROM INFORMATION_SCHEMA.TIDB_INDEX_USAGE WHERE TABLE_NAME = 'orders';
+
+-- 分析索引命中率
+SHOW INDEX FROM orders;
+```
+
+---
+
+## 十七-6、TiDB 监控与运维
+
+### 17.6.1 核心监控指标
+
+| 组件 | 指标 | 说明 |
+|------|------|------|
+| TiDB Server | QPS/TPS | 请求量 |
+| TiDB Server | Parse/Compile Duration | SQL 解析耗时 |
+| TiKV | Region Size | Region 大小 |
+| TiKV | CPU/Memory Usage | 资源使用 |
+| TiKV | Raft Log Duration | 日志同步延迟 |
+| TiFlash | Read Duration | 列存读取耗时 |
+| PD | Scheduler Duration | 调度延迟 |
+
+### 17.6.2 备份恢复配置
+
+```bash
+# 使用 BR 备份
+br backup full \
+  --pd "pd:2379" \
+  --storage "s3://backup/tidb/full" \
+  --send-credentials-to-tikv=true
+
+# 使用 BR 恢复
+br restore full \
+  --pd "pd:2379" \
+  --storage "s3://backup/tidb/full" \
+  --send-credentials-to-tikv=true
+```
+
+---
+
+## 十七-7、TiDB 金融级高可用
+
+### 17.7.1 金融级三副本
+
+| 配置 | 说明 | RPO/RTO |
+|------|------|---------|
+| 3 副本（默认） | 同城 3 机房 | RPO=0, RTO<30s |
+| 跨城 3 副本 | 异地机房 | RPO=0, RTO<30s |
+| 5 副本 | 超高可用 | RPO=0, RTO<10s |
+
+### 17.7.2 切换与恢复
+
+```mermaid
+flowchart LR
+    A[TiDB 主集群] -->|Raft 同步| B[TiDB 从集群]
+    A -->|异步复制| C[灾备集群]
+    B -->|DNS 切换| D[应用]
+    C -->|DNS 切换| D
+```
+
+---
+
+## 十七-8、TiDB 常见坑与最佳实践
+
+### 17.8.1 避坑清单
+
+| 坑点 | 说明 | 解决方案 |
+|------|------|----------|
+| AUTO_INCREMENT 不连续 | 分配后不使用 | 用 `SET @@auto_increment_increment=1` |
+| 事务过大 | OOM/锁冲突 | 拆分为小事务 |
+| 字段类型不兼容 | MySQL → TiDB | 使用 `SECURITY` 模式迁移 |
+| 热点 Region | 写入集中 | 预分裂 Region + 哈希打散 |
+| TiFlash 副本不足 | 查询回退 TiKV | 至少 1 副本 |
+| 慢查询 | 缺少索引 | EXPLAIN ANALYZE + 加索引 |
+
+### 17.8.2 迁移 Checklist
+
+```text
+迁移步骤：
+  1. Schema 兼容性检查（MySQL → TiDB 语法差异）
+  2. 数据迁移（DM 工具全量+增量）
+  3. 增量同步验证（DM 持续同步）
+  4. 应用切换（DNS 切换 + 双写验证）
+  5. 数据校验（全量校验 + 抽样校验）
+  6. 回滚方案（保留 MySQL 只读副本）
+```
+
 ## 十一-2、与其他板块的关系
 
 - 分片方案对比见「[MyCat 与 Vitess](./MyCat与Vitess.md)」与「[分库分表 ShardingSphere](./分库分表ShardingSphere.md)」；

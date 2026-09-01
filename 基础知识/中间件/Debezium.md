@@ -2023,6 +2023,306 @@ SELECT * FROM pg_stat_replication;
 | 端到端延迟 | 100ms~1s |
 | 快照速度 | 1~5 万行/秒 |
 
+## 三十五、Kafka Connect 运行时深度配置
+
+### 35.1 Connect Worker 集群配置
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `group.id` | Connect 集群组 | `debezium-cluster` |
+| `config.storage.topic` | 配置存储 topic | `_connect-configs` |
+| `offset.storage.topic` | 偏移量存储 topic | `_connect-offsets` |
+| `status.storage.topic` | 状态存储 topic | `_connect-status` |
+| `key.converter` | Key 序列化 | `org.apache.kafka.connect.json.JsonConverter` |
+| `value.converter` | Value 序列化 | `org.apache.kafka.connect.json.JsonConverter` |
+| `plugin.path` | 插件路径 | `/opt/debezium/plugins` |
+
+```properties
+# Worker 高可用配置
+group.id=debezium-cluster
+config.storage.replication.factor=3
+offset.storage.replication.factor=3
+status.storage.replication.factor=3
+offset.flush.interval.ms=10000
+rest.port=8083
+```
+
+### 35.2 Connector 并行度与任务分配
+
+```text
+Task 分配策略：
+  1. 每个 Connector 声明 task.max（MySQL 通常 = binlog 线程数）
+  2. Connect Worker 按 round-robin 分配 Task
+  3. Task 失败自动重分配到其他 Worker
+
+Task 分配检查：
+  GET /connectors/{name}/status
+  → tasks: [{id: 0, state: "RUNNING", worker_id: "worker-1"}]
+```
+
+---
+
+## 三十六、SMT 单消息转换详解
+
+### 36.1 常用 SMT 列表
+
+| SMT | 功能 | 示例 |
+|-----|------|------|
+| `InsertField` | 插入字段 | 添加 `topic` 字段 |
+| `ReplaceField` | 替换/删除字段 | 移除 `before` 字段 |
+| `MaskField` | 字段脱敏 | 掩码 `password` |
+| `TimestampRouter` | 按时间路由 topic | `db.table → db.table.202401` |
+| `RegexpRouter` | 正则路由 topic | 重命名 topic |
+| `ExtractNewRecordState` | 提取 after 字段 | 简化事件结构 |
+| `ContentBasedRouter` | 内容路由 | 按 `op` 字段分发 |
+
+### 36.2 SMT 链式配置示例
+
+```json
+{
+  "transforms": "route,mask,insert",
+  "transforms.route.type": "org.apache.kafka.connect.transforms.RegexpRouter",
+  "transforms.route.regex": "([^.]+)\\.([^.]+)",
+  "transforms.route.replacement": "$1_$2_cdc",
+  "transforms.mask.type": "org.apache.kafka.connect.transforms.MaskField$Value",
+  "transforms.mask.fields": "password,ssn",
+  "transforms.mask.replacement": "******",
+  "transforms.insert.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+  "transforms.insert.timestamp.field": "cdc_timestamp",
+  "transforms.insert.timestamp.value": "${timestamp}"
+}
+```
+
+---
+
+## 三十七、Debezium Schema 演进处理
+
+### 37.1 DDL 变更事件结构
+
+```json
+{
+  "schemaChange": {
+    "type": "ALTER",
+    "database": "order_db",
+    "table": "orders",
+    "changes": [
+      {"type": "ADD", "name": "shipping_address", "dataType": "VARCHAR(255)"},
+      {"type": "MODIFY", "name": "amount", "dataType": "DECIMAL(10,2)"}
+    ]
+  }
+}
+```
+
+### 37.2 Schema 兼容性策略
+
+| 策略 | 说明 | 风险 |
+|------|------|------|
+| `BACKWARD` | 新 Schema 能读旧数据 | 默认 |
+| `FORWARD` | 旧 Schema 能读新数据 | 需要默认值 |
+| `FULL` | 双向兼容 | 最严格 |
+| `NONE` | 不校验 | 最灵活 |
+
+```properties
+# Schema Registry 集成
+value.converter.schema.registry.url=http://schema-registry:8081
+value.converter.subject.name.strategy=TopicNameStrategy
+```
+
+---
+
+## 三十八、Debezium 监控指标与告警
+
+### 38.1 JMX 核心指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| `NumberOfEventsInQueue` | 事件队列积压 | > 10000 |
+| `QueueCapacity` | 队列总容量 | 使用率 > 80% |
+| `Connecting` | 连接状态 | 0 = 断开 |
+| `TotalConnectTime` | 连接时间 | 异常波动 |
+| `BinlogLineNumber` | binlog 行号 | 不增长 > 5min |
+| `EarliestBinlogTimestamp` | 最早 binlog 时间 | > 1min |
+
+### 38.2 Grafana 监控面板
+
+```yaml
+# Prometheus JMX Exporter 配置
+jmx_exporter:
+  hostPort: localhost:9404
+  lowercaseOutputName: true
+  rules:
+    - pattern: "debezium<type=connector-metrics,.*><>(\\w+)"
+      name: debezium_connector_$1
+      labels:
+        connector: "$1"
+```
+
+---
+
+## 三十九、Debezium vs Canal vs Maxwell 对比矩阵
+
+| 维度 | Debezium | Canal | Maxwell |
+|------|----------|-------|---------|
+| 支持数据库 | MySQL/PG/Oracle/MongoDB | 仅 MySQL | 仅 MySQL |
+| 架构 | Kafka Connect 集群 | 独立 Java 进程 | 独立 Java 进程 |
+| 输出格式 | Connect Event JSON | Canal JSON | Maxwell JSON |
+| 快照+增量 | 支持（初始快照） | 不支持（需外部） | 不支持（需外部） |
+| DDL 捕获 | 支持 | 部分支持 | 不支持 |
+| GTID 支持 | 支持 | 支持 | 不支持 |
+| 协议 | 开源 Apache 2.0 | 开源 MIT | 开源 MIT |
+| 运维成本 | 中等（Kafka Connect） | 低 | 低 |
+
+```text
+选型决策树：
+  需要多数据库（PG/Oracle） → Debezium
+  只用 MySQL + 极简部署 → Canal/Maxwell
+  已有 Kafka 生态 → Debezium（原生集成）
+  需要快照+增量一体 → Debezium
+```
+
+---
+
+## 四十、Debezium 安全加固
+
+### 40.1 认证与授权
+
+```sql
+-- MySQL 专用只读账户
+CREATE USER 'debezium'@'%' IDENTIFIED BY 'StrongPassword123!';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'debezium'@'%';
+FLUSH PRIVILEGES;
+
+-- PostgreSQL 专用账户
+CREATE ROLE debezium WITH LOGIN REPLICATION PASSWORD 'StrongPassword123!';
+GRANT pg_read_all_data TO debezium;
+```
+
+### 40.2 网络与加密
+
+| 安全层 | 配置 |
+|--------|------|
+| TLS | `database.sslmode=require` |
+| 认证 | `database.user/password` |
+| ACL | 限制 Connect Worker 出入站端口 |
+| 加密 | Kafka topic 启用 TLS + SASL |
+
+---
+
+## 四十一、Debezium 与 Flink CDC 集成
+
+### 41.1 集成架构
+
+```text
+MySQL → Debezium Connector → Kafka → Flink Source Connector → Flink SQL
+                                    ↓
+                              下游消费者（ES/数仓）
+
+优势：
+  - Debezium 负责增量解析（binlog → Kafka）
+  - Flink 负责复杂计算（窗口/Join/聚合）
+  - 解耦：CDC 引擎和计算引擎独立演进
+```
+
+### 41.2 Flink SQL 消费 Debezium 事件
+
+```sql
+-- Flink SQL 消费 Debezium 事件
+CREATE TABLE cdc_orders (
+  order_id BIGINT,
+  amount DECIMAL(10,2),
+  status STRING,
+  PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'order_db.orders',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'flink-cdc-group',
+  'scan.startup.mode' = 'latest-offset',
+  'format' = 'debezium-json'
+);
+
+-- 实时聚合
+SELECT
+  TUMBLE_START(proctime, INTERVAL '5' MINUTE) AS window_start,
+  status,
+  COUNT(*) AS order_count,
+  SUM(amount) AS total_amount
+FROM cdc_orders
+GROUP BY TUMBLE(proctime, INTERVAL '5' MINUTE), status;
+```
+
+---
+
+## 四十二、Debezium 生产问题排查清单
+
+### 42.1 常见问题速查
+
+| 问题 | 根因 | 解决方案 |
+|------|------|----------|
+| binlog 位点丢失 | binlog 被清理 | `SHOW BINARY LOGS` + 重新快照 |
+| 连接断开 | 网络/认证 | 检查 `max_connections` + 重试 |
+| 内存溢出 | 大事务/队列积压 | 增大 `max.queue.size` + 降并行 |
+| 延迟高 | binlog 解析慢 | 增加 Task 并行度 |
+| 事件丢失 | 未提交 offset | `offset.flush.interval.ms` 调小 |
+| Schema 不兼容 | DDL 变更 | 配置 Schema Registry 兼容策略 |
+
+### 42.2 故障恢复 SOP
+
+```mermaid
+flowchart TD
+    A[发现故障] --> B{故障类型}
+    B -->|连接失败| C[检查网络/认证/max_connections]
+    B -->|位点丢失| D[SHOW BINARY LOGS + 重新快照]
+    B -->|内存溢出| E[增大队列+降低并行度]
+    B -->|延迟高| F[增加Task并行度+优化查询]
+    C --> G[重启Connector]
+    D --> G
+    E --> G
+    F --> G
+    G --> H[验证数据一致性]
+    H --> I{恢复成功?}
+    I -->|是| J[记录故障报告]
+    I -->|否| K[升级处理]
+```
+
+---
+
+## 四十三、Debezium 性能调优参数
+
+### 43.1 Connector 级参数
+
+| 参数 | 说明 | 调优方向 |
+|------|------|----------|
+| `snapshot.mode` | 快照模式 | `initial` / `never` / `always` |
+| `snapshot.fetch.size` | 快照批量大小 | 增大可加速快照 |
+| `max.queue.size` | 内部队列大小 | 增大应对突发 |
+| `max.batch.size` | 批量大小 | 增大提升吞吐 |
+| `poll.interval.ms` | 轮询间隔 | 减小降低延迟 |
+| `heartbeat.interval.ms` | 心跳间隔 | 保持连接活跃 |
+
+### 43.2 MySQL binlog 配置
+
+```ini
+# my.cnf 最小配置
+[mysqld]
+server-id=1
+log-bin=mysql-bin
+binlog-format=ROW
+binlog-row-image=FULL
+expire-logs-days=7
+gtid-mode=ON
+enforce-gtid-consistency=ON
+```
+
+### 43.3 吞吐量基准
+
+| 指标 | MySQL 单机 | MySQL 主从 |
+|------|-----------|-----------|
+| binlog 吞吐 | 10~50 万事件/秒 | 10~50 万事件/秒 |
+| Kafka 写入吞吐 | 50~100 万事件/秒 | 50~100 万事件/秒 |
+| 端到端延迟 | 100ms~1s | 100ms~1s |
+| 快照速度 | 1~5 万行/秒 | 1~5 万行/秒 |
+
 ## 三十四、Debezium 常见问题排查
 
 ### 故障恢复流程

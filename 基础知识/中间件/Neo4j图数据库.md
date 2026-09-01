@@ -1581,6 +1581,288 @@ groups:
           summary: "Neo4j 连接数高"
 ```
 
+## 九、Cypher 高级查询与优化
+
+### 9.1 Cypher 查询模式
+
+| 模式 | 说明 | 示例 |
+|------|------|------|
+| 路径匹配 | 变长路径 | `(a)-[*1..5]->(b)` |
+| 可变长度路径 | 指定深度 | `(a)-[*2..4]->(b)` |
+| 最短路径 | Dijkstra | `allShortestPaths((a)-[*]->(b))` |
+| 任意路径 | 任一路径 | `shortestPath((a)-[*]->(b))` |
+| 聚合 | 分组聚合 | `MATCH (n) RETURN n.city, count(n)` |
+| 子查询 | 模式组合 | `CALL { ... }` |
+
+### 9.2 Cypher 性能优化
+
+```cypher
+// 1. 使用索引
+CREATE INDEX FOR (n:Person) ON (n.name);
+MATCH (n:Person {name: '张三'}) RETURN n;
+
+// 2. 避免全表扫描
+MATCH (n:Person) WHERE n.age > 25 RETURN n;
+// 优化：创建索引
+CREATE INDEX FOR (n:Person) ON (n.age);
+
+// 3. 限制返回数量
+MATCH (n:Person) RETURN n LIMIT 100;
+
+// 4. 使用 PROFILE 分析执行计划
+PROFILE MATCH (n:Person {name: '张三'})-[:KNOWS]->(m) RETURN m;
+```
+
+### 9.3 索引管理
+
+| 索引类型 | 说明 | 适用 |
+|----------|------|------|
+| B-Tree | 默认索引 | 精确匹配 |
+| 全文索引 | 文本搜索 | 模糊查询 |
+| 空间索引 | 地理位置 | 距离计算 |
+| 约束 | 唯一性约束 | 数据完整性 |
+
+```cypher
+// 创建索引
+CREATE INDEX person_name FOR (n:Person) ON (n.name);
+
+// 创建唯一约束
+CREATE CONSTRAINT person_id FOR (n:Person) REQUIRE n.id IS UNIQUE;
+
+// 创建全文索引
+CREATE FULLTEXT INDEX person_search FOR (n:Person) ON EACH [n.name, n.email];
+
+// 使用全文索引
+CALL db.index.fulltext.queryNodes('person_search', '张三') YIELD node, score
+RETURN node, score;
+```
+
+---
+
+## 十、Neo4j 集群部署与高可用
+
+### 10.1 集群架构
+
+| 角色 | 数量 | 职责 |
+|------|------|------|
+| Core | 3+ 奇数 | 数据主节点 |
+| Read Replica | 0+ | 只读副本 |
+| Proxy | 1+ | 路由代理 |
+
+### 10.2 集群配置
+
+```yaml
+# Neo4j 集群配置
+server.discovery.type=legacy
+server.discovery.seed_hosts=neo4j-core-1:5000,neo4j-core-2:5000,neo4j-core-3:5000
+server.initial_discovery_member_id=neo4j-core-1
+causal_clustering.minimum_core_cluster_size_at_core=3
+causal_clustering.initial_core_members=neo4j-core-1:5000,neo4j-core-2:5000,neo4j-core-3:5000
+```
+
+### 10.3 高可用策略
+
+| 策略 | 说明 | RTO |
+|------|------|-----|
+| 核心集群 | 3 节点 Raft | < 10s |
+| 读副本 | 异步复制 | N/A |
+| 备份恢复 | 定期备份 | 分钟级 |
+
+---
+
+## 十一、Neo4j 内存管理
+
+### 11.1 内存分配
+
+| 内存区域 | 说明 | 推荐比例 |
+|----------|------|----------|
+| Page Cache | 数据页面缓存 | 50%~60% |
+| Heap | JVM 堆 | 30%~40% |
+| Native | 原生内存 | 10% |
+
+### 11.2 内存配置
+
+```properties
+# neo4j.conf 内存配置
+server.memory.pagecache.size=4g
+server.memory.heap.initial_size=2g
+server.memory.heap.max_size=4g
+server.memory.off_heap.max_size=1g
+```
+
+### 11.3 内存监控
+
+```cypher
+// 查看内存使用
+CALL dbms.memory.getJVMHeapMemoryInfo() YIELD used, max, free
+RETURN used, max, free;
+
+// 查看 Page Cache
+CALL dbms.memory.getPageCacheMemoryInfo() YIELD total, used, free
+RETURN total, used, free;
+```
+
+---
+
+## 十二、Neo4j 数据导入最佳实践
+
+### 12.1 导入方式对比
+
+| 方式 | 速度 | 适用 |
+|------|------|------|
+| LOAD CSV | 中 | 小数据量 |
+| neo4j-admin import | 最快 | 初始导入 |
+| APOC periodic.iterate | 中 | 增量导入 |
+| JDBC | 慢 | 关系库迁移 |
+
+### 12.2 批量导入示例
+
+```cypher
+// LOAD CSV 批量导入
+LOAD CSV WITH HEADERS FROM 'file:///users.csv' AS row
+CALL {
+  WITH row
+  CREATE (n:User {
+    id: toInteger(row.id),
+    name: row.name,
+    email: row.email
+  })
+} IN TRANSACTIONS OF 10000 ROWS;
+
+// APOC 批量导入
+CALL apoc.periodic.iterate(
+  'LOAD CSV WITH HEADERS FROM "file:///orders.csv" AS row RETURN row',
+  'CREATE (n:Order {id: toInteger(row.id), amount: toFloat(row.amount)})',
+  {batchSize: 10000, parallel: true}
+);
+```
+
+---
+
+## 十三、Spring Data Neo4j 集成
+
+### 13.1 实体映射
+
+```java
+@Node
+public class Person {
+    @Id @GeneratedValue
+    private Long id;
+    
+    private String name;
+    
+    @Relationship(type = "KNOWS", direction = Direction.OUTGOING)
+    private List<Person> friends;
+    
+    @Property("age")
+    private int age;
+}
+
+// Repository 接口
+public interface PersonRepository extends Neo4jRepository<Person, Long> {
+    List<Person> findByName(String name);
+    
+    @Query("MATCH (p:Person {name: $name})-[:KNOWS]->(m) RETURN m")
+    List<Person> findFriendsByName(@Param("name") String name);
+}
+```
+
+### 13.2 查询优化
+
+```java
+// 使用 @Query 自定义查询
+@Query("MATCH (p:Person)-[:KNOWS*1..3]->(m:Person) WHERE p.name = $name RETURN DISTINCT m")
+List<Person> findFriendsOfFriends(@Param("name") String name);
+
+// 使用 Neo4jTemplate 批量操作
+neo4jTemplate.saveAll(persons);
+neo4jTemplate.findAll(Person.class);
+```
+
+---
+
+## 十四、Neo4j 监控与运维
+
+### 14.1 核心监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 事务数 | 事务/秒 | 异常波动 |
+| 页面缓存命中率 | 缓存效率 | < 90% |
+| 连接数 | 活跃连接 | > 80% 上限 |
+| 存储大小 | 数据库大小 | > 80% 磁盘 |
+| 查询延迟 | P99 延迟 | > 1s |
+
+### 14.2 运维命令
+
+```cypher
+// 查看数据库状态
+CALL dbms.listConfig() YIELD name, value WHERE name CONTAINS 'dbms.security'
+RETURN name, value;
+
+// 查看事务
+CALL dbms.listTransactions() YIELD transactionId, username, startTime
+RETURN transactionId, username, startTime;
+
+// 查看查询
+CALL dbms.listQueries() YIELD queryId, query, elapsedTimeMillis
+RETURN queryId, query, elapsedTimeMillis ORDER BY elapsedTimeMillis DESC;
+
+// 终止查询
+CALL dbms.killQuery(queryId);
+```
+
+---
+
+## 十五、Neo4j 安全加固
+
+### 15.1 安全配置
+
+| 配置 | 说明 | 推荐值 |
+|------|------|--------|
+| `dbms.security.auth_enabled` | 认证 | true |
+| `dbms.security.procedures.unrestricted` | 过程限制 | 最小化 |
+| `dbms.connector.bolt.tls_level` | TLS | REQUIRED |
+
+### 15.2 权限管理
+
+```cypher
+// 创建角色
+CREATE ROLE analyst;
+
+// 授予权限
+GRANT READ ON GRAPH * TO analyst;
+GRANT MATCH {*} ON GRAPH * NODES Person TO analyst;
+
+// 创建用户
+CREATE USER analyst_user SET PASSWORD 'StrongPassword123!';
+ASSIGN ROLE analyst TO analyst_user;
+```
+
+---
+
+## 十六、Neo4j 与 MySQL/ES 集成
+
+### 16.1 集成架构
+
+```text
+MySQL（事务数据） → CDC → Kafka → Neo4j（关系数据）
+                                      ↓
+                                   ES（全文检索）
+
+MySQL：存储事务数据（订单/用户信息）
+Neo4j：存储关系数据（好友/推荐/风控）
+ES：存储全文检索数据（搜索/日志）
+```
+
+### 16.2 数据同步方案
+
+| 方案 | 说明 | 适用 |
+|------|------|------|
+| CDC | 实时同步 | 通用 |
+| 批量导入 | 定时同步 | 离线分析 |
+| API 同步 | 按需同步 | 简单场景 |
+
 ## 八、与其他板块的关系
 
 - 与 [MongoDB](MongoDB.md)：MongoDB 用引用也能存图，但遍历要应用层多次查，深度关联远不如原生图存储。

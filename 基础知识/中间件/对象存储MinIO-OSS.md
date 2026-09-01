@@ -1247,6 +1247,206 @@ flowchart LR
 ```
 
 
+## 十六、多租户与访问控制
+
+### 16.1 多租户隔离方案
+
+| 方案 | 隔离级别 | 成本 | 适用 |
+|------|----------|------|------|
+| Bucket 隔离 | 高 | 低 | 通用 |
+| Policy 隔离 | 中 | 低 | 简单场景 |
+| Namespace 隔离 | 高 | 中 | K8s 多租户 |
+| 独立集群 | 最高 | 高 | 合规要求 |
+
+### 16.2 IAM Policy 示例
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::tenant-a/*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["s3:DeleteBucket"],
+      "Resource": "arn:aws:s3:::*"
+    }
+  ]
+}
+```
+
+---
+
+## 十七、生命周期与数据分层
+
+### 17.1 生命周期规则配置
+
+| 规则 | 操作 | 延迟 | 适用 |
+|------|------|------|------|
+| 临时文件 | 自动删除 | 7 天 | 日志/缓存 |
+| 温数据 | 降级为 IA | 30 天 | 历史数据 |
+| 冷数据 | 降级为 Archive | 90 天 | 归档 |
+| 极冷数据 | 永久删除 | 365 天 | 合规保留 |
+
+### 17.2 MinIO 生命周期配置
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "MoveToWarmStorage",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "logs/"},
+      "Expiration": {"Days": 30},
+      "Transition": {
+        "Days": 15,
+        "StorageClass": "WARM"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 十八、加密与安全
+
+### 18.1 加密层级
+
+| 层级 | 说明 | 配置 |
+|------|------|------|
+| 传输加密 | TLS 1.2+ | Nginx/MinIO TLS |
+| 静态加密 | SSE-S3/SSE-KMS | MinIO 端加密 |
+| 客户端加密 | CSE | 应用层加密 |
+| 密钥管理 | KMS 集成 | Vault/AWS KMS |
+
+### 18.2 加密配置示例
+
+```bash
+# MinIO 启用加密
+export MINIO_KMS_AUTO_ENCRYPTION=on
+export MINIO_VAULT_APPRoleId=xxx
+export MINIO_VAULT_APPSecretId=xxx
+
+# 客户端加密上传
+aws s3 cp file.txt s3://my-bucket/file.txt \
+  --sse aws:kms \
+  --sse-kms-key-id alias/my-key
+```
+
+---
+
+## 十九、监控与告警
+
+### 19.1 核心监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| 存储使用率 | Bucket 占用 | > 80% |
+| 请求延迟 | PUT/GET 延迟 | P99 > 100ms |
+| 4xx/5xx 错误率 | 请求失败 | > 1% |
+| 带宽使用 | 出入站带宽 | > 80% 上限 |
+| 对象数量 | Bucket 对象数 | > 1 亿 |
+
+### 19.2 Prometheus 指标采集
+
+```yaml
+# MinIO Prometheus 指标
+scrape_configs:
+  - job_name: 'minio'
+    metrics_path: '/minio/v2/metrics/cluster'
+    scheme: 'https'
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets: ['minio:9000']
+```
+
+---
+
+## 二十、跨区域复制与高可用
+
+### 20.1 跨区域复制配置
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| 同步复制 | 强一致 | 同城双活 |
+| 异步复制 | 最终一致 | 异地灾备 |
+| 批量同步 | 定时同步 | 成本敏感 |
+
+### 20.2 高可用架构
+
+```mermaid
+flowchart TB
+    A[用户] --> B[CDN]
+    B --> C[Region A MinIO]
+    B --> D[Region B MinIO]
+    C -->|同步复制| D
+    C --> E[EC2 集群]
+    D --> F[EC2 集群]
+```
+
+---
+
+## 二十一、性能优化
+
+### 21.1 读写性能调优
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 分片上传 | 大文件分片 | 提升上传成功率 |
+| 并行下载 | 多线程下载 | 提升下载速度 |
+| 预签名 URL | 免认证访问 | 降低延迟 |
+| CDN 加速 | 边缘缓存 | 降低源站压力 |
+| 连接池 | 复用连接 | 降低连接开销 |
+
+### 21.2 MinIO 性能基准
+
+```bash
+# MinIO 官方基准测试
+warp put --obj.size=1MiB --duration=10m --concurrent=32
+
+# 性能参考值
+单节点：1GB/s 读，500MB/s 写
+4 节点集群：4GB/s 读，2GB/s 写
+```
+
+---
+
+## 二十二、生产问题排查
+
+### 22.1 常见问题速查
+
+| 问题 | 可能原因 | 排查步骤 |
+|------|----------|----------|
+| 上传失败 | Bucket 不存在/权限不足 | 检查 IAM Policy |
+| 下载慢 | 网络带宽/CDN 配置 | traceroute + CDN 日志 |
+| 数据不一致 | 复制延迟 | 检查复制状态 |
+| 存储满 | 生命周期未配置 | 配置生命周期规则 |
+| 性能低 | 单节点/磁盘慢 | 增加节点/SSD |
+
+### 22.2 运维 Checklist
+
+```text
+每日：
+  - 检查存储使用率
+  - 检查请求错误率
+  - 检查复制状态
+
+每周：
+  - 检查生命周期规则执行
+  - 清理无用 Bucket
+  - 性能基线对比
+
+每月：
+  - 备份恢复演练
+  - 安全审计
+  - 容量规划
+```
+
 ## 十五、与其他板块的关系
 
 - 和「**基础知识/ES 体系**」：对象存储存原文件，ES 存元数据做检索。

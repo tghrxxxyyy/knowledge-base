@@ -1620,9 +1620,212 @@ security:
 
 ---
 
+## 十八、Prometheus 高级特性与生产实践
+
+### 18.1 Prometheus 部署模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| 单机 | 单实例 | 开发测试 |
+| 联邦 | 多 Prometheus 聚合 | 中等规模 |
+| Thanos | 全局视图+长期存储 | 大规模 |
+| VictoriaMetrics | 高性能替代 | 大规模 |
+
+### 18.2 Thanos 架构
+
+```mermaid
+flowchart TB
+    A[Prometheus 1] -->|Sidecar| B[Thanos Store Gateway]
+    C[Prometheus 2] -->|Sidecar| D[Thanos Store Gateway]
+    B --> E[Thanos Querier]
+    D --> E
+    E --> F[Thanos Ruler]
+    E --> G[Thanos Compactor]
+    B --> H[Object Storage]
+    D --> H
+```
+
+### 18.3 服务发现配置
+
+| 方式 | 说明 | 配置 |
+|------|------|------|
+| 静态 | 固定 target | `static_configs` |
+| 文件 | 文件动态 | `file_sd_configs` |
+| K8s | K8s 自动发现 | `kubernetes_sd_configs` |
+| Consul | 服务注册 | `consul_sd_configs` |
+| EC2 | 云实例 | `ec2_sd_configs` |
+
+---
+
+## 十九、Grafana 仪表板设计
+
+### 19.1 仪表板设计原则
+
+| 原则 | 说明 |
+|------|------|
+| 分层展示 | 概览→详情→诊断 |
+| 关键指标优先 | 黄金信号（延迟/流量/错误/饱和度） |
+| 时间范围合理 | 1h/6h/24h/7d |
+| 颜色语义 | 绿色正常/黄色警告/红色异常 |
+
+### 19.2 黄金信号仪表板
+
+| 信号 | 指标 | 面板类型 |
+|------|------|----------|
+| 延迟 | `histogram_quantile(0.99, ...)` | 时序图 |
+| 流量 | `rate(http_requests_total[5m])` | 时序图 |
+| 错误 | `rate(http_requests_total{status=~"5.."}[5m])` | 时序图 |
+| 饱和度 | `node_memory_MemAvailable` | 仪表盘 |
+
+### 19.3 Grafana 变量配置
+
+```json
+{
+  "name": "instance",
+  "type": "query",
+  "query": "label_values(http_requests_total, instance)",
+  "refresh": 2,
+  "multi": true,
+  "includeAll": true
+}
+```
+
+---
+
+## 二十、告警规则设计
+
+### 20.1 告警规则模板
+
+```yaml
+groups:
+  - name: application_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate: {{ $value | humanizePercentage }}"
+      
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency P99: {{ $value }}s"
+```
+
+### 20.2 告警分级策略
+
+| 级别 | 阈值 | 持续时间 | 通知方式 |
+|------|------|----------|----------|
+| P0 | > 10% 错误率 | 2 分钟 | 电话+短信 |
+| P1 | > 5% 错误率 | 5 分钟 | 短信+IM |
+| P2 | > 1% 错误率 | 10 分钟 | IM |
+| P3 | 资源使用 > 80% | 30 分钟 | 邮件 |
+
+---
+
+## 二十一、PromQL 深度实战
+
+### 21.1 常用 PromQL 模式
+
+```sql
+-- QPS 计算
+rate(http_requests_total[5m])
+
+-- P99 延迟
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+-- 错误率
+rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])
+
+-- 内存使用率
+(1 - node_memory_MemAvailable / node_memory_MemTotal) * 100
+
+-- CPU 使用率
+100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+### 21.2 聚合函数
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| `sum` | 求和 | 总 QPS |
+| `avg` | 平均 | 平均延迟 |
+| `max` | 最大值 | 峰值 |
+| `min` | 最小值 | 最低值 |
+| `count` | 计数 | 实例数 |
+| `topk` | Top K | Top 10 慢查询 |
+| `histogram_quantile` | 分位数 | P50/P99 |
+
+---
+
+## 二十二、长期存储与数据管理
+
+### 22.1 存储方案对比
+
+| 方案 | 保留期 | 成本 | 适用 |
+|------|--------|------|------|
+| 本地磁盘 | 15 天 | 低 | 开发 |
+| 远程写入 | 30 天 | 中 | 中等 |
+| Thanos | 永久 | 高 | 大规模 |
+| VictoriaMetrics | 永久 | 中 | 大规模 |
+
+### 22.2 数据降采样
+
+```yaml
+# Thanos 降采样配置
+retention:
+  resolution-5m: 30d
+  resolution-1h: 365d
+
+# VictoriaMetrics 降采样
+- storage.maxSamplesPerQuery: 100000
+- dedup.minScrapeInterval: 15s
+```
+
+---
+
+## 二十三、Prometheus vs Zabbix 对比
+
+| 维度 | Prometheus | Zabbix |
+|------|-----------|--------|
+| 数据模型 | 多维标签 | 主机+指标 |
+| 查询语言 | PromQL | 简单函数 |
+| 部署模式 | 拉取 | 推送+拉取 |
+| 云原生 | 原生支持 | 需适配 |
+| 告警 | Alertmanager | 内置 |
+| 可视化 | Grafana | 内置 |
+
+---
+
+## 二十四、生产问题排查
+
+### 24.1 常见问题速查
+
+| 问题 | 根因 | 解决方案 |
+|------|------|----------|
+| 指标缺失 | Target 不可达 | 检查网络/认证 |
+| 查询慢 | 高基数标签 | 减少标签基数 |
+| 存储满 | 保留期太长 | 降采样+删除旧数据 |
+| 告警风暴 | 规则太敏感 | 调整阈值+收敛 |
+| 内存溢出 | 时间序列太多 | 分片+联邦 |
+
+### 24.2 性能优化
+
+| 优化项 | 措施 | 效果 |
+|--------|------|------|
+| 查询优化 | 避免高基数 | 减少查询时间 |
+| 存储优化 | 压缩+降采样 | 减少存储成本 |
+| 网络优化 | 同 AZ 部署 | 减少延迟 |
+| 资源优化 | 合理配置 CPU/内存 | 提升稳定性 |
+
 ## 十、Prometheus 生产配置清单
 
-### 10.1 prometheus.yml 关键配置
+### 11.1 prometheus.yml 关键配置
 
 ```yaml
 global:

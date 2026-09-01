@@ -1253,6 +1253,235 @@ Kafka 备份策略：
 ```
 
 
+## 七、KRaft 模式部署详解
+
+### 7.1 KRaft vs ZooKeeper 对比
+
+| 维度 | ZooKeeper 模式 | KRaft 模式 |
+|------|---------------|-----------|
+| 元数据存储 | ZooKeeper | Kafka 内置 Raft |
+| Controller 选举 | ZK 选举 | Raft 选举 |
+| 元数据同步 | ZK 通知 | Raft 日志复制 |
+| 性能 | 受 ZK 限制 | 提升 2~3 倍 |
+| 运维 | 需维护 ZK 集群 | 无外部依赖 |
+| 最大分区 | ~200 万 | ~800 万 |
+
+### 7.2 KRaft 集群配置
+
+```properties
+# server.properties（KRaft 模式）
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+controller.listener.names=CONTROLLER
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+inter.broker.listener.name=PLAINTEXT
+log.dirs=/data/kafka-logs
+num.partitions=6
+default.replication.factor=3
+min.insync.replicas=2
+```
+
+---
+
+## 八、Kafka 性能调优参数
+
+### 8.1 Producer 调优
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `batch.size` | 批量大小 | 32768~65536 |
+| `linger.ms` | 批量等待时间 | 5~10 |
+| `buffer.memory` | 缓冲区大小 | 64MB~128MB |
+| `compression.type` | 压缩类型 | lz4/zstd |
+| `acks` | 确认机制 | all |
+| `retries` | 重试次数 | 2147483647 |
+| `max.in.flight.requests.per.connection` | 最大未确认请求 | 5 |
+
+### 8.2 Consumer 调优
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `fetch.min.bytes` | 最小拉取字节 | 1 |
+| `fetch.max.wait.ms` | 最大等待时间 | 500 |
+| `max.partition.fetch.bytes` | 分区最大拉取 | 1MB |
+| `max.poll.records` | 单次最大拉取记录 | 500 |
+| `session.timeout.ms` | 会话超时 | 45000 |
+| `heartbeat.interval.ms` | 心跳间隔 | 3000 |
+
+### 8.3 Broker 调优
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `num.io.threads` | IO 线程数 | 16 |
+| `num.network.threads` | 网络线程数 | 8 |
+| `log.flush.interval.messages` | 刷盘间隔消息数 | 10000 |
+| `log.flush.interval.ms` | 刷盘间隔时间 | 1000 |
+| `num.replica.fetchers` | 副本拉取线程 | 4 |
+| `leader.replication.lag.max` | 副本同步最大延迟 | 10 |
+
+---
+
+## 九、Kafka 监控与告警
+
+### 9.1 核心监控指标
+
+| 组件 | 指标 | 说明 | 告警阈值 |
+|------|------|------|----------|
+| Broker | Under Replicated Partitions | 副本不足分区数 | > 0 |
+| Broker | Offline Partitions | 离线分区数 | > 0 |
+| Broker | Active Controller Count | 活跃 Controller | != 1 |
+| Producer | Record Error Rate | 发送错误率 | > 0.1% |
+| Consumer | Consumer Lag | 消费延迟 | > 10000 |
+| Consumer | Commit Latency | 提交延迟 | > 1s |
+
+### 9.2 JMX 指标采集
+
+```bash
+# Kafka JMX Exporter 配置
+jmx_exporter:
+  hostPort: localhost:9404
+  lowercaseOutputName: true
+  rules:
+    - pattern: "kafka.server<type=BrokerTopicMetrics, name=(\\w+)><>Count"
+      name: kafka_broker_$1
+    - pattern: "kafka.consumer<type=consumer-fetch-manager-metrics, name=(\\w+)><>Value"
+      name: kafka_consumer_$1
+```
+
+---
+
+## 十、Kafka 安全加固
+
+### 10.1 认证方式
+
+| 方式 | 说明 | 适用 |
+|------|------|------|
+| SSL/TLS | 双向认证 | 高安全 |
+| SASL/PLAIN | 用户名密码 | 简单场景 |
+| SASL/SCRAM | 加盐密码 | 中等安全 |
+| SASL/OAUTHBEARER | OAuth 2.0 | 企业级 |
+| Kerberos | 企业认证 | 大企业 |
+
+### 10.2 ACL 权限配置
+
+```bash
+# 创建 ACL 规则
+kafka-acls.sh --add \
+  --allow-principal User:producer \
+  --operation Write \
+  --topic orders \
+  --bootstrap-server kafka:9092
+
+# 查看 ACL
+kafka-acls.sh --list --topic orders --bootstrap-server kafka:9092
+```
+
+---
+
+## 十一、Kafka 多租户配置
+
+### 11.1 租户隔离方案
+
+| 方案 | 隔离级别 | 说明 |
+|------|----------|------|
+| Topic 隔离 | 高 | 每个租户独立 Topic |
+| Quota 隔离 | 中 | 限制配额 |
+| ACL 隔离 | 高 | 权限隔离 |
+| 独立集群 | 最高 | 物理隔离 |
+
+### 11.2 Quota 配置
+
+```bash
+# 限制生产者带宽
+kafka-configs.sh --alter \
+  --add-config 'producer_byte_rate=10485760' \
+  --entity-type users --entity-name tenant-a
+
+# 限制消费者带宽
+kafka-configs.sh --alter \
+  --add-config 'consumer_byte_rate=20971520' \
+  --entity-type users --entity-name tenant-a
+```
+
+---
+
+## 十二、Kafka 生产问题排查
+
+### 12.1 常见问题速查
+
+| 问题 | 根因 | 解决方案 |
+|------|------|----------|
+| 消费延迟大 | 消费者处理慢 | 增加消费者/并行度 |
+| 消息丢失 | acks=0/1 | 设置 acks=all |
+| 消息重复 | 未幂等处理 | 启用幂等+事务 |
+| 分区不均 | 分区策略不合理 | 自定义分区器 |
+| 磁盘满 | 清理策略不当 | 调整 retention |
+| 副本不同步 | 网络/JVM | 检查 Broker 资源 |
+
+### 12.2 故障排查 SOP
+
+```mermaid
+flowchart TD
+    A[发现问题] --> B{问题类型}
+    B -->|消费延迟| C[检查消费者 Lag]
+    B -->|生产失败| D[检查 Producer 错误日志]
+    B -->|副本不同步| E[检查 Broker 资源]
+    C --> F[增加消费者+优化处理]
+    D --> G[检查acks+重试配置]
+    E --> H[检查网络+磁盘]
+    F --> I[验证恢复]
+    G --> I
+    H --> I
+```
+
+---
+
+## 十三、Kafka 与 Flink 深度集成
+
+### 13.1 集成模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| Flink Kafka Source | 直接消费 | 通用 |
+| Flink Kafka Connector | 增强功能 | 高级场景 |
+| Debezium + Kafka + Flink | CDC 全链路 | 实时同步 |
+
+### 13.2 Exactly-Once 集成
+
+```java
+// Flink Kafka Producer Exactly-Once
+KafkaSink<String> sink = KafkaSink.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(...)
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-kafka")
+    .build();
+```
+
+---
+
+## 十四、Kafka 压缩与存储优化
+
+### 14.1 压缩算法对比
+
+| 算法 | 压缩率 | CPU 开销 | 适用 |
+|------|--------|----------|------|
+| none | 无 | 无 | 不压缩 |
+| gzip | 高 | 高 | 存储敏感 |
+| snappy | 中 | 低 | 低延迟 |
+| lz4 | 中 | 低 | 通用 |
+| zstd | 高 | 中 | 高压缩率 |
+
+### 14.2 存储优化
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 日志段大小 | `log.segment.bytes` | 减少文件数 |
+| 清理策略 | `log.retention.hours` | 控制存储 |
+| 远程存储 | KIP-405 | 冷数据卸载 |
+| 分层存储 | Tiered Storage | 降成本 |
+
 ## 六、与其他板块的关系
 
 - 和「**源码系列/Kafka源码**」：本篇讲架构、语义、生产实践；源码篇讲 offset 索引、副本同步、日志存储等实现细节。

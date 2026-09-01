@@ -2313,6 +2313,303 @@ KafkaSink<String> sink = KafkaSink.<String>builder()
 | 分区策略 | 自定义分区 | setPartitioner |
 | 背压处理 | 限流控制 | setRateLimit |
 
+## 三十九、Flink Watermark 深度调优
+
+### 39.1 Watermark 策略选择
+
+| 策略 | 说明 | 适用 |
+|------|------|------|
+| `forBoundedOutOfOrderness` | 有界乱序 | 通用 |
+| `forMonotonousTimestamps` | 单调递增 | 严格有序 |
+| `forCooperative` | 协作式 | 多 Source 共享 |
+| 自定义 | 复杂逻辑 | 特殊场景 |
+
+### 39.2 Watermark 传递机制
+
+```text
+Watermark 传递：
+  Source → 并行度 N → Map → 并行度 N → Window
+
+  每个并行实例独立生成 Watermark
+  下游取所有上游 Watermark 的最小值
+  → 任一上游慢 → 整体 Watermark 慢
+
+优化：
+  - 设置 allowedLateness（允许延迟）
+  - 使用 sideOutputLateData（迟到数据侧输出）
+  - 避免 Watermark 传递链过长
+```
+
+### 39.3 迟到数据处理
+
+```java
+// 迟到数据处理配置
+OutputTag<Tuple2<String, Integer>> lateTag = new OutputTag<>("late-data"){};
+
+SingleOutputStreamOperator<Result> result = stream
+    .keyBy(e -> e.f0)
+    .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+    .allowedLateness(Time.seconds(5))  // 允许 5 秒延迟
+    .sideOutputLateData(lateTag)       // 超时迟到数据输出
+    .aggregate(new MyAggregateFunction());
+
+// 获取迟到数据
+DataStream<Tuple2<String, Integer>> lateData = result.getSideOutput(lateTag);
+```
+
+---
+
+## 四十、Flink 状态后端深度对比
+
+### 40.1 后端选型
+
+| 后端 | 状态存储 | 大状态支持 | 性能 |
+|------|----------|------------|------|
+| HashMapStateBackend | JVM 堆 | 不支持 | 最快 |
+| RocksDBStateBackend | 磁盘 | 支持 | 中等 |
+| EmbeddedRocksDBStateBackend | 磁盘 | 支持 | 中等 |
+
+### 40.2 RocksDB 调优
+
+```yaml
+# RocksDB 状态后端配置
+state.backend: rocksdb
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.fixed-per-slot: 256mb
+state.backend.rocksdb.block.cache-size: 128mb
+state.backend.rocksdb.writebuffer.size: 64mb
+state.backend.rocksdb.writebuffer.count: 4
+state.backend.rocksdb.compaction.style: level
+state.backend.rocksdb.timer-service.factory: rocksdb
+```
+
+### 40.3 状态后端性能基准
+
+| 操作 | HashMap | RocksDB |
+|------|---------|---------|
+| 状态读取 | 10ns | 100ns |
+| 状态写入 | 10ns | 200ns |
+| 状态大小 | 受限于 JVM 堆 | 不受限 |
+| Checkpoint | 快（增量） | 中等（增量） |
+
+---
+
+## 四十一、Flink CDC 实时同步实战
+
+### 41.1 Flink CDC 配置
+
+```sql
+-- Flink CDC 源表
+CREATE TABLE mysql_orders (
+  id BIGINT,
+  amount DECIMAL(10,2),
+  status STRING,
+  create_time TIMESTAMP(3),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'mysql-cdc',
+  'hostname' = 'mysql',
+  'port' = '3306',
+  'username' = 'cdc_user',
+  'password' = 'xxx',
+  'database-name' = 'order_db',
+  'table-name' = 'orders'
+);
+
+-- 实时同步到 ES
+CREATE TABLE es_orders (
+  id BIGINT,
+  amount DECIMAL(10,2),
+  status STRING,
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'elasticsearch-7',
+  'hosts' = 'http://es:9200',
+  'index' = 'orders'
+);
+
+INSERT INTO es_orders SELECT * FROM mysql_orders;
+```
+
+### 41.2 CDC 数据清洗
+
+```sql
+-- 增量聚合 + 实时报表
+SELECT
+  TUMBLE_START(proctime, INTERVAL '1' HOUR) AS window_start,
+  status,
+  COUNT(*) AS order_count,
+  SUM(amount) AS total_amount,
+  AVG(amount) AS avg_amount
+FROM mysql_orders
+WHERE proctime > TIMESTAMP '2024-01-01 00:00:00'
+GROUP BY TUMBLE(proctime, INTERVAL '1' HOUR), status;
+```
+
+---
+
+## 四十二、Flink SQL 调优参数
+
+### 42.1 核心调优参数
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `table.exec.state.ttl` | 状态 TTL | 24h |
+| `table.exec.shuffle-mode` | Shuffle 模式 | BATCH |
+| `table.exec.mini-batch.enabled` | Mini-batch | true |
+| `table.exec.mini-batch.allow-latency` | Mini-batch 延迟 | 5s |
+| `table.exec.mini-batch.size` | Mini-batch 大小 | 1000 |
+| `table.optimizer.join-reorder-enabled` | Join 重排 | true |
+| `table.optimizer.agg-phase-strategy` | 聚合策略 | TWO_PHASE |
+
+### 42.2 Checkpoint 调优
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `execution.checkpointing.interval` | Checkpoint 间隔 | 60s |
+| `execution.checkpointing.min-pause` | 最小间隔 | 30s |
+| `execution.checkpointing.timeout` | 超时时间 | 10min |
+| `execution.checkpointing.max-concurrent` | 最大并发 | 1 |
+| `state.backend.incremental` | 增量 Checkpoint | true |
+
+---
+
+## 四十三、Flink on K8s 部署最佳实践
+
+### 43.1 三种部署模式对比
+
+| 模式 | JobManager | TaskManager | 适用 |
+|------|-----------|-------------|------|
+| Session | 预部署 | 预部署 | 开发测试 |
+| Application | 每个 Job 一个 JM | 动态创建 | 生产环境 |
+| Per-Job | 每个 Job 一个 JM | 每个 Task 一个 TM | 隔离要求高 |
+
+### 43.2 K8s 部署配置
+
+```yaml
+# Flink JobManager 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink-jobmanager
+  template:
+    spec:
+      containers:
+        - name: jobmanager
+          image: flink:1.17
+          command: ["jobmanager.sh"]
+          args: ["standalone-job"]
+          resources:
+            requests:
+              memory: "1024Mi"
+              cpu: "500m"
+            limits:
+              memory: "2048Mi"
+              cpu: "1000m"
+          env:
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                taskmanager.numberOfTaskSlots: 4
+                parallelism.default: 4
+```
+
+---
+
+## 四十四、Flink 监控与告警
+
+### 44.1 核心监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|----------|
+| Checkpoint Duration | Checkpoint 耗时 | > 5min |
+| Checkpoint Failures | Checkpoint 失败数 | > 3 次 |
+| Backpressure | 反压比例 | > 80% |
+| Busy Time | 算子忙碌时间 | > 90% |
+| Watermark Delay | Watermark 延迟 | > 10s |
+| GC Time | GC 耗时 | > 10% |
+
+### 44.2 Prometheus 指标采集
+
+```yaml
+# Flink Prometheus 指标
+scrape_configs:
+  - job_name: 'flink'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['flink-jobmanager:9249']
+      - targets: ['flink-taskmanager:9249']
+```
+
+---
+
+## 四十五、Flink 生产问题排查指南
+
+### 45.1 常见问题速查
+
+| 问题 | 根因 | 解决方案 |
+|------|------|----------|
+| Checkpoint 超时 | 状态过大/算子慢 | 增量 Checkpoint + 增大超时 |
+| 反压严重 | 下游消费慢 | 增加并行度 + 限流 |
+| Watermark 停滞 | 数据乱序严重 | 调整 Watermark 策略 |
+| OOM | 状态过大 | 切换 RocksDB 后端 |
+| 数据倾斜 | KeyBy 不均 | 加盐 + 两阶段聚合 |
+| 延迟高 | Mini-batch 太大 | 减小 Mini-batch 延迟 |
+
+### 45.2 故障恢复 SOP
+
+```mermaid
+flowchart TD
+    A[任务失败] --> B{故障类型}
+    B -->|Checkpoint失败| C[增大超时+增量Checkpoint]
+    B -->|反压| D[增加并行度+限流]
+    B -->|OOM| E[切换RocksDB+增大内存]
+    B -->|数据倾斜| F[加盐+两阶段聚合]
+    C --> G[从Checkpoint恢复]
+    D --> G
+    E --> G
+    F --> G
+    G --> H{恢复成功?}
+    H -->|是| I[监控确认]
+    H -->|否| J[升级处理]
+```
+
+---
+
+## 四十六、Flink 最佳实践 Checklist
+
+### 46.1 开发阶段
+
+| 实践 | 说明 |
+|------|------|
+| 使用 Table API/SQL | 减少代码量，自动优化 |
+| 避免 KeyBy 热点 | 使用加盐打散 |
+| 合理设置并行度 | 匹配数据量和资源 |
+| 使用 Mini-batch | 减少状态访问频率 |
+
+### 46.2 部署阶段
+
+| 实践 | 说明 |
+|------|------|
+| 增量 Checkpoint | 减少 Checkpoint 耗时 |
+| RocksDB 后端 | 支持大状态 |
+| K8s 部署 | 弹性伸缩 |
+| 资源隔离 | 不同 Job 独立集群 |
+
+### 46.3 运维阶段
+
+| 实践 | 说明 |
+|------|------|
+| 监控 Checkpoint | 及时发现异常 |
+| 监控反压 | 优化吞吐 |
+| Savepoint 管理 | 定期保存+清理 |
+| 灰度发布 | 新版本逐步切流 |
+
 ## 三十八、Flink 状态管理最佳实践
 
 ### 18.1 状态类型选择

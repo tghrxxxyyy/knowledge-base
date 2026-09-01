@@ -2561,6 +2561,269 @@ security:
 ```
 
 
+## 四十、Lambda 事件源配置详解
+
+### 40.1 事件源类型
+
+| 事件源 | 触发方式 | 延迟 | 适用 |
+|--------|----------|------|------|
+| API Gateway | HTTP 请求 | 低 | REST API |
+| S3 | 对象变更 | 中 | 文件处理 |
+| DynamoDB Streams | 表变更 | 低 | 数据同步 |
+| SQS | 消息到达 | 低 | 异步解耦 |
+| SNS | 通知到达 | 低 | 事件广播 |
+| EventBridge | 定时/事件 | 低 | 定时任务 |
+| Kinesis | 数据流 | 中 | 流处理 |
+| IoT Core | 设备数据 | 低 | IoT |
+
+### 40.2 API Gateway + Lambda 配置
+
+```yaml
+# API Gateway REST API 配置
+Resources:
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResource
+      PathPart: "{proxy+}"
+  
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: ANY
+      ResourceId: !Ref ProxyResource
+      RestApiId: !Ref RestApi
+      AuthorizationType: COGNITO_USER_POOLS
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations"
+```
+
+---
+
+## 四十一、Step Functions 工作流编排
+
+### 41.1 工作流模式
+
+| 模式 | 说明 | 适用 |
+|------|------|------|
+| 顺序执行 | 步骤依次执行 | 简单流程 |
+| 并行执行 | 多分支并行 | 批量处理 |
+| 选择分支 | 条件判断 | 业务路由 |
+| Map 并发 | 集合并发处理 | 批量任务 |
+| 错误重试 | 自动重试+回滚 | 可靠性 |
+
+### 41.2 Step Functions 状态机示例
+
+```json
+{
+  "StartAt": "ProcessOrder",
+  "States": {
+    "ProcessOrder": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.orderType", "StringEquals": " express", "Next": "ExpressProcessing"},
+        {"Variable": "$.orderType", "StringEquals": "standard", "Next": "StandardProcessing"}
+      ]
+    },
+    "ExpressProcessing": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:region:account:function:express-handler",
+      "Next": "SendNotification"
+    },
+    "StandardProcessing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {"QueueUrl": "$.queueUrl", "MessageBody.$": "$"},
+      "Next": "WaitForConfirmation",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "MaxAttempts": 3}]
+    }
+  }
+}
+```
+
+---
+
+## 四十二、Knative 扩缩容配置
+
+### 42.1 Knative Service 配置
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        autoscaling.knative.dev/target: "50"
+        autoscaling.knative.dev/window: "60s"
+    spec:
+      containers:
+        - image: my-app:latest
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+```
+
+### 42.2 Knative vs 原生 K8s HPA
+
+| 维度 | Knative | K8s HPA |
+|------|---------|---------|
+| 缩容到零 | 支持 | 不支持 |
+| 冷启动 | 需优化 | 无 |
+| 指标 | RPS/并发 | CPU/内存 |
+| 配置复杂度 | 中等 | 低 |
+
+---
+
+## 四十三、冷启动优化策略
+
+### 43.1 冷启动原因分析
+
+| 阶段 | 耗时 | 优化方向 |
+|------|------|----------|
+| 下载代码 | 1~10s | 减小包大小 |
+| 启动运行时 | 0.5~3s | 预置运行时 |
+| 初始化代码 | 0.1~1s | 延迟初始化 |
+| 网络连接 | 0.1~1s | 连接池复用 |
+
+### 43.2 优化措施
+
+| 措施 | 效果 | 成本 |
+|------|------|------|
+| 预置并发 | 消除冷启动 | 高 |
+| SnapStart | 减少 90% 启动时间 | 低 |
+| 减小包大小 | 减少下载时间 | 无 |
+| 延迟初始化 | 减少初始化时间 | 无 |
+| 选择近区域 | 减少网络延迟 | 无 |
+
+---
+
+## 四十四、定时任务配置
+
+### 44.1 EventBridge 定时规则
+
+```json
+{
+  "ScheduleExpression": "rate(5 minutes)",
+  "State": "ENABLED",
+  "Targets": [{
+    "Arn": "arn:aws:lambda:region:account:function:my-function",
+    "Id": "TargetFunction"
+  }]
+}
+```
+
+### 44.2 Cron 表达式示例
+
+| 表达式 | 说明 |
+|--------|------|
+| `rate(5 minutes)` | 每 5 分钟 |
+| `rate(1 hour)` | 每小时 |
+| `cron(0 12 * * ? *)` | 每天 12:00 UTC |
+| `cron(0/15 * * * ? *)` | 每 15 分钟 |
+| `cron(0 8 ? * MON-FRI *)` | 工作日 8:00 |
+
+---
+
+## 四十五、Serverless 成本优化
+
+### 45.1 成本构成
+
+| 组件 | 说明 | 优化方向 |
+|------|------|----------|
+| 请求费用 | 每百万请求 | 减少调用次数 |
+| 执行时间 | GB-秒 | 优化代码+内存 |
+| 预置并发 | 常驻实例 | 按需调整 |
+| API Gateway | 每百万请求 | 精简 API |
+
+### 45.2 成本对比
+
+| 场景 | EC2 | Lambda | 节省 |
+|------|-----|--------|------|
+| 低频 API（1000 次/天） | $50/月 | $1/月 | 98% |
+| 中频 API（10 万次/天） | $200/月 | $50/月 | 75% |
+| 高频 API（1000 万次/天） | $500/月 | $800/月 | 更贵 |
+
+### 45.3 成本优化最佳实践
+
+```text
+优化策略：
+  1. 减少调用次数（合并请求）
+  2. 优化代码（减少执行时间）
+  3. 合理设置内存（性价比最优）
+  4. 使用预留并发（高频场景）
+  5. 监控成本（设置告警）
+```
+
+---
+
+## 四十六、Serverless 2.0 趋势
+
+### 46.1 新一代 Serverless 特性
+
+| 特性 | 说明 | 代表产品 |
+|------|------|----------|
+| 容器级粒度 | 更细粒度 | AWS Fargate |
+| 持久执行 | 长时间运行 | AWS Lambda SnapStart |
+| 冷启动消除 | 预置/预测 | Google Cloud Run |
+| 边缘计算 | 低延迟 | Cloudflare Workers |
+| AI 加速 | GPU 支持 | AWS Lambda + Inferentia |
+
+### 46.2 选型对比
+
+| 产品 | 粒度 | 冷启动 | 适用 |
+|------|------|--------|------|
+| AWS Lambda | 函数 | 有（可优化） | 通用 |
+| Google Cloud Run | 容器 | 低 | Web 服务 |
+| Azure Functions | 函数 | 有 | .NET 生态 |
+| Cloudflare Workers | 边缘函数 | 极低 | 边缘计算 |
+| Vercel Edge Functions | 边缘函数 | 极低 | 前端 |
+
+---
+
+## 四十七、Serverless 安全最佳实践
+
+### 47.1 安全清单
+
+| 层级 | 措施 |
+|------|------|
+| 代码 | 依赖扫描、密钥管理 |
+| 身份 | 最小权限、临时凭证 |
+| 网络 | VPC 隔离、安全组 |
+| 数据 | 加密存储、传输加密 |
+| 监控 | 日志审计、异常检测 |
+
+### 47.2 IAM 最小权限示例
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::my-bucket/data/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem"],
+      "Resource": "arn:aws:dynamodb:region:table:my-table"
+    }
+  ]
+}
+```
+
 ## 三十九、与其他板块的关系
 
 - 事件驱动架构见「[架构/事件溯源与CQRS](../../架构/事件溯源与CQRS实战.md)」；
