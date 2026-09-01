@@ -1080,6 +1080,7 @@ public class DeadLetterConsumer {
         // 记录日志/告警/人工处理
     }
 }
+```
 
 ## 十三、RabbitMQ流队列深度解析
 

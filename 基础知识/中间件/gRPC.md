@@ -1464,7 +1464,6 @@ protoc -I . --grpc-gateway_out=. --grpc-gateway_opt=paths=source_relative \
 
 # 启动 Gateway
 go run gateway.go -grpc-server=localhost:8080 -http-server=:8081
-```
 });
 ```
 

@@ -1307,6 +1307,7 @@ public class MyMetric extends RichMapFunction<Event, Event> {
 
     @Override
     public Event map(Event event) {
+```
 ## Flink高级实践与故障排查
 
 ### Watermark策略深入
