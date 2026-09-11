@@ -3,38 +3,94 @@
 > 对应 RFC 6455 与 RFC 7540（HTTP/2）多路复用定义，及 xiaolincoder/hello-http 对比。
 
 ## 一、背景与挑战
-HTTP/2 通过单连接上的多路复用流解决了队头阻塞（应用层），WebSocket 提供单连接全双工消息。二者都「复用一条 TCP 连接」，但设计目标与语义不同，常被混淆。
+HTTP/2 通过单连接上的「多路复用流」解决了 HTTP/1.1 的应用层队头阻塞（一个慢响应阻塞同连接其他请求）。WebSocket 提供单连接全双工消息通道。二者都「复用一条 TCP 连接」，但设计目标与语义不同，常被混淆。理解差异有助于正确选型：何时用 HTTP/2 并发请求，何时用 WebSocket 实时双向。
+
+很多开发者误以为「WebSocket 也多路复用，所以能替代 HTTP/2」，或反过来以为「HTTP/2 能双向推送所以能替代 WebSocket」。二者语义正交，选型错配会导致架构复杂或性能问题。
+
+本质上，HTTP/2 关心的是「如何高效地并发搬取资源」，WebSocket 关心的是「如何维持一条低延迟的双向对话」。把两者混为一谈，就会在需要「多请求并发」时错用单通道，或在需要「持续对话」时错用请求-响应。
 
 ## 二、核心原理
-HTTP/2 把请求/响应切分为带流 ID 的帧，多条流在同一个 TCP 连接上交错传输，实现并发且避免建立多连接。WebSocket 则是握手升级后的单一全双工消息通道，不区分流，消息由应用层自行路由。
+HTTP/2 把每个请求/响应切分为带「流 ID」的帧，多条流在同一 TCP 连接上交错传输（multiplexing），实现并发且避免建立多连接的开销。WebSocket 则是握手升级后的单一全双工消息通道，协议层不区分流——所有消息走同一条逻辑通道，由应用层自行路由（如带消息 ID）。
+
+二者复用的是「同一条 TCP 连接」，但 HTTP/2 的复用是「多流并发」，WebSocket 是「单通道双向」。换句话说，HTTP/2 的流是协议内建的一等公民，WebSocket 的「多路」需要应用自己实现。
 
 ## 三、形式化与数学基础
-HTTP/2 流并发度为可协商的 SETTINGS_MAX_CONCURRENT_STREAMS（N），单连接吞吐受单条 TCP 的拥塞窗口与队头阻塞（TCP 层）约束。WebSocket 通道数恒为 1，但双向对称；其复用体现在「一条连接替代多轮 HTTP 事务」。
+HTTP/2 并发流数受可协商的 `SETTINGS_MAX_CONCURRENT_STREAMS`（记为 $N$）约束；单连接吞吐受单条 TCP 的拥塞窗口与「TCP 层队头阻塞」约束。
+
+设一条 TCP 连接的带宽为 $B$、RTT 为 $R$，HTTP/1.1 串行事务吞吐受 $1/R$ 量级限制，HTTP/2 多流可逼近 $B$，WebSocket 单通道吞吐亦逼近 $B$ 但无「多事务并发」语义。若需在 WebSocket 上并发多逻辑通道，需应用层维护消息 ID 与分发表，等价于把多路复用「上移」到应用层。
+
+无论 HTTP/2 还是 WebSocket，只要底层仍是单条 TCP，一次丢包就会阻塞其上所有数据（TCP 层队头阻塞），这是二者共同的天花板。
+
+从连接数角度看：HTTP/1.1 常用 6 条并行连接绕开队头阻塞，HTTP/2 用一条连接多流取代之；WebSocket 则故意保持一条长期连接，用「帧交错」而不是「连接并行」来承载双向消息。
+
+从延迟角度看：HTTP/2 每个请求仍需一次往返（RTT）建立流语义；WebSocket 握手完成后消息可零额外建连开销直接发送，适合高频小消息。
+
+从服务器压力看：HTTP/2 的多流对服务端是「并发请求」，可按请求粒度调度与限流；WebSocket 是「长驻会话」，需要为每连接维护状态与心跳，内存模型完全不同。
+
+从故障恢复看：HTTP/2 请求失败可重试单条流；WebSocket 连接断开则需重连并恢复应用层会话，通常要设计断线续传与消息补偿。
 
 ## 四、代码实现
 ```http
-/* HTTP/2: 同一连接上多个流 */
-HEADERS (stream=1, GET /a)  +  HEADERS (stream=3, GET /b)
-DATA (stream=1) ... DATA (stream=3) ...  /* 交错 */
-/* WebSocket: 单通道双向帧 */
+# HTTP/2：同一连接上多个流交错
+HEADERS (stream=1, GET /a)
+HEADERS (stream=3, GET /b)
+DATA (stream=1) ... DATA (stream=3) ...   # 交错传输
+
+# WebSocket：单通道双向帧
 client -> server: text frame "hi"
 server -> client: text frame "pong"
+# 若需多路：应用层在 payload 带 {"chan": 1, "data": ...}
 ```
 
+HTTP/2 的多路复用由协议栈透明处理；WebSocket 若要「多路」，需在应用帧里自行编码 channel 字段并由两端分发，协议本身不感知。这也是 gRPC 选 HTTP/2 而非 WebSocket 承载多路 RPC 的原因——HTTP/2 的流天然对应一次 RPC 调用。
+
 ## 五、与其他技术对比
-HTTP/2 多路复用仍受 TCP 层队头阻塞影响（一个丢包阻塞所有流）；HTTP/3 基于 QUIC 解决该问题。WebSocket 逻辑上单流，但可在应用层自建多路（如带消息 ID）。SSE 作为 HTTP/2 上的单向流也很常见。
+
+| 特性 | HTTP/2 多路复用 | WebSocket |
+| --- | --- | --- |
+| 并发模型 | 多流交错 | 单通道全双工 |
+| 方向 | 请求-响应（半双工语义） | 双向对称 |
+| TCP 队头阻塞 | 仍有（丢包阻塞所有流） | 单流，同样受 TCP 影响 |
+| 应用层路由 | 流 ID | 需自建（消息 ID） |
+| 头部压缩 | HPACK | 无（靠扩展） |
+
+HTTP/2 多路复用仍受 TCP 层队头阻塞（一个丢包阻塞所有流）；HTTP/3 基于 QUIC 解决该问题。WebSocket 逻辑单流，可在应用层自建多路。SSE 作为 HTTP/2 上的单向流也很常见。
 
 ## 六、常见误区
-误区一：WebSocket 多路复用——它不在协议层多路。误区二：HTTP/2 完全无队头阻塞——仅解决 HTTP 层，TCP 层仍存在。误区三：二者互斥——可在 HTTP/2 连接上通过扩展承载 WebSocket。
+- 误区一：WebSocket 多路复用。它不在协议层多路，需应用层自建。
+- 误区二：HTTP/2 完全无队头阻塞。仅解决 HTTP 层，TCP 层仍存在（HTTP/3 才解决）。
+- 误区三：二者互斥。可在 HTTP/2 连接上通过扩展（如 WebSocket over HTTP/2 的 CONNECT）承载 WebSocket。
+- 误区四：WebSocket 比 HTTP/2 快。吞吐上限都由单 TCP 决定，差异在语义而非速度。
+- 误区五：HTTP/2 能双向推送所以替代 WS。HTTP/2 的 PUSH 是服务端推资源、仍是请求-响应模型，无 WS 的对称双向消息通道。
+- 误区六：有了 HTTP/2 就不需要长连接。多路复用减少连接数，但不等于提供了持续双向会话。
+- 误区七：WebSocket 天然支持请求-响应配对。它是消息流，配对需应用层用消息 ID 自行实现。
 
-## 七、与开源书/权威来源对应
-RFC 7540 第 5 节定义流与多路复用；RFC 6455 定义 WebSocket 帧；xiaolincoder/hello-http 给出二者对比图示；Kurose & Ross 介绍 HTTP 演进。
+## 七、与开源书·权威来源对应
+RFC 7540 第 5 节定义流与多路复用；RFC 6455 定义 WebSocket 帧；xiaolincoder/hello-http 给出二者对比图示；Kurose & Ross 介绍 HTTP 演进；QUIC（RFC 9000）解决 TCP 队头阻塞。
+
+gRPC 官方明确选择 HTTP/2 而非 WebSocket，正是因为流与 RPC 调用的天然映射。具体参数与实现以官方最新文档为准。
 
 ## 八、面试题
-HTTP/2 多路复用解决了什么？WebSocket 为何不算多路复用？TCP 队头阻塞对二者影响？何时用哪种？
+- 问：HTTP/2 多路复用解决什么？答：应用层队头阻塞，多请求并发于单连接。
+- 问：WebSocket 为何不算多路复用？答：协议层单通道，无流 ID。
+- 问：TCP 队头阻塞对二者影响？答：都受影响，HTTP/3/QUIC 才解决。
+- 问：何时用哪种？答：实时双向用 WS，并发请求用 HTTP/2。
+- 问：WS 上如何实现多路？答：应用层在消息中带 channel/消息 ID 并自行分发。
+- 问：HTTP/2 Server Push 能替代 WS 推送吗？答：不能，它推的是资源且仍是请求-响应语义。
+- 问：二者能否共存于一条连接？答：可以，通过 CONNECT 类扩展在 HTTP/2/3 上承载 WebSocket。
 
 ## 九、演进与趋势
-HTTP/3 用 QUIC 消除 TCP 队头阻塞；WebSocket over HTTP/3 通过 CONNECT 扩展继续可用，二者在传输层逐步融合。
+HTTP/3 用 QUIC 消除 TCP 队头阻塞；WebSocket over HTTP/3 通过 CONNECT 扩展继续可用，二者在传输层逐步融合。应用层常组合使用：用 HTTP/2 拉取资源、用 WebSocket 做实时通道，用 gRPC（HTTP/2）做内部 RPC。
+
+协议选型正从「二选一」走向「按语义分层使用」。相关演进以官方最新文档为准。
+
+选型时可用三个问题快速判断：需要服务端主动、低延迟推送吗？需要双向对等消息吗？会话需要长期保持状态吗？三者皆「是」选 WebSocket；只是并发拉取资源则选 HTTP/2。
+
+组合架构很常见：HTTP/2 负责资源与 API（请求-响应、可缓存、可重试），WebSocket 负责事件与通知（低延迟、双向、长驻），二者在同一应用里分工协作。
+
+可观测性也不同：HTTP/2 天然有请求级指标（状态码、耗时、流 ID），WebSocket 需自行埋点（消息延迟、连接时长、重连率），否则线上问题难以定位。
+
+迁移路径上，从 HTTP 轮询/长轮询迁移到 WebSocket 时，可先让 WebSocket 只承载推送、仍用 HTTP/2 做请求，逐步替换以降低一次性重写风险。
 
 ## 十、小结
-HTTP/2 多路复用是「多流交错」的并发模型，WebSocket 是「单通道全双工」模型，目标不同，理解差异有助于正确选型。
+HTTP/2 多路复用是「多流交错」的并发模型，WebSocket 是「单通道全双工」模型，目标不同；理解差异有助于正确选型，且二者都受 TCP 队头阻塞约束（HTTP/3 解此）。把「并发请求」交给 HTTP/2、「对称双向消息」交给 WebSocket，是现代 Web 实时架构的常态。
