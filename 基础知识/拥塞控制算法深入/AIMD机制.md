@@ -1,42 +1,110 @@
 # AIMD机制
 
-> 对应 RFC 5681；Chiu & Jain 公平性分析。
+> 对应 RFC 5681（TCP Congestion Control）；Chiu & Jain 1989《Analysis of the Increase and Decrease Algorithms》；Tanenbaum《Computer Networks》第6章。
 
 ## 一、背景与挑战
-多流共享瓶颈时，需要一种既“高效”又“公平”的控制律：公平地平分带宽（收敛到均衡点），且任一流退场时其余流能平滑补位。
+
+当多条流共享瓶颈链路时，需要一种既「高效」又「公平」的控制律：一方面要尽快把空闲带宽用满（利用率），另一方面当某流退场时其余流要能平滑补位、且占优的流要被拉回（公平性）。「增/减算法」的相图分析（Chiu & Jain）告诉我们：只有「加法增、乘法减」（AIMD）能同时保证长期收敛到公平点且保持高利用率。若改用乘法增（MIMD）会放大差距、强者恒强；若改用加法减（AIAD）则永远无法收敛。AIMD 因此成为 Reno 类算法的数学核心。
+
+AIMD 的另一个前提是「有可靠的拥塞信号」。它把丢包当拥塞信号，这在有线且缓冲区适中的网络中大体成立；一旦链路存在随机丢包（无线）或缓冲区过大（bufferbloat），信号就会失真，导致窗口被无谓压低或延迟飙升——这也是后续 CUBIC 与 BBR 改进的直接动因。
 
 ## 二、核心原理
-AIMD = Additive Increase / Multiplicative Decrease（加性增、乘性减）。丢包时 cwnd 乘性减半（×0.5），平稳时每 RTT 加性增 1 MSS。它在公平性（收敛到等分）与高利用率（接近满带宽）间取得平衡。
 
-## 三、形式化 / 数学基础
-拥塞避免阶段：$cwnd(t+1) = cwnd(t) + 1$（每 RTT 加性增）。
-丢包事件：$cwnd \leftarrow \max(\beta\cdot cwnd,\ 2\cdot SMSS)$，$\beta=1/2$（乘性减）。
-公平性：两流 x、y 在瓶颈容量 C 下，AIMD 使 $(x-y)$ 随 RTT 单调收敛到 0（Chiu-Jain 证明）。
+AIMD = Additive Increase / Multiplicative Decrease（加性增、乘性减）：
+
+- 加性增：在拥塞避免阶段，每个 RTT 把 `cwnd` 增加 1 个 MSS（等效每收到一个 ACK 增加 `SMSS²/cwnd`）。这保证「只要有空闲容量，就缓慢而确定地把它分掉」，趋向满带宽。
+- 乘性减：一旦检测到丢包（3-dup-ACK 或超时），把 `ssthresh` 设为 `cwnd/2`，并把 `cwnd` 减半（至少 2 个 MSS）。这保证「占优的流被快速拉回」，让落后流有机会追上。
+
+「加」保证效率、「乘减」保证公平，二者不对称正是 AIMD 收敛性的来源：在 Chiu-Jain 相图上，加法增沿对角线右上移动（趋向满利用），乘法减沿过原点的射线向内收缩（趋向等分），最终螺旋收敛到「满带宽且等分」的均衡点。
+
+AIMD 与慢启动配合构成完整状态机：慢启动以指数增长快速探路（每 RTT 翻倍），到达 `ssthresh` 后切入拥塞避免（线性增长），丢包后用快速恢复避免回到慢启动。AIMD 只是其中的「拥塞避免 + 减窗」部分，理解它必须放在整个状态机里。
+
+## 三、形式化与数学基础
+
+拥塞避免阶段的加性增（按 RTT）：
+
+$$ cwnd(t+1) = cwnd(t) + 1 \quad (\text{单位：MSS}) $$
+
+丢包事件的乘性减：
+
+$$ cwnd \leftarrow \max(\beta \cdot cwnd,\ 2\cdot SMSS), \qquad \beta = 1/2 $$
+$$ ssthresh \leftarrow \max(\beta \cdot cwnd,\ 2\cdot SMSS) $$
+
+两流公平收敛：设瓶颈容量 $C$，$x+y=C$。每次加性增使差距 $d=x-y$ 拉大，每次乘性减使 $d$ 按 $\beta$ 缩放。Chiu-Jain 证明对称配置下 $d$ 单调收敛到 0，即各流等分 $C$。若采用 MIMD（增也乘），则 $d$ 会放大而非收敛；若采用 AIAD（减也加），系统围绕均衡点震荡而不收敛。
+
+AIMD 的稳态还有一个工程含义：由于窗口在「减半」与「缓慢爬升」之间循环，平均窗口约为峰值的一部分（对 $\beta=1/2$ 的经典结论，平均吞吐约为峰值的 $3/4$ 量级），这部分「锯齿」是 AIMD 换取公平性的固有代价。
 
 ## 四、代码实现
-```python
-def on_ack_per_rtt(cwnd):
-    return cwnd + 1          # 加性增
 
-def on_loss(cwnd):
-    return max(cwnd * 0.5, 2)  # 乘性减
+下面用一段 Python 表达 AIMD 每 RTT 的「加」与丢包时的「减」：
+
+```python
+def on_rtt_ai(cwnd):
+    # 加性增：每 RTT 加 1 MSS（实际按 ACK 切片累加等效）
+    return cwnd + 1
+
+def on_loss_md(cwnd, beta=0.5):
+    # 乘性减：cwnd 减半，ssthresh 同设
+    new = max(int(cwnd * beta), 2)
+    return new, new   # 返回 (cwnd, ssthresh)
+
+def on_ack(cwnd, ssthresh, smss, in_slow_start):
+    # 内核实际写法：慢启动按 ACK 加 1 MSS，拥塞避免加 SMSS^2/cwnd
+    if in_slow_start:
+        return cwnd + smss
+    return cwnd + (smss * smss) // cwnd   # 一个 RTT 累积效果恰为 +1 MSS
 ```
 
+注意：Linux 内核在拥塞避免阶段对每 ACK 加 `SMSS²/cwnd`（整数累计），一个 RTT 累积效果恰为 +1 MSS，与上式一致。
+
 ## 五、与其他技术对比
-AIMD 是“基于丢包信号”的代表；相比 MIMD（乘增乘减，不公平）、AIAD（不稳），AIMD 在稳定性与公平性上最优。BBR 不采用 AIMD，而是按带宽模型 pacing。
+
+| 控制律 | 增 | 减 | 结论 |
+| --- | --- | --- | --- |
+| AIMD | 加 | 乘 | 收敛且公平（Reno 选它） |
+| MIMD | 乘 | 乘 | 差距放大、不公平 |
+| AIAD | 加 | 加 | 震荡、不收敛 |
+| MIAD | 乘 | 加 | 收敛但利用率低 |
+
+BBR 不采用 AIMD，而是按 BtlBw×RTTprop 模型 pacing，本质属于「模型式」而非「反应式信号驱动」，因此不在 AIMD 相图框架内讨论。
 
 ## 六、常见误区
-误区一：AIMD 的“加”是按包加。错，是按 RTT 加 1 MSS（等效每 ACK 加 SMSS²/cwnd）。误区二：乘性减会让吞吐减半以下。错，是 cwnd 减半，吞吐近似减半。误区三：AIMD 保证严格公平。错，仅长期收敛，且受 RTT 偏置（RTT 小的流占优）。
 
-## 七、与开源书 / 权威来源对应
-- CS-Notes：https://github.com/CyC2018/CS-Notes
-- RFC 5681、Kurose & Ross 第 3 章、Tanenbaum《Computer Networks》第 6 章。
+误区一：AIMD 的「加」是按包加。错——是按 RTT 加 1 个 MSS，等效每收到一个 ACK 加 `SMSS²/cwnd`，并非每包 +1。
+
+误区二：乘性减让吞吐减半以下。错——减半的是 `cwnd`，吞吐量近似减半（而非归零），且这是「快速恢复」而非回到起点。
+
+误区三：AIMD 保证严格公平。错——它只保证长期收敛到比例公平，且存在 RTT 偏置（RTT 小的流窗口涨得快、占优）。
+
+误区四：AIMD 只用于 TCP。错——其核心思想（加增乘减的反馈控制）广泛用于拥塞控制、流量整形与分布式资源分配。
+
+误区五：丢包一定是拥塞。错——随机丢包（无线误码）会让 AIMD 误判并压低窗口，这是它在有损链路上表现差的原因。
+
+误区六：缓冲区越大越好。错——过大的缓冲区削弱丢包信号（bufferbloat），使 AIMD 迟迟不降窗，反而造成高延迟。
+
+## 七、与开源书·权威来源对应
+
+- RFC 5681 第3节把 AIMD 落地为 TCP 的慢启动/拥塞避免/快速恢复规则。
+- Chiu & Jain 1989 用相图严格证明 AIMD 的收敛与公平性，是理论基石。
+- Tanenbaum《Computer Networks》第6章以直观图解说明 AIMD 的「效率-公平」权衡。
+- Kurose & Ross《Computer Networking》第3章给出加法增/乘法减的闭环控制视角。
+- CS-Notes 对 AIMD 有通俗小结。
 
 ## 八、面试题
-1. 为什么乘性减而非加性减？答：乘性减保证多流公平收敛、退场流让位快。2. AIMD 的公平收敛点？答：各流等分瓶颈带宽。
+
+1. 为什么用乘性减而非加性减？要点：乘性减保证多流公平收敛、退场流让位快；加性减永不收敛。
+2. AIMD 的公平收敛点是？要点：各流按权重等分瓶颈带宽（比例公平）。
+3. 为什么 RTT 小的流在 AIMD 下占优？要点：每 RTT +1 MSS，RTT 小者单位时间窗口涨得快。
+4. AIMD 与 BBR 的根本区别？要点：AIMD 是丢包信号驱动的反应式；BBR 是带宽模型驱动的主动式。
+5. AIMD 为什么在无线/大缓冲链路上效果差？要点：丢包信号与真实拥塞脱钩，导致窗口误判下降或迟迟不降。
+6. 锯齿波动是缺陷吗？要点：它是 AIMD 换取公平与收敛的固有代价，平均吞吐低于峰值但换来多流共存稳定性。
 
 ## 九、演进与趋势
-CUBIC 用凹-凸函数替代线性增，在大 BDP 下更高效；但本质仍属“丢包驱动”。
+
+CUBIC 用「凹-凸三次函数」替代线性增，在大 BDP 下收敛更快，但本质仍属「丢包驱动」的反应式框架，未跳出 AIMD 的精神（增缓减骤）。BBR 等模型式算法则彻底脱离 AIMD，转向对网络参数的显式估计。学术界也有把 AIMD 推广到「广义 AIMD（GAIMD）」以匹配不同 RTT/丢包率的研究。
+
+在数据中心内部，ECN 与 DCTCP 把「拥塞信号」从丢包前移到交换机标记，使减窗更平滑、队列更短；这仍属于「反应式」家族，只是信号更早更准。整体趋势是「信号质量决定算法上限」：无论 AIMD 还是模型式，能否及时准确获得拥塞信号，仍是决定性能的关键。
 
 ## 十、小结
-AIMD 以“加性增、乘性减”在公平与效率间取得平衡，是 Reno 类拥塞控制的数学核心。
+
+AIMD 以「加性增、乘性减」在效率（用满带宽）与公平（收敛到等分）之间取得数学上可证明的平衡，是 Reno 类拥塞控制的核心控制律。理解其相图与收敛性，是判断一切后续变体优劣的理论根底；而其依赖丢包作信号的假设，正是后续算法改进的出发点。
