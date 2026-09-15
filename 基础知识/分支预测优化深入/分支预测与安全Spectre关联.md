@@ -1,46 +1,120 @@
 # 分支预测与安全Spectre关联
 
-> 对应 Kocher et al. 2019 "Spectre" (arXiv:1801.01203) / Böhme 2018 "Meltdown"。
+> 对应 Kocher et al. 2019 "Spectre Attacks: Exploiting Speculative Execution"（IEEE S&P，arXiv:1801.01203）与 Lipp et al. 2018 "Meltdown: Reading Kernel Memory from User Space"（arXiv:1801.01207）。
 
 ## 一、背景与挑战
-投机执行在误预测时本应回滚结果，但微架构状态(缓存)未完全回滚，攻击者可借侧信道读出越权数据。Spectre 利用分支预测器的投机行为越界读。
+
+现代高性能核心为隐藏访存与运算延迟，在分支结果尚未解析前就沿预测路径**投机执行**。架构上误预测路径会被回滚：寄存器写、标志位、内存提交全部撤销，程序语义等价于分支从未走错。但「架构状态回滚」不等于「微架构状态回滚」——已被拉入的缓存行、TLB 表项、分支预测器历史、填充缓冲（MSHR）、硬件预取器都不会撤销。
+
+这一不对称性是所有投机类侧信道的根因。传统安全模型假设「地址空间隔离 + 权限检查」是可靠边界，而权限检查属于架构语义，数据流入缓存属于微架构事实。攻击者只要让受害进程在投机窗口内执行一次越权访存，就能把机密位编码进缓存的占用状态，再用计时读出来。
+
+难点在于投机不是可选的优化，而是现代乱序核心的默认工作方式。用全序列化彻底禁用它会让 IPC 崩塌，因此缓解必须做到精准且廉价。
 
 ## 二、核心原理
-Spectre v1 训练条件分支使其误预测进入越界路径，投机加载越界数据进缓存；随后用Flush+Reload 测缓存命中时间还原字节。v2 污染间接分支预测(BTB)劫持目标。
+
+与 Meltdown「利用异常检测与访存之间的时序差」不同，Spectre 让**受害者自己**沿错误路径执行越权访存：
+
+- **v1 边界检查绕过**：代码形如 `if (i < n) x = arr[i];`。攻击者先用合法下标把该条件分支训练成强 taken，再传入越界 `i`。分支仍被判 taken，投机执行 `arr[i]` 拿到越界字节，随后以该字节为下标访问 probe 数组，形成第二次投机访存，把字节值映射为「哪条缓存行被占用」。
+- **v2 分支目标注入**：针对间接分支。攻击者在自己的进程里执行与受害者虚拟地址相同的间接分支（命中同一 BTB 索引/组），把预测目标污染成攻击者选定的 gadget；受害者在投机窗口内跳过去执行泄露序列。前提是 BTB 索引只用低位地址且跨进程、跨特权级共享预测器状态。
+- **v4 投机存储绕过（SSB）**：加载在更早的存储地址解析完成前投机穿透，读到陈旧值，可被用来绕过「先写后读」式的检查顺序。
+
+读取阶段依赖缓存侧信道：**Flush+Reload** 先用 `clflush` 把 probe 数组逐行刷出，触发投机后逐行计时重载，耗时显著更短的那行对应泄露字节；**Evict+Time** 用于无法共享内存的场景；**Prime+Probe** 进一步摆脱对 `clflush` 的依赖。
 
 ## 三、形式化与数学基础
-侧信道观测：
-$$ t_{hit} \ll t_{miss} $$
-通过时间差 $\Delta t$ 判定某地址是否在缓存：
-$$ bit = \begin{cases}1 & \Delta t < \theta \\ 0 & \Delta t \ge \theta\end{cases} $$
-逐步拼出机密。
+
+设 $t_{hit}$ 与 $t_{miss}$ 分别为命中与未命中时的一次访存往返时间，典型量级为 $t_{hit} \ll t_{miss}$（L1 命中与 DRAM 往返可差两个数量级），于是单比特判定为
+
+$$
+bit = \begin{cases} 1, & \Delta t < \theta \\ 0, & \Delta t \ge \theta \end{cases}
+$$
+
+阈值 $\theta$ 由实测分布标定。重复测量可指数级降噪：若单次判定错误率为 $\epsilon < 1/2$，$k$ 次多数表决的失败概率满足
+
+$$
+P_{err}(k) \le \exp\!\left(-2k\left(\tfrac{1}{2}-\epsilon\right)^2\right)
+$$
+
+这是 Hoeffding 界的形式，它近似成立的前提是各次测量独立——现实中定时器精度、预取器与乱序执行的耦合会让实际降噪速度慢于该界。
+
+每次触发只能泄露一个字节（probe 数组一行），泄露 $b$ 字节需 $b$ 轮。由于「训练—触发—测量」全在同进程内完成，单进程 v1 gadget 每秒可尝试上万到数十万次，具体取决于缓存层级与噪声水平，以实测为准。
 
 ## 四、代码实现
+
+下面的 gadget 仅演示原理，真实利用需要精确的页对齐与缓存行布局。
+
 ```c
-// 示意：训练分支后越界投机读(仅演示原理，实际需精确布局)
-#include <cstdlib>
-char public_arr[16];
-int vuln(size_t idx) {
-    if (idx < 16)                 // 被训练为 taken
-        return public_arr[idx];   // 投机越界(若 idx 被误预测为正整数)
-    return -1;
+// Spectre v1 泄露 gadget 骨架（仅用于教学与防御研究）
+#include <stdint.h>
+#include <stddef.h>
+#include <x86intrin.h>
+
+#define STRIDE 4096                     /* 每字节独占一条缓存行，避开预取器 */
+static uint8_t probe[256 * STRIDE];
+
+/* 受害者：arr 与 n 合法，idx 由攻击者控制 */
+static uint8_t victim(const uint8_t *arr, size_t n, size_t idx) {
+    uint8_t v = 0;
+    if (idx < n)                        /* 该分支被训练为 taken */
+        v = arr[idx];                   /* 越界时于此投机读出 */
+    return v;
+}
+
+void spectre_v1(const uint8_t *arr, size_t n, size_t secret_idx) {
+    size_t i;
+    for (i = 0; i < 256 * STRIDE; i += 64)
+        _mm_clflush(&probe[i]);         /* 1. 刷出 probe */
+    for (i = 0; i < 30; i++)
+        (void)victim(arr, n, 0);        /* 2. 用合法下标训练分支 */
+    for (i = 0; i < 30; i++)
+        (void)victim(arr, n, secret_idx);   /* 3. 触发越界投机 */
+    /* 真实 gadget 中，此处由投机路径内的 probe[v*STRIDE] 完成缓存污染 */
+    _mm_mfence();
+    /* 4. 对 256 行逐一计时重载，最快的一行即泄露字节 */
 }
 ```
 
+真实 gadget 里必须存在一条**数据依赖**：`probe[v * STRIDE]` 的地址由投机读出的 `v` 计算。若编译器把该访问提到 `if` 之外或改成控制依赖，利用就会失效。这正是 `lfence` 插桩位置需要精确的原因——插早了挡住投机，插晚了无效。
+
 ## 五、与其他技术对比
-Meltdown 利用权限检查与加载的顺序漏洞(用户可读内核)，Spectre 利用预测器本身。二者都靠缓存侧信道，但根因不同。
+
+| 变体 | 根因 | 需越权 | 泄露载体 | 典型缓解 |
+| --- | --- | --- | --- | --- |
+| Spectre v1 | 条件分支投机 + 数据依赖 | 否 | L1/L2 缓存 | 序列化插桩、代码洁净、掩码 |
+| Spectre v2 | 间接分支预测器污染 | 否 | 缓存 | Retpoline、IBRS/IBPB、STIBP |
+| Meltdown | 异常抑制 + 乱序访存 | 是 | L1 缓存 | KPTI 页表隔离 |
+| L1TF | 地址翻译的投机执行 | 是 | L1 缓存 | PTE 反转、核心隔离 |
+| MDS/RIDL | 缓冲与端口的数据遗留 | 是 | 填充缓冲 | 微码清理、禁用 SMT |
+
+表中可见：Spectre 修「预测器」，Meltdown 类修「检查与访问的顺序」，但都靠缓存侧信道读出结果。
 
 ## 六、常见误区
-认为仅禁用投机即可修复(性能崩塌)。以为只影响特定厂商——多数乱序 OoO 实现均受影响，属微架构共性。
 
-## 七、与开源书/权威来源对应
-Kocher et al. 2019 Spectre 论文；Böhme 2018 Meltdown；CSAPP 第5章提及侧信道背景。
+- 「禁用投机就安全」：全序列化性能不可接受，且部分缓解只是改变了预测器的可利用方式。
+- 「这是某一家厂商的 bug」：这是投机执行的架构共性，几乎所有激进乱序实现都受影响。
+- 「`lfence` 到处插就行」：它只序列化本地核心的加载，代价高；插错位置既无效又损失性能，还需与编译器屏障配合防止重排。
+- 「回滚了就没事」：回滚的是架构状态，缓存与填充缓冲的残留才是信道。
+- 「静态分析能枚举所有 gadget」：gadget 依赖编译器调度与微架构细节，工具只能降低概率。
+
+## 七、与开源书·权威来源对应
+
+1. Kocher et al., *Spectre Attacks*, IEEE S&P 2019（arXiv:1801.01203）：v1/v2 的完整构造与原始实验。
+2. Lipp et al., *Meltdown: Reading Kernel Memory from User Space*, USENIX Security 2018：权限检查与访存的乱序窗口。
+3. Hennessy & Patterson《Computer Architecture: A Quantitative Approach》：投机执行、分支预测器与 ROB 的微架构基础。
+4. Bryant & O'Hallaron《CSAPP》第 5、6 章：程序性能优化与存储器层次，构成侧信道的物理基础。
+5. Intel SDM 与 ARM ARM 中 `LFENCE`、`CSDB`、`SSBB` 的语义描述：以官方最新文档为准。
 
 ## 八、面试题
-Spectre 与 Meltdown 区别？为何回滚结果仍有泄露？防护手段(Retpoline/LFENCE)？
+
+1. **Spectre 与 Meltdown 的本质区别？** 要点：Spectre 让受害者自己投机执行越权访存，不需绕过异常；Meltdown 依赖异常被推迟处理，用户态直接投机读内核地址。
+2. **结果被回滚为何仍泄露？** 要点：回滚只覆盖架构状态；缓存行、TLB、填充缓冲被填充属副作用。
+3. **Retpoline 的原理？** 要点：把间接跳转替换为「压目标 + `ret`」，用返回地址栈预测替代 BTB 预测，攻击者无法污染目标；代价是 RAS 压力与部分性能损失。
+4. **`lfence` 为何能挡 v1？** 要点：序列化加载，阻止后续访存在分支解析前把数据带入缓存；但它挡不住 v2 的目标注入，需要 IBPB/IBRS。
+5. **缓存侧信道为何偏好同一缓存行？** 要点：一致性粒度即缓存行，共享物理行时命中率高、噪声低；不共享则需 Prime+Probe 并承担组相联冲突噪声。
 
 ## 九、演进与趋势
-硬件缓解(IBPB, STIBP, 微码)、软件屏障(LFENCE)、Site Isolation 隔离；新变种持续出现。
+
+硬件侧出现 IBPB/STIBP/SSBD、微码序列化序列，以及按特权级给预测器打标签的思路；软件侧有 Retpoline、KPTI、Site Isolation（把不同站点分到不同进程，抬高跨进程利用成本）与编译器插桩（`-mretpoline`、推测加载加固）。研究方向上，形式化验证「无投机泄露」的指令子集、按需投机（如只在对安全敏感区投机）仍在推进。变种持续出现，防御趋向「硬件原语 + 编译器契约 + 运行时策略」三层协同。
 
 ## 十、小结
-分支预测器的投机执行在微架构层留下痕迹，被侧信道利用成跨权限泄露，是性能与安全的根本张力点。
+
+Spectre 暴露的不是某条指令的缺陷，而是**性能优化与安全抽象之间的根本张力**：投机把未来才可能发生的访存提前到当下，缓存又把这些访存留在证据链上。理解它需要同时掌握分支预测器结构、ROB 提交语义与缓存层次特性；三者缺一，防御就只能靠打补丁。

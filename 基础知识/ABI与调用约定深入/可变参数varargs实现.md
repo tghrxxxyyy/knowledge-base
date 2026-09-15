@@ -1,45 +1,109 @@
-# 可变参数varargs实现
+# 可变参数 varargs 实现
 
-> 对应 Bryant & O'Hallaron《CSAPP》第 3.7 节；System V AMD64 ABI varargs 规则。
+> 对应 Bryant & O'Hallaron《Computer Systems: A Programmer's Perspective》第 3.7 节；System V AMD64 ABI（x86-64 psABI）第 3.5.6 节「Variable Argument Lists」；glibc `<stdarg.h>` 实现。
 
 ## 一、背景与挑战
-printf 等接受不定数量、类型的参数。调用约定须保证被调能从寄存器与栈中按顺序取参，且不依赖类型信息。
+
+`printf` 这类函数接受数量与类型都不确定的参数。在 32 位 cdecl 下所有参数都压栈，按顺序取参很简单；但在 x86-64 上，前几个参数位于寄存器（整数在 rdi..r9，浮点在 xmm0..xmm7），多余才落栈。被调函数并不知道调用方传了几个、什么类型，却必须能从寄存器与栈的混合布局中「重建」出参数序列。难点在于：被调函数没有类型信息，只能依赖程序员在 `va_arg(ap, T)` 中显式给出的类型去推进游标，一旦给错类型就会读错寄存器/栈区，且错误会向后传播污染后续所有取值。
+
+这种「无类型契约」还带来一个隐蔽后果：调用方与被调方之间只靠约定（格式串、隐式计数器等）耦合，编译器无法校验。因此 C 的 varargs 本质上是一种「运行时自描述协议」，其正确性责任完全落在程序员身上——这也是它成为大量安全漏洞来源的根本原因。
 
 ## 二、核心原理
-x86-64 上，前 5 个整参在 rdi..r9、浮点在 xmm0..xmm7，多余落栈。va_list 结构记录当前抓取位置（gp 寄存器区、fp 寄存器区、栈溢出区及偏移）。va_arg 据请求类型推进对应指针并取值。
+
+glibc 的 `va_list` 是一个结构体，包含四个字段：`gp_offset`（下一个整数寄存器参数距寄存器保存区的字节偏移）、`fp_offset`（下一个 SSE 参数偏移）、`overflow_arg_area`（栈上溢出区指针）、`reg_save_area`（被调函数序言里保存所有寄存器参数的内存区地址）。进入可变参数函数时，编译器在序言把 rdi..r9 与 xmm0..xmm7 全部拷入 `reg_save_area` 这块连续内存——这一步是 varargs 能工作的前提。`va_start` 把 `reg_save_area` 指向它，并依据已用掉的命名参数把 `gp_offset`/`fp_offset` 初始化到「第一个可变参数」的位置。`va_arg(ap, T)` 则根据 `T` 的类别，从寄存器区或溢出区取出数据，并把对应偏移推进 8（整数）或 16（SSE，因 xmm 占 16 字节）。`va_end` 把结构清零，禁止再使用。
+
+「把所有候选寄存器都保存下来」这一步看似浪费（典型函数只用到两三个），却是不可省的：因为被调函数在编译时不知道会用到第几个，只有全量保存才能保证无论 `va_arg` 访问到哪一项都有正确的值可读。这个开销正是 varargs 函数通常比定参函数慢的原因之一，也是编译器倾向于把 `printf` 这类调用做专门优化的动机。
 
 ## 三、形式化与数学基础
-va_list 偏移推进：
-$$off = \begin{cases} gp\_off += 8 & INTEGER \\ fp\_off += 16 & SSE \\ stack\_off += 8 & overflow \end{cases}$$
-源地址 $=\ reg\_save\_area + off$ 或 $overflow\_arg\_area + stack\_off$。
+
+寄存器保存区布局：整数区 $[0,48)$，SSE 区 $[48,176)$（8 个 xmm × 16 字节）。`va_arg` 对类型 $T$ 的取址与推进为：
+
+$$
+addr = \begin{cases}
+reg\_save\_area + gp\_offset,\quad gp\_offset \mathrel{+}= 8 & T \in INTEGER \land gp\_offset < 48 \\
+overflow\_arg\_area,\quad \text{overflow} \mathrel{+}= 8 & T \in INTEGER \land gp\_offset \ge 48 \\
+reg\_save\_area + fp\_offset,\quad fp\_offset \mathrel{+}= 16 & T \in SSE \land fp\_offset < 176 \\
+overflow\_arg\_area,\quad \text{overflow} \mathrel{+}= 8 & \text{否则}
+\end{cases}
+$$
+
+可见整数与 SSE 各自独立计数，二者游标互不影响。这也解释了为何 `va_arg(ap, double)` 必须从 SSE 区取——整数游标对此无能为力，强行用错类型会读到完全错误的数据。
+
+两条推论值得记住：其一，由于两个游标独立，浮点参数与整数参数可以任意交错而互不干扰，`printf("%d %f %d", ...)` 这类混合调用才能正确工作；其二，溢出区的推进始终按 8 字节对齐（即使参数本身更小），这保证了从寄存器区切换到溢出区时地址始终对齐。此外，结构体、联合体等「非整型也非 SSE」的聚合类型通常只能走内存/溢出路径，这也是大结构体作为可变参数时性能较差的原因。
 
 ## 四、代码实现
+
 ```c
 #include <stdarg.h>
+#include <stdio.h>
+
 int sum(int n, ...) {
-    va_list ap; va_start(ap, n);
+    va_list ap;
+    va_start(ap, n);          /* 初始化 gp/fp_offset 与 reg_save_area */
     int s = 0;
-    for (int i=0;i<n;i++) s += va_arg(ap, int);
-    va_end(ap); return s;
+    for (int i = 0; i < n; i++)
+        s += va_arg(ap, int); /* 每次从 reg 区或溢出区取 4 字节并推进 */
+    va_end(ap);               /* 必须调用：清空 ap，禁止再用 */
+    return s;
 }
 ```
 
+```c
+/* va_list 的结构示意（glibc x86-64） */
+typedef struct {
+    unsigned int  gp_offset;        /* 下一个整参偏移，如首个可变整参为 8 */
+    unsigned int  fp_offset;        /* 下一个 SSE 参数偏移，如 48 之后 */
+    void         *overflow_arg_area;/* 栈上溢出参数区 */
+    void         *reg_save_area;    /* 被调序言保存的寄存器区 */
+} va_list_struct;
+```
+
+第三处易错点是游标的「消耗性」：`va_arg` 会就地推进 `va_list`，因此若要把同一组可变参数遍历两遍（例如先统计长度再做格式化），必须先用 `va_copy` 复制出一份独立的游标快照，让两路各自推进；两个副本还须分别调用 `va_end`。直接复用同一个 `va_list` 会从半途开始取参，产生难以察觉的错误结果。
+
 ## 五、与其他技术对比
-cdecl（32 位）全栈传递使 va_arg 简单；x86-64 因寄存器传参需 reg_save_area 暂存，va_list 更复杂但更快。
+
+| 维度 | 32 位 cdecl | x86-64 SysV varargs | C++ 可变参数模板 | 数组/结构体传参 |
+|------|-------------|---------------------|------------------|-----------------|
+| 参数位置 | 全在栈上 | 寄存器 + 栈混合 | 编译期类型已知 | 显式容器 |
+| va_list | 简单指针 | 含偏移游标结构体 | 不使用 va_list | 不需要 |
+| 类型安全 | 否 | 否 | 是（折叠表达式） | 是 |
+| 性能 | 取参需访存 | 寄存器区命中快 | 编译期展开最优 | 需构造容器 |
 
 ## 六、常见误区
-1. 用错 va_arg 类型导致读错寄存器/栈区。
-2. 忘记 va_end 致未定义行为。
-3. 可变参数无法类型安全，错误类型静默错读。
 
-## 七、与开源书/权威来源对应
-CSAPP 3.7 varargs；System V AMD64 ABI；CyC2018/CS-Notes。
+1. 用错 `va_arg` 的类型（例如声明 `double` 却按 `int` 取），会导致读错寄存器/栈区并损坏后续游标。
+2. 忘记 `va_end`，在开启优化时可能破坏栈帧，属未定义行为。
+3. 可变参数无法做类型检查，错误类型会**静默**错读，是安全与正确性的隐患。
+4. 误以为 `va_list` 可无限复用：`va_arg` 会推进游标，需用 `va_copy` 保存快照再并行遍历。
+5. 以为浮点缺省提升可省略：默认实参提升确实把 `float` 提为 `double`，但 `char/short` 提为 `int`，写错对应类型仍会取错。
+6. 把 `va_list` 按值传给另一个函数：在部分 ABI 上 `va_list` 是数组类型，按值传递会退化为指针，行为与预期不符；应传指针或使用 `va_copy`。
+7. 忽略默认实参提升：调用方把 `char` 提升为 `int` 传递，`va_arg` 却按 `char` 取，虽通常因小端布局而不出错，但属未定义行为。
+8. 在可变参数中传结构体：聚合类型多走内存路径，既慢又易与寄存器区切换逻辑不一致，应传指针。
+
+## 七、与开源书·权威来源对应
+
+- CSAPP 第 3.7 节：讲解 x86-64 栈帧与寄存器传参，含 varargs 背景。
+- System V AMD64 ABI（x86-64 psABI）第 3.5.6 节：规定 va_list 字段语义与 `va_arg` 推进规则。
+- glibc 源码 `<stdarg.h>` / `stdarg.h` 的 x86-64 实现：实际结构体定义。
+- Aho 等《Compilers》关于参数传递与调用序列的论述，可用于理解 ABI 约定的编译侧实现。
 
 ## 八、面试题
-问：va_list 存什么？为何 x86-64 的 varargs 复杂？va_arg 如何取值？
+
+1. `va_list` 里存了什么？答：寄存器保存区地址、整数与 SSE 各自的偏移游标、栈溢出区指针。
+2. 为何 x86-64 的 varargs 比 32 位复杂？答：参数分散在整数寄存器、SSE 寄存器与栈三处，需 reg_save_area 暂存并用双游标重建序列。
+3. `va_arg(ap, double)` 推进多少字节？答：从 SSE 区取时 `fp_offset += 16`（xmm 宽 16 字节），从溢出区取时按 8 字节对齐推进。
+4. 为什么必须从 SSE 区取浮点？答：浮点参数在调用时落在 xmm 寄存器，整数游标对应的 reg_save_area 前半区并不含它。
+5. 什么时候必须用 `va_copy`？答：需要把同一组可变参数遍历两遍（或传给另一个函数处理）时，因为 `va_arg` 会破坏游标状态。
+6. 为什么可变参数函数通常更慢？答：序言必须保存全部候选寄存器（含未使用的），且取参需按游标间接访问，开销高于定参调用。
 
 ## 九、演进与趋势
-C23 引入类型安全的可选参数提案探索；多数 API 转向显式数组/结构体。
+
+C++ 以可变参数模板与折叠表达式（`(sum += args, ...)`）提供了编译期类型安全的替代，新代码应尽量避开 C 风格 varargs；语言层面有无类型安全的可变参数提案仍是活跃研究方向，具体以官方最新文档为准。底层 ABI 的 varargs 规则则长期稳定。
+
+在安全实践上，`printf` 系函数的格式串漏洞催生了编译器的格式检查属性（如 `format(printf, 1, 2)`）与静态分析工具，把部分类型错误从运行时提前到编译期。这是在不改变 ABI 的前提下，用工具链弥补语言类型系统缺口的典型案例。
 
 ## 十、小结
-varargs 借 reg_save_area 与偏移游标在寄存器+栈混合布局上重建参数序列。
+
+varargs 的本质，是借 `reg_save_area` 把散落在寄存器与栈上的参数「拍平」到一块连续内存，再用整数/SSE 双游标按程序员指定的类型重建参数序列。它用运行时的复杂度换取了 C 语言表达不定参数的能力，也把类型安全的责任完全交给了调用者。
+
+三条记忆要点：类型必须与实参完全一致（错则静默错读）、`va_arg` 会消耗游标（复用前须 `va_copy`）、`va_end` 必须配对（否则未定义行为）。

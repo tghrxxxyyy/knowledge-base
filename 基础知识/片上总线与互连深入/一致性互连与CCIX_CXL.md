@@ -1,43 +1,122 @@
 # 一致性互连与 CCIX/CXL
 
-> 对应 CCIX 联盟规范与 CXL 联盟规范（厂商/行业手册，真实来源）。
+> 对应 CCIX 联盟规范与 CXL 联盟规范（行业标准，真实来源），以及 ARM AMBA CHI 一致性互连规范；具体版本细节以官方最新规范为准。
 
 ## 一、背景与挑战
-CPU 与加速器（GPU、FPGA、ASIC）需共享内存且保持缓存一致，传统 PCIe 无一致语义、需显式拷贝。CCIX/CXL 在互连层提供缓存一致性。
+
+加速器（GPU、FPGA、智能网卡、NPU）与 CPU 需要共享同一份数据。传统 PCIe 只提供「非一致」的内存语义：设备与主机之间要显式拷贝，或者由驱动维护复杂的缓存同步。数据搬移成为瓶颈，且在异构流水线中引入额外延迟与功耗。
+
+一致性互连的目标是把缓存一致性域从片上延伸到片间与板级：让加速器可以直接以缓存语义访问主机内存，反之亦然，从而支持细粒度共享、指针传递（pointer chasing）与共享虚拟地址。挑战在于：跨芯片的链路往返延迟远大于片上；一致性协议的状态机要跨域扩展且必须有明确的归属（ownership）与失效路径；同时还要兼顾协议复用（物理层沿用 PCIe 可降低成本与生态门槛）与安全（跨设备的访问隔离与链路加密）。
 
 ## 二、核心原理
-CXL 基于 PCIe 物理层，定义三种协议：CXL.io（IO）、CXL.cache（设备缓存主机内存）、CXL.mem（主机缓存设备内存）。主机与设备通过一致性协议（如 MESI 变体）同步缓存行。
+
+CXL 在 PCIe 物理层之上定义三类协议，复用链路但语义独立：
+
+- CXL.io：等价于 PCIe 事务，用于枚举、配置、DMA 与设备管理。
+- CXL.cache：让设备缓存主机内存，设备侧发起一致性请求（读共享、读独占、写回）。
+- CXL.mem：让主机访问设备内存（HDM，Host-managed Device Memory），主机侧发起读写。
+
+设备按能力分为若干类型（Type-1 无设备内存的加速器、Type-2 带设备内存的加速器、Type-3 纯内存扩展设备），不同类型启用不同协议组合。
+
+一致性在 CXL 中的实现要点是「偏置」（bias）：当主机侧访问频繁时把设备内存偏置到主机（host bias），由主机缓存该内存；当设备侧访问频繁时偏置到设备（device bias），设备本地缓存并允许主机通过反向失效（back-invalidate）收回。这样避免了设备内存的每一次访问都跨链路。
+
+CCIX 的思路类似：在链路层定义一致性事务与探针（probe）消息，通过「协议代理」把设备的缓存请求转换成主机一致性域的请求，实现设备参与主机一致性协议。其差异主要在协议出身与生态：CCIX 由多厂商联盟推动，CXL 由 Intel 主导并直接构建在 PCIe 之上。
+
+无论是 CXL 还是 CCIX，本质上都是把片上的 MESI 类状态机（或其变体，如带 Forward 态、Owned 态的变体）跨链路扩展，并额外解决四个问题：失效路径上的合并与排序、转发（forward）以减少跳数、代理缓存（如主机侧的 home agent 与设备侧的 device agent）与超时重试机制。
 
 ## 三、形式化与数学基础
-一致性域扩展后，跨设备的缓存行状态机与片上 MESI 同构，额外开销为链路往返延迟 $L_{link}$：
-$$CoherentLatency = L_{onchip} + L_{link}$$
-带宽受链路通道数约束，需 snoop 过滤减少广播。
+
+一致性域扩展后，同一地址的状态机与片上 MESI 同构，但每次跨域交互都要付出链路往返延迟 $L_{link}$。跨域一致访问延迟可近似表示为：
+
+$$L_{coherent} = L_{onchip} + L_{link} + L_{agent}$$
+
+其中 $L_{agent}$ 为代理节点（home agent / device agent）的处理与排队延迟。若发生失效—确认往返，则需再叠加一次 $L_{link}$：
+
+$$L_{inv} = L_{link} + t_{inv} + L_{agent}$$
+
+带宽方面，链路有效载荷带宽受通道数与编码开销约束：
+
+$$BW_{payload} = N_{lane} \cdot R_{lane} \cdot \eta_{coding}$$
+
+一致性消息在总流量中的占比决定「带宽税」。设失效消息占比 $\alpha$、每笔失效附带 $S_{inv}$ 字节元数据、数据有效载荷为 $S_{data}$，则有效数据带宽相对裸链路带宽的比例约为：
+
+$$\eta_{eff} = \frac{S_{data}}{S_{data} + \alpha \cdot S_{inv}}$$
+
+因此减少无效化与广播（使用目录化、snoop filter、以及偏置策略）是提升跨域有效带宽的核心手段。
 
 ## 四、代码实现
+
 ```c
-// 设备侧请求主机缓存行(概念)
-typedef enum { READ_SHARED, READ_EXCLUSIVE, WRITE_BACK } cxl_req_t;
-void cxl_request(uint64_t addr, cxl_req_t t) {
-    send_over_cxl_cache(addr, t);   // 经CXL.cache
-    wait_snoop_response();          // 一致性响应
-    // 设备本地缓存行进入S/E/M态
+/* 设备侧发起一致性请求（CXL.cache 概念模型） */
+typedef enum { REQ_RD_SHARED, REQ_RD_UNIQUE, REQ_WRITEBACK } req_t;
+typedef enum { ST_I, ST_S, ST_E, ST_M, ST_PENDING } st_t;
+
+void dev_load(uint64_t addr, void *dst, size_t len) {
+    st_t s = dev_cache_state(addr);
+    if (s == ST_I) {
+        send_cxl_cache(addr, REQ_RD_SHARED);   /* 走 CXL.cache 请求主机 */
+        wait_snoop_response();                 /* 等主机一致性域的响应 */
+        dev_cache_install(addr, ST_S);         /* 落入 S 态 */
+    }
+    /* 命中 S/E/M 则直接返回，无需跨链路 */
+    memcpy(dst, dev_cache_data(addr), len);
+}
+
+/* 主机侧反向失效：设备内存被偏置到设备时，主机要读需收回 */
+void host_back_invalidate(uint64_t addr) {
+    if (dev_cache_state(addr) == ST_M) {
+        send_back_inval(addr);                 /* 请求设备写回 */
+        wait_writeback(addr);                  /* 获得数据与归属 */
+    }
+    host_cache_install(addr, ST_E);            /* 主机侧进入独占 */
 }
 ```
 
+工程实现上，代理节点必须处理三类边界情况：请求与失效在链路上交错到达（需要按地址保序）、设备无响应（需要超时与重试，且重试必须幂等，避免重复写回破坏状态）、以及设备掉线（需要把一致性域回滚到内存，防止「明明有 dirty 副本却无人应答」的悬挂状态）。
+
 ## 五、与其他技术对比
-CCIX 基于 CCIX 协议（多厂商），CXL 由 Intel 主导基于 PCIe 5.0；二者目标一致，CXL 3.0 进一步支持 fabric 与内存池化。
+
+| 维度 | PCIe（非一致） | CCIX | CXL | NVLink 类专有互连 |
+| --- | --- | --- | --- | --- |
+| 物理层 | PCIe | 可复用 PCIe 类链路 | PCIe | 专有 |
+| 一致性 | 无 | 有（probe 式） | 有（CXL.cache/mem） | 有（域内强一致） |
+| 内存语义 | 设备 DMA | 设备参与一致性 | 主机可缓存设备内存 + 内存池化 | GPU 显存与主机内存统一 |
+| 生态开放度 | 极高 | 多厂商联盟 | 开放规范，厂商广泛参与 | 厂商专有 |
+| 典型场景 | 通用外设 | 加速器共享 | 内存扩展、池化、解聚 | GPU 集群内部 |
 
 ## 六、常见误区
-误以为 PCIe 本身一致：需 CXL/CCIX 叠加。误以为一致互连零开销：链路延迟显著。
 
-## 七、与开源书/权威来源对应
-CXL 规范 1.0/2.0/3.0；CCIX 规范；ARM CHI 一致性互连。
+1. 认为 PCIe 本身提供一致性：PCIe 只有 DMA 语义，一致性必须由 CXL/CCIX 等协议叠加获得。
+2. 认为一致互连零开销：链路往返与代理排队使跨域访问延迟显著高于片上，必须靠偏置与本地缓存摊薄。
+3. 混淆 CXL.cache 与 CXL.mem：前者是设备缓存主机内存，后者是主机访问设备内存，方向相反、发起方不同。
+4. 认为内存池化等于「扩展内存条」：池化引入链路延迟与失败域，需要软件层的分级放置（tiering）与迁移策略配合。
+5. 忽略安全：跨设备内存共享让 DMA 攻击面扩大，必须结合 IOMMU/PASID 与链路加密（如 IDE）做隔离。
+
+## 七、与开源书·权威来源对应
+
+- CXL 联盟规范（CXL 1.0/1.1/2.0/3.0 等版本，以官方最新版为准）：三类协议、偏置、HDM 与池化定义。
+- CCIX 联盟规范：链路层一致性事务与探针语义。
+- ARM AMBA CHI 规范：片上一致性互连的事务与缓存状态定义。
+- Hennessy & Patterson《Computer Architecture: A Quantitative Approach》：多插槽一致性、目录与探针过滤。
+- Intel SDM 卷 3：IOMMU/VT-d 对设备访问隔离的支持（与 CXL 设备共享地址空间的配合）。
+- Patterson & Hennessy《Computer Organization and Design》：I/O 与内存层次扩展的系统视角。
 
 ## 八、面试题
-问：CXL.cache 与 CXL.mem 区别？答：前者设备缓存主机内存，后者主机访问设备内存。
+
+1. 问：CXL.cache 与 CXL.mem 的区别？答：CXL.cache 让设备缓存主机内存（设备发起请求）；CXL.mem 让主机访问设备内存（主机发起请求），二者方向与发起方相反。
+2. 问：偏置（bias）解决什么问题？答：设备内存若每次访问都跨链路，延迟与带宽都不划算；把高频访问方偏置为其本地缓存可显著摊薄跨域成本，代价是反向失效的复杂度。
+3. 问：为什么跨域一致性比片上难？答：链路往返延迟大、失效路径更长、需要代理与超时重试、失败域更多（设备可能掉线），且协议要跨厂商互操作。
+4. 问：内存池化带来哪些新问题？答：链路延迟与带宽成为瓶颈，需分级放置与热数据迁移；同时失败域变大，需要处理池节点故障与数据重建。
+5. 问：如何在不牺牲安全的前提下共享内存？答：用 IOMMU/SMMU 做地址翻译与权限检查、用 PASID 支持进程级粒度，并对链路做完整性/加密保护。
 
 ## 九、演进与趋势
-CXL 内存池化、disaggregated memory 成为数据中心新范式。
+
+- 从点对点走向交换与 Fabric：支持交换机与多级交换，使多主机多设备共享内存池成为可能。
+- 内存分层与解聚：把远端内存作为容量层，配合软件分级（tiering）、预取与迁移策略。
+- 加速器一致性普及：GPU/NPU 通过一致性端口直接参与主机一致性域，减少显式拷贝。
+- 协议收敛：CXL 与 PCIe 代际同步演进，物理层升级带来带宽翻倍，一致性语义保持兼容。
+- 可组合系统（composable infrastructure）：通过一致性 Fabric 动态组合 CPU、内存与加速器资源。
 
 ## 十、小结
-CCIX/CXL 把缓存一致性延伸到芯片边界，是异构计算与内存解聚的关键使能技术。
+
+CCIX/CXL 把缓存一致性从芯片内部延伸到芯片边界：用代理节点承载状态机、用偏置与本地缓存摊薄链路延迟、用目录化与反向失效控制一致性流量。它既是异构计算（CPU 与加速器共享数据）的关键使能技术，也是内存解聚与可组合数据中心的基础设施；理解「谁归属、如何失效、如何缓冲竞态、如何容错」这四条主线，就理解了所有跨域一致性方案的共性。
